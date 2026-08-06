@@ -30,8 +30,14 @@
 //! usually-short critical sections: a delayed writer must never become stealable
 //! merely because scheduling or filesystem I/O exceeded the stale threshold.
 
+#[cfg(unix)]
+use std::ffi::{OsStr, OsString};
 use std::fs;
+#[cfg(unix)]
+use std::fs::File;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -64,11 +70,14 @@ pub fn lock_path_for(target: &Path) -> PathBuf {
 /// A future mtime (clock skew) or an unreadable mtime is treated as *fresh*
 /// (i.e. held) so we never steal a lock we cannot prove is abandoned.
 fn is_stale(meta: &fs::Metadata, stale: Duration) -> bool {
-    meta.modified().is_ok_and(|mtime| {
-        SystemTime::now()
-            .duration_since(mtime)
-            .is_ok_and(|age| age > stale)
-    })
+    meta.modified()
+        .is_ok_and(|mtime| is_stale_modified(mtime, stale))
+}
+
+fn is_stale_modified(modified: SystemTime, stale: Duration) -> bool {
+    SystemTime::now()
+        .duration_since(modified)
+        .is_ok_and(|age| age > stale)
 }
 
 /// Remove whatever occupies the lock path so acquisition can retry.
@@ -135,6 +144,135 @@ fn refresh_identity(lock_path: &Path) -> io::Result<LockIdentity> {
     lock_identity(&fs::symlink_metadata(lock_path)?)
 }
 
+#[cfg(unix)]
+fn stat_identifier_to_u64<T>(value: T, field: &'static str) -> io::Result<u64>
+where
+    u64: TryFrom<T>,
+{
+    u64::try_from(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, format!("lock {field} overflow")))
+}
+
+#[cfg(unix)]
+fn lock_identity_at(directory: &File, lock_name: &OsStr) -> io::Result<LockIdentity> {
+    let stat = rustix::fs::statat(directory, lock_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(io::Error::from)?;
+    let modified_seconds = u64::try_from(stat.st_mtime).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock mtime predates the Unix epoch",
+        )
+    })?;
+    let modified_nanoseconds = u32::try_from(stat.st_mtime_nsec).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock mtime has invalid nanoseconds",
+        )
+    })?;
+    if modified_nanoseconds >= 1_000_000_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "lock mtime has out-of-range nanoseconds",
+        ));
+    }
+    let modified = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::new(modified_seconds, modified_nanoseconds))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "lock mtime overflow"))?;
+    let device = stat_identifier_to_u64(stat.st_dev, "device id")?;
+    let inode = stat_identifier_to_u64(stat.st_ino, "inode")?;
+
+    Ok(LockIdentity {
+        modified,
+        is_dir: rustix::fs::FileType::from_raw_mode(stat.st_mode)
+            == rustix::fs::FileType::Directory,
+        device,
+        inode,
+    })
+}
+
+#[cfg(unix)]
+fn open_lock_dir_at(directory: &File, lock_name: &OsStr) -> io::Result<File> {
+    let descriptor = rustix::fs::openat(
+        directory,
+        lock_name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(unix)]
+fn reclaim_if_unchanged_at(directory: &File, lock_name: &OsStr, observed: LockIdentity) {
+    let Ok(current) = lock_identity_at(directory, lock_name) else {
+        return;
+    };
+    if current != observed {
+        return;
+    }
+    let flags = if current.is_dir {
+        rustix::fs::AtFlags::REMOVEDIR
+    } else {
+        rustix::fs::AtFlags::empty()
+    };
+    let _ = rustix::fs::unlinkat(directory, lock_name, flags);
+}
+
+#[cfg(unix)]
+fn remove_owned_dir_at(directory: &File, lock_name: &OsStr, expected: LockIdentity) {
+    let still_owned = lock_identity_at(directory, lock_name)
+        .is_ok_and(|identity| identity == expected && identity.is_dir);
+    if still_owned {
+        let _ = rustix::fs::unlinkat(directory, lock_name, rustix::fs::AtFlags::REMOVEDIR);
+    }
+}
+
+#[cfg(unix)]
+struct CreatedLockCleanup {
+    directory: Arc<File>,
+    lock_name: OsString,
+    expected: LockIdentity,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl CreatedLockCleanup {
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CreatedLockCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            remove_owned_dir_at(&self.directory, &self.lock_name, self.expected);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn refresh_identity_at(lock_handle: &File) -> io::Result<LockIdentity> {
+    rustix::fs::futimens(
+        lock_handle,
+        &rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_OMIT,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_NOW,
+            },
+        },
+    )
+    .map_err(io::Error::from)?;
+    lock_identity(&lock_handle.metadata()?)
+}
+
 /// Exponential backoff with light jitter, capped, mirroring the previous
 /// `fs4`-based retry loops in this crate.
 fn backoff(attempt: u32) -> Duration {
@@ -193,7 +331,6 @@ impl DirLock {
                 Ok(()) => {
                     #[cfg(unix)]
                     {
-                        use std::os::unix::fs::PermissionsExt as _;
                         let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o700));
                     }
                     return Self::start_heartbeat(lock_path, update);
@@ -330,6 +467,216 @@ impl Drop for DirLock {
     }
 }
 
+/// A proper-lockfile-compatible lock whose parent directory is held by descriptor.
+///
+/// Path-based locking is sufficient while every ancestor remains stable. Security-sensitive
+/// atomic writes already hold their destination directory open, though, and must keep the lock
+/// attached to that exact directory if an ancestor is concurrently renamed or replaced. This
+/// variant performs every operation relative to the supplied descriptor: acquisition, stale
+/// reclaim, heartbeat, ownership validation, and release.
+#[cfg(unix)]
+#[derive(Debug)]
+#[must_use = "the lock is released as soon as the DirLockAt is dropped"]
+pub struct DirLockAt {
+    directory: Arc<File>,
+    lock_name: OsString,
+    lock_handle: Arc<File>,
+    stop_heartbeat: Option<mpsc::Sender<()>>,
+    heartbeat: Option<JoinHandle<()>>,
+    expected_identity: Arc<Mutex<LockIdentity>>,
+    compromised: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+impl DirLockAt {
+    /// Acquire the proper-lockfile directory for `target_name` inside `directory`.
+    ///
+    /// The caller must keep using the same directory descriptor for the protected write. The
+    /// resulting physical entry is still named `<target_name>.lock`, so pathname-based upstream
+    /// clients and [`DirLock`] observe the same mutually exclusive lock.
+    pub fn acquire_for(
+        directory: &File,
+        target_name: &OsStr,
+        timeout: Duration,
+    ) -> io::Result<Self> {
+        Self::acquire_for_with_timing(directory, target_name, timeout, STALE, UPDATE)
+    }
+
+    fn acquire_for_with_timing(
+        directory: &File,
+        target_name: &OsStr,
+        timeout: Duration,
+        stale: Duration,
+        update: Duration,
+    ) -> io::Result<Self> {
+        let mut lock_name = target_name.to_os_string();
+        lock_name.push(".lock");
+        let directory = Arc::new(directory.try_clone()?);
+        let start = Instant::now();
+        let mut attempt: u32 = 0;
+
+        loop {
+            match rustix::fs::mkdirat(
+                &*directory,
+                &lock_name,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR | rustix::fs::Mode::XUSR,
+            ) {
+                Ok(()) => {
+                    // Capture the identity immediately after our successful mkdir. If opening the
+                    // directory subsequently fails (for example because the process exhausts file
+                    // descriptors), cleanup may remove only this exact entry. A concurrently
+                    // replaced lock must remain untouched.
+                    let acquired_identity = lock_identity_at(&directory, &lock_name)?;
+                    let mut cleanup = CreatedLockCleanup {
+                        directory: Arc::clone(&directory),
+                        lock_name: lock_name.clone(),
+                        expected: acquired_identity,
+                        armed: true,
+                    };
+                    if !acquired_identity.is_dir {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "new descriptor-relative lock is not a directory",
+                        ));
+                    }
+                    let lock_handle = open_lock_dir_at(&directory, &lock_name)?;
+                    let opened_identity = lock_identity(&lock_handle.metadata()?)?;
+                    if opened_identity != acquired_identity {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "descriptor-relative lock changed while it was being opened",
+                        ));
+                    }
+                    lock_handle.set_permissions(fs::Permissions::from_mode(0o700))?;
+                    let result =
+                        Self::start_heartbeat(directory, lock_name, Arc::new(lock_handle), update);
+                    if result.is_ok() {
+                        cleanup.disarm();
+                    }
+                    return result;
+                }
+                Err(rustix::io::Errno::EXIST) => match lock_identity_at(&directory, &lock_name) {
+                    Ok(identity) => {
+                        if is_stale_modified(identity.modified, stale) {
+                            reclaim_if_unchanged_at(&directory, &lock_name, identity);
+                            attempt = 0;
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => attempt = 0,
+                    Err(error) => return Err(error),
+                },
+                Err(error) => return Err(io::Error::from(error)),
+            }
+
+            if start.elapsed() >= timeout {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for descriptor-relative lock at {}",
+                        lock_name.to_string_lossy()
+                    ),
+                ));
+            }
+            std::thread::sleep(backoff(attempt));
+            attempt = attempt.saturating_add(1);
+        }
+    }
+
+    fn start_heartbeat(
+        directory: Arc<File>,
+        lock_name: OsString,
+        lock_handle: Arc<File>,
+        update: Duration,
+    ) -> io::Result<Self> {
+        let acquired_identity = lock_identity(&lock_handle.metadata()?)?;
+        let initial_identity = match refresh_identity_at(&lock_handle) {
+            Ok(identity) => identity,
+            Err(error) => {
+                remove_owned_dir_at(&directory, &lock_name, acquired_identity);
+                return Err(error);
+            }
+        };
+        let expected_identity = Arc::new(Mutex::new(initial_identity));
+        let compromised = Arc::new(AtomicBool::new(false));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let heartbeat_directory = Arc::clone(&directory);
+        let heartbeat_name = lock_name.clone();
+        let heartbeat_handle = Arc::clone(&lock_handle);
+        let heartbeat_expected = Arc::clone(&expected_identity);
+        let heartbeat_compromised = Arc::clone(&compromised);
+        let heartbeat = match thread::Builder::new()
+            .name("pi-file-lock-at-heartbeat".to_string())
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(update) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+
+                    let expected = *heartbeat_expected
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let still_owned = lock_identity_at(&heartbeat_directory, &heartbeat_name)
+                        .is_ok_and(|identity| identity == expected);
+                    if !still_owned {
+                        heartbeat_compromised.store(true, Ordering::Release);
+                        break;
+                    }
+                    if let Ok(identity) = refresh_identity_at(&heartbeat_handle) {
+                        *heartbeat_expected
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+                    } else {
+                        heartbeat_compromised.store(true, Ordering::Release);
+                        break;
+                    }
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                remove_owned_dir_at(&directory, &lock_name, initial_identity);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            directory,
+            lock_name,
+            lock_handle,
+            stop_heartbeat: Some(stop_tx),
+            heartbeat: Some(heartbeat),
+            expected_identity,
+            compromised,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DirLockAt {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop_heartbeat.take() {
+            let _ = stop.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        if self.compromised.load(Ordering::Acquire) {
+            return;
+        }
+        let expected = *self
+            .expected_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle_identity = self
+            .lock_handle
+            .metadata()
+            .and_then(|metadata| lock_identity(&metadata));
+        if handle_identity.is_ok_and(|identity| identity == expected) {
+            remove_owned_dir_at(&self.directory, &self.lock_name, expected);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +796,141 @@ mod tests {
             );
         }
         assert!(!lp.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_lock_interoperates_with_path_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory = open_test_directory(dir.path());
+        let lock_path = dir.path().join("auth.json.lock");
+        let guard =
+            DirLockAt::acquire_for(&directory, OsStr::new("auth.json"), Duration::from_secs(1))
+                .expect("acquire descriptor-relative lock");
+
+        assert!(lock_path.is_dir(), "lock must use the proper-lockfile name");
+        let error = DirLock::acquire(&lock_path, Duration::from_millis(100))
+            .expect_err("the pathname client must observe the held descriptor lock");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        drop(guard);
+        assert!(
+            !lock_path.exists(),
+            "descriptor-relative drop must release the shared lock entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_lock_survives_ancestor_swap_and_cleans_original_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("agent");
+        let moved_parent = dir.path().join("moved-agent");
+        let redirected_parent = dir.path().join("redirected");
+        fs::create_dir(&parent).expect("create lock parent");
+        fs::create_dir(&redirected_parent).expect("create redirected parent");
+        let directory = open_test_directory(&parent);
+        let guard = DirLockAt::acquire_for_with_timing(
+            &directory,
+            OsStr::new("auth.json"),
+            Duration::from_secs(1),
+            Duration::from_millis(180),
+            Duration::from_millis(40),
+        )
+        .expect("acquire descriptor-relative lock");
+
+        fs::rename(&parent, &moved_parent).expect("move original parent");
+        symlink(&redirected_parent, &parent).expect("replace parent with redirect");
+        std::thread::sleep(Duration::from_millis(260));
+
+        let moved_lock = moved_parent.join("auth.json.lock");
+        let error = DirLock::acquire(&moved_lock, Duration::from_millis(120))
+            .expect_err("the descriptor heartbeat must keep the moved live lock fresh");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            !redirected_parent.join("auth.json.lock").exists(),
+            "the replacement path must never receive lock state"
+        );
+
+        drop(guard);
+        assert!(
+            !moved_lock.exists(),
+            "drop must remove the owned lock from the descriptor-pinned directory"
+        );
+        assert!(
+            !redirected_parent.join("auth.json.lock").exists(),
+            "release must not touch the replacement path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_lock_reclaims_stale_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory = open_test_directory(dir.path());
+        let lock_path = dir.path().join("auth.json.lock");
+        fs::write(&lock_path, b"").expect("create stale legacy lock file");
+        filetime_set(&lock_path, SystemTime::now() - Duration::from_secs(30));
+
+        let guard = DirLockAt::acquire_for(
+            &directory,
+            OsStr::new("auth.json"),
+            Duration::from_millis(500),
+        )
+        .expect("reclaim stale descriptor-relative lock");
+        assert!(
+            lock_path.is_dir(),
+            "the stale legacy file must become a live lock directory"
+        );
+        drop(guard);
+        assert!(!lock_path.exists(), "the acquired lock must be released");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn descriptor_relative_failed_open_cleanup_preserves_replacement_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let directory = open_test_directory(dir.path());
+        let lock_name = OsStr::new("auth.json.lock");
+        let lock_path = dir.path().join(lock_name);
+        let preserved_path = dir.path().join("auth.json.lock.original");
+        fs::create_dir(&lock_path).expect("create original lock");
+        let original_identity = lock_identity_at(&directory, lock_name).expect("original identity");
+        let cleanup = CreatedLockCleanup {
+            directory: Arc::new(directory.try_clone().expect("clone directory")),
+            lock_name: lock_name.to_os_string(),
+            expected: original_identity,
+            armed: true,
+        };
+        fs::rename(&lock_path, &preserved_path).expect("move original lock");
+        fs::create_dir(&lock_path).expect("create replacement lock");
+
+        drop(cleanup);
+
+        assert!(
+            lock_path.is_dir(),
+            "identity-checked cleanup must not remove a replacement lock"
+        );
+        assert!(
+            preserved_path.is_dir(),
+            "the original fixture remains isolated"
+        );
+    }
+
+    #[cfg(unix)]
+    fn open_test_directory(path: &Path) -> File {
+        let descriptor = rustix::fs::open(
+            path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open test directory");
+        File::from(descriptor)
     }
 
     // Minimal mtime setter (avoids adding a dev-dep); uses std `File::set_times`.

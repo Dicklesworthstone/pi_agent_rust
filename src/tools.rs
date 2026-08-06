@@ -12,7 +12,8 @@ use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
 use crate::model::{ContentBlock, ImageContent, TextContent};
 use crate::platform::{
-    UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE, ensure_effective_mode_access,
+    EffectiveModeAccessContext, UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE,
+    ensure_effective_mode_access,
 };
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
@@ -26,7 +27,7 @@ use std::fmt::Write as _;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
@@ -234,6 +235,9 @@ pub const DEFAULT_GREP_LIMIT: usize = 100;
 
 /// Default find result limit.
 pub const DEFAULT_FIND_LIMIT: usize = 1000;
+
+/// Hard cap for complete find scans before newest-first selection.
+pub const FIND_SCAN_HARD_LIMIT: usize = 20_000;
 
 /// Default ls result limit.
 pub const DEFAULT_LS_LIMIT: usize = 500;
@@ -799,6 +803,162 @@ impl HeadTruncatingLineWriter {
     }
 }
 
+fn push_escaped_utf8_for_line_output(escaped: &mut String, text: &str) {
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            character if character.is_control() => escaped.extend(character.escape_unicode()),
+            character => escaped.push(character),
+        }
+    }
+}
+
+fn escape_bytes_for_line_output(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut escaped = String::with_capacity(bytes.len());
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(valid) => {
+                push_escaped_utf8_for_line_output(&mut escaped, valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                if valid_up_to > 0 {
+                    // SAFETY: `Utf8Error::valid_up_to` identifies a valid UTF-8 prefix.
+                    let valid = std::str::from_utf8(&remaining[..valid_up_to])
+                        .expect("valid_up_to must delimit valid UTF-8");
+                    push_escaped_utf8_for_line_output(&mut escaped, valid);
+                }
+
+                let invalid_len = error
+                    .error_len()
+                    .unwrap_or_else(|| remaining.len().saturating_sub(valid_up_to));
+                for &byte in &remaining[valid_up_to..valid_up_to + invalid_len] {
+                    escaped.push_str("\\x");
+                    escaped.push(char::from(HEX[usize::from(byte >> 4)]));
+                    escaped.push(char::from(HEX[usize::from(byte & 0x0f)]));
+                }
+                remaining = &remaining[valid_up_to + invalid_len..];
+            }
+        }
+    }
+    escaped
+}
+
+fn path_for_line_output(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        let rendered = path.to_string_lossy().replace('\\', "/");
+        return escape_bytes_for_line_output(rendered.as_bytes());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        escape_bytes_for_line_output(path.as_os_str().as_bytes())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    escape_bytes_for_line_output(path.to_string_lossy().as_bytes())
+}
+
+fn compare_paths_for_line_output(a: &Path, b: &Path) -> Ordering {
+    let a_rendered = path_for_line_output(a);
+    let b_rendered = path_for_line_output(b);
+    a_rendered
+        .to_lowercase()
+        .cmp(&b_rendered.to_lowercase())
+        .then_with(|| a_rendered.cmp(&b_rendered))
+}
+
+fn strip_ansi_sequences(bytes: &[u8]) -> Vec<u8> {
+    fn skip_csi(bytes: &[u8], mut index: usize) -> usize {
+        while index < bytes.len() {
+            let byte = bytes[index];
+            index += 1;
+            if (0x40..=0x7e).contains(&byte) {
+                break;
+            }
+        }
+        index
+    }
+
+    fn skip_string_sequence(bytes: &[u8], mut index: usize, osc: bool) -> usize {
+        while index < bytes.len() {
+            if osc && bytes[index] == 0x07 {
+                return index + 1;
+            }
+            if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'\\') {
+                return index + 2;
+            }
+            index += 1;
+        }
+        index
+    }
+
+    let mut sanitized = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            0x1b => {
+                index += 1;
+                match bytes.get(index).copied() {
+                    Some(b'[') => index = skip_csi(bytes, index + 1),
+                    Some(b']') => index = skip_string_sequence(bytes, index + 1, true),
+                    Some(b'P' | b'X' | b'^' | b'_') => {
+                        index = skip_string_sequence(bytes, index + 1, false);
+                    }
+                    Some(_) => index += 1,
+                    None => {}
+                }
+            }
+            0x9b => index = skip_csi(bytes, index + 1),
+            0x90 | 0x98 | 0x9e | 0x9f => {
+                index = skip_string_sequence(bytes, index + 1, false);
+            }
+            0x9d => index = skip_string_sequence(bytes, index + 1, true),
+            byte => {
+                sanitized.push(byte);
+                index += 1;
+            }
+        }
+    }
+    sanitized
+}
+
+fn diagnostic_for_line_output(bytes: &[u8], truncated: bool) -> String {
+    let sanitized = strip_ansi_sequences(bytes);
+    let Some(first) = sanitized
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+    else {
+        return if truncated {
+            "... [stderr truncated] ...".to_string()
+        } else {
+            String::new()
+        };
+    };
+    let last = sanitized
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .expect("a non-whitespace byte exists");
+    let mut rendered = escape_bytes_for_line_output(&sanitized[first..=last]);
+    if truncated {
+        rendered.push_str(" ... [stderr truncated] ...");
+    }
+    rendered
+}
+
+fn error_for_line_output(error: &impl std::fmt::Display) -> String {
+    diagnostic_for_line_output(error.to_string().as_bytes(), false)
+}
+
 fn utf8_prefix_len(s: &str, max_bytes: usize) -> usize {
     let mut valid_bytes = max_bytes.min(s.len());
     while valid_bytes > 0 && !s.is_char_boundary(valid_bytes) {
@@ -1294,10 +1454,32 @@ fn append_tool_output_artifact_notice(output_text: &mut String, artifact: &ToolO
 }
 
 fn append_artifact_source_line(full_text: &mut String, line: &str) {
+    // Artifact redaction refuses inputs above this size. Stop retaining bytes
+    // as soon as we cross that boundary instead of allowing a streaming grep
+    // with a caller-supplied huge limit to grow memory without bound. The one
+    // extra byte keeps the persistence path honest: it reports that the full
+    // artifact exceeded its redaction limit.
+    let capture_limit = TOOL_OUTPUT_ARTIFACT_REDACTION_MAX_BYTES_USIZE.saturating_add(1);
+    if full_text.len() >= capture_limit {
+        return;
+    }
     if !full_text.is_empty() {
         full_text.push('\n');
     }
-    full_text.push_str(line);
+    let remaining = capture_limit.saturating_sub(full_text.len());
+    if line.len() <= remaining {
+        full_text.push_str(line);
+        return;
+    }
+
+    let mut prefix_len = remaining;
+    while prefix_len > 0 && !line.is_char_boundary(prefix_len) {
+        prefix_len -= 1;
+    }
+    full_text.push_str(&line[..prefix_len]);
+    while full_text.len() <= TOOL_OUTPUT_ARTIFACT_REDACTION_MAX_BYTES_USIZE {
+        full_text.push('!');
+    }
 }
 
 fn record_tool_output_artifact_error(
@@ -1499,6 +1681,299 @@ const TOOL_OUTPUT_CACHE_MAX_ENTRY_BYTES: usize = DEFAULT_MAX_BYTES + 64 * 1024;
 const TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_FILES: usize = 2048;
 const TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES: u64 = 8 * 1024 * 1024;
 const TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES: u64 = 2 * 1024 * 1024;
+const GREP_CONTEXT_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const GREP_CONTEXT_MAX_LINES: usize = 200_000;
+const RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+#[cfg(unix)]
+fn opened_file_matches_metadata_snapshot(
+    expected: &std::fs::Metadata,
+    opened: &std::fs::Metadata,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    expected.dev() == opened.dev() && expected.ino() == opened.ino()
+}
+
+#[cfg(windows)]
+fn opened_file_matches_metadata_snapshot(
+    expected: &std::fs::Metadata,
+    opened: &std::fs::Metadata,
+) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    expected.creation_time() == opened.creation_time()
+        && expected.file_size() == opened.file_size()
+        && expected.last_write_time() == opened.last_write_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn opened_file_matches_metadata_snapshot(
+    _expected: &std::fs::Metadata,
+    _opened: &std::fs::Metadata,
+) -> bool {
+    true
+}
+
+fn open_regular_file_for_capped_read(path: &Path) -> std::io::Result<std::fs::File> {
+    // Resolve an intentional terminal symlink once, then refuse a second
+    // terminal link swap while opening the resolved target. NONBLOCK keeps a
+    // concurrent regular-file-to-FIFO swap from hanging the agent.
+    let resolved_path = std::fs::canonicalize(path)?;
+    let expected_metadata = std::fs::metadata(&resolved_path)?;
+    if !expected_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    ensure_ancestors_searchable_sync(&resolved_path)?;
+
+    #[cfg(unix)]
+    let file = {
+        let descriptor = rustix::fs::open(
+            &resolved_path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        std::fs::File::from(descriptor)
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&resolved_path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(&resolved_path)?;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    if !opened_file_matches_metadata_snapshot(&expected_metadata, &metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} changed while opening", path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{} changed to a reparse point while opening",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    ensure_effective_mode_access(
+        &metadata,
+        &resolved_path,
+        UNIX_ACCESS_READ,
+        "bounded file reading",
+    )?;
+    Ok(file)
+}
+
+fn open_regular_file_within_roots_with<F>(
+    path: &Path,
+    allowed_roots: &[PathBuf],
+    before_open: F,
+) -> std::io::Result<std::fs::File>
+where
+    F: FnOnce(),
+{
+    let lexical_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let canonical_path = strip_unc_prefix(std::fs::canonicalize(&lexical_path)?);
+    let within_allowed_root = allowed_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .map(strip_unc_prefix)
+            .is_ok_and(|canonical_root| canonical_path.starts_with(canonical_root))
+    });
+    if !within_allowed_root {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing to read outside the allowed roots: {}",
+                lexical_path.display()
+            ),
+        ));
+    }
+
+    let access_context = EffectiveModeAccessContext::current()?;
+    #[cfg(unix)]
+    {
+        ensure_ancestors_searchable_with_context_sync(&lexical_path, &access_context)?;
+        ensure_ancestors_searchable_with_context_sync(&canonical_path, &access_context)?;
+    }
+
+    let expected_metadata = std::fs::metadata(&canonical_path)?;
+    if !expected_metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", lexical_path.display()),
+        ));
+    }
+    access_context.ensure(
+        &expected_metadata,
+        &canonical_path,
+        UNIX_ACCESS_READ,
+        "scoped file reading",
+    )?;
+
+    before_open();
+
+    #[cfg(unix)]
+    let file = {
+        let descriptor = rustix::fs::open(
+            &lexical_path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        std::fs::File::from(descriptor)
+    };
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&lexical_path)?
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let file = std::fs::File::open(&lexical_path)?;
+
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || !opened_file_matches_metadata_snapshot(&expected_metadata, &opened_metadata)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("{} changed while opening", lexical_path.display()),
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        if opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} changed to a reparse point while opening",
+                    lexical_path.display()
+                ),
+            ));
+        }
+    }
+    access_context.ensure(
+        &opened_metadata,
+        &lexical_path,
+        UNIX_ACCESS_READ,
+        "scoped file reading",
+    )?;
+    Ok(file)
+}
+
+fn open_scoped_regular_file_for_read_with<F>(
+    path: &Path,
+    cwd: &Path,
+    before_open: F,
+) -> std::io::Result<std::fs::File>
+where
+    F: FnOnce(),
+{
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    open_regular_file_within_roots_with(&path, &[cwd.to_path_buf()], before_open)
+}
+
+fn read_scoped_file_capped_sync(
+    path: &Path,
+    cwd: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let file = open_scoped_regular_file_for_read_with(path, cwd, || {})?;
+    let mut contents = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(contents)
+}
+
+fn read_file_capped_within_roots_sync(
+    path: &Path,
+    allowed_roots: &[PathBuf],
+    max_bytes: u64,
+) -> std::io::Result<Vec<u8>> {
+    let file = open_regular_file_within_roots_with(path, allowed_roots, || {})?;
+    let mut contents = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(contents)
+}
+
+fn read_file_capped_sync(path: &Path, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let file = open_regular_file_for_capped_read(path)?;
+    let mut contents = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut contents)?;
+    if u64::try_from(contents.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} exceeds {max_bytes} bytes", path.display()),
+        ));
+    }
+    Ok(contents)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolCacheDependency {
@@ -1704,6 +2179,74 @@ fn stable_cache_dependency_for_path(
     (before_deps == after_deps.as_slice()).then_some(after_deps)
 }
 
+fn cache_dependencies_for_scan(
+    path: &Path,
+    cwd: &Path,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let mut dependencies = cache_dependency_for_path(path, mode)?;
+    if let Some(access) = recursive_access {
+        dependencies.extend(ignore_control_cache_dependencies(path, cwd, access)?);
+    }
+    Some(dependencies)
+}
+
+fn stable_cache_dependencies_for_scan(
+    path: &Path,
+    cwd: &Path,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+    before_deps: Option<&[ToolCacheDependency]>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let before_deps = before_deps?;
+    let after_deps = cache_dependencies_for_scan(path, cwd, mode, recursive_access)?;
+    (before_deps == after_deps.as_slice()).then_some(after_deps)
+}
+
+fn cache_dependencies_for_scoped_scan(
+    root: &ScopedScanRoot,
+    cwd_root: &ScopedScanRoot,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let io_path = root.io_path();
+    let fingerprint = match mode {
+        ToolCacheFingerprintMode::FileContent => fingerprint_file_content(&io_path)?,
+        ToolCacheFingerprintMode::DirectoryImmediate => fingerprint_directory_immediate(&io_path)?,
+        ToolCacheFingerprintMode::DirectoryRecursive => fingerprint_directory_recursive(&io_path)?,
+    };
+    let mut dependencies = vec![ToolCacheDependency {
+        path: root.logical_path().to_path_buf(),
+        fingerprint,
+    }];
+    if let Some(access) = recursive_access {
+        let cwd_io_path = cwd_root.io_path();
+        let mut controls = ignore_control_cache_dependencies(&io_path, &cwd_io_path, access)?;
+        for control in &mut controls {
+            if let Ok(relative) = control.path.strip_prefix(&io_path) {
+                control.path = root.logical_path().join(relative);
+            } else if let Ok(relative) = control.path.strip_prefix(&cwd_io_path) {
+                control.path = cwd_root.logical_path().join(relative);
+            }
+        }
+        dependencies.extend(controls);
+    }
+    Some(dependencies)
+}
+
+fn stable_cache_dependencies_for_scoped_scan(
+    root: &ScopedScanRoot,
+    cwd_root: &ScopedScanRoot,
+    mode: ToolCacheFingerprintMode,
+    recursive_access: Option<RecursiveScanAccess>,
+    before_deps: Option<&[ToolCacheDependency]>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let before_deps = before_deps?;
+    let after_deps = cache_dependencies_for_scoped_scan(root, cwd_root, mode, recursive_access)?;
+    (before_deps == after_deps.as_slice()).then_some(after_deps)
+}
+
 fn cacheable_tool_output_weight(output: &ToolOutput) -> Option<usize> {
     let mut weight = output
         .details
@@ -1745,19 +2288,135 @@ fn cache_dependency_for_path(
     }])
 }
 
+fn cache_dependency_for_open_file(
+    path: &Path,
+    file: &std::fs::File,
+) -> Option<Vec<ToolCacheDependency>> {
+    Some(vec![ToolCacheDependency {
+        path: path.to_path_buf(),
+        fingerprint: fingerprint_open_file_content(file)?,
+    }])
+}
+
+fn stable_cache_dependency_for_open_file(
+    path: &Path,
+    file: Option<&std::fs::File>,
+    before_deps: Option<&[ToolCacheDependency]>,
+) -> Option<Vec<ToolCacheDependency>> {
+    let file = file?;
+    let before_deps = before_deps?;
+    let after_deps = cache_dependency_for_open_file(path, file)?;
+    (before_deps == after_deps.as_slice()).then_some(after_deps)
+}
+
 fn fingerprint_file_content(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
+    ensure_ancestors_searchable_sync(path).ok()?;
+    let file = open_regular_file_for_capped_read(path).ok()?;
+    fingerprint_open_file_content(&file)
+}
+
+fn fingerprint_open_file_content(file: &std::fs::File) -> Option<[u8; 32]> {
+    let before = file.metadata().ok()?;
+    if !before.is_file() || before.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
         return None;
     }
-    ensure_ancestors_searchable_sync(path).ok()?;
-    ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_READ, "cache fingerprinting").ok()?;
 
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = read_open_file_capped_at(file, TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES).ok()?;
+    if u64::try_from(bytes.len()).ok()? != before.len() {
+        return None;
+    }
+    let after = file.metadata().ok()?;
+    if !cache_fingerprint_metadata_stable(&before, &after) {
+        return None;
+    }
+
     let mut hasher = sha2::Sha256::new();
-    update_fingerprint_metadata(&mut hasher, Path::new(""), &metadata);
+    update_fingerprint_metadata(&mut hasher, Path::new(""), &before);
     hasher.update(sha2::Sha256::digest(&bytes));
     Some(hasher.finalize().into())
+}
+
+fn cache_fingerprint_metadata_stable(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> bool {
+    opened_file_matches_metadata_snapshot(before, after)
+        && before.is_file() == after.is_file()
+        && before.is_dir() == after.is_dir()
+        && before.file_type().is_symlink() == after.file_type().is_symlink()
+        && before.len() == after.len()
+        && before.modified().ok() == after.modified().ok()
+}
+
+fn read_open_file_capped_at(file: &std::fs::File, max_bytes: u64) -> std::io::Result<Vec<u8>> {
+    let max_len = usize::try_from(max_bytes)
+        .map_err(|_| std::io::Error::other("cache fingerprint limit exceeds usize"))?;
+    let read_limit = max_len
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("cache fingerprint limit overflow"))?;
+    let initial_capacity = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0)
+        .min(read_limit);
+    let mut contents = Vec::with_capacity(initial_capacity);
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut offset = 0_u64;
+
+    while contents.len() < read_limit {
+        let remaining = read_limit - contents.len();
+        let chunk_len = remaining.min(buffer.len());
+        let read = loop {
+            match positioned_file_read(file, &mut buffer[..chunk_len], offset) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => break result?,
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        contents.extend_from_slice(&buffer[..read]);
+        offset = offset
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| std::io::Error::other("cache fingerprint offset overflow"))?;
+    }
+
+    if contents.len() > max_len {
+        return Err(std::io::Error::other(
+            "file exceeds cache fingerprint limit",
+        ));
+    }
+    Ok(contents)
+}
+
+#[cfg(unix)]
+fn positioned_file_read(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buffer, offset)
+}
+
+#[cfg(windows)]
+fn positioned_file_read(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn positioned_file_read(
+    file: &std::fs::File,
+    buffer: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut cloned = file.try_clone()?;
+    std::io::Seek::seek(&mut cloned, std::io::SeekFrom::Start(offset))?;
+    cloned.read(buffer)
 }
 
 fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
@@ -1879,7 +2538,8 @@ fn fingerprint_tree(
             if budget.bytes > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES {
                 return None;
             }
-            let bytes = std::fs::read(&entry_path).ok()?;
+            let bytes =
+                read_file_capped_sync(&entry_path, TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES).ok()?;
             hasher.update(sha2::Sha256::digest(&bytes));
         }
     }
@@ -2093,11 +2753,332 @@ fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
     if !canonical_path.starts_with(&canonical_cwd) {
         return Err(Error::validation(format!(
             "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
-            canonical_path.display(),
-            canonical_cwd.display()
+            path_for_line_output(&canonical_path),
+            path_for_line_output(&canonical_cwd)
         )));
     }
     Ok(canonical_path)
+}
+
+struct ScopedScanRoot {
+    logical_path: PathBuf,
+    #[cfg(unix)]
+    handle: std::fs::File,
+    #[cfg(windows)]
+    _component_guards: Vec<std::fs::File>,
+}
+
+impl ScopedScanRoot {
+    fn logical_path(&self) -> &Path {
+        &self.logical_path
+    }
+
+    #[cfg(unix)]
+    fn io_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+
+        let descriptor = self.handle.as_raw_fd();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let prefix = "/proc/self/fd";
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let prefix = "/dev/fd";
+        PathBuf::from(prefix).join(descriptor.to_string()).join(".")
+    }
+
+    #[cfg(windows)]
+    fn io_path(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    #[cfg(unix)]
+    fn child_operand(&self) -> PathBuf {
+        PathBuf::from(".")
+    }
+
+    #[cfg(windows)]
+    fn child_operand(&self) -> PathBuf {
+        PathBuf::from(".")
+    }
+
+    /// Path by which a child can access this root after its handle is installed
+    /// as stdin. Scanner children run with their pinned scan root as cwd, so
+    /// stdin remains available for the independently pinned workspace root.
+    #[cfg(unix)]
+    fn inherited_child_operand(&self) -> PathBuf {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let path = "/proc/self/fd/0";
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let path = "/dev/fd/0";
+        PathBuf::from(path).join(".")
+    }
+
+    #[cfg(windows)]
+    fn inherited_child_operand(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    #[cfg(unix)]
+    fn child_stdin(&self) -> std::io::Result<Stdio> {
+        Ok(Stdio::from(self.handle.try_clone()?))
+    }
+
+    #[cfg(windows)]
+    fn child_stdin(&self) -> std::io::Result<Stdio> {
+        Ok(Stdio::null())
+    }
+
+    fn map_child_output(&self, child_path: &Path) -> std::io::Result<ScopedScanOutputPath> {
+        #[cfg(unix)]
+        let relative = if child_path.is_absolute() {
+            child_path
+                .strip_prefix(self.io_path())
+                .or_else(|_| child_path.strip_prefix(&self.logical_path))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "scanner returned a path outside its pinned root",
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            child_path.to_path_buf()
+        };
+
+        #[cfg(windows)]
+        let relative = if child_path.is_absolute() {
+            strip_unc_prefix(child_path.to_path_buf())
+                .strip_prefix(strip_unc_prefix(self.logical_path.clone()))
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "scanner returned a path outside its pinned root",
+                    )
+                })?
+                .to_path_buf()
+        } else {
+            child_path.to_path_buf()
+        };
+
+        let relative = normalize_scanner_relative_path(&relative)?;
+        Ok(ScopedScanOutputPath {
+            read_path: self.io_path().join(&relative),
+            logical_path: self.logical_path.join(&relative),
+            relative,
+        })
+    }
+}
+
+struct ScopedScanOutputPath {
+    read_path: PathBuf,
+    logical_path: PathBuf,
+    relative: PathBuf,
+}
+
+fn normalize_scanner_relative_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(name) => normalized.push(name),
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "scanner returned a non-relative path component",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+async fn open_scoped_scan_root(
+    path: &Path,
+    cwd: &Path,
+    allow_file: bool,
+    after_open: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> std::io::Result<ScopedScanRoot> {
+    let path = path.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    asupersync::runtime::spawn_blocking_io(move || {
+        open_scoped_scan_root_sync(&path, &cwd, allow_file, || {
+            if let Some(after_open) = after_open {
+                after_open();
+            }
+        })
+    })
+    .await
+}
+
+#[cfg(unix)]
+fn open_scoped_scan_root_sync<F>(
+    path: &Path,
+    cwd: &Path,
+    allow_file: bool,
+    after_open: F,
+) -> std::io::Result<ScopedScanRoot>
+where
+    F: FnOnce(),
+{
+    let canonical_cwd = std::fs::canonicalize(cwd)?;
+    let canonical_path = std::fs::canonicalize(path)?;
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scan root escaped the working directory before it could be pinned",
+        ));
+    }
+    ensure_ancestors_searchable_sync(&canonical_path)?;
+    let expected = std::fs::symlink_metadata(&canonical_path)?;
+    if expected.file_type().is_symlink() || !(expected.is_dir() || allow_file && expected.is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "scan root is not an allowed directory or regular file",
+        ));
+    }
+
+    let mut flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::CLOEXEC
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK;
+    if expected.is_dir() {
+        flags |= rustix::fs::OFlags::DIRECTORY;
+    }
+    let descriptor = rustix::fs::open(&canonical_path, flags, rustix::fs::Mode::empty())
+        .map_err(std::io::Error::from)?;
+    let handle = std::fs::File::from(descriptor);
+    let opened = handle.metadata()?;
+    if !opened_file_matches_metadata_snapshot(&expected, &opened)
+        || !(opened.is_dir() || allow_file && opened.is_file())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scan root changed while it was being pinned",
+        ));
+    }
+    let required_access = if opened.is_dir() {
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+    } else {
+        UNIX_ACCESS_READ
+    };
+    ensure_effective_mode_access(&opened, &canonical_path, required_access, "scoped scanning")?;
+    after_open();
+    Ok(ScopedScanRoot {
+        logical_path: canonical_path,
+        handle,
+    })
+}
+
+#[cfg(windows)]
+fn open_scoped_scan_root_sync<F>(
+    path: &Path,
+    cwd: &Path,
+    allow_file: bool,
+    after_open: F,
+) -> std::io::Result<ScopedScanRoot>
+where
+    F: FnOnce(),
+{
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::path::Component;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let canonical_cwd = strip_unc_prefix(std::fs::canonicalize(cwd)?);
+    let canonical_path = strip_unc_prefix(std::fs::canonicalize(path)?);
+    if !canonical_path.starts_with(&canonical_cwd) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "scan root escaped the working directory before it could be pinned",
+        ));
+    }
+
+    let components = canonical_path.components().collect::<Vec<_>>();
+    let mut current = PathBuf::new();
+    let mut guards = Vec::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "scan roots must not contain parent components",
+                ));
+            }
+            Component::Normal(name) => current.push(name),
+        }
+
+        let is_final = index + 1 == components.len();
+        let expected = std::fs::symlink_metadata(&current)?;
+        let expected_type_allowed = if is_final {
+            expected.is_dir() || allow_file && expected.is_file()
+        } else {
+            expected.is_dir()
+        };
+        if !expected_type_allowed || expected.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "scan root traverses a non-directory or Windows reparse point",
+            ));
+        }
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&current)?;
+        let opened = handle.metadata()?;
+        if opened.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || opened.creation_time() != expected.creation_time()
+            || opened.is_dir() != expected.is_dir()
+            || opened.is_file() != expected.is_file()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "scan path component changed while it was being pinned",
+            ));
+        }
+        guards.push(handle);
+    }
+    if guards.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "scan root did not contain an openable path component",
+        ));
+    }
+    after_open();
+    Ok(ScopedScanRoot {
+        logical_path: canonical_path,
+        _component_guards: guards,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_scoped_scan_root_sync<F>(
+    _path: &Path,
+    _cwd: &Path,
+    _allow_file: bool,
+    _after_open: F,
+) -> std::io::Result<ScopedScanRoot>
+where
+    F: FnOnce(),
+{
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "scoped scanner root pinning is unsupported on this platform",
+    ))
 }
 
 async fn std_metadata_async(path: &Path) -> std::io::Result<std::fs::Metadata> {
@@ -2105,7 +3086,10 @@ async fn std_metadata_async(path: &Path) -> std::io::Result<std::fs::Metadata> {
     asupersync::runtime::spawn_blocking_io(move || std::fs::metadata(path)).await
 }
 
-fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
+fn ensure_ancestors_searchable_with_context_sync(
+    path: &Path,
+    access_context: &EffectiveModeAccessContext,
+) -> std::io::Result<()> {
     for directory in path.ancestors().skip(1) {
         if directory.as_os_str().is_empty() {
             continue;
@@ -2117,7 +3101,7 @@ fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
                 format!("Not a directory: {}", directory.display()),
             ));
         }
-        ensure_effective_mode_access(
+        access_context.ensure(
             &metadata,
             directory,
             UNIX_ACCESS_SEARCH,
@@ -2125,6 +3109,671 @@ fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
+    let access_context = EffectiveModeAccessContext::current()?;
+    ensure_ancestors_searchable_with_context_sync(path, &access_context)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecursiveScanAccess {
+    DirectoriesOnly,
+    ReadableFiles,
+}
+
+impl RecursiveScanAccess {
+    const fn custom_ignore_filename(self) -> &'static str {
+        match self {
+            Self::DirectoriesOnly => ".fdignore",
+            Self::ReadableFiles => ".rgignore",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RecursiveScanDenial {
+    path: PathBuf,
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+fn ensure_ignore_control_readable_sync(
+    path: &Path,
+    access_context: &EffectiveModeAccessContext,
+    operation: &str,
+) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    }
+    ensure_ancestors_searchable_with_context_sync(path, access_context)?;
+    let target = std::fs::canonicalize(path)?;
+    ensure_ancestors_searchable_with_context_sync(&target, access_context)?;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("ignore control is not a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.len() > RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "ignore control {} exceeds {} bytes",
+                path.display(),
+                RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES
+            ),
+        ));
+    }
+    access_context.ensure(&metadata, path, UNIX_ACCESS_READ, operation)
+}
+
+#[derive(Debug, Clone)]
+struct GitGlobalConfigLocations {
+    home_dir: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+}
+
+impl GitGlobalConfigLocations {
+    fn current() -> Self {
+        #[allow(deprecated)]
+        let home_dir = std::env::home_dir();
+        let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| home_dir.as_ref().map(|home| home.join(".config")));
+        Self {
+            home_dir,
+            xdg_config_home,
+        }
+    }
+}
+
+fn fd_global_ignore_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        // fd uses etcetera's Windows base strategy, which resolves to the
+        // roaming application-data directory rather than XDG_CONFIG_HOME.
+        dirs::config_dir().map(|root| root.join("fd").join("ignore"))
+    }
+
+    #[cfg(not(windows))]
+    {
+        // fd deliberately uses the XDG strategy on both Unix and macOS. The
+        // `dirs` crate instead returns `~/Library/Application Support` on
+        // macOS, so using `dirs::config_dir` here would validate and cache a
+        // different file from the one the child process actually consumes.
+        fd_global_ignore_path_from_locations(&GitGlobalConfigLocations::current())
+    }
+}
+
+#[cfg(not(windows))]
+fn fd_global_ignore_path_from_locations(locations: &GitGlobalConfigLocations) -> Option<PathBuf> {
+    locations
+        .xdg_config_home
+        .as_ref()
+        .map(|root| root.join("fd").join("ignore"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitGlobalIgnoreControls {
+    consumed_config_paths: Vec<PathBuf>,
+    ignore_path: Option<PathBuf>,
+}
+
+// Keep in-process config discovery bounded and aligned with the largest file
+// the tool-output cache can fingerprint. The external ignore crate reads these
+// configs without a cap, but doing that in the long-lived agent process would
+// let an oversized user-controlled config exhaust memory before rg/fd starts.
+const GIT_GLOBAL_CONFIG_MAX_BYTES: u64 = TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES;
+const GIT_GLOBAL_IGNORE_PATH_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+fn parse_gitconfig_excludes_path(
+    data: &[u8],
+    home_dir: Option<&Path>,
+) -> std::io::Result<Option<PathBuf>> {
+    static RE: OnceLock<regex::bytes::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::bytes::Regex::new(r#"(?im-u)^\s*excludesfile\s*=\s*"?\s*(\S+?)\s*"?\s*$"#)
+            .expect("valid git excludesFile regex")
+    });
+    let Some(candidate) = re
+        .captures(data)
+        .and_then(|captures| captures.get(1))
+        .and_then(|capture| std::str::from_utf8(capture.as_bytes()).ok())
+    else {
+        return Ok(None);
+    };
+    let home = home_dir.map(Path::to_string_lossy);
+    // ignore 0.4.25 deliberately replaces every `~`, not only a leading one.
+    // Preserve that behavior while bounding its potential allocation growth.
+    let tilde_count = candidate.bytes().filter(|byte| *byte == b'~').count();
+    let expanded_len = home.as_ref().map_or(Some(candidate.len()), |home| {
+        candidate
+            .len()
+            .checked_sub(tilde_count)?
+            .checked_add(tilde_count.checked_mul(home.len())?)
+    });
+    if expanded_len.is_none_or(|len| len > GIT_GLOBAL_IGNORE_PATH_MAX_BYTES) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "expanded git global ignore path exceeds {GIT_GLOBAL_IGNORE_PATH_MAX_BYTES} bytes"
+            ),
+        ));
+    }
+    let expanded = home.map_or_else(
+        || candidate.to_string(),
+        |home| candidate.replace('~', &home),
+    );
+    Ok(Some(PathBuf::from(expanded)))
+}
+
+fn read_checked_ignore_control_if_present(
+    path: &Path,
+    access_context: &EffectiveModeAccessContext,
+    operation: &str,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::symlink_metadata(path) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
+        Ok(_) => {}
+    }
+    ensure_ignore_control_readable_sync(path, access_context, operation)?;
+    read_file_capped_sync(path, GIT_GLOBAL_CONFIG_MAX_BYTES).map(Some)
+}
+
+fn resolve_git_global_ignore_controls(
+    locations: &GitGlobalConfigLocations,
+    access_context: &EffectiveModeAccessContext,
+    operation: &str,
+) -> std::io::Result<GitGlobalIgnoreControls> {
+    let mut consumed_config_paths = Vec::with_capacity(2);
+
+    if let Some(home_dir) = &locations.home_dir {
+        let home_config = home_dir.join(".gitconfig");
+        consumed_config_paths.push(home_config.clone());
+        if let Some(contents) =
+            read_checked_ignore_control_if_present(&home_config, access_context, operation)?
+            && let Some(ignore_path) =
+                parse_gitconfig_excludes_path(&contents, locations.home_dir.as_deref())?
+        {
+            return Ok(GitGlobalIgnoreControls {
+                consumed_config_paths,
+                ignore_path: Some(ignore_path),
+            });
+        }
+    }
+
+    if let Some(xdg_config_home) = &locations.xdg_config_home {
+        let xdg_config = xdg_config_home.join("git").join("config");
+        consumed_config_paths.push(xdg_config.clone());
+        if let Some(contents) =
+            read_checked_ignore_control_if_present(&xdg_config, access_context, operation)?
+            && let Some(ignore_path) =
+                parse_gitconfig_excludes_path(&contents, locations.home_dir.as_deref())?
+        {
+            return Ok(GitGlobalIgnoreControls {
+                consumed_config_paths,
+                ignore_path: Some(ignore_path),
+            });
+        }
+    }
+
+    Ok(GitGlobalIgnoreControls {
+        consumed_config_paths,
+        ignore_path: locations
+            .xdg_config_home
+            .as_ref()
+            .map(|root| root.join("git").join("ignore")),
+    })
+}
+
+fn ignore_control_path_from_command_cwd(path: PathBuf, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn ensure_directory_ignore_controls_access_sync(
+    directory: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    access_context: &EffectiveModeAccessContext,
+) -> std::io::Result<()> {
+    for filename in [".gitignore", ".ignore", access.custom_ignore_filename()] {
+        ensure_ignore_control_readable_sync(&directory.join(filename), access_context, operation)?;
+    }
+    // With --no-require-git, rg/fd probe this conventional path even outside
+    // a repository. A linked worktree uses a regular `.git` file, in which
+    // case `.git/info/exclude` is simply absent (ENOTDIR), not a scan error.
+    ensure_ignore_control_readable_sync(
+        &directory.join(".git").join("info").join("exclude"),
+        access_context,
+        operation,
+    )
+}
+
+fn ensure_recursive_ignore_controls_access_sync(
+    path: &Path,
+    cwd: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    access_context: &EffectiveModeAccessContext,
+) -> std::io::Result<Option<PathBuf>> {
+    let mut directory = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(current) = directory {
+        ensure_directory_ignore_controls_access_sync(current, operation, access, access_context)?;
+        directory = current.parent();
+    }
+
+    let global_controls = resolve_git_global_ignore_controls(
+        &GitGlobalConfigLocations::current(),
+        access_context,
+        operation,
+    )?;
+    let global_ignore = global_controls
+        .ignore_path
+        .map(|path| ignore_control_path_from_command_cwd(path, cwd));
+    if let Some(global_ignore) = global_ignore.as_deref() {
+        ensure_ignore_control_readable_sync(global_ignore, access_context, operation)?;
+    }
+    if access == RecursiveScanAccess::DirectoriesOnly
+        && let Some(global_ignore) = fd_global_ignore_path()
+    {
+        ensure_ignore_control_readable_sync(&global_ignore, access_context, operation)?;
+    }
+    Ok(global_ignore)
+}
+
+fn recursive_scan_ignore_control_paths(
+    path: &Path,
+    cwd: &Path,
+    access: RecursiveScanAccess,
+) -> Vec<PathBuf> {
+    let mut paths = std::collections::BTreeSet::new();
+    let mut directory = if path.is_dir() {
+        Some(path)
+    } else {
+        path.parent()
+    };
+    while let Some(current) = directory {
+        for filename in [".gitignore", ".ignore", access.custom_ignore_filename()] {
+            paths.insert(current.join(filename));
+        }
+        paths.insert(current.join(".git").join("info").join("exclude"));
+        directory = current.parent();
+    }
+
+    // These are passed explicitly to rg/fd. Keep the lexical cwd spelling as
+    // a dependency too: it can be a symlink even though `path` is canonical.
+    paths.insert(cwd.join(".gitignore"));
+    paths.insert(path.join(".gitignore"));
+
+    if access == RecursiveScanAccess::DirectoriesOnly
+        && let Some(global_ignore) = fd_global_ignore_path()
+    {
+        paths.insert(global_ignore);
+    }
+
+    paths.into_iter().collect()
+}
+
+fn ignore_control_cache_dependency(
+    path: PathBuf,
+    access_context: &EffectiveModeAccessContext,
+    budget: &mut FingerprintBudget,
+) -> Option<ToolCacheDependency> {
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_FILES {
+        return None;
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    match std::fs::symlink_metadata(&path) {
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            hasher.update(b"missing");
+        }
+        Err(_) => return None,
+        Ok(_) => {
+            ensure_ignore_control_readable_sync(
+                &path,
+                access_context,
+                "cache ignore-control reading",
+            )
+            .ok()?;
+            let metadata = std::fs::metadata(&path).ok()?;
+            if !metadata.is_file() || metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
+                return None;
+            }
+            budget.bytes = budget.bytes.saturating_add(metadata.len());
+            if budget.bytes > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES {
+                return None;
+            }
+            let bytes = read_file_capped_sync(&path, TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES).ok()?;
+            hasher.update(b"file");
+            update_fingerprint_metadata(&mut hasher, Path::new(""), &metadata);
+            hasher.update(sha2::Sha256::digest(&bytes));
+        }
+    }
+
+    Some(ToolCacheDependency {
+        path,
+        fingerprint: hasher.finalize().into(),
+    })
+}
+
+fn ignore_control_cache_dependencies(
+    path: &Path,
+    cwd: &Path,
+    access: RecursiveScanAccess,
+) -> Option<Vec<ToolCacheDependency>> {
+    let access_context = EffectiveModeAccessContext::current().ok()?;
+    let mut budget = FingerprintBudget::default();
+    let mut control_paths = recursive_scan_ignore_control_paths(path, cwd, access)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let global_controls = resolve_git_global_ignore_controls(
+        &GitGlobalConfigLocations::current(),
+        &access_context,
+        "cache global-git-config reading",
+    )
+    .ok()?;
+    control_paths.extend(global_controls.consumed_config_paths);
+    if let Some(global_ignore) = global_controls.ignore_path {
+        control_paths.insert(ignore_control_path_from_command_cwd(global_ignore, cwd));
+    }
+    control_paths
+        .into_iter()
+        .map(|path| ignore_control_cache_dependency(path, &access_context, &mut budget))
+        .collect()
+}
+
+fn recursive_scan_walk_builder(
+    path: &Path,
+    cwd: &Path,
+    access: RecursiveScanAccess,
+    glob: Option<&str>,
+    global_git_ignore: Option<&Path>,
+) -> std::io::Result<ignore::WalkBuilder> {
+    let mut builder = ignore::WalkBuilder::new(path);
+    builder
+        .current_dir(cwd)
+        .hidden(false)
+        .parents(true)
+        .ignore(true)
+        .git_ignore(true)
+        // `ignore` resolves a relative core.excludesFile against the process
+        // cwd before `current_dir` takes effect. External rg/fd run in `cwd`,
+        // so load the already mode-checked, cwd-resolved file explicitly.
+        .git_global(false)
+        .git_exclude(true)
+        .require_git(false)
+        .follow_links(false);
+    builder.add_custom_ignore_filename(access.custom_ignore_filename());
+    if let Some(global_ignore) = global_git_ignore
+        && global_ignore.is_file()
+        && let Some(err) = builder.add_ignore(global_ignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load git global ignore file {}: {err}",
+            global_ignore.display()
+        )));
+    }
+    if access == RecursiveScanAccess::DirectoriesOnly
+        && let Some(global_ignore) = fd_global_ignore_path()
+        && global_ignore.is_file()
+        && let Some(err) = builder.add_ignore(&global_ignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load fd global ignore file {}: {err}",
+            global_ignore.display()
+        )));
+    }
+
+    // The external commands pass these two files via --ignore-file in
+    // addition to native discovery. Explicit ignore files are interpreted
+    // relative to the command cwd, which can exclude a different (larger)
+    // surface than the same file discovered natively below `path`.
+    let workspace_gitignore = cwd.join(".gitignore");
+    if workspace_gitignore.exists()
+        && let Some(err) = builder.add_ignore(&workspace_gitignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load explicit ignore file {}: {err}",
+            workspace_gitignore.display()
+        )));
+    }
+    let root_gitignore = path.join(".gitignore");
+    if root_gitignore != workspace_gitignore
+        && root_gitignore.exists()
+        && let Some(err) = builder.add_ignore(&root_gitignore)
+    {
+        return Err(std::io::Error::other(format!(
+            "failed to load explicit ignore file {}: {err}",
+            root_gitignore.display()
+        )));
+    }
+    if let Some(glob) = glob {
+        // rg evaluates --glob relative to its process cwd, even when the
+        // explicit search root is absolute. Rooting this at `path` reverses
+        // the result for slash-containing globs (for example `src/a/*.rs`).
+        let mut overrides = ignore::overrides::OverrideBuilder::new(cwd);
+        overrides.add(glob).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?;
+        builder.overrides(overrides.build().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?);
+    }
+    Ok(builder)
+}
+
+/// Validate every visible filesystem object a recursive search could visit.
+///
+/// The `ignore` walker mirrors the external scanners' hidden-file, ignore-file,
+/// parent-ignore, and no-symlink-following behavior. A grep glob is installed as
+/// an override so files excluded by that glob do not cause false denials. Find
+/// validates directories plus the ignore-control files that fd must read;
+/// enumerating any other regular-file name does not require content access.
+/// The entire visible tree is checked:
+/// an output limit cannot prove which candidates an external scanner will open
+/// before it reaches that limit.
+fn ensure_recursive_scan_access_sync(
+    path: &Path,
+    cwd: &Path,
+    operation: &str,
+    access: RecursiveScanAccess,
+    glob: Option<&str>,
+) -> std::io::Result<()> {
+    let access_context = EffectiveModeAccessContext::current()?;
+    ensure_ancestors_searchable_with_context_sync(path, &access_context)?;
+    let global_git_ignore = ensure_recursive_ignore_controls_access_sync(
+        path,
+        cwd,
+        operation,
+        access,
+        &access_context,
+    )?;
+
+    let root_metadata = std::fs::metadata(path)?;
+    if root_metadata.is_file() {
+        return if access == RecursiveScanAccess::ReadableFiles {
+            access_context.ensure(&root_metadata, path, UNIX_ACCESS_READ, operation)
+        } else {
+            Ok(())
+        };
+    }
+    if !root_metadata.is_dir() {
+        return Ok(());
+    }
+    access_context.ensure(
+        &root_metadata,
+        path,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        operation,
+    )?;
+
+    let denied = std::sync::Arc::new(std::sync::Mutex::new(None::<RecursiveScanDenial>));
+    let denied_from_filter = std::sync::Arc::clone(&denied);
+    let operation_owned = operation.to_string();
+
+    let mut builder =
+        recursive_scan_walk_builder(path, cwd, access, glob, global_git_ignore.as_deref())?;
+
+    builder.filter_entry(move |entry| {
+        if entry.path_is_symlink() {
+            return true;
+        }
+        let Some(file_type) = entry.file_type() else {
+            return true;
+        };
+        let required = if file_type.is_dir() {
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+        } else if file_type.is_file() && access == RecursiveScanAccess::ReadableFiles {
+            UNIX_ACCESS_READ
+        } else {
+            return true;
+        };
+
+        let result = std::fs::symlink_metadata(entry.path()).and_then(|metadata| {
+            access_context
+                .ensure(&metadata, entry.path(), required, &operation_owned)
+                .and_then(|()| {
+                    if file_type.is_dir() {
+                        // Ignore controls are loaded before the walker yields
+                        // their directory contents. Validate them here so a
+                        // positive rg glob cannot hide a consumed control file
+                        // from the permission filter.
+                        ensure_directory_ignore_controls_access_sync(
+                            entry.path(),
+                            &operation_owned,
+                            access,
+                            &access_context,
+                        )
+                    } else {
+                        Ok(())
+                    }
+                })
+        });
+        if let Err(err) = result {
+            let mut slot = denied_from_filter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if slot.is_none() {
+                *slot = Some(RecursiveScanDenial {
+                    path: entry.path().to_path_buf(),
+                    kind: err.kind(),
+                    message: err.to_string(),
+                });
+            }
+            drop(slot);
+            return false;
+        }
+        true
+    });
+
+    finish_recursive_scan_access_walk(builder.build(), denied.as_ref(), operation)
+}
+
+fn finish_recursive_scan_access_walk(
+    mut walker: ignore::Walk,
+    denied: &std::sync::Mutex<Option<RecursiveScanDenial>>,
+    operation: &str,
+) -> std::io::Result<()> {
+    loop {
+        let next = walker.next();
+        let denial = denied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(denial) = denial {
+            tracing::debug!(
+                denied_path = %denial.path.display(),
+                operation,
+                error = %denial.message,
+                "recursive scan denied a descendant"
+            );
+            return Err(std::io::Error::new(
+                denial.kind,
+                format!("{}: {}", denial.path.display(), denial.message),
+            ));
+        }
+
+        match next {
+            None => break,
+            Some(Ok(entry)) => {
+                if let Some(err) = entry.error()
+                    && err
+                        .io_error()
+                        .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::PermissionDenied)
+                {
+                    tracing::debug!(
+                        denied_path = %entry.path().display(),
+                        operation,
+                        error = %err,
+                        "recursive scan could not read an ignore control file"
+                    );
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("{}: {err}", entry.path().display()),
+                    ));
+                }
+            }
+            Some(Err(err)) => {
+                let kind = err
+                    .io_error()
+                    .map_or(std::io::ErrorKind::Other, std::io::Error::kind);
+                tracing::debug!(operation, error = %err, "recursive scan walk failed");
+                return Err(std::io::Error::new(kind, err.to_string()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn ensure_recursive_scan_access(
+    path: &Path,
+    cwd: &Path,
+    operation: &'static str,
+    access: RecursiveScanAccess,
+    glob: Option<String>,
+) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    let cwd = cwd.to_path_buf();
+    asupersync::runtime::spawn_blocking_io(move || {
+        ensure_recursive_scan_access_sync(&path, &cwd, operation, access, glob.as_deref())
+    })
+    .await
 }
 
 /// Require directory-search access on every existing ancestor of `path`.
@@ -2136,24 +3785,9 @@ fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
 async fn ensure_ancestors_searchable(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        for directory in path.ancestors().skip(1) {
-            if directory.as_os_str().is_empty() {
-                continue;
-            }
-            let metadata = std_metadata_async(directory).await?;
-            if !metadata.is_dir() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotADirectory,
-                    format!("Not a directory: {}", directory.display()),
-                ));
-            }
-            ensure_effective_mode_access(
-                &metadata,
-                directory,
-                UNIX_ACCESS_SEARCH,
-                "directory traversal",
-            )?;
-        }
+        let path = path.to_path_buf();
+        asupersync::runtime::spawn_blocking_io(move || ensure_ancestors_searchable_sync(&path))
+            .await?;
     }
 
     #[cfg(not(unix))]
@@ -2164,12 +3798,41 @@ async fn ensure_ancestors_searchable(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Require write-and-search access on the nearest existing parent directory.
+/// Preserve traversal checks for both the user-supplied spelling and the
+/// canonical path used for scope enforcement. Canonicalization otherwise
+/// erases a mode-denied lexical parent of a terminal symlink under UID 0.
+async fn ensure_scan_path_ancestors_searchable(
+    lexical_path: &Path,
+    canonical_path: &Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let lexical_path = lexical_path.to_path_buf();
+        let canonical_path = canonical_path.to_path_buf();
+        asupersync::runtime::spawn_blocking_io(move || {
+            let access_context = EffectiveModeAccessContext::current()?;
+            ensure_ancestors_searchable_with_context_sync(&lexical_path, &access_context)?;
+            ensure_ancestors_searchable_with_context_sync(&canonical_path, &access_context)
+        })
+        .await?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (lexical_path, canonical_path);
+    }
+
+    Ok(())
+}
+
+/// Require read, write, and search access on the nearest existing parent directory.
 ///
 /// This check happens before `create_dir_all`, preventing a privileged process
 /// from creating missing descendants beneath an explicitly non-writable
 /// ancestor. Newly-created parents are covered by their normal creation mode;
-/// the eventual create/rename syscall is still the final authority.
+/// read access is required because the durable atomic-write path opens and
+/// synchronizes the parent directory after rename. The eventual create/rename
+/// syscall is still the final authority.
 async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -2186,8 +3849,8 @@ async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
                     ensure_effective_mode_access(
                         &metadata,
                         directory,
-                        UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
-                        "file creation",
+                        UNIX_ACCESS_READ | UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
+                        "durable file creation",
                     )?;
                     return ensure_ancestors_searchable(directory).await;
                 }
@@ -2349,7 +4012,7 @@ fn tolerate_fsync_refusal(
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, any(target_os = "espidf", target_os = "redox")))]
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -2372,6 +4035,434 @@ fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
+}
+
+fn set_atomic_replacement_permissions(
+    temp_file: &tempfile::NamedTempFile,
+    original_permissions: Option<std::fs::Permissions>,
+) -> std::io::Result<()> {
+    if let Some(permissions) = original_permissions {
+        temp_file.as_file().set_permissions(permissions)?;
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            temp_file
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AtomicContentExpectation {
+    len: u64,
+    sha256: [u8; 32],
+}
+
+impl AtomicContentExpectation {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            len: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: sha2::Sha256::digest(bytes).into(),
+        }
+    }
+}
+
+fn ensure_atomic_source_unchanged(
+    mut source: std::fs::File,
+    expectation: AtomicContentExpectation,
+) -> std::io::Result<()> {
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() != expectation.len {
+        return Err(std::io::Error::other(
+            "file changed since it was read; re-read it and retry the edit",
+        ));
+    }
+
+    let mut hasher = sha2::Sha256::new();
+    let mut total = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        if total > expectation.len {
+            return Err(std::io::Error::other(
+                "file changed since it was read; re-read it and retry the edit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    let actual_sha256: [u8; 32] = hasher.finalize().into();
+    if total != expectation.len || actual_sha256 != expectation.sha256 {
+        return Err(std::io::Error::other(
+            "file changed since it was read; re-read it and retry the edit",
+        ));
+    }
+    Ok(())
+}
+
+// Keep the descriptor-pinned validation, write, rename, durability, and
+// identity-checked cleanup sequence together: splitting this security-critical
+// transaction across helpers would make its ordering invariants harder to audit.
+#[allow(clippy::too_many_lines)]
+fn atomic_replace_file_with<F>(
+    target: &Path,
+    cwd: &Path,
+    contents: &[u8],
+    expected_source: Option<AtomicContentExpectation>,
+    before_persist: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(),
+{
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let canonical_cwd = std::fs::canonicalize(cwd)?;
+        let canonical_parent = std::fs::canonicalize(parent)?;
+        if !canonical_parent.starts_with(&canonical_cwd) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "atomic replacement parent escaped the working directory: {}",
+                    parent.display()
+                ),
+            ));
+        }
+
+        let access_context = EffectiveModeAccessContext::current()?;
+        ensure_ancestors_searchable_with_context_sync(parent, &access_context)?;
+        ensure_ancestors_searchable_with_context_sync(&canonical_parent, &access_context)?;
+        let expected_parent_metadata = std::fs::metadata(&canonical_parent)?;
+        if !expected_parent_metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", parent.display()),
+            ));
+        }
+        access_context.ensure(
+            &expected_parent_metadata,
+            &canonical_parent,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
+            "atomic file replacement",
+        )?;
+
+        let parent_descriptor = rustix::fs::open(
+            parent,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let parent_file = std::fs::File::from(parent_descriptor);
+        let opened_parent_metadata = parent_file.metadata()?;
+        if !opened_file_matches_metadata_snapshot(
+            &expected_parent_metadata,
+            &opened_parent_metadata,
+        ) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} changed while opening", parent.display()),
+            ));
+        }
+        access_context.ensure(
+            &opened_parent_metadata,
+            parent,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
+            "atomic file replacement",
+        )?;
+
+        let target_name = target
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("replacement target has no basename"))?;
+        let expected_target_identity = match rustix::fs::statat(
+            &parent_file,
+            target_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(metadata)
+                if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                    == rustix::fs::FileType::RegularFile =>
+            {
+                Some((metadata.st_dev, metadata.st_ino, metadata.st_mode))
+            }
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} is not a regular file", target.display()),
+                ));
+            }
+            Err(err) if err == rustix::io::Errno::NOENT => None,
+            Err(err) => return Err(std::io::Error::from(err)),
+        };
+        let original_permissions = expected_target_identity.map(|(_, _, mode)| {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::Permissions::from_mode(mode)
+        });
+
+        // The pathname stored by `NamedTempFile` is not descriptor-relative.
+        // Disable its Drop cleanup from construction so a concurrent parent
+        // rename cannot redirect cleanup into an attacker-controlled directory.
+        // Errors below clean up only after re-validating the entry through the
+        // pinned parent descriptor.
+        let mut temp_file = tempfile::Builder::new()
+            .disable_cleanup(true)
+            .tempfile_in(parent)?;
+        let temp_name = temp_file
+            .path()
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("temporary file has no basename"))?
+            .to_os_string();
+        let temp_descriptor_metadata = rustix::fs::fstat(temp_file.as_file())?;
+        let temp_entry_metadata = rustix::fs::statat(
+            &parent_file,
+            &temp_name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        if temp_descriptor_metadata.st_dev != temp_entry_metadata.st_dev
+            || temp_descriptor_metadata.st_ino != temp_entry_metadata.st_ino
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "temporary file was created outside the pinned parent directory",
+            ));
+        }
+
+        let replacement_result = (|| {
+            temp_file.as_file_mut().write_all(contents)?;
+            set_atomic_replacement_permissions(&temp_file, original_permissions)?;
+            tolerate_fsync_refusal(temp_file.as_file_mut().sync_all(), "temp file", target)?;
+
+            before_persist();
+
+            // A descriptor-relative rename is safe even if this check races,
+            // but fail before mutation when a deterministic parent swap is
+            // already visible. The post-rename check reports narrower races.
+            let current_parent_metadata = std::fs::metadata(parent)?;
+            if current_parent_metadata.dev() != opened_parent_metadata.dev()
+                || current_parent_metadata.ino() != opened_parent_metadata.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} changed before atomic replacement", parent.display()),
+                ));
+            }
+
+            let current_target_identity = match rustix::fs::statat(
+                &parent_file,
+                target_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            ) {
+                Ok(metadata)
+                    if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                        == rustix::fs::FileType::RegularFile =>
+                {
+                    Some((metadata.st_dev, metadata.st_ino, metadata.st_mode))
+                }
+                Ok(_) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "atomic replacement target changed to a non-regular file",
+                    ));
+                }
+                Err(err) if err == rustix::io::Errno::NOENT => None,
+                Err(err) => return Err(std::io::Error::from(err)),
+            };
+            if current_target_identity != expected_target_identity {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "atomic replacement target changed before rename",
+                ));
+            }
+
+            if let Some(expectation) = expected_source {
+                let Some((expected_dev, expected_ino, _)) = expected_target_identity else {
+                    return Err(std::io::Error::other(
+                        "file changed since it was read; re-read it and retry the edit",
+                    ));
+                };
+                let source_descriptor = rustix::fs::openat(
+                    &parent_file,
+                    target_name,
+                    rustix::fs::OFlags::RDONLY
+                        | rustix::fs::OFlags::CLOEXEC
+                        | rustix::fs::OFlags::NOFOLLOW
+                        | rustix::fs::OFlags::NONBLOCK,
+                    rustix::fs::Mode::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                let source_file = std::fs::File::from(source_descriptor);
+                let source_metadata = source_file.metadata()?;
+                if !source_metadata.is_file()
+                    || source_metadata.dev() != expected_dev
+                    || source_metadata.ino() != expected_ino
+                {
+                    return Err(std::io::Error::other(
+                        "file changed since it was read; re-read it and retry the edit",
+                    ));
+                }
+                access_context.ensure(
+                    &source_metadata,
+                    target,
+                    UNIX_ACCESS_READ,
+                    "optimistic edit validation",
+                )?;
+                ensure_atomic_source_unchanged(source_file, expectation)?;
+
+                // Re-check the directory entry after hashing. This keeps a
+                // rename/replacement concurrent with the digest read from
+                // being overwritten by the final descriptor-relative rename.
+                let after_digest = rustix::fs::statat(
+                    &parent_file,
+                    target_name,
+                    rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+                if after_digest.st_dev != expected_dev
+                    || after_digest.st_ino != expected_ino
+                    || Some((
+                        after_digest.st_dev,
+                        after_digest.st_ino,
+                        after_digest.st_mode,
+                    )) != expected_target_identity
+                {
+                    return Err(std::io::Error::other(
+                        "file changed since it was read; re-read it and retry the edit",
+                    ));
+                }
+            }
+
+            rustix::fs::renameat(&parent_file, &temp_name, &parent_file, target_name)?;
+
+            let persisted_entry_metadata = rustix::fs::statat(
+                &parent_file,
+                target_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            if temp_descriptor_metadata.st_dev != persisted_entry_metadata.st_dev
+                || temp_descriptor_metadata.st_ino != persisted_entry_metadata.st_ino
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "atomic replacement target changed immediately after rename",
+                ));
+            }
+            tolerate_fsync_refusal(parent_file.sync_all(), "parent directory", parent)?;
+
+            let current_parent_metadata = std::fs::metadata(parent)?;
+            if current_parent_metadata.dev() != opened_parent_metadata.dev()
+                || current_parent_metadata.ino() != opened_parent_metadata.ino()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} changed during atomic replacement", parent.display()),
+                ));
+            }
+            Ok(())
+        })();
+
+        if replacement_result.is_err()
+            && let Ok(current_temp_entry) = rustix::fs::statat(
+                &parent_file,
+                &temp_name,
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            && current_temp_entry.st_dev == temp_descriptor_metadata.st_dev
+            && current_temp_entry.st_ino == temp_descriptor_metadata.st_ino
+        {
+            // Only unlink the exact temporary inode we created. An attacker
+            // that replaced the name cannot make cleanup delete their entry.
+            let _ = rustix::fs::unlinkat(&parent_file, &temp_name, rustix::fs::AtFlags::empty());
+        }
+
+        replacement_result
+    }
+
+    #[cfg(not(all(unix, not(any(target_os = "espidf", target_os = "redox")))))]
+    {
+        let original_permissions = std::fs::metadata(target)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map(|metadata| metadata.permissions());
+        let canonical_cwd = strip_unc_prefix(std::fs::canonicalize(cwd)?);
+        let canonical_parent = strip_unc_prefix(std::fs::canonicalize(parent)?);
+        if !canonical_parent.starts_with(&canonical_cwd) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "atomic replacement parent escaped the working directory: {}",
+                    parent.display()
+                ),
+            ));
+        }
+
+        let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        let canonical_temp_parent = temp_file
+            .path()
+            .parent()
+            .and_then(|temp_parent| std::fs::canonicalize(temp_parent).ok())
+            .map(strip_unc_prefix)
+            .ok_or_else(|| std::io::Error::other("failed to resolve temporary-file parent"))?;
+        if canonical_temp_parent != canonical_parent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "temporary file was created outside the validated parent directory",
+            ));
+        }
+
+        temp_file.as_file_mut().write_all(contents)?;
+        set_atomic_replacement_permissions(&temp_file, original_permissions)?;
+        tolerate_fsync_refusal(temp_file.as_file_mut().sync_all(), "temp file", target)?;
+
+        before_persist();
+
+        let parent_before_persist = strip_unc_prefix(std::fs::canonicalize(parent)?);
+        if parent_before_persist != canonical_parent {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{} changed before atomic replacement", parent.display()),
+            ));
+        }
+        if let Some(expectation) = expected_source {
+            let source = open_regular_file_within_roots_with(target, &[cwd.to_path_buf()], || {})?;
+            ensure_atomic_source_unchanged(source, expectation)?;
+
+            let parent_after_digest = strip_unc_prefix(std::fs::canonicalize(parent)?);
+            if parent_after_digest != canonical_parent {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} changed before atomic replacement", parent.display()),
+                ));
+            }
+        }
+        temp_file.persist(target).map_err(|error| error.error)?;
+        sync_parent_dir(target)
+    }
+}
+
+fn atomic_replace_file(target: &Path, cwd: &Path, contents: &[u8]) -> std::io::Result<()> {
+    atomic_replace_file_with(target, cwd, contents, None, || {})
+}
+
+fn atomic_replace_file_if_unchanged(
+    target: &Path,
+    cwd: &Path,
+    contents: &[u8],
+    expected_source: AtomicContentExpectation,
+) -> std::io::Result<()> {
+    atomic_replace_file_with(target, cwd, contents, Some(expected_source), || {})
 }
 
 fn escape_file_tag_attribute(value: &str) -> String {
@@ -2564,12 +4655,15 @@ pub fn process_file_arguments(
             continue;
         }
 
-        let bytes = std::fs::read(&absolute_path).map_err(|e| {
-            Error::tool(
-                "read",
-                format!("Could not read file {}: {e}", absolute_path.display()),
-            )
-        })?;
+        let allowed_roots = [cwd.to_path_buf(), Config::global_dir()];
+        let bytes =
+            read_file_capped_within_roots_sync(&absolute_path, &allowed_roots, READ_TOOL_MAX_BYTES)
+                .map_err(|e| {
+                    Error::tool(
+                        "read",
+                        format!("Could not read file {}: {e}", absolute_path.display()),
+                    )
+                })?;
 
         if maybe_append_image_argument(&mut out, &absolute_path, &bytes, auto_resize_images)? {
             continue;
@@ -2949,6 +5043,8 @@ pub struct ReadTool {
     auto_resize: bool,
     block_images: bool,
     artifact_root: Option<PathBuf>,
+    #[cfg(test)]
+    after_open_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ReadTool {
@@ -2958,6 +5054,8 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: None,
+            #[cfg(test)]
+            after_open_hook: None,
         }
     }
 
@@ -2967,6 +5065,8 @@ impl ReadTool {
             auto_resize,
             block_images,
             artifact_root: None,
+            #[cfg(test)]
+            after_open_hook: None,
         }
     }
 
@@ -2977,6 +5077,21 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: Some(artifact_root.to_path_buf()),
+            after_open_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_open_hook(
+        cwd: &Path,
+        after_open_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            auto_resize: true,
+            block_images: false,
+            artifact_root: None,
+            after_open_hook: Some(Arc::new(after_open_hook)),
         }
     }
 }
@@ -3067,31 +5182,41 @@ impl Tool for ReadTool {
         let path = resolve_read_path(&input.path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd)?;
 
-        let meta = std_metadata_async(&path)
+        let path_for_open = path.clone();
+        let allowed_roots = vec![self.cwd.clone(), Config::global_dir()];
+        #[cfg(test)]
+        let after_open_hook = self.after_open_hook.clone();
+        let (std_file, cache_file, meta, cache_deps) =
+            asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<_> {
+                let file =
+                    open_regular_file_within_roots_with(&path_for_open, &allowed_roots, || {})?;
+                let metadata = file.metadata()?;
+                let cache_file = file.try_clone().ok();
+                #[cfg(test)]
+                if let Some(after_open_hook) = after_open_hook {
+                    after_open_hook();
+                }
+                let cache_deps = cache_file.as_ref().and_then(|cache_file| {
+                    cache_dependency_for_open_file(&path_for_open, cache_file)
+                });
+                Ok((file, cache_file, metadata, cache_deps))
+            })
             .await
-            .map_err(|err| Error::tool("read", err.to_string()))?;
-        if !meta.is_file() {
-            return Err(Error::tool(
-                "read",
-                format!("Path {} is not a regular file", path.display()),
-            ));
-        }
-        ensure_ancestors_searchable(&path)
-            .await
-            .map_err(|err| Error::tool("read", err.to_string()))?;
-        ensure_effective_mode_access(&meta, &path, UNIX_ACCESS_READ, "file reading")
             .map_err(|err| Error::tool("read", err.to_string()))?;
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
-        let cache_mode = ToolCacheFingerprintMode::FileContent;
-        let cache_deps = cache_dependency_for_path(&path, cache_mode);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
-            return Ok(output);
+            let stable_deps = stable_cache_dependency_for_open_file(
+                &path,
+                cache_file.as_ref(),
+                cache_deps.as_deref(),
+            );
+            if stable_deps.is_some() {
+                return Ok(output);
+            }
         }
 
-        let mut file = asupersync::fs::File::open(&path)
-            .await
-            .map_err(|e| Error::tool("read", e.to_string()))?;
+        let mut file = asupersync::fs::File::from_std(std_file);
 
         // Read initial chunk for mime detection
         let mut buffer = [0u8; 8192];
@@ -3335,7 +5460,11 @@ impl Tool for ReadTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependency_for_open_file(
+                    &path,
+                    cache_file.as_ref(),
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
@@ -3482,7 +5611,11 @@ impl Tool for ReadTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependency_for_open_file(
+                &path,
+                cache_file.as_ref(),
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -4037,12 +6170,22 @@ struct EditInput {
 
 pub struct EditTool {
     cwd: PathBuf,
+    before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl EditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            before_persist_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            before_persist_hook: Some(Arc::new(hook)),
         }
     }
 }
@@ -4736,16 +6879,16 @@ impl Tool for EditTool {
             return Err(Error::tool("edit", message));
         }
 
-        // Read bytes strictly up to the limit to prevent OOM if metadata failed or file grows.
-        let file = asupersync::fs::File::open(&absolute_path)
-            .await
-            .map_err(|e| Error::tool("edit", format!("Failed to open file: {e}")))?;
-        let mut raw = Vec::new();
-        let mut limiter = file.take(READ_TOOL_MAX_BYTES.saturating_add(1));
-        limiter
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
+        // Read the transformation source through the validated, no-follow
+        // descriptor path. The digest of these exact bytes becomes the
+        // optimistic-CAS expectation checked immediately before rename.
+        let path_for_read = absolute_path.clone();
+        let cwd_for_read = self.cwd.clone();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            read_scoped_file_capped_sync(&path_for_read, &cwd_for_read, READ_TOOL_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
 
         if raw.len() > usize::try_from(READ_TOOL_MAX_BYTES).unwrap_or(usize::MAX) {
             return Err(Error::tool(
@@ -4754,6 +6897,7 @@ impl Tool for EditTool {
             ));
         }
 
+        let source_expectation = AtomicContentExpectation::from_bytes(&raw);
         let raw_content = String::from_utf8(raw).map_err(|_| {
             Error::tool(
                 "edit",
@@ -4893,43 +7037,29 @@ impl Tool for EditTool {
 
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
         let absolute_path_clone = absolute_path.clone();
+        let cwd_clone = self.cwd.clone();
         let final_content_bytes = final_content.into_bytes();
+        let before_persist_hook = self.before_persist_hook.clone();
         asupersync::runtime::spawn_blocking_io(move || {
-            // Capture original permissions before the file is replaced.
-            let original_perms = std::fs::metadata(&absolute_path_clone)
-                .ok()
-                .map(|m| m.permissions());
-            let parent = absolute_path_clone
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            tolerate_fsync_refusal(
-                temp_file.as_file_mut().sync_all(),
-                "temp file",
-                &absolute_path_clone,
-            )?;
-
-            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                // Default to 0644 (rw-r--r--) instead of tempfile's 0600 if we couldn't read original perms.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            temp_file
-                .persist(&absolute_path_clone)
-                .map_err(|e| e.error)?;
-            sync_parent_dir(&absolute_path_clone)?;
-            Ok(())
+            before_persist_hook.map_or_else(
+                || {
+                    atomic_replace_file_if_unchanged(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        source_expectation,
+                    )
+                },
+                |hook| {
+                    atomic_replace_file_with(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        Some(source_expectation),
+                        move || hook(),
+                    )
+                },
+            )
         })
         .await
         .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")))?;
@@ -4970,12 +7100,22 @@ struct WriteInput {
 
 pub struct WriteTool {
     cwd: PathBuf,
+    before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            before_persist_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            before_persist_hook: Some(Arc::new(hook)),
         }
     }
 }
@@ -5093,34 +7233,22 @@ impl Tool for WriteTool {
 
         // Write atomically using tempfile on a blocking thread
         let path_clone = path.clone();
+        let cwd_clone = self.cwd.clone();
         let content_bytes = input.content.into_bytes();
+        let before_persist_hook = self.before_persist_hook.clone();
         asupersync::runtime::spawn_blocking_io(move || {
-            // Capture original permissions before the file is replaced (new files get None).
-            let original_perms = std::fs::metadata(&path_clone).ok().map(|m| m.permissions());
-            let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&content_bytes)?;
-            tolerate_fsync_refusal(temp_file.as_file_mut().sync_all(), "temp file", &path_clone)?;
-
-            // Restore original file permissions (tempfile defaults to 0o600) before persisting.
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                // New file: default to 0644 (rw-r--r--) instead of tempfile's 0600.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            // Persist (atomic rename)
-            temp_file.persist(&path_clone).map_err(|e| e.error)?;
-            sync_parent_dir(&path_clone)?;
-            Ok(())
+            before_persist_hook.map_or_else(
+                || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
+                |hook| {
+                    atomic_replace_file_with(
+                        &path_clone,
+                        &cwd_clone,
+                        &content_bytes,
+                        None,
+                        move || hook(),
+                    )
+                },
+            )
         })
         .await
         .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
@@ -5158,6 +7286,8 @@ struct GrepInput {
 pub struct GrepTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    #[cfg(test)]
+    after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GrepTool {
@@ -5165,6 +7295,8 @@ impl GrepTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            #[cfg(test)]
+            after_scope_hook: None,
         }
     }
 
@@ -5173,6 +7305,19 @@ impl GrepTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
+            after_scope_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_scope_hook(
+        cwd: &Path,
+        after_scope_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            artifact_root: None,
+            after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
 }
@@ -5203,73 +7348,189 @@ fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult {
     }
 }
 
+fn path_from_rg_json(event: &serde_json::Value) -> Result<PathBuf> {
+    if let Some(path) = event
+        .pointer("/data/path/text")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Ok(PathBuf::from(path));
+    }
+
+    let encoded = event
+        .pointer("/data/path/bytes")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            Error::tool(
+                "grep",
+                "ripgrep match event is missing path.text and path.bytes",
+            )
+        })?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map_err(|error| {
+            Error::tool(
+                "grep",
+                format!(
+                    "ripgrep match event has invalid path.bytes base64: {}",
+                    error_for_line_output(&error)
+                ),
+            )
+        })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        Ok(PathBuf::from(OsString::from_vec(bytes)))
+    }
+
+    #[cfg(not(unix))]
+    String::from_utf8(bytes)
+        .map(PathBuf::from)
+        .map_err(|error| {
+            Error::tool(
+                "grep",
+                format!(
+                    "ripgrep match event has non-UTF-8 path.bytes on this platform: {}",
+                    error_for_line_output(&error)
+                ),
+            )
+        })
+}
+
 fn process_rg_json_match_line(
     line_res: std::io::Result<String>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
     scan_limit: usize,
-) {
+) -> Result<()> {
+    process_rg_json_match_line_with_filter(
+        line_res,
+        None,
+        None,
+        matches,
+        match_count,
+        match_limit_reached,
+        scan_limit,
+    )
+}
+
+fn process_rg_json_match_line_with_filter(
+    line_res: std::io::Result<String>,
+    scoped_root: Option<&ScopedScanRoot>,
+    glob_override: Option<&ignore::overrides::Override>,
+    matches: &mut Vec<(PathBuf, usize)>,
+    match_count: &mut usize,
+    match_limit_reached: &mut bool,
+    scan_limit: usize,
+) -> Result<()> {
     if *match_limit_reached {
-        return;
+        return Ok(());
     }
 
     let line = match line_res {
         Ok(l) => l,
         Err(e) => {
-            tracing::debug!("Skipping ripgrep output line due to read error: {e}");
-            return;
+            return Err(Error::tool(
+                "grep",
+                format!(
+                    "Failed to read ripgrep JSON output: {}",
+                    error_for_line_output(&e)
+                ),
+            ));
         }
     };
     if line.trim().is_empty() {
-        return;
+        return Ok(());
     }
 
-    let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-        return;
-    };
+    let event = serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+        Error::tool(
+            "grep",
+            format!(
+                "Invalid ripgrep JSON output: {}",
+                error_for_line_output(&error)
+            ),
+        )
+    })?;
 
     if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
-        return;
+        return Ok(());
     }
 
-    let file_path = event
-        .pointer("/data/path/text")
-        .and_then(serde_json::Value::as_str)
-        .map(PathBuf::from);
+    let file_path = path_from_rg_json(&event)?;
+    if let (Some(scoped_root), Some(glob_override)) = (scoped_root, glob_override) {
+        let mapped = scoped_root.map_child_output(&file_path).map_err(|error| {
+            Error::tool(
+                "grep",
+                format!(
+                    "ripgrep returned an invalid path: {}",
+                    error_for_line_output(&error)
+                ),
+            )
+        })?;
+        if glob_override
+            .matched(&mapped.logical_path, false)
+            .is_ignore()
+        {
+            return Ok(());
+        }
+    }
     let line_number = event
         .pointer("/data/line_number")
         .and_then(serde_json::Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok());
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|line_number| *line_number > 0)
+        .ok_or_else(|| Error::tool("grep", "ripgrep match event is missing a valid line_number"))?;
 
-    if let (Some(fp), Some(ln)) = (file_path, line_number) {
-        matches.push((fp, ln));
-        *match_count += 1;
-        if *match_count >= scan_limit {
-            *match_limit_reached = true;
-        }
+    matches.push((file_path, line_number));
+    *match_count += 1;
+    if *match_count >= scan_limit {
+        *match_limit_reached = true;
     }
+    Ok(())
 }
 
 fn drain_rg_stdout(
     stdout_rx: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    scoped_root: &ScopedScanRoot,
+    glob_override: Option<&ignore::overrides::Override>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
     scan_limit: usize,
-) {
+) -> Result<()> {
     while let Ok(line_res) = stdout_rx.try_recv() {
-        process_rg_json_match_line(
+        process_rg_json_match_line_with_filter(
             line_res,
+            Some(scoped_root),
+            glob_override,
             matches,
             match_count,
             match_limit_reached,
             scan_limit,
-        );
+        )?;
         if *match_limit_reached {
             break;
         }
     }
+    Ok(())
+}
+
+fn build_grep_glob_override(
+    cwd: &Path,
+    glob: Option<&str>,
+) -> Result<Option<ignore::overrides::Override>> {
+    let Some(glob) = glob else {
+        return Ok(None);
+    };
+    let mut builder = ignore::overrides::OverrideBuilder::new(cwd);
+    builder
+        .add(glob)
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))?;
+    builder
+        .build()
+        .map(Some)
+        .map_err(|error| Error::tool("grep", error_for_line_output(&error)))
 }
 
 fn drain_rg_stderr(
@@ -5277,11 +7538,36 @@ fn drain_rg_stderr(
     stderr_bytes: &mut Vec<u8>,
 ) -> Result<()> {
     while let Ok(chunk_result) = stderr_rx.try_recv() {
-        let chunk = chunk_result
-            .map_err(|err| Error::tool("grep", format!("Failed to read stderr: {err}")))?;
+        let chunk = chunk_result.map_err(|err| {
+            Error::tool(
+                "grep",
+                format!("Failed to read stderr: {}", error_for_line_output(&err)),
+            )
+        })?;
         stderr_bytes.extend_from_slice(&chunk);
     }
     Ok(())
+}
+
+fn rg_exit_failure(status: std::process::ExitStatus, stderr: &str) -> Option<String> {
+    if matches!(status.code(), Some(0 | 1)) {
+        return None;
+    }
+    if !stderr.is_empty() {
+        return Some(stderr.to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        if let Some(signal) = status.signal() {
+            return Some(format!("ripgrep terminated by signal {signal}"));
+        }
+    }
+    Some(status.code().map_or_else(
+        || "ripgrep terminated without an exit code".to_string(),
+        |code| format!("ripgrep exited with code {code}"),
+    ))
 }
 
 #[async_trait]
@@ -5366,24 +7652,46 @@ impl Tool for GrepTool {
             ));
         }
 
-        let search_dir = input.path.as_deref().unwrap_or(".");
-        let search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&search_path, &self.cwd, "grep")?;
-
-        let search_metadata = std_metadata_async(&search_path).await.map_err(|e| {
-            Error::tool(
-                "grep",
-                format!("Cannot access path {}: {e}", search_path.display()),
-            )
-        })?;
-        ensure_ancestors_searchable(&search_path)
+        let cwd_scope = open_scoped_scan_root(&self.cwd, &self.cwd, false, None)
             .await
             .map_err(|err| {
                 Error::tool(
                     "grep",
-                    format!("Cannot access path {}: {err}", search_path.display()),
+                    format!(
+                        "Cannot pin working directory {} for scanning: {}",
+                        path_for_line_output(&self.cwd),
+                        error_for_line_output(&err)
+                    ),
                 )
             })?;
+        let operation_cwd = cwd_scope.io_path();
+
+        let search_dir = input.path.as_deref().unwrap_or(".");
+        let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
+        let search_path = enforce_cwd_scope(&lexical_search_path, &self.cwd, "grep")?;
+        ensure_scan_path_ancestors_searchable(&lexical_search_path, &search_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "grep",
+                    format!(
+                        "Cannot access path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+
+        let search_metadata = std_metadata_async(&search_path).await.map_err(|e| {
+            Error::tool(
+                "grep",
+                format!(
+                    "Cannot access path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&e)
+                ),
+            )
+        })?;
         let is_directory = search_metadata.is_dir();
         let required_access = if is_directory {
             UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
@@ -5399,9 +7707,55 @@ impl Tool for GrepTool {
         .map_err(|err| {
             Error::tool(
                 "grep",
-                format!("Cannot access path {}: {err}", search_path.display()),
+                format!(
+                    "Cannot access path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&err)
+                ),
             )
         })?;
+        #[cfg(test)]
+        let after_scope_hook = self.after_scope_hook.clone();
+        #[cfg(not(test))]
+        let after_scope_hook = None;
+        let scoped_root = open_scoped_scan_root(&search_path, &self.cwd, true, after_scope_hook)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "grep",
+                    format!(
+                        "Cannot pin path {} for scanning: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let scan_io_path = scoped_root.io_path();
+        if is_directory {
+            ensure_recursive_scan_access(
+                &scan_io_path,
+                &operation_cwd,
+                "recursive content scanning",
+                RecursiveScanAccess::ReadableFiles,
+                input.glob.clone(),
+            )
+            .await
+            .map_err(|err| {
+                let message = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                    format!(
+                        "Permission denied while scanning descendants of {}",
+                        path_for_line_output(&search_path)
+                    )
+                } else {
+                    format!(
+                        "Cannot scan path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    )
+                };
+                Error::tool("grep", message)
+            })?;
+        }
 
         let context_value = input.context.unwrap_or(0);
         let effective_limit = input.limit.unwrap_or(DEFAULT_GREP_LIMIT).max(1);
@@ -5413,60 +7767,74 @@ impl Tool for GrepTool {
         } else {
             ToolCacheFingerprintMode::FileContent
         };
-        let cache_deps = cache_dependency_for_path(&search_path, cache_mode);
+        let recursive_cache_access = is_directory.then_some(RecursiveScanAccess::ReadableFiles);
+        let cache_deps = cache_dependencies_for_scoped_scan(
+            &scoped_root,
+            &cwd_scope,
+            cache_mode,
+            recursive_cache_access,
+        );
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
 
-        let mut args: Vec<String> = vec![
-            "--json".to_string(),
-            "--line-number".to_string(),
-            "--color=never".to_string(),
-            "--hidden".to_string(),
+        let mut args: Vec<OsString> = vec![
+            OsString::from("--json"),
+            OsString::from("--line-number"),
+            OsString::from("--color=never"),
+            OsString::from("--hidden"),
+            OsString::from("--no-config"),
+            OsString::from("--no-follow"),
+            OsString::from("--no-ignore-parent"),
+            OsString::from("--no-require-git"),
             // Prevent massive JSON lines from minified files causing OOM
-            "--max-columns=10000".to_string(),
+            OsString::from("--max-columns=10000"),
         ];
 
         if input.ignore_case.unwrap_or(false) {
-            args.push("--ignore-case".to_string());
+            args.push(OsString::from("--ignore-case"));
         }
         if input.literal.unwrap_or(false) {
-            args.push("--fixed-strings".to_string());
+            args.push(OsString::from("--fixed-strings"));
         }
-        if let Some(glob) = &input.glob {
-            args.push("--glob".to_string());
-            args.push(glob.clone());
-        }
+        // The scanner runs from the pinned search root, while grep globs are
+        // defined relative to the command cwd. Apply that glob to mapped
+        // logical result paths below so a descriptor path cannot change its
+        // slash-containing semantics.
+        let glob_override =
+            build_grep_glob_override(cwd_scope.logical_path(), input.glob.as_deref())?;
 
         // Mirror find-tool behavior: explicitly pass root/nested .gitignore files
         // so ignore rules apply consistently even outside a git worktree.
-        let ignore_root = if is_directory {
-            search_path.clone()
-        } else {
-            search_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf()
-        };
-        // NOTE: We rely on rg's native .gitignore discovery. We only explicitly pass
-        // the root .gitignore if it exists, to ensure it's respected even if the
-        // search path logic might otherwise miss it (e.g. searching a subdir).
-        // We do NOT perform a blocking `glob("**/.gitignore")` here, as that stalls
-        // the async runtime on large repos.
-        let workspace_gitignore = self.cwd.join(".gitignore");
-        if workspace_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(workspace_gitignore.display().to_string());
-        }
-        let root_gitignore = ignore_root.join(".gitignore");
-        if root_gitignore != workspace_gitignore && root_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(root_gitignore.display().to_string());
+        if is_directory {
+            // NOTE: We rely on rg's native .gitignore discovery. We only explicitly pass
+            // the root .gitignore if it exists, to ensure it's respected even if the
+            // search path logic might otherwise miss it (e.g. searching a subdir).
+            // We do NOT perform a blocking `glob("**/.gitignore")` here, as that stalls
+            // the async runtime on large repos. Explicit file operands bypass ignore
+            // filtering, so do not load unrelated directory controls for that case.
+            let workspace_gitignore = operation_cwd.join(".gitignore");
+            if workspace_gitignore.exists() {
+                args.push(OsString::from("--ignore-file"));
+                args.push(
+                    cwd_scope
+                        .inherited_child_operand()
+                        .join(".gitignore")
+                        .into_os_string(),
+                );
+            }
+            let root_gitignore = scoped_root.child_operand().join(".gitignore");
+            if scoped_root.logical_path() != cwd_scope.logical_path()
+                && scan_io_path.join(".gitignore").exists()
+            {
+                args.push(OsString::from("--ignore-file"));
+                args.push(root_gitignore.as_os_str().to_owned());
+            }
         }
 
-        args.push("--".to_string());
-        args.push(input.pattern.clone());
-        args.push(search_path.display().to_string());
+        args.push(OsString::from("--"));
+        args.push(OsString::from(&input.pattern));
+        args.push(scoped_root.child_operand().into_os_string());
 
         let rg_cmd = find_rg_binary().ok_or_else(|| {
             Error::tool(
@@ -5475,13 +7843,33 @@ impl Tool for GrepTool {
             )
         })?;
 
-        let mut child = command_with_default_sigpipe(rg_cmd)
-            .map_err(|e| Error::tool("grep", format!("Failed to prepare ripgrep: {e}")))?
+        let mut child = command_with_default_sigpipe_in_dir(rg_cmd, &scan_io_path)
+            .map_err(|e| {
+                Error::tool(
+                    "grep",
+                    format!("Failed to prepare ripgrep: {}", error_for_line_output(&e)),
+                )
+            })?
             .args(args)
+            .current_dir(&scan_io_path)
+            .stdin(cwd_scope.child_stdin().map_err(|error| {
+                Error::tool(
+                    "grep",
+                    format!(
+                        "Failed to pin ripgrep workspace: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::tool("grep", format!("Failed to run ripgrep: {e}")))?;
+            .map_err(|e| {
+                Error::tool(
+                    "grep",
+                    format!("Failed to run ripgrep: {}", error_for_line_output(&e)),
+                )
+            })?;
 
         let stdout = child
             .stdout
@@ -5530,11 +7918,13 @@ impl Tool for GrepTool {
 
             drain_rg_stdout(
                 &stdout_rx,
+                &scoped_root,
+                glob_override.as_ref(),
                 &mut matches,
                 &mut match_count,
                 &mut match_scan_limit_reached,
                 scan_limit,
-            );
+            )?;
             drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
 
             if match_scan_limit_reached {
@@ -5547,19 +7937,21 @@ impl Tool for GrepTool {
                     let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
                     sleep(now, tick).await;
                 }
-                Err(e) => return Err(Error::tool("grep", e.to_string())),
+                Err(e) => return Err(Error::tool("grep", error_for_line_output(&e))),
             }
         };
 
         drain_rg_stdout(
             &stdout_rx,
+            &scoped_root,
+            glob_override.as_ref(),
             &mut matches,
             &mut match_count,
             &mut match_scan_limit_reached,
             scan_limit,
-        );
+        )?;
 
-        let code = if match_scan_limit_reached || cx_cancelled {
+        let completed_status = if match_scan_limit_reached || cx_cancelled {
             // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
             // `kill()` terminates the process, and we reap it in a background thread
             // so the stdout reader threads can exit promptly without blocking this task.
@@ -5567,10 +7959,9 @@ impl Tool for GrepTool {
             // Drop any buffered stdout/stderr lines that were queued before termination.
             while stdout_rx.try_recv().is_ok() {}
             while stderr_rx.try_recv().is_ok() {}
-            0
+            None
         } else {
-            let status = exit_status.expect("rg exit status");
-            status.code().unwrap_or(0)
+            Some(exit_status.expect("rg exit status"))
         };
 
         // Keep draining while waiting for reader threads to finish; otherwise a
@@ -5582,11 +7973,13 @@ impl Tool for GrepTool {
             } else {
                 drain_rg_stdout(
                     &stdout_rx,
+                    &scoped_root,
+                    glob_override.as_ref(),
                     &mut matches,
                     &mut match_count,
                     &mut match_scan_limit_reached,
                     scan_limit,
-                );
+                )?;
             }
             drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
             sleep(wall_now(), Duration::from_millis(1)).await;
@@ -5613,25 +8006,25 @@ impl Tool for GrepTool {
         } else {
             drain_rg_stdout(
                 &stdout_rx,
+                &scoped_root,
+                glob_override.as_ref(),
                 &mut matches,
                 &mut match_count,
                 &mut match_scan_limit_reached,
                 scan_limit,
-            );
+            )?;
         }
         drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
 
-        let mut stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        if stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
-            stderr_text.push_str("\n... [stderr truncated] ...");
-        }
-        if !match_scan_limit_reached && code != 0 && code != 1 {
-            let msg = if stderr_text.is_empty() {
-                format!("ripgrep exited with code {code}")
-            } else {
-                stderr_text
-            };
-            return Err(Error::tool("grep", msg));
+        let stderr_text = diagnostic_for_line_output(
+            &stderr_bytes,
+            stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES,
+        );
+        if !match_scan_limit_reached
+            && let Some(message) =
+                completed_status.and_then(|status| rg_exit_failure(status, &stderr_text))
+        {
+            return Err(Error::tool("grep", message));
         }
 
         let match_limit_reached = match_count > effective_limit;
@@ -5648,13 +8041,18 @@ impl Tool for GrepTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
         }
 
-        let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
         let mut lines_truncated = false;
@@ -5662,12 +8060,23 @@ impl Tool for GrepTool {
         // Group matches by file to merge overlapping context windows
         let mut file_order: Vec<PathBuf> = Vec::new();
         let mut matches_by_file: HashMap<PathBuf, Vec<usize>> = HashMap::new();
-        for (file_path, line_number) in &matches {
-            if !matches_by_file.contains_key(file_path) {
-                file_order.push(file_path.clone());
+        let mut logical_paths_by_file: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for (child_path, line_number) in &matches {
+            let mapped = scoped_root.map_child_output(child_path).map_err(|error| {
+                Error::tool(
+                    "grep",
+                    format!(
+                        "ripgrep returned an invalid path: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?;
+            if !matches_by_file.contains_key(&mapped.read_path) {
+                file_order.push(mapped.read_path.clone());
+                logical_paths_by_file.insert(mapped.read_path.clone(), mapped.logical_path.clone());
             }
             matches_by_file
-                .entry(file_path.clone())
+                .entry(mapped.read_path)
                 .or_default()
                 .push(*line_number);
         }
@@ -5676,8 +8085,11 @@ impl Tool for GrepTool {
             let Some(mut match_lines) = matches_by_file.remove(&file_path) else {
                 continue;
             };
-            let relative_path = format_grep_path(&file_path, &self.cwd);
-            let lines = get_file_lines_async(&file_path, &mut file_cache).await;
+            let logical_path = logical_paths_by_file
+                .remove(&file_path)
+                .ok_or_else(|| Error::tool("grep", "missing logical scanner result path"))?;
+            let relative_path = format_grep_path(&logical_path, cwd_scope.logical_path());
+            let lines = get_file_lines_async(&file_path, &operation_cwd).await;
 
             if lines.is_empty() {
                 if let Some(first_match) = match_lines.first() {
@@ -5761,7 +8173,7 @@ impl Tool for GrepTool {
         if match_limit_reached {
             notices.push(format!(
                 "{effective_limit} matches limit reached. Use limit={} for more, or refine pattern",
-                effective_limit * 2
+                effective_limit.saturating_mul(2)
             ));
             details_map.insert(
                 "matchLimitReached".to_string(),
@@ -5808,7 +8220,13 @@ impl Tool for GrepTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                recursive_cache_access,
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -5830,13 +8248,16 @@ struct FindInput {
 
 #[derive(Debug)]
 struct FindEntry {
-    rel: String,
+    rel: PathBuf,
     modified: Option<SystemTime>,
+    is_dir: bool,
 }
 
 pub struct FindTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    #[cfg(test)]
+    after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FindTool {
@@ -5844,6 +8265,20 @@ impl FindTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            #[cfg(test)]
+            after_scope_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_scope_hook(
+        cwd: &Path,
+        after_scope_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            artifact_root: None,
+            after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
 }
@@ -5903,58 +8338,131 @@ impl Tool for FindTool {
             ));
         }
 
-        let search_dir = input.path.as_deref().unwrap_or(".");
-        let search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&search_path, &self.cwd, "find")?;
-        let search_path = strip_unc_prefix(search_path);
-        let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
-        // Overfetch one result so limit notices only appear after confirmed overflow.
-        let scan_limit = effective_limit.saturating_add(1);
-
-        let search_metadata = std_metadata_async(&search_path).await.map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                Error::tool("find", format!("Path not found: {}", search_path.display()))
-            } else {
-                Error::tool(
-                    "find",
-                    format!("Cannot access path {}: {err}", search_path.display()),
-                )
-            }
-        })?;
-        ensure_ancestors_searchable(&search_path)
+        let cwd_scope = open_scoped_scan_root(&self.cwd, &self.cwd, false, None)
             .await
             .map_err(|err| {
                 Error::tool(
                     "find",
-                    format!("Cannot access path {}: {err}", search_path.display()),
+                    format!(
+                        "Cannot pin working directory {} for scanning: {}",
+                        path_for_line_output(&self.cwd),
+                        error_for_line_output(&err)
+                    ),
                 )
             })?;
-        let search_is_directory = search_metadata.is_dir();
-        let required_access = if search_is_directory {
-            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
-        } else {
-            UNIX_ACCESS_READ
-        };
+        let operation_cwd = cwd_scope.io_path();
+
+        let search_dir = input.path.as_deref().unwrap_or(".");
+        let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
+        let search_path = enforce_cwd_scope(&lexical_search_path, &self.cwd, "find")?;
+        let search_path = strip_unc_prefix(search_path);
+        ensure_scan_path_ancestors_searchable(&lexical_search_path, &search_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot access path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
+        // Enumerate the complete bounded candidate set before newest-first
+        // selection; stopping at the caller's result limit would make the
+        // advertised global ordering depend on fd traversal order.
+        let scan_limit = FIND_SCAN_HARD_LIMIT.saturating_add(1);
+
+        let search_metadata = std_metadata_async(&search_path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::tool(
+                    "find",
+                    format!("Path not found: {}", path_for_line_output(&search_path)),
+                )
+            } else {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot access path {}: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            }
+        })?;
+        if !search_metadata.is_dir() {
+            return Err(Error::tool(
+                "find",
+                format!("Not a directory: {}", path_for_line_output(&search_path)),
+            ));
+        }
         ensure_effective_mode_access(
             &search_metadata,
             &search_path,
-            required_access,
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
             "path scanning",
         )
         .map_err(|err| {
             Error::tool(
                 "find",
-                format!("Cannot access path {}: {err}", search_path.display()),
+                format!(
+                    "Cannot access path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&err)
+                ),
             )
+        })?;
+        #[cfg(test)]
+        let after_scope_hook = self.after_scope_hook.clone();
+        #[cfg(not(test))]
+        let after_scope_hook = None;
+        let scoped_root = open_scoped_scan_root(&search_path, &self.cwd, false, after_scope_hook)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Cannot pin path {} for scanning: {}",
+                        path_for_line_output(&search_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let scan_io_path = scoped_root.io_path();
+        ensure_recursive_scan_access(
+            &scan_io_path,
+            &operation_cwd,
+            "recursive path scanning",
+            RecursiveScanAccess::DirectoriesOnly,
+            None,
+        )
+        .await
+        .map_err(|err| {
+            let message = if err.kind() == std::io::ErrorKind::PermissionDenied {
+                format!(
+                    "Permission denied while scanning descendants of {}",
+                    path_for_line_output(&search_path)
+                )
+            } else {
+                format!(
+                    "Cannot scan path {}: {}",
+                    path_for_line_output(&search_path),
+                    error_for_line_output(&err)
+                )
+            };
+            Error::tool("find", message)
         })?;
 
         let cache_key = tool_cache_key("find", &self.cwd, &input_value);
-        let cache_mode = if search_is_directory {
-            ToolCacheFingerprintMode::DirectoryRecursive
-        } else {
-            ToolCacheFingerprintMode::FileContent
-        };
-        let cache_deps = cache_dependency_for_path(&search_path, cache_mode);
+        let cache_mode = ToolCacheFingerprintMode::DirectoryRecursive;
+        let recursive_cache_access = Some(RecursiveScanAccess::DirectoriesOnly);
+        let cache_deps = cache_dependencies_for_scoped_scan(
+            &scoped_root,
+            &cwd_scope,
+            cache_mode,
+            recursive_cache_access,
+        );
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
@@ -5967,42 +8475,74 @@ impl Tool for FindTool {
         })?;
 
         // Build fd arguments
-        let mut args: Vec<String> = vec![
-            "--glob".to_string(),
-            "--color=never".to_string(),
-            "--hidden".to_string(),
-            "--max-results".to_string(),
-            scan_limit.to_string(),
+        let mut args: Vec<OsString> = vec![
+            OsString::from("--glob"),
+            OsString::from("--color=never"),
+            OsString::from("--hidden"),
+            OsString::from("--no-follow"),
+            OsString::from("--no-ignore-parent"),
+            OsString::from("--no-require-git"),
+            // Filenames may contain newlines on Unix. NUL-delimited records
+            // prevent one real entry from being split into attacker-chosen
+            // path fragments during postprocessing.
+            OsString::from("--print0"),
+            OsString::from("--max-results"),
+            OsString::from(scan_limit.to_string()),
         ];
 
         // NOTE: We rely on fd's native .gitignore discovery. We only explicitly pass
         // the root .gitignore if it exists, to ensure it's respected even if the
         // search path logic might otherwise miss it.
         // We do NOT perform a blocking `glob("**/.gitignore")` here.
-        let workspace_gitignore = self.cwd.join(".gitignore");
+        let workspace_gitignore = operation_cwd.join(".gitignore");
         if workspace_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(workspace_gitignore.display().to_string());
+            args.push(OsString::from("--ignore-file"));
+            args.push(
+                cwd_scope
+                    .inherited_child_operand()
+                    .join(".gitignore")
+                    .into_os_string(),
+            );
         }
-        let root_gitignore = search_path.join(".gitignore");
-        if root_gitignore != workspace_gitignore && root_gitignore.exists() {
-            args.push("--ignore-file".to_string());
-            args.push(root_gitignore.display().to_string());
+        let root_gitignore = scoped_root.child_operand().join(".gitignore");
+        if scoped_root.logical_path() != cwd_scope.logical_path()
+            && scan_io_path.join(".gitignore").exists()
+        {
+            args.push(OsString::from("--ignore-file"));
+            args.push(root_gitignore.as_os_str().to_owned());
         }
 
-        args.push("--".to_string());
-        args.push(input.pattern.clone());
-        args.push(search_path.display().to_string());
+        args.push(OsString::from("--"));
+        args.push(OsString::from(&input.pattern));
+        args.push(scoped_root.child_operand().into_os_string());
 
-        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, &self.cwd)
-            .map_err(|e| Error::tool("find", format!("Failed to prepare fd: {e}")))?
+        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, &scan_io_path)
+            .map_err(|e| {
+                Error::tool(
+                    "find",
+                    format!("Failed to prepare fd: {}", error_for_line_output(&e)),
+                )
+            })?
             .args(args)
-            .current_dir(&self.cwd)
-            .stdin(Stdio::null())
+            .current_dir(&scan_io_path)
+            .stdin(cwd_scope.child_stdin().map_err(|error| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "Failed to pin fd workspace: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
+            .map_err(|e| {
+                Error::tool(
+                    "find",
+                    format!("Failed to run fd: {}", error_for_line_output(&e)),
+                )
+            })?;
 
         let stdout_pipe = child
             .stdout
@@ -6050,18 +8590,28 @@ impl Tool for FindTool {
                     let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
                     sleep(now, tick).await;
                 }
-                Err(e) => return Err(Error::tool("find", e.to_string())),
+                Err(e) => return Err(Error::tool("find", error_for_line_output(&e))),
             }
         };
 
         let stdout_bytes = stdout_handle
             .join()
             .map_err(|_| Error::tool("find", "fd stdout reader thread panicked"))?
-            .map_err(|err| Error::tool("find", format!("Failed to read fd stdout: {err}")))?;
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("Failed to read fd stdout: {}", error_for_line_output(&err)),
+                )
+            })?;
         let stderr_bytes = stderr_handle
             .join()
             .map_err(|_| Error::tool("find", "fd stderr reader thread panicked"))?
-            .map_err(|err| Error::tool("find", format!("Failed to read fd stderr: {err}")))?;
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("Failed to read fd stderr: {}", error_for_line_output(&err)),
+                )
+            })?;
 
         if cx_cancelled {
             return Err(Error::tool("find", "Command cancelled"));
@@ -6071,22 +8621,28 @@ impl Tool for FindTool {
         }
         let status = status.expect("fd exit status after successful completion");
 
-        let mut stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
         if stdout_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
-            stdout.push_str("\n... [stdout truncated] ...");
+            return Err(Error::tool(
+                "find",
+                "fd output exceeded the safe capture limit; lower `limit` or narrow the pattern",
+            ));
         }
-        let mut stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
-        if stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES {
-            stderr.push_str("\n... [stderr truncated] ...");
-        }
+        let stderr = diagnostic_for_line_output(
+            &stderr_bytes,
+            stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES,
+        );
 
-        if !status.success() && stdout.is_empty() {
-            if status.code() == Some(1) && stderr.is_empty() {
+        if !status.success() {
+            if status.code() == Some(1) && stderr.is_empty() && stdout_bytes.is_empty() {
                 // fd uses exit code 1 for "no matches"; treat as empty result.
             } else {
                 let code = status.code().unwrap_or(1);
                 let msg = if stderr.is_empty() {
-                    format!("fd exited with code {code}")
+                    if stdout_bytes.is_empty() {
+                        format!("fd exited with code {code}")
+                    } else {
+                        format!("fd exited with code {code} after producing partial output")
+                    }
                 } else {
                     stderr
                 };
@@ -6094,7 +8650,7 @@ impl Tool for FindTool {
             }
         }
 
-        if stdout.is_empty() {
+        if stdout_bytes.is_empty() {
             let output = ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(
                     "No files found matching pattern",
@@ -6104,45 +8660,69 @@ impl Tool for FindTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
         }
 
         let mut entries: Vec<FindEntry> = Vec::new();
-        for raw_line in stdout.lines() {
-            let line = raw_line.trim_end_matches('\r').trim();
-            if line.is_empty() {
+        for raw_entry in stdout_bytes.split(|byte| *byte == b'\0') {
+            if raw_entry.is_empty() {
                 continue;
             }
+            // `fd --print0` preserves every valid filename byte other than
+            // the impossible NUL byte, including leading/trailing whitespace
+            // and embedded newlines.
+            #[cfg(unix)]
+            let raw_path = {
+                use std::os::unix::ffi::OsStringExt as _;
+                PathBuf::from(OsString::from_vec(raw_entry.to_vec()))
+            };
+            #[cfg(not(unix))]
+            let raw_path = PathBuf::from(String::from_utf8_lossy(raw_entry).into_owned());
 
-            // On Windows, fd may emit `//?/…` or `\\?\…` extended-length
-            // paths. Strip the prefix so relativization works correctly.
-            let clean = strip_unc_prefix(PathBuf::from(line));
-            let line_path = clean.as_path();
-            let mut rel = if line_path.is_absolute() {
-                line_path.strip_prefix(&search_path).map_or_else(
-                    |_| line_path.to_string_lossy().to_string(),
-                    |stripped| stripped.to_string_lossy().to_string(),
+            let mapped = scoped_root.map_child_output(&raw_path).map_err(|error| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "fd returned an invalid path: {}",
+                        error_for_line_output(&error)
+                    ),
                 )
-            } else {
-                line_path.to_string_lossy().to_string()
-            };
+            })?;
+            let rel = mapped.relative;
+            let full_path = mapped.read_path;
+            // fd was invoked with --no-follow. Inspect the directory entry
+            // itself as well, otherwise `is_dir`/`metadata` follows a symlink
+            // or junction after the scan and leaks target type/mtime into the
+            // output and sort order.
+            let entry_metadata = std::fs::symlink_metadata(&full_path).ok();
+            let is_dir = entry_metadata
+                .as_ref()
+                .is_some_and(std::fs::Metadata::is_dir);
 
-            let full_path = if line_path.is_absolute() {
-                line_path.to_path_buf()
-            } else {
-                search_path.join(line_path)
-            };
-            if full_path.is_dir() && !rel.ends_with('/') {
-                rel.push('/');
-            }
+            let modified = entry_metadata.and_then(|meta| meta.modified().ok());
+            entries.push(FindEntry {
+                rel,
+                modified,
+                is_dir,
+            });
+        }
 
-            let modified = std::fs::metadata(&full_path)
-                .and_then(|meta| meta.modified())
-                .ok();
-            entries.push(FindEntry { rel, modified });
+        if entries.len() > FIND_SCAN_HARD_LIMIT {
+            return Err(Error::tool(
+                "find",
+                format!(
+                    "find scan exceeded the {FIND_SCAN_HARD_LIMIT} candidate safety limit; narrow the path or pattern"
+                ),
+            ));
         }
 
         entries.sort_by(|a, b| {
@@ -6152,11 +8732,7 @@ impl Tool for FindTool {
                 (None, Some(_)) => Ordering::Greater,
                 (None, None) => Ordering::Equal,
             };
-            ordering.then_with(|| {
-                let a_lower = a.rel.to_lowercase();
-                let b_lower = b.rel.to_lowercase();
-                a_lower.cmp(&b_lower).then_with(|| a.rel.cmp(&b.rel))
-            })
+            ordering.then_with(|| compare_paths_for_line_output(&a.rel, &b.rel))
         });
 
         if entries.is_empty() {
@@ -6169,7 +8745,13 @@ impl Tool for FindTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
@@ -6179,8 +8761,14 @@ impl Tool for FindTool {
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
         for entry in entries.into_iter().take(effective_limit) {
-            output_builder.push_line(&entry.rel);
-            append_artifact_source_line(&mut artifact_source, &entry.rel);
+            let escaped_path = path_for_line_output(&entry.rel);
+            let line = if entry.is_dir {
+                format!("{escaped_path}/")
+            } else {
+                escaped_path
+            };
+            output_builder.push_line(&line);
+            append_artifact_source_line(&mut artifact_source, &line);
         }
         let mut truncation = output_builder.finish();
 
@@ -6196,7 +8784,7 @@ impl Tool for FindTool {
         if result_limit_reached {
             notices.push(format!(
                 "{effective_limit} results limit reached. Use limit={} for more, or refine pattern",
-                effective_limit * 2
+                effective_limit.saturating_mul(2)
             ));
             details_map.insert(
                 "resultLimitReached".to_string(),
@@ -6236,7 +8824,13 @@ impl Tool for FindTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&search_path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                recursive_cache_access,
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -6258,6 +8852,8 @@ struct LsInput {
 pub struct LsTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    #[cfg(test)]
+    after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LsTool {
@@ -6265,6 +8861,8 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            #[cfg(test)]
+            after_scope_hook: None,
         }
     }
 
@@ -6273,6 +8871,19 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
+            after_scope_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_after_scope_hook(
+        cwd: &Path,
+        after_scope_hook: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            artifact_root: None,
+            after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
 }
@@ -6326,6 +8937,19 @@ impl Tool for LsTool {
             ));
         }
 
+        let cwd_scope = open_scoped_scan_root(&self.cwd, &self.cwd, false, None)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "ls",
+                    format!(
+                        "Cannot pin working directory {} for listing: {}",
+                        path_for_line_output(&self.cwd),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+
         let dir_path = input
             .path
             .as_ref()
@@ -6336,51 +8960,89 @@ impl Tool for LsTool {
 
         let dir_metadata = std_metadata_async(&dir_path).await.map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
-                Error::tool("ls", format!("Path not found: {}", dir_path.display()))
+                Error::tool(
+                    "ls",
+                    format!("Path not found: {}", path_for_line_output(&dir_path)),
+                )
             } else {
-                Error::tool("ls", format!("Cannot read directory: {err}"))
+                Error::tool(
+                    "ls",
+                    format!("Cannot read directory: {}", error_for_line_output(&err)),
+                )
             }
         })?;
         if !dir_metadata.is_dir() {
             return Err(Error::tool(
                 "ls",
-                format!("Not a directory: {}", dir_path.display()),
+                format!("Not a directory: {}", path_for_line_output(&dir_path)),
             ));
         }
         ensure_ancestors_searchable(&dir_path)
             .await
-            .map_err(|err| Error::tool("ls", format!("Cannot read directory: {err}")))?;
+            .map_err(|err| {
+                Error::tool(
+                    "ls",
+                    format!("Cannot read directory: {}", error_for_line_output(&err)),
+                )
+            })?;
         ensure_effective_mode_access(
             &dir_metadata,
             &dir_path,
             UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
             "directory listing",
         )
-        .map_err(|err| Error::tool("ls", format!("Cannot read directory: {err}")))?;
+        .map_err(|err| {
+            Error::tool(
+                "ls",
+                format!("Cannot read directory: {}", error_for_line_output(&err)),
+            )
+        })?;
+        #[cfg(test)]
+        let after_scope_hook = self.after_scope_hook.clone();
+        #[cfg(not(test))]
+        let after_scope_hook = None;
+        let scoped_root = open_scoped_scan_root(&dir_path, &self.cwd, false, after_scope_hook)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "ls",
+                    format!(
+                        "Cannot pin directory {} for listing: {}",
+                        path_for_line_output(&dir_path),
+                        error_for_line_output(&err)
+                    ),
+                )
+            })?;
+        let listing_path = scoped_root.io_path();
 
         let cache_key = tool_cache_key("ls", &self.cwd, &input_value);
         let cache_mode = ToolCacheFingerprintMode::DirectoryImmediate;
-        let cache_deps = cache_dependency_for_path(&dir_path, cache_mode);
+        let cache_deps =
+            cache_dependencies_for_scoped_scan(&scoped_root, &cwd_scope, cache_mode, None);
         if let Some(output) = cached_tool_output(&cache_key, cache_deps.as_deref()) {
             return Ok(output);
         }
 
         let mut entries = Vec::new();
-        let mut read_dir = asupersync::fs::read_dir(&dir_path)
-            .await
-            .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
+        let mut read_dir = asupersync::fs::read_dir(&listing_path).await.map_err(|e| {
+            Error::tool(
+                "ls",
+                format!("Cannot read directory: {}", error_for_line_output(&e)),
+            )
+        })?;
 
         let mut scan_limit_reached = false;
-        while let Some(entry) = read_dir
-            .next_entry()
-            .await
-            .map_err(|e| Error::tool("ls", format!("Cannot read directory entry: {e}")))?
-        {
+        while let Some(entry) = read_dir.next_entry().await.map_err(|e| {
+            Error::tool(
+                "ls",
+                format!("Cannot read directory entry: {}", error_for_line_output(&e)),
+            )
+        })? {
             if entries.len() >= LS_SCAN_HARD_LIMIT {
                 scan_limit_reached = true;
                 break;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
+            let name = entry.file_name();
             // Handle broken symlinks or permission errors by treating them as non-directories
             // Optimization: use file_type() first to avoid stat overhead on every file.
             let is_dir = match entry.file_type().await {
@@ -6399,8 +9061,9 @@ impl Tool for LsTool {
             entries.push((name, is_dir));
         }
 
-        // Sort alphabetically (case-insensitive).
-        entries.sort_by_cached_key(|(a, _)| a.to_lowercase());
+        // Sort alphabetically (case-insensitive) with a lossless deterministic
+        // tie-breaker for names that differ only by case or invalid Unix bytes.
+        entries.sort_by(|(a, _), (b, _)| compare_paths_for_line_output(Path::new(a), Path::new(b)));
 
         let mut output_builder = HeadTruncatingLineWriter::new(DEFAULT_MAX_BYTES);
         let mut artifact_source = String::new();
@@ -6412,7 +9075,12 @@ impl Tool for LsTool {
                 entry_limit_reached = true;
                 break;
             }
-            let line = if is_dir { format!("{entry}/") } else { entry };
+            let escaped_entry = path_for_line_output(Path::new(&entry));
+            let line = if is_dir {
+                format!("{escaped_entry}/")
+            } else {
+                escaped_entry
+            };
             output_builder.push_line(&line);
             append_artifact_source_line(&mut artifact_source, &line);
             emitted_entries = emitted_entries.saturating_add(1);
@@ -6426,7 +9094,13 @@ impl Tool for LsTool {
             };
             cache_tool_output(
                 cache_key,
-                stable_cache_dependency_for_path(&dir_path, cache_mode, cache_deps.as_deref()),
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    None,
+                    cache_deps.as_deref(),
+                ),
                 &output,
             );
             return Ok(output);
@@ -6442,7 +9116,7 @@ impl Tool for LsTool {
         if entry_limit_reached {
             notices.push(format!(
                 "{effective_limit} entries limit reached. Use limit={} for more",
-                effective_limit * 2
+                effective_limit.saturating_mul(2)
             ));
             details_map.insert(
                 "entryLimitReached".to_string(),
@@ -6492,7 +9166,13 @@ impl Tool for LsTool {
         };
         cache_tool_output(
             cache_key,
-            stable_cache_dependency_for_path(&dir_path, cache_mode, cache_deps.as_deref()),
+            stable_cache_dependencies_for_scoped_scan(
+                &scoped_root,
+                &cwd_scope,
+                cache_mode,
+                None,
+                cache_deps.as_deref(),
+            ),
             &output,
         );
         Ok(output)
@@ -7246,7 +9926,7 @@ pub(crate) fn isolate_command_process_group(command: &mut Command) {
 
 fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
     if let Ok(rel) = file_path.strip_prefix(cwd) {
-        let rel_str = rel.display().to_string().replace('\\', "/");
+        let rel_str = path_for_line_output(rel);
         if !rel_str.is_empty() {
             return rel_str;
         }
@@ -7255,74 +9935,57 @@ fn format_grep_path(file_path: &Path, cwd: &Path) -> String {
     let canonical_file = safe_canonicalize(file_path);
     let canonical_cwd = safe_canonicalize(cwd);
     if let Ok(rel) = canonical_file.strip_prefix(&canonical_cwd) {
-        let rel_str = rel.display().to_string().replace('\\', "/");
+        let rel_str = path_for_line_output(rel);
         if !rel_str.is_empty() {
             return rel_str;
         }
     }
 
-    file_path.display().to_string().replace('\\', "/")
+    path_for_line_output(file_path)
 }
 
-async fn get_file_lines_async<'a>(
-    path: &Path,
-    cache: &'a mut HashMap<PathBuf, Vec<String>>,
-) -> &'a [String] {
-    // Recheck access even for cached content so a mode change cannot expose
-    // lines that are no longer readable during the same scan.
-    let metadata = match std_metadata_async(path).await {
-        Ok(metadata) => metadata,
+async fn get_file_lines_async(path: &Path, cwd: &Path) -> Vec<String> {
+    // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
+    // Open the exact result path without following a terminal link and
+    // verify its descriptor identity against the scoped path snapshot.
+    // This prevents a concurrent workspace mutation from swapping an rg
+    // result to an out-of-scope file between search and context rendering.
+    let path_for_read = path.to_path_buf();
+    let cwd_for_read = cwd.to_path_buf();
+    let bytes = match asupersync::runtime::spawn_blocking_io(move || {
+        read_scoped_file_capped_sync(&path_for_read, &cwd_for_read, GREP_CONTEXT_MAX_FILE_BYTES)
+    })
+    .await
+    {
+        Ok(bytes) => bytes,
         Err(err) => {
-            tracing::debug!("Failed to inspect grep file {}: {err}", path.display());
-            cache.insert(path.to_path_buf(), Vec::new());
-            return &[];
+            tracing::debug!(
+                "Failed to read grep file {}: {}",
+                path_for_line_output(path),
+                error_for_line_output(&err)
+            );
+            return Vec::new();
         }
     };
-    if !metadata.is_file() || metadata.len() > 10 * 1024 * 1024 {
-        cache.insert(path.to_path_buf(), Vec::new());
-        return &[];
-    }
-    if let Err(err) = ensure_ancestors_searchable(path).await {
-        tracing::debug!("Failed to read grep file {}: {err}", path.display());
-        cache.insert(path.to_path_buf(), Vec::new());
-        return &[];
-    }
-    if let Err(err) =
-        ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_READ, "file reading")
-    {
-        tracing::debug!("Failed to read grep file {}: {err}", path.display());
-        cache.insert(path.to_path_buf(), Vec::new());
-        return &[];
-    }
-
-    if !cache.contains_key(path) {
-        // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
-        let bytes = match asupersync::fs::read(path).await {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::debug!("Failed to read grep file {}: {err}", path.display());
-                cache.insert(path.to_path_buf(), Vec::new());
-                return &[];
+    let content = String::from_utf8_lossy(&bytes);
+    let mut lines = Vec::new();
+    for line in content.split('\n') {
+        let trimmed = line.strip_suffix('\r').unwrap_or(line);
+        for piece in trimmed.split('\r') {
+            if lines.len() == GREP_CONTEXT_MAX_LINES {
+                tracing::debug!(
+                    "Refusing to materialize more than {GREP_CONTEXT_MAX_LINES} grep context lines from {}",
+                    path_for_line_output(path)
+                );
+                return Vec::new();
             }
-        };
-        let content = String::from_utf8_lossy(&bytes);
-        let mut lines = Vec::new();
-        for line in content.split('\n') {
-            let trimmed = line.strip_suffix('\r').unwrap_or(line);
-            for piece in trimmed.split('\r') {
-                lines.push(piece.to_string());
-            }
+            lines.push(piece.to_string());
         }
-        if content.ends_with('\n') && lines.last().is_some_and(std::string::String::is_empty) {
-            lines.pop();
-        }
-        cache.insert(path.to_path_buf(), lines);
     }
-    if let Some(lines) = cache.get(path) {
-        lines.as_slice()
-    } else {
-        &[]
+    if content.ends_with('\n') && lines.last().is_some_and(std::string::String::is_empty) {
+        lines.pop();
     }
+    lines
 }
 
 fn find_fd_binary() -> Option<&'static str> {
@@ -7538,12 +10201,22 @@ struct ResolvedEdit<'a> {
 
 pub struct HashlineEditTool {
     cwd: PathBuf,
+    before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl HashlineEditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            before_persist_hook: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+            before_persist_hook: Some(Arc::new(hook)),
         }
     }
 }
@@ -7771,16 +10444,16 @@ impl Tool for HashlineEditTool {
             ));
         }
 
-        // Read file content
-        let file = asupersync::fs::File::open(&absolute_path)
-            .await
-            .map_err(|e| Error::tool("hashline_edit", format!("Cannot open file: {e}")))?;
-        let mut raw = Vec::new();
-        let mut limiter = file.take(READ_TOOL_MAX_BYTES.saturating_add(1));
-        limiter
-            .read_to_end(&mut raw)
-            .await
-            .map_err(|e| Error::tool("hashline_edit", format!("Cannot read file: {e}")))?;
+        // Read the transformation source through the validated, no-follow
+        // descriptor path. The digest of these exact bytes becomes the
+        // optimistic-CAS expectation checked immediately before rename.
+        let path_for_read = absolute_path.clone();
+        let cwd_for_read = self.cwd.clone();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            read_scoped_file_capped_sync(&path_for_read, &cwd_for_read, READ_TOOL_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("Cannot read file: {e}")))?;
 
         if raw.len() as u64 > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
@@ -7789,6 +10462,7 @@ impl Tool for HashlineEditTool {
             ));
         }
 
+        let source_expectation = AtomicContentExpectation::from_bytes(&raw);
         let raw_content = String::from_utf8(raw).map_err(|_| {
             Error::tool(
                 "hashline_edit",
@@ -8025,35 +10699,29 @@ impl Tool for HashlineEditTool {
 
         // Atomic write (same pattern as EditTool)
         let absolute_path_clone = absolute_path.clone();
+        let cwd_clone = self.cwd.clone();
         let final_content_bytes = final_content.into_bytes();
+        let before_persist_hook = self.before_persist_hook.clone();
         asupersync::runtime::spawn_blocking_io(move || {
-            let original_perms = std::fs::metadata(&absolute_path_clone)
-                .ok()
-                .map(|m| m.permissions());
-            let parent = absolute_path_clone
-                .parent()
-                .unwrap_or_else(|| Path::new("."));
-            let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
-
-            temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
-
-            if let Some(perms) = original_perms {
-                let _ = temp_file.as_file().set_permissions(perms);
-            } else {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = temp_file
-                        .as_file()
-                        .set_permissions(std::fs::Permissions::from_mode(0o644));
-                }
-            }
-
-            temp_file
-                .persist(&absolute_path_clone)
-                .map_err(|e| e.error)?;
-            Ok(())
+            before_persist_hook.map_or_else(
+                || {
+                    atomic_replace_file_if_unchanged(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        source_expectation,
+                    )
+                },
+                |hook| {
+                    atomic_replace_file_with(
+                        &absolute_path_clone,
+                        &cwd_clone,
+                        &final_content_bytes,
+                        Some(source_expectation),
+                        move || hook(),
+                    )
+                },
+            )
         })
         .await
         .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")))?;
@@ -8167,6 +10835,201 @@ mod tests {
             tolerate_fsync_refusal(Err(Error::new(ErrorKind::PermissionDenied, "no")), "x", p)
                 .is_err()
         );
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn atomic_replace_parent_swap_cannot_redirect_persistence_outside_cwd() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("atomic replacement fixture");
+        let cwd = tmp.path().join("workspace");
+        let parent = cwd.join("parent");
+        std::fs::create_dir_all(&parent).expect("create replacement parent");
+        let target = parent.join("target.txt");
+        std::fs::write(&target, "original\n").expect("write original target");
+
+        let outside_parent = tmp.path().join("outside");
+        std::fs::create_dir(&outside_parent).expect("create outside parent");
+        let outside_target = outside_parent.join("target.txt");
+        std::fs::write(&outside_target, "outside sentinel\n").expect("write outside sentinel");
+        let displaced_parent = cwd.join("parent-original");
+
+        let result = atomic_replace_file_with(&target, &cwd, b"replacement\n", None, || {
+            std::fs::rename(&parent, &displaced_parent).expect("displace validated parent");
+            symlink(&outside_parent, &parent).expect("redirect parent path outside cwd");
+        });
+
+        let error = result.expect_err("a changed parent pathname must be reported");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            std::fs::read_to_string(&outside_target).expect("read outside sentinel"),
+            "outside sentinel\n",
+            "descriptor-relative rename must not touch the redirected target"
+        );
+        assert_eq!(
+            std::fs::read_to_string(displaced_parent.join("target.txt"))
+                .expect("read unchanged pinned-directory target"),
+            "original\n",
+            "a parent swap observed before rename must abort the mutation"
+        );
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn edit_rejects_same_inode_change_before_persist_and_preserves_concurrent_writer() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("edit CAS fixture");
+            let target = tmp.path().join("target.txt");
+            std::fs::write(&target, "before\nORIGINAL\nafter\n").expect("write edit source");
+            let original_inode = std::fs::metadata(&target).expect("stat edit source").ino();
+            let hook_target = target.clone();
+            let tool = EditTool::with_before_persist_hook(tmp.path(), move || {
+                std::fs::write(&hook_target, "concurrent writer\n")
+                    .expect("same-inode concurrent edit");
+                assert_eq!(
+                    std::fs::metadata(&hook_target)
+                        .expect("stat concurrent edit")
+                        .ino(),
+                    original_inode,
+                    "fixture mutation must preserve the inode"
+                );
+            });
+
+            let error = tool
+                .execute(
+                    "edit-cas",
+                    serde_json::json!({
+                        "path": target,
+                        "oldText": "ORIGINAL",
+                        "newText": "replacement"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("Edit must reject a same-inode concurrent change");
+
+            assert!(
+                error.to_string().contains("changed since it was read"),
+                "unexpected Edit conflict: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read concurrent Edit result"),
+                "concurrent writer\n",
+                "Edit must not replace the concurrent writer"
+            );
+            assert_eq!(
+                std::fs::metadata(&target)
+                    .expect("stat preserved concurrent Edit result")
+                    .ino(),
+                original_inode
+            );
+        });
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn hashline_edit_rejects_same_inode_change_and_preserves_concurrent_writer() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("hashline CAS fixture");
+            let target = tmp.path().join("target.txt");
+            std::fs::write(&target, "before\nORIGINAL\nafter\n").expect("write hashline source");
+            let original_inode = std::fs::metadata(&target)
+                .expect("stat hashline source")
+                .ino();
+            let original_tag = format_hashline_tag(1, "ORIGINAL");
+            let hook_target = target.clone();
+            let tool = HashlineEditTool::with_before_persist_hook(tmp.path(), move || {
+                std::fs::write(&hook_target, "concurrent hashline writer\n")
+                    .expect("same-inode concurrent hashline edit");
+                assert_eq!(
+                    std::fs::metadata(&hook_target)
+                        .expect("stat concurrent hashline edit")
+                        .ino(),
+                    original_inode,
+                    "fixture mutation must preserve the inode"
+                );
+            });
+
+            let error = tool
+                .execute(
+                    "hashline-cas",
+                    serde_json::json!({
+                        "path": target,
+                        "edits": [{
+                            "op": "replace",
+                            "pos": original_tag,
+                            "lines": "replacement"
+                        }]
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("HashlineEdit must reject a same-inode concurrent change");
+
+            assert!(
+                error.to_string().contains("changed since it was read"),
+                "unexpected HashlineEdit conflict: {error}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read concurrent HashlineEdit result"),
+                "concurrent hashline writer\n",
+                "HashlineEdit must not replace the concurrent writer"
+            );
+            assert_eq!(
+                std::fs::metadata(&target)
+                    .expect("stat preserved concurrent HashlineEdit result")
+                    .ino(),
+                original_inode
+            );
+        });
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+    #[test]
+    fn write_intentionally_overwrites_same_inode_change_before_persist() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("write overwrite fixture");
+            let target = tmp.path().join("target.txt");
+            std::fs::write(&target, "original\n").expect("write initial target");
+            let original_inode = std::fs::metadata(&target)
+                .expect("stat initial target")
+                .ino();
+            let hook_target = target.clone();
+            let tool = WriteTool::with_before_persist_hook(tmp.path(), move || {
+                std::fs::write(&hook_target, "concurrent writer\n")
+                    .expect("same-inode concurrent write");
+                assert_eq!(
+                    std::fs::metadata(&hook_target)
+                        .expect("stat concurrent write")
+                        .ino(),
+                    original_inode,
+                    "fixture mutation must preserve the inode"
+                );
+            });
+
+            tool.execute(
+                "write-overwrite",
+                serde_json::json!({
+                    "path": target,
+                    "content": "requested write\n"
+                }),
+                None,
+            )
+            .await
+            .expect("Write intentionally overwrites concurrent content");
+
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read final Write result"),
+                "requested write\n"
+            );
+        });
     }
 
     #[test]
@@ -8698,6 +11561,398 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cache_permission_fingerprints_do_not_read_mode_denied_content() {
+        let tmp = tempfile::tempdir().expect("cache permission workspace");
+        let denied_file = tmp.path().join("owner-denied.txt");
+        std::fs::write(&denied_file, "cache secret").expect("write denied cache fixture");
+        let file_guard = UnixModeGuard::set(&denied_file, 0o004);
+        assert!(
+            fingerprint_file_content(&denied_file).is_none(),
+            "file fingerprinting must not borrow other-read for an owner-denied file"
+        );
+        drop(file_guard);
+
+        let denied_dir = tmp.path().join("denied-tree");
+        std::fs::create_dir(&denied_dir).expect("create denied cache directory");
+        std::fs::write(denied_dir.join("secret.txt"), "recursive cache secret")
+            .expect("write recursive cache fixture");
+        let dir_guard = UnixModeGuard::set(&denied_dir, 0o000);
+        assert!(
+            fingerprint_directory_recursive(tmp.path()).is_none(),
+            "recursive fingerprinting must stop before a mode-denied subtree"
+        );
+        drop(dir_guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_git_ignore_resolution_short_circuits_xdg_after_home_match() {
+        let tmp = tempfile::tempdir().expect("global git config fixture");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).expect("create xdg git config directory");
+        std::fs::create_dir(&home).expect("create home directory");
+        let home_config = home.join(".gitconfig");
+        std::fs::write(
+            &home_config,
+            "[core]\n    excludesFile = ~/home-global-ignore\n",
+        )
+        .expect("write home git config");
+        let xdg_config = xdg.join("git").join("config");
+        std::fs::write(
+            &xdg_config,
+            "[core]\n    excludesFile = /must-not-be-consumed\n",
+        )
+        .expect("write xdg git config");
+        let _xdg_mode_guard = UnixModeGuard::set(&xdg_config, 0o000);
+        let locations = GitGlobalConfigLocations {
+            home_dir: Some(home.clone()),
+            xdg_config_home: Some(xdg),
+        };
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let controls = resolve_git_global_ignore_controls(
+            &locations,
+            &access_context,
+            "global git config test",
+        )
+        .expect("a home match must short-circuit the denied xdg config");
+        assert_eq!(controls.consumed_config_paths, vec![home_config]);
+        assert_eq!(controls.ignore_path, Some(home.join("home-global-ignore")));
+    }
+
+    #[test]
+    fn global_git_ignore_parser_matches_broad_tilde_expansion_with_a_bound() {
+        let home = Path::new("/synthetic/home");
+        let candidate = "prefix~middle~suffix";
+        let config = format!("[core]\n    excludesFile = {candidate}\n");
+        let parsed = parse_gitconfig_excludes_path(config.as_bytes(), Some(home))
+            .expect("bounded tilde expansion")
+            .expect("configured excludesFile");
+        assert_eq!(
+            parsed,
+            PathBuf::from(candidate.replace('~', &home.to_string_lossy()))
+        );
+
+        let expansion_unit = "h".repeat(128);
+        let tilde_count = GIT_GLOBAL_IGNORE_PATH_MAX_BYTES / expansion_unit.len() + 1;
+        let oversized = format!("[core]\n    excludesFile = {}\n", "~".repeat(tilde_count));
+        let error =
+            parse_gitconfig_excludes_path(oversized.as_bytes(), Some(Path::new(&expansion_unit)))
+                .expect_err("broad replacement must not amplify beyond the path bound");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("expanded"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn fd_global_ignore_resolution_uses_xdg_strategy_on_unix_and_macos() {
+        let locations = GitGlobalConfigLocations {
+            home_dir: Some(PathBuf::from("/synthetic/home")),
+            xdg_config_home: Some(PathBuf::from("/synthetic/xdg")),
+        };
+        assert_eq!(
+            fd_global_ignore_path_from_locations(&locations),
+            Some(PathBuf::from("/synthetic/xdg/fd/ignore"))
+        );
+
+        let fallback = GitGlobalConfigLocations {
+            home_dir: Some(PathBuf::from("/synthetic/home")),
+            xdg_config_home: Some(PathBuf::from("/synthetic/home/.config")),
+        };
+        assert_eq!(
+            fd_global_ignore_path_from_locations(&fallback),
+            Some(PathBuf::from("/synthetic/home/.config/fd/ignore"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_git_ignore_resolution_rejects_mode_denied_consumed_configs() {
+        let tmp = tempfile::tempdir().expect("denied global git config fixture");
+        let home = tmp.path().join("home");
+        let xdg = tmp.path().join("xdg");
+        std::fs::create_dir_all(xdg.join("git")).expect("create xdg git config directory");
+        std::fs::create_dir(&home).expect("create home directory");
+        let locations = GitGlobalConfigLocations {
+            home_dir: Some(home.clone()),
+            xdg_config_home: Some(xdg.clone()),
+        };
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let home_config = home.join(".gitconfig");
+        std::fs::write(&home_config, "[core]\n").expect("write home git config");
+        let home_guard = UnixModeGuard::set(&home_config, 0o004);
+        let error = resolve_git_global_ignore_controls(
+            &locations,
+            &access_context,
+            "global git config test",
+        )
+        .expect_err("the selected owner class must reject a denied home config");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        drop(home_guard);
+
+        let xdg_config = xdg.join("git").join("config");
+        std::fs::write(
+            &xdg_config,
+            "[core]\n    excludesFile = /xdg-global-ignore\n",
+        )
+        .expect("write xdg git config");
+        let _xdg_guard = UnixModeGuard::set(&xdg_config, 0o004);
+        let error = resolve_git_global_ignore_controls(
+            &locations,
+            &access_context,
+            "global git config test",
+        )
+        .expect_err("xdg is consumed when home has no excludesFile and must be mode-checked");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_git_ignore_resolution_rejects_oversized_consumed_config() {
+        let tmp = tempfile::tempdir().expect("oversized global git config fixture");
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).expect("create home directory");
+        let config = home.join(".gitconfig");
+        let oversized_len = usize::try_from(GIT_GLOBAL_CONFIG_MAX_BYTES)
+            .expect("global config limit fits usize")
+            .saturating_add(1);
+        std::fs::write(&config, vec![b'x'; oversized_len])
+            .expect("write oversized global git config");
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let error = resolve_git_global_ignore_controls(
+            &GitGlobalConfigLocations {
+                home_dir: Some(home),
+                xdg_config_home: None,
+            },
+            &access_context,
+            "global git config test",
+        )
+        .expect_err("an oversized consumed config must not be read without a bound");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains(&config.display().to_string()));
+    }
+
+    #[test]
+    fn recursive_scan_rejects_oversized_ignore_control_before_walking() {
+        let tmp = tempfile::tempdir().expect("oversized ignore-control fixture");
+        let control = tmp.path().join(".gitignore");
+        let file = std::fs::File::create(&control).expect("create sparse ignore control");
+        file.set_len(RECURSIVE_SCAN_IGNORE_CONTROL_MAX_BYTES.saturating_add(1))
+            .expect("size sparse ignore control");
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+
+        let error =
+            ensure_ignore_control_readable_sync(&control, &access_context, "recursive scan test")
+                .expect_err("the in-process ignore parser must have an explicit input bound");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+        assert!(error.to_string().contains(&control.display().to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_applies_relative_global_git_ignore_from_command_cwd() {
+        let tmp = tempfile::tempdir().expect("relative global ignore fixture");
+        let cwd = tmp.path().join("workspace");
+        let home = tmp.path().join("home");
+        let search_root = cwd.join("scan-root");
+        let ignored = search_root.join("ignored-vault");
+        std::fs::create_dir_all(&ignored).expect("create ignored directory");
+        std::fs::create_dir(&home).expect("create home directory");
+        std::fs::create_dir(cwd.join("config")).expect("create relative ignore directory");
+        std::fs::write(search_root.join("visible.txt"), "needle\n").expect("write visible file");
+        std::fs::write(ignored.join("secret.txt"), "needle\n").expect("write ignored file");
+        std::fs::write(
+            home.join(".gitconfig"),
+            "[core]\n    excludesFile = config/global.ignore\n",
+        )
+        .expect("write relative global git config");
+        std::fs::write(
+            cwd.join("config").join("global.ignore"),
+            "scan-root/ignored-vault/\n",
+        )
+        .expect("write relative global ignore file");
+
+        let access_context = EffectiveModeAccessContext::current().expect("effective identity");
+        let controls = resolve_git_global_ignore_controls(
+            &GitGlobalConfigLocations {
+                home_dir: Some(home),
+                xdg_config_home: None,
+            },
+            &access_context,
+            "relative global ignore test",
+        )
+        .expect("resolve relative global ignore");
+        let global_ignore = ignore_control_path_from_command_cwd(
+            controls.ignore_path.expect("configured global ignore"),
+            &cwd,
+        );
+        ensure_ignore_control_readable_sync(
+            &global_ignore,
+            &access_context,
+            "relative global ignore test",
+        )
+        .expect("validate relative global ignore");
+
+        let walker = recursive_scan_walk_builder(
+            &search_root,
+            &cwd,
+            RecursiveScanAccess::ReadableFiles,
+            None,
+            Some(&global_ignore),
+        )
+        .expect("build recursive walker")
+        .build();
+        let visited = walker
+            .map(|entry| entry.expect("walk entry").into_path())
+            .collect::<Vec<_>>();
+
+        assert!(visited.contains(&search_root.join("visible.txt")));
+        assert!(!visited.contains(&ignored));
+        assert!(!visited.contains(&ignored.join("secret.txt")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_accepts_linked_worktree_git_file() {
+        let tmp = tempfile::tempdir().expect("linked worktree fixture");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir(&worktree).expect("create linked worktree");
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /tmp/example-git-common-dir/worktrees/example\n",
+        )
+        .expect("write linked-worktree .git file");
+        std::fs::write(worktree.join("visible.txt"), "needle\n").expect("write visible file");
+
+        for access in [
+            RecursiveScanAccess::ReadableFiles,
+            RecursiveScanAccess::DirectoriesOnly,
+        ] {
+            ensure_recursive_scan_access_sync(
+                &worktree,
+                tmp.path(),
+                "linked worktree scan",
+                access,
+                None,
+            )
+            .expect("a regular .git file must not make .git/info/exclude an ENOTDIR failure");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_grep_glob_is_rooted_at_command_cwd() {
+        let tmp = tempfile::tempdir().expect("grep glob fixture");
+        let search_root = tmp.path().join("scan-root");
+        let nested = search_root.join("a");
+        std::fs::create_dir_all(&nested).expect("create nested scan root");
+        let denied = nested.join("owner-denied.txt");
+        std::fs::write(&denied, "needle\n").expect("write denied glob fixture");
+        let _mode_guard = UnixModeGuard::set(&denied, 0o004);
+
+        let error = ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            Some("scan-root/a/*.txt"),
+        )
+        .expect_err("cwd-relative rg glob includes the owner-denied file");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            Some("a/*.txt"),
+        )
+        .expect("a slash glob that rg evaluates outside its cwd-relative surface must not deny");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_scan_applies_explicit_root_ignore_from_command_cwd() {
+        let tmp = tempfile::tempdir().expect("explicit ignore fixture");
+        let search_root = tmp.path().join("scan-root");
+        let ignored = search_root.join("ignored-vault");
+        std::fs::create_dir_all(&ignored).expect("create ignored directory");
+        std::fs::write(ignored.join("secret.txt"), "needle\n").expect("write ignored file");
+        std::fs::write(search_root.join(".gitignore"), "scan-root/ignored-vault/\n")
+            .expect("write cwd-relative explicit ignore rule");
+        let _mode_guard = UnixModeGuard::set(&ignored, 0o000);
+
+        ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            None,
+        )
+        .expect("the preflight must honor the same explicit --ignore-file surface as rg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_grep_validates_ignore_control_hidden_by_positive_glob() {
+        let tmp = tempfile::tempdir().expect("nested ignore control fixture");
+        let search_root = tmp.path().join("scan-root");
+        let nested = search_root.join("nested");
+        std::fs::create_dir_all(&nested).expect("create nested directory");
+        std::fs::write(nested.join("visible.txt"), "needle\n").expect("write visible file");
+        let ignore_control = nested.join(".gitignore");
+        std::fs::write(&ignore_control, "ignored.txt\n").expect("write nested ignore control");
+        let _mode_guard = UnixModeGuard::set(&ignore_control, 0o004);
+
+        let error = ensure_recursive_scan_access_sync(
+            &search_root,
+            tmp.path(),
+            "recursive content scanning",
+            RecursiveScanAccess::ReadableFiles,
+            Some("scan-root/**/*.txt"),
+        )
+        .expect_err("rg consumes a nested ignore control even when its positive glob hides it");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_scan_path_checks_lexical_parent_erased_by_terminal_symlink() {
+        use std::os::unix::fs::symlink;
+
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().expect("terminal symlink fixture");
+            let target = tmp.path().join("target");
+            std::fs::create_dir(&target).expect("create accessible target");
+            let blocked_parent = tmp.path().join("blocked-parent");
+            std::fs::create_dir(&blocked_parent).expect("create blocked lexical parent");
+            let lexical_path = blocked_parent.join("scan-link");
+            symlink(&target, &lexical_path).expect("create terminal symlink");
+            let canonical_path = std::fs::canonicalize(&lexical_path).expect("canonical target");
+            let _mode_guard = UnixModeGuard::set(&blocked_parent, 0o000);
+
+            let error = ensure_scan_path_ancestors_searchable(&lexical_path, &canonical_path)
+                .await
+                .expect_err("a mode-denied lexical parent must survive canonical scope checks");
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                error
+                    .to_string()
+                    .contains(&blocked_parent.display().to_string()),
+                "permission error must identify the denied lexical ancestor: {error}"
+            );
+        });
+    }
+
     async fn assert_read_cache_hit_and_stale(tmp: &Path) {
         let note = tmp.join("note.txt");
         std::fs::write(&note, "alpha\n").expect("write note");
@@ -8727,6 +11982,336 @@ mod tests {
         assert!(first_text(&third).contains("beta"));
         assert!(!first_text(&third).contains("alpha"));
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+    }
+
+    #[cfg(unix)]
+    async fn assert_read_cache_does_not_bind_opened_inode_to_replacement_path(tmp: &Path) {
+        let target = tmp.join("read-cache-race.txt");
+        let retained_original = tmp.join("read-cache-race-opened-original.txt");
+        std::fs::write(&target, "opened inode payload\n").expect("write original read target");
+
+        let target_for_hook = target.clone();
+        let retained_for_hook = retained_original.clone();
+        let raced_tool = ReadTool::with_after_open_hook(tmp, move || {
+            std::fs::rename(&target_for_hook, &retained_for_hook)
+                .expect("retain the already-open read target");
+            std::fs::write(&target_for_hook, "replacement path payload\n")
+                .expect("install replacement read target");
+        });
+        let input = serde_json::json!({ "path": "read-cache-race.txt" });
+        let opened_output = raced_tool
+            .execute("read-cache-race-opened", input.clone(), None)
+            .await
+            .expect("read the already-open inode");
+        assert!(first_text(&opened_output).contains("opened inode payload"));
+        assert!(!first_text(&opened_output).contains("replacement path payload"));
+
+        let replacement_output = ReadTool::new(tmp)
+            .execute("read-cache-race-replacement", input, None)
+            .await
+            .expect("read the replacement pathname");
+        assert!(first_text(&replacement_output).contains("replacement path payload"));
+        assert!(!first_text(&replacement_output).contains("opened inode payload"));
+        assert_eq!(
+            std::fs::read_to_string(&retained_original).expect("read retained original"),
+            "opened inode payload\n"
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_scoped_scan_roots_survive_after_open_replacement(tmp: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().expect("create outside scan fixture");
+
+        if find_rg_binary().is_some() {
+            let cwd_root = tmp.join("grep-pinned-cwd");
+            let retained_cwd = tmp.join("grep-pinned-cwd-retained");
+            std::fs::create_dir_all(cwd_root.join("src")).expect("create pinned grep cwd");
+            std::fs::write(
+                cwd_root.join("src").join("context.txt"),
+                "before context\ninside cwd sentinel\nafter context\n",
+            )
+            .expect("write pinned cwd grep fixture");
+            let outside_cwd = outside.path().join("grep-cwd-outside");
+            std::fs::create_dir_all(outside_cwd.join("src")).expect("create replacement grep cwd");
+            std::fs::write(outside_cwd.join(".gitignore"), "src/\n")
+                .expect("write replacement cwd ignore control");
+            std::fs::write(
+                outside_cwd.join("src").join("outside.txt"),
+                "outside cwd sentinel\n",
+            )
+            .expect("write replacement cwd grep fixture");
+
+            let root_for_hook = cwd_root.clone();
+            let retained_for_hook = retained_cwd.clone();
+            let outside_for_hook = outside_cwd.clone();
+            let grep = GrepTool::with_after_scope_hook(&cwd_root, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned grep cwd");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace grep cwd with outside symlink");
+            });
+            let output = grep
+                .execute(
+                    "grep-pinned-cwd-race",
+                    serde_json::json!({
+                        "pattern": "cwd sentinel",
+                        "glob": "src/**/*.txt",
+                        "context": 1
+                    }),
+                    None,
+                )
+                .await
+                .expect("grep pinned default cwd");
+            let text = first_text(&output);
+            assert!(text.contains("before context"), "{text}");
+            assert!(text.contains("inside cwd sentinel"), "{text}");
+            assert!(text.contains("after context"), "{text}");
+            assert!(!text.contains("outside cwd sentinel"), "{text}");
+            assert!(!text.contains("unable to read file"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        if find_fd_binary().is_some() {
+            let cwd_root = tmp.join("find-pinned-cwd");
+            let retained_cwd = tmp.join("find-pinned-cwd-retained");
+            std::fs::create_dir_all(cwd_root.join("src")).expect("create pinned find cwd");
+            std::fs::write(cwd_root.join("src").join("inside.txt"), "inside\n")
+                .expect("write pinned cwd find fixture");
+            let outside_cwd = outside.path().join("find-cwd-outside");
+            std::fs::create_dir_all(outside_cwd.join("src")).expect("create replacement find cwd");
+            std::fs::write(outside_cwd.join(".gitignore"), "src/\n")
+                .expect("write replacement find ignore control");
+            std::fs::write(outside_cwd.join("src").join("outside.txt"), "outside\n")
+                .expect("write replacement cwd find fixture");
+
+            let root_for_hook = cwd_root.clone();
+            let retained_for_hook = retained_cwd.clone();
+            let outside_for_hook = outside_cwd.clone();
+            let find = FindTool::with_after_scope_hook(&cwd_root, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned find cwd");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace find cwd with outside symlink");
+            });
+            let output = find
+                .execute(
+                    "find-pinned-cwd-race",
+                    serde_json::json!({ "pattern": "src/**/*.txt" }),
+                    None,
+                )
+                .await
+                .expect("find pinned default cwd");
+            let text = first_text(&output);
+            assert!(text.contains("src/inside.txt"), "{text}");
+            assert!(!text.contains("outside.txt"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        {
+            let cwd_root = tmp.join("ls-pinned-cwd");
+            let retained_cwd = tmp.join("ls-pinned-cwd-retained");
+            std::fs::create_dir(&cwd_root).expect("create pinned ls cwd");
+            std::fs::write(cwd_root.join("inside.txt"), "inside\n")
+                .expect("write pinned cwd ls fixture");
+            let outside_cwd = outside.path().join("ls-cwd-outside");
+            std::fs::create_dir(&outside_cwd).expect("create replacement ls cwd");
+            std::fs::write(outside_cwd.join("outside.txt"), "outside\n")
+                .expect("write replacement cwd ls fixture");
+
+            let root_for_hook = cwd_root.clone();
+            let retained_for_hook = retained_cwd.clone();
+            let outside_for_hook = outside_cwd.clone();
+            let ls = LsTool::with_after_scope_hook(&cwd_root, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook).expect("retain pinned ls cwd");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace ls cwd with outside symlink");
+            });
+            let output = ls
+                .execute("ls-pinned-cwd-race", serde_json::json!({}), None)
+                .await
+                .expect("list pinned default cwd");
+            let text = first_text(&output);
+            assert!(text.contains("inside.txt"), "{text}");
+            assert!(!text.contains("outside.txt"), "{text}");
+        }
+
+        if find_rg_binary().is_some() {
+            let grep_root = tmp.join("grep-pinned-root");
+            let retained_grep_root = tmp.join("grep-pinned-root-retained");
+            std::fs::create_dir(&grep_root).expect("create grep root");
+            std::fs::write(grep_root.join("inside.txt"), "inside grep sentinel\n")
+                .expect("write inside grep fixture");
+            let outside_grep = outside.path().join("grep-outside");
+            std::fs::create_dir(&outside_grep).expect("create outside grep root");
+            std::fs::write(outside_grep.join("outside.txt"), "outside grep sentinel\n")
+                .expect("write outside grep fixture");
+
+            let root_for_hook = grep_root.clone();
+            let retained_for_hook = retained_grep_root.clone();
+            let outside_for_hook = outside_grep.clone();
+            let grep = GrepTool::with_after_scope_hook(tmp, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned grep root");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace grep path with outside symlink");
+            });
+            let output = grep
+                .execute(
+                    "grep-pinned-root-race",
+                    serde_json::json!({
+                        "pattern": "sentinel",
+                        "path": "grep-pinned-root"
+                    }),
+                    None,
+                )
+                .await
+                .expect("grep pinned directory root");
+            let text = first_text(&output);
+            assert!(text.contains("inside grep sentinel"), "{text}");
+            assert!(!text.contains("outside grep sentinel"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+
+            let grep_file = tmp.join("grep-pinned-file.txt");
+            let retained_grep_file = tmp.join("grep-pinned-file-retained.txt");
+            let outside_grep_file = outside.path().join("grep-outside-file.txt");
+            std::fs::write(&grep_file, "inside file sentinel\n").expect("write inside grep file");
+            std::fs::write(&outside_grep_file, "outside file sentinel\n")
+                .expect("write outside grep file");
+            let file_for_hook = grep_file.clone();
+            let retained_file_for_hook = retained_grep_file.clone();
+            let outside_file_for_hook = outside_grep_file.clone();
+            let grep = GrepTool::with_after_scope_hook(tmp, move || {
+                std::fs::rename(&file_for_hook, &retained_file_for_hook)
+                    .expect("retain pinned grep file");
+                symlink(&outside_file_for_hook, &file_for_hook)
+                    .expect("replace grep file with outside symlink");
+            });
+            let output = grep
+                .execute(
+                    "grep-pinned-file-race",
+                    serde_json::json!({
+                        "pattern": "sentinel",
+                        "path": "grep-pinned-file.txt"
+                    }),
+                    None,
+                )
+                .await
+                .expect("grep pinned file root");
+            let text = first_text(&output);
+            assert!(text.contains("inside file sentinel"), "{text}");
+            assert!(!text.contains("outside file sentinel"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        if find_fd_binary().is_some() {
+            let find_root = tmp.join("find-pinned-root");
+            let retained_find_root = tmp.join("find-pinned-root-retained");
+            std::fs::create_dir(&find_root).expect("create find root");
+            std::fs::write(find_root.join("inside-find.txt"), "inside\n")
+                .expect("write inside find fixture");
+            let outside_find = outside.path().join("find-outside");
+            std::fs::create_dir(&outside_find).expect("create outside find root");
+            std::fs::write(outside_find.join("outside-find.txt"), "outside\n")
+                .expect("write outside find fixture");
+
+            let root_for_hook = find_root.clone();
+            let retained_for_hook = retained_find_root.clone();
+            let outside_for_hook = outside_find.clone();
+            let find = FindTool::with_after_scope_hook(tmp, move || {
+                std::fs::rename(&root_for_hook, &retained_for_hook)
+                    .expect("retain pinned find root");
+                symlink(&outside_for_hook, &root_for_hook)
+                    .expect("replace find path with outside symlink");
+            });
+            let output = find
+                .execute(
+                    "find-pinned-root-race",
+                    serde_json::json!({
+                        "pattern": "*.txt",
+                        "path": "find-pinned-root"
+                    }),
+                    None,
+                )
+                .await
+                .expect("find pinned directory root");
+            let text = first_text(&output);
+            assert!(text.contains("inside-find.txt"), "{text}");
+            assert!(!text.contains("outside-find.txt"), "{text}");
+            assert!(!text.contains("/proc/self/fd"), "{text}");
+            assert!(!text.contains("/dev/fd"), "{text}");
+        }
+
+        let ls_root = tmp.join("ls-pinned-root");
+        let retained_ls_root = tmp.join("ls-pinned-root-retained");
+        std::fs::create_dir(&ls_root).expect("create ls root");
+        std::fs::write(ls_root.join("inside-ls.txt"), "inside\n").expect("write inside ls fixture");
+        let outside_ls = outside.path().join("ls-outside");
+        std::fs::create_dir(&outside_ls).expect("create outside ls root");
+        std::fs::write(outside_ls.join("outside-ls.txt"), "outside\n")
+            .expect("write outside ls fixture");
+
+        let root_for_hook = ls_root.clone();
+        let retained_for_hook = retained_ls_root.clone();
+        let outside_for_hook = outside_ls.clone();
+        let ls = LsTool::with_after_scope_hook(tmp, move || {
+            std::fs::rename(&root_for_hook, &retained_for_hook).expect("retain pinned ls root");
+            symlink(&outside_for_hook, &root_for_hook)
+                .expect("replace ls path with outside symlink");
+        });
+        let output = ls
+            .execute(
+                "ls-pinned-root-race",
+                serde_json::json!({ "path": "ls-pinned-root" }),
+                None,
+            )
+            .await
+            .expect("list pinned directory root");
+        let text = first_text(&output);
+        assert!(text.contains("inside-ls.txt"), "{text}");
+        assert!(!text.contains("outside-ls.txt"), "{text}");
+    }
+
+    async fn assert_find_selects_globally_newest_match(tmp: &Path) {
+        if find_fd_binary().is_none() {
+            return;
+        }
+        let root = tmp.join("find-newest-complete-root");
+        std::fs::create_dir(&root).expect("create complete find fixture");
+        let old_time = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        for index in 0..64 {
+            let old = root.join(format!("a-old-{index:03}.txt"));
+            std::fs::write(&old, "old\n").expect("write old find candidate");
+            filetime::set_file_mtime(&old, old_time).expect("set old candidate mtime");
+        }
+        let newest = root.join("z-newest.txt");
+        std::fs::write(&newest, "newest\n").expect("write newest find candidate");
+        filetime::set_file_mtime(
+            &newest,
+            filetime::FileTime::from_unix_time(1_700_000_000, 0),
+        )
+        .expect("set newest candidate mtime");
+
+        let output = FindTool::new(tmp)
+            .execute(
+                "find-global-newest",
+                serde_json::json!({
+                    "pattern": "*.txt",
+                    "path": "find-newest-complete-root",
+                    "limit": 1
+                }),
+                None,
+            )
+            .await
+            .expect("find globally newest result");
+        let text = first_text(&output);
+        assert!(text.contains("z-newest.txt"), "{text}");
+        assert!(!text.contains("a-old-"), "{text}");
     }
 
     async fn assert_ls_cache_hit_and_stale(tmp: &Path) {
@@ -8822,6 +12407,178 @@ mod tests {
         assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
     }
 
+    async fn assert_scan_caches_track_parent_ignore_control(tmp: &Path) {
+        let have_rg = find_rg_binary().is_some();
+        let have_fd = find_fd_binary().is_some();
+        if !have_rg && !have_fd {
+            return;
+        }
+
+        let search_root = tmp.join("parent-ignore-cache-root");
+        std::fs::create_dir(&search_root).expect("create parent-ignore search root");
+        std::fs::write(search_root.join("parent-grep.txt"), "parent cache needle\n")
+            .expect("write parent-ignore grep fixture");
+        std::fs::write(search_root.join("parent-find.txt"), "find fixture\n")
+            .expect("write parent-ignore find fixture");
+        let parent_ignore = tmp.join(".gitignore");
+        std::fs::write(
+            &parent_ignore,
+            "parent-ignore-cache-root/parent-grep.txt\n\
+             parent-ignore-cache-root/parent-find.txt\n",
+        )
+        .expect("write parent ignore control");
+
+        let grep_tool = GrepTool::new(tmp);
+        let grep_input = serde_json::json!({
+            "pattern": "parent cache needle",
+            "path": "parent-ignore-cache-root"
+        });
+        if have_rg {
+            let first = grep_tool
+                .execute("grep-parent-ignore-1", grep_input.clone(), None)
+                .await
+                .expect("first parent-ignore grep");
+            assert!(!first_text(&first).contains("parent-grep.txt"));
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let second = grep_tool
+                .execute("grep-parent-ignore-2", grep_input.clone(), None)
+                .await
+                .expect("cached parent-ignore grep");
+            assert_eq!(first_text(&first), first_text(&second));
+            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        }
+
+        let find_tool = FindTool::new(tmp);
+        let find_input = serde_json::json!({
+            "pattern": "parent-find.txt",
+            "path": "parent-ignore-cache-root"
+        });
+        if have_fd {
+            let first = find_tool
+                .execute("find-parent-ignore-1", find_input.clone(), None)
+                .await
+                .expect("first parent-ignore find");
+            assert!(!first_text(&first).contains("parent-find.txt"));
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let second = find_tool
+                .execute("find-parent-ignore-2", find_input.clone(), None)
+                .await
+                .expect("cached parent-ignore find");
+            assert_eq!(first_text(&first), first_text(&second));
+            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        }
+
+        std::fs::write(&parent_ignore, "").expect("clear parent ignore control");
+        if have_rg {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = grep_tool
+                .execute("grep-parent-ignore-3", grep_input, None)
+                .await
+                .expect("invalidated parent-ignore grep");
+            assert!(first_text(&third).contains("parent-grep.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+        if have_fd {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = find_tool
+                .execute("find-parent-ignore-3", find_input, None)
+                .await
+                .expect("invalidated parent-ignore find");
+            assert!(first_text(&third).contains("parent-find.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn assert_scan_caches_track_symlinked_ignore_target(tmp: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let have_rg = find_rg_binary().is_some();
+        let have_fd = find_fd_binary().is_some();
+        if !have_rg && !have_fd {
+            return;
+        }
+
+        let workspace = tmp.join("symlink-ignore-workspace");
+        let search_root = workspace.join("scan-root");
+        std::fs::create_dir_all(&search_root).expect("create symlink-ignore search root");
+        std::fs::write(
+            search_root.join("symlink-grep.txt"),
+            "symlink cache needle\n",
+        )
+        .expect("write symlink-ignore grep fixture");
+        std::fs::write(search_root.join("symlink-find.txt"), "find fixture\n")
+            .expect("write symlink-ignore find fixture");
+        let ignore_target = tmp.join("symlink-ignore-target");
+        std::fs::write(
+            &ignore_target,
+            "scan-root/symlink-grep.txt\nscan-root/symlink-find.txt\n",
+        )
+        .expect("write symlinked ignore target");
+        symlink(&ignore_target, workspace.join(".gitignore"))
+            .expect("create symlinked ignore control");
+
+        let grep_tool = GrepTool::new(&workspace);
+        let grep_input = serde_json::json!({
+            "pattern": "symlink cache needle",
+            "path": "scan-root"
+        });
+        if have_rg {
+            let first = grep_tool
+                .execute("grep-symlink-ignore-1", grep_input.clone(), None)
+                .await
+                .expect("first symlink-ignore grep");
+            assert!(!first_text(&first).contains("symlink-grep.txt"));
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let second = grep_tool
+                .execute("grep-symlink-ignore-2", grep_input.clone(), None)
+                .await
+                .expect("cached symlink-ignore grep");
+            assert_eq!(first_text(&first), first_text(&second));
+            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        }
+
+        let find_tool = FindTool::new(&workspace);
+        let find_input = serde_json::json!({
+            "pattern": "symlink-find.txt",
+            "path": "scan-root"
+        });
+        if have_fd {
+            let first = find_tool
+                .execute("find-symlink-ignore-1", find_input.clone(), None)
+                .await
+                .expect("first symlink-ignore find");
+            assert!(!first_text(&first).contains("symlink-find.txt"));
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let second = find_tool
+                .execute("find-symlink-ignore-2", find_input.clone(), None)
+                .await
+                .expect("cached symlink-ignore find");
+            assert_eq!(first_text(&first), first_text(&second));
+            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        }
+
+        std::fs::write(&ignore_target, "").expect("clear symlinked ignore target");
+        if have_rg {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = grep_tool
+                .execute("grep-symlink-ignore-3", grep_input, None)
+                .await
+                .expect("invalidated symlink-ignore grep");
+            assert!(first_text(&third).contains("symlink-grep.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+        if have_fd {
+            let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
+            let third = find_tool
+                .execute("find-symlink-ignore-3", find_input, None)
+                .await
+                .expect("invalidated symlink-ignore find");
+            assert!(first_text(&third).contains("symlink-find.txt"));
+            assert!(tool_output_cache_stats_for_tests().invalidations > invalidations_before);
+        }
+    }
+
     async fn assert_side_effect_tools_remain_uncached(tmp: &Path) {
         let side_effect_stats_before = tool_output_cache_stats_for_tests();
         let write_tool = WriteTool::new(tmp);
@@ -8885,9 +12642,17 @@ mod tests {
 
             let tmp = tempfile::tempdir().expect("create temp dir");
             assert_read_cache_hit_and_stale(tmp.path()).await;
+            #[cfg(unix)]
+            assert_read_cache_does_not_bind_opened_inode_to_replacement_path(tmp.path()).await;
+            #[cfg(unix)]
+            assert_scoped_scan_roots_survive_after_open_replacement(tmp.path()).await;
+            assert_find_selects_globally_newest_match(tmp.path()).await;
             assert_ls_cache_hit_and_stale(tmp.path()).await;
             assert_grep_cache_hit_and_stale_when_available(tmp.path()).await;
             assert_find_cache_hit_and_stale_when_available(tmp.path()).await;
+            assert_scan_caches_track_parent_ignore_control(tmp.path()).await;
+            #[cfg(unix)]
+            assert_scan_caches_track_symlinked_ignore_target(tmp.path()).await;
             assert_side_effect_tools_remain_uncached(tmp.path()).await;
         });
     }
@@ -8994,7 +12759,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rg_match_requires_path_and_line_number() {
+    fn test_rg_match_rejects_missing_or_malformed_required_fields() {
         let mut matches = Vec::new();
         let mut match_count = 0usize;
         let mut match_limit_reached = false;
@@ -9002,12 +12767,43 @@ mod tests {
 
         let missing_line =
             Ok(r#"{"type":"match","data":{"path":{"text":"file.txt"}}}"#.to_string());
-        process_rg_json_match_line(
+        let missing_line_error = process_rg_json_match_line(
             missing_line,
             &mut matches,
             &mut match_count,
             &mut match_limit_reached,
             scan_limit,
+        )
+        .expect_err("a match without line_number must fail closed");
+        assert!(missing_line_error.to_string().contains("line_number"));
+
+        let zero_line = Ok(
+            r#"{"type":"match","data":{"path":{"text":"file.txt"},"line_number":0}}"#.to_string(),
+        );
+        let zero_line_error = process_rg_json_match_line(
+            zero_line,
+            &mut matches,
+            &mut match_count,
+            &mut match_limit_reached,
+            scan_limit,
+        )
+        .expect_err("line_number zero must fail closed before context arithmetic");
+        assert!(zero_line_error.to_string().contains("line_number"));
+
+        let malformed_bytes =
+            Ok(r#"{"type":"match","data":{"path":{"bytes":"%%%"},"line_number":2}}"#.to_string());
+        let malformed_path_error = process_rg_json_match_line(
+            malformed_bytes,
+            &mut matches,
+            &mut match_count,
+            &mut match_limit_reached,
+            scan_limit,
+        )
+        .expect_err("invalid path.bytes base64 must fail closed");
+        assert!(
+            malformed_path_error
+                .to_string()
+                .contains("invalid path.bytes base64")
         );
         assert!(matches.is_empty());
         assert_eq!(match_count, 0);
@@ -9022,11 +12818,24 @@ mod tests {
             &mut match_count,
             &mut match_limit_reached,
             scan_limit,
-        );
+        )
+        .expect("valid match event");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].1, 3);
         assert_eq!(match_count, 1);
         assert!(match_limit_reached);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_ripgrep_status_is_never_classified_as_success() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .status()
+            .expect("run signaled ripgrep-status fixture");
+        assert!(status.code().is_none(), "fixture must terminate by signal");
+        let error = rg_exit_failure(status, "").expect("signal termination must be an error");
+        assert!(error.contains("signal"), "{error}");
     }
 
     #[test]
@@ -9154,8 +12963,7 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied
             );
 
-            let mut cache = HashMap::new();
-            let lines = get_file_lines_async(&path, &mut cache).await;
+            let lines = get_file_lines_async(&path, tmp.path()).await;
             assert!(lines.is_empty());
         });
     }
@@ -9179,10 +12987,65 @@ mod tests {
                 std::io::ErrorKind::PermissionDenied
             );
 
-            let mut cache = HashMap::new();
-            let lines = get_file_lines_async(&path, &mut cache).await;
+            let lines = get_file_lines_async(&path, tmp.path()).await;
             assert!(lines.is_empty());
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scoped_grep_read_rejects_terminal_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("create workspace");
+        let path = workspace.join("match.txt");
+        let displaced = workspace.join("match-original.txt");
+        std::fs::write(&path, "public match\n").expect("write original result");
+        let outside = tmp.path().join("outside-secret.txt");
+        std::fs::write(&outside, "outside secret\n").expect("write outside fixture");
+
+        let result = open_scoped_regular_file_for_read_with(&path, &workspace, || {
+            std::fs::rename(&path, &displaced).expect("displace original result");
+            symlink(&outside, &path).expect("replace result with outside symlink");
+        });
+
+        assert!(
+            result.is_err(),
+            "a terminal symlink swap must never return an outside descriptor"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scoped_grep_read_rejects_ancestor_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let workspace = tmp.path().join("workspace");
+        let result_parent = workspace.join("tree");
+        std::fs::create_dir_all(&result_parent).expect("create result parent");
+        let path = result_parent.join("match.txt");
+        std::fs::write(&path, "public match\n").expect("write original result");
+
+        let outside_parent = tmp.path().join("outside-tree");
+        std::fs::create_dir(&outside_parent).expect("create outside parent");
+        std::fs::write(outside_parent.join("match.txt"), "outside secret\n")
+            .expect("write outside fixture");
+        let displaced_parent = workspace.join("tree-original");
+
+        let result = open_scoped_regular_file_for_read_with(&path, &workspace, || {
+            std::fs::rename(&result_parent, &displaced_parent)
+                .expect("displace original result parent");
+            symlink(&outside_parent, &result_parent)
+                .expect("replace result parent with outside symlink");
+        });
+
+        assert!(
+            result.is_err(),
+            "an ancestor symlink swap must never return an outside descriptor"
+        );
     }
 
     #[test]

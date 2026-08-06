@@ -507,6 +507,35 @@ mod read_tool {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_read_permission_owner_class_does_not_borrow_other_read_bit() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("read_owner_class_is_exclusive");
+            let path = harness.create_file("owner-denied.txt", b"owner class secret");
+            let _mode_guard = UnixModeGuard::set(&path, 0o004);
+
+            let tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "path": path.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .expect_err("the owner class must not borrow the other-class read bit");
+            let message = err.to_string();
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "read should reject owner-mode 0 even when other-read is set: {message}"
+            );
+            assert!(
+                !message.contains("owner class secret"),
+                "permission failure must not disclose file contents"
+            );
+        });
+    }
+
     #[test]
     fn test_read_nonexistent_file() {
         asupersync::test_utils::run_test(|| async {
@@ -533,6 +562,31 @@ mod read_tool {
             let result = tool.execute("test-id", input, None).await;
             assert!(result.is_err());
         });
+    }
+}
+
+#[cfg(unix)]
+mod file_arguments {
+    use super::*;
+
+    #[test]
+    fn test_at_file_permission_owner_class_does_not_borrow_other_read_bit() {
+        let harness = TestHarness::new("at_file_owner_class_is_exclusive");
+        let path = harness.create_file("owner-denied.txt", b"at-file secret payload");
+        let _mode_guard = UnixModeGuard::set(&path, 0o004);
+        let file_args = vec![path.to_string_lossy().into_owned()];
+
+        let err = pi::tools::process_file_arguments(&file_args, harness.temp_dir(), true)
+            .expect_err("@file must enforce the selected owner permission class");
+        let message = err.to_string();
+        assert!(
+            message.to_lowercase().contains("permission denied"),
+            "@file should reject owner-mode 0 even when other-read is set: {message}"
+        );
+        assert!(
+            !message.contains("at-file secret payload"),
+            "permission failure must not disclose @file contents"
+        );
     }
 }
 
@@ -621,6 +675,34 @@ mod write_tool {
                 message.to_lowercase().contains("permission denied"),
                 "write should report PermissionDenied: {message}"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_rejects_parent_without_read_before_atomic_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("write_parent_without_read");
+            let parent = harness.create_dir("write-search-only");
+            let path = harness.create_file("write-search-only/target.txt", b"original");
+            let mode_guard = UnixModeGuard::set(&parent, 0o300);
+
+            let tool = pi::tools::WriteTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "content": "replacement"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("durable atomic write requires opening the parent directory");
+            assert!(err.to_string().to_lowercase().contains("permission denied"));
+
+            drop(mode_guard);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
         });
     }
 
@@ -915,6 +997,35 @@ mod edit_tool {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_edit_rejects_parent_without_read_before_atomic_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("edit_parent_without_read");
+            let parent = harness.create_dir("write-search-only");
+            let path = harness.create_file("write-search-only/target.txt", b"original");
+            let mode_guard = UnixModeGuard::set(&parent, 0o300);
+
+            let tool = pi::tools::EditTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "oldText": "original",
+                        "newText": "replacement"
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("durable atomic edit requires opening the parent directory");
+            assert!(err.to_string().to_lowercase().contains("permission denied"));
+
+            drop(mode_guard);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        });
+    }
+
     #[test]
     fn test_edit_text_not_found() {
         asupersync::test_utils::run_test(|| async {
@@ -1090,6 +1201,74 @@ mod grep_tool {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_escapes_control_characters_and_backslashes_in_file_paths() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_escapes_control_path_bytes");
+            harness.create_file("line\nbreak\\tab\tname.txt", b"needle\n");
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "needle" }), None)
+                .await
+                .expect("grep should render an unambiguous single-line path");
+            let text = get_text_content(&result.content);
+
+            assert_eq!(text, "line\\nbreak\\\\tab\\tname.txt:1: needle");
+            assert_eq!(text.lines().count(), 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_renders_invalid_utf8_filename_losslessly() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_invalid_utf8_filename");
+            let name = std::ffi::OsString::from_vec(b"cafe-\xe2\x98\x83-\xff.txt".to_vec());
+            std::fs::write(harness.temp_dir().join(name), b"needle\n")
+                .expect("create invalid UTF-8 grep fixture");
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "needle" }), None)
+                .await
+                .expect("grep must decode ripgrep path.bytes without data loss");
+            let text = get_text_content(&result.content);
+
+            assert_eq!(text, "cafe-☃-\\xFF.txt:1: needle");
+            assert_eq!(text.lines().count(), 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_sanitizes_control_bearing_external_diagnostic() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_control_bearing_diagnostic");
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let error = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "(\n\u{1b}[31m" }),
+                    None,
+                )
+                .await
+                .expect_err("invalid regex should expose a sanitized ripgrep diagnostic");
+            let message = error.to_string();
+
+            assert_eq!(message.lines().count(), 1, "diagnostic: {message:?}");
+            assert!(!message.contains('\u{1b}'), "diagnostic: {message:?}");
+            assert!(message.contains("\\n"), "diagnostic: {message:?}");
+            assert!(
+                message.to_lowercase().contains("regex parse error"),
+                "diagnostic: {message:?}"
+            );
+        });
+    }
+
     #[test]
     fn test_grep_invalid_path_reports_error() {
         asupersync::test_utils::run_test(|| async {
@@ -1143,6 +1322,162 @@ mod grep_tool {
                 !message.contains("needle"),
                 "permission failure must not disclose scanned content"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_permission_denied_for_nested_mode_zero_directory_before_scanning() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_nested_mode_zero_directory");
+            harness.create_file("public.txt", b"public needle\n");
+            let locked = harness.create_dir("buried-vault");
+            harness.create_file("buried-vault/denied-name.txt", b"denied needle payload\n");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "needle", "limit": 1 }),
+                    None,
+                )
+                .await
+                .expect_err("a nested mode-000 directory must fail closed before rg starts");
+            let message = err.to_string();
+            assert!(message.to_lowercase().contains("permission denied"));
+            assert!(!message.contains("buried-vault"));
+            assert!(!message.contains("denied-name.txt"));
+            assert!(!message.contains("denied needle payload"));
+            assert!(!message.contains("unable to read"));
+            assert!(!message.contains("limit reached"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_permission_denied_for_nested_owner_file_before_scanning() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_nested_owner_denied_file");
+            harness.create_file("public.txt", b"public needle\n");
+            let denied = harness.create_file("sealed-result.txt", b"sealed needle payload\n");
+            let _mode_guard = UnixModeGuard::set(&denied, 0o004);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "needle", "glob": "*.txt", "limit": 1 }),
+                    None,
+                )
+                .await
+                .expect_err("the owner class must not borrow other-read during recursive grep");
+            let message = err.to_string();
+            assert!(message.to_lowercase().contains("permission denied"));
+            assert!(!message.contains("sealed-result.txt"));
+            assert!(!message.contains("sealed needle payload"));
+            assert!(!message.contains("unable to read"));
+            assert!(!message.contains("limit reached"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_file_input_does_not_read_directory_ignore_controls() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_file_ignores_directory_controls");
+            let target = harness.create_file("direct.txt", b"public needle\n");
+            let control = harness.create_file(".gitignore", b"direct.txt\n");
+            let _mode_guard = UnixModeGuard::set(&control, 0o000);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let result = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({
+                        "pattern": "needle",
+                        "path": target.to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .expect("an explicit file operand bypasses directory ignore filtering");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("public needle"), "grep output: {text}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_permission_preflight_skips_gitignored_denied_descendants() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_skips_gitignored_denied_descendants");
+            harness.create_file(".gitignore", b"ignored-vault/\nignored-owner-denied.txt\n");
+            harness.create_file("public.txt", b"public needle\n");
+            let locked_dir = harness.create_dir("ignored-vault");
+            harness.create_file("ignored-vault/secret.txt", b"ignored needle\n");
+            let locked_file = harness.create_file("ignored-owner-denied.txt", b"ignored needle\n");
+            let _dir_guard = UnixModeGuard::set(&locked_dir, 0o000);
+            let _file_guard = UnixModeGuard::set(&locked_file, 0o004);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "needle" }), None)
+                .await
+                .expect("gitignored denied descendants are outside rg's scan surface");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("public.txt"), "grep output: {text}");
+            assert!(!text.contains("ignored-vault"));
+            assert!(!text.contains("ignored-owner-denied.txt"));
+            assert!(!text.contains("ignored needle"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_permission_preflight_skips_rgignored_denied_descendants() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_skips_rgignored_denied_descendants");
+            harness.create_file(".rgignore", b"ignored-vault/\n");
+            harness.create_file("public.txt", b"public needle\n");
+            let locked = harness.create_dir("ignored-vault");
+            harness.create_file("ignored-vault/secret.txt", b"ignored needle\n");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "needle" }), None)
+                .await
+                .expect(".rgignore must define the same preflight and scanner surface");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("public.txt"), "grep output: {text}");
+            assert!(!text.contains("ignored-vault"));
+            assert!(!text.contains("secret.txt"));
+            assert!(!text.contains("ignored needle"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_nested_gitignore_matches_preflight_outside_git_repository() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_nested_gitignore_outside_repository");
+            harness.create_file("nested/.gitignore", b"ignored-vault/\n");
+            harness.create_file("nested/public.txt", b"public needle\n");
+            let locked = harness.create_dir("nested/ignored-vault");
+            harness.create_file("nested/ignored-vault/secret.txt", b"ignored needle\n");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "needle" }), None)
+                .await
+                .expect("nested .gitignore semantics must match outside a git repository");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("nested/public.txt"), "grep output: {text}");
+            assert!(!text.contains("ignored-vault"));
+            assert!(!text.contains("secret.txt"));
+            assert!(!text.contains("ignored needle"));
         });
     }
 
@@ -1463,6 +1798,305 @@ mod find_tool {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_find_permission_denied_for_nested_mode_zero_directory_before_scanning() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_nested_mode_zero_directory");
+            harness.create_file("public.txt", b"");
+            let locked = harness.create_dir("buried-vault");
+            harness.create_file("buried-vault/denied-name.txt", b"");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "*.txt", "limit": 1 }),
+                    None,
+                )
+                .await
+                .expect_err("a nested mode-000 directory must fail closed before fd starts");
+            let message = err.to_string();
+            assert!(message.to_lowercase().contains("permission denied"));
+            assert!(!message.contains("buried-vault"));
+            assert!(!message.contains("denied-name.txt"));
+            assert!(!message.contains("limit reached"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_permission_policy_allows_owner_unreadable_regular_file_names() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_unreadable_regular_file_name");
+            let unreadable = harness.create_file("visible-name.txt", b"unreadable payload");
+            let _mode_guard = UnixModeGuard::set(&unreadable, 0o004);
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "*.txt" }), None)
+                .await
+                .expect("find only enumerates the directory entry name");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("visible-name.txt"), "find output: {text}");
+            assert!(!text.contains("unreadable payload"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_no_follow_does_not_classify_symlink_by_target_metadata() {
+        use std::os::unix::fs::symlink;
+
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_no_follow_symlink_metadata");
+            let outside = tempfile::tempdir().expect("outside target directory");
+            let _mode_guard = UnixModeGuard::set(outside.path(), 0o000);
+            symlink(outside.path(), harness.temp_dir().join("outside-link"))
+                .expect("create directory symlink");
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "outside-link" }),
+                    None,
+                )
+                .await
+                .expect("--no-follow find should inspect only the symlink entry");
+            let text = get_text_content(&result.content);
+            assert!(text.lines().any(|line| line == "outside-link"), "{text}");
+            assert!(
+                !text.lines().any(|line| line == "outside-link/"),
+                "a no-follow symlink must not be labeled from its target type: {text}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_preserves_leading_and_trailing_spaces_in_filename() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_preserves_filename_spaces");
+            harness.create_file(" leading-and-trailing.txt ", b"");
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "*" }), None)
+                .await
+                .expect("valid filename whitespace must survive fd output parsing");
+            let text = get_text_content(&result.content);
+
+            assert_eq!(text, " leading-and-trailing.txt ");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_newline_in_directory_name_cannot_create_fake_parent_path() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_nul_delimited_paths");
+            let fixture_parent = harness
+                .temp_dir()
+                .parent()
+                .expect("harness temp directory has a parent");
+            let outside = tempfile::tempdir_in(fixture_parent).expect("outside sibling directory");
+            let outside_name = outside
+                .path()
+                .file_name()
+                .expect("outside directory has a basename")
+                .to_string_lossy();
+
+            harness.create_dir("prefix\n..");
+            harness.create_file(&format!("prefix\n../{outside_name}"), b"inside entry");
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": outside_name.as_ref() }),
+                    None,
+                )
+                .await
+                .expect("newline-bearing path must stay one fd output record");
+            let text = get_text_content(&result.content);
+            let expected = format!("prefix\\n../{outside_name}");
+
+            assert_eq!(text, expected, "find must emit one escaped result line");
+            assert!(
+                !text.contains(&format!("../{outside_name}/")),
+                "a split output record must not stat and classify the outside sibling: {text:?}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_renders_invalid_utf8_filename_losslessly() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_invalid_utf8_filename");
+            let name = std::ffi::OsString::from_vec(b"cafe-\xe2\x98\x83-\xfe.txt".to_vec());
+            std::fs::write(harness.temp_dir().join(name), b"")
+                .expect("create invalid UTF-8 find fixture");
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "*" }), None)
+                .await
+                .expect("find must retain raw NUL-delimited path bytes");
+            let text = get_text_content(&result.content);
+
+            assert_eq!(text, "cafe-☃-\\xFE.txt");
+            assert_eq!(text.lines().count(), 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_sanitizes_control_bearing_external_diagnostic() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_control_bearing_diagnostic");
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let error = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "pattern": "[\n\u{1b}[31m" }),
+                    None,
+                )
+                .await
+                .expect_err("invalid glob should expose a sanitized fd diagnostic");
+            let message = error.to_string();
+
+            assert_eq!(message.lines().count(), 1, "diagnostic: {message:?}");
+            assert!(!message.contains('\u{1b}'), "diagnostic: {message:?}");
+            assert!(message.contains("\\n"), "diagnostic: {message:?}");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_permission_preflight_reads_only_consumed_ignore_controls() {
+        asupersync::test_utils::run_test(|| async {
+            for control in [".gitignore", ".ignore", ".fdignore"] {
+                let harness = TestHarness::new(&format!(
+                    "find_owner_denied_{}",
+                    control.trim_start_matches('.')
+                ));
+                harness.create_file("visible-name.txt", b"ordinary file payload");
+                let denied_control = harness.create_file(control, b"ignored-name.txt\n");
+                let _mode_guard = UnixModeGuard::set(&denied_control, 0o004);
+
+                let tool = pi::tools::FindTool::new(harness.temp_dir());
+                let error = tool
+                    .execute("test-id", serde_json::json!({ "pattern": "*.txt" }), None)
+                    .await
+                    .expect_err("find must read each ignore control before invoking fd");
+                let message = error.to_string();
+                assert!(
+                    message.to_lowercase().contains("permission denied"),
+                    "owner-denied {control} must produce PermissionDenied: {message}"
+                );
+                assert!(
+                    !message.contains("ordinary file payload"),
+                    "denial must not expose unrelated file contents: {message}"
+                );
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_permission_preflight_skips_gitignored_denied_directory() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_skips_gitignored_denied_directory");
+            harness.create_file(".gitignore", b"ignored-vault/\n");
+            harness.create_file("public.txt", b"");
+            let locked = harness.create_dir("ignored-vault");
+            harness.create_file("ignored-vault/secret.txt", b"");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "*.txt" }), None)
+                .await
+                .expect("gitignored denied directories are outside fd's traversal surface");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("public.txt"), "find output: {text}");
+            assert!(!text.contains("ignored-vault"));
+            assert!(!text.contains("secret.txt"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_permission_preflight_skips_fdignored_denied_directory() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_skips_fdignored_denied_directory");
+            harness.create_file(".fdignore", b"ignored-vault/\n");
+            harness.create_file("public.txt", b"");
+            let locked = harness.create_dir("ignored-vault");
+            harness.create_file("ignored-vault/secret.txt", b"");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "*.txt" }), None)
+                .await
+                .expect(".fdignore must define the same preflight and scanner surface");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("public.txt"), "find output: {text}");
+            assert!(!text.contains("ignored-vault"));
+            assert!(!text.contains("secret.txt"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_nested_gitignore_matches_preflight_outside_git_repository() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_nested_gitignore_outside_repository");
+            harness.create_file("nested/.gitignore", b"ignored-vault/\n");
+            harness.create_file("nested/public.txt", b"");
+            let locked = harness.create_dir("nested/ignored-vault");
+            harness.create_file("nested/ignored-vault/secret.txt", b"");
+            let _mode_guard = UnixModeGuard::set(&locked, 0o000);
+
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({ "pattern": "*.txt" }), None)
+                .await
+                .expect("nested .gitignore semantics must match outside a git repository");
+            let text = get_text_content(&result.content);
+            assert!(text.contains("nested/public.txt"), "find output: {text}");
+            assert!(!text.contains("ignored-vault"));
+            assert!(!text.contains("secret.txt"));
+        });
+    }
+
+    #[test]
+    fn test_find_rejects_file_search_root() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_rejects_file_search_root");
+            let file = harness.create_file("not-a-directory.txt", b"");
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({
+                        "pattern": "*.txt",
+                        "path": file.to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("find path is documented as a directory");
+            assert!(err.to_string().contains("Not a directory"));
+        });
+    }
+
     #[test]
     fn test_find_limit_reached_sets_details() {
         asupersync::test_utils::run_test(|| async {
@@ -1653,6 +2287,71 @@ mod ls_tool {
             assert!(text.contains("file.txt"));
             assert!(text.contains("subdir/"));
             // Details are only present when limits/truncation occur
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ls_escapes_control_characters_and_backslashes_in_entry_names() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("ls_escapes_control_path_bytes");
+            harness.create_file("line\nbreak\\tab\tname.txt", b"");
+
+            let tool = pi::tools::LsTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({}), None)
+                .await
+                .expect("ls should render an unambiguous single-line path");
+            let text = get_text_content(&result.content);
+
+            assert_eq!(text, "line\\nbreak\\\\tab\\tname.txt");
+            assert_eq!(text.lines().count(), 1);
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ls_renders_invalid_utf8_filenames_losslessly_and_deterministically() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("ls_invalid_utf8_filenames");
+            for bytes in [b"same-\xff.txt".as_slice(), b"same-\xfe.txt".as_slice()] {
+                let name = std::ffi::OsString::from_vec(bytes.to_vec());
+                std::fs::write(harness.temp_dir().join(name), b"")
+                    .expect("create invalid UTF-8 ls fixture");
+            }
+
+            let tool = pi::tools::LsTool::new(harness.temp_dir());
+            let result = tool
+                .execute("test-id", serde_json::json!({}), None)
+                .await
+                .expect("ls must retain raw OsString names");
+            let text = get_text_content(&result.content);
+
+            assert_eq!(text, "same-\\xFE.txt\nsame-\\xFF.txt");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ls_escapes_control_bearing_failure_path() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("ls_control_bearing_failure_path");
+            let tool = pi::tools::LsTool::new(harness.temp_dir());
+            let error = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({ "path": "missing\n\u{1b}[31m-dir" }),
+                    None,
+                )
+                .await
+                .expect_err("missing path should be rendered as one safe diagnostic line");
+            let message = error.to_string();
+
+            assert_eq!(message.lines().count(), 1, "diagnostic: {message:?}");
+            assert!(!message.contains('\u{1b}'), "diagnostic: {message:?}");
+            assert!(message.contains("missing\\n\\u{1b}[31m-dir"));
         });
     }
 
@@ -3594,7 +4293,7 @@ mod security_path_traversal {
     /// Write tool rejects symlinks that resolve outside CWD.
     #[test]
     #[cfg(unix)]
-    fn write_replaces_symlink_with_regular_file() {
+    fn write_symlink_escape_is_rejected() {
         asupersync::test_utils::run_test(|| async {
             let outside = tempfile::tempdir().unwrap();
             let target = outside.path().join("target.txt");
@@ -4061,6 +4760,87 @@ mod hashline_edit_tool {
 
             // Just verify the tool executed successfully - content may be empty
             assert!(result.details.is_none() || result.details.as_ref().unwrap().is_object());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_permission_denied_owner_class_does_not_borrow_other_bits() {
+        asupersync::test_utils::run_test(|| async {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let test_file = temp_dir.path().join("owner-denied.txt");
+            std::fs::write(&test_file, "line1\nLOCKED_LINE\nline3").unwrap();
+
+            let read_tool = pi::tools::ReadTool::new(temp_dir.path());
+            let line2_tag = get_hashline_tag(&read_tool, &test_file, 2).await;
+            let mode_guard = UnixModeGuard::set(&test_file, 0o006);
+
+            let tool = pi::tools::HashlineEditTool::new(temp_dir.path());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({
+                        "path": test_file.to_string_lossy(),
+                        "edits": [{
+                            "op": "replace",
+                            "pos": line2_tag,
+                            "lines": "CHANGED"
+                        }]
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("hashline_edit must enforce the selected owner mode class");
+            let message = err.to_string();
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "hashline_edit should reject owner-mode 0: {message}"
+            );
+
+            drop(mode_guard);
+            assert_eq!(
+                std::fs::read_to_string(&test_file).unwrap(),
+                "line1\nLOCKED_LINE\nline3",
+                "permission failure must leave the file unchanged"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parent_without_read_is_rejected_before_hashline_atomic_mutation() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("hashline_parent_without_read");
+            let parent = harness.create_dir("write-search-only");
+            let path =
+                harness.create_file("write-search-only/target.txt", b"line1\nORIGINAL\nline3");
+            let read_tool = pi::tools::ReadTool::new(harness.temp_dir());
+            let line2_tag = get_hashline_tag(&read_tool, &path, 2).await;
+            let mode_guard = UnixModeGuard::set(&parent, 0o300);
+
+            let tool = pi::tools::HashlineEditTool::new(harness.temp_dir());
+            let err = tool
+                .execute(
+                    "test-id",
+                    serde_json::json!({
+                        "path": path.to_string_lossy(),
+                        "edits": [{
+                            "op": "replace",
+                            "pos": line2_tag,
+                            "lines": "CHANGED"
+                        }]
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("durable hashline edit requires opening the parent directory");
+            assert!(err.to_string().to_lowercase().contains("permission denied"));
+
+            drop(mode_guard);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                "line1\nORIGINAL\nline3"
+            );
         });
     }
 

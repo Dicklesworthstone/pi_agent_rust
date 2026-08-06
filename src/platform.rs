@@ -51,6 +51,78 @@ impl EffectiveUnixIdentity {
     }
 }
 
+/// Effective Unix identity captured for one filesystem-policy operation.
+///
+/// Callers that validate many paths should create one context per operation so
+/// supplementary groups are fetched once, without caching credentials across
+/// later operations where the process identity may have changed.
+#[derive(Debug, Clone)]
+pub(crate) struct EffectiveModeAccessContext {
+    #[cfg(unix)]
+    identity: EffectiveUnixIdentity,
+}
+
+impl EffectiveModeAccessContext {
+    pub(crate) fn current() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                identity: EffectiveUnixIdentity::current()?,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    pub(crate) fn ensure(
+        &self,
+        metadata: &std::fs::Metadata,
+        path: &Path,
+        required: u32,
+        operation: &str,
+    ) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+
+            if required & !0o7 != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid Unix access mask {required:#o}"),
+                ));
+            }
+
+            let shift = self.identity.mode_shift(metadata.uid(), metadata.gid());
+            let selected = (metadata.mode() >> shift) & 0o7;
+            if selected & required != required {
+                let class = match shift {
+                    6 => "owner",
+                    3 => "group",
+                    _ => "other",
+                };
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Permission denied: Unix {class} mode class {:04o} on {} does not allow {operation}",
+                        metadata.mode() & 0o7777,
+                        path.display()
+                    ),
+                ));
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = (metadata, path, required, operation);
+        }
+
+        Ok(())
+    }
+}
+
 /// Enforce the Unix permission class selected for the effective process identity.
 ///
 /// Unix selects exactly one class in owner, group, other order; permissions from
@@ -76,32 +148,16 @@ pub(crate) fn ensure_effective_mode_access(
             ));
         }
 
-        let identity = EffectiveUnixIdentity::current()?;
-        let shift = identity.mode_shift(metadata.uid(), metadata.gid());
-        let selected = (metadata.mode() >> shift) & 0o7;
-        if selected & required != required {
-            let class = match shift {
-                6 => "owner",
-                3 => "group",
-                _ => "other",
-            };
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "Permission denied: Unix {class} mode class {:04o} on {} does not allow {operation}",
-                    metadata.mode() & 0o7777,
-                    path.display()
-                ),
-            ));
+        let mode = metadata.mode();
+        if [0, 3, 6]
+            .into_iter()
+            .all(|shift| ((mode >> shift) & 0o7) & required == required)
+        {
+            return Ok(());
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        let _ = (metadata, path, required, operation);
-    }
-
-    Ok(())
+    EffectiveModeAccessContext::current()?.ensure(metadata, path, required, operation)
 }
 
 // ---------------------------------------------------------------------------
@@ -179,7 +235,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_mode_class_selection_is_owner_then_group_then_other() {
+    fn unix_permission_mode_class_selection_is_owner_then_group_then_other() {
         assert_eq!(identity(1000, 2000, &[3000]).mode_shift(1000, 3000), 6);
         assert_eq!(identity(1000, 2000, &[3000]).mode_shift(4000, 2000), 3);
         assert_eq!(identity(1000, 2000, &[3000]).mode_shift(4000, 3000), 3);
@@ -188,7 +244,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unix_root_uses_selected_mode_class_without_dac_bypass() {
+    fn unix_permission_root_uses_selected_mode_class_without_dac_bypass() {
         let root = identity(0, 0, &[0]);
         assert_eq!(root.mode_shift(0, 1234), 6, "root-owned path uses owner");
         assert_eq!(root.mode_shift(1234, 0), 3, "root-group path uses group");
