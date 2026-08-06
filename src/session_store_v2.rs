@@ -808,12 +808,41 @@ fn read_private_directory(path: &Path) -> std::io::Result<PrivateReadDir> {
     }
 }
 
+#[cfg(unix)]
+fn reopen_named_regular_file_matching(
+    directory: &File,
+    name: &std::ffi::OsStr,
+    opened_file: &File,
+    display_path: &Path,
+) -> Result<File> {
+    let current = rustix::fs::openat(
+        directory,
+        name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)?;
+    let opened_metadata = opened_file.metadata()?;
+    let current_metadata = current.metadata()?;
+    reject_non_private_regular_file(display_path, &opened_metadata)?;
+    reject_non_private_regular_file(display_path, &current_metadata)?;
+    if !metadata_identity_matches(&opened_metadata, &current_metadata) {
+        return Err(Error::session(format!(
+            "artifact source path changed before mutation: {}",
+            display_path.display()
+        )));
+    }
+    Ok(current)
+}
+
 #[cfg(all(
     unix,
-    not(target_os = "redox"),
+    not(any(target_os = "espidf", target_os = "redox")),
     any(test, not(any(target_os = "linux", target_vendor = "apple")))
 ))]
 fn publish_regular_file_via_hard_link_no_replace(
+    source_file: &File,
     source_directory: &File,
     source_name: &std::ffi::OsStr,
     target_directory: &File,
@@ -823,19 +852,52 @@ fn publish_regular_file_via_hard_link_no_replace(
     // existing name. Filesystems without hard-link support fail before the
     // source is unlinked, which is the only safe fallback when renameat2-style
     // no-replace publication is unavailable.
+    use std::os::fd::AsRawFd as _;
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", source_file.as_raw_fd()));
+    #[cfg(not(any(target_os = "android", target_os = "linux")))]
+    let descriptor_path = PathBuf::from(format!("/dev/fd/{}", source_file.as_raw_fd()));
     rustix::fs::linkat(
-        source_directory,
-        source_name,
+        rustix::fs::CWD,
+        &descriptor_path,
         target_directory,
         target_name,
-        rustix::fs::AtFlags::empty(),
+        rustix::fs::AtFlags::SYMLINK_FOLLOW,
     )
     .map_err(std::io::Error::from)?;
     target_directory.sync_all()?;
+    let current_source = rustix::fs::openat(
+        source_directory,
+        source_name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(std::io::Error::from)?;
+    if !metadata_identity_matches(&source_file.metadata()?, &current_source.metadata()?) {
+        return Err(std::io::Error::other(
+            "artifact source path changed after publication; retained the published target and refused to unlink the replacement",
+        ));
+    }
     rustix::fs::unlinkat(source_directory, source_name, rustix::fs::AtFlags::empty())
         .map_err(std::io::Error::from)?;
     source_directory.sync_all()?;
     Ok(())
+}
+
+#[cfg(target_os = "espidf")]
+fn publish_regular_file_via_hard_link_no_replace(
+    _source_file: &File,
+    _source_directory: &File,
+    _source_name: &std::ffi::OsStr,
+    _target_directory: &File,
+    _target_name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace artifact publication requires hard-link support",
+    ))
 }
 
 fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
@@ -913,7 +975,7 @@ where
 {
     let source_file = open_regular_file_for_read(source)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", source.display())))?;
-    drop(source_file);
+    let source_identity = artifact_file_identity(&source_file.metadata()?);
     #[cfg(unix)]
     let source_parent = source
         .parent()
@@ -944,6 +1006,24 @@ where
 
     before_publish()?;
 
+    #[cfg(unix)]
+    let _source_name_guard =
+        reopen_named_regular_file_matching(&source_directory, source_name, &source_file, source)?;
+
+    #[cfg(windows)]
+    {
+        let current_metadata = fs::symlink_metadata(&source_operation_path)?;
+        reject_non_private_regular_file(&source_operation_path, &current_metadata)?;
+        if artifact_file_identity(&current_metadata)
+            != artifact_file_identity(&source_file.metadata()?)
+        {
+            return Err(Error::session(format!(
+                "artifact source path changed before publication: {}",
+                source_operation_path.display()
+            )));
+        }
+    }
+
     #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))]
     rustix::fs::renameat_with(
         &source_directory,
@@ -959,6 +1039,7 @@ where
         not(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))
     ))]
     publish_regular_file_via_hard_link_no_replace(
+        &source_file,
         &source_directory,
         source_name,
         &target_directory,
@@ -970,6 +1051,15 @@ where
         validate_windows_artifact_directory_guards(&source_parent_guards)?;
         validate_windows_artifact_directory_guards(&target_parent_guards)?;
         fs::hard_link(&source_operation_path, &target_operation_path)?;
+        let target_metadata = fs::symlink_metadata(&target_operation_path)?;
+        reject_non_private_regular_file(&target_operation_path, &target_metadata)?;
+        if artifact_file_identity(&target_metadata) != source_identity {
+            return Err(Error::session(format!(
+                "published artifact identity does not match its retained source: {}",
+                target_operation_path.display()
+            )));
+        }
+        drop(source_file);
         fs::remove_file(&source_operation_path)?;
         validate_windows_artifact_directory_guards(&source_parent_guards)?;
         validate_windows_artifact_directory_guards(&target_parent_guards)?;
@@ -980,13 +1070,31 @@ where
 
     #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))]
     target_directory.sync_all()?;
+    let target_file = open_regular_file_for_read(target)?.ok_or_else(|| {
+        Error::session(format!(
+            "published artifact disappeared before identity verification: {}",
+            target.display()
+        ))
+    })?;
+    if artifact_file_identity(&target_file.metadata()?) != source_identity {
+        return Err(Error::session(format!(
+            "published artifact identity does not match its retained source: {}",
+            target.display()
+        )));
+    }
     Ok(())
 }
 
 fn remove_regular_file(path: &Path) -> Result<()> {
+    remove_regular_file_with(path, || Ok(()))
+}
+
+fn remove_regular_file_with<F>(path: &Path, before_remove: F) -> Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
     let file = open_regular_file_for_read(path)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", path.display())))?;
-    drop(file);
     #[cfg(unix)]
     let parent = path
         .parent()
@@ -1000,6 +1108,24 @@ fn remove_regular_file(path: &Path) -> Result<()> {
 
     #[cfg(windows)]
     let (operation_path, parent_guards) = open_or_create_windows_artifact_parent(path, false)?;
+
+    before_remove()?;
+
+    #[cfg(unix)]
+    let _source_name_guard = reopen_named_regular_file_matching(&directory, name, &file, path)?;
+
+    #[cfg(windows)]
+    {
+        let current_metadata = fs::symlink_metadata(&operation_path)?;
+        reject_non_private_regular_file(&operation_path, &current_metadata)?;
+        if artifact_file_identity(&current_metadata) != artifact_file_identity(&file.metadata()?) {
+            return Err(Error::session(format!(
+                "artifact path changed before removal: {}",
+                operation_path.display()
+            )));
+        }
+        drop(file);
+    }
 
     #[cfg(unix)]
     rustix::fs::unlinkat(&directory, name, rustix::fs::AtFlags::empty())
@@ -5259,7 +5385,73 @@ mod proptests {
         assert_eq!(fs::read(&source).expect("read retained source"), b"source");
     }
 
-    #[cfg(all(unix, not(target_os = "redox")))]
+    #[cfg(unix)]
+    #[test]
+    fn no_replace_publication_rejects_a_swapped_source_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        drop(open_private_directory(tmp.path(), true).expect("privatize tempdir"));
+        let source = tmp.path().join("source.tmp");
+        let retained_source = tmp.path().join("retained-source.tmp");
+        let target = tmp.path().join("immutable.json");
+        let mut source_file =
+            open_regular_file_for_write(&source, true, ArtifactWriteMode::CreateNew)
+                .expect("create source artifact");
+        source_file
+            .write_all(b"intended source")
+            .expect("write source artifact");
+        source_file.sync_all().expect("sync source artifact");
+        drop(source_file);
+
+        rename_regular_file_no_replace_with(&source, &target, || {
+            fs::rename(&source, &retained_source)?;
+            fs::write(&source, b"replacement")?;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+        })
+        .expect_err("publication must reject a source-name replacement");
+
+        assert!(!target.exists(), "a swapped source must not be published");
+        assert_eq!(
+            fs::read(&retained_source).expect("read intended source"),
+            b"intended source"
+        );
+        assert_eq!(fs::read(&source).expect("read replacement"), b"replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_rejects_a_swapped_source_name_without_deleting_either_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        drop(open_private_directory(tmp.path(), true).expect("privatize tempdir"));
+        let source = tmp.path().join("source.tmp");
+        let retained_source = tmp.path().join("retained-source.tmp");
+        let mut source_file =
+            open_regular_file_for_write(&source, true, ArtifactWriteMode::CreateNew)
+                .expect("create source artifact");
+        source_file
+            .write_all(b"intended source")
+            .expect("write source artifact");
+        source_file.sync_all().expect("sync source artifact");
+        drop(source_file);
+
+        remove_regular_file_with(&source, || {
+            fs::rename(&source, &retained_source)?;
+            fs::write(&source, b"replacement")?;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+        })
+        .expect_err("removal must reject a source-name replacement");
+
+        assert_eq!(
+            fs::read(&retained_source).expect("read intended source"),
+            b"intended source"
+        );
+        assert_eq!(fs::read(&source).expect("read replacement"), b"replacement");
+    }
+
+    #[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
     #[test]
     fn hard_link_publication_helper_never_replaces_an_existing_target() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -5276,7 +5468,11 @@ mod proptests {
             file.sync_all().expect("sync publication artifact");
         }
 
+        let source_file = open_regular_file_for_read(&source)
+            .expect("open source")
+            .expect("source exists");
         let error = publish_regular_file_via_hard_link_no_replace(
+            &source_file,
             &directory,
             source.file_name().expect("source name"),
             &directory,
