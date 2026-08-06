@@ -42,7 +42,7 @@ use pi::extensions::{
 };
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
-use pi::models::{ModelEntry, ModelRegistry, default_models_path};
+use pi::models::{ModelEntry, ModelRegistry, default_models_path, fetched_models_path};
 use pi::package_manager::{
     PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
 };
@@ -1043,7 +1043,12 @@ async fn run(
     }
 
     if let Some(provider) = cli.fetch_models.take() {
-        handle_fetch_models(&provider, cli.refresh_models).await?;
+        handle_fetch_models(
+            &provider,
+            cli.refresh_models,
+            cli.persist_models,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -5525,6 +5530,7 @@ fn list_models_cache_path(models_path: &Path) -> Option<PathBuf> {
     hasher.update(pi::models::model_catalog_cache_fingerprint().to_le_bytes());
     append_file_fingerprint(&mut hasher, &Config::auth_path());
     append_file_fingerprint(&mut hasher, models_path);
+    append_file_fingerprint(&mut hasher, &fetched_models_path(models_path));
 
     let mut env_vars = std::env::vars()
         .filter(|(key, _)| should_fingerprint_model_env_var(key))
@@ -5579,42 +5585,71 @@ fn save_list_models_cache(models_path: &Path, payload: &ListModelsCachePayload) 
     }
 }
 
-async fn handle_fetch_models(provider: &str, refresh: bool) -> Result<()> {
+async fn handle_fetch_models(provider: &str, refresh: bool, persist: bool) -> Result<()> {
     // Resolve the API key: prefer the user's auth.json credential for the
     // provider, then fall back to environment variables advertised in the
     // canonical metadata.  An empty key triggers the static-registry path
     // inside `fetch_provider_models` itself.
     let api_key = resolve_provider_api_key(provider);
 
-    let models = if refresh {
-        pi::providers::refresh_provider_models(provider, &api_key).await
+    let catalog = if refresh {
+        pi::providers::refresh_provider_model_catalog(provider, &api_key).await
     } else {
-        pi::providers::fetch_provider_models(provider, &api_key).await
+        pi::providers::fetch_provider_model_catalog(provider, &api_key).await
     };
 
-    let models = match models {
-        Ok(models) => models,
+    let catalog = match catalog {
+        Ok(catalog) => catalog,
         Err(err) => {
-            // `fetch_provider_models` only returns Err for inputs that can
-            // never produce a useful list (unknown provider, etc.); surface
-            // those clearly rather than dumping the empty static fallback.
-            eprintln!("Failed to list models for {provider:?}: {err}");
             return Err(anyhow::anyhow!(err.to_string()));
         }
     };
 
-    if models.is_empty() {
+    if matches!(
+        catalog.source,
+        pi::providers::ModelCatalogSource::StaticFallback
+    ) {
+        eprintln!(
+            "Warning: live model discovery for {provider:?} was unavailable; \
+             showing the static registry instead. Use --refresh-models to require a live result."
+        );
+    }
+
+    if persist {
+        if matches!(
+            catalog.source,
+            pi::providers::ModelCatalogSource::StaticFallback
+        ) {
+            bail!(
+                "Refusing to persist the static fallback for {provider:?}; \
+                 configure provider credentials and retry a successful live fetch"
+            );
+        }
+        let models_path = default_models_path(&Config::global_dir());
+        let fetched_path = pi::providers::persist_provider_model_catalog(
+            &models_path,
+            provider,
+            &catalog.models,
+        )?;
+        eprintln!(
+            "Persisted {} models for {provider:?} to {}",
+            catalog.models.len(),
+            fetched_path.display()
+        );
+    }
+
+    if catalog.models.is_empty() {
         eprintln!(
             "No models available for {provider:?} (static registry is empty and live fetch failed). \
-             Run with RUST_LOG=warn for fallback diagnostics."
+             Check the provider name and credentials."
         );
     } else {
         let stdout = io::stdout();
         let mut out = io::BufWriter::new(stdout.lock());
-        for id in &models {
-            let _ = writeln!(out, "{id}");
+        for id in &catalog.models {
+            writeln!(out, "{id}")?;
         }
-        let _ = out.flush();
+        out.flush()?;
     }
     Ok(())
 }

@@ -17,8 +17,9 @@
 //! entry.  Entries expire after [`MODEL_CACHE_TTL`] (5 minutes).  Hits within
 //! the TTL window do **not** issue a network call.  Setting
 //! `PI_DISABLE_MODEL_CACHE=1` (or `true`/`yes`/`on`) bypasses both the read
-//! and write paths for debugging.  [`refresh_provider_models`] forces a
-//! refetch regardless of cache state.
+//! and write paths for debugging. [`refresh_provider_models`] forces a strict
+//! live refetch regardless of cache state and returns an error rather than a
+//! static fallback when that refresh fails.
 //!
 //! ## Fallback
 //!
@@ -36,17 +37,22 @@
 //! supplying a bespoke request builder + JSON shape parser.  Keep the cache
 //! key + fallback paths unchanged; only the network call shape varies.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+#[cfg(unix)]
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use crate::auth::AuthStorage;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
-use crate::models::{ModelRegistry, default_models_path};
+use crate::models::{ModelRegistry, default_models_path, fetched_models_path};
 use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
@@ -64,6 +70,54 @@ pub const DISABLE_CACHE_ENV: &str = "PI_DISABLE_MODEL_CACHE";
 struct CacheEntry {
     models: Vec<String>,
     inserted: Instant,
+}
+
+/// Provenance for a model catalog returned by dynamic discovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelCatalogSource {
+    /// The provider answered the network request in this call.
+    Live,
+    /// A successful earlier live response was reused from the process cache.
+    Cache,
+    /// Live discovery failed and the bundled/on-disk static registry was used.
+    StaticFallback,
+}
+
+/// A discovered provider catalog together with its non-secret provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderModelCatalog {
+    pub models: Vec<String>,
+    pub source: ModelCatalogSource,
+}
+
+const FETCHED_MODELS_SCHEMA: &str = "pi.models.fetched.v1";
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedFetchedCatalog {
+    schema: String,
+    providers: BTreeMap<String, PersistedFetchedProvider>,
+}
+
+impl Default for PersistedFetchedCatalog {
+    fn default() -> Self {
+        Self {
+            schema: FETCHED_MODELS_SCHEMA.to_string(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedFetchedProvider {
+    models: Vec<PersistedFetchedModel>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedFetchedModel {
+    id: String,
 }
 
 fn cache() -> &'static Mutex<HashMap<String, CacheEntry>> {
@@ -130,26 +184,69 @@ pub fn clear_model_cache() {
 /// The static-registry fallback never errors as long as the provider is
 /// known — at worst it returns an empty `Vec`.
 pub async fn fetch_provider_models(provider: &str, api_key: &str) -> Result<Vec<String>> {
+    Ok(fetch_provider_model_catalog(provider, api_key).await?.models)
+}
+
+/// Fetch a provider catalog while retaining whether the rows came from a
+/// successful live call, the in-process cache, or the static fallback.
+pub async fn fetch_provider_model_catalog(
+    provider: &str,
+    api_key: &str,
+) -> Result<ProviderModelCatalog> {
     let key = cache_key(provider);
 
     if !cache_disabled()
         && let Some(cached) = cache_lookup(&key)
     {
         tracing::debug!(provider = %key, count = cached.len(), "model cache hit");
-        return Ok(cached);
+        return Ok(ProviderModelCatalog {
+            models: cached,
+            source: ModelCatalogSource::Cache,
+        });
     }
 
     fetch_and_cache(provider, &key, api_key).await
 }
 
-/// Force a refresh, bypassing any cached entry.  The newly fetched (or
-/// fallback) result replaces the cache entry on success.
+/// Force a refresh, bypassing any cached entry. Only a successful, non-empty
+/// live response replaces the cache entry; failures are returned to the caller.
 pub async fn refresh_provider_models(provider: &str, api_key: &str) -> Result<Vec<String>> {
-    let key = cache_key(provider);
-    fetch_and_cache(provider, &key, api_key).await
+    Ok(
+        refresh_provider_model_catalog(provider, api_key)
+            .await?
+            .models,
+    )
 }
 
-async fn fetch_and_cache(provider: &str, key: &str, api_key: &str) -> Result<Vec<String>> {
+/// Force a genuinely live refresh, bypassing the cache and rejecting network,
+/// authentication, parse, and empty-catalog failures. This strict behavior
+/// prevents callers from mistaking a static fallback for a fresh provider
+/// response.
+pub async fn refresh_provider_model_catalog(
+    provider: &str,
+    api_key: &str,
+) -> Result<ProviderModelCatalog> {
+    let key = cache_key(provider);
+    let live = fetch_live_models(provider, api_key).await?;
+    if live.is_empty() {
+        return Err(Error::api(format!(
+            "live model fetch for {provider:?} returned an empty catalog"
+        )));
+    }
+    if !cache_disabled() {
+        cache_store(key, live.clone());
+    }
+    Ok(ProviderModelCatalog {
+        models: live,
+        source: ModelCatalogSource::Live,
+    })
+}
+
+async fn fetch_and_cache(
+    provider: &str,
+    key: &str,
+    api_key: &str,
+) -> Result<ProviderModelCatalog> {
     // Only cache results from a successful live fetch — caching the
     // static-registry fallback would pin a stale answer for 5 minutes and
     // silently swallow the next call even after the user adds the missing
@@ -160,14 +257,20 @@ async fn fetch_and_cache(provider: &str, key: &str, api_key: &str) -> Result<Vec
             if !cache_disabled() {
                 cache_store(key.to_string(), live.clone());
             }
-            Ok(live)
+            Ok(ProviderModelCatalog {
+                models: live,
+                source: ModelCatalogSource::Live,
+            })
         }
         Ok(_) => {
             tracing::warn!(
                 provider = %key,
                 "live model fetch returned empty list; falling back to static registry (not cached)"
             );
-            Ok(static_registry_models(provider))
+            Ok(ProviderModelCatalog {
+                models: static_registry_models(provider),
+                source: ModelCatalogSource::StaticFallback,
+            })
         }
         Err(err) => {
             tracing::warn!(
@@ -175,7 +278,10 @@ async fn fetch_and_cache(provider: &str, key: &str, api_key: &str) -> Result<Vec
                 error = %err,
                 "live model fetch failed; falling back to static registry (not cached)"
             );
-            Ok(static_registry_models(provider))
+            Ok(ProviderModelCatalog {
+                models: static_registry_models(provider),
+                source: ModelCatalogSource::StaticFallback,
+            })
         }
     }
 }
@@ -206,6 +312,167 @@ pub fn static_registry_models(provider: &str) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Atomically persist one successfully discovered provider catalog beside the
+/// user's `models.json`, without ever reading or modifying `models.json`
+/// itself. Existing generated catalogs for other providers are retained.
+///
+/// The generated schema can only encode provider IDs and model IDs, so API
+/// keys, headers, and other credentials cannot be written accidentally.
+pub fn persist_provider_model_catalog(
+    models_path: &Path,
+    provider: &str,
+    models: &[String],
+) -> Result<PathBuf> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Err(Error::validation("provider must not be empty"));
+    }
+
+    let mut model_ids = models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    model_ids.sort_unstable();
+    model_ids.dedup();
+    if model_ids.is_empty() {
+        return Err(Error::validation(
+            "refusing to persist an empty fetched model catalog",
+        ));
+    }
+
+    let path = fetched_models_path(models_path);
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Error::config(format!(
+                "Failed to create fetched model catalog directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let _process_guard = fetched_catalog_persist_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _file_guard = crate::file_lock::DirLock::acquire_for(&path, Duration::from_secs(30))
+        .map_err(|error| {
+            Error::config(format!(
+                "Failed to lock fetched model catalog {}: {error}",
+                path.display()
+            ))
+        })?;
+
+    let mut catalog = load_persisted_catalog(&path)?;
+    let provider = cache_key(provider);
+    catalog.providers.insert(
+        provider,
+        PersistedFetchedProvider {
+            models: model_ids
+                .into_iter()
+                .map(|id| PersistedFetchedModel { id })
+                .collect(),
+        },
+    );
+    write_persisted_catalog_atomic(&path, &catalog)?;
+    Ok(path)
+}
+
+fn fetched_catalog_persist_lock() -> &'static Mutex<()> {
+    static PERSIST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    PERSIST_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn load_persisted_catalog(path: &Path) -> Result<PersistedFetchedCatalog> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(PersistedFetchedCatalog::default());
+        }
+        Err(error) => {
+            return Err(Error::config(format!(
+                "Failed to read fetched model catalog {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    let catalog: PersistedFetchedCatalog = serde_json::from_str(&contents).map_err(|error| {
+        Error::config(format!(
+            "Refusing to overwrite malformed or unrecognized fetched model catalog {}: {error}",
+            path.display()
+        ))
+    })?;
+    if catalog.schema != FETCHED_MODELS_SCHEMA {
+        return Err(Error::config(format!(
+            "Refusing to overwrite fetched model catalog {} with unsupported schema {:?}",
+            path.display(),
+            catalog.schema
+        )));
+    }
+    Ok(catalog)
+}
+
+fn write_persisted_catalog_atomic(path: &Path, catalog: &PersistedFetchedCatalog) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut contents = serde_json::to_string_pretty(catalog).map_err(Error::from)?;
+    contents.push('\n');
+
+    let mut temporary = NamedTempFile::new_in(parent).map_err(|error| {
+        Error::config(format!(
+            "Failed to create temporary fetched model catalog in {}: {error}",
+            parent.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                Error::config(format!(
+                    "Failed to secure temporary fetched model catalog: {error}"
+                ))
+            })?;
+    }
+    temporary.write_all(contents.as_bytes()).map_err(|error| {
+        Error::config(format!(
+            "Failed to write temporary fetched model catalog: {error}"
+        ))
+    })?;
+    temporary.as_file().sync_all().map_err(|error| {
+        Error::config(format!(
+            "Failed to sync temporary fetched model catalog: {error}"
+        ))
+    })?;
+    temporary.persist(path).map_err(|error| {
+        Error::config(format!(
+            "Failed to atomically persist fetched model catalog to {}: {}",
+            path.display(),
+            error.error
+        ))
+    })?;
+    sync_parent_directory(path).map_err(|error| {
+        Error::config(format!(
+            "Failed to sync fetched model catalog directory for {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// JSON shape returned by an OpenAI-compatible `/v1/models` endpoint.
@@ -299,6 +566,11 @@ fn openai_compat_models_url(defaults: &ProviderRoutingDefaults) -> Option<String
 mod tests {
     use super::*;
 
+    fn cache_test_lock() -> &'static Mutex<()> {
+        static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn cache_key_canonicalizes_aliases() {
         // anthropic has no aliases, but provider IDs should round-trip lowercased
@@ -347,6 +619,9 @@ mod tests {
 
     #[test]
     fn cache_round_trip_respects_ttl() {
+        let _guard = cache_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         clear_model_cache();
         let key = cache_key("openai");
         assert!(cache_lookup(&key).is_none(), "starts empty");
@@ -355,5 +630,117 @@ mod tests {
         assert_eq!(hit, vec!["m-1".to_string(), "m-2".to_string()]);
         clear_model_cache();
         assert!(cache_lookup(&key).is_none(), "cleared");
+    }
+
+    #[test]
+    fn catalog_reports_cache_provenance() {
+        let _guard = cache_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_model_cache();
+        cache_store("openai".to_string(), vec!["cached-model".to_string()]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let catalog = runtime
+            .block_on(fetch_provider_model_catalog("openai", ""))
+            .expect("cached catalog");
+        assert_eq!(catalog.models, vec!["cached-model"]);
+        assert_eq!(catalog.source, ModelCatalogSource::Cache);
+        clear_model_cache();
+    }
+
+    #[test]
+    fn refresh_without_credentials_is_strict_instead_of_falling_back() {
+        let _guard = cache_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        clear_model_cache();
+        cache_store("openai".to_string(), vec!["stale-cache".to_string()]);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime");
+        let error = runtime
+            .block_on(refresh_provider_model_catalog("openai", ""))
+            .expect_err("refresh must require a live response");
+        assert!(error.to_string().contains("api_key"), "{error}");
+        assert_eq!(
+            cache_lookup("openai"),
+            Some(vec!["stale-cache".to_string()]),
+            "failed refresh must not replace or disguise the previous cache"
+        );
+        clear_model_cache();
+    }
+
+    #[test]
+    fn persisted_catalog_is_secret_free_and_preserves_other_providers() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let models_path = directory.path().join("models.json");
+        let manual_bytes = br#"{
+  "futureUserField": {"unknown": true},
+  "providers": {"manual": {"apiKey": "do-not-touch"}}
+}"#;
+        std::fs::write(&models_path, manual_bytes).expect("write manual models.json");
+
+        let fetched_path = persist_provider_model_catalog(
+            &models_path,
+            "OpenRouter",
+            &[
+                "z/model".to_string(),
+                "a/model".to_string(),
+                "a/model".to_string(),
+                "  ".to_string(),
+            ],
+        )
+        .expect("persist OpenRouter catalog");
+        persist_provider_model_catalog(
+            &models_path,
+            "groq",
+            &["groq-model".to_string()],
+        )
+        .expect("persist Groq catalog");
+
+        assert_eq!(
+            std::fs::read(&models_path).expect("read manual models.json"),
+            manual_bytes,
+            "persistence must never rewrite or normalize user models.json"
+        );
+        let encoded = std::fs::read_to_string(&fetched_path).expect("read fetched catalog");
+        let catalog: PersistedFetchedCatalog =
+            serde_json::from_str(&encoded).expect("parse fetched catalog");
+        assert_eq!(catalog.schema, FETCHED_MODELS_SCHEMA);
+        assert_eq!(
+            catalog.providers["openrouter"]
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a/model", "z/model"]
+        );
+        assert_eq!(catalog.providers["groq"].models[0].id, "groq-model");
+        assert!(!encoded.contains("apiKey"));
+        assert!(!encoded.contains("do-not-touch"));
+    }
+
+    #[test]
+    fn malformed_generated_catalog_is_not_overwritten() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let models_path = directory.path().join("models.json");
+        let fetched_path = fetched_models_path(&models_path);
+        let original = b"not generated catalog json\n";
+        std::fs::write(&fetched_path, original).expect("write malformed fetched catalog");
+
+        let error = persist_provider_model_catalog(
+            &models_path,
+            "openrouter",
+            &["openai/gpt-test".to_string()],
+        )
+        .expect_err("malformed generated catalog must fail closed");
+        assert!(error.to_string().contains("Refusing to overwrite"), "{error}");
+        assert_eq!(
+            std::fs::read(&fetched_path).expect("re-read fetched catalog"),
+            original,
+            "failed persistence must preserve the existing bytes"
+        );
     }
 }

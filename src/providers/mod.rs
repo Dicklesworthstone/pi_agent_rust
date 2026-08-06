@@ -40,8 +40,9 @@ pub mod openai_responses;
 pub mod vertex;
 
 pub use model_fetch::{
-    DISABLE_CACHE_ENV, MODEL_CACHE_TTL, fetch_provider_models, refresh_provider_models,
-    static_registry_models,
+    DISABLE_CACHE_ENV, MODEL_CACHE_TTL, ModelCatalogSource, ProviderModelCatalog,
+    fetch_provider_model_catalog, fetch_provider_models, persist_provider_model_catalog,
+    refresh_provider_model_catalog, refresh_provider_models, static_registry_models,
 };
 
 pub(super) fn first_non_empty_header_value_case_insensitive(
