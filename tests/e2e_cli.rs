@@ -406,6 +406,18 @@ fn canon(p: &Path) -> PathBuf {
     pi::extensions::strip_unc_prefix(c)
 }
 
+#[cfg(unix)]
+fn deny_auth_fixture_reads(agent_dir: &Path) -> PathBuf {
+    let auth_path = agent_dir.join("auth.json");
+    fs::write(&auth_path, [0xff]).expect("write invalid UTF-8 auth fixture");
+    let mut permissions = fs::metadata(&auth_path)
+        .expect("stat auth fixture")
+        .permissions();
+    permissions.set_mode(0o000);
+    fs::set_permissions(&auth_path, permissions).expect("deny auth fixture reads");
+    auth_path
+}
+
 fn assert_contains(harness: &TestHarness, haystack: &str, needle: &str) {
     harness.assert_log(format!("assert contains: {needle}").as_str());
     assert!(
@@ -1216,6 +1228,8 @@ fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
             .expect("isolated agent dir"),
     );
     fs::create_dir_all(&agent_dir).expect("create isolated agent dir");
+    #[cfg(unix)]
+    let _denied_auth = deny_auth_fixture_reads(&agent_dir);
     fs::write(
         agent_dir.join("models.json"),
         serde_json::to_vec_pretty(&json!({
@@ -1267,6 +1281,96 @@ fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
 }
 
 #[test]
+fn e2e_cli_fetch_models_custom_authorization_skips_held_auth_lock() {
+    let harness =
+        CliTestHarness::new("e2e_cli_fetch_models_custom_authorization_skips_held_auth_lock");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog fixture");
+    let address = listener.local_addr().expect("fixture address");
+    listener
+        .set_nonblocking(true)
+        .expect("make fixture accept bounded");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "catalog fixture was never called"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept catalog request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound fixture request read");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("read catalog request");
+            assert!(count > 0, "catalog request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        let body = br#"{"data":[{"id":"custom-auth-model"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write catalog response headers");
+        stream.write_all(body).expect("write catalog response");
+        String::from_utf8(request).expect("request headers are UTF-8")
+    });
+
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    );
+    fs::create_dir_all(&agent_dir).expect("create isolated agent dir");
+    let auth_path = agent_dir.join("auth.json");
+    let _held_auth_lock = pi::file_lock::DirLock::acquire_for(&auth_path, Duration::from_secs(1))
+        .expect("hold auth lock while custom-authorization catalog fetch runs");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": {
+                "acme": {
+                    "api": "openai-completions",
+                    "baseUrl": format!("http://{address}/v1"),
+                    "headers": {
+                        "Authorization": "Token configured-only"
+                    }
+                }
+            }
+        }))
+        .expect("serialize custom catalog route"),
+    )
+    .expect("write custom catalog route");
+
+    let result = harness.run(&[
+        "--fetch-models",
+        "acme",
+        "--refresh-models",
+        "--request-timeout",
+        "5",
+    ]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_eq!(result.stdout, "custom-auth-model\n");
+    let request = server.join().expect("catalog fixture thread");
+    let request_lower = request.to_ascii_lowercase();
+    assert!(
+        request_lower.contains("authorization: token configured-only\r\n"),
+        "{request}"
+    );
+    assert_eq!(request_lower.matches("authorization:").count(), 1);
+}
+
+#[test]
 fn e2e_cli_fetch_models_ignores_text_input_guards() {
     let harness = CliTestHarness::new("e2e_cli_fetch_models_ignores_text_input_guards");
     for presentation_flag in ["--print", "--mode=text"] {
@@ -1277,6 +1381,30 @@ fn e2e_cli_fetch_models_ignores_text_input_guards() {
             "{presentation_flag} must not make standalone model discovery require prompt input"
         );
     }
+}
+
+#[test]
+fn e2e_cli_fetch_models_only_conflicts_with_explicit_hide_cwd_flag() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_fetch_models_only_conflicts_with_explicit_hide_cwd_flag");
+    harness
+        .env
+        .insert("PI_HIDE_CWD_IN_PROMPT".to_string(), "true".to_string());
+
+    let env_only = harness.run(&["--fetch-models", "openai"]);
+    assert_exit_code(&harness.harness, &env_only, 0);
+    assert!(
+        env_only.stdout.lines().any(|line| !line.trim().is_empty()),
+        "ambient prompt-presentation policy must not block standalone discovery"
+    );
+
+    let explicit = harness.run(&["--fetch-models", "openai", "--hide-cwd-in-prompt"]);
+    assert_exit_code(&harness.harness, &explicit, 2);
+    assert_contains(
+        &harness.harness,
+        &explicit.stderr,
+        "--fetch-models cannot be combined with --hide-cwd-in-prompt",
+    );
 }
 
 #[test]
@@ -1305,13 +1433,47 @@ fn e2e_cli_fetch_models_rejects_ambiguous_terminal_actions() {
 }
 
 #[test]
-fn e2e_cli_list_models_reads_the_persisted_fetched_catalog() {
-    let mut harness =
-        CliTestHarness::new("e2e_cli_list_models_reads_the_persisted_fetched_catalog");
-    harness.env.insert(
-        "OPENROUTER_API_KEY".to_string(),
-        "test-only-openrouter-key".to_string(),
+fn e2e_cli_fetch_models_keyless_persist_updates_list_models_despite_held_auth_lock() {
+    let harness = CliTestHarness::new(
+        "e2e_cli_fetch_models_keyless_persist_updates_list_models_despite_held_auth_lock",
     );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog fixture");
+    let address = listener.local_addr().expect("catalog fixture address");
+    listener
+        .set_nonblocking(true)
+        .expect("make catalog accept bounded");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "catalog request timed out");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept catalog request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound catalog request read");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("read catalog request");
+            assert!(count > 0, "catalog request ended before headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        let body = br#"{"data":[{"id":"issue-150-live-model"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write catalog response headers");
+        stream.write_all(body).expect("write catalog response");
+    });
+
     let agent_dir = PathBuf::from(
         harness
             .env
@@ -1319,24 +1481,39 @@ fn e2e_cli_list_models_reads_the_persisted_fetched_catalog() {
             .expect("isolated agent dir"),
     );
     fs::create_dir_all(&agent_dir).expect("create isolated agent dir");
+    let auth_path = agent_dir.join("auth.json");
+    let held_auth_lock = pi::file_lock::DirLock::acquire_for(&auth_path, Duration::from_secs(1))
+        .expect("hold auth lock while keyless catalog fetch runs");
     fs::write(
-        agent_dir.join("models.fetched.json"),
+        agent_dir.join("models.json"),
         serde_json::to_vec_pretty(&json!({
-            "schema": "pi.models.fetched.v1",
             "providers": {
-                "openrouter": {
-                    "models": [{"id": "issue-150-live-model"}]
+                "acme": {
+                    "api": "openai-completions",
+                    "baseUrl": format!("http://{address}/v1"),
+                    "authHeader": false
                 }
             }
         }))
-        .expect("serialize fetched catalog"),
+        .expect("serialize models route"),
     )
-    .expect("write fetched catalog");
+    .expect("write models route");
+
+    let persisted = harness.run(&[
+        "--fetch-models",
+        "acme",
+        "--refresh-models",
+        "--persist-models",
+    ]);
+    assert_exit_code(&harness.harness, &persisted, 0);
+    assert_eq!(persisted.stdout, "issue-150-live-model\n");
+    server.join().expect("catalog fixture thread");
+    drop(held_auth_lock);
 
     let result = harness.run(&["--list-models", "issue-150-live-model"]);
 
     assert_exit_code(&harness.harness, &result, 0);
-    assert_contains(&harness.harness, &result.stdout, "openrouter");
+    assert_contains(&harness.harness, &result.stdout, "acme");
     assert_contains(&harness.harness, &result.stdout, "issue-150-live-model");
 }
 

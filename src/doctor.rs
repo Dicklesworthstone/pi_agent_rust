@@ -13848,7 +13848,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
             ..SessionHeader::default()
         };
         futures::executor::block_on(async {
-            crate::session_sqlite::save_session(&path, &header, &[])
+            crate::session_sqlite::save_session(&path, &header, &[], true)
                 .await
                 .expect("save sqlite session");
         });
@@ -13865,7 +13865,7 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
             ..SessionHeader::default()
         };
         futures::executor::block_on(async {
-            crate::session_sqlite::save_session(&path, &header, &[])
+            crate::session_sqlite::save_session(&path, &header, &[], true)
                 .await
                 .expect("save sqlite session");
         });

@@ -133,6 +133,124 @@ fn parse_cli_from_env() -> Result<Option<ParsedCliEnvironment>> {
         .map(|(cli, extension_flags)| (cli, extension_flags, raw_args)))
 }
 
+fn add_fetch_models_conflict(
+    conflicts: &mut Vec<&'static str>,
+    condition: bool,
+    description: &'static str,
+) {
+    if condition {
+        conflicts.push(description);
+    }
+}
+
+fn collect_fetch_models_execution_conflicts(
+    cli: &cli::Cli,
+    extension_flags: &[cli::ExtensionCliFlag],
+    raw_args: &[String],
+    conflicts: &mut Vec<&'static str>,
+) {
+    add_fetch_models_conflict(conflicts, cli.version, "--version");
+    add_fetch_models_conflict(
+        conflicts,
+        cli.explain_extension_policy,
+        "--explain-extension-policy",
+    );
+    add_fetch_models_conflict(
+        conflicts,
+        cli.explain_repair_policy,
+        "--explain-repair-policy",
+    );
+    add_fetch_models_conflict(conflicts, cli.list_models.is_some(), "--list-models");
+    add_fetch_models_conflict(conflicts, cli.list_providers, "--list-providers");
+    add_fetch_models_conflict(conflicts, cli.export.is_some(), "--export");
+    add_fetch_models_conflict(
+        conflicts,
+        cli.rpc || cli.mode.as_deref().is_some_and(|mode| !mode.eq("text")),
+        "output-mode arguments",
+    );
+    add_fetch_models_conflict(conflicts, cli.acp, "--acp");
+    add_fetch_models_conflict(conflicts, cli.command.is_some(), "a subcommand");
+    add_fetch_models_conflict(conflicts, !cli.args.is_empty(), "prompt or file arguments");
+    add_fetch_models_conflict(
+        conflicts,
+        !cli.extension.is_empty() || !extension_flags.is_empty(),
+        "extension arguments",
+    );
+    let has_selection_arguments = raw_args
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| {
+            matches!(argument.as_str(), "--provider" | "--model" | "--tools")
+                || argument.starts_with("--provider=")
+                || argument.starts_with("--model=")
+                || argument.starts_with("--tools=")
+        });
+    add_fetch_models_conflict(
+        conflicts,
+        has_selection_arguments,
+        "provider, model, or tool-selection arguments",
+    );
+    add_fetch_models_conflict(conflicts, cli.models.is_some(), "--models");
+    add_fetch_models_conflict(conflicts, cli.thinking.is_some(), "--thinking");
+    add_fetch_models_conflict(
+        conflicts,
+        cli.system_prompt.is_some() || cli.append_system_prompt.is_some(),
+        "system-prompt arguments",
+    );
+}
+
+fn collect_fetch_models_context_conflicts(
+    cli: &cli::Cli,
+    raw_args: &[String],
+    conflicts: &mut Vec<&'static str>,
+) {
+    let has_session_arguments = cli.r#continue
+        || cli.resume
+        || cli.session.is_some()
+        || cli.session_dir.is_some()
+        || cli.no_session
+        || cli.session_durability.is_some();
+    add_fetch_models_conflict(conflicts, has_session_arguments, "session arguments");
+    add_fetch_models_conflict(conflicts, cli.no_mouse_capture, "--no-mouse-capture");
+    add_fetch_models_conflict(conflicts, cli.no_migrations, "--no-migrations");
+    add_fetch_models_conflict(conflicts, cli.verbose, "--verbose");
+    add_fetch_models_conflict(conflicts, cli.no_tools, "--no-tools");
+    add_fetch_models_conflict(
+        conflicts,
+        cli.extension_policy.is_some() || cli.repair_policy.is_some(),
+        "policy arguments",
+    );
+    add_fetch_models_conflict(
+        conflicts,
+        !cli.skill.is_empty() || !cli.prompt_template.is_empty(),
+        "skill or prompt-template arguments",
+    );
+    add_fetch_models_conflict(
+        conflicts,
+        cli.no_extensions || cli.no_skills || cli.no_prompt_templates || cli.no_themes,
+        "resource-discovery disable arguments",
+    );
+    add_fetch_models_conflict(
+        conflicts,
+        cli.theme.is_some() || !cli.theme_path.is_empty(),
+        "theme arguments",
+    );
+    let has_hide_cwd_argument = raw_args
+        .iter()
+        .skip(1)
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| {
+            argument == "--hide-cwd-in-prompt" || argument.starts_with("--hide-cwd-in-prompt=")
+        });
+    add_fetch_models_conflict(conflicts, has_hide_cwd_argument, "--hide-cwd-in-prompt");
+    add_fetch_models_conflict(
+        conflicts,
+        cli.max_tool_iterations.is_some(),
+        "--max-tool-iterations",
+    );
+}
+
 fn validate_fetch_models_is_standalone(
     cli: &cli::Cli,
     extension_flags: &[cli::ExtensionCliFlag],
@@ -143,89 +261,8 @@ fn validate_fetch_models_is_standalone(
     }
 
     let mut conflicts = Vec::new();
-    if cli.version {
-        conflicts.push("--version");
-    }
-    if cli.explain_extension_policy {
-        conflicts.push("--explain-extension-policy");
-    }
-    if cli.explain_repair_policy {
-        conflicts.push("--explain-repair-policy");
-    }
-    if cli.list_models.is_some() {
-        conflicts.push("--list-models");
-    }
-    if cli.list_providers {
-        conflicts.push("--list-providers");
-    }
-    if cli.export.is_some() {
-        conflicts.push("--export");
-    }
-    if cli.rpc || cli.mode.as_deref().is_some_and(|mode| mode != "text") {
-        conflicts.push("RPC/JSON mode");
-    }
-    if cli.acp {
-        conflicts.push("--acp");
-    }
-    if cli.command.is_some() {
-        conflicts.push("a subcommand");
-    }
-    if !cli.args.is_empty() {
-        conflicts.push("prompt or file arguments");
-    }
-    if !cli.extension.is_empty() || !extension_flags.is_empty() {
-        conflicts.push("extension arguments");
-    }
-    if raw_args.iter().skip(1).any(|argument| {
-        matches!(argument.as_str(), "--provider" | "--model" | "--tools")
-            || argument.starts_with("--provider=")
-            || argument.starts_with("--model=")
-            || argument.starts_with("--tools=")
-    }) {
-        conflicts.push("provider, model, or tool-selection arguments");
-    }
-    if cli.models.is_some() {
-        conflicts.push("--models");
-    }
-    if cli.thinking.is_some() {
-        conflicts.push("--thinking");
-    }
-    if cli.system_prompt.is_some() || cli.append_system_prompt.is_some() {
-        conflicts.push("system-prompt arguments");
-    }
-    if cli.r#continue
-        || cli.resume
-        || cli.session.is_some()
-        || cli.session_dir.is_some()
-        || cli.no_session
-        || cli.session_durability.is_some()
-    {
-        conflicts.push("session arguments");
-    }
-    if cli.no_mouse_capture {
-        conflicts.push("--no-mouse-capture");
-    }
-    if cli.verbose {
-        conflicts.push("--verbose");
-    }
-    if cli.no_tools {
-        conflicts.push("--no-tools");
-    }
-    if cli.extension_policy.is_some() || cli.repair_policy.is_some() {
-        conflicts.push("policy arguments");
-    }
-    if !cli.skill.is_empty() || !cli.prompt_template.is_empty() {
-        conflicts.push("skill or prompt-template arguments");
-    }
-    if cli.theme.is_some() || !cli.theme_path.is_empty() {
-        conflicts.push("theme arguments");
-    }
-    if cli.hide_cwd_in_prompt {
-        conflicts.push("--hide-cwd-in-prompt");
-    }
-    if cli.max_tool_iterations.is_some() {
-        conflicts.push("--max-tool-iterations");
-    }
+    collect_fetch_models_execution_conflicts(cli, extension_flags, raw_args, &mut conflicts);
+    collect_fetch_models_context_conflicts(cli, raw_args, &mut conflicts);
 
     if conflicts.is_empty() {
         Ok(())
@@ -303,31 +340,24 @@ async fn resolve_selection_with_auth(
         };
 
         match pi::app::resolve_api_key(auth, cli, &selection.model_entry) {
+            // Structured SAP credentials are deliberately resolved in the provider, after
+            // custom-header precedence is known. Eager exchange here would touch auth.json or
+            // the network even when a complete Authorization override (or authHeader:false)
+            // makes those credentials unused.
             Ok(key) => return Ok(Some((selection, key))),
             Err(err) => {
-                if let Some(startup) = err.downcast_ref::<StartupError>() {
-                    if let StartupError::MissingApiKey { provider } = startup {
-                        let canonical_provider =
-                            pi::provider_metadata::canonical_provider_id(provider)
-                                .unwrap_or(provider.as_str());
-                        if canonical_provider.eq("sap-ai-core")
-                            && let Some(token) = pi::auth::exchange_sap_access_token(auth).await?
-                        {
-                            return Ok(Some((selection, Some(token))));
-                        }
+                if let Some(startup) = err.downcast_ref::<StartupError>()
+                    && allow_setup_prompt
+                {
+                    if run_first_time_setup(startup, auth, cli, models_path).await? {
+                        *model_registry = reload_model_registry_with_extra_entries(
+                            auth,
+                            models_path,
+                            extra_entries,
+                        );
+                        continue;
                     }
-
-                    if allow_setup_prompt {
-                        if run_first_time_setup(startup, auth, cli, models_path).await? {
-                            *model_registry = reload_model_registry_with_extra_entries(
-                                auth,
-                                models_path,
-                                extra_entries,
-                            );
-                            continue;
-                        }
-                        return Ok(None);
-                    }
+                    return Ok(None);
                 }
                 return Err(err);
             }
@@ -1187,8 +1217,9 @@ async fn run(
         config.theme = Some(theme_spec.to_string());
     }
     if cli.no_mouse_capture {
-        // CLI flag (and PI_NO_MOUSE_CAPTURE env var, which clap reads via #[arg(env)])
-        // takes precedence over the persisted setting. Workaround for #78.
+        // The CLI flag takes precedence over the persisted setting. The
+        // PI_NO_MOUSE_CAPTURE env var is read separately by run_interactive so
+        // only the literal value `1` is truthy. Workaround for #78.
         config.disable_mouse_capture = Some(true);
     }
     // Apply the persisted request-timeout setting at the lowest precedence:
@@ -5807,23 +5838,39 @@ async fn handle_fetch_models(
     refresh: bool,
     persist: bool,
 ) -> Result<()> {
-    // Use the normal credential resolver: an explicit CLI override wins, then
-    // stored OAuth/Bearer credentials, provider environment variables, stored
-    // API keys, and supported external-CLI credentials. An empty key is valid
-    // for keyless local providers; keyed providers degrade to the static
-    // registry path unless refresh is strict.
-    let api_key = resolve_provider_api_key(provider, api_key_override);
+    // SAP service-key resolution performs a token exchange. Establish that a
+    // usable live-catalog route exists first so an unsupported native adapter
+    // cannot trigger an unnecessary credential network request. Explicit
+    // models.json SAP routes continue through the normal exchange path.
+    if pi::provider_metadata::canonical_provider_id(provider)
+        .is_some_and(|canonical| canonical == "sap-ai-core")
+        && !pi::providers::model_fetch::provider_model_catalog_route_is_configured(provider)?
+    {
+        bail!(
+            "provider {provider:?} has no built-in or models.json routing configuration for live model discovery"
+        );
+    }
 
-    let catalog = if refresh {
-        pi::providers::refresh_provider_model_catalog(provider, &api_key).await
+    // Resolve the route before auth storage so keyless routes and routes with a
+    // complete custom Authorization header cannot be delayed or rejected by an
+    // unrelated auth.json lock. The plan keeps configured fallback credentials
+    // lazy and reuses the already-resolved route headers for the actual request.
+    let fetch_plan = pi::providers::prepare_provider_model_catalog_fetch(provider)?;
+    let api_key = if fetch_plan.requires_runtime_api_key() {
+        // Use the normal credential resolver: an explicit CLI override wins,
+        // then stored OAuth/Bearer credentials, provider environment variables,
+        // stored API keys, and supported external-CLI credentials.
+        resolve_provider_api_key(provider, api_key_override).await?
     } else {
-        pi::providers::fetch_provider_model_catalog(provider, &api_key).await
+        String::new()
     };
+
+    let catalog = fetch_plan.fetch(&api_key, refresh).await;
 
     let catalog = catalog.map_err(anyhow::Error::new)?;
 
     let used_static_fallback = matches!(
-        catalog.source,
+        catalog.source(),
         pi::providers::ModelCatalogSource::StaticFallback
     );
 
@@ -5835,16 +5882,15 @@ async fn handle_fetch_models(
             );
         }
         let models_path = default_models_path(&Config::global_dir());
-        let fetched_path =
-            pi::providers::persist_provider_model_catalog(&models_path, provider, &catalog.models)?;
+        let fetched_path = pi::providers::persist_provider_model_catalog(&models_path, &catalog)?;
         eprintln!(
             "Persisted {} models for {provider:?} to {}",
-            catalog.models.len(),
+            catalog.models().len(),
             fetched_path.display()
         );
     }
 
-    if catalog.models.is_empty() {
+    if catalog.models().is_empty() {
         bail!(
             "No models available for {provider:?}: live discovery failed and the static registry \
              has no matching entries. Check the provider name and credentials."
@@ -5860,31 +5906,138 @@ async fn handle_fetch_models(
 
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    for id in &catalog.models {
+    for id in catalog.models() {
         writeln!(out, "{id}")?;
     }
     out.flush()?;
     Ok(())
 }
 
-fn resolve_provider_api_key(provider: &str, override_key: Option<&str>) -> String {
+async fn resolve_provider_api_key(provider: &str, override_key: Option<&str>) -> Result<String> {
+    resolve_provider_api_key_with_auth_path_and_env(
+        provider,
+        override_key,
+        Config::auth_path(),
+        |name| std::env::var(name).ok(),
+    )
+    .await
+}
+
+fn resolve_ambient_provider_api_key_with_env<F>(provider: &str, mut env: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let canonical_provider =
+        pi::provider_metadata::canonical_provider_id(provider).unwrap_or(provider);
+    let env_keys: &[&str] = match canonical_provider {
+        // The remaining AWS variables are structured credential-chain inputs,
+        // not standalone bearer tokens. Preserve AuthStorage's normal rule.
+        "amazon-bedrock" => &["AWS_BEARER_TOKEN_BEDROCK"],
+        // SAP's structured environment is exchanged by its provider-owned path.
+        "sap-ai-core" => &[],
+        _ => provider_metadata::provider_auth_env_keys(canonical_provider),
+    };
+    env_keys.iter().find_map(|name| {
+        env(name).and_then(|value| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+    })
+}
+
+async fn resolve_provider_api_key_with_auth_path_and_env<F>(
+    provider: &str,
+    override_key: Option<&str>,
+    auth_path: PathBuf,
+    ambient_env: F,
+) -> Result<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
     if let Some(key) = override_key.map(str::trim).filter(|key| !key.is_empty()) {
-        return key.to_string();
-    }
-    if let Ok(auth) = AuthStorage::load(Config::auth_path())
-        && let Some(key) = auth.resolve_api_key(provider, None)
-        && !key.trim().is_empty()
-    {
-        return key;
-    }
-    for env_key in provider_metadata::provider_auth_env_keys(provider) {
-        if let Ok(value) = std::env::var(env_key)
-            && !value.trim().is_empty()
+        if pi::provider_metadata::canonical_provider_id(provider)
+            .is_some_and(|canonical| canonical == "sap-ai-core")
         {
-            return value;
+            return Ok(pi::auth::resolve_sap_auth_candidate(key)
+                .await?
+                .unwrap_or_default());
+        }
+        return Ok(key.to_string());
+    }
+    match AuthStorage::load_with_lock_timeout_classified(
+        auth_path,
+        pi::auth::AUTH_RESOLUTION_LOCK_TIMEOUT,
+    ) {
+        Ok(mut auth) => {
+            let requested_oauth_expired = matches!(
+                auth.credential_status(provider),
+                pi::auth::CredentialStatus::OAuthExpired { .. }
+            );
+            let refresh_error = if requested_oauth_expired {
+                auth.refresh_expired_oauth_tokens().await.err()
+            } else {
+                None
+            };
+            let resolved = resolve_provider_api_key_from_auth(provider, &auth).await?;
+            if resolved.trim().is_empty() {
+                if let Some(error) = refresh_error {
+                    return Err(anyhow::Error::new(error));
+                }
+            } else if refresh_error.is_some() {
+                // Refresh processes all expiring stored OAuth entries. The requested provider may
+                // still have refreshed successfully (or resolved through its next normal source)
+                // even when an unrelated provider failed. Do not expose the aggregate refresh
+                // diagnostic here because provider error bodies can contain credential material.
+                tracing::warn!(
+                    provider,
+                    "one or more stored OAuth refreshes failed, but the requested model-catalog provider resolved successfully"
+                );
+            }
+            Ok(resolved)
+        }
+        Err(failure @ pi::auth::AuthStorageLoadFailure::LockTimeout(_)) => {
+            Err(anyhow::Error::new(failure.into_error()))
+        }
+        Err(pi::auth::AuthStorageLoadFailure::Other(error)) => {
+            tracing::warn!(
+                provider,
+                error = %error,
+                "stored provider credentials are unavailable; continuing model discovery without them"
+            );
+            if pi::provider_metadata::canonical_provider_id(provider)
+                .is_some_and(|canonical| canonical == "sap-ai-core")
+            {
+                Ok(pi::auth::resolve_ambient_sap_auth_token()
+                    .await?
+                    .unwrap_or_default())
+            } else {
+                Ok(
+                    resolve_ambient_provider_api_key_with_env(provider, ambient_env)
+                        .unwrap_or_default(),
+                )
+            }
         }
     }
-    String::new()
+}
+
+async fn resolve_provider_api_key_from_auth(provider: &str, auth: &AuthStorage) -> Result<String> {
+    if pi::provider_metadata::canonical_provider_id(provider)
+        .is_some_and(|canonical| canonical == "sap-ai-core")
+    {
+        return Ok(pi::auth::resolve_sap_auth_token(auth, None)
+            .await?
+            .unwrap_or_default());
+    }
+
+    if let Some(key) = auth
+        .resolve_api_key(provider, None)
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+    {
+        return Ok(key);
+    }
+
+    Ok(String::new())
 }
 
 fn list_providers() {
@@ -7372,6 +7525,28 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    fn spawn_auth_response_server(status: u16, body: &str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind auth fixture");
+        let address = listener.local_addr().expect("auth fixture address");
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept auth request");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("bound auth request read");
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            let reason = if status == 200 { "OK" } else { "Unauthorized" };
+            write!(
+                stream,
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("write auth response");
+        });
+        format!("http://{address}/token")
+    }
+
     fn render_model_table_for_test<R: ModelTableRow>(rows: &[R]) -> String {
         let mut buf = Vec::new();
         write_model_table(&mut buf, rows).expect("render model table");
@@ -7395,10 +7570,266 @@ mod tests {
 
     #[test]
     fn fetch_models_api_key_override_has_highest_precedence() {
-        assert_eq!(
-            resolve_provider_api_key("openai", Some("  explicit-cli-key  ")),
-            "explicit-cli-key"
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let resolved = runtime
+            .block_on(resolve_provider_api_key(
+                "openai",
+                Some("  explicit-cli-key  "),
+            ))
+            .expect("explicit key resolution");
+        assert_eq!(resolved, "explicit-cli-key");
+    }
+
+    #[test]
+    fn fetch_models_auth_load_failures_preserve_only_ambient_provider_keys() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let directory = TempDir::new().expect("tempdir");
+        let invalid_utf8 = directory.path().join("invalid-auth.json");
+        fs::write(&invalid_utf8, [0xff]).expect("write invalid UTF-8 auth fixture");
+        let oversized = directory.path().join("oversized-auth.json");
+        fs::write(&oversized, vec![b' '; 2 * 1024 * 1024]).expect("write oversized auth fixture");
+        let nonregular = directory.path().join("directory-auth.json");
+        fs::create_dir(&nonregular).expect("create non-regular auth fixture");
+
+        for auth_path in [&invalid_utf8, &oversized, &nonregular] {
+            let resolved = runtime
+                .block_on(resolve_provider_api_key_with_auth_path_and_env(
+                    "openai",
+                    None,
+                    (*auth_path).clone(),
+                    |name| {
+                        (name == "OPENAI_API_KEY").then(|| "  ambient-provider-value  ".to_string())
+                    },
+                ))
+                .expect("ambient key remains usable after non-lock auth load failure");
+            assert_eq!(resolved, "ambient-provider-value");
+        }
+
+        let absent = runtime
+            .block_on(resolve_provider_api_key_with_auth_path_and_env(
+                "openai",
+                None,
+                invalid_utf8,
+                |_| None,
+            ))
+            .expect("missing ambient key remains an explicit empty result");
+        assert!(absent.is_empty());
+    }
+
+    #[test]
+    fn fetch_models_refreshes_expired_oauth_for_requested_provider() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let directory = TempDir::new().expect("tempdir");
+        let auth_path = directory.path().join("auth.json");
+        let token_url = spawn_auth_response_server(
+            200,
+            r#"{"access_token":"refreshed-catalog-token","refresh_token":"next-refresh-token","expires_in":3600}"#,
         );
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "custom-openai",
+            AuthCredential::OAuth {
+                extra: std::collections::HashMap::new(),
+                access_token: "expired-catalog-token".to_string(),
+                refresh_token: "catalog-refresh-token".to_string(),
+                expires: 0,
+                token_url: Some(token_url),
+                client_id: Some("catalog-client".to_string()),
+            },
+        );
+        auth.save().expect("save expired OAuth fixture");
+
+        let resolved = runtime
+            .block_on(resolve_provider_api_key_with_auth_path_and_env(
+                "custom-openai",
+                None,
+                auth_path.clone(),
+                |_| None,
+            ))
+            .expect("refresh requested provider OAuth");
+
+        assert_eq!(resolved, "refreshed-catalog-token");
+        let reloaded = AuthStorage::load(auth_path).expect("reload refreshed auth");
+        assert_eq!(
+            reloaded.api_key("custom-openai").as_deref(),
+            Some("refreshed-catalog-token"),
+            "the normal OAuth lifecycle must durably retain the refreshed credential"
+        );
+    }
+
+    #[test]
+    fn fetch_models_returns_requested_provider_oauth_refresh_failure() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let directory = TempDir::new().expect("tempdir");
+        let auth_path = directory.path().join("auth.json");
+        let token_url = spawn_auth_response_server(401, r#"{"error":"invalid_grant"}"#);
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "custom-openai",
+            AuthCredential::OAuth {
+                extra: std::collections::HashMap::new(),
+                access_token: "expired-catalog-token".to_string(),
+                refresh_token: "rejected-refresh-token".to_string(),
+                expires: 0,
+                token_url: Some(token_url),
+                client_id: Some("catalog-client".to_string()),
+            },
+        );
+        auth.save().expect("save expired OAuth fixture");
+
+        let error = runtime
+            .block_on(resolve_provider_api_key_with_auth_path_and_env(
+                "custom-openai",
+                None,
+                auth_path,
+                |_| None,
+            ))
+            .expect_err("the requested provider refresh failure must be surfaced");
+
+        let message = error.to_string();
+        assert!(message.contains("custom-openai"), "{message}");
+        assert!(message.contains("token refresh failed"), "{message}");
+    }
+
+    #[test]
+    fn fetch_models_sap_auth_uses_stored_bearer_or_exchanges_service_key() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let directory = TempDir::new().expect("tempdir");
+        let auth_path = directory.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("load auth");
+
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::BearerToken {
+                token: "stored-sap-bearer".to_string(),
+            },
+        );
+        let bearer = runtime
+            .block_on(resolve_provider_api_key_from_auth("sap", &auth))
+            .expect("resolve stored SAP bearer");
+        assert_eq!(bearer, "stored-sap-bearer");
+
+        let token_url =
+            spawn_auth_response_server(200, r#"{"access_token":"exchanged-sap-token"}"#);
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ServiceKey {
+                client_id: Some("sap-client".to_string()),
+                // ubs:ignore test fixture credential, not live secret.
+                client_secret: Some("sap-secret".to_string()),
+                token_url: Some(token_url),
+                service_url: Some("https://api.ai.sap.example.com".to_string()),
+            },
+        );
+        let exchanged = runtime
+            .block_on(resolve_provider_api_key_from_auth("sap-ai-core", &auth))
+            .expect("exchange SAP service credentials");
+        assert_eq!(exchanged, "exchanged-sap-token");
+
+        let explicit_token_url =
+            spawn_auth_response_server(200, r#"{"access_token":"explicit-sap-token"}"#);
+        let explicit_service_key = serde_json::json!({
+            "clientid": "explicit-client",
+            // ubs:ignore test fixture credential, not live secret.
+            "clientsecret": "explicit-secret",
+            "url": explicit_token_url,
+            "serviceurls": {"AI_API_URL": "https://api.ai.sap.example.com"}
+        })
+        .to_string();
+        let explicit = runtime
+            .block_on(resolve_provider_api_key("sap", Some(&explicit_service_key)))
+            .expect("exchange explicit SAP service key");
+        assert_eq!(explicit, "explicit-sap-token");
+    }
+
+    #[test]
+    fn fetch_models_option_scan_stops_at_positional_separator() {
+        let raw_args = [
+            "pi",
+            "--fetch-models",
+            "openai",
+            "--",
+            "--hide-cwd-in-prompt",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        let (cli, extension_flags) = parse_cli_args(raw_args.clone())
+            .expect("parse result")
+            .expect("parsed CLI");
+        assert_eq!(cli.args, vec!["--hide-cwd-in-prompt"]);
+
+        let error = validate_fetch_models_is_standalone(&cli, &extension_flags, &raw_args)
+            .expect_err("positional prompt remains incompatible with standalone fetch");
+        let message = error.to_string();
+        assert!(message.contains("prompt or file arguments"), "{message}");
+        assert!(
+            !message.contains("prompt or file arguments, --hide-cwd-in-prompt"),
+            "the positional token must not be misclassified as an explicit flag: {message}"
+        );
+    }
+
+    #[test]
+    fn fetch_models_accepts_text_output_but_rejects_non_text_and_startup_resource_flags() {
+        let text_args = [
+            "pi",
+            "--fetch-models",
+            "openai",
+            "--print",
+            "--mode",
+            "text",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        let (cli, extension_flags) = parse_cli_args(text_args.clone())
+            .expect("parse result")
+            .expect("parsed CLI");
+        validate_fetch_models_is_standalone(&cli, &extension_flags, &text_args)
+            .expect("redundant text output flags remain valid for standalone fetch");
+
+        let conflicting_args = [
+            "pi",
+            "--fetch-models",
+            "openai",
+            "--mode",
+            "json",
+            "--no-migrations",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+        ]
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+        let (cli, extension_flags) = parse_cli_args(conflicting_args.clone())
+            .expect("parse result")
+            .expect("parsed CLI");
+
+        let error = validate_fetch_models_is_standalone(&cli, &extension_flags, &conflicting_args)
+            .expect_err("standalone fetch must reject silently ignored flags");
+        let message = error.to_string();
+        for expected in [
+            "output-mode arguments",
+            "--no-migrations",
+            "resource-discovery disable arguments",
+        ] {
+            assert!(
+                message.contains(expected),
+                "missing {expected:?}: {message}"
+            );
+        }
     }
 
     #[test]

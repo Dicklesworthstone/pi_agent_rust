@@ -516,8 +516,9 @@ pub struct Cli {
 
     /// Fetch the live model catalog from a provider's `/v1/models` endpoint
     /// (OpenAI-compatible providers only). Falls back to the static registry
-    /// when the live call fails. Results are cached in-memory for 5 minutes;
-    /// set `PI_DISABLE_MODEL_CACHE=1` to bypass.
+    /// when the live call fails. Long-lived library callers reuse successful
+    /// results in-process for 5 minutes; separate CLI invocations do not share
+    /// that cache. Set `PI_DISABLE_MODEL_CACHE=1` to bypass it.
     #[arg(long, value_name = "PROVIDER")]
     pub fetch_models: Option<String>,
 
@@ -527,8 +528,8 @@ pub struct Cli {
     #[arg(long, requires = "fetch_models")]
     pub refresh_models: bool,
 
-    /// Persist a successful live or cached `--fetch-models` catalog to
-    /// `models.fetched.json`. Static fallback results are never persisted.
+    /// Persist a verified live or same-process cached `--fetch-models` catalog
+    /// to `models.fetched.json`. Static fallback results are never persisted.
     #[arg(long, requires = "fetch_models")]
     pub persist_models: bool,
 

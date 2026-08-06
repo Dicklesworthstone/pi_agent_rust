@@ -132,6 +132,7 @@ pub struct OpenAIProvider {
     provider: String,
     compat: Option<CompatConfig>,
     auth_path_override: Option<PathBuf>,
+    auth_header: bool,
     /// Whether the model is a reasoning model. Gates the DeepSeek thinking
     /// dialect so non-reasoning DeepSeek models (e.g. `deepseek-chat`) never
     /// emit `thinking`/`reasoning_effort` (gh #114). Defaults to `false`; the
@@ -149,6 +150,7 @@ impl OpenAIProvider {
             provider: "openai".to_string(),
             compat: None,
             auth_path_override: None,
+            auth_header: true,
             reasoning: false,
         }
     }
@@ -208,6 +210,14 @@ impl OpenAIProvider {
     #[must_use]
     pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
         self.compat = compat;
+        self
+    }
+
+    /// Control whether this route generates a Bearer Authorization header.
+    /// Custom Authorization headers remain authoritative regardless of this flag.
+    #[must_use]
+    pub const fn with_auth_header(mut self, enabled: bool) -> Self {
+        self.auth_header = enabled;
         self
     }
 
@@ -410,7 +420,7 @@ impl Provider for OpenAIProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let authorization_override = authorization_override(options, self.compat.as_ref());
 
-        let auth_value = if authorization_override.is_some() {
+        let auth_value = if authorization_override.is_some() || !self.auth_header {
             None
         } else {
             // SAP supports either a direct bearer or a service-key JSON candidate. Classify every
@@ -2209,6 +2219,23 @@ mod tests {
         let body: Value = serde_json::from_str(&captured.body).expect("request body json");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn auth_header_false_sends_custom_openai_request_without_authorization() {
+        let options = StreamOptions::default();
+        let captured = run_stream_and_capture_headers_with(
+            OpenAIProvider::new("custom-model")
+                .with_provider_name("custom-openai")
+                .with_auth_header(false),
+            &options,
+        )
+        .expect("captured keyless custom request");
+
+        assert!(
+            !captured.headers.contains_key("authorization"),
+            "authHeader:false must not synthesize Authorization"
+        );
     }
 
     #[test]
