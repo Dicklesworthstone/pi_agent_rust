@@ -7,10 +7,10 @@
     "schema",
     "manifest",
     "segments",
-    "offset_index",
+    "offsetIndex",
     "checkpoints",
-    "migration_events",
-    "state_transitions"
+    "migrationEvents",
+    "stateTransitions"
   ],
   "properties": {
     "schema": {
@@ -22,35 +22,35 @@
     },
     "segments": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "$ref": "#/$defs/segment_frame"
       }
     },
-    "offset_index": {
+    "offsetIndex": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "$ref": "#/$defs/offset_index"
       }
     },
     "checkpoints": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "$ref": "#/$defs/checkpoint"
       }
     },
-    "migration_events": {
+    "migrationEvents": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "$ref": "#/$defs/migration_event"
       }
     },
-    "state_transitions": {
+    "stateTransitions": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "items": {
         "$ref": "#/$defs/state_transition"
       }
@@ -60,7 +60,7 @@
   "$defs": {
     "entry_id": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9_-]{8,128}$"
+      "pattern": "^[A-Za-z0-9_-]{1,128}$"
     },
     "hex64": {
       "type": "string",
@@ -88,11 +88,11 @@
       "type": "object",
       "required": [
         "schema",
-        "store_version",
-        "session_id",
-        "source_format",
-        "created_at",
-        "updated_at",
+        "storeVersion",
+        "sessionId",
+        "sourceFormat",
+        "createdAt",
+        "updatedAt",
         "head",
         "counters",
         "files",
@@ -104,15 +104,15 @@
           "type": "string",
           "const": "pi.session_store_v2.manifest.v1"
         },
-        "store_version": {
+        "storeVersion": {
           "type": "integer",
           "const": 2
         },
-        "session_id": {
+        "sessionId": {
           "type": "string",
           "format": "uuid"
         },
-        "source_format": {
+        "sourceFormat": {
           "type": "string",
           "enum": [
             "jsonl_v3",
@@ -120,32 +120,32 @@
             "native_v2"
           ]
         },
-        "created_at": {
+        "createdAt": {
           "type": "string",
           "format": "date-time"
         },
-        "updated_at": {
+        "updatedAt": {
           "type": "string",
           "format": "date-time"
         },
         "head": {
           "type": "object",
           "required": [
-            "segment_seq",
-            "entry_seq",
-            "entry_id"
+            "segmentSeq",
+            "entrySeq",
+            "entryId"
           ],
           "properties": {
-            "segment_seq": {
+            "segmentSeq": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 0
             },
-            "entry_seq": {
+            "entrySeq": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 0
             },
-            "entry_id": {
-              "$ref": "#/$defs/entry_id"
+            "entryId": {
+              "type": "string"
             }
           },
           "additionalProperties": false
@@ -153,30 +153,30 @@
         "counters": {
           "type": "object",
           "required": [
-            "entries_total",
-            "messages_total",
-            "branches_total",
-            "compactions_total",
-            "bytes_total"
+            "entriesTotal",
+            "messagesTotal",
+            "branchesTotal",
+            "compactionsTotal",
+            "bytesTotal"
           ],
           "properties": {
-            "entries_total": {
+            "entriesTotal": {
               "type": "integer",
               "minimum": 0
             },
-            "messages_total": {
+            "messagesTotal": {
               "type": "integer",
               "minimum": 0
             },
-            "branches_total": {
+            "branchesTotal": {
               "type": "integer",
               "minimum": 0
             },
-            "compactions_total": {
+            "compactionsTotal": {
               "type": "integer",
               "minimum": 0
             },
-            "bytes_total": {
+            "bytesTotal": {
               "type": "integer",
               "minimum": 0
             }
@@ -186,30 +186,30 @@
         "files": {
           "type": "object",
           "required": [
-            "segment_dir",
-            "segment_count",
-            "index_path",
-            "checkpoint_dir",
-            "migration_ledger_path"
+            "segmentDir",
+            "segmentCount",
+            "indexPath",
+            "checkpointDir",
+            "migrationLedgerPath"
           ],
           "properties": {
-            "segment_dir": {
+            "segmentDir": {
               "type": "string",
               "minLength": 1
             },
-            "segment_count": {
+            "segmentCount": {
               "type": "integer",
-              "minimum": 1
+              "minimum": 0
             },
-            "index_path": {
+            "indexPath": {
               "type": "string",
               "minLength": 1
             },
-            "checkpoint_dir": {
+            "checkpointDir": {
               "type": "string",
               "minLength": 1
             },
-            "migration_ledger_path": {
+            "migrationLedgerPath": {
               "type": "string",
               "minLength": 1
             }
@@ -219,18 +219,18 @@
         "integrity": {
           "type": "object",
           "required": [
-            "chain_hash",
-            "manifest_hash",
-            "last_crc32c"
+            "chainHash",
+            "manifestHash",
+            "lastCrc32c"
           ],
           "properties": {
-            "chain_hash": {
+            "chainHash": {
               "$ref": "#/$defs/hex64"
             },
-            "manifest_hash": {
+            "manifestHash": {
               "$ref": "#/$defs/hex64"
             },
-            "last_crc32c": {
+            "lastCrc32c": {
               "$ref": "#/$defs/crc32c"
             }
           },
@@ -239,54 +239,123 @@
         "invariants": {
           "type": "object",
           "required": [
-            "parent_links_closed",
-            "monotonic_entry_seq",
-            "monotonic_segment_seq",
-            "index_within_segment_bounds",
-            "branch_heads_indexed",
-            "checkpoints_monotonic",
-            "hash_chain_valid"
+            "parentLinksClosed",
+            "monotonicEntrySeq",
+            "monotonicSegmentSeq",
+            "indexWithinSegmentBounds",
+            "branchHeadsIndexed",
+            "checkpointsMonotonic",
+            "hashChainValid"
           ],
           "properties": {
-            "parent_links_closed": {
+            "parentLinksClosed": {
               "type": "boolean"
             },
-            "monotonic_entry_seq": {
+            "monotonicEntrySeq": {
               "type": "boolean"
             },
-            "monotonic_segment_seq": {
+            "monotonicSegmentSeq": {
               "type": "boolean"
             },
-            "index_within_segment_bounds": {
+            "indexWithinSegmentBounds": {
               "type": "boolean"
             },
-            "branch_heads_indexed": {
+            "branchHeadsIndexed": {
               "type": "boolean"
             },
-            "checkpoints_monotonic": {
+            "checkpointsMonotonic": {
               "type": "boolean"
             },
-            "hash_chain_valid": {
+            "hashChainValid": {
               "type": "boolean"
             }
           },
           "additionalProperties": false
         }
       },
-      "additionalProperties": false
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "counters": {
+                "properties": {
+                  "entriesTotal": {
+                    "const": 0
+                  }
+                },
+                "required": [
+                  "entriesTotal"
+                ]
+              }
+            },
+            "required": [
+              "counters"
+            ]
+          },
+          "then": {
+            "properties": {
+              "head": {
+                "properties": {
+                  "segmentSeq": {
+                    "const": 0
+                  },
+                  "entrySeq": {
+                    "const": 0
+                  },
+                  "entryId": {
+                    "const": ""
+                  }
+                }
+              },
+              "files": {
+                "properties": {
+                  "segmentCount": {
+                    "const": 0
+                  }
+                }
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "head": {
+                "properties": {
+                  "segmentSeq": {
+                    "minimum": 1
+                  },
+                  "entrySeq": {
+                    "minimum": 1
+                  },
+                  "entryId": {
+                    "$ref": "#/$defs/entry_id"
+                  }
+                }
+              },
+              "files": {
+                "properties": {
+                  "segmentCount": {
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "segment_frame": {
       "type": "object",
       "required": [
         "schema",
-        "segment_seq",
-        "frame_seq",
-        "entry_seq",
-        "entry_id",
-        "entry_type",
+        "segmentSeq",
+        "frameSeq",
+        "entrySeq",
+        "entryId",
+        "entryType",
         "timestamp",
-        "payload_sha256",
-        "payload_bytes",
+        "payloadSha256",
+        "payloadBytes",
         "payload"
       ],
       "properties": {
@@ -294,22 +363,22 @@
           "type": "string",
           "const": "pi.session_store_v2.segment_frame.v1"
         },
-        "segment_seq": {
+        "segmentSeq": {
           "type": "integer",
           "minimum": 1
         },
-        "frame_seq": {
+        "frameSeq": {
           "type": "integer",
           "minimum": 1
         },
-        "entry_seq": {
+        "entrySeq": {
           "type": "integer",
           "minimum": 1
         },
-        "entry_id": {
+        "entryId": {
           "$ref": "#/$defs/entry_id"
         },
-        "parent_entry_id": {
+        "parentEntryId": {
           "oneOf": [
             {
               "$ref": "#/$defs/entry_id"
@@ -319,7 +388,7 @@
             }
           ]
         },
-        "entry_type": {
+        "entryType": {
           "type": "string",
           "enum": [
             "message",
@@ -336,10 +405,10 @@
           "type": "string",
           "format": "date-time"
         },
-        "payload_sha256": {
+        "payloadSha256": {
           "$ref": "#/$defs/hex64"
         },
-        "payload_bytes": {
+        "payloadBytes": {
           "type": "integer",
           "minimum": 1
         },
@@ -354,12 +423,12 @@
       "type": "object",
       "required": [
         "schema",
-        "entry_seq",
-        "entry_id",
-        "segment_seq",
-        "frame_seq",
-        "byte_offset",
-        "byte_length",
+        "entrySeq",
+        "entryId",
+        "segmentSeq",
+        "frameSeq",
+        "byteOffset",
+        "byteLength",
         "crc32c",
         "state"
       ],
@@ -368,26 +437,26 @@
           "type": "string",
           "const": "pi.session_store_v2.offset_index.v1"
         },
-        "entry_seq": {
+        "entrySeq": {
           "type": "integer",
           "minimum": 1
         },
-        "entry_id": {
+        "entryId": {
           "$ref": "#/$defs/entry_id"
         },
-        "segment_seq": {
+        "segmentSeq": {
           "type": "integer",
           "minimum": 1
         },
-        "frame_seq": {
+        "frameSeq": {
           "type": "integer",
           "minimum": 1
         },
-        "byte_offset": {
+        "byteOffset": {
           "type": "integer",
           "minimum": 0
         },
-        "byte_length": {
+        "byteLength": {
           "type": "integer",
           "minimum": 1
         },
@@ -409,13 +478,13 @@
       "type": "object",
       "required": [
         "schema",
-        "checkpoint_seq",
+        "checkpointSeq",
         "at",
-        "head_entry_seq",
-        "head_entry_id",
-        "snapshot_ref",
-        "compacted_before_entry_seq",
-        "chain_hash",
+        "headEntrySeq",
+        "headEntryId",
+        "snapshotRef",
+        "compactedBeforeEntrySeq",
+        "chainHash",
         "reason"
       ],
       "properties": {
@@ -423,7 +492,7 @@
           "type": "string",
           "const": "pi.session_store_v2.checkpoint.v1"
         },
-        "checkpoint_seq": {
+        "checkpointSeq": {
           "type": "integer",
           "minimum": 1
         },
@@ -431,22 +500,22 @@
           "type": "string",
           "format": "date-time"
         },
-        "head_entry_seq": {
+        "headEntrySeq": {
           "type": "integer",
           "minimum": 1
         },
-        "head_entry_id": {
+        "headEntryId": {
           "$ref": "#/$defs/entry_id"
         },
-        "snapshot_ref": {
+        "snapshotRef": {
           "type": "string",
           "minLength": 1
         },
-        "compacted_before_entry_seq": {
+        "compactedBeforeEntrySeq": {
           "type": "integer",
           "minimum": 0
         },
-        "chain_hash": {
+        "chainHash": {
           "$ref": "#/$defs/hex64"
         },
         "reason": {
@@ -466,23 +535,23 @@
       "type": "object",
       "required": [
         "schema",
-        "migration_id",
+        "migrationId",
         "phase",
         "at",
-        "source_path",
-        "target_path",
-        "source_format",
-        "target_format",
+        "sourcePath",
+        "targetPath",
+        "sourceFormat",
+        "targetFormat",
         "verification",
         "outcome",
-        "correlation_id"
+        "correlationId"
       ],
       "properties": {
         "schema": {
           "type": "string",
           "const": "pi.session_store_v2.migration_event.v1"
         },
-        "migration_id": {
+        "migrationId": {
           "type": "string",
           "format": "uuid"
         },
@@ -502,15 +571,15 @@
           "type": "string",
           "format": "date-time"
         },
-        "source_path": {
+        "sourcePath": {
           "type": "string",
           "minLength": 1
         },
-        "target_path": {
+        "targetPath": {
           "type": "string",
           "minLength": 1
         },
-        "source_format": {
+        "sourceFormat": {
           "type": "string",
           "enum": [
             "jsonl_v3",
@@ -518,7 +587,7 @@
             "native_v2"
           ]
         },
-        "target_format": {
+        "targetFormat": {
           "type": "string",
           "enum": [
             "jsonl_v3",
@@ -529,18 +598,18 @@
         "verification": {
           "type": "object",
           "required": [
-            "entry_count_match",
-            "hash_chain_match",
-            "index_consistent"
+            "entryCountMatch",
+            "hashChainMatch",
+            "indexConsistent"
           ],
           "properties": {
-            "entry_count_match": {
+            "entryCountMatch": {
               "type": "boolean"
             },
-            "hash_chain_match": {
+            "hashChainMatch": {
               "type": "boolean"
             },
-            "index_consistent": {
+            "indexConsistent": {
               "type": "boolean"
             }
           },
@@ -554,7 +623,7 @@
             "fatal_error"
           ]
         },
-        "error_class": {
+        "errorClass": {
           "type": [
             "string",
             "null"
@@ -567,7 +636,7 @@
             null
           ]
         },
-        "correlation_id": {
+        "correlationId": {
           "type": "string",
           "pattern": "^[A-Za-z0-9._:-]{8,128}$"
         }
@@ -577,16 +646,16 @@
     "state_transition": {
       "type": "object",
       "required": [
-        "from_state",
-        "to_state",
+        "fromState",
+        "toState",
         "reason",
         "at"
       ],
       "properties": {
-        "from_state": {
+        "fromState": {
           "$ref": "#/$defs/store_state"
         },
-        "to_state": {
+        "toState": {
           "$ref": "#/$defs/store_state"
         },
         "reason": {
@@ -603,17 +672,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "CLEAN"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "DIRTY",
                   "MIGRATION_STAGING"
@@ -625,17 +694,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "DIRTY"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "SEGMENT_SEALED",
                   "FAILED"
@@ -647,17 +716,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "SEGMENT_SEALED"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "INDEXED",
                   "FAILED"
@@ -669,17 +738,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "INDEXED"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "CHECKPOINTED",
                   "DIRTY",
@@ -692,17 +761,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "CHECKPOINTED"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "DIRTY",
                   "MIGRATION_STAGING",
@@ -716,17 +785,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "MIGRATION_STAGING"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "MIGRATED",
                   "ROLLED_BACK",
@@ -739,17 +808,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "MIGRATED"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "DIRTY",
                   "FAILED"
@@ -761,17 +830,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "ROLLED_BACK"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "DIRTY",
                   "FAILED"
@@ -783,17 +852,17 @@
         {
           "if": {
             "properties": {
-              "from_state": {
+              "fromState": {
                 "const": "FAILED"
               }
             },
             "required": [
-              "from_state"
+              "fromState"
             ]
           },
           "then": {
             "properties": {
-              "to_state": {
+              "toState": {
                 "enum": [
                   "DIRTY",
                   "ROLLED_BACK"

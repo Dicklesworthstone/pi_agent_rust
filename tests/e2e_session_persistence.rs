@@ -1146,7 +1146,7 @@ fn run_session_store_chaos_worker_from_env() {
                     )
                     .expect("append rollback base");
                 rollback_store
-                    .create_checkpoint(1, "chaos-baseline")
+                    .create_checkpoint(1, "manual")
                     .expect("create rollback checkpoint");
                 rollback_store
                     .append_entry(

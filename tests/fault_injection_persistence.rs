@@ -546,6 +546,41 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
 // Phase 5: Durability mode fault behavior matrix
 // ===========================================================================
 
+#[cfg(unix)]
+#[test]
+fn fault_inject_first_save_denial_leaves_no_partial_session_tree() {
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let sessions_root = temp_dir.path().join("sessions");
+    std::fs::create_dir(&sessions_root).expect("create sessions root");
+
+    let mut session = Session::create();
+    session.session_dir = Some(sessions_root.clone());
+    session.append_message(make_msg("pending-first-save"));
+
+    // The fixture owner lacks write while group/other are writable. The same
+    // strict assertion therefore exercises effective-class policy under both
+    // UID 0 and UID 1000, with RAII restoration and no conditional skip.
+    let mut mode_guard = UnixModeGuard::apply(&sessions_root, 0o577);
+    let result = run_async(async { session.save().await });
+    mode_guard.restore();
+
+    let error = result.expect_err("first save must fail before directory creation");
+    assert_permission_denied(&error);
+    assert!(session.path.is_none(), "failed save must not assign a path");
+    assert_eq!(
+        session.entries.len(),
+        1,
+        "pending entry must remain in memory"
+    );
+    assert_eq!(
+        std::fs::read_dir(&sessions_root)
+            .expect("read restored sessions root")
+            .count(),
+        0,
+        "permission denial must leave no partial project directory"
+    );
+}
+
 #[test]
 fn fault_inject_durability_strict_fails_on_io_error() {
     let mut trace = TraceLog::new();
@@ -860,7 +895,7 @@ fn fault_inject_v2_store_segment_corruption_recovery() {
     );
 
     // Create checkpoint to snapshot known-good state.
-    let checkpoint = store.create_checkpoint(1, "post-fault-checkpoint");
+    let checkpoint = store.create_checkpoint(1, "recovery");
     trace.log(
         "CHECKPOINT",
         "create",

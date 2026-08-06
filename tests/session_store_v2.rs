@@ -3,11 +3,12 @@
 use pi::PiResult;
 use pi::session::{CustomEntry, EntryBase, MigrationState, Session, SessionEntry, SessionHeader};
 use pi::session_store_v2::{
-    MigrationEvent, MigrationVerification, SessionStoreV2, frame_to_session_entry,
+    Manifest, MigrationEvent, MigrationVerification, SessionStoreV2, frame_to_session_entry,
     session_entry_to_frame_args,
 };
 use proptest::prelude::*;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::future::Future;
 use std::io::{Seek, SeekFrom, Write};
@@ -15,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
+
+const TEST_MANIFEST_SESSION_ID: &str = "f4c03c8c-cf0a-4c90-9535-e95f2d02b393";
 
 const fn lcg_next(state: &mut u64) -> u64 {
     *state = state
@@ -66,6 +69,37 @@ fn write_index_json_rows(path: &Path, rows: &[Value]) -> PiResult<()> {
     Ok(())
 }
 
+fn rewrite_single_segment_frames_and_index(
+    store: &SessionStoreV2,
+    frames: &[pi::session_store_v2::SegmentFrame],
+) -> PiResult<()> {
+    let mut index_rows = read_index_json_rows(&store.index_file_path())?;
+    assert_eq!(index_rows.len(), frames.len());
+    let segment_seq = frames.first().map_or(1, |frame| frame.segment_seq);
+    assert!(frames.iter().all(|frame| frame.segment_seq == segment_seq));
+
+    let mut segment_bytes = Vec::new();
+    for (index_row, frame) in index_rows.iter_mut().zip(frames) {
+        let byte_offset = segment_bytes.len();
+        let mut record = serde_json::to_vec(frame)?;
+        record.push(b'\n');
+        index_row["byteOffset"] = json!(byte_offset);
+        index_row["byteLength"] = json!(record.len());
+        index_row["crc32c"] = json!(format!("{:08X}", crc32c::crc32c(&record)));
+        segment_bytes.extend_from_slice(&record);
+    }
+    fs::write(store.segment_file_path(segment_seq), segment_bytes)?;
+    write_index_json_rows(&store.index_file_path(), &index_rows)
+}
+
+fn write_rehashed_manifest(path: &Path, mut manifest: Manifest) -> PiResult<()> {
+    manifest.integrity.manifest_hash.clear();
+    manifest.integrity.manifest_hash =
+        format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?));
+    fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+    Ok(())
+}
+
 #[test]
 fn segmented_append_and_index_round_trip() -> PiResult<()> {
     let dir = tempdir()?;
@@ -101,11 +135,16 @@ fn segmented_append_and_index_round_trip() -> PiResult<()> {
 #[test]
 fn rotates_segment_when_threshold_is_hit() -> PiResult<()> {
     let dir = tempdir()?;
-    let mut store = SessionStoreV2::create(dir.path(), 220)?;
     let payload = json!({
         "kind": "message",
         "text": "x".repeat(180)
     });
+
+    let mut probe = SessionStoreV2::create(dir.path().join("probe"), 4 * 1024)?;
+    let threshold = probe
+        .append_entry("entry_00000001", None, "message", payload.clone())?
+        .byte_length;
+    let mut store = SessionStoreV2::create(dir.path().join("store"), threshold)?;
 
     store.append_entry("entry_00000001", None, "message", payload.clone())?;
     store.append_entry("entry_00000002", None, "message", payload)?;
@@ -218,6 +257,38 @@ fn create_recovers_when_index_json_is_corrupt() -> PiResult<()> {
     let recovered = SessionStoreV2::create(dir.path(), 4 * 1024)?;
     recovered.validate_integrity()?;
     assert_eq!(recovered.entry_count(), 5);
+    assert_eq!(frame_ids(&recovered.read_all_entries()?), expected_ids);
+    Ok(())
+}
+
+#[test]
+fn create_rebuilds_unterminated_index_before_append() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let mut expected_ids = append_linear_entries(&mut store, 4)?;
+    let index_path = store.index_file_path();
+    let mut index_bytes = fs::read(&index_path)?;
+    assert_eq!(
+        index_bytes.pop(),
+        Some(b'\n'),
+        "fixture index must end in LF"
+    );
+    fs::write(&index_path, index_bytes)?;
+    drop(store);
+
+    let mut recovered = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    assert_eq!(frame_ids(&recovered.read_all_entries()?), expected_ids);
+    assert_eq!(fs::read(&index_path)?.last(), Some(&b'\n'));
+
+    let next_id = "entry_00000005".to_string();
+    recovered.append_entry(
+        next_id.clone(),
+        expected_ids.last().cloned(),
+        "message",
+        json!({"kind":"message","ordinal":5}),
+    )?;
+    expected_ids.push(next_id);
+    recovered.validate_integrity()?;
     assert_eq!(frame_ids(&recovered.read_all_entries()?), expected_ids);
     Ok(())
 }
@@ -442,6 +513,257 @@ fn read_tail_entries_returns_last_n() -> PiResult<()> {
 }
 
 #[test]
+fn bounded_resume_skips_unselected_corruption_but_rejects_it_when_accessed() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 64 * 1024)?;
+    let ids = append_linear_entries(&mut store, 6)?;
+    store.write_manifest(TEST_MANIFEST_SESSION_ID, "native_v2")?;
+    let index = store.read_index()?;
+
+    let first = &index[0];
+    let first_segment_path = store.segment_file_path(first.segment_seq);
+    let mut first_segment = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&first_segment_path)?;
+    first_segment.seek(SeekFrom::Start(first.byte_offset))?;
+    first_segment.write_all(b"[")?;
+    first_segment.sync_all()?;
+
+    let manifest = store
+        .validate_resume_manifest_against_store()?
+        .expect("structurally valid bounded resume manifest");
+    assert_eq!(manifest.counters.entries_total, 6);
+    let tail = store.read_tail_entries(1)?;
+    assert_eq!(frame_ids(&tail), ids[5..].to_vec());
+
+    let audit_error = store
+        .validate_integrity()
+        .expect_err("a full audit must still inspect the corrupt sibling frame");
+    assert!(
+        audit_error.to_string().contains("checksum mismatch"),
+        "unexpected audit error: {audit_error}"
+    );
+    let accessed_error = store
+        .lookup_entry(first.entry_seq)
+        .expect_err("fetching the corrupt sibling must fail closed");
+    assert!(
+        accessed_error.to_string().contains("checksum mismatch"),
+        "unexpected accessed-frame error: {accessed_error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn fetched_frame_rejects_payload_hash_corruption_with_matching_index_crc() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let row = store.append_entry(
+        "entry_00000001",
+        None,
+        "message",
+        json!({"kind":"message","text":"payload-bound"}),
+    )?;
+    let frame = store
+        .lookup_entry(row.entry_seq)?
+        .expect("freshly appended frame");
+    let digest = frame.payload_sha256.as_bytes();
+
+    let segment_path = store.segment_file_path(row.segment_seq);
+    let mut segment_bytes = fs::read(&segment_path)?;
+    let start = usize::try_from(row.byte_offset).expect("frame offset fits usize");
+    let length = usize::try_from(row.byte_length).expect("frame length fits usize");
+    let end = start.checked_add(length).expect("frame range fits usize");
+    let record = &mut segment_bytes[start..end];
+    let digest_offset = record
+        .windows(digest.len())
+        .position(|window| window == digest)
+        .expect("payload digest occurs in frame");
+    record[digest_offset] = if record[digest_offset] == b'0' {
+        b'1'
+    } else {
+        b'0'
+    };
+    let replacement_crc = format!("{:08X}", crc32c::crc32c(record));
+    fs::write(&segment_path, &segment_bytes)?;
+
+    let mut index_rows = read_index_json_rows(&store.index_file_path())?;
+    index_rows[0]["crc32c"] = json!(replacement_crc);
+    write_index_json_rows(&store.index_file_path(), &index_rows)?;
+
+    let error = store
+        .lookup_entry(row.entry_seq)
+        .expect_err("payload hash mismatch must fail even when the index CRC matches");
+    assert!(
+        error.to_string().contains("payload integrity mismatch"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn fetched_frame_requires_lf_even_when_index_crc_matches() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let row = store.append_entry(
+        "entry_00000001",
+        None,
+        "message",
+        json!({"kind":"message","text":"lf-bound"}),
+    )?;
+    let segment_path = store.segment_file_path(row.segment_seq);
+    let mut segment_bytes = fs::read(&segment_path)?;
+    let start = usize::try_from(row.byte_offset).expect("frame offset fits usize");
+    let length = usize::try_from(row.byte_length).expect("frame length fits usize");
+    let end = start.checked_add(length).expect("frame range fits usize");
+    let record = &mut segment_bytes[start..end];
+    assert_eq!(record.last(), Some(&b'\n'));
+    *record.last_mut().expect("nonempty frame") = b' ';
+    let replacement_crc = format!("{:08X}", crc32c::crc32c(record));
+    fs::write(&segment_path, &segment_bytes)?;
+
+    let mut index_rows = read_index_json_rows(&store.index_file_path())?;
+    index_rows[0]["crc32c"] = json!(replacement_crc);
+    write_index_json_rows(&store.index_file_path(), &index_rows)?;
+
+    let error = store
+        .lookup_entry(row.entry_seq)
+        .expect_err("a fetched frame without LF termination must fail closed");
+    assert!(
+        error.to_string().contains("not LF-terminated"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn bounded_fetch_rejects_a_selected_self_parent_with_matching_crc() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let ids = append_linear_entries(&mut store, 2)?;
+    let index = store.read_index()?;
+    let row = &index[1];
+
+    let segment_path = store.segment_file_path(row.segment_seq);
+    let mut segment_bytes = fs::read(&segment_path)?;
+    let start = usize::try_from(row.byte_offset).expect("frame offset fits usize");
+    let length = usize::try_from(row.byte_length).expect("frame length fits usize");
+    let end = start.checked_add(length).expect("frame range fits usize");
+    let record = &mut segment_bytes[start..end];
+    let parent_offset = record
+        .windows(ids[0].len())
+        .position(|window| window == ids[0].as_bytes())
+        .expect("second frame contains its parent ID");
+    record[parent_offset..parent_offset + ids[1].len()].copy_from_slice(ids[1].as_bytes());
+    let replacement_crc = format!("{:08X}", crc32c::crc32c(record));
+    fs::write(&segment_path, segment_bytes)?;
+
+    let mut index_rows = read_index_json_rows(&store.index_file_path())?;
+    index_rows[1]["crc32c"] = json!(replacement_crc);
+    write_index_json_rows(&store.index_file_path(), &index_rows)?;
+
+    let error = store
+        .read_tail_entries(1)
+        .expect_err("a fetched self-parent must be rejected before hydration");
+    assert!(
+        error.to_string().contains("cyclic parent chain"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
+fn wire_readers_reject_unknown_index_and_frame_fields() -> PiResult<()> {
+    let dir = tempdir()?;
+
+    let index_root = dir.path().join("index");
+    let mut index_store = SessionStoreV2::create(&index_root, 4 * 1024)?;
+    append_linear_entries(&mut index_store, 1)?;
+    let mut index_rows = read_index_json_rows(&index_store.index_file_path())?;
+    index_rows[0]["unexpectedField"] = json!(true);
+    write_index_json_rows(&index_store.index_file_path(), &index_rows)?;
+    let error = index_store
+        .read_index()
+        .expect_err("unknown offset-index fields must be rejected");
+    assert!(error.to_string().contains("unknown field"));
+
+    let frame_root = dir.path().join("frame");
+    let mut frame_store = SessionStoreV2::create(&frame_root, 4 * 1024)?;
+    let row = frame_store.append_entry(
+        "entry_00000001",
+        None,
+        "message",
+        json!({"kind":"message","ordinal":1}),
+    )?;
+    let segment_path = frame_store.segment_file_path(row.segment_seq);
+    let segment_bytes = fs::read(&segment_path)?;
+    let mut frame_json: Value = serde_json::from_slice(
+        segment_bytes
+            .strip_suffix(b"\n")
+            .expect("stored frame is LF-terminated"),
+    )?;
+    frame_json["unexpectedField"] = json!(true);
+    let mut forged_record = serde_json::to_vec(&frame_json)?;
+    forged_record.push(b'\n');
+    fs::write(&segment_path, &forged_record)?;
+
+    let mut frame_index_rows = read_index_json_rows(&frame_store.index_file_path())?;
+    frame_index_rows[0]["byteLength"] = json!(forged_record.len());
+    frame_index_rows[0]["crc32c"] = json!(format!("{:08X}", crc32c::crc32c(&forged_record)));
+    write_index_json_rows(&frame_store.index_file_path(), &frame_index_rows)?;
+
+    let error = frame_store
+        .lookup_entry(row.entry_seq)
+        .expect_err("unknown segment-frame fields must be rejected before use");
+    assert!(error.to_string().contains("unknown field"));
+    Ok(())
+}
+
+#[test]
+fn checkpoint_reader_rejects_unknown_fields() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_linear_entries(&mut store, 1)?;
+    store.create_checkpoint(1, "manual")?;
+
+    let checkpoint_path = dir.path().join("checkpoints/0000000000000001.json");
+    let mut checkpoint: Value = serde_json::from_slice(&fs::read(&checkpoint_path)?)?;
+    checkpoint["unexpectedField"] = json!(true);
+    fs::write(&checkpoint_path, serde_json::to_vec_pretty(&checkpoint)?)?;
+
+    let error = store
+        .read_checkpoint(1)
+        .expect_err("unknown checkpoint fields must be rejected");
+    assert!(error.to_string().contains("unknown field"));
+    Ok(())
+}
+
+#[test]
+fn bounded_resume_rejects_an_unindexed_empty_segment_file() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_linear_entries(&mut store, 2)?;
+    store.write_manifest(TEST_MANIFEST_SESSION_ID, "native_v2")?;
+
+    let unindexed_segment = store.segment_file_path(99);
+    fs::write(&unindexed_segment, [])?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&unindexed_segment, fs::Permissions::from_mode(0o600))?;
+    }
+
+    let error = store
+        .validate_resume_manifest_against_store()
+        .expect_err("even an empty unindexed segment must fail structural coverage validation");
+    assert!(
+        error.to_string().contains("segment byte coverage mismatch"),
+        "unexpected error: {error}"
+    );
+    Ok(())
+}
+
+#[test]
 fn read_active_path_linear_returns_all() -> PiResult<()> {
     let dir = tempdir()?;
     let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
@@ -488,17 +810,10 @@ fn read_active_path_errors_on_cyclic_parent_chain() -> PiResult<()> {
     store.append_entry("A", None, "message", json!({"v":"A"}))?;
     store.append_entry("B", Some("A".to_string()), "message", json!({"v":"B"}))?;
 
-    let segment_path = store.segment_file_path(1);
     let mut frames = store.read_segment(1)?;
     assert_eq!(frames.len(), 2);
     frames[1].parent_entry_id = Some("B".to_string());
-
-    let mut encoded = String::new();
-    for frame in frames {
-        encoded.push_str(&serde_json::to_string(&frame)?);
-        encoded.push('\n');
-    }
-    fs::write(&segment_path, encoded)?;
+    rewrite_single_segment_frames_and_index(&store, &frames)?;
 
     let err = store
         .read_active_path("B")
@@ -543,7 +858,7 @@ fn read_active_path_errors_on_missing_leaf_frame() -> PiResult<()> {
     let err = store
         .read_active_path("B")
         .expect_err("missing indexed leaf frame must fail");
-    assert!(err.to_string().contains("index references missing frame"));
+    assert!(err.to_string().contains("index references missing segment"));
     Ok(())
 }
 
@@ -554,17 +869,10 @@ fn read_active_path_errors_on_missing_parent_reference() -> PiResult<()> {
     store.append_entry("A", None, "message", json!({"v":"A"}))?;
     store.append_entry("B", Some("A".to_string()), "message", json!({"v":"B"}))?;
 
-    let segment_path = store.segment_file_path(1);
     let mut frames = store.read_segment(1)?;
     assert_eq!(frames.len(), 2);
     frames[1].parent_entry_id = Some("Z".to_string());
-
-    let mut encoded = String::new();
-    for frame in frames {
-        encoded.push_str(&serde_json::to_string(&frame)?);
-        encoded.push('\n');
-    }
-    fs::write(&segment_path, encoded)?;
+    rewrite_single_segment_frames_and_index(&store, &frames)?;
 
     let err = store
         .read_active_path("B")
@@ -678,6 +986,71 @@ fn frame_to_session_entry_roundtrip() -> PiResult<()> {
 }
 
 #[test]
+fn frame_to_session_entry_rejects_metadata_payload_mismatch() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_session_entry(&mut store, &make_custom_entry("parent", None))?;
+    let entry = make_custom_entry("entry", Some("parent"));
+    append_session_entry(&mut store, &entry)?;
+    let frame = store
+        .read_all_entries()?
+        .into_iter()
+        .nth(1)
+        .expect("child frame");
+
+    let mut wrong_id = frame.clone();
+    wrong_id.entry_id = "other".to_string();
+    assert!(
+        frame_to_session_entry(&wrong_id)
+            .expect_err("entry ID mismatch must fail")
+            .to_string()
+            .contains("frame entry_id mismatch")
+    );
+
+    let mut wrong_parent = frame.clone();
+    wrong_parent.parent_entry_id = Some("other-parent".to_string());
+    assert!(
+        frame_to_session_entry(&wrong_parent)
+            .expect_err("parent mismatch must fail")
+            .to_string()
+            .contains("frame parent_entry_id mismatch")
+    );
+
+    let mut wrong_type = frame;
+    wrong_type.entry_type = "message".to_string();
+    assert!(
+        frame_to_session_entry(&wrong_type)
+            .expect_err("entry type mismatch must fail")
+            .to_string()
+            .contains("frame entry_type mismatch")
+    );
+    Ok(())
+}
+
+#[test]
+fn session_integrity_rejects_tampered_frame_metadata() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_session_entry(&mut store, &make_custom_entry("entry", None))?;
+
+    let segment_path = store.segment_file_path(1);
+    let mut frames = store.read_segment(1)?;
+    frames[0].entry_type = "message".to_string();
+    fs::write(
+        &segment_path,
+        format!("{}\n", serde_json::to_string(&frames[0])?),
+    )?;
+    store.rebuild_index()?;
+
+    store.validate_integrity()?;
+    let err = store
+        .validate_session_integrity()
+        .expect_err("session integrity must bind frame metadata to its payload");
+    assert!(err.to_string().contains("frame entry_type mismatch"));
+    Ok(())
+}
+
+#[test]
 fn session_entry_to_frame_args_preserves_fields() -> PiResult<()> {
     let entry = make_custom_entry("my_id", Some("parent_id"));
     let (entry_id, parent_id, entry_type, payload) = session_entry_to_frame_args(&entry)?;
@@ -733,7 +1106,7 @@ fn seeded_randomized_append_replay_invariants() -> PiResult<()> {
         let dir = tempdir()?;
         let artifact_hint = dir.path().display().to_string();
         let mut state = seed;
-        let max_segment_bytes = 320 + (lcg_next(&mut state) % 640);
+        let max_segment_bytes = 512 + (lcg_next(&mut state) % 768);
         let mut store = SessionStoreV2::create(dir.path(), max_segment_bytes)?;
 
         let entry_count = 24 + usize::try_from(lcg_next(&mut state) % 32).unwrap_or(0);
@@ -868,6 +1241,14 @@ fn corruption_corpus_index_frame_mismatch_is_detected_and_recoverable() -> PiRes
     rows[0]["entryId"] = json!("entry_corrupted");
     write_index_json_rows(&index_path, &rows)?;
 
+    let fetched_error = store
+        .lookup_entry(1)
+        .expect_err("an accessed frame must be bound to its index coordinates and ID");
+    assert!(
+        fetched_error.to_string().contains("index/frame mismatch"),
+        "unexpected fetched-frame error: {fetched_error}"
+    );
+
     let err = store
         .validate_integrity()
         .expect_err("entry_id tampering must fail integrity validation");
@@ -887,11 +1268,11 @@ fn corruption_corpus_index_frame_mismatch_is_detected_and_recoverable() -> PiRes
 #[test]
 fn checkpoint_replay_is_deterministic_after_reopen_and_rebuild() -> PiResult<()> {
     let dir = tempdir()?;
-    let max_segment_bytes = 260;
+    let max_segment_bytes = 512;
     let mut store = SessionStoreV2::create(dir.path(), max_segment_bytes)?;
     let expected_ids = append_linear_entries(&mut store, 14)?;
 
-    let checkpoint = store.create_checkpoint(1, "deterministic_replay_test")?;
+    let checkpoint = store.create_checkpoint(1, "manual")?;
     let baseline_ids = frame_ids(&store.read_all_entries()?);
     let tail_from = checkpoint.head_entry_seq.saturating_sub(4).max(1);
     let baseline_tail_ids = frame_ids(&store.read_entries_from(tail_from)?);
@@ -968,7 +1349,7 @@ fn migration_events_roundtrip_via_ledger() -> PiResult<()> {
 #[test]
 fn rollback_to_checkpoint_truncates_tail_and_records_event() -> PiResult<()> {
     let dir = tempdir()?;
-    let mut store = SessionStoreV2::create(dir.path(), 260)?;
+    let mut store = SessionStoreV2::create(dir.path(), 512)?;
     let all_ids = append_linear_entries(&mut store, 8)?;
 
     let checkpoint = store.create_checkpoint(1, "pre_migration")?;
@@ -1011,7 +1392,146 @@ fn rollback_to_checkpoint_truncates_tail_and_records_event() -> PiResult<()> {
 }
 
 #[test]
-fn rollback_missing_checkpoint_records_classified_failure_event() -> PiResult<()> {
+fn rollback_reconciles_manifest_and_quarantines_future_artifacts() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 512)?;
+    append_linear_entries(&mut store, 4)?;
+    let checkpoint = store.create_checkpoint(1, "pre_migration")?;
+    store.write_manifest(TEST_MANIFEST_SESSION_ID, "native_v2")?;
+
+    let mut parent = Some(checkpoint.head_entry_id.clone());
+    for ordinal in 5..=8 {
+        let id = format!("entry_{ordinal:08}");
+        store.append_entry(
+            id.clone(),
+            parent,
+            "message",
+            json!({"kind":"message","ordinal":ordinal}),
+        )?;
+        parent = Some(id);
+    }
+    store.create_checkpoint(2, "periodic")?;
+    store.write_manifest(TEST_MANIFEST_SESSION_ID, "native_v2")?;
+
+    store.rollback_to_checkpoint(
+        1,
+        "00000000-0000-0000-0000-000000000021",
+        "rollback_manifest_reconcile",
+    )?;
+
+    let manifest = store
+        .validate_manifest_against_store()?
+        .expect("rollback must preserve and reconcile the manifest");
+    assert_eq!(manifest.session_id, TEST_MANIFEST_SESSION_ID);
+    assert_eq!(manifest.counters.entries_total, checkpoint.head_entry_seq);
+    assert_eq!(manifest.head.entry_id, checkpoint.head_entry_id);
+    assert!(store.read_checkpoint(2)?.is_none());
+    assert!(
+        fs::read_dir(dir.path().join("checkpoints"))?.any(|entry| {
+            entry.is_ok_and(|entry| entry.file_name().to_string_lossy().contains(".bak"))
+        }),
+        "future checkpoint must be retained under a quarantine name"
+    );
+    assert!(
+        fs::symlink_metadata(dir.path().join("tmp/rollback.intent.json")).is_err(),
+        "durable intent must be removed only after successful reconciliation"
+    );
+    Ok(())
+}
+
+#[test]
+fn stale_store_instance_refreshes_after_locked_rollback_before_append() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut writer = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    writer.append_entry("entry_00000001", None, "message", json!({"ordinal":1}))?;
+    writer.create_checkpoint(1, "manual")?;
+    writer.append_entry(
+        "entry_00000002",
+        Some("entry_00000001".to_string()),
+        "message",
+        json!({"ordinal":2}),
+    )?;
+    let mut stale = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+
+    writer.rollback_to_checkpoint(
+        1,
+        "00000000-0000-0000-0000-000000000022",
+        "rollback_two_instance_serialization",
+    )?;
+    stale.append_entry(
+        "entry_00000003",
+        Some("entry_00000001".to_string()),
+        "message",
+        json!({"ordinal":3}),
+    )?;
+
+    let reopened = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    assert_eq!(
+        frame_ids(&reopened.read_all_entries()?),
+        vec!["entry_00000001".to_string(), "entry_00000003".to_string()]
+    );
+    reopened.validate_integrity()?;
+    Ok(())
+}
+
+#[test]
+fn stale_store_instance_detects_same_size_rollback_replacement() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut writer = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    writer.append_entry("entry_00000001", None, "message", json!({"ordinal":1}))?;
+    writer.create_checkpoint(1, "manual")?;
+    writer.append_entry(
+        "entry_00000002",
+        Some("entry_00000001".to_string()),
+        "message",
+        json!({"ordinal":2}),
+    )?;
+    let original_index_len = fs::metadata(writer.index_file_path())?.len();
+    let original_segment_len = fs::metadata(writer.segment_file_path(1))?.len();
+    let mut stale = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+
+    writer.rollback_to_checkpoint(
+        1,
+        "00000000-0000-0000-0000-000000000023",
+        "rollback_same_size_two_instance",
+    )?;
+    writer.append_entry(
+        "other_00000002",
+        Some("entry_00000001".to_string()),
+        "message",
+        json!({"ordinal":9}),
+    )?;
+    assert_eq!(
+        fs::metadata(writer.index_file_path())?.len(),
+        original_index_len
+    );
+    assert_eq!(
+        fs::metadata(writer.segment_file_path(1))?.len(),
+        original_segment_len
+    );
+
+    stale.append_entry(
+        "entry_00000003",
+        Some("other_00000002".to_string()),
+        "message",
+        json!({"ordinal":3}),
+    )?;
+    let reopened = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    assert_eq!(
+        frame_ids(&reopened.read_all_entries()?),
+        vec![
+            "entry_00000001".to_string(),
+            "other_00000002".to_string(),
+            "entry_00000003".to_string(),
+        ]
+    );
+    assert_eq!(stale.chain_hash(), reopened.chain_hash());
+    reopened.validate_integrity()?;
+    Ok(())
+}
+
+#[test]
+fn rollback_missing_checkpoint_is_a_pure_preflight_rejection() -> PiResult<()> {
     let dir = tempdir()?;
     let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
     append_linear_entries(&mut store, 3)?;
@@ -1029,26 +1549,19 @@ fn rollback_missing_checkpoint_records_classified_failure_event() -> PiResult<()
         "unexpected error: {err_text}"
     );
 
-    let ledger = store.read_migration_events()?;
-    assert_eq!(ledger.len(), 1);
-    let event = &ledger[0];
-    assert_eq!(event.phase, "rollback");
-    assert_eq!(event.outcome, "fatal_error");
-    assert_eq!(event.error_class.as_deref(), Some("checkpoint_not_found"));
-    assert_eq!(event.correlation_id, "rollback_missing_checkpoint");
-    assert_eq!(event.migration_id, "00000000-0000-0000-0000-000000000042");
-    assert!(!event.verification.entry_count_match);
-    assert!(!event.verification.hash_chain_match);
-    assert!(!event.verification.index_consistent);
+    assert!(
+        store.read_migration_events()?.is_empty(),
+        "preflight rejection must not mutate the migration ledger"
+    );
     Ok(())
 }
 
 #[test]
-fn rollback_with_tampered_checkpoint_classifies_integrity_mismatch() -> PiResult<()> {
+fn rollback_with_tampered_checkpoint_is_rejected_before_mutation() -> PiResult<()> {
     let dir = tempdir()?;
-    let mut store = SessionStoreV2::create(dir.path(), 260)?;
+    let mut store = SessionStoreV2::create(dir.path(), 512)?;
     append_linear_entries(&mut store, 6)?;
-    store.create_checkpoint(1, "pre_tamper")?;
+    store.create_checkpoint(1, "manual")?;
 
     let mut parent = Some("entry_00000006".to_string());
     for ordinal in 7..=9 {
@@ -1071,6 +1584,15 @@ fn rollback_with_tampered_checkpoint_classifies_integrity_mismatch() -> PiResult
         &checkpoint_path,
         serde_json::to_vec_pretty(&checkpoint_json)?,
     )?;
+    let index_path = dir.path().join("index/offsets.jsonl");
+    let index_before = fs::read(&index_path)?;
+    let checkpoint_before = fs::read(&checkpoint_path)?;
+    let mut segments_before = Vec::new();
+    for entry in fs::read_dir(dir.path().join("segments"))? {
+        let path = entry?.path();
+        segments_before.push((path.clone(), fs::read(path)?));
+    }
+    segments_before.sort_by(|left, right| left.0.cmp(&right.0));
 
     let err = store
         .rollback_to_checkpoint(
@@ -1078,21 +1600,21 @@ fn rollback_with_tampered_checkpoint_classifies_integrity_mismatch() -> PiResult
             "00000000-0000-0000-0000-000000000111",
             "rollback_tampered_checkpoint",
         )
-        .expect_err("tampered checkpoint should fail verification");
+        .expect_err("tampered checkpoint should fail preflight");
     assert!(
-        err.to_string().contains("rollback verification failed"),
+        err.to_string().contains("rollback preflight rejected"),
         "unexpected error: {err}"
     );
-
-    let ledger = store.read_migration_events()?;
-    assert_eq!(ledger.len(), 1);
-    let event = &ledger[0];
-    assert_eq!(event.phase, "rollback");
-    assert_eq!(event.outcome, "recoverable_error");
-    assert_eq!(event.error_class.as_deref(), Some("integrity_mismatch"));
-    assert!(!event.verification.hash_chain_match);
-    assert!(event.verification.index_consistent);
-    assert_eq!(event.correlation_id, "rollback_tampered_checkpoint");
+    assert_eq!(fs::read(&index_path)?, index_before);
+    assert_eq!(fs::read(&checkpoint_path)?, checkpoint_before);
+    for (path, bytes) in segments_before {
+        assert_eq!(fs::read(path)?, bytes);
+    }
+    assert!(
+        store.read_migration_events()?.is_empty(),
+        "a rejected rollback must not mutate the migration ledger"
+    );
+    assert_eq!(store.read_all_entries()?.len(), 9);
     Ok(())
 }
 
@@ -1104,9 +1626,9 @@ fn manifest_write_and_read_round_trip() -> PiResult<()> {
     let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
     append_linear_entries(&mut store, 5)?;
 
-    let manifest = store.write_manifest("test-session-id", "jsonl_v3")?;
+    let manifest = store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
     assert_eq!(manifest.store_version, 2);
-    assert_eq!(manifest.session_id, "test-session-id");
+    assert_eq!(manifest.session_id, TEST_MANIFEST_SESSION_ID);
     assert_eq!(manifest.source_format, "jsonl_v3");
     assert_eq!(manifest.counters.entries_total, 5);
     assert_eq!(manifest.head.entry_seq, 5);
@@ -1126,6 +1648,228 @@ fn manifest_write_and_read_round_trip() -> PiResult<()> {
 }
 
 #[test]
+fn manifest_reader_rejects_wrong_schema_version_and_hash() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_linear_entries(&mut store, 2)?;
+    let manifest = store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
+    let manifest_path = dir.path().join("manifest.json");
+
+    let mut wrong_schema = manifest.clone();
+    wrong_schema.schema = "pi.session_store_v2.manifest.v999".to_string();
+    write_rehashed_manifest(&manifest_path, wrong_schema)?;
+    let error = store
+        .read_manifest()
+        .expect_err("an unsupported schema must be rejected before use");
+    assert!(error.to_string().contains("unsupported manifest schema"));
+
+    let mut wrong_version = manifest.clone();
+    wrong_version.store_version = 99;
+    write_rehashed_manifest(&manifest_path, wrong_version)?;
+    let error = store
+        .read_manifest()
+        .expect_err("an unsupported store version must be rejected before use");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported manifest storeVersion")
+    );
+
+    let mut wrong_source_format = manifest.clone();
+    wrong_source_format.source_format = "jsonl".to_string();
+    write_rehashed_manifest(&manifest_path, wrong_source_format)?;
+    let error = store
+        .read_manifest()
+        .expect_err("a source format outside the manifest contract must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported manifest sourceFormat")
+    );
+
+    let mut wrong_index_path = manifest.clone();
+    wrong_index_path.files.index_path = "elsewhere/offsets.jsonl".to_string();
+    write_rehashed_manifest(&manifest_path, wrong_index_path)?;
+    let error = store
+        .read_manifest()
+        .expect_err("a rehashed fixed-path mismatch must be rejected");
+    assert!(error.to_string().contains("files.indexPath mismatch"));
+
+    let mut unknown_field = serde_json::to_value(&manifest)?;
+    unknown_field["unexpectedField"] = json!(true);
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&unknown_field)?)?;
+    let error = store
+        .read_manifest()
+        .expect_err("unknown manifest fields must not bypass the self-hash contract");
+    assert!(error.to_string().contains("unknown field"));
+
+    let mut wrong_hash = manifest;
+    wrong_hash.integrity.manifest_hash = "0".repeat(64);
+    fs::write(&manifest_path, serde_json::to_vec_pretty(&wrong_hash)?)?;
+    let error = store
+        .read_manifest()
+        .expect_err("a noncanonical manifest hash must be rejected before use");
+    assert!(error.to_string().contains("manifest hash mismatch"));
+    Ok(())
+}
+
+#[test]
+fn manifest_reader_bounds_oversized_input_before_parsing() -> PiResult<()> {
+    let dir = tempdir()?;
+    let store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let manifest_path = dir.path().join("manifest.json");
+    fs::write(&manifest_path, vec![b' '; 2 * 1024 * 1024])?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600))?;
+    }
+
+    let error = store
+        .read_manifest()
+        .expect_err("an oversized manifest must be rejected by the bounded reader");
+    assert!(error.to_string().contains("byte read limit"));
+    Ok(())
+}
+
+#[test]
+fn manifest_store_validation_rejects_rehashed_forged_messages_total() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_linear_entries(&mut store, 3)?;
+    let mut manifest = store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
+    manifest.counters.messages_total = 9_999;
+    write_rehashed_manifest(&dir.path().join("manifest.json"), manifest)?;
+
+    assert!(
+        store.read_manifest()?.is_some(),
+        "the fixture must carry a valid recomputed manifest hash"
+    );
+    let error = store
+        .validate_manifest_against_store()
+        .expect_err("a rehashed but forged message counter must be rejected");
+    assert!(error.to_string().contains("counters.messagesTotal"));
+    Ok(())
+}
+
+#[test]
+fn manifest_store_validation_rejects_rehashed_false_integrity_invariants() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    append_linear_entries(&mut store, 3)?;
+    let manifest = store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
+    let manifest_path = dir.path().join("manifest.json");
+
+    let mut variants = Vec::new();
+    let mut forged = manifest.clone();
+    forged.invariants.parent_links_closed = false;
+    variants.push(("parentLinksClosed", forged));
+    let mut forged = manifest.clone();
+    forged.invariants.monotonic_entry_seq = false;
+    variants.push(("monotonicEntrySeq", forged));
+    let mut forged = manifest.clone();
+    forged.invariants.monotonic_segment_seq = false;
+    variants.push(("monotonicSegmentSeq", forged));
+    let mut forged = manifest.clone();
+    forged.invariants.index_within_segment_bounds = false;
+    variants.push(("indexWithinSegmentBounds", forged));
+    let mut forged = manifest.clone();
+    forged.invariants.branch_heads_indexed = false;
+    variants.push(("branchHeadsIndexed", forged));
+    let mut forged = manifest.clone();
+    forged.invariants.checkpoints_monotonic = false;
+    variants.push(("checkpointsMonotonic", forged));
+    let mut forged = manifest;
+    forged.invariants.hash_chain_valid = false;
+    variants.push(("hashChainValid", forged));
+
+    for (field, forged) in variants {
+        write_rehashed_manifest(&manifest_path, forged)?;
+        assert!(
+            store.read_manifest()?.is_some(),
+            "{field} fixture must carry a valid recomputed self-hash"
+        );
+        let error = store
+            .validate_manifest_against_store()
+            .expect_err("a false integrity invariant must not survive semantic validation");
+        assert!(
+            error.to_string().contains(field),
+            "unexpected {field} validation error: {error}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn manifest_store_validation_recomputes_branch_and_checkpoint_claims() -> PiResult<()> {
+    let dir = tempdir()?;
+    let branch_root = dir.path().join("branch-coverage");
+    let mut branch_store = SessionStoreV2::create(&branch_root, 4 * 1024)?;
+    append_linear_entries(&mut branch_store, 2)?;
+    branch_store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
+    let segment_path = branch_store.segment_file_path(1);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&segment_path)?
+        .write_all(b"unindexed trailing bytes\n")?;
+    let error = branch_store
+        .validate_manifest_against_store()
+        .expect_err("a true branchHeadsIndexed claim must not hide unindexed segment bytes");
+    assert!(error.to_string().contains("segment byte coverage mismatch"));
+
+    let checkpoint_root = dir.path().join("checkpoint-order");
+    let mut checkpoint_store = SessionStoreV2::create(&checkpoint_root, 4 * 1024)?;
+    append_linear_entries(&mut checkpoint_store, 2)?;
+    checkpoint_store.create_checkpoint(1, "manual")?;
+    checkpoint_store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
+    let checkpoint_path = checkpoint_root.join("checkpoints/0000000000000001.json");
+    let mut checkpoint: Value = serde_json::from_slice(&fs::read(&checkpoint_path)?)?;
+    checkpoint["checkpointSeq"] = json!(2);
+    fs::write(&checkpoint_path, serde_json::to_vec_pretty(&checkpoint)?)?;
+    let error = checkpoint_store
+        .validate_manifest_against_store()
+        .expect_err("a true checkpointsMonotonic claim must be recomputed from checkpoint files");
+    assert!(
+        error
+            .to_string()
+            .contains("does not match requested sequence or filename"),
+        "unexpected checkpoint identity error: {error}"
+    );
+
+    let regressing_root = dir.path().join("checkpoint-regression");
+    let mut regressing_store = SessionStoreV2::create(&regressing_root, 4 * 1024)?;
+    let first_ids = append_linear_entries(&mut regressing_store, 1)?;
+    regressing_store.create_checkpoint(1, "manual")?;
+    regressing_store.append_entry(
+        "entry_00000002",
+        Some(first_ids[0].clone()),
+        "message",
+        json!({"kind":"message","ordinal":2}),
+    )?;
+    regressing_store.create_checkpoint(2, "manual")?;
+    regressing_store.write_manifest(TEST_MANIFEST_SESSION_ID, "jsonl_v3")?;
+    let first_checkpoint_path = regressing_root.join("checkpoints/0000000000000001.json");
+    let second_checkpoint_path = regressing_root.join("checkpoints/0000000000000002.json");
+    let mut first_checkpoint: Value = serde_json::from_slice(&fs::read(&first_checkpoint_path)?)?;
+    let second_checkpoint: Value = serde_json::from_slice(&fs::read(&second_checkpoint_path)?)?;
+    first_checkpoint["headEntrySeq"] = json!(
+        second_checkpoint["headEntrySeq"]
+            .as_u64()
+            .expect("checkpoint head sequence is an integer")
+            + 1
+    );
+    fs::write(
+        &first_checkpoint_path,
+        serde_json::to_vec_pretty(&first_checkpoint)?,
+    )?;
+    let error = regressing_store
+        .validate_manifest_against_store()
+        .expect_err("checkpoint heads must not regress as checkpoint sequence increases");
+    assert!(error.to_string().contains("head sequence regresses"));
+    Ok(())
+}
+
+#[test]
 fn manifest_absent_returns_none() -> PiResult<()> {
     let dir = tempdir()?;
     let store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
@@ -1136,8 +1880,8 @@ fn manifest_absent_returns_none() -> PiResult<()> {
 #[test]
 fn manifest_on_empty_store_has_zero_counters() -> PiResult<()> {
     let dir = tempdir()?;
-    let store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
-    let manifest = store.write_manifest("empty-session", "native_v2")?;
+    let mut store = SessionStoreV2::create(dir.path(), 4 * 1024)?;
+    let manifest = store.write_manifest(TEST_MANIFEST_SESSION_ID, "native_v2")?;
     assert_eq!(manifest.counters.entries_total, 0);
     assert_eq!(manifest.head.entry_seq, 0);
     assert_eq!(manifest.head.entry_id, "");
@@ -1330,7 +2074,7 @@ proptest! {
     #[test]
     fn proptest_linear_appends_keep_index_and_head_consistent(
         count in 1usize..64,
-        threshold in 256_u64..4096_u64,
+        threshold in 512_u64..4096_u64,
     ) {
         let dir = tempdir().expect("tempdir");
         let mut store = SessionStoreV2::create(dir.path(), threshold).expect("create store");
@@ -1354,7 +2098,7 @@ proptest! {
     #[test]
     fn proptest_reopen_preserves_chain_hash_and_ids(
         count in 1usize..48,
-        threshold in 256_u64..4096_u64,
+        threshold in 512_u64..4096_u64,
     ) {
         let dir = tempdir().expect("tempdir");
 
@@ -1399,7 +2143,7 @@ fn rebuild_index_from_missing_index_file() -> PiResult<()> {
 #[test]
 fn many_segments_with_small_threshold() -> PiResult<()> {
     let dir = tempdir()?;
-    let mut store = SessionStoreV2::create(dir.path(), 200)?;
+    let mut store = SessionStoreV2::create(dir.path(), 512)?;
     let ids = append_linear_entries(&mut store, 50)?;
 
     let index = store.read_index()?;
@@ -1408,7 +2152,7 @@ fn many_segments_with_small_threshold() -> PiResult<()> {
     let max_seg = index.iter().map(|r| r.segment_seq).max().unwrap_or(0);
     assert!(
         max_seg >= 10,
-        "50 entries with 200-byte threshold should produce many segments, got {max_seg}"
+        "50 entries with 512-byte threshold should produce many segments, got {max_seg}"
     );
 
     store.validate_integrity()?;
@@ -1801,7 +2545,7 @@ struct V2ResumeParity {
     opened_backend: String,
 }
 
-struct CorruptSidecarFallback {
+struct CorruptSidecarRepair {
     opened_backend: String,
     selected_backend: String,
 }
@@ -1823,13 +2567,13 @@ fn migrate_large_history_and_rebuild_checkpoint(
     let migration_elapsed_us = elapsed_test_us(migration_start);
 
     let v2_root = pi::session_store_v2::v2_sidecar_path(jsonl);
-    let store = SessionStoreV2::create(&v2_root, max_segment_bytes)?;
+    let mut store = SessionStoreV2::create(&v2_root, max_segment_bytes)?;
     let base_entries_u64 = usize_to_u64(base_entries, "base_entries")?;
     assert_eq!(store.entry_count(), base_entries_u64);
     store.validate_integrity()?;
 
     let checkpoint_start = test_timing_start();
-    let checkpoint = store.create_checkpoint(1, "bd-07cku.6 pre-rebuild checkpoint")?;
+    let checkpoint = store.create_checkpoint(1, "manual")?;
     assert_eq!(checkpoint.head_entry_seq, base_entries_u64);
 
     let index_path = v2_root.join("index").join("offsets.jsonl");
@@ -1957,15 +2701,13 @@ fn assert_stale_sidecar_fallback(
     })
 }
 
-fn assert_jsonl_v2_resume_parity_and_corrupt_sidecar_fallback(
-    jsonl_root: &Path,
-) -> PiResult<Value> {
+fn assert_jsonl_v2_resume_parity_and_corrupt_sidecar_repair(jsonl_root: &Path) -> PiResult<Value> {
     let baseline = build_jsonl_resume_baseline(jsonl_root)?;
     let sidecar = assert_v2_resume_parity(jsonl_root, &baseline)?;
     let (index_path, segment_path) =
         assert_recoverable_v2_index_rebuild(&sidecar.store, &sidecar.v2_root, &baseline.ids)?;
     corrupt_sidecar_segment(&segment_path)?;
-    let fallback = assert_corrupt_sidecar_jsonl_fallback(jsonl_root, &baseline, &segment_path)?;
+    let repair = assert_corrupt_sidecar_verified_repair(jsonl_root, &baseline, &segment_path)?;
 
     Ok(json!({
         "jsonl_path": baseline.jsonl.display().to_string(),
@@ -1975,8 +2717,8 @@ fn assert_jsonl_v2_resume_parity_and_corrupt_sidecar_fallback(
         "entry_count": baseline.ids.len(),
         "baseline_backend": baseline.opened_backend,
         "sidecar_backend": sidecar.opened_backend,
-        "fallback_backend": fallback.opened_backend,
-        "sidecar_selected_before_fallback": fallback.selected_backend,
+        "repair_backend": repair.opened_backend,
+        "sidecar_selected_before_repair": repair.selected_backend,
     }))
 }
 
@@ -2100,36 +2842,41 @@ fn corrupt_sidecar_segment(segment_path: &Path) -> PiResult<()> {
     Ok(())
 }
 
-fn assert_corrupt_sidecar_jsonl_fallback(
+fn assert_corrupt_sidecar_verified_repair(
     jsonl_root: &Path,
     baseline: &JsonlResumeBaseline,
     segment_path: &Path,
-) -> PiResult<CorruptSidecarFallback> {
-    let fallback_trace =
+) -> PiResult<CorruptSidecarRepair> {
+    let repair_trace =
         run_async(async { Session::cold_start_trace_bundle(&baseline.jsonl, jsonl_root).await })?;
     assert_eq!(
-        fallback_trace.storage.selected_backend,
+        repair_trace.storage.selected_backend,
         "v2_sidecar",
         "corrupt sidecar fixture should first select V2; jsonl={}",
         baseline.jsonl.display()
     );
     assert_eq!(
-        fallback_trace.storage.opened_backend,
-        "jsonl",
-        "corrupt V2 sidecar did not fall back to JSONL; segment={}",
+        repair_trace.storage.opened_backend,
+        "v2_sidecar",
+        "corrupt V2 sidecar was not rebuilt and reopened after verification; segment={}",
         segment_path.display()
     );
-    let fallback_session = run_async(async { Session::open(&baseline.jsonl_path).await })?;
+    let repaired_session = run_async(async { Session::open(&baseline.jsonl_path).await })?;
     assert_eq!(
-        session_entry_ids(&fallback_session),
+        session_entry_ids(&repaired_session),
         baseline.ids,
-        "JSONL fallback after corrupt sidecar changed entry IDs; segment={}",
+        "verified V2 repair changed authoritative JSONL entry IDs; segment={}",
         segment_path.display()
+    );
+    assert_eq!(
+        pi::session::migration_status(&baseline.jsonl),
+        MigrationState::Migrated,
+        "verified V2 repair did not leave a healthy migrated store"
     );
 
-    Ok(CorruptSidecarFallback {
-        opened_backend: fallback_trace.storage.opened_backend,
-        selected_backend: fallback_trace.storage.selected_backend,
+    Ok(CorruptSidecarRepair {
+        opened_backend: repair_trace.storage.opened_backend,
+        selected_backend: repair_trace.storage.selected_backend,
     })
 }
 
@@ -2312,7 +3059,7 @@ fn migrate_jsonl_to_v2_creates_verified_sidecar() -> PiResult<()> {
     let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
     let ledger = store.read_migration_events()?;
     assert_eq!(ledger.len(), 1);
-    assert_eq!(ledger[0].phase, "forward");
+    assert_eq!(ledger[0].phase, "completed");
 
     Ok(())
 }
@@ -2524,7 +3271,7 @@ fn migration_status_partial_when_sidecar_incomplete() {
 }
 
 #[test]
-fn migration_status_self_heals_when_index_damaged() -> PiResult<()> {
+fn migration_status_is_read_only_and_recovery_heals_damaged_index() -> PiResult<()> {
     let dir = tempdir()?;
     let entries = vec![
         make_message_entry("c1", None, "one"),
@@ -2538,9 +3285,16 @@ fn migration_status_self_heals_when_index_damaged() -> PiResult<()> {
     let index_path = v2_root.join("index").join("offsets.jsonl");
     fs::write(&index_path, "not valid json\n")?;
 
-    // Recoverable index corruption should be rebuilt automatically.
+    // Status inspection reports corruption without mutating the sidecar.
+    match pi::session::migration_status(&jsonl) {
+        MigrationState::Corrupt { .. } => {}
+        other => panic!("expected corrupt migration state, got {other:?}"),
+    }
+    assert_eq!(fs::read_to_string(&index_path)?, "not valid json\n");
+
+    // Explicit recovery owns the mutation and returns the store to a verified state.
     assert_eq!(
-        pi::session::migration_status(&jsonl),
+        pi::session::recover_partial_migration(&jsonl, "corrupt-status-recovery", true)?,
         MigrationState::Migrated
     );
 
@@ -2582,6 +3336,48 @@ fn migrate_dry_run_validates_without_persisting() -> PiResult<()> {
 }
 
 #[test]
+fn migrate_dry_run_matches_real_migration_for_legacy_idless_entries() -> PiResult<()> {
+    let dir = tempdir()?;
+    let mut legacy_entry = make_message_entry("placeholder", None, "legacy idless row");
+    legacy_entry.base_mut().id = None;
+    let jsonl = build_test_jsonl(dir.path(), &[legacy_entry]);
+
+    let verification = pi::session::migrate_dry_run(&jsonl)?;
+    assert!(verification.entry_count_match);
+    assert!(verification.hash_chain_match);
+    assert!(verification.index_consistent);
+    assert!(
+        !pi::session_store_v2::has_v2_sidecar(&jsonl),
+        "dry-run normalization must not persist a sidecar"
+    );
+    Ok(())
+}
+
+#[test]
+fn migration_validates_graph_without_reordering_authoritative_jsonl() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(
+        dir.path(),
+        &[
+            make_message_entry("child-first", Some("parent-second"), "child"),
+            make_message_entry("parent-second", None, "parent"),
+        ],
+    );
+
+    let store = pi::session::create_v2_sidecar_from_jsonl(&jsonl)?;
+    assert_eq!(
+        frame_ids(&store.read_all_entries()?),
+        vec!["child-first".to_string(), "parent-second".to_string()],
+        "graph validation must not rewrite authoritative source order"
+    );
+    let manifest = store
+        .validate_manifest_against_store()?
+        .expect("migrated manifest");
+    assert!(manifest.invariants.parent_links_closed);
+    Ok(())
+}
+
+#[test]
 fn recover_partial_migration_cleans_up_and_optionally_re_migrates() -> PiResult<()> {
     let dir = tempdir()?;
     let jsonl = build_test_jsonl(dir.path(), &[make_message_entry("r1", None, "data")]);
@@ -2601,6 +3397,303 @@ fn recover_partial_migration_cleans_up_and_optionally_re_migrates() -> PiResult<
     assert_eq!(state, MigrationState::Migrated);
     assert!(pi::session_store_v2::has_v2_sidecar(&jsonl));
 
+    Ok(())
+}
+
+#[test]
+fn failed_remigration_preserves_the_prior_v2_tree_byte_for_byte() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(
+        dir.path(),
+        &[
+            make_message_entry("preserve-1", None, "first"),
+            make_message_entry("preserve-2", Some("preserve-1"), "second"),
+        ],
+    );
+    pi::session::migrate_jsonl_to_v2(&jsonl, "preserve-before-failure")?;
+
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let source_state = v2_root.join("source-state.json");
+    fs::write(&source_state, b"invalid source state\n")?;
+    let preserved_paths = [
+        source_state,
+        v2_root.join("manifest.json"),
+        v2_root.join("index/offsets.jsonl"),
+        v2_root.join("segments/0000000000000001.seg"),
+        v2_root.join("migrations/ledger.jsonl"),
+    ];
+    let before = preserved_paths
+        .iter()
+        .map(|path| Ok((path.clone(), fs::read(path)?)))
+        .collect::<PiResult<Vec<_>>>()?;
+
+    let header = fs::read_to_string(&jsonl)?
+        .lines()
+        .next()
+        .expect("JSONL fixture has a header")
+        .to_string();
+    fs::write(&jsonl, format!("{header}\nnot valid JSON\n"))?;
+    assert!(matches!(
+        pi::session::migration_status(&jsonl),
+        MigrationState::Corrupt { .. }
+    ));
+
+    pi::session::recover_partial_migration(&jsonl, "preserve-failed-remigration", true)
+        .expect_err("an unreadable authoritative JSONL must reject re-migration");
+
+    assert!(
+        v2_root.is_dir(),
+        "failed recovery removed the prior V2 root"
+    );
+    for (path, expected) in before {
+        assert_eq!(
+            fs::read(&path)?,
+            expected,
+            "failed recovery changed preserved V2 artifact {}",
+            path.display()
+        );
+    }
+    let inspector = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    inspector.validate_session_integrity()?;
+    Ok(())
+}
+
+#[test]
+fn ambiguous_jsonl_graph_repair_fails_closed_and_preserves_prior_v2_tree() -> PiResult<()> {
+    let root = tempdir()?;
+    let mut duplicate_second = make_message_entry("duplicate", Some("duplicate"), "second");
+    duplicate_second.base_mut().id = Some("duplicate".to_string());
+    let cases = [
+        (
+            "duplicate",
+            vec![
+                make_message_entry("duplicate", None, "first"),
+                duplicate_second,
+            ],
+            "duplicate entry ID",
+        ),
+        (
+            "missing-parent",
+            vec![make_message_entry(
+                "orphan",
+                Some("absent-parent"),
+                "orphan",
+            )],
+            "references missing parent",
+        ),
+        (
+            "cycle",
+            vec![
+                make_message_entry("cycle-a", Some("cycle-b"), "a"),
+                make_message_entry("cycle-b", Some("cycle-a"), "b"),
+            ],
+            "contains a cycle",
+        ),
+    ];
+
+    for (case_name, invalid_entries, expected_error) in cases {
+        let case_dir = root.path().join(case_name);
+        fs::create_dir(&case_dir)?;
+        let jsonl = build_test_jsonl(
+            &case_dir,
+            &[
+                make_message_entry("prior-1", None, "first"),
+                make_message_entry("prior-2", Some("prior-1"), "second"),
+            ],
+        );
+        pi::session::migrate_jsonl_to_v2(&jsonl, &format!("seed-{case_name}"))?;
+        let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+        let preserved_paths = [
+            v2_root.join("source-state.json"),
+            v2_root.join("manifest.json"),
+            v2_root.join("index/offsets.jsonl"),
+            v2_root.join("segments/0000000000000001.seg"),
+            v2_root.join("migrations/ledger.jsonl"),
+        ];
+        let before = preserved_paths
+            .iter()
+            .map(|path| Ok((path.clone(), fs::read(path)?)))
+            .collect::<PiResult<Vec<_>>>()?;
+
+        let header = fs::read_to_string(&jsonl)?
+            .lines()
+            .next()
+            .expect("JSONL fixture has a header")
+            .to_string();
+        let mut replacement = Vec::new();
+        replacement.extend_from_slice(header.as_bytes());
+        replacement.push(b'\n');
+        for entry in invalid_entries {
+            serde_json::to_writer(&mut replacement, &entry)?;
+            replacement.push(b'\n');
+        }
+        fs::write(&jsonl, replacement)?;
+
+        let error =
+            pi::session::recover_partial_migration(&jsonl, &format!("reject-{case_name}"), true)
+                .expect_err("ambiguous authoritative JSONL must not replace a prior V2 store");
+        assert!(
+            error.to_string().contains(expected_error),
+            "unexpected {case_name} validation error: {error}"
+        );
+        for (path, expected) in before {
+            assert_eq!(
+                fs::read(&path)?,
+                expected,
+                "{case_name} rejection changed prior V2 artifact {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+fn forged_manifest_repair_rebuilds_a_valid_counter_from_authoritative_jsonl() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(
+        dir.path(),
+        &[
+            make_message_entry("repair-manifest-1", None, "first"),
+            make_message_entry("repair-manifest-2", Some("repair-manifest-1"), "second"),
+        ],
+    );
+    pi::session::migrate_jsonl_to_v2(&jsonl, "manifest-repair-seed")?;
+
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let inspector = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let mut manifest = inspector.read_manifest()?.expect("migrated manifest");
+    manifest.counters.messages_total = 8_888;
+    write_rehashed_manifest(&v2_root.join("manifest.json"), manifest)?;
+    assert!(matches!(
+        pi::session::migration_status(&jsonl),
+        MigrationState::Corrupt { .. }
+    ));
+
+    assert_eq!(
+        pi::session::recover_partial_migration(&jsonl, "manifest-repair", true)?,
+        MigrationState::Migrated
+    );
+    let repaired = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let manifest = repaired
+        .validate_manifest_against_store()?
+        .expect("repair must regenerate the manifest");
+    assert_eq!(manifest.counters.messages_total, 2);
+    Ok(())
+}
+
+#[test]
+fn jsonl_v2_manifest_identity_and_source_format_are_semantically_bound() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(
+        dir.path(),
+        &[
+            make_message_entry("identity-1", None, "first"),
+            make_message_entry("identity-2", Some("identity-1"), "second"),
+        ],
+    );
+    pi::session::migrate_jsonl_to_v2(&jsonl, "manifest-identity-seed")?;
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let manifest_path = v2_root.join("manifest.json");
+    let header: SessionHeader = serde_json::from_str(
+        fs::read_to_string(&jsonl)?
+            .lines()
+            .next()
+            .expect("JSONL header"),
+    )?;
+
+    let inspector = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let mut manifest = inspector.read_manifest()?.expect("migrated manifest");
+    let forged_session_id = if header.id == "75d59e5f-d4bc-4e29-941a-72eb0d31b9d1" {
+        "f5734512-2ad8-4656-aafd-e5402c6ac6bb"
+    } else {
+        "75d59e5f-d4bc-4e29-941a-72eb0d31b9d1"
+    };
+    manifest.session_id = forged_session_id.to_string();
+    write_rehashed_manifest(&manifest_path, manifest)?;
+    let MigrationState::Corrupt { error } = pi::session::migration_status(&jsonl) else {
+        panic!("a valid but different manifest UUID must be rejected semantically");
+    };
+    assert!(
+        error.contains("V2 manifest sessionId mismatch"),
+        "unexpected semantic identity error: {error}"
+    );
+    pi::session::recover_partial_migration(&jsonl, "repair-manifest-session-id", true)?;
+
+    let inspector = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let mut manifest = inspector.read_manifest()?.expect("repaired manifest");
+    manifest.source_format = "native_v2".to_string();
+    write_rehashed_manifest(&manifest_path, manifest)?;
+    let MigrationState::Corrupt { error } = pi::session::migration_status(&jsonl) else {
+        panic!("a valid but wrong source format must be rejected semantically");
+    };
+    assert!(
+        error.contains("V2 manifest sourceFormat mismatch"),
+        "unexpected semantic source-format error: {error}"
+    );
+    pi::session::recover_partial_migration(&jsonl, "repair-manifest-source-format", true)?;
+
+    let repaired = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let manifest = repaired
+        .validate_manifest_against_store()?
+        .expect("verified repaired manifest");
+    assert_eq!(manifest.session_id, header.id);
+    assert_eq!(manifest.source_format, "jsonl_v3");
+    Ok(())
+}
+
+#[test]
+fn failed_forged_manifest_repair_preserves_prior_v2_tree_byte_for_byte() -> PiResult<()> {
+    let dir = tempdir()?;
+    let jsonl = build_test_jsonl(
+        dir.path(),
+        &[
+            make_message_entry("failed-manifest-1", None, "first"),
+            make_message_entry("failed-manifest-2", Some("failed-manifest-1"), "second"),
+        ],
+    );
+    pi::session::migrate_jsonl_to_v2(&jsonl, "failed-manifest-seed")?;
+
+    let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
+    let inspector = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let mut manifest = inspector.read_manifest()?.expect("migrated manifest");
+    manifest.counters.messages_total = 7_777;
+    let manifest_path = v2_root.join("manifest.json");
+    write_rehashed_manifest(&manifest_path, manifest)?;
+    let preserved_paths = [
+        v2_root.join("source-state.json"),
+        manifest_path,
+        v2_root.join("index/offsets.jsonl"),
+        v2_root.join("segments/0000000000000001.seg"),
+        v2_root.join("migrations/ledger.jsonl"),
+    ];
+    let before = preserved_paths
+        .iter()
+        .map(|path| Ok((path.clone(), fs::read(path)?)))
+        .collect::<PiResult<Vec<_>>>()?;
+
+    let header = fs::read_to_string(&jsonl)?
+        .lines()
+        .next()
+        .expect("JSONL fixture has a header")
+        .to_string();
+    fs::write(&jsonl, format!("{header}\nnot valid JSON\n"))?;
+    assert!(matches!(
+        pi::session::migration_status(&jsonl),
+        MigrationState::Corrupt { .. }
+    ));
+    pi::session::recover_partial_migration(&jsonl, "failed-manifest-repair", true)
+        .expect_err("invalid authoritative JSONL must reject manifest repair");
+
+    for (path, expected) in before {
+        assert_eq!(
+            fs::read(&path)?,
+            expected,
+            "failed manifest repair changed prior V2 artifact {}",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -2742,7 +3835,7 @@ fn migration_ledger_accumulates_events() -> PiResult<()> {
     let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
     let events = store.read_migration_events()?;
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].phase, "forward");
+    assert_eq!(events[0].phase, "completed");
 
     Ok(())
 }
@@ -2773,7 +3866,7 @@ fn e2e_full_migration_rollback_round_trip_with_forensic_log() -> PiResult<()> {
 
     // Phase 1: Forward migration.
     let fwd_event = pi::session::migrate_jsonl_to_v2(&jsonl, "e2e-round-trip")?;
-    assert_eq!(fwd_event.phase, "forward");
+    assert_eq!(fwd_event.phase, "completed");
     assert_eq!(fwd_event.outcome, "ok");
     assert_eq!(fwd_event.source_format, "jsonl_v3");
     assert_eq!(fwd_event.target_format, "native_v2");
@@ -2802,7 +3895,7 @@ fn e2e_full_migration_rollback_round_trip_with_forensic_log() -> PiResult<()> {
     // Verify forensic ledger has exactly 1 forward event.
     let ledger = store.read_migration_events()?;
     assert_eq!(ledger.len(), 1);
-    assert_eq!(ledger[0].phase, "forward");
+    assert_eq!(ledger[0].phase, "completed");
     assert_eq!(ledger[0].schema, "pi.session_store_v2.migration_event.v1");
 
     // Verify the JSONL source is still intact (migration is non-destructive).
@@ -2843,8 +3936,8 @@ fn e2e_migrate_rollback_remigrate_ledger_accumulates() -> PiResult<()> {
     let jsonl = build_test_jsonl(dir.path(), &entries);
 
     // First migration.
-    let event1 = pi::session::migrate_jsonl_to_v2(&jsonl, "cycle-1")?;
-    assert_eq!(event1.phase, "forward");
+    let event1 = pi::session::migrate_jsonl_to_v2(&jsonl, "cycle-01")?;
+    assert_eq!(event1.phase, "completed");
 
     // Check ledger before rollback.
     let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
@@ -2860,15 +3953,15 @@ fn e2e_migrate_rollback_remigrate_ledger_accumulates() -> PiResult<()> {
     );
 
     // Re-migrate — fresh sidecar, fresh ledger.
-    let event2 = pi::session::migrate_jsonl_to_v2(&jsonl, "cycle-2")?;
-    assert_eq!(event2.phase, "forward");
-    assert_eq!(event2.correlation_id, "cycle-2");
+    let event2 = pi::session::migrate_jsonl_to_v2(&jsonl, "cycle-02")?;
+    assert_eq!(event2.phase, "completed");
+    assert_eq!(event2.correlation_id, "cycle-02");
 
     // New ledger should have 1 event (fresh sidecar after rollback).
     let store2 = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
     let ledger = store2.read_migration_events()?;
     assert_eq!(ledger.len(), 1);
-    assert_eq!(ledger[0].correlation_id, "cycle-2");
+    assert_eq!(ledger[0].correlation_id, "cycle-02");
 
     // Verify data integrity after re-migration.
     assert_eq!(store2.entry_count(), 3);
@@ -2961,7 +4054,7 @@ fn e2e_partial_migration_recovery_with_forensic_check() -> PiResult<()> {
     // Verify forensic ledger exists with forward event.
     let ledger = store.read_migration_events()?;
     assert_eq!(ledger.len(), 1);
-    assert_eq!(ledger[0].phase, "forward");
+    assert_eq!(ledger[0].phase, "completed");
     assert_eq!(ledger[0].correlation_id, "partial-recovery-e2e");
 
     Ok(())
@@ -3017,7 +4110,7 @@ fn e2e_forensic_event_field_completeness() -> PiResult<()> {
     // Check every field of the forensic event.
     assert_eq!(event.schema, "pi.session_store_v2.migration_event.v1");
     assert!(!event.migration_id.is_empty(), "migration_id must be set");
-    assert_eq!(event.phase, "forward");
+    assert_eq!(event.phase, "completed");
     assert!(!event.at.is_empty(), "timestamp must be set");
     // Validate the timestamp is parseable as RFC 3339.
     assert!(
@@ -3274,7 +4367,7 @@ fn large_session_store_v2_recovery_swarm_profile_emits_evidence() -> PiResult<()
 }
 
 /// Deterministic chaos lane for concurrent save/resume, session-index refresh,
-/// recoverable V2 index rebuild, corrupt-sidecar fallback, and JSONL/V2 parity.
+/// recoverable V2 index rebuild, verified corrupt-sidecar repair, and JSONL/V2 parity.
 #[test]
 fn session_index_store_v2_resume_chaos_lane_emits_evidence() -> PiResult<()> {
     let total_start = test_timing_start();
@@ -3283,7 +4376,7 @@ fn session_index_store_v2_resume_chaos_lane_emits_evidence() -> PiResult<()> {
     let index_root = dir.path().join("index-concurrency");
 
     let parity_start = test_timing_start();
-    let parity = assert_jsonl_v2_resume_parity_and_corrupt_sidecar_fallback(&jsonl_root)?;
+    let parity = assert_jsonl_v2_resume_parity_and_corrupt_sidecar_repair(&jsonl_root)?;
     let parity_elapsed_us = elapsed_test_us(parity_start);
 
     let index_start = test_timing_start();
@@ -3291,23 +4384,23 @@ fn session_index_store_v2_resume_chaos_lane_emits_evidence() -> PiResult<()> {
     let index_elapsed_us = elapsed_test_us(index_start);
 
     let report = json!({
-        "schema": "pi.session_store_v2.chaos_lane.v1",
+        "schema": "pi.session_store_v2.chaos_lane.v2",
         "bead": "bd-e5le6.8",
         "status": "pass",
         "coverage": {
             "concurrent_save_resume": true,
             "session_index_stale_refresh": true,
             "store_v2_recoverable_index_rebuild": true,
-            "corrupt_sidecar_jsonl_fallback": true,
+            "corrupt_sidecar_verified_repair": true,
             "jsonl_v2_resume_parity": true,
         },
-        "parity_and_fallback": parity,
+        "parity_and_repair": parity,
         "session_index": {
             "indexed_rows_after_concurrent_workers": indexed_rows,
             "root": index_root.display().to_string(),
         },
         "timings_us": {
-            "parity_and_fallback": parity_elapsed_us,
+            "parity_and_repair": parity_elapsed_us,
             "concurrent_index": index_elapsed_us,
             "total": elapsed_test_us(total_start),
         }
@@ -3491,7 +4584,7 @@ fn e2e_rollback_nonexistent_sidecar_is_safe() -> PiResult<()> {
     Ok(())
 }
 
-/// Migrate, write manifest, verify manifest consistency, then rollback.
+/// Migrate and verify the published manifest against both stores of identity.
 #[test]
 fn e2e_migration_manifest_consistency() -> PiResult<()> {
     let dir = tempdir()?;
@@ -3505,24 +4598,50 @@ fn e2e_migration_manifest_consistency() -> PiResult<()> {
     pi::session::migrate_jsonl_to_v2(&jsonl, "manifest-e2e")?;
 
     let v2_root = pi::session_store_v2::v2_sidecar_path(&jsonl);
-    let store = SessionStoreV2::create(&v2_root, 64 * 1024 * 1024)?;
+    let store = SessionStoreV2::open_for_inspection(&v2_root, 64 * 1024 * 1024)?;
+    let header: SessionHeader = serde_json::from_str(
+        fs::read_to_string(&jsonl)?
+            .lines()
+            .next()
+            .expect("JSONL header"),
+    )?;
 
-    // Write a manifest and verify fields.
-    let manifest = store.write_manifest("manifest-session-id", "jsonl_v3")?;
+    // Validate the manifest emitted by migration; do not replace the artifact
+    // under test with a newly generated manifest.
+    let manifest = store
+        .validate_manifest_against_store()?
+        .expect("migration must publish a manifest");
     assert_eq!(manifest.store_version, 2);
-    assert_eq!(manifest.counters.entries_total, 3);
-    assert_eq!(manifest.head.entry_seq, 3);
+    assert_eq!(manifest.session_id, header.id);
+    assert_eq!(manifest.source_format, "jsonl_v3");
+    let expected_entry_count = u64::try_from(entries.len()).expect("fixture length fits u64");
+    assert_eq!(manifest.counters.entries_total, expected_entry_count);
+    assert_eq!(manifest.head.entry_seq, expected_entry_count);
     assert_eq!(manifest.head.entry_id, "mf3");
     assert!(manifest.invariants.hash_chain_valid);
     assert!(manifest.invariants.monotonic_entry_seq);
+    assert_eq!(
+        frame_ids(&store.read_all_entries()?),
+        vec!["mf1".to_string(), "mf2".to_string(), "mf3".to_string()]
+    );
 
-    // Read manifest back and verify it matches.
+    // A second read must preserve the exact identity and integrity evidence.
     let read_back = store.read_manifest()?.expect("manifest should exist");
-    assert_eq!(read_back.session_id, "manifest-session-id");
-    assert_eq!(read_back.head.entry_seq, 3);
+    assert_eq!(read_back.session_id, header.id);
+    assert_eq!(read_back.source_format, manifest.source_format);
+    assert_eq!(read_back.head.entry_id, manifest.head.entry_id);
+    assert_eq!(read_back.head.entry_seq, manifest.head.entry_seq);
     assert_eq!(
         read_back.integrity.chain_hash,
         manifest.integrity.chain_hash
+    );
+    assert_eq!(
+        read_back.integrity.manifest_hash,
+        manifest.integrity.manifest_hash
+    );
+    assert_eq!(
+        pi::session::migration_status(&jsonl),
+        MigrationState::Migrated
     );
 
     Ok(())

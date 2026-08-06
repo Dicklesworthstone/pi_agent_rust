@@ -494,10 +494,31 @@ pub(crate) fn delete_session_file(path: &Path) -> Result<()> {
 }
 
 fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()> {
-    if try_trash_with_cmd(path, trash_cmd) {
-        remove_sqlite_sidecars_best_effort(path, trash_cmd);
-        remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd);
+    if !session_artifacts_exist(path)? {
         return Ok(());
+    }
+
+    // Writers for JSONL, SQLite, and their sidecars all participate in this
+    // persistent per-session lock. Re-check after acquisition so a delete
+    // waiting behind a writer cannot operate on a stale artifact inventory.
+    let _lock = crate::session::lock_session_persistence(path)?;
+    if !session_artifacts_exist(path)? {
+        return Ok(());
+    }
+    crate::session::ensure_session_parent_writable(path).map_err(|err| Error::Io(Box::new(err)))?;
+
+    if try_trash_with_cmd(path, trash_cmd) {
+        if crate::session::session_path_entry_exists(path)
+            .map_err(|error| Error::Io(Box::new(error)))?
+        {
+            return Err(Error::session(format!(
+                "Trash command reported success but left the session in place; sidecars were preserved: {}",
+                path.display()
+            )));
+        }
+        remove_sqlite_sidecars_best_effort(path, trash_cmd)?;
+        remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd)?;
+        return ensure_session_artifacts_removed(path);
     }
 
     match fs::remove_file(path) {
@@ -511,13 +532,41 @@ fn delete_session_file_with_trash_cmd(path: &Path, trash_cmd: &str) -> Result<()
         }
     }
 
-    remove_sqlite_sidecars_best_effort(path, trash_cmd);
-    remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd);
+    remove_sqlite_sidecars_best_effort(path, trash_cmd)?;
+    remove_sidecar_dir_best_effort(&crate::session_store_v2::v2_sidecar_path(path), trash_cmd)?;
+    ensure_session_artifacts_removed(path)
+}
+
+fn ensure_session_artifacts_removed(path: &Path) -> Result<()> {
+    if session_artifacts_exist(path)? {
+        return Err(Error::session(format!(
+            "Session deletion left one or more artifacts behind: {}",
+            path.display()
+        )));
+    }
     Ok(())
 }
 
-fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 2] {
-    ["-wal", "-shm"].map(|suffix| {
+fn session_artifacts_exist(path: &Path) -> Result<bool> {
+    let primary_exists =
+        crate::session::session_path_entry_exists(path).map_err(|err| Error::Io(Box::new(err)))?;
+    let v2_exists =
+        crate::session::session_path_entry_exists(&crate::session_store_v2::v2_sidecar_path(path))
+            .map_err(|err| Error::Io(Box::new(err)))?;
+    #[cfg(feature = "sqlite-sessions")]
+    let sqlite_sidecar_exists = sqlite_auxiliary_paths(path)
+        .into_iter()
+        .try_fold(false, |found, auxiliary_path| {
+            crate::session::session_path_entry_exists(&auxiliary_path).map(|exists| found || exists)
+        })
+        .map_err(|err| Error::Io(Box::new(err)))?;
+    #[cfg(not(feature = "sqlite-sessions"))]
+    let sqlite_sidecar_exists = false;
+    Ok(primary_exists || v2_exists || sqlite_sidecar_exists)
+}
+
+fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 3] {
+    ["-wal", "-shm", "-journal"].map(|suffix| {
         let mut candidate = path.as_os_str().to_os_string();
         candidate.push(suffix);
         PathBuf::from(candidate)
@@ -525,13 +574,18 @@ fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 2] {
 }
 
 #[cfg(feature = "sqlite-sessions")]
-fn remove_sqlite_sidecars_best_effort(path: &Path, trash_cmd: &str) {
+fn remove_sqlite_sidecars_best_effort(path: &Path, trash_cmd: &str) -> Result<()> {
     if path.extension().and_then(|ext| ext.to_str()) == Some("sqlite") {
         for auxiliary_path in sqlite_auxiliary_paths(path) {
-            if !auxiliary_path.exists() {
+            if !crate::session::session_path_entry_exists(&auxiliary_path)
+                .map_err(|error| Error::Io(Box::new(error)))?
+            {
                 continue;
             }
-            if try_trash_with_cmd(&auxiliary_path, trash_cmd) {
+            if try_trash_with_cmd(&auxiliary_path, trash_cmd)
+                && !crate::session::session_path_entry_exists(&auxiliary_path)
+                    .map_err(|error| Error::Io(Box::new(error)))?
+            {
                 continue;
             }
             if let Err(err) = fs::remove_file(&auxiliary_path)
@@ -545,52 +599,96 @@ fn remove_sqlite_sidecars_best_effort(path: &Path, trash_cmd: &str) {
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(not(feature = "sqlite-sessions"))]
-const fn remove_sqlite_sidecars_best_effort(_path: &Path, _trash_cmd: &str) {}
+fn remove_sqlite_sidecars_best_effort(_path: &Path, _trash_cmd: &str) -> Result<()> {
+    Ok(())
+}
 
-fn remove_sidecar_dir_best_effort(sidecar_path: &Path, trash_cmd: &str) {
-    if !sidecar_path.exists() {
-        return;
+fn remove_sidecar_dir_best_effort(sidecar_path: &Path, trash_cmd: &str) -> Result<()> {
+    if !crate::session::session_path_entry_exists(sidecar_path)
+        .map_err(|error| Error::Io(Box::new(error)))?
+    {
+        return Ok(());
     }
 
-    if try_trash_with_cmd(sidecar_path, trash_cmd) {
-        return;
+    if try_trash_with_cmd(sidecar_path, trash_cmd)
+        && !crate::session::session_path_entry_exists(sidecar_path)
+            .map_err(|error| Error::Io(Box::new(error)))?
+    {
+        return Ok(());
     }
 
-    if let Err(err) = fs::remove_dir_all(sidecar_path) {
+    let metadata =
+        fs::symlink_metadata(sidecar_path).map_err(|error| Error::Io(Box::new(error)))?;
+    let removal = if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        fs::remove_file(sidecar_path)
+    } else {
+        fs::remove_dir_all(sidecar_path)
+    };
+    if let Err(err) = removal {
         tracing::warn!(
             path = %sidecar_path.display(),
             error = %err,
             "Failed to remove session sidecar"
         );
     }
+    Ok(())
 }
 
 fn try_trash_with_cmd(path: &Path, trash_cmd: &str) -> bool {
-    match std::process::Command::new(trash_cmd)
+    let child = std::process::Command::new(trash_cmd)
         .arg(path)
         .stdin(std::process::Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => true,
-        Ok(status) => {
-            tracing::warn!(
-                path = %path.display(),
-                exit = status.code().unwrap_or(-1),
-                "trash command failed; falling back to direct file removal"
-            );
-            false
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
         Err(err) => {
             tracing::warn!(
                 path = %path.display(),
                 error = %err,
                 "trash command invocation failed; falling back to direct file removal"
             );
-            false
+            return false;
+        }
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return true,
+            Ok(Some(status)) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    exit = status.code().unwrap_or(-1),
+                    "trash command failed; falling back to direct file removal"
+                );
+                return false;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(
+                    path = %path.display(),
+                    "trash command timed out; falling back to direct file removal"
+                );
+                return false;
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "trash command wait failed; falling back to direct file removal"
+                );
+                return false;
+            }
         }
     }
 }
@@ -1527,15 +1625,97 @@ mod tests {
         assert!(!session_path.exists(), "session file should remain deleted");
     }
 
+    #[cfg(all(unix, feature = "sqlite-sessions"))]
+    #[test]
+    fn successful_noop_trash_preserves_primary_and_every_sidecar() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("noop-trash.sqlite");
+        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
+        fs::write(&session_path, "db").expect("write SQLite primary");
+        fs::write(&wal_path, "wal").expect("write SQLite WAL");
+        fs::write(&shm_path, "shm").expect("write SQLite SHM");
+        fs::write(&journal_path, "journal").expect("write SQLite rollback journal");
+        fs::create_dir(&v2_path).expect("create V2 sidecar");
+        fs::write(v2_path.join("manifest.json"), "manifest").expect("write V2 manifest");
+
+        let trash_script = tmp.path().join("successful-noop-trash.sh");
+        fs::write(&trash_script, "#!/bin/sh\nexit 0\n").expect("write trash script");
+        let mut permissions = fs::metadata(&trash_script)
+            .expect("trash script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&trash_script, permissions).expect("chmod trash script");
+
+        let error = delete_session_file_with_trash_cmd(
+            &session_path,
+            trash_script.to_string_lossy().as_ref(),
+        )
+        .expect_err("an exit-zero no-op trash command must not authorize sidecar deletion");
+        assert!(error.to_string().contains("left the session in place"));
+        for artifact in [&session_path, &wal_path, &shm_path, &journal_path, &v2_path] {
+            assert!(
+                crate::session::session_path_entry_exists(artifact)
+                    .expect("inspect preserved artifact"),
+                "no-op trash removed or lost {}",
+                artifact.display()
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "sqlite-sessions"))]
+    #[test]
+    fn auxiliary_noop_trash_falls_back_after_primary_was_trashed() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("aux-noop-trash.sqlite");
+        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
+        fs::write(&session_path, "db").expect("write SQLite primary");
+        fs::write(&wal_path, "wal").expect("write SQLite WAL");
+        fs::write(&shm_path, "shm").expect("write SQLite SHM");
+        fs::write(&journal_path, "journal").expect("write SQLite rollback journal");
+        fs::create_dir(&v2_path).expect("create V2 sidecar");
+        fs::write(v2_path.join("manifest.json"), "manifest").expect("write V2 manifest");
+
+        let trash_script = tmp.path().join("primary-only-trash.sh");
+        fs::write(
+            &trash_script,
+            "#!/bin/sh\ncase \"$1\" in\n  *.sqlite) rm -f -- \"$1\" ;;\n  *) : ;;\nesac\nexit 0\n",
+        )
+        .expect("write trash script");
+        let mut permissions = fs::metadata(&trash_script)
+            .expect("trash script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&trash_script, permissions).expect("chmod trash script");
+
+        delete_session_file_with_trash_cmd(&session_path, trash_script.to_string_lossy().as_ref())
+            .expect("direct fallback must finish auxiliary cleanup");
+
+        for artifact in [&session_path, &wal_path, &shm_path, &journal_path, &v2_path] {
+            assert!(
+                !crate::session::session_path_entry_exists(artifact)
+                    .expect("inspect removed artifact"),
+                "auxiliary cleanup left {}",
+                artifact.display()
+            );
+        }
+    }
+
     #[cfg(feature = "sqlite-sessions")]
     #[test]
-    fn delete_sqlite_session_removes_wal_and_shm_sidecars() {
+    fn fresh_eyes_delete_sqlite_session_removes_all_sidecars() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("sqlite-session.sqlite");
-        let [wal_path, shm_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
         fs::write(&session_path, "db").expect("write sqlite session");
         fs::write(&wal_path, "wal").expect("write sqlite wal");
         fs::write(&shm_path, "shm").expect("write sqlite shm");
+        fs::write(&journal_path, "journal").expect("write sqlite rollback journal");
 
         let result = delete_session_file_with_trash_cmd(
             &session_path,
@@ -1548,6 +1728,88 @@ mod tests {
         );
         assert!(!wal_path.exists(), "sqlite wal sidecar should be deleted");
         assert!(!shm_path.exists(), "sqlite shm sidecar should be deleted");
+        assert!(
+            !journal_path.exists(),
+            "sqlite rollback journal should be deleted"
+        );
+    }
+
+    #[cfg(all(unix, feature = "sqlite-sessions"))]
+    #[test]
+    fn delete_removes_dangling_sqlite_and_v2_sidecar_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("dangling-sidecars.sqlite");
+        let [wal_path, _, _] = sqlite_auxiliary_paths(&session_path);
+        let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
+        let missing_target = tmp.path().join("missing-target");
+        symlink(&missing_target, &wal_path).expect("create dangling WAL symlink");
+        symlink(&missing_target, &v2_path).expect("create dangling V2 symlink");
+
+        delete_session_file_with_trash_cmd(
+            &session_path,
+            "__pi_agent_rust_nonexistent_trash_command__",
+        )
+        .expect("delete dangling sidecars");
+
+        assert!(
+            !crate::session::session_path_entry_exists(&wal_path).expect("inspect WAL link"),
+            "dangling WAL symlink must be removed"
+        );
+        assert!(
+            !crate::session::session_path_entry_exists(&v2_path).expect("inspect V2 link"),
+            "dangling V2 symlink must be removed"
+        );
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn delete_holds_persistent_lock_across_primary_and_sidecar_removal() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("locked-delete.sqlite");
+        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        fs::write(&session_path, "db").expect("write SQLite primary");
+        fs::write(&wal_path, "wal").expect("write SQLite WAL");
+        fs::write(&shm_path, "shm").expect("write SQLite SHM");
+        let held_lock = crate::session::lock_session_persistence(&session_path)
+            .expect("hold writer-compatible persistence lock");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let path_for_delete = session_path.clone();
+        let delete_thread = std::thread::spawn(move || {
+            started_tx.send(()).expect("announce delete start");
+            let result = delete_session_file_with_trash_cmd(
+                &path_for_delete,
+                "__pi_agent_rust_nonexistent_trash_command__",
+            );
+            done_tx.send(result).expect("report delete result");
+        });
+
+        started_rx.recv().expect("delete thread started");
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "delete bypassed the persistent session lock"
+        );
+        fs::write(&journal_path, "journal-created-by-locked-writer")
+            .expect("create sidecar while writer lock is held");
+        drop(held_lock);
+
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delete completed after lock release")
+            .expect("delete succeeded");
+        delete_thread.join().expect("join delete thread");
+        for artifact in [&session_path, &wal_path, &shm_path, &journal_path] {
+            assert!(
+                !artifact.exists(),
+                "locked delete left artifact {}",
+                artifact.display()
+            );
+        }
     }
 
     #[cfg(feature = "sqlite-sessions")]
@@ -1555,10 +1817,11 @@ mod tests {
     fn delete_sqlite_session_preserves_sidecars_when_primary_delete_fails() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("delete-fails.sqlite");
-        let [wal_path, shm_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
         fs::create_dir(&session_path).expect("create directory in place of sqlite session");
         fs::write(&wal_path, "wal").expect("write sqlite wal");
         fs::write(&shm_path, "shm").expect("write sqlite shm");
+        fs::write(&journal_path, "journal").expect("write sqlite rollback journal");
 
         let result = delete_session_file_with_trash_cmd(
             &session_path,
@@ -1575,6 +1838,10 @@ mod tests {
         assert!(
             shm_path.exists(),
             "shm sidecar must be preserved on primary delete failure"
+        );
+        assert!(
+            journal_path.exists(),
+            "rollback journal must be preserved on primary delete failure"
         );
     }
 
@@ -1615,6 +1882,103 @@ esac
         assert!(
             sidecar_path.exists(),
             "sidecar must be preserved when the main session path could not be deleted"
+        );
+    }
+
+    #[cfg(all(unix, feature = "sqlite-sessions"))]
+    #[test]
+    fn delete_denial_preserves_primary_and_every_sidecar_without_invoking_trash() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker_dir = tempfile::tempdir().expect("marker tempdir");
+        let invocation_marker = marker_dir.path().join("trash-invoked");
+        let session_path = tmp.path().join("guarded.sqlite");
+        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
+        fs::write(&session_path, b"database").expect("write primary");
+        fs::write(&wal_path, b"wal").expect("write WAL");
+        fs::write(&shm_path, b"shm").expect("write SHM");
+        fs::write(&journal_path, b"journal").expect("write rollback journal");
+        fs::create_dir(&v2_path).expect("create V2 sidecar");
+        fs::write(v2_path.join("manifest.json"), b"manifest").expect("write manifest");
+
+        let trash_script = tmp.path().join("fake-trash.sh");
+        fs::write(
+            &trash_script,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 0\n",
+                invocation_marker.display()
+            ),
+        )
+        .expect("write trash script");
+        let mut script_permissions = fs::metadata(&trash_script)
+            .expect("trash script metadata")
+            .permissions();
+        script_permissions.set_mode(0o755);
+        fs::set_permissions(&trash_script, script_permissions).expect("chmod trash script");
+
+        // The fixture owner lacks parent-directory write while group/other
+        // deliberately have it, exercising selected-class semantics as UID 0
+        // and UID 1000 without conditional skips.
+        let mut mode_guard = UnixModeGuard::apply(tmp.path(), 0o577);
+        let result = delete_session_file_with_trash_cmd(
+            &session_path,
+            trash_script.to_string_lossy().as_ref(),
+        );
+        mode_guard.restore();
+
+        let error = result.expect_err("parent owner class must deny deletion");
+        let Error::Io(io_error) = error else {
+            panic!("expected typed I/O error, got {error}");
+        };
+        assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(session_path.exists(), "primary session must be preserved");
+        assert!(wal_path.exists(), "WAL sidecar must be preserved");
+        assert!(shm_path.exists(), "SHM sidecar must be preserved");
+        assert!(journal_path.exists(), "rollback journal must be preserved");
+        assert!(v2_path.exists(), "V2 sidecar must be preserved");
+        assert!(
+            !invocation_marker.exists(),
+            "trash must not run after permission preflight denial"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_already_absent_session_is_idempotent_in_read_only_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker_dir = tempfile::tempdir().expect("marker tempdir");
+        let invocation_marker = marker_dir.path().join("trash-invoked");
+        let trash_script = tmp.path().join("fake-trash.sh");
+        fs::write(
+            &trash_script,
+            format!(
+                "#!/bin/sh\nprintf invoked > '{}'\nexit 0\n",
+                invocation_marker.display()
+            ),
+        )
+        .expect("write trash script");
+        let mut script_permissions = fs::metadata(&trash_script)
+            .expect("trash script metadata")
+            .permissions();
+        script_permissions.set_mode(0o755);
+        fs::set_permissions(&trash_script, script_permissions).expect("chmod trash script");
+
+        let absent_session = tmp.path().join("already-absent.jsonl");
+        let mut mode_guard = UnixModeGuard::apply(tmp.path(), 0o577);
+        let result = delete_session_file_with_trash_cmd(
+            &absent_session,
+            trash_script.to_string_lossy().as_ref(),
+        );
+        mode_guard.restore();
+
+        result.expect("deleting an already-absent session must remain idempotent");
+        assert!(
+            !invocation_marker.exists(),
+            "an idempotent no-op must not invoke the trash command"
         );
     }
 

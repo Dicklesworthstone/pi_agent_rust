@@ -116,6 +116,19 @@ The logical V2 session container is:
 
 Machine-readable schema: `docs/schema/session_store_v2_contract.json`
 
+All serialized JSON member names use lower camel case (`entrySeq`,
+`sourceFormat`, `migrationEvents`). Rust identifiers and explanatory prose may
+use snake case, but snake-case member names are not accepted on the wire. Enum
+values such as `pre_migration` and `native_v2` remain exactly as shown in the
+schema. Persisted contract documents reject unknown members; only the
+`segment_frame.payload` object is intentionally open to entry-specific fields.
+
+An empty store is represented explicitly: `entriesTotal`, `segmentCount`,
+`head.segmentSeq`, and `head.entrySeq` are all zero, `head.entryId` is empty,
+and the segment/index/checkpoint arrays may be empty. A non-empty store requires
+positive head and segment values plus a contract-valid entry ID. Checkpoints
+always require a non-empty head.
+
 Contract schema IDs:
 
 1. `pi.session_store_v2.contract.v1` (bundle-level validation artifact)
@@ -127,8 +140,8 @@ Contract schema IDs:
 
 Required contract properties:
 
-1. Strictly monotonic `entry_seq` and `segment_seq`.
-2. Stable `entry_id` references from index/checkpoint/migration records.
+1. Strictly contiguous `entrySeq` values and monotonic `segmentSeq` values.
+2. Stable `entryId` references from index/checkpoint/migration records.
 3. Hash-chain integrity material in manifest and checkpoints.
 4. Explicit migration correlation IDs and classified outcomes.
 5. Deterministic state transitions with fail-closed validation.
@@ -161,13 +174,42 @@ Allowed transitions are intentionally narrow and enforced by schema + tests:
 
 Invariant IDs (must hold unless state is `FAILED`):
 
-1. `INV-001`: parent links are closed (`parent_entry_id` either null or known).
-2. `INV-002`: `entry_seq` is strictly increasing by 1 within a segment stream.
-3. `INV-003`: index rows resolve to in-bounds `(segment_seq, frame_seq, byte_offset, byte_length)`.
+1. `INV-001`: parent links are closed (`parentEntryId` either null or known).
+2. `INV-002`: `entrySeq` is strictly increasing by 1 across the store.
+3. `INV-003`: index rows resolve to in-bounds `(segmentSeq, frameSeq, byteOffset, byteLength)` ranges with complete, gap-free segment coverage.
 4. `INV-004`: checkpoint head matches manifest head at checkpoint creation time.
 5. `INV-005`: hash chain is continuous from first segment frame to current head.
 6. `INV-006`: branch heads referenced by active context are indexed.
 7. `INV-007`: migration cutover is atomic: both manifest pointer and active store marker move together.
+
+### Steady-state resume validation
+
+Resume keeps bounded hydration honest without treating it as a full audit. It
+reads the JSONL header and the complete V2 offset index, then validates the
+index documents, contiguous entry/frame/byte ranges, segment metadata, and
+complete segment-file coverage. This structural pass is O(index rows + segment
+files) and does not scan every frame body. The manifest must pass its self-hash
+and declared invariants, must match index-derived entry, byte, segment, head,
+and last-CRC facts, and must keep message, branch, and compaction counters
+within bounds implied by the indexed entry count.
+
+Hydration uses that same validated index snapshot and reads only the selected
+full, active-path, or tail rows. Before a fetched frame is used, the reader
+enforces its configured size limit, exact indexed byte range, CRC32C, trailing
+LF, schema and index coordinates, entry and parent IDs, entry type, timestamp,
+and payload byte count and SHA-256. Consequently, tail resume is O(index rows +
+segment files + selected frames). A fetched parent ID must exist in the index,
+and cycles wholly visible in the fetched set are rejected; forward parent
+references remain valid because migration preserves authoritative JSONL order.
+Corruption in an unselected frame body is detected when that frame is fetched,
+not by the bounded structural pass.
+
+Full integrity and migration validation remain deliberately stronger:
+`validate_integrity`, `validate_session_integrity`, and manifest/store audit
+paths scan every frame, validate the parent graph and hash chain, and check
+checkpoint evidence. A resume-time failure in a selected frame or in the
+manifest/JSONL identity envelope fails closed and invokes repair from the
+authoritative JSONL source where that repair is permitted.
 
 ### Failure semantics and recovery behavior
 
@@ -181,11 +223,11 @@ If segment seal fails after data write but before manifest/index commit, the seg
 
 #### Index update failure
 
-If index write fails after sealed segment write, open-path recovery rebuilds missing index rows from segment tail and records a recoverable migration event.
+If index write fails after a durable segment write, open-path recovery logs a warning and rebuilds missing index rows from the segment tail. The migration ledger remains reserved for migration and rollback events.
 
 #### Checkpoint failure
 
-Checkpoint files are written to temp + atomically renamed. Partial files are ignored. Last valid checkpoint remains authoritative.
+Checkpoint files are staged in a temp file and atomically renamed without replacing an existing final checkpoint. A crash-left regular temp file is overwritten on retry; linked or special-file temp occupants are rejected. The last valid published checkpoint remains authoritative.
 
 #### Migration cutover failure
 
@@ -197,16 +239,26 @@ Forward migration (`jsonl_v3|sqlite_v1 -> native_v2`) requires:
 
 1. Create migration event `phase=planned`.
 2. Build V2 segments/index/checkpoints in staging path.
-3. Validate integrity (`entry_count_match`, `hash_chain_match`, `index_consistent`).
+3. Validate integrity (`entryCountMatch`, `hashChainMatch`, `indexConsistent`).
 4. Commit cutover atomically by updating active manifest pointer.
 5. Emit `phase=completed` with `outcome=ok`.
 
-Rollback (`native_v2 -> jsonl_v3|sqlite_v1`) requires:
+Format cutback (`native_v2 -> jsonl_v3|sqlite_v1`) is a migration-layer
+operation. It requires:
 
 1. Preserve source snapshot ID and migration correlation ID.
 2. Restore previous active pointer atomically.
 3. Verify rollback target integrity before reopening writes.
 4. Emit rollback event with explicit reason and outcome.
+
+Checkpoint rollback is a distinct, in-place V2 history operation implemented
+by `SessionStoreV2::rollback_to_checkpoint`. It does not switch the active
+format or restore a V1 pointer. Before changing the active index or segment
+set, it durably records a bounded rollback intent and a checksum-bound staged
+index. Recovery replays that intent idempotently, publishes the retained index
+before truncating or quarantining segment tails, reconciles the manifest,
+quarantines checkpoints newer than the target, verifies the resulting store,
+and removes the intent only after durable success evidence is recorded.
 
 Recovery from partial migration is deterministic:
 
