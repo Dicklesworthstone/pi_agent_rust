@@ -329,8 +329,12 @@ if not git_dir.is_dir():
 
 def git(*args):
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_LITERAL_PATHSPECS"] = "1"
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     result = subprocess.run(
         [
             "git",
@@ -367,6 +371,13 @@ if not top_level_text.endswith("\n") or "\n" in top_level_text.removesuffix("\n"
 top_level = Path(top_level_text.removesuffix("\n")).resolve(strict=True)
 if top_level != root:
     fail("Git worktree does not match the canonical release repository root")
+
+absolute_git_dir_text = git("rev-parse", "--absolute-git-dir").decode("utf-8", "strict")
+if not absolute_git_dir_text.endswith("\n") or "\n" in absolute_git_dir_text.removesuffix("\n"):
+    fail("Git absolute directory output is not one canonical line")
+reported_git_dir = Path(absolute_git_dir_text.removesuffix("\n")).resolve(strict=True)
+if reported_git_dir != git_dir:
+    fail("Git directory does not match the canonical release repository binding")
 
 head = git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
 if len(head) not in (40, 64) or head.lower() != head or any(ch not in "0123456789abcdef" for ch in head):
@@ -542,8 +553,9 @@ fi
 # Gate 2: Evidence contract
 EVIDENCE_CONTRACT="$EVIDENCE_DIR/evidence_contract.json"
 if [[ -f "$EVIDENCE_CONTRACT" ]]; then
-    if EVIDENCE_CHECK=$(python3 - "$PROJECT_ROOT" "$EVIDENCE_DIR" 2>&1 <<'PY'
+    if EVIDENCE_CHECK=$(python3 - "$PROJECT_ROOT" "$EVIDENCE_DIR" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -551,10 +563,12 @@ import stat
 import subprocess
 import sys
 import tomllib
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-project_root = Path(sys.argv[1])
+raw_project_root = Path(sys.argv[1])
 evidence_dir = Path(sys.argv[2])
+maximum_age = timedelta(hours=int(sys.argv[3]))
 
 def finish(status, detail):
     print(f"{status}|{detail}")
@@ -567,6 +581,35 @@ def reject_duplicate_keys(pairs):
             raise ValueError(f"duplicate JSON object key: {key}")
         value[key] = item
     return value
+
+def resolve_repository_context():
+    if raw_project_root.is_symlink() or not raw_project_root.is_dir():
+        finish("fail", "E2E repository root must be a real directory, not a symlink")
+    try:
+        resolved_root = raw_project_root.resolve(strict=True)
+        git_marker = resolved_root / ".git"
+        marker_metadata = git_marker.lstat()
+        if stat.S_ISLNK(marker_metadata.st_mode):
+            finish("fail", "E2E repository .git marker must not be a symlink")
+        if stat.S_ISDIR(marker_metadata.st_mode):
+            resolved_git_dir = git_marker.resolve(strict=True)
+        elif stat.S_ISREG(marker_metadata.st_mode):
+            marker = git_marker.read_text(encoding="utf-8").rstrip("\r\n")
+            if "\n" in marker or "\r" in marker or not marker.startswith("gitdir: "):
+                finish("fail", "E2E repository .git file is malformed")
+            target = Path(marker.removeprefix("gitdir: "))
+            candidate = target if target.is_absolute() else resolved_root / target
+            target_metadata = candidate.lstat()
+            if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISDIR(target_metadata.st_mode):
+                finish("fail", "E2E repository gitfile target must be a non-symlink directory")
+            resolved_git_dir = candidate.resolve(strict=True)
+        else:
+            finish("fail", "E2E repository .git marker is not a directory or gitfile")
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        finish("fail", f"E2E repository Git context could not be resolved safely: {exc}")
+    if not resolved_git_dir.is_dir():
+        finish("fail", "E2E repository Git directory is not a directory")
+    return resolved_root, resolved_git_dir
 
 def load_object(path, label):
     try:
@@ -606,10 +649,23 @@ def string_list(value, label, *, nonempty=False):
     return value
 
 def run_git(*args, text=True):
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     return subprocess.run(
-        ["git", "-C", str(project_root), *args],
+        [
+            "git",
+            "--git-dir", str(git_dir),
+            "--work-tree", str(project_root),
+            "-c", "core.bare=false",
+            "-c", "core.fsmonitor=false",
+            "-c", f"core.worktree={project_root}",
+            *args,
+        ],
         capture_output=True,
         text=text,
         env=env,
@@ -626,6 +682,91 @@ def package_includes(path, patterns):
         if pattern.endswith("/**") and path.startswith(pattern[:-3].rstrip("/") + "/"):
             return True
     return False
+
+project_root, git_dir = resolve_repository_context()
+
+def verify_repository_binding():
+    bindings = (
+        (("rev-parse", "--show-toplevel"), project_root, "worktree"),
+        (("rev-parse", "--absolute-git-dir"), git_dir, "Git directory"),
+    )
+    for args, expected, label in bindings:
+        result = run_git(*args)
+        if result.returncode != 0:
+            finish("fail", f"unable to verify canonical E2E repository {label}")
+        output = result.stdout
+        if not output.endswith("\n") or "\n" in output.removesuffix("\n"):
+            finish("fail", f"E2E repository {label} output is not one canonical line")
+        try:
+            reported = Path(output.removesuffix("\n")).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            finish("fail", f"unable to canonicalize E2E repository {label}: {exc}")
+        if reported != expected:
+            finish("fail", f"E2E repository {label} does not match the filesystem-derived binding")
+
+verify_repository_binding()
+
+def framed_field(value):
+    return str(len(value)).encode("ascii") + b":" + value
+
+def recompute_e2e_source_snapshot(commit):
+    tree_result = run_git(
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        commit,
+        text=False,
+    )
+    if tree_result.returncode != 0:
+        finish("fail", "unable to enumerate the E2E source tree")
+    tree_bytes = tree_result.stdout
+    entries = []
+    seen_paths = set()
+    canonical_index = bytearray()
+    canonical_flags = bytearray()
+    for record in (item for item in tree_bytes.split(b"\0") if item):
+        try:
+            metadata, path = record.split(b"\t", 1)
+            mode, object_type, object_id = metadata.split(b" ", 2)
+        except ValueError:
+            finish("fail", "E2E source tree contains a malformed record")
+        if (
+            not path
+            or path in seen_paths
+            or mode not in (b"100644", b"100755", b"120000")
+            or object_type != b"blob"
+            or len(object_id) not in (40, 64)
+            or object_id.lower() != object_id
+            or any(byte not in b"0123456789abcdef" for byte in object_id)
+        ):
+            finish("fail", f"E2E source tree contains a non-canonical entry at {os.fsdecode(path)!r}")
+        seen_paths.add(path)
+        entries.append((path, mode, object_id))
+        canonical_index.extend(mode + b" " + object_id + b" 0\t" + path + b"\0")
+        canonical_flags.extend(b"H " + path + b"\0")
+
+    digest = hashlib.sha256()
+    digest.update(framed_field(b"pi.e2e.source_snapshot.v1"))
+    digest.update(framed_field(commit.encode("ascii")))
+    digest.update(framed_field(tree_bytes))
+    digest.update(framed_field(bytes(canonical_index)))
+    digest.update(framed_field(bytes(canonical_flags)))
+    for path, mode, object_id in entries:
+        blob = run_git("cat-file", "blob", os.fsdecode(object_id), text=False)
+        if blob.returncode != 0:
+            finish("fail", f"unable to read E2E source blob at {os.fsdecode(path)!r}")
+        framed_blob = b"blob " + str(len(blob.stdout)).encode("ascii") + b"\0" + blob.stdout
+        if len(object_id) == 40:
+            actual_object_id = hashlib.sha1(framed_blob).hexdigest().encode("ascii")
+        else:
+            actual_object_id = hashlib.sha256(framed_blob).hexdigest().encode("ascii")
+        if actual_object_id != object_id:
+            finish("fail", f"E2E source blob identity is corrupt at {os.fsdecode(path)!r}")
+        digest.update(framed_field(path))
+        digest.update(framed_field(mode))
+        digest.update(framed_field(blob.stdout))
+    return "sha256:" + digest.hexdigest()
 
 try:
     root_resolved = project_root.resolve(strict=True)
@@ -661,6 +802,31 @@ if environment.get("schema") != "pi.e2e.environment.v1":
 if summary.get("schema") != "pi.e2e.summary.v1":
     finish("fail", f"unsupported E2E summary schema: {summary.get('schema')!r}")
 
+generated_values = (
+    contract.get("generated_at"),
+    environment.get("generated_at"),
+    summary.get("generated_at"),
+)
+if not all(isinstance(value, str) for value in generated_values):
+    finish("fail", "E2E contract, environment, and summary must each contain generated_at")
+if len(set(generated_values)) != 1:
+    finish("fail", "E2E contract, environment, and summary generated_at values do not match")
+generated_at_raw = generated_values[0]
+if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", generated_at_raw) is None:
+    finish("fail", "E2E generated_at must use canonical UTC second precision")
+try:
+    generated_at = datetime.fromisoformat(generated_at_raw.removesuffix("Z") + "+00:00")
+except ValueError:
+    finish("fail", "E2E generated_at is not a valid UTC timestamp")
+now = datetime.now(timezone.utc)
+if generated_at > now + timedelta(minutes=5):
+    finish("fail", "E2E generated_at is more than five minutes in the future")
+if now - generated_at > maximum_age:
+    finish("fail", f"E2E evidence is stale ({now - generated_at} old; maximum {maximum_age})")
+expected_directory_name = generated_at.strftime("%Y%m%dT%H%M%SZ")
+if evidence_resolved.name != expected_directory_name:
+    finish("fail", "E2E generated_at does not match the canonical evidence directory name")
+
 profile = contract.get("profile")
 if profile not in ("ci", "full"):
     finish("fail", f"release evidence profile must be ci or full, got {profile!r}")
@@ -674,6 +840,9 @@ if contract.get("strict_conformance") is not expected_strict_conformance:
     )
 if summary.get("rerun_from") is not None or environment.get("rerun_from") is not None:
     finish("fail", "release evidence must be a baseline run, not a failed-suite rerun")
+expected_shard = {"kind": "none", "name": "unsharded", "index": None, "total": None}
+if environment.get("shard") != expected_shard or summary.get("shard") != expected_shard:
+    finish("fail", "release evidence must be one complete, unsharded run")
 
 if contract.get("status") != "pass":
     finish("fail", f"evidence contract status={contract.get('status')!r} (expected 'pass')")
@@ -684,6 +853,7 @@ checks = contract.get("checks")
 if not isinstance(checks, list) or not checks:
     finish("fail", "evidence contract checks must be a non-empty array")
 seen_check_ids = set()
+checks_by_id = {}
 passed_checks = 0
 for index, check in enumerate(checks):
     if not isinstance(check, dict):
@@ -694,6 +864,7 @@ for index, check in enumerate(checks):
     if check_id in seen_check_ids:
         finish("fail", f"evidence contract contains duplicate check id: {check_id}")
     seen_check_ids.add(check_id)
+    checks_by_id[check_id] = check
     if not isinstance(check.get("path"), str) or not check["path"]:
         finish("fail", f"evidence contract check {check_id} has an invalid path")
     if not isinstance(check.get("diagnostics"), str):
@@ -714,6 +885,11 @@ if not isinstance(artifact_dir, str) or not artifact_dir:
     finish("fail", "evidence contract artifact_dir must be a non-empty string")
 if environment.get("artifact_dir") != artifact_dir or summary.get("artifact_dir") != artifact_dir:
     finish("fail", "evidence contract, environment, and summary artifact_dir values do not match")
+try:
+    if Path(artifact_dir).resolve(strict=True) != evidence_resolved:
+        finish("fail", "E2E artifact_dir does not identify the selected evidence directory")
+except (OSError, RuntimeError) as exc:
+    finish("fail", f"unable to resolve E2E artifact_dir: {exc}")
 
 total_units = uint(summary.get("total_units"), "summary.total_units")
 passed_units = uint(summary.get("passed_units"), "summary.passed_units")
@@ -725,8 +901,191 @@ if total_units != len(unit_results) or passed_units + failed_units != total_unit
     finish("fail", "summary unit totals are internally inconsistent")
 if failed_units != 0 or passed_units != total_units:
     finish("fail", "release evidence contains failed integration-test targets")
+if summary.get("failed_unit_names") != []:
+    finish("fail", "summary.failed_unit_names must be an empty array")
 environment_units = string_list(environment.get("unit_targets"), "environment.unit_targets", nonempty=True)
 observed_unit_names = []
+required_result_fields = {
+    "schema",
+    "result_kind",
+    "correlation_id",
+    "exit_code",
+    "duration_ms",
+    "passed",
+    "failed",
+    "ignored",
+    "total",
+    "log_file",
+    "diagnostic_artifacts",
+    "timestamp",
+}
+structured_result_fields = {"test_log_jsonl", "artifact_index_jsonl"}
+diagnostic_limits = {
+    "output_log": 8 * 1024 * 1024,
+    "test_log_jsonl": 4 * 1024 * 1024,
+    "artifact_index_jsonl": 4 * 1024 * 1024,
+}
+leak_patterns = (
+    ("openai_like_key", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("generic_key_token", re.compile(r"\bkey-[A-Za-z0-9_-]{20,}\b", re.IGNORECASE)),
+    ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}")),
+    (
+        "auth_header_value",
+        re.compile(
+            r"(?i)(authorization|x-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token)"
+            r"\s*[:=]\s*[\"']?[A-Za-z0-9._~+/=-]{12,}"
+        ),
+    ),
+)
+
+def validate_result_diagnostics(result, kind, name, base_dir, *, structured):
+    expected_paths = {
+        "log_file": base_dir / "output.log",
+    }
+    if structured:
+        expected_paths.update(
+            {
+                "test_log_jsonl": base_dir / "test-log.jsonl",
+                "artifact_index_jsonl": base_dir / "artifact-index.jsonl",
+            }
+        )
+    diagnostic_artifacts = result.get("diagnostic_artifacts")
+    if not isinstance(diagnostic_artifacts, dict):
+        finish("fail", f"{kind} {name} diagnostic_artifacts must be an object")
+    if set(diagnostic_artifacts) != {
+        "schema",
+        "output_log",
+        "test_log_jsonl",
+        "artifact_index_jsonl",
+    } or diagnostic_artifacts.get("schema") != "pi.e2e.diagnostic_artifacts.v1":
+        finish("fail", f"{kind} {name} diagnostic_artifacts has an invalid contract")
+
+    captured = {}
+    field_bindings = {
+        "log_file": "output_log",
+        "test_log_jsonl": "test_log_jsonl",
+        "artifact_index_jsonl": "artifact_index_jsonl",
+    }
+    if not structured:
+        for binding_field in ("test_log_jsonl", "artifact_index_jsonl"):
+            if diagnostic_artifacts.get(binding_field) is not None:
+                finish("fail", f"{kind} {name} {binding_field} binding must be null")
+    for field, expected_path in expected_paths.items():
+        binding_field = field_bindings[field]
+        binding = diagnostic_artifacts.get(binding_field)
+        if not isinstance(binding, dict) or set(binding) != {"path", "sha256", "size_bytes"}:
+            finish("fail", f"{kind} {name} {binding_field} byte binding is invalid")
+        raw_path = result.get(field)
+        if not isinstance(raw_path, str) or not raw_path:
+            finish("fail", f"{kind} {name} {field} must be a non-empty path")
+        try:
+            resolved = Path(raw_path).resolve(strict=True)
+            expected = expected_path.resolve(strict=True)
+            metadata = expected_path.lstat()
+            raw = expected_path.read_bytes()
+        except (OSError, RuntimeError) as exc:
+            finish("fail", f"unable to inspect {kind} {name} {field}: {exc}")
+        if resolved != expected:
+            finish("fail", f"{kind} {name} {field} does not name its canonical in-run artifact")
+        if not stat.S_ISREG(metadata.st_mode) or (os.name != "nt" and metadata.st_mode & 0o111):
+            finish("fail", f"{kind} {name} {field} must be a non-executable regular file")
+        if binding.get("path") != raw_path:
+            finish("fail", f"{kind} {name} {binding_field} binding path does not match its result path")
+        bound_sha256 = binding.get("sha256")
+        bound_size = binding.get("size_bytes")
+        if not isinstance(bound_sha256, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", bound_sha256) is None:
+            finish("fail", f"{kind} {name} {binding_field} binding SHA-256 is malformed")
+        if isinstance(bound_size, bool) or not isinstance(bound_size, int) or not 0 <= bound_size <= 2**63 - 1:
+            finish("fail", f"{kind} {name} {binding_field} binding size is invalid")
+        if len(raw) > diagnostic_limits[binding_field]:
+            finish(
+                "fail",
+                f"{kind} {name} {binding_field} exceeds its {diagnostic_limits[binding_field]}-byte budget",
+            )
+        actual_sha256 = "sha256:" + hashlib.sha256(raw).hexdigest()
+        if bound_size != len(raw) or bound_sha256 != actual_sha256:
+            finish("fail", f"{kind} {name} {binding_field} byte binding does not match retained bytes")
+        text_value = raw.decode("utf-8", "replace")
+        for leak_label, leak_pattern in leak_patterns:
+            for match in leak_pattern.finditer(text_value):
+                snippet = match.group(0)
+                upper = snippet.upper()
+                if "REDACTED" not in upper and "<TRACE_ID>" not in snippet and "<TIMESTAMP>" not in snippet:
+                    finish("fail", f"{kind} {name} {binding_field} contains a potential {leak_label} secret")
+        captured[field] = raw
+        decision_inputs.append((expected_path, raw))
+    if not captured["log_file"]:
+        finish("fail", f"{kind} {name} output.log must be non-empty")
+
+    def parse_jsonl(field, *, require_harness):
+        raw = captured[field]
+        if raw and not raw.endswith(b"\n"):
+            finish("fail", f"{kind} {name} {field} must be newline-terminated JSONL")
+        lines = raw.removesuffix(b"\n").split(b"\n") if raw else []
+        saw_harness = False
+        for line_number, line in enumerate(lines, start=1):
+            if not line:
+                finish("fail", f"{kind} {name} {field} contains an empty JSONL record")
+            try:
+                payload = json.loads(
+                    line.decode("utf-8", "strict"),
+                    object_pairs_hook=reject_duplicate_keys,
+                )
+            except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+                finish("fail", f"{kind} {name} {field} line {line_number} is invalid: {exc}")
+            if not isinstance(payload, dict):
+                finish("fail", f"{kind} {name} {field} line {line_number} must be an object")
+            if payload.get("category") == "harness":
+                saw_harness = True
+        if require_harness and not saw_harness:
+            finish("fail", f"{kind} {name} test log lacks required harness signal")
+
+    if structured:
+        parse_jsonl("test_log_jsonl", require_harness=True)
+        parse_jsonl("artifact_index_jsonl", require_harness=False)
+
+
+lib_embedded = summary.get("lib")
+if not isinstance(lib_embedded, dict):
+    finish("fail", "summary.lib must contain the actual inline-lib test result")
+lib_result_path = evidence_resolved / "lib" / "result.json"
+lib_result, lib_result_bytes = load_object(lib_result_path, "inline-lib result")
+decision_inputs.append((lib_result_path, lib_result_bytes))
+if lib_result != lib_embedded:
+    finish("fail", "summary.lib and lib/result.json disagree")
+expected_lib_fields = required_result_fields | {"target"}
+if set(lib_result) != expected_lib_fields:
+    finish("fail", "inline-lib result fields do not match the canonical result contract")
+if lib_result.get("schema") != "pi.e2e.result.v1" or lib_result.get("result_kind") != "lib":
+    finish("fail", "inline-lib result has an invalid result contract")
+if lib_result.get("target") != "lib":
+    finish("fail", "inline-lib result target must be 'lib'")
+if lib_result.get("correlation_id") != correlation_id:
+    finish("fail", "inline-lib result correlation_id does not match the run")
+if lib_result.get("timestamp") != evidence_resolved.name:
+    finish("fail", "inline-lib result timestamp does not match the run")
+lib_duration = lib_result.get("duration_ms")
+if isinstance(lib_duration, bool) or not isinstance(lib_duration, int) or lib_duration < 0:
+    finish("fail", "inline-lib result duration_ms must be a non-negative integer")
+validate_result_diagnostics(
+    lib_result,
+    "inline-lib result",
+    "lib",
+    evidence_resolved / "lib",
+    structured=False,
+)
+lib_exit = lib_result.get("exit_code")
+if isinstance(lib_exit, bool) or not isinstance(lib_exit, int) or lib_exit != 0:
+    finish("fail", "inline-lib tests did not exit successfully")
+lib_passed = uint(lib_result.get("passed"), "lib.passed")
+lib_failed = uint(lib_result.get("failed"), "lib.failed")
+lib_ignored = uint(lib_result.get("ignored"), "lib.ignored")
+lib_total = uint(lib_result.get("total"), "lib.total")
+if lib_total == 0 or lib_passed == 0:
+    finish("fail", "inline-lib result executed zero passing tests")
+if lib_passed + lib_failed + lib_ignored != lib_total or lib_failed != 0:
+    finish("fail", "inline-lib result counts are inconsistent or failing")
+
 for index, embedded_result in enumerate(unit_results):
     if not isinstance(embedded_result, dict):
         finish("fail", f"summary.unit_targets[{index}] must be an object")
@@ -734,6 +1093,32 @@ for index, embedded_result in enumerate(unit_results):
     if not isinstance(target_name, str) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", target_name) is None:
         finish("fail", f"summary.unit_targets[{index}] has an unsafe target name")
     observed_unit_names.append(target_name)
+    result_path = evidence_resolved / "unit" / target_name / "result.json"
+    actual_result, result_bytes = load_object(result_path, f"integration result for {target_name}")
+    decision_inputs.append((result_path, result_bytes))
+    if actual_result != embedded_result:
+        finish("fail", f"summary and result.json disagree for integration target {target_name}")
+    if actual_result.get("schema") != "pi.e2e.result.v1" or actual_result.get("result_kind") != "unit":
+        finish("fail", f"integration target {target_name} has an invalid result contract")
+    missing_fields = sorted(
+        (required_result_fields | structured_result_fields | {"target"}) - set(actual_result)
+    )
+    if missing_fields:
+        finish("fail", f"integration target {target_name} result is missing fields: {missing_fields}")
+    if actual_result.get("correlation_id") != correlation_id:
+        finish("fail", f"integration target {target_name} correlation_id does not match the run")
+    if actual_result.get("timestamp") != evidence_resolved.name:
+        finish("fail", f"integration target {target_name} timestamp does not match the run")
+    duration_ms = actual_result.get("duration_ms")
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+        finish("fail", f"integration target {target_name} duration_ms must be a non-negative integer")
+    validate_result_diagnostics(
+        actual_result,
+        "integration target",
+        target_name,
+        evidence_resolved / "unit" / target_name,
+        structured=True,
+    )
     exit_code = embedded_result.get("exit_code")
     if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code != 0:
         finish("fail", f"integration-test target {target_name} did not exit successfully")
@@ -773,9 +1158,29 @@ for index, embedded_result in enumerate(summary_suites):
     result_path = evidence_resolved / suite_name / "result.json"
     actual_result, result_bytes = load_object(result_path, f"E2E result for {suite_name}")
     decision_inputs.append((result_path, result_bytes))
-    for field in ("suite", "exit_code", "passed", "failed", "ignored", "total"):
-        if actual_result.get(field) != embedded_result.get(field):
-            finish("fail", f"summary and result.json disagree for {suite_name}.{field}")
+    if actual_result != embedded_result:
+        finish("fail", f"summary and result.json disagree for E2E suite {suite_name}")
+    if actual_result.get("schema") != "pi.e2e.result.v1" or actual_result.get("result_kind") != "suite":
+        finish("fail", f"E2E suite {suite_name} has an invalid result contract")
+    missing_fields = sorted(
+        (required_result_fields | structured_result_fields | {"suite"}) - set(actual_result)
+    )
+    if missing_fields:
+        finish("fail", f"E2E suite {suite_name} result is missing fields: {missing_fields}")
+    if actual_result.get("correlation_id") != correlation_id:
+        finish("fail", f"E2E suite {suite_name} correlation_id does not match the run")
+    if actual_result.get("timestamp") != evidence_resolved.name:
+        finish("fail", f"E2E suite {suite_name} timestamp does not match the run")
+    duration_ms = actual_result.get("duration_ms")
+    if isinstance(duration_ms, bool) or not isinstance(duration_ms, int) or duration_ms < 0:
+        finish("fail", f"E2E suite {suite_name} duration_ms must be a non-negative integer")
+    validate_result_diagnostics(
+        actual_result,
+        "E2E suite",
+        suite_name,
+        evidence_resolved / suite_name,
+        structured=True,
+    )
     exit_code = actual_result.get("exit_code")
     if isinstance(exit_code, bool) or not isinstance(exit_code, int) or exit_code != 0:
         finish("fail", f"E2E suite {suite_name} did not exit successfully")
@@ -790,12 +1195,382 @@ for index, embedded_result in enumerate(summary_suites):
 if observed_suite_names != environment_suites or len(observed_suite_names) != len(set(observed_suite_names)):
     finish("fail", "environment and summary E2E suite identities/order do not match")
 
-source_commit = environment.get("git_sha")
-if not isinstance(source_commit, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit) is None:
-    finish("fail", "environment.git_sha must be a full lowercase Git commit ID")
+source_commit_values = (
+    contract.get("source_commit"),
+    environment.get("source_commit"),
+    summary.get("source_commit"),
+    environment.get("git_sha"),
+)
+source_snapshot_values = (
+    contract.get("source_snapshot"),
+    environment.get("source_snapshot"),
+    summary.get("source_snapshot"),
+)
+if not all(
+    isinstance(value, str)
+    and re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value) is not None
+    for value in source_commit_values
+):
+    finish("fail", "E2E contract, environment, summary, and git_sha must contain canonical source commits")
+if len(set(source_commit_values)) != 1:
+    finish("fail", "E2E contract, environment, summary, and git_sha source commits do not match")
+if not all(
+    isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value) is not None
+    for value in source_snapshot_values
+):
+    finish("fail", "E2E contract, environment, and summary must contain canonical source snapshots")
+if len(set(source_snapshot_values)) != 1:
+    finish("fail", "E2E contract, environment, and summary source snapshots do not match")
+source_commit = source_commit_values[0]
+source_snapshot = source_snapshot_values[0]
 source_check = run_git("rev-parse", "--verify", f"{source_commit}^{{commit}}")
 if source_check.returncode != 0 or source_check.stdout.strip() != source_commit:
-    finish("fail", f"environment.git_sha does not resolve exactly to a commit: {source_commit}")
+    finish("fail", f"E2E source_commit does not resolve exactly to a commit: {source_commit}")
+recomputed_source_snapshot = recompute_e2e_source_snapshot(source_commit)
+if recomputed_source_snapshot != source_snapshot:
+    finish(
+        "fail",
+        "E2E source_snapshot does not match the independently recomputed source commit: "
+        f"recorded={source_snapshot} recomputed={recomputed_source_snapshot}",
+    )
+
+runner_outcome_path = evidence_resolved / "runner_outcome.json"
+runner_outcome, runner_outcome_bytes = load_object(runner_outcome_path, "runner outcome")
+decision_inputs.append((runner_outcome_path, runner_outcome_bytes))
+runner_outcome_fields = {
+    "schema",
+    "generated_at",
+    "timestamp",
+    "profile",
+    "artifact_dir",
+    "correlation_id",
+    "source_commit",
+    "source_snapshot",
+    "status",
+    "exit_code",
+    "source_snapshot_verified",
+    "failed_phases",
+}
+if set(runner_outcome) != runner_outcome_fields:
+    finish("fail", "runner outcome fields do not match the canonical contract")
+if runner_outcome.get("schema") != "pi.e2e.runner_outcome.v1":
+    finish("fail", "runner outcome has an unsupported schema")
+if runner_outcome.get("generated_at") != generated_at_raw:
+    finish("fail", "runner outcome generated_at does not match the run")
+if runner_outcome.get("timestamp") != evidence_resolved.name:
+    finish("fail", "runner outcome timestamp does not match the run")
+if runner_outcome.get("profile") != profile:
+    finish("fail", "runner outcome profile does not match the run")
+if runner_outcome.get("artifact_dir") != artifact_dir:
+    finish("fail", "runner outcome artifact_dir does not match the run")
+if runner_outcome.get("correlation_id") != correlation_id:
+    finish("fail", "runner outcome correlation_id does not match the run")
+if runner_outcome.get("source_commit") != source_commit:
+    finish("fail", "runner outcome source_commit does not match the run")
+if runner_outcome.get("source_snapshot") != source_snapshot:
+    finish("fail", "runner outcome source_snapshot does not match the run")
+runner_exit_code = runner_outcome.get("exit_code")
+if isinstance(runner_exit_code, bool) or not isinstance(runner_exit_code, int) or runner_exit_code != 0:
+    finish("fail", "runner outcome exit_code must be zero")
+if runner_outcome.get("status") != "pass":
+    finish("fail", "runner outcome status must be pass")
+if runner_outcome.get("source_snapshot_verified") is not True:
+    finish("fail", "runner outcome must prove a matching final source snapshot")
+if runner_outcome.get("failed_phases") != []:
+    finish("fail", "runner outcome must contain no failed phases")
+if summary.get("runner_outcome") != runner_outcome:
+    finish("fail", "summary runner_outcome does not match runner_outcome.json")
+contract_runner = contract.get("runner_outcome")
+expected_contract_runner = {
+    "schema": "pi.e2e.runner_outcome.v1",
+    "path": str(runner_outcome_path),
+    "status": "pass",
+    "exit_code": 0,
+}
+if contract_runner != expected_contract_runner:
+    finish("fail", "evidence contract runner_outcome metadata is inconsistent")
+
+classification = run_git("show", f"{source_commit}:tests/suite_classification.toml")
+if classification.returncode != 0:
+    finish("fail", "unable to load the source test-suite classification")
+try:
+    classification_document = tomllib.loads(classification.stdout)
+except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+    finish("fail", f"unable to parse the source test-suite classification: {exc}")
+suite_table = classification_document.get("suite")
+if not isinstance(suite_table, dict):
+    finish("fail", "source test-suite classification has no suite table")
+
+def classified_files(name):
+    section = suite_table.get(name)
+    values = section.get("files") if isinstance(section, dict) else None
+    if not isinstance(values, list) or not values:
+        finish("fail", f"source test-suite classification {name} list must be non-empty")
+    if any(not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", value) is None for value in values):
+        finish("fail", f"source test-suite classification {name} list is invalid")
+    if len(values) != len(set(values)):
+        finish("fail", f"source test-suite classification {name} list contains duplicates")
+    return values
+
+classified_units = classified_files("unit")
+classified_vcr = classified_files("vcr")
+classified_e2e = classified_files("e2e")
+classified_sets = [set(classified_units), set(classified_vcr), set(classified_e2e)]
+if any(
+    classified_sets[left] & classified_sets[right]
+    for left in range(len(classified_sets))
+    for right in range(left + 1, len(classified_sets))
+):
+    finish("fail", "source test-suite classifications must be pairwise disjoint")
+if "e2e_extension_registration" not in classified_sets[2]:
+    finish("fail", "source test-suite classification does not place the CI smoke suite in e2e")
+test_tree = run_git(
+    "ls-tree",
+    "-r",
+    "-z",
+    "--name-only",
+    source_commit,
+    "--",
+    "tests",
+    text=False,
+)
+if test_tree.returncode != 0:
+    finish("fail", "unable to enumerate source integration-test files")
+tracked_test_stems = []
+for path in (item for item in test_tree.stdout.split(b"\0") if item):
+    try:
+        decoded = path.decode("utf-8", "strict")
+    except UnicodeError:
+        finish("fail", "source integration-test path is not UTF-8")
+    match = re.fullmatch(r"tests/([^/]+)\.rs", decoded)
+    if match is not None:
+        tracked_test_stems.append(match.group(1))
+if len(tracked_test_stems) != len(set(tracked_test_stems)):
+    finish("fail", "source tree contains duplicate top-level integration-test stems")
+classified_union = classified_sets[0] | classified_sets[1] | classified_sets[2]
+if classified_union != set(tracked_test_stems):
+    missing = sorted(set(tracked_test_stems) - classified_union)
+    nonexistent = sorted(classified_union - set(tracked_test_stems))
+    finish(
+        "fail",
+        f"source test-suite classification must cover every tracked top-level tests/*.rs exactly once; "
+        f"missing={missing[:5]} nonexistent={nonexistent[:5]}",
+    )
+expected_units = sorted(classified_sets[0] | classified_sets[1])
+expected_suites = sorted(classified_e2e) if profile == "full" else ["e2e_extension_registration"]
+if observed_unit_names != expected_units:
+    finish("fail", f"profile={profile} integration scope does not match source classification")
+if observed_suite_names != expected_suites:
+    finish("fail", f"profile={profile} E2E scope does not match source classification")
+
+required_check_paths = {
+    "run.source_commit_format": contract_path,
+    "run.source_snapshot_format": contract_path,
+    "contract.source_commit_matches_run": contract_path,
+    "contract.source_snapshot_matches_run": contract_path,
+    "environment": environment_path,
+    "environment.json_parse": environment_path,
+    "environment.keys": environment_path,
+    "environment.schema": environment_path,
+    "environment.correlation_id_nonempty": environment_path,
+    "environment.generated_at_matches_run": environment_path,
+    "environment.source_commit_format": environment_path,
+    "environment.source_snapshot_format": environment_path,
+    "environment.source_commit_matches_run": environment_path,
+    "environment.source_snapshot_matches_run": environment_path,
+    "environment.git_sha_matches_source_commit": environment_path,
+    "summary": summary_path,
+    "summary.json_parse": summary_path,
+    "summary.keys": summary_path,
+    "summary.schema": summary_path,
+    "summary.correlation_id_nonempty": summary_path,
+    "summary.generated_at_matches_run": summary_path,
+    "summary.source_commit_format": summary_path,
+    "summary.source_snapshot_format": summary_path,
+    "summary.source_commit_matches_run": summary_path,
+    "summary.source_snapshot_matches_run": summary_path,
+    "run.correlation_id_matches_environment": summary_path,
+    "run.generated_at_matches_environment": summary_path,
+    "run.source_commit_matches_environment": summary_path,
+    "run.source_snapshot_matches_environment": summary_path,
+    "summary.failed_suites_matches_suite_results": summary_path,
+    "summary.lib_matches_result": summary_path,
+    "summary.runner_outcome_matches_file": summary_path,
+}
+for check_id in (
+    "runner_outcome",
+    "runner_outcome.json_parse",
+    "runner_outcome.keys",
+    "runner_outcome.keys_exact",
+    "runner_outcome.schema",
+    "runner_outcome.generated_at_matches_run",
+    "runner_outcome.timestamp_matches_run",
+    "runner_outcome.profile_matches_run",
+    "runner_outcome.artifact_dir_matches_run",
+    "runner_outcome.correlation_id_matches_run",
+    "runner_outcome.source_commit_matches_run",
+    "runner_outcome.source_snapshot_matches_run",
+    "runner_outcome.status_pass",
+    "runner_outcome.exit_code_zero",
+    "runner_outcome.source_snapshot_verified",
+    "runner_outcome.failed_phases_empty",
+):
+    required_check_paths[check_id] = runner_outcome_path
+
+lib_result_path = evidence_resolved / "lib" / "result.json"
+lib_dir = evidence_resolved / "lib"
+for suffix in (
+    "",
+    ".json_parse",
+    ".keys",
+    ".schema",
+    ".kind",
+    ".name",
+    ".correlation_id_matches_summary",
+    ".exit_code_zero",
+    ".duration_ms_nonnegative",
+    ".counts_nonnegative",
+    ".counts_consistent",
+    ".tests_executed",
+    ".timestamp_matches_run",
+    ".diagnostic_artifacts.object",
+    ".diagnostic_artifacts.keys_exact",
+    ".diagnostic_artifacts.schema",
+    ".log_file_nonempty",
+    ".log_file_path_matches",
+):
+    required_check_paths[f"lib:lib:result{suffix}"] = lib_result_path
+for suffix in (
+    ".object",
+    ".keys",
+    ".path_matches",
+    ".sha256_format",
+    ".size_format",
+):
+    required_check_paths[
+        f"lib:lib:result.diagnostic_artifacts.output_log{suffix}"
+    ] = lib_result_path
+for suffix in (".regular_non_executable", ".stable_read", ".size_matches", ".sha256_matches"):
+    required_check_paths[
+        f"lib:lib:result.diagnostic_artifacts.output_log{suffix}"
+    ] = lib_dir / "output.log"
+for check_id in (
+    "lib:lib:result.log_file_exists",
+    "lib:lib:result.log_file_budget",
+    "lib:lib:result.log_file_redaction",
+):
+    required_check_paths[check_id] = lib_dir / "output.log"
+for field in ("test_log_jsonl", "artifact_index_jsonl"):
+    required_check_paths[
+        f"lib:lib:result.diagnostic_artifacts.{field}_null"
+    ] = lib_result_path
+for target_name in expected_units:
+    result_path = evidence_resolved / "unit" / target_name / "result.json"
+    for suffix in ("", ".json_parse", ".keys", ".schema", ".kind", ".name", ".correlation_id_matches_summary"):
+        required_check_paths[f"unit:{target_name}:result{suffix}"] = result_path
+    target_dir = evidence_resolved / "unit" / target_name
+    for field, artifact_name in (
+        ("log_file", "output.log"),
+        ("test_log_jsonl", "test-log.jsonl"),
+        ("artifact_index_jsonl", "artifact-index.jsonl"),
+    ):
+        required_check_paths[f"unit:{target_name}:result.{field}_nonempty"] = result_path
+        required_check_paths[f"unit:{target_name}:result.{field}_path_matches"] = result_path
+    for check_id in (
+        f"unit:{target_name}:result.diagnostic_artifacts.object",
+        f"unit:{target_name}:result.diagnostic_artifacts.schema",
+    ):
+        required_check_paths[check_id] = result_path
+    for binding_field, artifact_name in (
+        ("output_log", "output.log"),
+        ("test_log_jsonl", "test-log.jsonl"),
+        ("artifact_index_jsonl", "artifact-index.jsonl"),
+    ):
+        binding_prefix = f"unit:{target_name}:result.diagnostic_artifacts.{binding_field}"
+        for suffix in ("object", "keys", "path_matches", "sha256_format", "size_format"):
+            required_check_paths[f"{binding_prefix}.{suffix}"] = result_path
+        for suffix in ("regular_non_executable", "stable_read", "size_matches", "sha256_matches"):
+            required_check_paths[f"{binding_prefix}.{suffix}"] = target_dir / artifact_name
+    for check_id in (
+        f"unit:{target_name}:result.log_file_exists",
+        f"unit:{target_name}:result.log_file_budget",
+        f"unit:{target_name}:result.log_file_redaction",
+    ):
+        required_check_paths[check_id] = target_dir / "output.log"
+    for check_id in (
+        f"unit:{target_name}.test_log_jsonl.file_budget",
+        f"unit:{target_name}.test_log_jsonl.redaction_scan",
+        f"unit:{target_name}.test_log_jsonl.minimum_signal_harness_category",
+    ):
+        required_check_paths[check_id] = target_dir / "test-log.jsonl"
+    for check_id in (
+        f"unit:{target_name}.artifact_index_jsonl.file_budget",
+        f"unit:{target_name}.artifact_index_jsonl.redaction_scan",
+    ):
+        required_check_paths[check_id] = target_dir / "artifact-index.jsonl"
+for suite_name in expected_suites:
+    result_path = evidence_resolved / suite_name / "result.json"
+    for suffix in ("", ".json_parse", ".keys", ".schema", ".kind", ".name", ".correlation_id_matches_summary"):
+        required_check_paths[f"suite:{suite_name}:result{suffix}"] = result_path
+    suite_dir = evidence_resolved / suite_name
+    for field, artifact_name in (
+        ("log_file", "output.log"),
+        ("test_log_jsonl", "test-log.jsonl"),
+        ("artifact_index_jsonl", "artifact-index.jsonl"),
+    ):
+        required_check_paths[f"suite:{suite_name}:result.{field}_nonempty"] = result_path
+        required_check_paths[f"suite:{suite_name}:result.{field}_path_matches"] = result_path
+    for check_id in (
+        f"suite:{suite_name}:result.diagnostic_artifacts.object",
+        f"suite:{suite_name}:result.diagnostic_artifacts.schema",
+    ):
+        required_check_paths[check_id] = result_path
+    for binding_field, artifact_name in (
+        ("output_log", "output.log"),
+        ("test_log_jsonl", "test-log.jsonl"),
+        ("artifact_index_jsonl", "artifact-index.jsonl"),
+    ):
+        binding_prefix = f"suite:{suite_name}:result.diagnostic_artifacts.{binding_field}"
+        for suffix in ("object", "keys", "path_matches", "sha256_format", "size_format"):
+            required_check_paths[f"{binding_prefix}.{suffix}"] = result_path
+        for suffix in ("regular_non_executable", "stable_read", "size_matches", "sha256_matches"):
+            required_check_paths[f"{binding_prefix}.{suffix}"] = suite_dir / artifact_name
+    for check_id in (
+        f"suite:{suite_name}:result.log_file_exists",
+        f"suite:{suite_name}:result.log_file_budget",
+        f"suite:{suite_name}:result.log_file_redaction",
+    ):
+        required_check_paths[check_id] = suite_dir / "output.log"
+    for check_id in (
+        f"suite:{suite_name}.test_log_jsonl.file_budget",
+        f"suite:{suite_name}.test_log_jsonl.redaction_scan",
+        f"suite:{suite_name}.test_log_jsonl.minimum_signal_harness_category",
+    ):
+        required_check_paths[check_id] = suite_dir / "test-log.jsonl"
+    for check_id in (
+        f"suite:{suite_name}.artifact_index_jsonl.file_budget",
+        f"suite:{suite_name}.artifact_index_jsonl.redaction_scan",
+    ):
+        required_check_paths[check_id] = suite_dir / "artifact-index.jsonl"
+if profile == "full":
+    for check_id in (
+        "full_profile.rerun_mode",
+        "full_profile.shard_mode",
+        "full_profile.unit_scope_complete",
+        "full_profile.e2e_scope_complete",
+    ):
+        required_check_paths[check_id] = summary_path
+for check_id, expected_path in required_check_paths.items():
+    check = checks_by_id.get(check_id)
+    if not isinstance(check, dict) or check.get("ok") is not True:
+        finish("fail", f"evidence contract is missing required passing check: {check_id}")
+    try:
+        recorded_path = Path(check.get("path", "")).resolve(strict=True)
+        canonical_expected = expected_path.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        finish("fail", f"unable to resolve evidence-contract check path for {check_id}: {exc}")
+    if recorded_path != canonical_expected:
+        finish("fail", f"evidence-contract check {check_id} points at the wrong artifact")
 head_check = run_git("rev-parse", "--verify", "HEAD^{commit}")
 if head_check.returncode != 0:
     finish("fail", "unable to resolve current release HEAD")
@@ -1007,7 +1782,7 @@ import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-root = Path(sys.argv[1])
+raw_root = Path(sys.argv[1])
 summary_path = Path(sys.argv[2])
 minimum_rate = int(sys.argv[3])
 maximum_age = timedelta(hours=int(sys.argv[4]))
@@ -1021,19 +1796,97 @@ def reject_duplicate_keys(pairs):
     return value
 
 
-def git(*args):
-    env = os.environ.copy()
+def resolve_repository_context():
+    if raw_root.is_symlink() or not raw_root.is_dir():
+        raise ValueError("conformance repository root must be a real directory, not a symlink")
+    try:
+        resolved_root = raw_root.resolve(strict=True)
+        git_marker = resolved_root / ".git"
+        marker_metadata = git_marker.lstat()
+        if stat.S_ISLNK(marker_metadata.st_mode):
+            raise ValueError("conformance repository .git marker must not be a symlink")
+        if stat.S_ISDIR(marker_metadata.st_mode):
+            resolved_git_dir = git_marker.resolve(strict=True)
+        elif stat.S_ISREG(marker_metadata.st_mode):
+            marker = git_marker.read_text(encoding="utf-8").rstrip("\r\n")
+            if "\n" in marker or "\r" in marker or not marker.startswith("gitdir: "):
+                raise ValueError("conformance repository .git file is malformed")
+            target = Path(marker.removeprefix("gitdir: "))
+            candidate = target if target.is_absolute() else resolved_root / target
+            target_metadata = candidate.lstat()
+            if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISDIR(target_metadata.st_mode):
+                raise ValueError(
+                    "conformance repository gitfile target must be a non-symlink directory"
+                )
+            resolved_git_dir = candidate.resolve(strict=True)
+        else:
+            raise ValueError("conformance repository .git marker is not a directory or gitfile")
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        raise ValueError(
+            f"conformance repository Git context could not be resolved safely: {exc}"
+        ) from exc
+    if not resolved_git_dir.is_dir():
+        raise ValueError("conformance repository Git directory is not a directory")
+    return resolved_root, resolved_git_dir
+
+
+def git_result(*args):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_LITERAL_PATHSPECS"] = "1"
-    result = subprocess.run(
-        ["git", "-C", str(root), *args],
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    return subprocess.run(
+        [
+            "git",
+            "--git-dir", str(git_dir),
+            "--work-tree", str(root),
+            "-c", "core.bare=false",
+            "-c", "core.fsmonitor=false",
+            "-c", f"core.worktree={root}",
+            *args,
+        ],
         capture_output=True,
         env=env,
         check=False,
     )
+
+
+def git(*args):
+    result = git_result(*args)
     if result.returncode != 0:
         diagnostic = result.stderr.decode("utf-8", "replace").strip()
         raise ValueError(f"git {' '.join(args)} failed: {diagnostic}")
     return result.stdout
+
+
+root, git_dir = resolve_repository_context()
+
+
+def verify_repository_binding():
+    bindings = (
+        (("rev-parse", "--show-toplevel"), root, "worktree"),
+        (("rev-parse", "--absolute-git-dir"), git_dir, "Git directory"),
+    )
+    for args, expected, label in bindings:
+        output = git(*args).decode("utf-8", "strict")
+        if not output.endswith("\n") or "\n" in output.removesuffix("\n"):
+            raise ValueError(f"conformance repository {label} output is not one canonical line")
+        try:
+            reported = Path(output.removesuffix("\n")).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"unable to canonicalize conformance repository {label}: {exc}"
+            ) from exc
+        if reported != expected:
+            raise ValueError(
+                f"conformance repository {label} does not match the filesystem-derived binding"
+            )
+
+
+verify_repository_binding()
 
 
 def canonical_lineage(value, label):
@@ -1055,8 +1908,17 @@ def package_includes(path, patterns):
 
 
 summary_relative = "tests/ext_conformance/reports/conformance_summary.json"
-if summary_path.is_symlink() or not summary_path.is_file():
-    raise ValueError("conformance summary must be a regular non-symlink file")
+expected_summary_path = root / summary_relative
+try:
+    summary_metadata = summary_path.lstat()
+    if summary_path.resolve(strict=True) != expected_summary_path.resolve(strict=True):
+        raise ValueError("conformance summary path does not identify the canonical report")
+except (OSError, RuntimeError) as exc:
+    raise ValueError(f"unable to resolve the conformance summary path: {exc}") from exc
+if not stat.S_ISREG(summary_metadata.st_mode) or (
+    os.name != "nt" and summary_metadata.st_mode & 0o111
+):
+    raise ValueError("conformance summary must be a non-executable regular file")
 current = root
 for part in Path(summary_relative).parts[:-1]:
     current /= part
@@ -1065,6 +1927,11 @@ for part in Path(summary_relative).parts[:-1]:
         raise ValueError(f"conformance summary traverses symlinked parent: {current}")
 
 head = git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
+head_tracked_paths = {
+    os.fsdecode(path)
+    for path in git("ls-tree", "-r", "-z", "--name-only", "HEAD").split(b"\0")
+    if path
+}
 head_entry = [record for record in git("ls-tree", "-z", "HEAD", "--", summary_relative).split(b"\0") if record]
 if len(head_entry) != 1:
     raise ValueError("conformance summary must be a single tracked blob in release HEAD")
@@ -1103,11 +1970,188 @@ else:
 if worktree_oid != head_oid:
     raise ValueError("raw conformance summary bytes differ from release HEAD")
 
-data = json.loads(raw_summary, object_pairs_hook=reject_duplicate_keys)
+def capture_head_bound_file(relative, label):
+    path = root / relative
+    try:
+        file_metadata = path.lstat()
+    except OSError as exc:
+        raise ValueError(f"unable to inspect {label}: {exc}") from exc
+    if not stat.S_ISREG(file_metadata.st_mode) or (
+        os.name != "nt" and file_metadata.st_mode & 0o111
+    ):
+        raise ValueError(f"{label} must be a non-executable regular file")
+    current = root
+    for part in Path(relative).parts[:-1]:
+        current /= part
+        metadata = os.lstat(current)
+        if stat.S_ISLNK(metadata.st_mode):
+            raise ValueError(f"{label} traverses symlinked parent: {current}")
+    tree_records = [
+        record for record in git("ls-tree", "-z", "HEAD", "--", relative).split(b"\0") if record
+    ]
+    if len(tree_records) != 1:
+        raise ValueError(f"{label} must be one tracked blob in release HEAD")
+    try:
+        tree_metadata, tree_path = tree_records[0].split(b"\t", 1)
+        tree_mode, tree_type, tree_oid = tree_metadata.split(b" ", 2)
+    except ValueError as exc:
+        raise ValueError(f"malformed {label} tree entry") from exc
+    if tree_mode != b"100644" or tree_type != b"blob" or os.fsdecode(tree_path) != relative:
+        raise ValueError(f"{label} must be a canonical non-executable blob")
+    index_records = [
+        record for record in git("ls-files", "--stage", "-z", "--", relative).split(b"\0") if record
+    ]
+    if len(index_records) != 1:
+        raise ValueError(f"{label} must have one index entry")
+    try:
+        index_metadata, index_path = index_records[0].split(b"\t", 1)
+        index_mode, index_oid, index_stage = index_metadata.split(b" ", 2)
+    except ValueError as exc:
+        raise ValueError(f"malformed {label} index entry") from exc
+    if (
+        index_mode != tree_mode
+        or index_oid != tree_oid
+        or index_stage != b"0"
+        or os.fsdecode(index_path) != relative
+    ):
+        raise ValueError(f"{label} index entry differs from release HEAD")
+    flag_records = [
+        record for record in git("ls-files", "-v", "-z", "--", relative).split(b"\0") if record
+    ]
+    if flag_records != [b"H " + os.fsencode(relative)]:
+        raise ValueError(f"{label} uses non-canonical index flags")
+    raw = path.read_bytes()
+    committed = git("cat-file", "blob", os.fsdecode(tree_oid))
+    if raw != committed:
+        raise ValueError(f"{label} bytes differ from release HEAD")
+    return path, raw, tree_records, index_records, flag_records
+
+
+decision_inputs = {}
+absent_decision_paths = set()
+
+
+def capture_decision_input(relative, label):
+    previous = decision_inputs.get(relative)
+    if previous is not None:
+        return previous[2]
+    captured = capture_head_bound_file(relative, label)
+    decision_inputs[relative] = (label, *captured)
+    return captured[1]
+
+
+def decision_source_present(relative, label):
+    worktree_present = os.path.lexists(root / relative)
+    if relative in head_tracked_paths or worktree_present:
+        capture_decision_input(relative, label)
+        return True
+    absent_decision_paths.add(relative)
+    return False
+
+
+def parse_json_document(raw, label):
+    try:
+        value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"unable to parse {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} root must be an object")
+    return value
+
+
+def parse_jsonl_document(raw, label, *, nonempty=True):
+    if not raw:
+        if nonempty:
+            raise ValueError(f"{label} must be non-empty JSONL")
+        return []
+    if not raw.endswith(b"\n"):
+        raise ValueError(f"{label} must be newline-terminated JSONL")
+    lines = raw.removesuffix(b"\n").split(b"\n")
+    values = []
+    for index, line in enumerate(lines, start=1):
+        if not line:
+            raise ValueError(f"{label} contains an empty record at line {index}")
+        try:
+            value = json.loads(
+                line.decode("utf-8", "strict"), object_pairs_hook=reject_duplicate_keys
+            )
+        except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"unable to parse {label} line {index}: {exc}") from exc
+        if not isinstance(value, dict):
+            raise ValueError(f"{label} line {index} must be an object")
+        values.append(value)
+    return values
+
+
+def uint(value, label, *, nullable=False):
+    if nullable and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+        suffix = " or null" if nullable else ""
+        raise ValueError(f"{label} must be a non-negative signed 64-bit integer{suffix}")
+    return value
+
+
+def finite_number(value, label, *, nullable=False):
+    if nullable and value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        suffix = " or null" if nullable else ""
+        raise ValueError(f"{label} must be a finite number{suffix}")
+    return float(value)
+
+
+def canonical_timestamp(value, label, *, millis):
+    precision = r"\.\d{3}" if millis else ""
+    if not isinstance(value, str) or re.fullmatch(
+        rf"\d{{4}}-\d{{2}}-\d{{2}}T\d{{2}}:\d{{2}}:\d{{2}}{precision}Z", value
+    ) is None:
+        expected = "UTC millisecond precision" if millis else "UTC second precision"
+        raise ValueError(f"{label} must use canonical {expected}")
+    try:
+        return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError(f"{label} is not a valid UTC timestamp") from exc
+
+events_relative = "tests/ext_conformance/reports/conformance_events.jsonl"
+events_path, raw_events, events_head_entry, events_index_entry, events_flags = (
+    capture_head_bound_file(events_relative, "conformance events")
+)
+decision_inputs[events_relative] = (
+    "conformance events",
+    events_path,
+    raw_events,
+    events_head_entry,
+    events_index_entry,
+    events_flags,
+)
+
+try:
+    data = json.loads(
+        raw_summary.decode("utf-8", "strict"), object_pairs_hook=reject_duplicate_keys
+    )
+except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    raise ValueError(f"unable to parse conformance summary: {exc}") from exc
 if not isinstance(data, dict):
     raise ValueError("summary root must be an object")
 if data.get("schema") != "pi.ext.conformance_summary.v2":
     raise ValueError(f"unsupported conformance summary schema: {data.get('schema')!r}")
+expected_summary_fields = {
+    "schema",
+    "generated_at",
+    "run_id",
+    "correlation_id",
+    "git_commit",
+    "source_tree_sha256",
+    "counts",
+    "pass_rate_pct",
+    "coverage_rate_pct",
+    "negative",
+    "per_tier",
+    "evidence",
+}
+if set(data) != expected_summary_fields:
+    raise ValueError("conformance summary top-level fields do not match the canonical v2 contract")
 
 generated_at_raw = data.get("generated_at")
 if not isinstance(generated_at_raw, str) or re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", generated_at_raw) is None:
@@ -1129,17 +2173,23 @@ if not isinstance(source_commit, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]
 resolved_source = git("rev-parse", "--verify", f"{source_commit}^{{commit}}").decode("ascii", "strict").strip()
 if resolved_source != source_commit:
     raise ValueError("git_commit does not resolve to the exact recorded commit")
-ancestor = subprocess.run(
-    ["git", "-C", str(root), "merge-base", "--is-ancestor", source_commit, head],
-    capture_output=True,
-    check=False,
-)
+ancestor = git_result("merge-base", "--is-ancestor", source_commit, head)
 if ancestor.returncode == 1:
     raise ValueError("conformance source commit is not an ancestor of release HEAD")
 if ancestor.returncode != 0:
     raise ValueError("unable to verify conformance source ancestry")
 
 source_tree = git("ls-tree", "-r", "-z", "--full-tree", source_commit)
+source_tracked_paths = set()
+for record in (item for item in source_tree.split(b"\0") if item):
+    try:
+        source_metadata, source_path = record.split(b"\t", 1)
+        _, source_object_type, _ = source_metadata.split(b" ", 2)
+    except ValueError as exc:
+        raise ValueError("source conformance tree contains a malformed record") from exc
+    if source_object_type != b"blob":
+        raise ValueError("source conformance tree contains a non-blob entry")
+    source_tracked_paths.add(os.fsdecode(source_path))
 expected_tree_digest = hashlib.sha256(source_tree).hexdigest()
 recorded_tree_digest = data.get("source_tree_sha256")
 if not isinstance(recorded_tree_digest, str) or re.fullmatch(r"[0-9a-f]{64}", recorded_tree_digest) is None:
@@ -1155,7 +2205,18 @@ package_patterns = cargo_document.get("package", {}).get("include", [])
 if not isinstance(package_patterns, list):
     raise ValueError("source Cargo.toml package.include must be an array")
 
-changed_paths = [os.fsdecode(path) for path in git("diff", "--name-only", "-z", source_commit, head).split(b"\0") if path]
+changed_paths = [
+    os.fsdecode(path)
+    for path in git(
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        source_commit,
+        head,
+    ).split(b"\0")
+    if path
+]
 for path in changed_paths:
     evidence_only = (
         path.startswith("tests/e2e_results/")
@@ -1168,9 +2229,888 @@ for path in changed_paths:
     if path.startswith("docs/evidence/") and package_includes(path, package_patterns):
         raise ValueError(f"packaged or product-consumed evidence changed after source capture: {path}")
 
+manifest_result = git("show", f"{source_commit}:tests/ext_conformance/VALIDATED_MANIFEST.json")
+try:
+    manifest = json.loads(
+        manifest_result.decode("utf-8", "strict"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
+except (UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    raise ValueError(f"unable to parse source conformance manifest: {exc}") from exc
+if not isinstance(manifest, dict) or manifest.get("schema") != "pi.ext.validated-manifest.v1":
+    raise ValueError("source conformance manifest has an unsupported schema")
+manifest_extensions = manifest.get("extensions")
+if not isinstance(manifest_extensions, list) or not manifest_extensions:
+    raise ValueError("source conformance manifest extensions must be non-empty")
+expected_extension_ids = []
+expected_source_tiers = []
+expected_extensions = {}
+entry_path_to_extension_id = {}
+capability_fields = {
+    "registers_tools",
+    "registers_commands",
+    "registers_flags",
+    "registers_providers",
+    "subscribes_events",
+    "uses_exec",
+    "uses_http",
+    "uses_ui",
+    "uses_session",
+    "is_multi_file",
+    "has_npm_deps",
+}
+registration_fields = {"tools", "commands", "flags", "event_handlers"}
+
+
+def canonical_relative_path(value, label):
+    if not isinstance(value, str) or not value or "\x00" in value or "\\" in value:
+        raise ValueError(f"{label} must be a non-empty relative path")
+    candidate = Path(value)
+    if candidate.is_absolute() or value != candidate.as_posix() or any(
+        part in ("", ".", "..") for part in candidate.parts
+    ):
+        raise ValueError(f"{label} must be a canonical relative path")
+    return value
+
+
+def canonical_string_array(value, label):
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{label} must be an array of non-empty strings")
+    if len(value) != len(set(value)):
+        raise ValueError(f"{label} must not contain duplicates")
+    return value
+
+
+for index, extension in enumerate(manifest_extensions):
+    if not isinstance(extension, dict):
+        raise ValueError(f"source conformance manifest extension[{index}] must be an object")
+    extension_id = extension.get("id")
+    source_tier = extension.get("source_tier")
+    extension_id = canonical_relative_path(
+        extension_id, f"source conformance manifest extension[{index}].id"
+    )
+    source_tier = canonical_lineage(
+        source_tier, f"source conformance manifest extension[{index}].source_tier"
+    )
+    entry_path = canonical_relative_path(
+        extension.get("entry_path"), f"source conformance manifest extension[{index}].entry_path"
+    )
+    conformance_tier = uint(
+        extension.get("conformance_tier"),
+        f"source conformance manifest extension[{index}].conformance_tier",
+    )
+    if conformance_tier not in (1, 2, 3, 4, 5):
+        raise ValueError(f"source conformance manifest extension[{index}].conformance_tier is invalid")
+    capabilities = extension.get("capabilities")
+    if not isinstance(capabilities, dict) or set(capabilities) != capability_fields:
+        raise ValueError(f"source conformance manifest extension[{index}].capabilities is invalid")
+    for field in capability_fields - {"subscribes_events"}:
+        if not isinstance(capabilities[field], bool):
+            raise ValueError(
+                f"source conformance manifest extension[{index}].capabilities.{field} must be boolean"
+            )
+    canonical_string_array(
+        capabilities["subscribes_events"],
+        f"source conformance manifest extension[{index}].capabilities.subscribes_events",
+    )
+    registrations = extension.get("registrations")
+    if not isinstance(registrations, dict) or set(registrations) != registration_fields:
+        raise ValueError(f"source conformance manifest extension[{index}].registrations is invalid")
+    for field in registration_fields:
+        canonical_string_array(
+            registrations[field],
+            f"source conformance manifest extension[{index}].registrations.{field}",
+        )
+    expected_extension_ids.append(extension_id)
+    expected_source_tiers.append(source_tier)
+    if entry_path in entry_path_to_extension_id:
+        raise ValueError("source conformance manifest contains duplicate entry paths")
+    entry_path_to_extension_id[entry_path] = extension_id
+    expected_extensions[extension_id] = {
+        "source_tier": source_tier,
+        "entry_path": entry_path,
+        "conformance_tier": conformance_tier,
+        "capabilities": capabilities,
+        "registrations": registrations,
+    }
+if len(expected_extension_ids) != len(set(expected_extension_ids)):
+    raise ValueError("source conformance manifest contains duplicate extension IDs")
+
+provenance_versions = {}
+provenance_result = git_result("show", f"{source_commit}:docs/extension-artifact-provenance.json")
+if provenance_result.returncode == 0:
+    provenance = parse_json_document(provenance_result.stdout, "source extension provenance")
+    provenance_items = provenance.get("items")
+    if not isinstance(provenance_items, list):
+        raise ValueError("source extension provenance items must be an array")
+    for index, item in enumerate(provenance_items):
+        if not isinstance(item, dict):
+            raise ValueError(f"source extension provenance item[{index}] must be an object")
+        extension_id = item.get("id")
+        if not isinstance(extension_id, str) or not extension_id:
+            raise ValueError(f"source extension provenance item[{index}].id is invalid")
+        version = item.get("version")
+        if version is not None and (not isinstance(version, str) or not version.strip()):
+            raise ValueError(f"source extension provenance item[{index}].version is invalid")
+        if version is not None:
+            if extension_id in provenance_versions:
+                raise ValueError("source extension provenance contains duplicate versioned IDs")
+            provenance_versions[extension_id] = version.strip()
+
+
+def validate_input_timestamp(value, label, *, millis=False):
+    timestamp = canonical_timestamp(value, label, millis=millis)
+    if timestamp > now + timedelta(minutes=5):
+        raise ValueError(f"{label} is more than five minutes in the future")
+    if now - timestamp > maximum_age:
+        raise ValueError(f"{label} is stale ({now - timestamp} old; maximum {maximum_age})")
+    if timestamp > generated_at + timedelta(minutes=5):
+        raise ValueError(f"{label} postdates the conformance summary run")
+    return timestamp
+
+
+def validate_rate(value, passed_count, failed_count, label):
+    actual = finite_number(value, label)
+    expected = 100.0 * passed_count / (passed_count + failed_count) if passed_count + failed_count else 100.0
+    if not 0 <= actual <= 100 or not math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-9):
+        raise ValueError(f"{label} is inconsistent with its retained pass/fail records")
+
+
+statuses = {
+    extension_id: {
+        "rust_load_ms": None,
+        "ts_load_ms": None,
+        "load_ratio": None,
+        "scenario_pass": 0,
+        "scenario_fail": 0,
+        "scenario_skip": 0,
+        "failures": [],
+        "smoke_pass": 0,
+        "smoke_fail": 0,
+        "parity_match": 0,
+        "parity_mismatch": 0,
+    }
+    for extension_id in expected_extension_ids
+}
+
+
+def require_manifest_extension(extension_id, label):
+    if extension_id not in statuses:
+        raise ValueError(f"{label} references extension outside the source manifest: {extension_id!r}")
+    return statuses[extension_id]
+
+
+load_relative = "tests/ext_conformance/reports/load_time_benchmark.json"
+load_report = parse_json_document(
+    capture_decision_input(load_relative, "load-time benchmark"), "load-time benchmark"
+)
+if load_report.get("schema") != "pi.ext.load_time_benchmark.v1":
+    raise ValueError("load-time benchmark has an unsupported schema")
+validate_input_timestamp(load_report.get("generated_at"), "load-time benchmark generated_at")
+load_results = load_report.get("results")
+if not isinstance(load_results, list):
+    raise ValueError("load-time benchmark results must be an array")
+load_derived_counts = {"total": len(load_results), "ts_success": 0, "rust_success": 0, "paired": 0}
+seen_load_extensions = set()
+for index, result in enumerate(load_results):
+    if not isinstance(result, dict):
+        raise ValueError(f"load-time benchmark result[{index}] must be an object")
+    extension_path = result.get("extension")
+    if not isinstance(extension_path, str) or not extension_path:
+        raise ValueError(f"load-time benchmark result[{index}].extension is invalid")
+    extension_id = entry_path_to_extension_id.get(extension_path)
+    if extension_id is None:
+        raise ValueError(
+            f"load-time benchmark result[{index}].extension differs from the source manifest"
+        )
+    status = require_manifest_extension(extension_id, f"load-time benchmark result[{index}]")
+    if extension_id in seen_load_extensions:
+        raise ValueError(f"load-time benchmark results duplicate extension {extension_id}")
+    seen_load_extensions.add(extension_id)
+    runtime_values = {}
+    for runtime in ("ts", "rust"):
+        runtime_result = result.get(runtime)
+        if not isinstance(runtime_result, dict):
+            raise ValueError(f"load-time benchmark result[{index}].{runtime} must be an object")
+        runtime_values[runtime] = uint(
+            runtime_result.get("load_time_ms"),
+            f"load-time benchmark result[{index}].{runtime}.load_time_ms",
+            nullable=True,
+        )
+        success = runtime_result.get("success")
+        error = runtime_result.get("error")
+        if not isinstance(success, bool) or (error is not None and not isinstance(error, str)):
+            raise ValueError(f"load-time benchmark result[{index}].{runtime} outcome is malformed")
+        if success and (runtime_values[runtime] is None or error is not None):
+            raise ValueError(
+                f"load-time benchmark result[{index}].{runtime} success contradicts its result"
+            )
+        if not success and (not isinstance(error, str) or not error):
+            raise ValueError(
+                f"load-time benchmark result[{index}].{runtime} failure lacks an error"
+            )
+        if runtime == "rust" and success != (runtime_values[runtime] is not None):
+            raise ValueError(
+                f"load-time benchmark result[{index}].rust success contradicts load_time_ms"
+            )
+        load_derived_counts[f"{runtime}_success"] += int(success)
+    load_derived_counts["paired"] += int(
+        runtime_values["ts"] is not None
+        and runtime_values["ts"] > 0
+        and runtime_values["rust"] is not None
+    )
+    ratio = finite_number(
+        result.get("ratio"), f"load-time benchmark result[{index}].ratio", nullable=True
+    )
+    if ratio is not None and ratio < 0:
+        raise ValueError(f"load-time benchmark result[{index}].ratio must be non-negative")
+    expected_ratio = (
+        float(runtime_values["rust"]) / float(runtime_values["ts"])
+        if runtime_values["rust"] is not None
+        and runtime_values["ts"] is not None
+        and runtime_values["ts"] > 0
+        else None
+    )
+    if (ratio is None) != (expected_ratio is None) or (
+        ratio is not None
+        and not math.isclose(ratio, expected_ratio, rel_tol=1e-9, abs_tol=1e-9)
+    ):
+        raise ValueError(
+            f"load-time benchmark result[{index}].ratio contradicts retained load times"
+        )
+    status["ts_load_ms"] = runtime_values["ts"]
+    status["rust_load_ms"] = runtime_values["rust"]
+    status["load_ratio"] = ratio
+load_counts = load_report.get("counts")
+if not isinstance(load_counts, dict) or set(load_counts) != set(load_derived_counts):
+    raise ValueError("load-time benchmark counts have an invalid shape")
+for field, expected in load_derived_counts.items():
+    if uint(load_counts.get(field), f"load-time benchmark counts.{field}") != expected:
+        raise ValueError(f"load-time benchmark counts.{field} does not match retained results")
+
+scenario_relative = "tests/ext_conformance/reports/scenario_conformance.json"
+scenario_report = parse_json_document(
+    capture_decision_input(scenario_relative, "scenario conformance"), "scenario conformance"
+)
+if scenario_report.get("schema") != "pi.ext.scenario_conformance.v1":
+    raise ValueError("scenario conformance report has an unsupported schema")
+validate_input_timestamp(scenario_report.get("generated_at"), "scenario conformance generated_at")
+scenario_results = scenario_report.get("results")
+if not isinstance(scenario_results, list):
+    raise ValueError("scenario conformance results must be an array")
+scenario_counts = {"total": len(scenario_results), "pass": 0, "fail": 0, "error": 0, "skip": 0}
+seen_scenarios = set()
+for index, result in enumerate(scenario_results):
+    if not isinstance(result, dict):
+        raise ValueError(f"scenario conformance result[{index}] must be an object")
+    extension_id = result.get("extension_id")
+    if not isinstance(extension_id, str) or not extension_id:
+        raise ValueError(f"scenario conformance result[{index}].extension_id is invalid")
+    status = require_manifest_extension(extension_id, f"scenario conformance result[{index}]")
+    scenario_id = result.get("scenario_id")
+    if not isinstance(scenario_id, str) or not scenario_id or scenario_id in seen_scenarios:
+        raise ValueError(f"scenario conformance result[{index}].scenario_id is invalid or duplicate")
+    seen_scenarios.add(scenario_id)
+    outcome = result.get("status")
+    if outcome not in ("pass", "fail", "error", "skip"):
+        raise ValueError(f"scenario conformance result[{index}].status is invalid")
+    scenario_counts[outcome] += 1
+    uint(result.get("duration_ms"), f"scenario conformance result[{index}].duration_ms")
+    if outcome == "pass":
+        status["scenario_pass"] += 1
+    elif outcome in ("fail", "error"):
+        status["scenario_fail"] += 1
+        failure = result.get("summary")
+        if not isinstance(failure, str):
+            failure = result.get("error")
+        if failure is not None and not isinstance(failure, str):
+            raise ValueError(f"scenario conformance result[{index}] failure text is invalid")
+        if isinstance(failure, str):
+            status["failures"].append(failure)
+    else:
+        status["scenario_skip"] += 1
+reported_scenario_counts = scenario_report.get("counts")
+if not isinstance(reported_scenario_counts, dict) or set(reported_scenario_counts) != set(scenario_counts):
+    raise ValueError("scenario conformance counts have an invalid shape")
+for field, expected in scenario_counts.items():
+    if uint(reported_scenario_counts.get(field), f"scenario conformance counts.{field}") != expected:
+        raise ValueError(f"scenario conformance counts.{field} does not match retained results")
+validate_rate(
+    scenario_report.get("pass_rate_pct"),
+    scenario_counts["pass"],
+    scenario_counts["fail"] + scenario_counts["error"],
+    "scenario conformance pass_rate_pct",
+)
+
+
+def validate_smoke_report(report, relative):
+    if report.get("schema") != "pi.ext.smoke_triage.v1":
+        raise ValueError(f"{relative} has an unsupported schema")
+    timestamp = validate_input_timestamp(report.get("generated_at"), f"{relative} generated_at")
+    extensions = report.get("extensions")
+    if not isinstance(extensions, list):
+        raise ValueError(f"{relative} extensions must be an array")
+    derived = {"total": 0, "pass": 0, "fail": 0, "error": 0, "skip": 0}
+    parsed = []
+    for index, entry in enumerate(extensions):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{relative} extension[{index}] must be an object")
+        extension_id = entry.get("extension_id")
+        if not isinstance(extension_id, str) or not extension_id:
+            raise ValueError(f"{relative} extension[{index}].extension_id is invalid")
+        require_manifest_extension(extension_id, f"{relative} extension[{index}]")
+        counters = {}
+        for field in ("pass", "fail", "error", "skip"):
+            counters[field] = uint(entry.get(field), f"{relative} extension[{index}].{field}")
+            derived[field] += counters[field]
+        derived["total"] += sum(counters.values())
+        if not isinstance(entry.get("failures"), list) or not isinstance(
+            entry.get("failure_categories"), dict
+        ):
+            raise ValueError(f"{relative} extension[{index}] failure diagnostics are malformed")
+        parsed.append((extension_id, counters))
+    counts = report.get("counts")
+    if not isinstance(counts, dict) or set(counts) != set(derived):
+        raise ValueError(f"{relative} counts have an invalid shape")
+    for field, expected in derived.items():
+        if uint(counts.get(field), f"{relative} counts.{field}") != expected:
+            raise ValueError(f"{relative} counts.{field} does not match retained extensions")
+    validate_rate(
+        report.get("pass_rate_pct"),
+        derived["pass"],
+        derived["fail"] + derived["error"],
+        f"{relative} pass_rate_pct",
+    )
+    return timestamp, parsed
+
+
+smoke_candidates = []
+for candidate_index, relative in enumerate(
+    ("tests/ext_conformance/reports/smoke_triage.json", "tests/ext_conformance/reports/smoke/triage.json")
+):
+    if decision_source_present(relative, relative):
+        report = parse_json_document(capture_decision_input(relative, relative), relative)
+        timestamp, parsed = validate_smoke_report(report, relative)
+        smoke_candidates.append((timestamp, -candidate_index, parsed, relative))
+if not smoke_candidates:
+    raise ValueError("no tracked smoke triage report is available")
+_, _, selected_smoke, selected_smoke_relative = max(smoke_candidates, key=lambda item: item[:2])
+for extension_id, counters in selected_smoke:
+    status = statuses[extension_id]
+    status["smoke_pass"] += counters["pass"]
+    status["smoke_fail"] += counters["fail"] + counters["error"]
+
+parity_relative = "tests/ext_conformance/reports/parity/parity_events.jsonl"
+parity_events = []
+if decision_source_present(parity_relative, "parity events"):
+    parity_events = parse_jsonl_document(
+        capture_decision_input(parity_relative, "parity events"), "parity events", nonempty=False
+    )
+parity_main_records = {}
+parity_run_ids = set()
+parity_main_fields = {
+    "schema",
+    "run_id",
+    "ts",
+    "extension_id",
+    "scenario_id",
+    "kind",
+    "summary",
+    "source_tier",
+    "runtime_tier",
+    "status",
+    "ts_ms",
+    "rust_ms",
+    "diffs",
+    "error",
+    "skip_reason",
+}
+for index, event in enumerate(parity_events):
+    if set(event) != parity_main_fields or event.get("schema") != "pi.ext.parity.v1":
+        raise ValueError(f"parity event[{index}] has an invalid canonical schema")
+    extension_id = event.get("extension_id")
+    if not isinstance(extension_id, str) or not extension_id:
+        raise ValueError(f"parity event[{index}].extension_id is invalid")
+    require_manifest_extension(extension_id, f"parity event[{index}]")
+    expected_extension = expected_extensions[extension_id]
+    scenario_id = event.get("scenario_id")
+    if not isinstance(scenario_id, str) or not scenario_id:
+        raise ValueError(f"parity event[{index}].scenario_id is invalid")
+    record_key = (extension_id, scenario_id)
+    if record_key in parity_main_records:
+        raise ValueError(f"parity event[{index}] duplicates {extension_id}/{scenario_id}")
+    run_id = canonical_lineage(event.get("run_id"), f"parity event[{index}].run_id")
+    parity_run_ids.add(run_id)
+    for field in ("kind", "summary", "runtime_tier"):
+        if not isinstance(event.get(field), str) or not event[field]:
+            raise ValueError(f"parity event[{index}].{field} is invalid")
+    if event.get("source_tier") != expected_extension["source_tier"]:
+        raise ValueError(f"parity event[{index}].source_tier differs from the source manifest")
+    uint(event.get("ts_ms"), f"parity event[{index}].ts_ms")
+    uint(event.get("rust_ms"), f"parity event[{index}].rust_ms")
+    outcome = event.get("status")
+    if outcome not in ("match", "mismatch", "ts_error", "rust_error", "skip"):
+        raise ValueError(f"parity event[{index}].status is invalid")
+    validate_input_timestamp(event.get("ts"), f"parity event[{index}].ts", millis=True)
+    diffs = event.get("diffs", [])
+    if not isinstance(diffs, list) or any(not isinstance(item, str) for item in diffs):
+        raise ValueError(f"parity event[{index}].diffs is invalid")
+    error = event.get("error")
+    skip_reason = event.get("skip_reason")
+    if error is not None and (not isinstance(error, str) or not error):
+        raise ValueError(f"parity event[{index}].error is invalid")
+    if skip_reason is not None and (not isinstance(skip_reason, str) or not skip_reason):
+        raise ValueError(f"parity event[{index}].skip_reason is invalid")
+    if outcome == "match" and diffs:
+        raise ValueError(f"parity event[{index}] reports a match with retained diffs")
+    if outcome == "mismatch" and not diffs:
+        raise ValueError(f"parity event[{index}] reports a mismatch without retained diffs")
+    if outcome in ("ts_error", "rust_error") and error is None:
+        raise ValueError(f"parity event[{index}] reports an error without diagnostics")
+    if outcome == "skip" and skip_reason is None:
+        raise ValueError(f"parity event[{index}] reports a skip without a reason")
+    if outcome in ("match", "mismatch") and (error is not None or skip_reason is not None):
+        raise ValueError(f"parity event[{index}] has diagnostics for the wrong outcome")
+    if outcome in ("ts_error", "rust_error") and (diffs or skip_reason is not None):
+        raise ValueError(f"parity event[{index}] has diagnostics for the wrong error outcome")
+    if outcome == "skip" and (diffs or error is not None):
+        raise ValueError(f"parity event[{index}] has diagnostics for the wrong skip outcome")
+    parity_main_records[record_key] = event
+if len(parity_run_ids) > 1:
+    raise ValueError("parity events combine multiple run IDs")
+
+negative_triage_relative = "tests/ext_conformance/reports/negative/triage.json"
+negative_events_relative = "tests/ext_conformance/reports/negative/negative_events.jsonl"
+negative_triage = parse_json_document(
+    capture_decision_input(negative_triage_relative, "negative conformance triage"),
+    "negative conformance triage",
+)
+if set(negative_triage) != {"schema", "generated_at", "counts", "pass_rate_pct"} or negative_triage.get(
+    "schema"
+) != "pi.ext.negative_triage.v1":
+    raise ValueError("negative conformance triage has an invalid canonical schema")
+negative_generated = validate_input_timestamp(
+    negative_triage.get("generated_at"), "negative conformance triage generated_at"
+)
+negative_events = parse_jsonl_document(
+    capture_decision_input(negative_events_relative, "negative conformance events"),
+    "negative conformance events",
+)
+negative_derived = {"total": len(negative_events), "pass": 0, "fail": 0}
+negative_event_fields = {
+    "schema",
+    "ts",
+    "test_name",
+    "capability",
+    "mode",
+    "reason",
+    "expected_decision",
+    "actual_decision",
+    "status",
+    "duration_ms",
+}
+seen_negative_tests = set()
+for index, event in enumerate(negative_events):
+    if set(event) != negative_event_fields or event.get("schema") != "pi.ext.negative_conformance.v1":
+        raise ValueError(f"negative conformance event[{index}] has an invalid canonical schema")
+    for field in ("test_name", "mode", "reason", "expected_decision", "actual_decision"):
+        if not isinstance(event.get(field), str) or not event[field]:
+            raise ValueError(f"negative conformance event[{index}].{field} is invalid")
+    if not isinstance(event.get("capability"), str):
+        raise ValueError(f"negative conformance event[{index}].capability is invalid")
+    if event["mode"] not in ("strict", "prompt", "permissive"):
+        raise ValueError(f"negative conformance event[{index}].mode is unsupported")
+    if event["expected_decision"] not in ("allow", "deny", "prompt"):
+        raise ValueError(
+            f"negative conformance event[{index}].expected_decision is unsupported"
+        )
+    if event["actual_decision"] not in ("Allow", "Deny", "Prompt"):
+        raise ValueError(
+            f"negative conformance event[{index}].actual_decision is unsupported"
+        )
+    if event["test_name"] in seen_negative_tests:
+        raise ValueError("negative conformance events contain duplicate test names")
+    seen_negative_tests.add(event["test_name"])
+    outcome = event.get("status")
+    if outcome not in ("pass", "fail"):
+        raise ValueError(f"negative conformance event[{index}].status is invalid")
+    derived_outcome = "pass" if event["actual_decision"].lower() == event["expected_decision"] else "fail"
+    if outcome != derived_outcome:
+        raise ValueError(
+            f"negative conformance event[{index}].status contradicts its decisions"
+        )
+    negative_derived[outcome] += 1
+    uint(event.get("duration_ms"), f"negative conformance event[{index}].duration_ms")
+    event_time = validate_input_timestamp(
+        event.get("ts"), f"negative conformance event[{index}].ts", millis=True
+    )
+    if abs((event_time - negative_generated).total_seconds()) > 300:
+        raise ValueError(f"negative conformance event[{index}] is not bound to its triage run")
+negative_counts = negative_triage.get("counts")
+if not isinstance(negative_counts, dict) or set(negative_counts) != set(negative_derived):
+    raise ValueError("negative conformance triage counts have an invalid shape")
+for field, expected in negative_derived.items():
+    if uint(negative_counts.get(field), f"negative conformance triage counts.{field}") != expected:
+        raise ValueError(f"negative conformance triage counts.{field} does not match retained events")
+validate_rate(
+    negative_triage.get("pass_rate_pct"),
+    negative_derived["pass"],
+    negative_derived["fail"],
+    "negative conformance triage pass_rate_pct",
+)
+
+
+def source_blob_exists(relative):
+    return relative in source_tracked_paths
+
+
+def expected_report_log(suite, extension_id):
+    candidates = (
+        (
+            f"tests/ext_conformance/reports/extensions/{extension_id}.jsonl",
+            f"tests/ext_conformance/reports/smoke/extensions/{extension_id}.jsonl",
+        )
+        if suite == "smoke"
+        else (f"tests/ext_conformance/reports/{suite}/extensions/{extension_id}.jsonl",)
+    )
+    for relative in candidates:
+        if decision_source_present(relative, f"{suite} evidence log for {extension_id}"):
+            raw = capture_decision_input(relative, f"{suite} evidence log for {extension_id}")
+            parse_jsonl_document(raw, f"{suite} evidence log for {extension_id}")
+            return relative
+    return None
+
+
+parity_log_paths = {}
+parity_records_seen = set()
+parity_error_records = []
+parity_log_required_fields = {
+    "scenario_id",
+    "extension_id",
+    "kind",
+    "summary",
+    "status",
+    "source_tier",
+    "runtime_tier",
+    "ts_ms",
+    "rust_ms",
+}
+parity_log_optional_fields = {
+    "diffs",
+    "ts_result",
+    "rust_result",
+    "error",
+    "skip_reason",
+}
+for extension_id in expected_extension_ids:
+    parity_log_relative = expected_report_log("parity", extension_id)
+    main_for_extension = {
+        key: value for key, value in parity_main_records.items() if key[0] == extension_id
+    }
+    if parity_log_relative is None:
+        if main_for_extension:
+            raise ValueError(f"parity events for {extension_id} lack a retained per-extension log")
+        parity_log_paths[extension_id] = None
+        continue
+    parity_log_paths[extension_id] = parity_log_relative
+    records = parse_jsonl_document(
+        capture_decision_input(
+            parity_log_relative, f"parity evidence log for {extension_id}"
+        ),
+        f"parity evidence log for {extension_id}",
+    )
+    derived_match = 0
+    derived_mismatch = 0
+    extension_record_keys = set()
+    for record_index, record in enumerate(records):
+        fields = set(record)
+        if not parity_log_required_fields <= fields or not fields <= (
+            parity_log_required_fields | parity_log_optional_fields
+        ):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}] has invalid fields"
+            )
+        if record.get("extension_id") != extension_id:
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}] has the wrong extension"
+            )
+        scenario_id = record.get("scenario_id")
+        if not isinstance(scenario_id, str) or not scenario_id:
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}].scenario_id is invalid"
+            )
+        record_key = (extension_id, scenario_id)
+        if record_key in parity_records_seen:
+            raise ValueError(f"parity evidence logs duplicate {extension_id}/{scenario_id}")
+        parity_records_seen.add(record_key)
+        extension_record_keys.add(record_key)
+        for field in ("kind", "summary", "runtime_tier"):
+            if not isinstance(record.get(field), str) or not record[field]:
+                raise ValueError(
+                    f"parity evidence log for {extension_id} record[{record_index}].{field} is invalid"
+                )
+        if record.get("source_tier") != expected_extensions[extension_id]["source_tier"]:
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}].source_tier "
+                "differs from the source manifest"
+            )
+        uint(
+            record.get("ts_ms"),
+            f"parity evidence log for {extension_id} record[{record_index}].ts_ms",
+        )
+        uint(
+            record.get("rust_ms"),
+            f"parity evidence log for {extension_id} record[{record_index}].rust_ms",
+        )
+        outcome = record.get("status")
+        if outcome not in ("match", "mismatch", "ts_error", "rust_error", "skip"):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}].status is invalid"
+            )
+        diffs = record.get("diffs", [])
+        if not isinstance(diffs, list) or any(not isinstance(item, str) for item in diffs):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}].diffs is invalid"
+            )
+        error = record.get("error")
+        skip_reason = record.get("skip_reason")
+        if error is not None and (not isinstance(error, str) or not error):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}].error is invalid"
+            )
+        if skip_reason is not None and (not isinstance(skip_reason, str) or not skip_reason):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}].skip_reason is invalid"
+            )
+        if outcome == "match":
+            if diffs:
+                raise ValueError(
+                    f"parity evidence log for {extension_id} record[{record_index}] "
+                    "reports a match with retained diffs"
+                )
+            derived_match += 1
+        elif outcome == "mismatch":
+            if not diffs:
+                raise ValueError(
+                    f"parity evidence log for {extension_id} record[{record_index}] "
+                    "reports a mismatch without retained diffs"
+                )
+            derived_mismatch += 1
+        elif outcome in ("ts_error", "rust_error"):
+            if error is None:
+                raise ValueError(
+                    f"parity evidence log for {extension_id} record[{record_index}] "
+                    "reports an error without diagnostics"
+                )
+            parity_error_records.append(f"{extension_id}/{scenario_id}:{outcome}")
+            derived_mismatch += 1
+        elif skip_reason is None:
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}] "
+                "reports a skip without a reason"
+            )
+
+        if outcome in ("match", "mismatch") and (error is not None or skip_reason is not None):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}] "
+                "has diagnostics for the wrong outcome"
+            )
+        if outcome in ("ts_error", "rust_error") and (diffs or skip_reason is not None):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}] "
+                "has diagnostics for the wrong error outcome"
+            )
+        if outcome == "skip" and (diffs or error is not None):
+            raise ValueError(
+                f"parity evidence log for {extension_id} record[{record_index}] "
+                "has diagnostics for the wrong skip outcome"
+            )
+
+        main_event = parity_main_records.get(record_key)
+        if main_event is None:
+            raise ValueError(
+                f"parity evidence log outcome {extension_id}/{scenario_id} is missing "
+                "from parity_events.jsonl"
+            )
+        for field in (
+            "kind",
+            "summary",
+            "source_tier",
+            "runtime_tier",
+            "status",
+            "ts_ms",
+            "rust_ms",
+        ):
+            if main_event.get(field) != record.get(field):
+                raise ValueError(
+                    f"parity event {extension_id}/{scenario_id}.{field} disagrees with "
+                    "the per-extension log"
+                )
+        for field, default in (("diffs", []), ("error", None), ("skip_reason", None)):
+            if main_event.get(field, default) != record.get(field, default):
+                raise ValueError(
+                    f"parity event {extension_id}/{scenario_id}.{field} disagrees with "
+                    "the per-extension log"
+                )
+    if extension_record_keys != set(main_for_extension):
+        raise ValueError(
+            f"parity_events.jsonl inventory for {extension_id} does not exactly match "
+            "its per-extension log"
+        )
+    statuses[extension_id]["parity_match"] = derived_match
+    statuses[extension_id]["parity_mismatch"] = derived_mismatch
+if parity_error_records:
+    raise ValueError(
+        "parity evidence contains runtime/oracle errors: "
+        + ", ".join(parity_error_records[:5])
+    )
+
+
+event_fields = {
+    "schema",
+    "ts",
+    "extension_id",
+    "version",
+    "source_tier",
+    "conformance_tier",
+    "artifact_path",
+    "evidence",
+    "capabilities",
+    "registrations",
+    "overall_status",
+    "rust_load_ms",
+    "ts_load_ms",
+    "load_ratio",
+    "scenario_pass",
+    "scenario_fail",
+    "scenario_skip",
+    "smoke_pass",
+    "smoke_fail",
+    "parity_match",
+    "parity_mismatch",
+    "failures",
+}
+events = parse_jsonl_document(raw_events, "conformance events")
+if len(events) != len(expected_extension_ids):
+    raise ValueError("conformance event inventory does not exactly cover the source manifest")
+for index, event in enumerate(events):
+    if set(event) != event_fields or event.get("schema") != "pi.ext.conformance_report.v2":
+        raise ValueError(f"conformance event line {index + 1} has an invalid schema")
+    extension_id = expected_extension_ids[index]
+    expected = expected_extensions[extension_id]
+    if event.get("extension_id") != extension_id:
+        raise ValueError("conformance event identities/order do not match the source manifest")
+    if event.get("source_tier") != expected["source_tier"]:
+        raise ValueError(f"conformance event source tier differs for {extension_id}")
+    if event.get("conformance_tier") != expected["conformance_tier"]:
+        raise ValueError(f"conformance event conformance tier differs for {extension_id}")
+    expected_artifact = f"tests/ext_conformance/artifacts/{expected['entry_path']}"
+    if event.get("artifact_path") != expected_artifact or not source_blob_exists(expected_artifact):
+        raise ValueError(f"conformance event artifact path differs from source manifest for {extension_id}")
+    if event.get("capabilities") != expected["capabilities"]:
+        raise ValueError(f"conformance event capabilities differ from source manifest for {extension_id}")
+    if event.get("registrations") != expected["registrations"]:
+        raise ValueError(f"conformance event registrations differ from source manifest for {extension_id}")
+    expected_version = provenance_versions.get(extension_id)
+    if event.get("version") != expected_version:
+        raise ValueError(f"conformance event version differs from source provenance for {extension_id}")
+    if event.get("overall_status") not in ("PASS", "FAIL", "N/A"):
+        raise ValueError(f"conformance event status is invalid for {extension_id}")
+    parsed_event_time = canonical_timestamp(event.get("ts"), f"conformance event ts for {extension_id}", millis=True)
+    if abs((parsed_event_time - generated_at).total_seconds()) > 300:
+        raise ValueError(f"conformance event timestamp is not bound to the summary run for {extension_id}")
+    counters = {}
+    for field in (
+        "scenario_pass",
+        "scenario_fail",
+        "scenario_skip",
+        "smoke_pass",
+        "smoke_fail",
+        "parity_match",
+        "parity_mismatch",
+    ):
+        counters[field] = uint(event.get(field), f"conformance event {extension_id}.{field}")
+    rust_load_ms = uint(
+        event.get("rust_load_ms"), f"conformance event {extension_id}.rust_load_ms", nullable=True
+    )
+    ts_load_ms = uint(
+        event.get("ts_load_ms"), f"conformance event {extension_id}.ts_load_ms", nullable=True
+    )
+    load_ratio = finite_number(
+        event.get("load_ratio"), f"conformance event {extension_id}.load_ratio", nullable=True
+    )
+    if load_ratio is not None and load_ratio < 0:
+        raise ValueError(f"conformance event {extension_id}.load_ratio must be non-negative")
+    failures = event.get("failures")
+    if not isinstance(failures, list) or any(not isinstance(item, str) for item in failures):
+        raise ValueError(f"conformance event {extension_id}.failures must be an array of strings")
+    has_scenario_results = counters["scenario_pass"] > 0 or counters["scenario_fail"] > 0
+    effective_smoke_fail = 0 if has_scenario_results else counters["smoke_fail"]
+    if counters["scenario_fail"] > 0 or effective_smoke_fail > 0 or counters["parity_mismatch"] > 0:
+        derived_overall = "FAIL"
+    elif counters["scenario_pass"] > 0 or counters["smoke_pass"] > 0 or counters["parity_match"] > 0:
+        derived_overall = "PASS"
+    elif rust_load_ms is not None:
+        derived_overall = "PASS"
+    else:
+        derived_overall = "N/A"
+    if event.get("overall_status") != derived_overall:
+        raise ValueError(
+            f"conformance event {extension_id} overall_status contradicts its retained counters"
+        )
+    expected_status = statuses[extension_id]
+    for field, value in (
+        *counters.items(),
+        ("rust_load_ms", rust_load_ms),
+        ("ts_load_ms", ts_load_ms),
+        ("load_ratio", load_ratio),
+        ("failures", failures),
+    ):
+        if value != expected_status[field]:
+            raise ValueError(
+                f"conformance event {extension_id}.{field} does not match retained raw decision sources"
+            )
+    evidence = event.get("evidence")
+    if not isinstance(evidence, dict) or set(evidence) != {"fixture", "smoke_log", "parity_log"}:
+        raise ValueError(f"conformance event {extension_id}.evidence has an invalid shape")
+    fixture_relative = f"tests/ext_conformance/fixtures/{extension_id}.json"
+    expected_fixture = fixture_relative if source_blob_exists(fixture_relative) else None
+    expected_evidence = {
+        "fixture": expected_fixture,
+        "smoke_log": expected_report_log("smoke", extension_id),
+        "parity_log": parity_log_paths[extension_id],
+    }
+    if evidence != expected_evidence:
+        raise ValueError(f"conformance event {extension_id}.evidence differs from retained artifacts")
+
+derived_status_counts = {
+    "pass": sum(event["overall_status"] == "PASS" for event in events),
+    "fail": sum(event["overall_status"] == "FAIL" for event in events),
+    "na": sum(event["overall_status"] == "N/A" for event in events),
+}
+derived_tiers = {}
+for source_tier, event in zip(expected_source_tiers, events, strict=True):
+    tier = derived_tiers.setdefault(source_tier, {"total": 0, "pass": 0, "fail": 0, "na": 0})
+    tier["total"] += 1
+    tier[{"PASS": "pass", "FAIL": "fail", "N/A": "na"}[event["overall_status"]]] += 1
+reported_tiers = data.get("per_tier")
+if not isinstance(reported_tiers, dict) or set(reported_tiers) != set(derived_tiers):
+    raise ValueError("conformance per_tier summary has an invalid tier inventory")
+for tier_name, expected_tier in derived_tiers.items():
+    reported_tier = reported_tiers.get(tier_name)
+    if not isinstance(reported_tier, dict) or set(reported_tier) != {"total", "pass", "fail", "na"}:
+        raise ValueError(f"conformance per_tier.{tier_name} has an invalid shape")
+    for field, expected in expected_tier.items():
+        if uint(reported_tier.get(field), f"conformance per_tier.{tier_name}.{field}") != expected:
+            raise ValueError(
+                f"conformance per_tier.{tier_name}.{field} does not match source-bound events"
+            )
+if reported_tiers != dict(sorted(derived_tiers.items())):
+    raise ValueError("conformance per_tier summary does not match the source-bound event inventory")
+
 counts = data.get('counts', {})
-if not isinstance(counts, dict):
-    raise ValueError("counts must be an object")
+if not isinstance(counts, dict) or set(counts) != {"total", "pass", "fail", "na", "tested"}:
+    raise ValueError("counts must contain exactly total/pass/fail/na/tested")
 
 def count(name):
     value = counts.get(name)
@@ -1185,8 +3125,16 @@ not_applicable = count("na")
 tested = passed + failed
 if total != tested + not_applicable:
     raise ValueError("counts.total must equal counts.pass + counts.fail + counts.na")
-if "tested" in counts and counts["tested"] != tested:
+if counts["tested"] != tested:
     raise ValueError("counts.tested must equal counts.pass + counts.fail")
+if total != len(expected_extension_ids):
+    raise ValueError("counts.total does not match the source conformance manifest")
+if (
+    passed != derived_status_counts["pass"]
+    or failed != derived_status_counts["fail"]
+    or not_applicable != derived_status_counts["na"]
+):
+    raise ValueError("conformance counts do not match the source-bound event inventory")
 
 pass_rate = data.get("pass_rate_pct")
 if isinstance(pass_rate, bool) or not isinstance(pass_rate, (int, float)) or not math.isfinite(pass_rate):
@@ -1199,8 +3147,103 @@ if not math.isclose(float(pass_rate), expected_rate, rel_tol=1e-9, abs_tol=1e-9)
         f"pass_rate_pct={pass_rate} is inconsistent with pass/fail counts (expected {expected_rate})"
     )
 
+coverage_rate = data.get("coverage_rate_pct")
+if isinstance(coverage_rate, bool) or not isinstance(coverage_rate, (int, float)) or not math.isfinite(coverage_rate):
+    raise ValueError("coverage_rate_pct must be a finite number")
+expected_coverage = 100.0 * tested / total
+if not math.isclose(float(coverage_rate), expected_coverage, rel_tol=1e-9, abs_tol=1e-9):
+    raise ValueError(
+        f"coverage_rate_pct={coverage_rate} is inconsistent with tested/total counts (expected {expected_coverage})"
+    )
+
+negative_summary = data.get("negative")
+if not isinstance(negative_summary, dict) or set(negative_summary) != {"pass", "fail"}:
+    raise ValueError("negative fields do not match the canonical summary contract")
+for field in ("pass", "fail"):
+    if uint(negative_summary.get(field), f"negative.{field}") != negative_derived[field]:
+        raise ValueError(f"negative.{field} does not match retained negative conformance evidence")
+if negative_summary["fail"] != 0:
+    raise ValueError("negative.fail must be zero for release admission")
+
+derived_evidence = {
+    "golden_fixtures": sum(event["evidence"]["fixture"] is not None for event in events),
+    "smoke_logs": sum(event["evidence"]["smoke_log"] is not None for event in events),
+    "parity_logs": sum(event["evidence"]["parity_log"] is not None for event in events),
+    "load_time_benchmarks": sum(event["rust_load_ms"] is not None for event in events),
+}
+reported_evidence = data.get("evidence")
+if not isinstance(reported_evidence, dict) or set(reported_evidence) != set(derived_evidence):
+    raise ValueError("evidence fields do not match the canonical summary contract")
+for field, expected in derived_evidence.items():
+    if uint(reported_evidence.get(field), f"evidence.{field}") != expected:
+        raise ValueError(f"evidence.{field} does not match validated event evidence")
+
 rate_display = format(float(pass_rate), ".12g")
 rate_passes = int(float(pass_rate) >= minimum_rate)
+
+verify_repository_binding()
+final_head = git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
+if final_head != head:
+    raise ValueError("release HEAD changed during conformance validation")
+final_head_entry = [
+    record
+    for record in git("ls-tree", "-z", "HEAD", "--", summary_relative).split(b"\0")
+    if record
+]
+if final_head_entry != head_entry:
+    raise ValueError("conformance summary tree entry changed during validation")
+final_index_entry = [
+    record
+    for record in git("ls-files", "--stage", "-z", "--", summary_relative).split(b"\0")
+    if record
+]
+if final_index_entry != index_entry:
+    raise ValueError("conformance summary index entry changed during validation")
+final_flags = [
+    record
+    for record in git("ls-files", "-v", "-z", "--", summary_relative).split(b"\0")
+    if record
+]
+if final_flags != flags:
+    raise ValueError("conformance summary index flags changed during validation")
+try:
+    final_metadata = summary_path.lstat()
+    final_summary = summary_path.read_bytes()
+except OSError as exc:
+    raise ValueError(f"unable to re-read conformance summary: {exc}") from exc
+if not stat.S_ISREG(final_metadata.st_mode):
+    raise ValueError("conformance summary became a symlink or special file during validation")
+if os.name != "nt" and final_metadata.st_mode & 0o111:
+    raise ValueError("conformance summary became executable during validation")
+if final_summary != raw_summary:
+    raise ValueError("conformance summary bytes changed during validation")
+final_framed = b"blob " + str(len(final_summary)).encode("ascii") + b"\0" + final_summary
+final_oid = (
+    hashlib.sha1(final_framed).hexdigest().encode("ascii")
+    if len(head_oid) == 40
+    else hashlib.sha256(final_framed).hexdigest().encode("ascii")
+)
+if final_oid != head_oid:
+    raise ValueError("conformance summary bytes no longer match release HEAD")
+for relative, initial in decision_inputs.items():
+    label, initial_path, initial_raw, initial_tree, initial_index, initial_flags = initial
+    final_path, final_raw, final_tree, final_index, final_input_flags = capture_head_bound_file(
+        relative, label
+    )
+    if final_path != initial_path or final_raw != initial_raw:
+        raise ValueError(f"{label} bytes changed during validation")
+    if final_tree != initial_tree:
+        raise ValueError(f"{label} tree entry changed during validation")
+    if final_index != initial_index:
+        raise ValueError(f"{label} index entry changed during validation")
+    if final_input_flags != initial_flags:
+        raise ValueError(f"{label} index flags changed during validation")
+for relative in absent_decision_paths:
+    if os.path.lexists(root / relative):
+        raise ValueError(f"absent conformance decision source appeared during validation: {relative}")
+    if relative in head_tracked_paths:
+        raise ValueError(f"absent conformance decision source became tracked during validation: {relative}")
+
 print(
     total,
     passed,
@@ -1472,8 +3515,12 @@ def canonical_budget_inventory_json(budgets):
 
 def run_git_result(*args):
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_LITERAL_PATHSPECS"] = "1"
     env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     return subprocess.run(
         [
             "git",
@@ -1496,6 +3543,25 @@ def run_git(*args):
         diagnostic = result.stderr.decode("utf-8", "replace").strip()
         fail(f"git {' '.join(args)} failed: {diagnostic}")
     return result.stdout
+
+
+def verify_repository_binding():
+    bindings = (
+        (("rev-parse", "--show-toplevel"), project_root, "worktree"),
+        (("rev-parse", "--absolute-git-dir"), git_dir, "Git directory"),
+    )
+    for args, expected, label in bindings:
+        output = run_git(*args).decode("utf-8", "strict")
+        if not output.endswith("\n") or "\n" in output.removesuffix("\n"):
+            fail(f"performance repository {label} output is not one canonical line")
+        try:
+            reported = Path(output.removesuffix("\n")).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            fail(f"unable to canonicalize performance repository {label}: {exc}")
+        if reported != expected:
+            fail(
+                f"performance repository {label} does not match the filesystem-derived binding"
+            )
 
 
 def canonical_head():
@@ -1628,6 +3694,7 @@ def verify_claim_source_binding(source_commit, head):
 
 try:
     project_root, git_dir = resolve_repository_context()
+    verify_repository_binding()
     artifact_head, artifact_bytes = validate_performance_artifact_at_head()
     raw = artifact_bytes.decode("utf-8", "strict")
     data = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
@@ -1870,9 +3937,10 @@ try:
     if claim["performance_claims_authorized"] is not claim_ready:
         fail(f"claim_readiness.performance_claims_authorized must be {claim_ready}")
 
+    if now - generated_at > maximum_age:
+        fail(f"performance summary is stale ({now - generated_at} old; maximum {maximum_age})")
+
     if claim_ready:
-        if now - generated_at > maximum_age:
-            fail(f"performance summary is stale ({now - generated_at} old; maximum {maximum_age})")
         finish_validated(
             "pass",
             f"performance claims authorized: all {counts['total_budgets']} declared budgets "
@@ -2103,7 +4171,7 @@ import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
-project_root = Path(sys.argv[1])
+raw_project_root = Path(sys.argv[1])
 contract_path = Path(sys.argv[2])
 verdict_path = Path(sys.argv[3])
 # IMPORTANT: this must track the shell-resolved gate toggle derived from
@@ -2114,6 +4182,7 @@ max_evidence_age = timedelta(hours=int(sys.argv[5]))
 certification_claimed = False
 DROPIN_CONTRACT_RELATIVE = "docs/contracts/dropin-certification-contract.json"
 DROPIN_VERDICT_RELATIVE = "docs/evidence/dropin-certification-verdict.json"
+DROPIN_LANE_RELATIVE = "tests/full_suite_gate/certification_verdict.json"
 decision_inputs = []
 current_head = None
 
@@ -2129,16 +4198,81 @@ def reject_duplicate_keys(pairs):
         value[key] = item
     return value
 
+def resolve_repository_context():
+    if raw_project_root.is_symlink() or not raw_project_root.is_dir():
+        finish("fail", "drop-in repository root must be a real directory, not a symlink")
+    try:
+        resolved_root = raw_project_root.resolve(strict=True)
+        git_marker = resolved_root / ".git"
+        marker_metadata = git_marker.lstat()
+        if stat.S_ISLNK(marker_metadata.st_mode):
+            finish("fail", "drop-in repository .git marker must not be a symlink")
+        if stat.S_ISDIR(marker_metadata.st_mode):
+            resolved_git_dir = git_marker.resolve(strict=True)
+        elif stat.S_ISREG(marker_metadata.st_mode):
+            marker = git_marker.read_text(encoding="utf-8").rstrip("\r\n")
+            if "\n" in marker or "\r" in marker or not marker.startswith("gitdir: "):
+                finish("fail", "drop-in repository .git file is malformed")
+            target = Path(marker.removeprefix("gitdir: "))
+            candidate = target if target.is_absolute() else resolved_root / target
+            target_metadata = candidate.lstat()
+            if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISDIR(target_metadata.st_mode):
+                finish("fail", "drop-in repository gitfile target must be a non-symlink directory")
+            resolved_git_dir = candidate.resolve(strict=True)
+        else:
+            finish("fail", "drop-in repository .git marker is not a directory or gitfile")
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        finish("fail", f"drop-in repository Git context could not be resolved safely: {exc}")
+    if not resolved_git_dir.is_dir():
+        finish("fail", "drop-in repository Git directory is not a directory")
+    return resolved_root, resolved_git_dir
+
 def run_git(*args, text=True):
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     return subprocess.run(
-        ["git", "-C", str(project_root), *args],
+        [
+            "git",
+            "--git-dir", str(git_dir),
+            "--work-tree", str(project_root),
+            "-c", "core.bare=false",
+            "-c", "core.fsmonitor=false",
+            "-c", f"core.worktree={project_root}",
+            *args,
+        ],
         capture_output=True,
         text=text,
         env=env,
         check=False,
     )
+
+project_root, git_dir = resolve_repository_context()
+
+def verify_repository_binding():
+    bindings = (
+        (("rev-parse", "--show-toplevel"), project_root, "worktree"),
+        (("rev-parse", "--absolute-git-dir"), git_dir, "Git directory"),
+    )
+    for args, expected, label in bindings:
+        result = run_git(*args)
+        if result.returncode != 0:
+            finish("fail", f"unable to verify canonical drop-in repository {label}")
+        output = result.stdout
+        if not output.endswith("\n") or "\n" in output.removesuffix("\n"):
+            finish("fail", f"drop-in repository {label} output is not one canonical line")
+        try:
+            reported = Path(output.removesuffix("\n")).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            finish("fail", f"unable to canonicalize drop-in repository {label}: {exc}")
+        if reported != expected:
+            finish("fail", f"drop-in repository {label} does not match the filesystem-derived binding")
+
+verify_repository_binding()
 
 def canonical_input_metadata(path, relative, label):
     expected_path = project_root / relative
@@ -2258,7 +4392,8 @@ def verify_decision_inputs(expected_head):
         finish("fail", "release HEAD changed during the final drop-in decision-input recheck")
 
 def finish_verified(status, detail):
-    if current_head is None or len(decision_inputs) != 2:
+    expected_inputs = 3 if certification_claimed else 2
+    if current_head is None or len(decision_inputs) != expected_inputs:
         finish("fail", "drop-in decision-input verification was not initialized")
     verify_decision_inputs(current_head)
     finish(status, detail)
@@ -2562,6 +4697,204 @@ if strict_required or certification_claimed:
         finish("fail", f"source.lane_schema={source.get('lane_schema')!r} (expected 'pi.ci.certification_lane.v1')")
     if source.get("lane_verdict") != "pass":
         finish("fail", f"source.lane_verdict={source.get('lane_verdict')!r} (expected 'pass')")
+
+    lane_path = project_root / DROPIN_LANE_RELATIVE
+    lane, lane_bytes = load_json_input(
+        lane_path,
+        DROPIN_LANE_RELATIVE,
+        "drop-in certification lane",
+    )
+    decision_inputs.append(
+        (lane_path, DROPIN_LANE_RELATIVE, "drop-in certification lane", lane_bytes)
+    )
+    if lane.get("schema") != "pi.ci.certification_lane.v1":
+        finish(
+            "fail",
+            f"actual certification lane schema={lane.get('schema')!r} "
+            "(expected 'pi.ci.certification_lane.v1')",
+        )
+    expected_lane_fields = {
+        "schema",
+        "lane",
+        "generated_at",
+        "verdict",
+        "policy",
+        "gates",
+        "waiver_audit",
+        "waivers_applied",
+        "summary",
+        "promotion_rules",
+        "rerun_guidance",
+    }
+    if set(lane) != expected_lane_fields:
+        finish("fail", "actual certification lane top-level fields do not match the canonical contract")
+    if lane.get("lane") != "full":
+        finish("fail", f"actual certification lane lane={lane.get('lane')!r} (expected 'full')")
+    expected_policy = (
+        "Full certification: all blocking gates must pass for release. "
+        "Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate."
+    )
+    if lane.get("policy") != expected_policy:
+        finish("fail", "actual certification lane policy does not match the canonical full-lane policy")
+    lane_generated_raw = lane.get("generated_at")
+    if (
+        not isinstance(lane_generated_raw, str)
+        or re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z",
+            lane_generated_raw,
+        )
+        is None
+    ):
+        finish("fail", "actual certification lane generated_at must use canonical millisecond UTC precision")
+    try:
+        lane_generated = datetime.fromisoformat(lane_generated_raw.removesuffix("Z") + "+00:00")
+    except ValueError:
+        finish("fail", "actual certification lane generated_at is invalid")
+    if lane_generated > now + timedelta(minutes=5):
+        finish("fail", "actual certification lane generated_at is more than five minutes in the future")
+    if now - lane_generated > max_evidence_age:
+        finish("fail", "actual certification lane evidence is stale")
+    if abs((generated_at_time - lane_generated).total_seconds()) > 300:
+        finish("fail", "drop-in verdict and actual certification lane timestamps differ by more than five minutes")
+
+    expected_lane_gates = [
+        ("non_mock_unit", "Non-mock unit compliance", "bd-1f42.2.6", True, "docs/non-mock-rubric.json", "cargo test --test non_mock_compliance_gate -- --nocapture"),
+        ("e2e_log_contract", "E2E log contract and transcripts", "bd-1f42.3.6", False, "tests/e2e_results", None),
+        ("ext_must_pass", "Extension must-pass gate", "bd-1f42.4.4", True, "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json", "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"),
+        ("ext_provider_compat", "Extension provider compatibility matrix", "bd-1f42.4.6", False, "tests/ext_conformance/reports/provider_compat/provider_compat_report.json", "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact"),
+        ("evidence_bundle", "Unified evidence bundle", "bd-1f42.6.8", False, "tests/evidence_bundle/index.json", "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"),
+        ("cross_platform", "Cross-platform matrix validation", "bd-1f42.6.7", True, "tests/cross_platform_reports/linux/platform_report.json", "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact"),
+        ("conformance_regression", "Conformance regression gate", "bd-1f42.4", True, "tests/ext_conformance/reports/regression_verdict.json", "cargo test --test conformance_regression_gate -- --nocapture"),
+        ("conformance_pass_rate", "Conformance pass rate >= 80%", "bd-1f42.4", True, "tests/ext_conformance/reports/conformance_summary.json", "cargo test --test conformance_report -- --nocapture"),
+        ("suite_classification", "Suite classification guard", "bd-1f42.6.1", True, "tests/suite_classification.toml", None),
+        ("traceability_matrix", "Requirement traceability matrix", "bd-1f42.6.4", False, "docs/traceability_matrix.json", None),
+        ("e2e_scenario_matrix", "Canonical E2E scenario matrix", "bd-1f42.8.5.1", False, "docs/e2e_scenario_matrix.json", "python3 scripts/check_traceability_matrix.py"),
+        ("provider_gap_matrix", "Provider gap test matrix coverage", "bd-3uqg.11.11.5", False, "docs/provider-gaps-test-matrix.json", "cargo test --test provider_native_contract --test e2e_provider_scenarios -- --nocapture"),
+        ("sec_conformance", "SEC-6.4 security compatibility conformance", "bd-1a2cu", True, "tests/full_suite_gate/sec_conformance_verdict.json", "cargo test --test sec_compatibility_conformance -- --nocapture"),
+        ("perf3x_bead_coverage", "PERF-3X bead-to-artifact coverage audit", "bd-3ar8v.6.11", True, "tests/full_suite_gate/perf3x_bead_coverage_audit.json", "cargo test --test ci_full_suite_gate -- perf3x_bead_coverage_contract_is_well_formed --nocapture --exact"),
+        ("practical_finish_checkpoint", "Practical-finish checkpoint (docs-only residual filter)", "bd-3ar8v.6.9", True, "tests/full_suite_gate/practical_finish_checkpoint.json", "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact"),
+        ("extension_remediation_backlog", "Extension remediation backlog artifact integrity", "bd-3ar8v.6.8", True, "tests/full_suite_gate/extension_remediation_backlog.json", "cargo test --test qa_certification_dossier -- certification_dossier --nocapture --exact"),
+        ("opportunity_matrix_integrity", "Opportunity matrix artifact integrity", "bd-3ar8v.6.1", True, "tests/perf/reports/opportunity_matrix.json", "cargo test --test release_evidence_gate -- phase1_weighted_attribution_contract_links_phase5_consumers --nocapture --exact"),
+        ("parameter_sweeps_integrity", "Parameter sweeps artifact integrity", "bd-3ar8v.6.2", True, "tests/perf/reports/parameter_sweeps.json", "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact"),
+        ("conformance_stress_lineage", "Conformance+stress lineage coherence", "bd-3ar8v.6.3", True, "tests/ext_conformance/reports/conformance_summary.json", "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact"),
+        ("waiver_lifecycle", "Waiver lifecycle compliance", "bd-1f42.8.8.1", True, "tests/full_suite_gate/waiver_audit.json", "cargo test --test ci_full_suite_gate -- waiver_lifecycle_audit --nocapture --exact"),
+    ]
+    lane_gates = lane.get("gates")
+    if not isinstance(lane_gates, list) or len(lane_gates) != len(expected_lane_gates):
+        finish("fail", f"actual certification lane must contain exactly {len(expected_lane_gates)} canonical gates")
+    allowed_gate_fields = {"id", "name", "bead", "status", "blocking", "artifact_path", "detail", "reproduce_command"}
+    required_gate_fields = {"id", "name", "bead", "status", "blocking", "artifact_path"}
+    for index, (gate, expected) in enumerate(zip(lane_gates, expected_lane_gates, strict=True)):
+        if not isinstance(gate, dict) or not required_gate_fields.issubset(gate) or not set(gate).issubset(allowed_gate_fields):
+            finish("fail", f"actual certification lane gate[{index}] has invalid fields")
+        gate_id, name, bead, blocking, artifact_path, reproduce_command = expected
+        if (
+            gate.get("id") != gate_id
+            or gate.get("name") != name
+            or gate.get("bead") != bead
+            or gate.get("status") != "pass"
+            or gate.get("blocking") is not blocking
+            or gate.get("artifact_path") != artifact_path
+            or gate.get("reproduce_command") != reproduce_command
+        ):
+            finish("fail", f"actual certification lane gate[{index}] does not match canonical passing gate {gate_id}")
+        if "detail" in gate and (not isinstance(gate["detail"], str) or not gate["detail"]):
+            finish("fail", f"actual certification lane gate {gate_id} has an invalid detail")
+
+    waiver_audit = lane.get("waiver_audit")
+    expected_waiver_fields = {
+        "schema",
+        "generated_at",
+        "total_waivers",
+        "active",
+        "expired",
+        "expiring_soon",
+        "invalid",
+        "waivers",
+        "raw_waivers",
+    }
+    if not isinstance(waiver_audit, dict) or set(waiver_audit) != expected_waiver_fields:
+        finish("fail", "actual certification lane waiver_audit fields are invalid")
+    waiver_generated_raw = waiver_audit.get("generated_at")
+    if (
+        waiver_audit.get("schema") != "pi.ci.waiver_audit.v1"
+        or not isinstance(waiver_generated_raw, str)
+        or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z", waiver_generated_raw) is None
+    ):
+        finish("fail", "actual certification lane waiver_audit schema or timestamp is invalid")
+    try:
+        waiver_generated = datetime.fromisoformat(waiver_generated_raw.removesuffix("Z") + "+00:00")
+    except ValueError:
+        finish("fail", "actual certification lane waiver_audit timestamp is invalid")
+    if waiver_generated > now + timedelta(minutes=5) or now - waiver_generated > max_evidence_age:
+        finish("fail", "actual certification lane waiver_audit is not fresh")
+    if waiver_generated > lane_generated or (lane_generated - waiver_generated) > timedelta(minutes=5):
+        finish("fail", "certification lane and waiver_audit timestamps differ by more than five minutes")
+    waiver_count_fields = ("total_waivers", "active", "expired", "expiring_soon", "invalid")
+    if any(
+        isinstance(waiver_audit.get(field), bool)
+        or not isinstance(waiver_audit.get(field), int)
+        or waiver_audit.get(field) != 0
+        for field in waiver_count_fields
+    ):
+        finish("fail", "strict drop-in certification may not rely on waivers")
+    if waiver_audit.get("waivers") != [] or waiver_audit.get("raw_waivers") != [] or lane.get("waivers_applied") != []:
+        finish("fail", "strict drop-in certification requires empty waiver inventories")
+
+    expected_summary = {
+        "total_gates": 20,
+        "passed": 20,
+        "failed": 0,
+        "warned": 0,
+        "skipped": 0,
+        "waived": 0,
+        "blocking_pass": 14,
+        "blocking_total": 14,
+        "all_blocking_pass": True,
+    }
+    summary = lane.get("summary")
+    if isinstance(summary, dict):
+        for field in (
+            "total_gates",
+            "passed",
+            "failed",
+            "warned",
+            "skipped",
+            "waived",
+            "blocking_pass",
+            "blocking_total",
+        ):
+            if isinstance(summary.get(field), bool) or not isinstance(summary.get(field), int):
+                finish("fail", f"actual certification lane summary.{field} must be an integer")
+        if not isinstance(summary.get("all_blocking_pass"), bool):
+            finish("fail", "actual certification lane summary.all_blocking_pass must be boolean")
+    if summary != expected_summary:
+        finish("fail", "actual certification lane summary does not describe 20 canonical passing gates")
+    expected_promotion = {
+        "can_promote": True,
+        "blocker_gates": [],
+        "waiver_gates": [],
+        "conditions": ["All blocking gates pass (including waivers)"],
+    }
+    promotion_rules = lane.get("promotion_rules")
+    if not isinstance(promotion_rules, dict) or not isinstance(
+        promotion_rules.get("can_promote"), bool
+    ):
+        finish("fail", "actual certification lane promotion_rules.can_promote must be boolean")
+    if promotion_rules != expected_promotion:
+        finish("fail", "actual certification lane promotion_rules are not the canonical no-waiver pass state")
+    expected_rerun = {
+        "preflight_command": "cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact",
+        "full_command": "cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact",
+        "single_gate_template": "See reproduce_command field on each gate",
+    }
+    if lane.get("rerun_guidance") != expected_rerun:
+        finish("fail", "actual certification lane rerun_guidance is not canonical")
+    if lane.get("verdict") != "pass":
+        finish(
+            "fail",
+            f"actual certification lane verdict={lane.get('verdict')!r} (expected 'pass')",
+        )
 
 evidence_index = verdict.get("evidence_index")
 if strict_required or certification_claimed:

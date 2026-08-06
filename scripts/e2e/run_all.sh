@@ -50,8 +50,47 @@ fi
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-$PROJECT_ROOT/tests/e2e_results/$TIMESTAMP}"
+if [[ -n "${E2E_ARTIFACT_DIR+x}" ]]; then
+    ARTIFACT_DIR="$E2E_ARTIFACT_DIR"
+    if ! artifact_timestamp_values="$(python3 - "$ARTIFACT_DIR" <<'PY'
+import re
+import sys
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+artifact_dir = Path(sys.argv[1])
+timestamp = artifact_dir.name
+if re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", timestamp) is None:
+    raise SystemExit(
+        "E2E_ARTIFACT_DIR basename must use canonical YYYYMMDDTHHMMSSZ syntax"
+    )
+try:
+    instant = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(
+        tzinfo=timezone.utc
+    )
+except ValueError as exc:
+    raise SystemExit(f"E2E_ARTIFACT_DIR basename is not a real UTC instant: {exc}") from exc
+if instant > datetime.now(timezone.utc) + timedelta(minutes=5):
+    raise SystemExit("E2E_ARTIFACT_DIR timestamp is more than five minutes in the future")
+print(f"{instant:%Y-%m-%dT%H:%M:%SZ}|{timestamp}")
+PY
+)"; then
+        echo "Invalid E2E_ARTIFACT_DIR: $ARTIFACT_DIR" >&2
+        exit 1
+    fi
+    IFS='|' read -r GENERATED_AT TIMESTAMP extra_timestamp_field <<<"$artifact_timestamp_values"
+    if [[ -n "$extra_timestamp_field" ]] || \
+        [[ ! "$GENERATED_AT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || \
+        [[ ! "$TIMESTAMP" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
+        echo "Invalid E2E_ARTIFACT_DIR timestamp binding: $ARTIFACT_DIR" >&2
+        exit 1
+    fi
+else
+    GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    TIMESTAMP="${GENERATED_AT//-/}"
+    TIMESTAMP="${TIMESTAMP//:/}"
+    ARTIFACT_DIR="$PROJECT_ROOT/tests/e2e_results/$TIMESTAMP"
+fi
 PARALLELISM="${E2E_PARALLELISM:-1}"
 LOG_LEVEL="${RUST_LOG:-info}"
 PROFILE="${VERIFY_PROFILE:-full}"
@@ -71,6 +110,8 @@ CARGO_RUNNER_DESC="cargo"
 CARGO_EXEC_PREFIX=""
 CARGO_EXEC_PREFIX_JSON="[]"
 CARGO_RUNNER_ARGS=()
+SOURCE_COMMIT=""
+SOURCE_SNAPSHOT=""
 
 configure_cargo_runner() {
     case "$CARGO_RUNNER_MODE" in
@@ -530,7 +571,519 @@ if [[ -n "$DIFF_FROM" ]]; then
     DIFF_JSON_VALUE="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$DIFF_FROM")"
 fi
 
+# ─── Clean Source Snapshot ───────────────────────────────────────────────────
+
+capture_repository_snapshot() {
+    python3 - "$PROJECT_ROOT" "$ARTIFACT_DIR" "${CARGO_TARGET_DIR:-$PROJECT_ROOT/target}" <<'PY'
+import hashlib
+import os
+import re
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+raw_root = Path(sys.argv[1])
+raw_artifact_dir = Path(sys.argv[2])
+raw_cargo_target_dir = Path(sys.argv[3])
+
+
+def fail(detail: str) -> None:
+    print(detail, file=sys.stderr)
+    raise SystemExit(1)
+
+
+try:
+    root_metadata = raw_root.lstat()
+except OSError as exc:
+    fail(f"cannot inspect repository root: {exc}")
+if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+    fail("repository root must be a real directory, not a symlink")
+
+try:
+    root = raw_root.resolve(strict=True)
+    git_marker = root / ".git"
+    marker_metadata = git_marker.lstat()
+    if stat.S_ISLNK(marker_metadata.st_mode):
+        fail("repository .git marker must not be a symlink")
+    if stat.S_ISDIR(marker_metadata.st_mode):
+        git_dir = git_marker.resolve(strict=True)
+    elif stat.S_ISREG(marker_metadata.st_mode):
+        marker = git_marker.read_text(encoding="utf-8").rstrip("\r\n")
+        if "\n" in marker or "\r" in marker or not marker.startswith("gitdir: "):
+            fail("repository .git file is malformed")
+        target = Path(marker.removeprefix("gitdir: "))
+        candidate = target if target.is_absolute() else root / target
+        target_metadata = candidate.lstat()
+        if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISDIR(target_metadata.st_mode):
+            fail("repository gitfile target must be a non-symlink directory")
+        git_dir = candidate.resolve(strict=True)
+    else:
+        fail("repository .git marker is neither a directory nor a gitfile")
+except (OSError, RuntimeError, UnicodeError) as exc:
+    fail(f"repository Git context could not be resolved safely: {exc}")
+
+
+def git(*args: str) -> bytes:
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    result = subprocess.run(
+        [
+            "git",
+            "--git-dir",
+            str(git_dir),
+            "--work-tree",
+            str(root),
+            "-c",
+            "core.bare=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            f"core.worktree={root}",
+            *args,
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.decode("utf-8", "replace").strip()
+        fail(f"git {' '.join(args)} failed: {diagnostic}")
+    return result.stdout
+
+
+def one_canonical_path(raw: bytes, label: str) -> Path:
+    try:
+        text = raw.decode("utf-8", "strict")
+    except UnicodeError as exc:
+        fail(f"Git {label} output is not UTF-8: {exc}")
+    if not text.endswith("\n") or "\n" in text.removesuffix("\n"):
+        fail(f"Git {label} output is not one canonical line")
+    try:
+        return Path(text.removesuffix("\n")).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        fail(f"Git {label} path cannot be canonicalized: {exc}")
+
+
+def split_record(record: bytes, label: str) -> tuple[bytes, bytes]:
+    try:
+        metadata, path = record.split(b"\t", 1)
+    except ValueError:
+        fail(f"malformed {label} record")
+    if not path:
+        fail(f"empty path in {label} record")
+    return metadata, path
+
+
+if one_canonical_path(git("rev-parse", "--show-toplevel"), "top-level") != root:
+    fail("Git worktree does not match the filesystem-derived repository root")
+if one_canonical_path(git("rev-parse", "--absolute-git-dir"), "directory") != git_dir:
+    fail("Git directory does not match the filesystem-derived repository binding")
+
+try:
+    head = git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
+except UnicodeError as exc:
+    fail(f"HEAD object ID is not ASCII: {exc}")
+if (
+    len(head) not in (40, 64)
+    or head.lower() != head
+    or any(character not in "0123456789abcdef" for character in head)
+):
+    fail(f"HEAD is not a canonical full object ID: {head!r}")
+
+tree_bytes = git("ls-tree", "-r", "-z", "--full-tree", head)
+tree: dict[bytes, tuple[bytes, bytes]] = {}
+for record in filter(None, tree_bytes.split(b"\0")):
+    metadata, path = split_record(record, "HEAD tree")
+    fields = metadata.split(b" ")
+    if len(fields) != 3:
+        fail("malformed HEAD tree metadata")
+    mode, object_type, object_id = fields
+    if mode not in (b"100644", b"100755", b"120000") or object_type != b"blob":
+        fail(
+            f"unsupported tracked entry at {os.fsdecode(path)!r}: "
+            f"mode={mode!r} type={object_type!r}"
+        )
+    if path in tree:
+        fail(f"duplicate path in HEAD tree: {os.fsdecode(path)!r}")
+    tree[path] = (mode, object_id)
+
+index_bytes = git("ls-files", "--stage", "-z")
+index: dict[bytes, tuple[bytes, bytes]] = {}
+for record in filter(None, index_bytes.split(b"\0")):
+    metadata, path = split_record(record, "index")
+    fields = metadata.split(b" ")
+    if len(fields) != 3:
+        fail("malformed index metadata")
+    mode, object_id, stage = fields
+    if stage != b"0":
+        fail(f"non-stage-zero index entry at {os.fsdecode(path)!r}")
+    if path in index:
+        fail(f"duplicate path in index: {os.fsdecode(path)!r}")
+    index[path] = (mode, object_id)
+if index != tree:
+    fail("index entries do not match the HEAD tree exactly")
+
+flag_bytes = git("ls-files", "-v", "-z")
+flag_paths: set[bytes] = set()
+for record in filter(None, flag_bytes.split(b"\0")):
+    if len(record) < 3 or record[1:2] != b" ":
+        fail("malformed index-flag record")
+    tag, path = record[:1], record[2:]
+    if tag != b"H":
+        fail(
+            f"non-canonical index flag {tag.decode('ascii', 'replace')!r} at "
+            f"{os.fsdecode(path)!r}; assume-unchanged and skip-worktree are forbidden"
+        )
+    if path in flag_paths:
+        fail(f"duplicate path in index-flag listing: {os.fsdecode(path)!r}")
+    flag_paths.add(path)
+if flag_paths != set(tree):
+    fail("index-flag path set does not match the HEAD tree")
+
+untracked_bytes = git("ls-files", "--others", "--exclude-standard", "-z")
+if untracked_bytes:
+    untracked_paths = [
+        os.fsdecode(path) for path in untracked_bytes.split(b"\0") if path
+    ]
+    fail("untracked non-ignored paths are present: " + ", ".join(untracked_paths[:10]))
+
+known_generated_output_prefixes = (
+    b"tests/ext_conformance/artifacts/",
+    b"tests/ext_conformance/reports/",
+    b"tests/artifacts/perf/",
+    b"tests/evidence_bundle/",
+    b".rch-tmp/",
+    b".rch-target-",
+)
+
+
+def repository_relative_output_path(raw_path: Path) -> Path | None:
+    candidate = raw_path if raw_path.is_absolute() else root / raw_path
+    try:
+        return Path(os.path.abspath(candidate)).relative_to(root)
+    except (OSError, ValueError):
+        return None
+
+
+allowed_output_prefixes = set(known_generated_output_prefixes)
+artifact_relative = repository_relative_output_path(raw_artifact_dir)
+if artifact_relative is not None:
+    artifact_parts = artifact_relative.parts
+    if (
+        len(artifact_parts) != 3
+        or artifact_parts[:2] != ("tests", "e2e_results")
+        or re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", artifact_parts[2]) is None
+    ):
+        fail(
+            "in-repository E2E artifact directory must be one canonical timestamp child "
+            "of tests/e2e_results"
+        )
+    allowed_output_prefixes.add(os.fsencode(artifact_relative) + b"/")
+
+cargo_target_relative = repository_relative_output_path(raw_cargo_target_dir)
+if cargo_target_relative is not None:
+    cargo_target_parts = cargo_target_relative.parts
+    target_root = cargo_target_parts[0] if cargo_target_parts else ""
+    if re.fullmatch(
+        r"(?:target(?:[-_].+)?|\.cargo-target.*|\.target[-_].+|_target[-_].+|"
+        r"\.rch-target-.+|bd-.+)",
+        target_root,
+    ) is None:
+        fail(
+            "in-repository CARGO_TARGET_DIR must be under an approved root-level "
+            "Cargo target/cache directory"
+        )
+    allowed_output_prefixes.add(os.fsencode(cargo_target_relative) + b"/")
+
+
+def ignored_path_is_generated_output(path: bytes) -> bool:
+    return any(path.startswith(prefix) for prefix in allowed_output_prefixes)
+
+
+def ignored_source_bytes() -> bytes:
+    ignored_bytes = git("ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+    paths = [
+        path
+        for path in ignored_bytes.split(b"\0")
+        if path and not ignored_path_is_generated_output(path)
+    ]
+    if paths:
+        decoded = [os.fsdecode(path) for path in paths]
+        fail(
+            "ignored untracked paths outside approved generated-output roots are present: "
+            + ", ".join(decoded[:10])
+        )
+    return b""
+
+
+initial_ignored_source_bytes = ignored_source_bytes()
+
+root_bytes = os.fsencode(root)
+
+
+def framed_field(value: bytes) -> bytes:
+    return str(len(value)).encode("ascii") + b":" + value
+
+
+def capture_raw_source_digest() -> str:
+    digest = hashlib.sha256()
+    digest.update(framed_field(b"pi.e2e.source_snapshot.v1"))
+    digest.update(framed_field(head.encode("ascii")))
+    digest.update(framed_field(tree_bytes))
+    digest.update(framed_field(index_bytes))
+    digest.update(framed_field(flag_bytes))
+
+    for path, (expected_mode, expected_object_id) in tree.items():
+        full_path = os.path.join(root_bytes, path)
+        parent = os.path.dirname(full_path)
+        while parent != root_bytes:
+            try:
+                parent_metadata = os.lstat(parent)
+            except OSError as exc:
+                fail(f"cannot inspect parent of {os.fsdecode(path)!r}: {exc}")
+            if stat.S_ISLNK(parent_metadata.st_mode):
+                fail(f"tracked path traverses a symlinked parent: {os.fsdecode(path)!r}")
+            if not stat.S_ISDIR(parent_metadata.st_mode):
+                fail(f"tracked path traverses a non-directory parent: {os.fsdecode(path)!r}")
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent or not parent.startswith(root_bytes + os.sep.encode()):
+                fail(f"tracked path escapes repository root: {os.fsdecode(path)!r}")
+            parent = next_parent
+
+        try:
+            file_metadata = os.lstat(full_path)
+        except OSError as exc:
+            fail(f"cannot inspect tracked path {os.fsdecode(path)!r}: {exc}")
+
+        if expected_mode in (b"100644", b"100755"):
+            if not stat.S_ISREG(file_metadata.st_mode):
+                fail(f"tracked regular file has wrong worktree type: {os.fsdecode(path)!r}")
+            actual_mode = b"100755" if file_metadata.st_mode & 0o111 else b"100644"
+            if actual_mode != expected_mode:
+                fail(
+                    f"raw worktree mode differs from HEAD at {os.fsdecode(path)!r}: "
+                    f"expected={expected_mode.decode('ascii')} actual={actual_mode.decode('ascii')}"
+                )
+            try:
+                with open(full_path, "rb") as handle:
+                    contents = handle.read()
+            except OSError as exc:
+                fail(f"cannot read tracked path {os.fsdecode(path)!r}: {exc}")
+        else:
+            if not stat.S_ISLNK(file_metadata.st_mode):
+                fail(f"tracked symlink has wrong worktree type: {os.fsdecode(path)!r}")
+            actual_mode = b"120000"
+            try:
+                contents = os.readlink(full_path)
+            except OSError as exc:
+                fail(f"cannot read tracked symlink {os.fsdecode(path)!r}: {exc}")
+
+        framed_blob = b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
+        if len(expected_object_id) == 40:
+            actual_object_id = hashlib.sha1(framed_blob).hexdigest().encode("ascii")
+        elif len(expected_object_id) == 64:
+            actual_object_id = hashlib.sha256(framed_blob).hexdigest().encode("ascii")
+        else:
+            fail(f"unsupported Git object ID length for {os.fsdecode(path)!r}")
+        if actual_object_id != expected_object_id:
+            fail(f"raw worktree bytes differ from HEAD at {os.fsdecode(path)!r}")
+
+        digest.update(framed_field(path))
+        digest.update(framed_field(actual_mode))
+        digest.update(framed_field(contents))
+
+    return digest.hexdigest()
+
+
+def verify_git_metadata_unchanged() -> None:
+    try:
+        current_head = git("rev-parse", "--verify", "HEAD^{commit}").decode(
+            "ascii", "strict"
+        ).strip()
+    except UnicodeError as exc:
+        fail(f"HEAD object ID became invalid while capturing source: {exc}")
+    if current_head != head:
+        fail("HEAD changed while repository state was captured")
+    if git("ls-tree", "-r", "-z", "--full-tree", head) != tree_bytes:
+        fail("HEAD tree changed while repository state was captured")
+    if git("ls-files", "--stage", "-z") != index_bytes:
+        fail("index changed while repository state was captured")
+    if git("ls-files", "-v", "-z") != flag_bytes:
+        fail("index flags changed while repository state was captured")
+    if git("ls-files", "--others", "--exclude-standard", "-z") != untracked_bytes:
+        fail("untracked path set changed while repository state was captured")
+    if ignored_source_bytes() != initial_ignored_source_bytes:
+        fail("ignored source path set changed while repository state was captured")
+
+
+initial_digest = capture_raw_source_digest()
+verify_git_metadata_unchanged()
+final_digest = capture_raw_source_digest()
+if final_digest != initial_digest:
+    fail("raw tracked worktree bytes or modes changed while repository state was captured")
+verify_git_metadata_unchanged()
+
+print(f"{head}|sha256:{final_digest}")
+PY
+}
+
+initialize_source_snapshot() {
+    local captured_snapshot extra_field
+    if ! captured_snapshot="$(capture_repository_snapshot 2>&1)"; then
+        echo "[source] FAIL: repository is not byte-for-byte clean at snapshot time: $captured_snapshot" >&2
+        return 1
+    fi
+    IFS='|' read -r SOURCE_COMMIT SOURCE_SNAPSHOT extra_field <<<"$captured_snapshot"
+    if [[ -n "$extra_field" ]] || \
+        [[ ! "$SOURCE_COMMIT" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || \
+        [[ ! "$SOURCE_SNAPSHOT" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "[source] FAIL: repository snapshot helper returned malformed identity" >&2
+        SOURCE_COMMIT=""
+        SOURCE_SNAPSHOT=""
+        return 1
+    fi
+    echo "[source] Captured clean source snapshot at $SOURCE_COMMIT ($SOURCE_SNAPSHOT)"
+}
+
+verify_source_snapshot_unchanged() {
+    local final_capture final_commit final_snapshot extra_field
+    if ! final_capture="$(capture_repository_snapshot 2>&1)"; then
+        echo "[source] FAIL: final repository snapshot could not be captured: $final_capture" >&2
+        return 1
+    fi
+    IFS='|' read -r final_commit final_snapshot extra_field <<<"$final_capture"
+    if [[ -n "$extra_field" ]] || \
+        [[ "$final_commit" != "$SOURCE_COMMIT" ]] || \
+        [[ "$final_snapshot" != "$SOURCE_SNAPSHOT" ]]; then
+        echo "[source] FAIL: repository source changed during E2E verification" >&2
+        echo "[source] Initial: $SOURCE_COMMIT|$SOURCE_SNAPSHOT" >&2
+        echo "[source] Final:   $final_capture" >&2
+        return 1
+    fi
+    echo "[source] PASS: final source snapshot matches $SOURCE_SNAPSHOT"
+}
+
+capture_diagnostic_artifacts_json() {
+    local output_log_path="$1"
+    local test_log_path="${2:-}"
+    local artifact_index_path="${3:-}"
+
+    python3 - "$output_log_path" "$test_log_path" "$artifact_index_path" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+
+def fail(detail: str) -> None:
+    print(f"diagnostic artifact binding failed: {detail}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def capture_file(raw_path: str, label: str) -> dict | None:
+    if not raw_path:
+        return None
+    path = Path(os.path.abspath(raw_path))
+    parent = path.parent
+    while True:
+        try:
+            parent_metadata = parent.lstat()
+        except OSError as exc:
+            fail(f"cannot inspect parent of {label}: {parent}: {exc}")
+        if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+            fail(f"{label} traverses a symlinked or non-directory parent: {parent}")
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        fail(f"cannot open {label} as a non-symlink regular file: {path}: {exc}")
+
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            fail(f"{label} is not a regular file: {path}")
+        if before.st_mode & 0o111:
+            fail(f"{label} must not be executable: {path}")
+
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+
+    stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+        fail(f"{label} changed while its raw bytes were hashed: {path}")
+    if size != after.st_size:
+        fail(f"{label} byte count changed while it was hashed: {path}")
+    try:
+        final_metadata = path.lstat()
+    except OSError as exc:
+        fail(f"cannot re-inspect {label}: {path}: {exc}")
+    if any(getattr(after, field) != getattr(final_metadata, field) for field in stable_fields):
+        fail(f"{label} path was replaced while its raw bytes were hashed: {path}")
+
+    return {
+        "path": raw_path,
+        "sha256": f"sha256:{digest.hexdigest()}",
+        "size_bytes": size,
+    }
+
+
+output_log, test_log, artifact_index = sys.argv[1:]
+payload = {
+    "schema": "pi.e2e.diagnostic_artifacts.v1",
+    "output_log": capture_file(output_log, "output log"),
+    "test_log_jsonl": capture_file(test_log, "test log JSONL"),
+    "artifact_index_jsonl": capture_file(artifact_index, "artifact index JSONL"),
+}
+print(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+PY
+}
+
 # ─── Environment Capture ─────────────────────────────────────────────────────
+
+prepare_artifact_directory() {
+    if [[ -L "$ARTIFACT_DIR" ]]; then
+        echo "[preflight] E2E artifact directory must not be a symlink: $ARTIFACT_DIR" >&2
+        return 1
+    fi
+    if [[ -e "$ARTIFACT_DIR" && ! -d "$ARTIFACT_DIR" ]]; then
+        echo "[preflight] E2E artifact path is not a directory: $ARTIFACT_DIR" >&2
+        return 1
+    fi
+    if ! mkdir -p "$ARTIFACT_DIR"; then
+        echo "[preflight] Unable to create E2E artifact directory: $ARTIFACT_DIR" >&2
+        return 1
+    fi
+
+    local first_entry
+    if ! first_entry="$(find "$ARTIFACT_DIR" -mindepth 1 -maxdepth 1 -print -quit)"; then
+        echo "[preflight] Unable to inspect E2E artifact directory: $ARTIFACT_DIR" >&2
+        return 1
+    fi
+    if [[ -n "$first_entry" ]]; then
+        echo "[preflight] E2E artifact directory must be empty; refusing to reuse prior evidence: $ARTIFACT_DIR" >&2
+        return 1
+    fi
+}
 
 check_disk_headroom() {
     local min_free_mb="${VERIFY_MIN_FREE_MB:-2048}"
@@ -591,23 +1144,28 @@ check_disk_headroom() {
         avail_kb="${disk_row%%|*}"
         mount_point="${disk_row#*|}"
 
-        local inode_used_pct inode_free_pct
+        local inode_used_pct inode_free_pct inode_free_display
+        local inode_check_available=true
         inode_used_pct="$(df -Pi "$probe_path" | awk 'NR==2 {gsub(/%/, "", $5); print $5}')"
-        if [[ -z "$inode_used_pct" ]]; then
-            inode_free_pct=0
-        else
+        if [[ "$inode_used_pct" =~ ^[0-9]+$ ]]; then
             inode_free_pct=$((100 - inode_used_pct))
+            inode_free_display="${inode_free_pct}%"
+        else
+            inode_free_pct="unknown"
+            inode_free_display="unknown"
+            inode_check_available=false
+            echo "[preflight] WARN: inode utilization is unavailable for '$probe_path'" >&2
         fi
 
         local avail_mb
         avail_mb=$((avail_kb / 1024))
-        echo "[preflight] target=$probe_label mount=$mount_point free=${avail_mb}MB inode_free=${inode_free_pct}% path=$raw_path"
+        echo "[preflight] target=$probe_label mount=$mount_point free=${avail_mb}MB inode_free=$inode_free_display path=$raw_path"
 
         if (( avail_kb < required_kb )); then
             echo "[preflight] FAIL: target '$probe_label' on mount '$mount_point' has ${avail_mb}MB free (< ${required_mb}MB required)" >&2
             failed=true
         fi
-        if (( inode_free_pct < min_inode_free_pct )); then
+        if $inode_check_available && (( inode_free_pct < min_inode_free_pct )); then
             echo "[preflight] FAIL: mount '$mount_point' has ${inode_free_pct}% free inodes (< ${min_inode_free_pct}% required)" >&2
             failed=true
         fi
@@ -637,12 +1195,13 @@ capture_env() {
     rustc_version="$(rustc --version 2>/dev/null || echo 'unknown')"
     cargo_version="$(run_cargo --version 2>/dev/null || echo 'unknown')"
     os_info="$(uname -srm 2>/dev/null || echo 'unknown')"
-    git_sha="$(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
+    git_sha="$SOURCE_COMMIT"
     git_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 
     cat > "$env_file" <<ENVJSON
 {
   "schema": "pi.e2e.environment.v1",
+  "generated_at": "$GENERATED_AT",
   "timestamp": "$TIMESTAMP",
   "profile": "$PROFILE",
   "rerun_from": $RERUN_JSON_VALUE,
@@ -654,6 +1213,8 @@ capture_env() {
   "os": "$os_info",
   "git_sha": "$git_sha",
   "git_branch": "$git_branch",
+  "source_commit": "$SOURCE_COMMIT",
+  "source_snapshot": "$SOURCE_SNAPSHOT",
   "parallelism": $PARALLELISM,
   "log_level": "$LOG_LEVEL",
   "artifact_dir": "$ARTIFACT_DIR",
@@ -803,6 +1364,10 @@ run_lib_tests() {
     ignored=$(grep -oP '\d+ ignored' "$log_file" | tail -1 | grep -oP '\d+' || echo "0")
     total=$((passed + failed + ignored))
 
+    redact_secrets
+    local diagnostic_artifacts_json
+    diagnostic_artifacts_json="$(capture_diagnostic_artifacts_json "$log_file")"
+
     cat > "$result_file" <<RESULTJSON
 {
   "schema": "pi.e2e.result.v1",
@@ -816,6 +1381,7 @@ run_lib_tests() {
   "ignored": $ignored,
   "total": $total,
   "log_file": "$log_file",
+  "diagnostic_artifacts": $diagnostic_artifacts_json,
   "timestamp": "$TIMESTAMP"
 }
 RESULTJSON
@@ -891,6 +1457,8 @@ run_unit_target() {
     local test_log_env_path artifact_index_env_path
     test_log_env_path="$(path_for_test_harness "$target_dir/test-log.jsonl")"
     artifact_index_env_path="$(path_for_test_harness "$target_dir/artifact-index.jsonl")"
+    : > "$target_dir/test-log.jsonl"
+    : > "$target_dir/artifact-index.jsonl"
     export TEST_LOG_JSONL_PATH="$test_log_env_path"
     export TEST_ARTIFACT_INDEX_PATH="$artifact_index_env_path"
     export RUST_LOG="$LOG_LEVEL"
@@ -919,6 +1487,15 @@ run_unit_target() {
     ignored=$(grep -oP '\d+ ignored' "$log_file" | tail -1 | grep -oP '\d+' || echo "0")
     total=$((passed + failed + ignored))
 
+    redact_secrets
+    local diagnostic_artifacts_json
+    diagnostic_artifacts_json="$(
+        capture_diagnostic_artifacts_json \
+            "$log_file" \
+            "$target_dir/test-log.jsonl" \
+            "$target_dir/artifact-index.jsonl"
+    )"
+
     cat > "$result_file" <<RESULTJSON
 {
   "schema": "pi.e2e.result.v1",
@@ -934,6 +1511,7 @@ run_unit_target() {
   "log_file": "$log_file",
   "test_log_jsonl": "$target_dir/test-log.jsonl",
   "artifact_index_jsonl": "$target_dir/artifact-index.jsonl",
+  "diagnostic_artifacts": $diagnostic_artifacts_json,
   "timestamp": "$TIMESTAMP"
 }
 RESULTJSON
@@ -969,6 +1547,8 @@ run_suite() {
     local test_log_env_path artifact_index_env_path
     test_log_env_path="$(path_for_test_harness "$suite_dir/test-log.jsonl")"
     artifact_index_env_path="$(path_for_test_harness "$suite_dir/artifact-index.jsonl")"
+    : > "$suite_dir/test-log.jsonl"
+    : > "$suite_dir/artifact-index.jsonl"
     export TEST_LOG_JSONL_PATH="$test_log_env_path"
     export TEST_ARTIFACT_INDEX_PATH="$artifact_index_env_path"
     export RUST_LOG="$LOG_LEVEL"
@@ -1000,6 +1580,15 @@ run_suite() {
     ignored=$(grep -oP '\d+ ignored' "$log_file" | tail -1 | grep -oP '\d+' || echo "0")
     total=$((passed + failed + ignored))
 
+    redact_secrets
+    local diagnostic_artifacts_json
+    diagnostic_artifacts_json="$(
+        capture_diagnostic_artifacts_json \
+            "$log_file" \
+            "$suite_dir/test-log.jsonl" \
+            "$suite_dir/artifact-index.jsonl"
+    )"
+
     cat > "$result_file" <<RESULTJSON
 {
   "schema": "pi.e2e.result.v1",
@@ -1015,6 +1604,7 @@ run_suite() {
   "log_file": "$log_file",
   "test_log_jsonl": "$suite_dir/test-log.jsonl",
   "artifact_index_jsonl": "$suite_dir/artifact-index.jsonl",
+  "diagnostic_artifacts": $diagnostic_artifacts_json,
   "timestamp": "$TIMESTAMP"
 }
 RESULTJSON
@@ -1038,6 +1628,7 @@ RESULTJSON
 
 write_summary() {
     local summary_file="$ARTIFACT_DIR/summary.json"
+    local lib_result_json="null"
     local total_units=${#SELECTED_UNIT_TARGETS[@]}
     local passed_units=0
     local failed_units=0
@@ -1048,6 +1639,14 @@ write_summary() {
     local failed_names=()
 
     echo "[summary] Writing manifest to $summary_file"
+
+    # Freeze all human-readable diagnostics before embedding their byte
+    # identities from the per-target result documents into the summary.
+    redact_secrets
+
+    if [[ -f "$ARTIFACT_DIR/lib/result.json" ]]; then
+        lib_result_json="$(cat "$ARTIFACT_DIR/lib/result.json")"
+    fi
 
     # Read unit target results.
     local unit_results_array="["
@@ -1103,18 +1702,18 @@ write_summary() {
     done
     suite_results_array+="]"
 
-    # Redact secrets from logs.
-    redact_secrets
-
     cat > "$summary_file" <<SUMMARYJSON
 {
   "schema": "pi.e2e.summary.v1",
+  "generated_at": "$GENERATED_AT",
   "timestamp": "$TIMESTAMP",
   "profile": "$PROFILE",
   "rerun_from": $RERUN_JSON_VALUE,
   "diff_from": $DIFF_JSON_VALUE,
   "artifact_dir": "$ARTIFACT_DIR",
   "correlation_id": "$CORRELATION_ID",
+  "source_commit": "$SOURCE_COMMIT",
+  "source_snapshot": "$SOURCE_SNAPSHOT",
   "shard": {
     "kind": "$SHARD_KIND",
     "name": "$SHARD_NAME",
@@ -1129,6 +1728,8 @@ write_summary() {
   "passed_suites": $passed_suites,
   "failed_suites": $failed_suites,
   "failed_names": $(printf '%s\n' "${failed_names[@]:-}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))' 2>/dev/null || echo '[]'),
+  "lib": $lib_result_json,
+  "runner_outcome": null,
   "unit_targets": $unit_results_array,
   "suites": $suite_results_array
 }
@@ -1172,6 +1773,104 @@ SUMMARYJSON
     fi
     echo " Artifacts: $ARTIFACT_DIR"
     echo "═══════════════════════════════════════════════════════════════"
+}
+
+write_runner_outcome() {
+    local exit_code="$1"
+    local source_snapshot_verified="$2"
+    shift 2
+    local failed_phases_json
+    failed_phases_json="$(
+        printf '%s\n' "$@" | \
+            python3 -c 'import json,sys; print(json.dumps([line.strip() for line in sys.stdin if line.strip()]))'
+    )"
+
+    if ARTIFACT_DIR="$ARTIFACT_DIR" \
+        GENERATED_AT="$GENERATED_AT" \
+        TIMESTAMP="$TIMESTAMP" \
+        VERIFY_PROFILE_NAME="$PROFILE" \
+        CORRELATION_ID="$CORRELATION_ID" \
+        SOURCE_COMMIT="$SOURCE_COMMIT" \
+        SOURCE_SNAPSHOT="$SOURCE_SNAPSHOT" \
+        RUNNER_EXIT_CODE="$exit_code" \
+        SOURCE_SNAPSHOT_VERIFIED="$source_snapshot_verified" \
+        FAILED_PHASES_JSON="$failed_phases_json" \
+        python3 - <<'PY'
+import json
+import os
+import re
+from pathlib import Path
+
+artifact_dir = Path(os.environ["ARTIFACT_DIR"])
+summary_path = artifact_dir / "summary.json"
+outcome_path = artifact_dir / "runner_outcome.json"
+
+try:
+    exit_code = int(os.environ["RUNNER_EXIT_CODE"])
+except ValueError as exc:
+    raise SystemExit(f"runner exit code is invalid: {exc}") from exc
+if exit_code not in (0, 1):
+    raise SystemExit(f"runner exit code must be 0 or 1, got {exit_code}")
+
+source_snapshot_verified_raw = os.environ["SOURCE_SNAPSHOT_VERIFIED"]
+if source_snapshot_verified_raw not in {"true", "false"}:
+    raise SystemExit("source snapshot verification flag must be true or false")
+source_snapshot_verified = source_snapshot_verified_raw == "true"
+
+try:
+    failed_phases = json.loads(os.environ["FAILED_PHASES_JSON"])
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"failed phase list is invalid JSON: {exc}") from exc
+if (
+    not isinstance(failed_phases, list)
+    or any(
+        not isinstance(phase, str)
+        or re.fullmatch(r"[A-Za-z0-9_.:-]+", phase) is None
+        for phase in failed_phases
+    )
+    or len(failed_phases) != len(set(failed_phases))
+):
+    raise SystemExit("failed phase list must contain unique canonical identifiers")
+
+passed = exit_code == 0 and source_snapshot_verified and not failed_phases
+if (exit_code == 0) != passed:
+    raise SystemExit(
+        "runner exit code 0 requires a verified source snapshot and no failed phases"
+    )
+
+outcome = {
+    "schema": "pi.e2e.runner_outcome.v1",
+    "generated_at": os.environ["GENERATED_AT"],
+    "timestamp": os.environ["TIMESTAMP"],
+    "profile": os.environ["VERIFY_PROFILE_NAME"],
+    "artifact_dir": str(artifact_dir),
+    "correlation_id": os.environ["CORRELATION_ID"],
+    "source_commit": os.environ["SOURCE_COMMIT"],
+    "source_snapshot": os.environ["SOURCE_SNAPSHOT"],
+    "status": "pass" if passed else "fail",
+    "exit_code": exit_code,
+    "source_snapshot_verified": source_snapshot_verified,
+    "failed_phases": failed_phases,
+}
+
+try:
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"cannot load summary before writing runner outcome: {exc}") from exc
+if not isinstance(summary, dict):
+    raise SystemExit("summary must be an object before writing runner outcome")
+
+outcome_path.write_text(json.dumps(outcome, indent=2) + "\n", encoding="utf-8")
+summary["runner_outcome"] = outcome
+summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+PY
+    then
+        echo "[outcome] Recorded runner exit=$exit_code source_verified=$source_snapshot_verified"
+        return 0
+    fi
+
+    echo "[outcome] FAIL: unable to record the final runner outcome" >&2
+    return 1
 }
 
 # ─── Structured Failure Diagnostics (bd-1f42.8.6.4) ─────────────────────────
@@ -4140,6 +4839,7 @@ PY
 
 validate_evidence_contract() {
     local contract_file="$ARTIFACT_DIR/evidence_contract.json"
+    local runner_outcome_file="$ARTIFACT_DIR/runner_outcome.json"
     local selected_units_json selected_suites_json
     local all_unit_targets_json all_suites_json
     local perf_baseline_confidence_json perf_extension_stratification_json
@@ -4169,8 +4869,12 @@ validate_evidence_contract() {
 
     if ARTIFACT_DIR="$ARTIFACT_DIR" \
         PROJECT_ROOT="$PROJECT_ROOT" \
+        GENERATED_AT="$GENERATED_AT" \
+        SOURCE_COMMIT="$SOURCE_COMMIT" \
+        SOURCE_SNAPSHOT="$SOURCE_SNAPSHOT" \
         VERIFY_PROFILE_NAME="$PROFILE" \
         CONTRACT_FILE="$contract_file" \
+        RUNNER_OUTCOME_FILE="$runner_outcome_file" \
         SELECTED_UNITS_JSON="$selected_units_json" \
         SELECTED_SUITES_JSON="$selected_suites_json" \
         ALL_UNIT_TARGETS_JSON="$all_unit_targets_json" \
@@ -4184,18 +4888,24 @@ validate_evidence_contract() {
         FRANKEN_NODE_CLAIM_TIER="$franken_node_claim_tier_json" \
         CI_ENV="${CI:-}" \
         python3 - <<'PY'
+import hashlib
 import json
 import math
 import os
 import re
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 artifact_dir = Path(os.environ["ARTIFACT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
+generated_at = os.environ["GENERATED_AT"]
+source_commit = os.environ["SOURCE_COMMIT"]
+source_snapshot = os.environ["SOURCE_SNAPSHOT"]
 profile = os.environ.get("VERIFY_PROFILE_NAME", "full")
 contract_file = Path(os.environ["CONTRACT_FILE"])
+runner_outcome_path = Path(os.environ["RUNNER_OUTCOME_FILE"])
 
 try:
     selected_units = json.loads(os.environ.get("SELECTED_UNITS_JSON", "[]"))
@@ -4323,9 +5033,9 @@ def remediation_for_missing_keys(check_id: str, path: Path, missing: list[str]) 
             "Update generate_failure_diagnostics() payloads in scripts/e2e/run_all.sh "
             f"to include key(s): {missing_list}."
         )
-    if check_id.startswith("unit:") or check_id.startswith("suite:"):
+    if check_id.startswith(("lib:", "unit:", "suite:")):
         return (
-            "Update run_unit_target()/run_suite() result.json emitters to include "
+            "Update the lib/unit/suite result.json emitters to include "
             f"key(s): {missing_list}."
         )
     if check_id.startswith("conformance.release_readiness"):
@@ -4437,6 +5147,7 @@ require_keys(
     environment_path,
     [
         "schema",
+        "generated_at",
         "timestamp",
         "profile",
         "rerun_from",
@@ -4446,6 +5157,8 @@ require_keys(
         "os",
         "git_sha",
         "git_branch",
+        "source_commit",
+        "source_snapshot",
         "parallelism",
         "log_level",
         "artifact_dir",
@@ -4465,12 +5178,15 @@ require_keys(
     summary_path,
     [
         "schema",
+        "generated_at",
         "timestamp",
         "profile",
         "rerun_from",
         "diff_from",
         "artifact_dir",
         "correlation_id",
+        "source_commit",
+        "source_snapshot",
         "shard",
         "total_units",
         "passed_units",
@@ -4478,9 +5194,33 @@ require_keys(
         "total_suites",
         "passed_suites",
         "failed_suites",
+        "lib",
+        "runner_outcome",
         "unit_targets",
         "suites",
         "failure_diagnostics",
+    ],
+    strict=True,
+)
+
+runner_outcome = load_json("runner_outcome", runner_outcome_path, strict=True)
+require_keys(
+    "runner_outcome",
+    runner_outcome,
+    runner_outcome_path,
+    [
+        "schema",
+        "generated_at",
+        "timestamp",
+        "profile",
+        "artifact_dir",
+        "correlation_id",
+        "source_commit",
+        "source_snapshot",
+        "status",
+        "exit_code",
+        "source_snapshot_verified",
+        "failed_phases",
     ],
     strict=True,
 )
@@ -4543,6 +5283,360 @@ if summary_correlation_id and environment_correlation_id:
         remediation=(
             "Propagate the same CORRELATION_ID through capture_env() and write_summary()."
         ),
+    )
+
+if isinstance(environment, dict):
+    require_condition(
+        "environment.generated_at_matches_run",
+        path=environment_path,
+        ok=environment.get("generated_at") == generated_at,
+        ok_msg="environment generated_at matches the run timestamp",
+        fail_msg=(
+            "environment generated_at mismatch: expected "
+            f"{generated_at!r}, got {environment.get('generated_at')!r}"
+        ),
+        strict=True,
+        remediation="Emit the run-level GENERATED_AT value in environment.json.",
+    )
+
+if isinstance(summary, dict):
+    require_condition(
+        "summary.generated_at_matches_run",
+        path=summary_path,
+        ok=summary.get("generated_at") == generated_at,
+        ok_msg="summary generated_at matches the run timestamp",
+        fail_msg=(
+            "summary generated_at mismatch: expected "
+            f"{generated_at!r}, got {summary.get('generated_at')!r}"
+        ),
+        strict=True,
+        remediation="Emit the run-level GENERATED_AT value in summary.json.",
+    )
+
+if isinstance(environment, dict) and isinstance(summary, dict):
+    require_condition(
+        "run.generated_at_matches_environment",
+        path=summary_path,
+        ok=summary.get("generated_at") == environment.get("generated_at"),
+        ok_msg="summary/environment generated_at values match",
+        fail_msg=(
+            "summary/environment generated_at mismatch: "
+            f"{summary.get('generated_at')!r} vs {environment.get('generated_at')!r}"
+        ),
+        strict=True,
+        remediation=(
+            "Propagate the same run-level GENERATED_AT value through capture_env() "
+            "and write_summary()."
+        ),
+    )
+
+source_commit_ok = bool(
+    re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", source_commit)
+)
+source_snapshot_ok = bool(re.fullmatch(r"sha256:[0-9a-f]{64}", source_snapshot))
+require_condition(
+    "run.source_commit_format",
+    path=contract_file,
+    ok=source_commit_ok,
+    ok_msg="captured source commit is a canonical full object ID",
+    fail_msg=f"captured source commit is malformed: {source_commit!r}",
+    strict=True,
+    remediation="Rerun from a canonical Git checkout with a valid HEAD commit.",
+)
+require_condition(
+    "run.source_snapshot_format",
+    path=contract_file,
+    ok=source_snapshot_ok,
+    ok_msg="captured source snapshot uses canonical sha256 identity syntax",
+    fail_msg=f"captured source snapshot is malformed: {source_snapshot!r}",
+    strict=True,
+    remediation="Rerun so the producer can capture a clean immutable source snapshot.",
+)
+
+environment_source_commit = (
+    environment.get("source_commit") if isinstance(environment, dict) else None
+)
+environment_source_snapshot = (
+    environment.get("source_snapshot") if isinstance(environment, dict) else None
+)
+summary_source_commit = summary.get("source_commit") if isinstance(summary, dict) else None
+summary_source_snapshot = (
+    summary.get("source_snapshot") if isinstance(summary, dict) else None
+)
+
+if isinstance(environment, dict):
+    require_condition(
+        "environment.source_commit_format",
+        path=environment_path,
+        ok=isinstance(environment_source_commit, str)
+        and bool(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", environment_source_commit)),
+        ok_msg="environment source_commit is a canonical full object ID",
+        fail_msg=f"environment source_commit is malformed: {environment_source_commit!r}",
+        strict=True,
+        remediation="Emit SOURCE_COMMIT from capture_env().",
+    )
+    require_condition(
+        "environment.source_snapshot_format",
+        path=environment_path,
+        ok=isinstance(environment_source_snapshot, str)
+        and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", environment_source_snapshot)),
+        ok_msg="environment source_snapshot uses canonical sha256 identity syntax",
+        fail_msg=f"environment source_snapshot is malformed: {environment_source_snapshot!r}",
+        strict=True,
+        remediation="Emit SOURCE_SNAPSHOT from capture_env().",
+    )
+    require_condition(
+        "environment.source_commit_matches_run",
+        path=environment_path,
+        ok=source_commit_ok and environment_source_commit == source_commit,
+        ok_msg="environment source_commit matches the captured run source",
+        fail_msg=(
+            "environment source_commit does not match the captured run source: "
+            f"{environment_source_commit!r} vs {source_commit!r}"
+        ),
+        strict=True,
+        remediation="Propagate the captured SOURCE_COMMIT unchanged into environment.json.",
+    )
+    require_condition(
+        "environment.source_snapshot_matches_run",
+        path=environment_path,
+        ok=source_snapshot_ok and environment_source_snapshot == source_snapshot,
+        ok_msg="environment source_snapshot matches the captured run source",
+        fail_msg=(
+            "environment source_snapshot does not match the captured run source: "
+            f"{environment_source_snapshot!r} vs {source_snapshot!r}"
+        ),
+        strict=True,
+        remediation="Propagate the captured SOURCE_SNAPSHOT unchanged into environment.json.",
+    )
+    require_condition(
+        "environment.git_sha_matches_source_commit",
+        path=environment_path,
+        ok=source_commit_ok and environment.get("git_sha") == source_commit,
+        ok_msg="environment git_sha matches the captured source commit",
+        fail_msg=(
+            "environment git_sha does not match the captured source commit: "
+            f"{environment.get('git_sha')!r} vs {source_commit!r}"
+        ),
+        strict=True,
+        remediation="Populate environment git_sha from SOURCE_COMMIT.",
+    )
+
+if isinstance(summary, dict):
+    require_condition(
+        "summary.source_commit_format",
+        path=summary_path,
+        ok=isinstance(summary_source_commit, str)
+        and bool(re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", summary_source_commit)),
+        ok_msg="summary source_commit is a canonical full object ID",
+        fail_msg=f"summary source_commit is malformed: {summary_source_commit!r}",
+        strict=True,
+        remediation="Emit SOURCE_COMMIT from write_summary().",
+    )
+    require_condition(
+        "summary.source_snapshot_format",
+        path=summary_path,
+        ok=isinstance(summary_source_snapshot, str)
+        and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", summary_source_snapshot)),
+        ok_msg="summary source_snapshot uses canonical sha256 identity syntax",
+        fail_msg=f"summary source_snapshot is malformed: {summary_source_snapshot!r}",
+        strict=True,
+        remediation="Emit SOURCE_SNAPSHOT from write_summary().",
+    )
+    require_condition(
+        "summary.source_commit_matches_run",
+        path=summary_path,
+        ok=source_commit_ok and summary_source_commit == source_commit,
+        ok_msg="summary source_commit matches the captured run source",
+        fail_msg=(
+            "summary source_commit does not match the captured run source: "
+            f"{summary_source_commit!r} vs {source_commit!r}"
+        ),
+        strict=True,
+        remediation="Propagate the captured SOURCE_COMMIT unchanged into summary.json.",
+    )
+    require_condition(
+        "summary.source_snapshot_matches_run",
+        path=summary_path,
+        ok=source_snapshot_ok and summary_source_snapshot == source_snapshot,
+        ok_msg="summary source_snapshot matches the captured run source",
+        fail_msg=(
+            "summary source_snapshot does not match the captured run source: "
+            f"{summary_source_snapshot!r} vs {source_snapshot!r}"
+        ),
+        strict=True,
+        remediation="Propagate the captured SOURCE_SNAPSHOT unchanged into summary.json.",
+    )
+
+if isinstance(environment, dict) and isinstance(summary, dict):
+    require_condition(
+        "run.source_commit_matches_environment",
+        path=summary_path,
+        ok=summary_source_commit == environment_source_commit,
+        ok_msg="summary/environment source_commit values match",
+        fail_msg=(
+            "summary/environment source_commit mismatch: "
+            f"{summary_source_commit!r} vs {environment_source_commit!r}"
+        ),
+        strict=True,
+        remediation="Propagate one captured SOURCE_COMMIT through all run artifacts.",
+    )
+    require_condition(
+        "run.source_snapshot_matches_environment",
+        path=summary_path,
+        ok=summary_source_snapshot == environment_source_snapshot,
+        ok_msg="summary/environment source_snapshot values match",
+        fail_msg=(
+            "summary/environment source_snapshot mismatch: "
+            f"{summary_source_snapshot!r} vs {environment_source_snapshot!r}"
+        ),
+        strict=True,
+        remediation="Propagate one captured SOURCE_SNAPSHOT through all run artifacts.",
+    )
+
+if isinstance(runner_outcome, dict):
+    expected_runner_outcome_keys = {
+        "schema",
+        "generated_at",
+        "timestamp",
+        "profile",
+        "artifact_dir",
+        "correlation_id",
+        "source_commit",
+        "source_snapshot",
+        "status",
+        "exit_code",
+        "source_snapshot_verified",
+        "failed_phases",
+    }
+    require_condition(
+        "runner_outcome.keys_exact",
+        path=runner_outcome_path,
+        ok=set(runner_outcome) == expected_runner_outcome_keys,
+        ok_msg="runner outcome contains exactly the versioned schema fields",
+        fail_msg="runner outcome contains missing or unsupported fields",
+        strict=True,
+        remediation="Regenerate runner_outcome.json with write_runner_outcome().",
+    )
+    require_condition(
+        "runner_outcome.schema",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("schema") == "pi.e2e.runner_outcome.v1",
+        ok_msg="runner outcome schema matches",
+        fail_msg=(
+            "expected schema 'pi.e2e.runner_outcome.v1', got "
+            f"{runner_outcome.get('schema')!r}"
+        ),
+        strict=True,
+        remediation="Emit schema pi.e2e.runner_outcome.v1.",
+    )
+    require_condition(
+        "runner_outcome.generated_at_matches_run",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("generated_at") == generated_at,
+        ok_msg="runner outcome generated_at matches the run",
+        fail_msg="runner outcome generated_at does not match the run",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.timestamp_matches_run",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("timestamp") == artifact_dir.name,
+        ok_msg="runner outcome timestamp matches the artifact directory",
+        fail_msg="runner outcome timestamp does not match the artifact directory",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.profile_matches_run",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("profile") == profile,
+        ok_msg="runner outcome profile matches the run",
+        fail_msg="runner outcome profile does not match the run",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.artifact_dir_matches_run",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("artifact_dir") == str(artifact_dir),
+        ok_msg="runner outcome artifact_dir matches the run",
+        fail_msg="runner outcome artifact_dir does not match the run",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.correlation_id_matches_run",
+        path=runner_outcome_path,
+        ok=bool(summary_correlation_id)
+        and runner_outcome.get("correlation_id") == summary_correlation_id,
+        ok_msg="runner outcome correlation_id matches the run",
+        fail_msg="runner outcome correlation_id does not match the run",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.source_commit_matches_run",
+        path=runner_outcome_path,
+        ok=source_commit_ok and runner_outcome.get("source_commit") == source_commit,
+        ok_msg="runner outcome source_commit matches the captured run source",
+        fail_msg="runner outcome source_commit does not match the captured run source",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.source_snapshot_matches_run",
+        path=runner_outcome_path,
+        ok=source_snapshot_ok and runner_outcome.get("source_snapshot") == source_snapshot,
+        ok_msg="runner outcome source_snapshot matches the captured run source",
+        fail_msg="runner outcome source_snapshot does not match the captured run source",
+        strict=True,
+    )
+    require_condition(
+        "runner_outcome.status_pass",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("status") == "pass",
+        ok_msg="runner outcome status is pass",
+        fail_msg=f"runner outcome status is {runner_outcome.get('status')!r}",
+        strict=True,
+        remediation="Resolve every failed producer phase and rerun the complete profile.",
+    )
+    runner_exit_code = runner_outcome.get("exit_code")
+    require_condition(
+        "runner_outcome.exit_code_zero",
+        path=runner_outcome_path,
+        ok=not isinstance(runner_exit_code, bool)
+        and isinstance(runner_exit_code, int)
+        and runner_exit_code == 0,
+        ok_msg="runner outcome exit_code is zero",
+        fail_msg=f"runner outcome exit_code is {runner_exit_code!r}",
+        strict=True,
+        remediation="Resolve every failed producer phase and rerun the complete profile.",
+    )
+    require_condition(
+        "runner_outcome.source_snapshot_verified",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("source_snapshot_verified") is True,
+        ok_msg="runner completed a matching final source snapshot verification",
+        fail_msg="runner did not complete a matching final source snapshot verification",
+        strict=True,
+        remediation="Rerun from an immutable clean source checkout.",
+    )
+    require_condition(
+        "runner_outcome.failed_phases_empty",
+        path=runner_outcome_path,
+        ok=runner_outcome.get("failed_phases") == [],
+        ok_msg="runner outcome contains no failed phases",
+        fail_msg=f"runner failed phases: {runner_outcome.get('failed_phases')!r}",
+        strict=True,
+        remediation="Resolve every listed producer phase and rerun the complete profile.",
+    )
+
+if isinstance(summary, dict):
+    require_condition(
+        "summary.runner_outcome_matches_file",
+        path=summary_path,
+        ok=isinstance(runner_outcome, dict)
+        and summary.get("runner_outcome") == runner_outcome,
+        ok_msg="summary embeds the exact runner outcome",
+        fail_msg="summary runner_outcome does not match runner_outcome.json",
+        strict=True,
+        remediation="Write runner_outcome.json and its summary embedding in one producer step.",
     )
 
 # Full-profile, unsharded baseline runs must cover every configured target and
@@ -5173,36 +6267,40 @@ def validate_result_contract(
     name: str,
     result_path: Path,
     expected_log_path: Path,
-    expected_test_log_path: Path,
-    expected_artifact_index_path: Path,
-) -> None:
+    expected_test_log_path: Path | None,
+    expected_artifact_index_path: Path | None,
+) -> dict | None:
     check_prefix = f"{kind}:{name}"
     result = load_json(f"{check_prefix}:result", result_path, strict=True)
-    key_name = "target" if kind == "unit" else "suite"
+    key_name = "target" if kind in {"lib", "unit"} else "suite"
+    required_result_keys = [
+        "schema",
+        "result_kind",
+        "correlation_id",
+        key_name,
+        "exit_code",
+        "duration_ms",
+        "passed",
+        "failed",
+        "ignored",
+        "total",
+        "log_file",
+        "diagnostic_artifacts",
+        "timestamp",
+    ]
+    if expected_test_log_path is not None:
+        required_result_keys.append("test_log_jsonl")
+    if expected_artifact_index_path is not None:
+        required_result_keys.append("artifact_index_jsonl")
     require_keys(
         f"{check_prefix}:result",
         result,
         result_path,
-        [
-            "schema",
-            "result_kind",
-            "correlation_id",
-            key_name,
-            "exit_code",
-            "duration_ms",
-            "passed",
-            "failed",
-            "ignored",
-            "total",
-            "log_file",
-            "test_log_jsonl",
-            "artifact_index_jsonl",
-            "timestamp",
-        ],
+        required_result_keys,
         strict=True,
     )
     if not isinstance(result, dict):
-        return
+        return None
 
     require_condition(
         f"{check_prefix}:result.schema",
@@ -5220,7 +6318,7 @@ def validate_result_contract(
         ok_msg=f"result_kind is {kind!r}",
         fail_msg=f"expected result_kind {kind!r}, got {result.get('result_kind')!r}",
         strict=True,
-        remediation="Set result_kind to unit/suite in the corresponding result emitter.",
+        remediation="Set result_kind to lib/unit/suite in the corresponding result emitter.",
     )
     require_condition(
         f"{check_prefix}:result.name",
@@ -5246,6 +6344,258 @@ def validate_result_contract(
         strict=True,
         remediation="Propagate CORRELATION_ID into every result.json emitter.",
     )
+    exit_code = result.get("exit_code")
+    require_condition(
+        f"{check_prefix}:result.exit_code_zero",
+        path=result_path,
+        ok=not isinstance(exit_code, bool)
+        and isinstance(exit_code, int)
+        and exit_code == 0,
+        ok_msg="result exit_code is zero",
+        fail_msg=f"result exit_code is {exit_code!r}",
+        strict=True,
+        remediation=f"Resolve the failing {kind} test and rerun the complete profile.",
+    )
+    duration_ms = result.get("duration_ms")
+    require_condition(
+        f"{check_prefix}:result.duration_ms_nonnegative",
+        path=result_path,
+        ok=not isinstance(duration_ms, bool)
+        and isinstance(duration_ms, int)
+        and duration_ms >= 0,
+        ok_msg="result duration_ms is a non-negative integer",
+        fail_msg=f"result duration_ms is invalid: {duration_ms!r}",
+        strict=True,
+    )
+    counts = [result.get(field) for field in ("passed", "failed", "ignored", "total")]
+    counts_are_uints = all(
+        not isinstance(value, bool) and isinstance(value, int) and value >= 0
+        for value in counts
+    )
+    require_condition(
+        f"{check_prefix}:result.counts_nonnegative",
+        path=result_path,
+        ok=counts_are_uints,
+        ok_msg="result counts are non-negative integers",
+        fail_msg=f"result counts are invalid: {counts!r}",
+        strict=True,
+    )
+    passed, failed, ignored, total = counts
+    counts_consistent = (
+        counts_are_uints
+        and passed + failed + ignored == total
+        and failed == 0
+    )
+    require_condition(
+        f"{check_prefix}:result.counts_consistent",
+        path=result_path,
+        ok=counts_consistent,
+        ok_msg="result counts are internally consistent and contain no failures",
+        fail_msg=f"result counts are inconsistent or failing: {counts!r}",
+        strict=True,
+        remediation=f"Resolve the failing {kind} test and regenerate result.json.",
+    )
+    require_condition(
+        f"{check_prefix}:result.tests_executed",
+        path=result_path,
+        ok=counts_are_uints and total > 0 and passed > 0,
+        ok_msg="result proves at least one passing test executed",
+        fail_msg=f"result does not prove any passing tests executed: {counts!r}",
+        strict=True,
+        remediation=f"Ensure the {kind} selector executes at least one real test.",
+    )
+    require_condition(
+        f"{check_prefix}:result.timestamp_matches_run",
+        path=result_path,
+        ok=result.get("timestamp") == artifact_dir.name,
+        ok_msg="result timestamp matches the run",
+        fail_msg="result timestamp does not match the run",
+        strict=True,
+    )
+
+    diagnostic_artifacts = result.get("diagnostic_artifacts")
+    require_condition(
+        f"{check_prefix}:result.diagnostic_artifacts.object",
+        path=result_path,
+        ok=isinstance(diagnostic_artifacts, dict),
+        ok_msg="diagnostic_artifacts is an object",
+        fail_msg="diagnostic_artifacts is missing or not an object",
+        strict=True,
+        remediation="Emit byte bindings for every retained diagnostic artifact.",
+    )
+    if isinstance(diagnostic_artifacts, dict):
+        require_condition(
+            f"{check_prefix}:result.diagnostic_artifacts.keys_exact",
+            path=result_path,
+            ok=set(diagnostic_artifacts)
+            == {
+                "schema",
+                "output_log",
+                "test_log_jsonl",
+                "artifact_index_jsonl",
+            },
+            ok_msg="diagnostic_artifacts contains exactly the versioned schema fields",
+            fail_msg="diagnostic_artifacts contains missing or unsupported fields",
+            strict=True,
+            remediation="Emit only the versioned diagnostic artifact binding fields.",
+        )
+        require_condition(
+            f"{check_prefix}:result.diagnostic_artifacts.schema",
+            path=result_path,
+            ok=diagnostic_artifacts.get("schema") == "pi.e2e.diagnostic_artifacts.v1",
+            ok_msg="diagnostic_artifacts schema matches",
+            fail_msg=(
+                "expected diagnostic_artifacts schema "
+                f"'pi.e2e.diagnostic_artifacts.v1', got {diagnostic_artifacts.get('schema')!r}"
+            ),
+            strict=True,
+            remediation="Emit schema pi.e2e.diagnostic_artifacts.v1.",
+        )
+
+    def validate_diagnostic_binding(field: str, expected_path: Path) -> None:
+        binding = (
+            diagnostic_artifacts.get(field)
+            if isinstance(diagnostic_artifacts, dict)
+            else None
+        )
+        binding_prefix = f"{check_prefix}:result.diagnostic_artifacts.{field}"
+        require_condition(
+            f"{binding_prefix}.object",
+            path=result_path,
+            ok=isinstance(binding, dict),
+            ok_msg=f"{field} binding is an object",
+            fail_msg=f"{field} binding is missing or not an object",
+            strict=True,
+            remediation=f"Emit path, sha256, and size_bytes for {field}.",
+        )
+        if not isinstance(binding, dict):
+            return
+        require_keys(
+            binding_prefix,
+            binding,
+            result_path,
+            ["path", "sha256", "size_bytes"],
+            strict=True,
+        )
+
+        bound_path = binding.get("path")
+        bound_sha256 = binding.get("sha256")
+        bound_size = binding.get("size_bytes")
+        require_condition(
+            f"{binding_prefix}.path_matches",
+            path=result_path,
+            ok=isinstance(bound_path, str) and path_matches(bound_path, expected_path),
+            ok_msg=f"{field} binding path matches the retained artifact",
+            fail_msg=(
+                f"{field} binding path mismatch; expected {expected_path}, got {bound_path!r}"
+            ),
+            strict=True,
+            remediation=f"Bind {field} to its exact retained artifact path.",
+        )
+        require_condition(
+            f"{binding_prefix}.sha256_format",
+            path=result_path,
+            ok=isinstance(bound_sha256, str)
+            and bool(re.fullmatch(r"sha256:[0-9a-f]{64}", bound_sha256)),
+            ok_msg=f"{field} binding sha256 uses canonical syntax",
+            fail_msg=f"{field} binding sha256 is malformed: {bound_sha256!r}",
+            strict=True,
+            remediation=f"Hash the finalized raw bytes of {field} with SHA-256.",
+        )
+        require_condition(
+            f"{binding_prefix}.size_format",
+            path=result_path,
+            ok=not isinstance(bound_size, bool)
+            and isinstance(bound_size, int)
+            and 0 <= bound_size <= 2**63 - 1,
+            ok_msg=f"{field} binding size_bytes is a non-negative integer",
+            fail_msg=f"{field} binding size_bytes is invalid: {bound_size!r}",
+            strict=True,
+            remediation=f"Emit the finalized raw byte length for {field}.",
+        )
+
+        try:
+            before = expected_path.lstat()
+        except OSError as exc:
+            require_condition(
+                f"{binding_prefix}.regular_non_executable",
+                path=expected_path,
+                ok=False,
+                ok_msg=f"{field} is a regular non-executable file",
+                fail_msg=f"cannot inspect retained {field}: {exc}",
+                strict=True,
+                remediation=f"Retain {field} as a regular non-executable file.",
+            )
+            return
+        regular_non_executable = stat.S_ISREG(before.st_mode) and not (
+            before.st_mode & 0o111
+        )
+        require_condition(
+            f"{binding_prefix}.regular_non_executable",
+            path=expected_path,
+            ok=regular_non_executable,
+            ok_msg=f"{field} is a regular non-executable file",
+            fail_msg=f"{field} is a symlink, special file, or executable",
+            strict=True,
+            remediation=f"Retain {field} as a regular non-executable file.",
+        )
+        if not regular_non_executable:
+            return
+        try:
+            raw_bytes = expected_path.read_bytes()
+            after = expected_path.lstat()
+        except OSError as exc:
+            require_condition(
+                f"{binding_prefix}.stable_read",
+                path=expected_path,
+                ok=False,
+                ok_msg=f"{field} remained stable while read",
+                fail_msg=f"cannot read retained {field} stably: {exc}",
+                strict=True,
+                remediation=f"Stop concurrent writers to {field} and rerun verification.",
+            )
+            return
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        stable_read = all(
+            getattr(before, metadata_field) == getattr(after, metadata_field)
+            for metadata_field in stable_fields
+        )
+        require_condition(
+            f"{binding_prefix}.stable_read",
+            path=expected_path,
+            ok=stable_read,
+            ok_msg=f"{field} remained stable while read",
+            fail_msg=f"{field} changed while its binding was validated",
+            strict=True,
+            remediation=f"Stop concurrent writers to {field} and rerun verification.",
+        )
+        if not stable_read:
+            return
+
+        actual_size = len(raw_bytes)
+        actual_sha256 = f"sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+        require_condition(
+            f"{binding_prefix}.size_matches",
+            path=expected_path,
+            ok=bound_size == actual_size,
+            ok_msg=f"{field} size_bytes matches {actual_size} raw bytes",
+            fail_msg=(
+                f"{field} size mismatch: bound={bound_size!r}, actual={actual_size}"
+            ),
+            strict=True,
+            remediation=f"Recompute {field} binding after redaction and final writes.",
+        )
+        require_condition(
+            f"{binding_prefix}.sha256_matches",
+            path=expected_path,
+            ok=bound_sha256 == actual_sha256,
+            ok_msg=f"{field} SHA-256 matches retained raw bytes",
+            fail_msg=(
+                f"{field} SHA-256 mismatch: bound={bound_sha256!r}, actual={actual_sha256}"
+            ),
+            strict=True,
+            remediation=f"Recompute {field} binding after redaction and final writes.",
+        )
 
     def resolve_required_path_field(
         field: str,
@@ -5309,6 +6659,22 @@ def validate_result_contract(
             path=log_file,
             strict=True,
         )
+    validate_diagnostic_binding("output_log", expected_log_path)
+
+    if (expected_test_log_path is None) != (expected_artifact_index_path is None):
+        raise RuntimeError("structured diagnostic paths must both be configured or both omitted")
+    if expected_test_log_path is None and expected_artifact_index_path is None:
+        for field in ("test_log_jsonl", "artifact_index_jsonl"):
+            require_condition(
+                f"{check_prefix}:result.diagnostic_artifacts.{field}_null",
+                path=result_path,
+                ok=isinstance(diagnostic_artifacts, dict)
+                and diagnostic_artifacts.get(field) is None,
+                ok_msg=f"{field} is explicitly unavailable for {kind} results",
+                fail_msg=f"{field} must be null for {kind} results",
+                strict=True,
+            )
+        return result
 
     test_log_jsonl_path = resolve_required_path_field(
         "test_log_jsonl",
@@ -5358,6 +6724,8 @@ def validate_result_contract(
         path=artifact_index_jsonl_path,
         strict=True,
     )
+    validate_diagnostic_binding("test_log_jsonl", expected_test_log_path)
+    validate_diagnostic_binding("artifact_index_jsonl", expected_artifact_index_path)
 
     trace_ids_by_test = parse_test_log_jsonl(check_prefix, test_log_jsonl_path)
     parse_artifact_index_jsonl(check_prefix, artifact_index_jsonl_path, trace_ids_by_test)
@@ -5396,6 +6764,7 @@ def validate_result_contract(
         allowed_schemas={"pi.test.artifact.v1"},
         enforce_path_placeholder=True,
     )
+    return result
 
 
 def validate_failure_timeline_file(
@@ -5481,6 +6850,25 @@ def validate_failure_timeline_file(
         )
         records.append(payload)
     return records
+
+lib_result = validate_result_contract(
+    kind="lib",
+    name="lib",
+    result_path=artifact_dir / "lib" / "result.json",
+    expected_log_path=artifact_dir / "lib" / "output.log",
+    expected_test_log_path=None,
+    expected_artifact_index_path=None,
+)
+if isinstance(summary, dict):
+    require_condition(
+        "summary.lib_matches_result",
+        path=summary_path,
+        ok=isinstance(lib_result, dict) and summary.get("lib") == lib_result,
+        ok_msg="summary embeds the exact lib result",
+        fail_msg="summary lib result does not match lib/result.json",
+        strict=True,
+        remediation="Embed lib/result.json unchanged in write_summary().",
+    )
 
 for target in selected_units:
     validate_result_contract(
@@ -7335,6 +8723,7 @@ franken_node_claim_gate_status_payload: dict | None = None
 franken_node_claim_gate_status_json_path: Path | None = None
 franken_node_kernel_boundary_drift_report_payload: dict | None = None
 franken_node_kernel_boundary_drift_report_json_path: Path | None = None
+kernel_boundary_drift_report_filename = "franken_node_kernel_boundary_drift_report.json"
 
 expected_claim_correlation_id = summary_correlation_id or environment_correlation_id
 freshness_cutoff = datetime.now(timezone.utc) - timedelta(days=7)
@@ -10637,12 +12026,12 @@ if isinstance(franken_node_mission_contract, dict):
         if str(artifact).strip()
     ]
     kernel_boundary_manifest_rel_path = "docs/franken-node-kernel-extraction-boundary-manifest.json"
-    kernel_boundary_drift_report_rel_path = (
+    kernel_boundary_declared_report_artifact = (
         "tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json"
     )
     kernel_boundary_manifest_path = project_root / kernel_boundary_manifest_rel_path
     franken_node_kernel_boundary_drift_report_json_path = (
-        project_root / kernel_boundary_drift_report_rel_path
+        artifact_dir / kernel_boundary_drift_report_filename
     )
     kernel_boundary_required_checks = [
         "kernel_boundary.all_modules_mapped_or_deferred",
@@ -10693,7 +12082,7 @@ if isinstance(franken_node_mission_contract, dict):
             else ""
         )
         kernel_boundary_report_artifact_ok = (
-            declared_report_artifact == kernel_boundary_drift_report_rel_path
+            declared_report_artifact == kernel_boundary_declared_report_artifact
         )
         require_condition(
             "claim_integrity.franken_node_kernel_boundary_report_artifact_declared",
@@ -10702,7 +12091,8 @@ if isinstance(franken_node_mission_contract, dict):
             ok_msg="kernel-boundary manifest declares expected drift report artifact",
             fail_msg=(
                 "kernel-boundary manifest drift_detection_contract.report_artifact must be "
-                f"{kernel_boundary_drift_report_rel_path!r} (got {declared_report_artifact!r})"
+                f"{kernel_boundary_declared_report_artifact!r} "
+                f"(got {declared_report_artifact!r})"
             ),
             strict=claim_integrity_required,
         )
@@ -11390,8 +12780,7 @@ kernel_boundary_manifest_path = (
     project_root / "docs" / "franken-node-kernel-extraction-boundary-manifest.json"
 )
 kernel_boundary_drift_report_path = (
-    project_root / "tests" / "full_suite_gate"
-    / "franken_node_kernel_boundary_drift_report.json"
+    artifact_dir / kernel_boundary_drift_report_filename
 )
 kernel_boundary_manifest = load_json(
     "claim_integrity.kernel_boundary_manifest_json",
@@ -11409,7 +12798,7 @@ if isinstance(kernel_boundary_drift_report, dict):
         path=kernel_boundary_drift_report_path,
         ok=(
             kernel_boundary_drift_report.get("schema")
-            == "pi.frankennode.kernel_boundary_drift_report.v1"
+            == "pi.franken_node.kernel_boundary_drift_report.v1"
         ),
         ok_msg="kernel-boundary drift report schema is correct",
         fail_msg=(
@@ -11420,19 +12809,19 @@ if isinstance(kernel_boundary_drift_report, dict):
     )
     drift_summary = kernel_boundary_drift_report.get("summary", {})
     require_condition(
-        "claim_integrity.kernel_boundary_drift_report_verdict_pass",
+        "claim_integrity.kernel_boundary_drift_report_overall_status_pass",
         path=kernel_boundary_drift_report_path,
-        ok=drift_summary.get("verdict") == "pass",
-        ok_msg="kernel-boundary drift report verdict is pass",
+        ok=drift_summary.get("overall_status") == "pass",
+        ok_msg="kernel-boundary drift report overall_status is pass",
         fail_msg=(
-            "kernel-boundary drift report verdict is not pass: "
-            f"{drift_summary.get('verdict')!r}; "
-            f"fail_count={drift_summary.get('fail_count', '?')}"
+            "kernel-boundary drift report overall_status is not pass: "
+            f"{drift_summary.get('overall_status')!r}; "
+            f"failing_checks={drift_summary.get('failing_checks', '?')}"
         ),
         strict=True,
         remediation=(
-            "Run kernel-boundary drift checks against the manifest and update "
-            "tests/full_suite_gate/franken_node_kernel_boundary_drift_report.json."
+            "Rerun scripts/e2e/run_all.sh so the kernel-boundary checks regenerate "
+            "the run-specific artifact."
         ),
     )
     drift_checks = kernel_boundary_drift_report.get("checks", [])
@@ -11674,13 +13063,43 @@ if isinstance(full_conformance_report, dict):
 
 
 contract_correlation_id = summary_correlation_id or environment_correlation_id
+require_condition(
+    "contract.source_commit_matches_run",
+    path=contract_file,
+    ok=source_commit_ok,
+    ok_msg="contract source_commit is bound to the captured run source",
+    fail_msg=f"contract cannot bind malformed source_commit: {source_commit!r}",
+    strict=True,
+    remediation="Rerun from a canonical Git checkout with a valid HEAD commit.",
+)
+require_condition(
+    "contract.source_snapshot_matches_run",
+    path=contract_file,
+    ok=source_snapshot_ok,
+    ok_msg="contract source_snapshot is bound to the captured run source",
+    fail_msg=f"contract cannot bind malformed source_snapshot: {source_snapshot!r}",
+    strict=True,
+    remediation="Rerun so the producer can capture a clean immutable source snapshot.",
+)
 status = "pass" if not errors else "fail"
 contract_payload = {
     "schema": "pi.evidence.contract.v1",
-    "generated_at": datetime.now(timezone.utc).isoformat(),
+    "generated_at": generated_at,
     "profile": profile,
     "artifact_dir": str(artifact_dir),
     "correlation_id": contract_correlation_id,
+    "source_commit": source_commit,
+    "source_snapshot": source_snapshot,
+    "runner_outcome": (
+        {
+            "schema": runner_outcome.get("schema"),
+            "path": str(runner_outcome_path),
+            "status": runner_outcome.get("status"),
+            "exit_code": runner_outcome.get("exit_code"),
+        }
+        if isinstance(runner_outcome, dict)
+        else None
+    ),
     "status": status,
     "strict_conformance": strict_conformance,
     "checks": checks,
@@ -11764,12 +13183,18 @@ contract_payload = {
     ),
 }
 contract_file.parent.mkdir(parents=True, exist_ok=True)
-contract_file.write_text(json.dumps(contract_payload, indent=2) + "\n", encoding="utf-8")
+contract_json = json.dumps(contract_payload, indent=2) + "\n"
+if status != "pass":
+    # On a failed run, invalidate any earlier passing contract before touching
+    # secondary metadata. This is the fail-closed ordering.
+    contract_file.write_text(contract_json, encoding="utf-8")
 
 if isinstance(summary, dict):
     summary["evidence_contract"] = {
         "schema": "pi.evidence.contract.v1",
         "correlation_id": contract_correlation_id,
+        "source_commit": source_commit,
+        "source_snapshot": source_snapshot,
         "path": str(contract_file),
         "status": status,
         "strict_conformance": strict_conformance,
@@ -11829,6 +13254,10 @@ if isinstance(summary, dict):
         }
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
 
+if status == "pass":
+    # Publish a passing contract only after every summary update succeeded.
+    contract_file.write_text(contract_json, encoding="utf-8")
+
 if errors:
     print("EVIDENCE CONTRACT FAILED")
     for error in errors:
@@ -11882,8 +13311,18 @@ main() {
     echo "═══════════════════════════════════════════════════════════════"
     echo ""
 
+    if ! prepare_artifact_directory; then
+        echo "[fatal] Artifact-directory preflight failed; refusing to reuse evidence." >&2
+        exit 2
+    fi
+
     if ! check_disk_headroom; then
         echo "[fatal] Preflight checks failed; refusing to start verification run." >&2
+        exit 2
+    fi
+
+    if ! initialize_source_snapshot; then
+        echo "[fatal] Source snapshot preflight failed; refusing to start verification run." >&2
         exit 2
     fi
 
@@ -11891,69 +13330,130 @@ main() {
     write_shard_manifest
 
     local overall_exit=0
+    local source_snapshot_verified=true
+    local runner_failed_phases=()
+
+    record_runner_failure() {
+        local phase="$1"
+        local existing
+        overall_exit=1
+        for existing in "${runner_failed_phases[@]}"; do
+            if [[ "$existing" == "$phase" ]]; then
+                return 0
+            fi
+        done
+        runner_failed_phases+=("$phase")
+    }
 
     # Phase 1: Lint gates (fmt + clippy).
     if ! run_lint_gates; then
-        overall_exit=1
+        record_runner_failure "lint"
     fi
 
     # Phase 2: Build all selected targets.
     if ! build_tests; then
         echo "[fatal] Build failed, aborting test run." >&2
+        record_runner_failure "build"
+        verify_source_snapshot_unchanged || true
         exit 1
     fi
 
     # Phase 3: Lib inline tests.
     if ! run_lib_tests; then
-        overall_exit=1
+        record_runner_failure "lib"
     fi
 
     # Phase 4: Integration targets (unit + vcr test files).
     for target in "${SELECTED_UNIT_TARGETS[@]}"; do
         if ! run_unit_target "$target"; then
-            overall_exit=1
+            record_runner_failure "unit:$target"
         fi
     done
 
     # Phase 5: E2E suites.
     for suite in "${SELECTED_SUITES[@]}"; do
         if [[ ! -f "tests/${suite}.rs" ]]; then
-            echo "[skip] $suite: test file not found"
+            echo "[suite] FAIL: $suite test file not found" >&2
+            record_runner_failure "suite:$suite"
             continue
         fi
         if ! run_suite "$suite"; then
-            overall_exit=1
+            record_runner_failure "suite:$suite"
         fi
     done
 
-    write_summary
+    if ! write_summary; then
+        echo "[fatal] Unable to write the verification summary." >&2
+        verify_source_snapshot_unchanged || true
+        exit 1
+    fi
 
     if ! generate_failure_diagnostics; then
-        overall_exit=1
+        record_runner_failure "failure_diagnostics"
     fi
 
     if ! generate_replay_bundle; then
-        overall_exit=1
+        record_runner_failure "replay_bundle"
     fi
 
     if ! generate_extension_profile_matrix; then
-        overall_exit=1
+        record_runner_failure "extension_profile_matrix"
     fi
 
     if ! generate_soak_longevity_report; then
-        overall_exit=1
+        record_runner_failure "soak_longevity_report"
     fi
 
     if ! generate_release_readiness_report; then
-        overall_exit=1
+        record_runner_failure "release_readiness_report"
     fi
 
     if ! generate_triage_diff; then
-        overall_exit=1
+        record_runner_failure "triage_diff"
+    fi
+
+    # The contract consumes a finalized aggregate outcome. Capture the source
+    # once before contract generation, then recapture it again afterward to
+    # preserve the producer's final TOCTOU guard.
+    if ! verify_source_snapshot_unchanged; then
+        source_snapshot_verified=false
+        record_runner_failure "source_snapshot"
+    fi
+
+    if ! write_runner_outcome \
+        "$overall_exit" \
+        "$source_snapshot_verified" \
+        "${runner_failed_phases[@]}"; then
+        record_runner_failure "runner_outcome"
     fi
 
     if ! validate_evidence_contract; then
-        overall_exit=1
+        record_runner_failure "evidence_contract"
+
+        # A validator failure is itself part of the final runner outcome. Make
+        # that state durable and regenerate the contract so a stale pass can
+        # never survive beside a non-zero producer exit.
+        if write_runner_outcome \
+            "$overall_exit" \
+            "$source_snapshot_verified" \
+            "${runner_failed_phases[@]}"; then
+            validate_evidence_contract || true
+        fi
+    fi
+
+    if ! verify_source_snapshot_unchanged; then
+        source_snapshot_verified=false
+        record_runner_failure "source_snapshot_final"
+
+        # The post-contract source recapture is the last pass/fail input. If it
+        # fails, rewrite both artifacts so release consumers cannot observe a
+        # passing contract from a run that ultimately returned non-zero.
+        if write_runner_outcome \
+            "$overall_exit" \
+            "$source_snapshot_verified" \
+            "${runner_failed_phases[@]}"; then
+            validate_evidence_contract || true
+        fi
     fi
 
     exit $overall_exit

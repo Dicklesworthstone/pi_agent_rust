@@ -938,6 +938,42 @@ def capture_release_artifact_snapshot(
     return snapshot, None
 
 
+def release_artifact_head_commit_time(
+    snapshot: ReleaseArtifactSnapshot,
+) -> tuple[datetime | None, str | None]:
+    """Return the HEAD-bound time of the last commit touching one artifact path."""
+    raw_timestamp, git_error = _git_bytes(
+        snapshot.repository,
+        "log",
+        "-1",
+        "--format=%ct",
+        snapshot.head,
+        "--",
+        snapshot.artifact_path,
+    )
+    if git_error is not None:
+        return None, (
+            "release-facing non-JSON artifact commit time could not be resolved: "
+            f"{git_error}"
+        )
+    assert raw_timestamp is not None
+    if re.fullmatch(rb"[0-9]{1,20}\n", raw_timestamp) is None:
+        return None, (
+            "release-facing non-JSON artifact has no canonical HEAD-bound commit time"
+        )
+    timestamp = int(raw_timestamp)
+    if timestamp > 2**63 - 1:
+        return None, (
+            "release-facing non-JSON artifact commit time exceeds the signed 64-bit range"
+        )
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc), None
+    except (OverflowError, OSError, ValueError):
+        return None, (
+            "release-facing non-JSON artifact commit time is outside the supported range"
+        )
+
+
 def release_artifact_head_binding_error(
     repo_root: Path,
     artifact_repo_path: str,
@@ -1763,7 +1799,25 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
                     raise OSError("artifact is not a regular file")
                 artifact_bytes = full_path.read_bytes()
                 mtime = datetime.fromtimestamp(metadata.st_mtime, timezone.utc)
-            age = now - mtime
+            freshness_time = mtime
+            freshness_source = "filesystem_mtime"
+            head_commit_time: datetime | None = None
+            if (
+                release_snapshot is not None
+                and not artifact_path.endswith(".json")
+            ):
+                head_commit_time, commit_time_error = (
+                    release_artifact_head_commit_time(release_snapshot)
+                )
+                if commit_time_error is not None:
+                    release_binding_errors.append(commit_time_error)
+                    freshness_source = "git_head_path_commit_unresolved"
+                else:
+                    assert head_commit_time is not None
+                    freshness_time = head_commit_time
+                    freshness_source = "git_head_path_commit"
+
+            age = now - freshness_time
             days_old = age.total_seconds() / 86400  # Convert to days
             is_stale = claim_surface != "historical_snapshot" and age > staleness_threshold
             if (
@@ -1773,11 +1827,19 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
                 release_binding_errors.append(
                     "artifact modification time is more than five minutes in the future"
                 )
+            if (
+                head_commit_time is not None
+                and head_commit_time > now + MAX_FUTURE_CLOCK_SKEW
+            ):
+                release_binding_errors.append(
+                    "artifact HEAD-bound commit time is more than five minutes in the future"
+                )
 
             if is_stale:
                 print(
                     f"STALE: line {obligation.line_number}: {artifact_path} "
-                    f"(age: {days_old:.1f} days, limit: 14 days)"
+                    f"(age: {days_old:.1f} days, limit: 14 days, "
+                    f"freshness={freshness_source})"
                 )
                 print(
                     "  Remediation: regenerate fresh evidence and update the README citation "
@@ -1789,7 +1851,8 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
                 print(
                     f"{freshness_label}: line {obligation.line_number}: {artifact_path} "
                     f"(age: {days_old:.1f} days, surface={claim_surface}, "
-                    f"proof={proof_artifact_family(artifact_path)})"
+                    f"proof={proof_artifact_family(artifact_path)}, "
+                    f"freshness={freshness_source})"
                 )
 
             artifact_content_errors = check_artifact_content(
@@ -1911,6 +1974,28 @@ def run_self_test() -> int:
                 f"{result.stderr.decode('utf-8', 'replace').strip()}"
             )
         return result.stdout
+
+    def commit_fixture_paths_at(
+        repo_root: Path,
+        timestamp: datetime,
+        message: str,
+        *paths: str,
+    ) -> None:
+        git(repo_root, "add", "--", *paths)
+        commit_environment = os.environ.copy()
+        commit_timestamp = as_utc(timestamp).isoformat()
+        commit_environment["GIT_AUTHOR_DATE"] = commit_timestamp
+        commit_environment["GIT_COMMITTER_DATE"] = commit_timestamp
+        git(
+            repo_root,
+            "-c",
+            "commit.gpgSign=false",
+            "commit",
+            "-q",
+            "-m",
+            message,
+            env=commit_environment,
+        )
 
     def claim_ready_payload(source_commit: str) -> dict[str, object]:
         budgets = cloned(canonical_budgets)
@@ -2264,6 +2349,54 @@ def run_self_test() -> int:
         if ignored_binding_error is None or "tracked at HEAD" not in ignored_binding_error:
             print(ignored_binding_error)
             print("SELF-TEST FAIL: ignored release evidence must not authorize claims")
+            return 2
+
+        fresh_text_artifact = generic_root / "docs/evidence/fresh.txt"
+        fresh_text_artifact.parent.mkdir(parents=True, exist_ok=True)
+        fresh_text_artifact.write_text("fresh-text-run\n", encoding="utf-8")
+        commit_fixture_paths_at(
+            generic_root,
+            now,
+            "fresh non-JSON evidence",
+            "docs/evidence/fresh.txt",
+        )
+        stale_mtime = (now - timedelta(days=30)).timestamp()
+        os.utime(fresh_text_artifact, (stale_mtime, stale_mtime))
+        result, output = run_check(
+            generic_root,
+            "Claim: *(from docs/evidence/fresh.txt, run fresh-text-run)*\n",
+        )
+        if result != 0 or "freshness=git_head_path_commit" not in output:
+            print(output)
+            print(
+                "SELF-TEST FAIL: fresh committed non-JSON evidence must use its "
+                "HEAD-bound commit time, not stale filesystem metadata"
+            )
+            return 2
+
+        touched_stale_artifact = generic_root / "docs/evidence/touched-stale.txt"
+        touched_stale_artifact.write_text("touched-stale-run\n", encoding="utf-8")
+        commit_fixture_paths_at(
+            generic_root,
+            now - timedelta(days=30),
+            "stale non-JSON evidence",
+            "docs/evidence/touched-stale.txt",
+        )
+        os.utime(touched_stale_artifact, (fresh_ts, fresh_ts))
+        result, output = run_check(
+            generic_root,
+            "Claim: *(from docs/evidence/touched-stale.txt, run touched-stale-run)*\n",
+        )
+        if (
+            result != 1
+            or "STALE:" not in output
+            or "freshness=git_head_path_commit" not in output
+        ):
+            print(output)
+            print(
+                "SELF-TEST FAIL: touching stale committed non-JSON evidence must not "
+                "refresh it without new byte/commit evidence"
+            )
             return 2
 
         future_text_artifact = generic_root / "docs/evidence/future.txt"

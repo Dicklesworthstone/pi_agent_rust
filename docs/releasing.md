@@ -227,6 +227,27 @@ commit marked with `[skip actions]`; the commit ultimately referenced by the
 tag must contain that marker. Use an annotated tag with the marker as an
 additional auditable signal.
 
+Operate the lane from a fresh, private clone of the exact `[skip actions]`
+source commit, never from a shared development checkout. Create the clone from
+that exact local commit without hardlinks, keep its `main` branch at the source
+commit, repoint its fetch URL to the canonical GitHub repository, and disable
+its push URL until the explicit branch-push checkpoint below. Do not copy
+ignored or untracked files into it. Record the resolved paths and SHA-256
+digests of `bash`, `git`, `python3`, `cargo`, `rustc`, `gh`, `jq`, `ssh`, and
+`sha256sum` in the state directory before relying on them. During the E2E run,
+make the clone's `.git` metadata non-writable so tests cannot move HEAD or
+alter the index, and keep Cargo target and temporary output outside the clone.
+The worktree remains writable because ordinary tests legitimately emit ignored
+reports, but the runner hashes every tracked byte and mode before and after the
+run, rejects non-allowlisted ignored/untracked inputs, and fails on any net
+source mutation. Restore owner-write permission on `.git` immediately after
+the runner exits, then require both restoration and the runner to have passed.
+The preserved DSR configuration is
+path-pinned, so invoke only that child through the documented bubblewrap bind
+that presents this clone at the canonical path without changing the shared
+checkout. Preserve the private clone through publication so every retained
+absolute evidence path remains resolvable.
+
 Before opening the fail-fast session, freeze every release-source change in one
 or more commits whose subjects end in `[skip actions]`, and leave the checkout
 completely clean. Run the lane as one fail-fast Bash session (`set -euo
@@ -253,6 +274,59 @@ export WINDOWS_AMD64_SMOKE_HOST="wlap"
 [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 export RELEASE_TAG="v${RELEASE_VERSION}"
 test "$RELEASE_TAG" != "vX.Y.Z"
+release_source_checkout="$(pwd -P)"
+test "$release_source_checkout" = /data/projects/pi_agent_rust
+test -z "$(git status --porcelain=v2 --untracked-files=all)"
+source_commit="$(git rev-parse 'HEAD^{commit}')"
+case "$(git show -s --format=%s "$source_commit")" in
+  *'[skip actions]') ;;
+  *) printf 'release-source HEAD lacks [skip actions]\n' >&2; exit 1 ;;
+esac
+release_clone_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+[[ "$release_clone_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+release_checkout="/data/tmp/pi_agent_rust-v${RELEASE_VERSION}-release-$release_clone_id"
+test ! -e "$release_checkout" && test ! -L "$release_checkout"
+git clone --no-local --no-hardlinks --single-branch --branch main \
+  "$release_source_checkout" "$release_checkout"
+test "$(git -C "$release_checkout" rev-parse 'HEAD^{commit}')" = "$source_commit"
+test -z "$(git -C "$release_checkout" status --porcelain=v2 --untracked-files=all)"
+release_remote_url="https://github.com/Dicklesworthstone/pi_agent_rust.git"
+git -C "$release_checkout" remote set-url origin "$release_remote_url"
+git -C "$release_checkout" remote set-url --push origin \
+  no-push://pi-agent-rust-v0.2.0-release-guard
+test "$(git -C "$release_checkout" remote get-url origin)" = "$release_remote_url"
+test "$(git -C "$release_checkout" remote get-url --push origin)" = \
+  no-push://pi-agent-rust-v0.2.0-release-guard
+cd "$release_checkout"
+test "$(pwd -P)" = "$release_checkout"
+
+disable_origin_push() {
+  git remote set-url --push origin \
+    no-push://pi-agent-rust-v0.2.0-release-guard || return
+  local -a release_push_urls
+  mapfile -t release_push_urls < <(git remote get-url --push --all origin)
+  test "${#release_push_urls[@]}" -eq 1 || return
+  test "${release_push_urls[0]}" = \
+    no-push://pi-agent-rust-v0.2.0-release-guard
+}
+enable_origin_push() {
+  local -a release_fetch_urls release_push_urls
+  mapfile -t release_fetch_urls < <(git remote get-url --all origin)
+  test "${#release_fetch_urls[@]}" -eq 1 || return
+  test "${release_fetch_urls[0]}" = "$release_remote_url" || return
+  git remote set-url --push origin "$release_remote_url" || return
+  mapfile -t release_push_urls < <(git remote get-url --push --all origin)
+  test "${#release_push_urls[@]}" -eq 1 || return
+  test "${release_push_urls[0]}" = "$release_remote_url"
+}
+origin_push_guarded() {
+  local push_status=0 guard_status=0
+  { enable_origin_push && git push --atomic origin "$@"; } || push_status=$?
+  disable_origin_push || guard_status=$?
+  test "$guard_status" -eq 0 || return "$guard_status"
+  return "$push_status"
+}
+disable_origin_push
 test "$LINUX_AMD64_SMOKE_HOST" = trj
 test "$LINUX_ARM64_SMOKE_HOST" = trj
 test "$LINUX_ARM64_QEMU_SYSROOT" != "/operator/supplied/aarch64/sysroot"
@@ -271,14 +345,23 @@ export -n release_crates_io_token
 unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
-release_cargo_parent=/data/tmp/pi_agent_rust_cargo
-if [[ ! -e "$release_cargo_parent" && ! -L "$release_cargo_parent" ]]; then
-  mkdir -m 700 "$release_cargo_parent"
-fi
+release_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-tools.sha256"
+test ! -e "$release_tool_receipt"
+for release_tool in bash git python3 cargo rustc gh jq ssh sha256sum bwrap; do
+  release_tool_path="$(command -v "$release_tool")"
+  test -n "$release_tool_path"
+  release_tool_path="$(realpath -e -- "$release_tool_path")"
+  test -f "$release_tool_path" && test ! -L "$release_tool_path"
+  sha256sum -- "$release_tool_path"
+done > "$release_tool_receipt"
+test "$(wc -l < "$release_tool_receipt")" -eq 10
+release_cargo_parent="$MANUAL_RELEASE_STATE_DIR/controller-cargo"
+test ! -e "$release_cargo_parent" && test ! -L "$release_cargo_parent"
+mkdir -m 700 "$release_cargo_parent"
 test -d "$release_cargo_parent" && test ! -L "$release_cargo_parent"
 test "$(stat -c '%a:%u' "$release_cargo_parent")" = "700:$(id -u)"
 RELEASE_CARGO_WORK_DIR="$(mktemp -d \
-  "$release_cargo_parent/manual-v${RELEASE_VERSION}-XXXXXXXX")"
+  "$release_cargo_parent/work-v${RELEASE_VERSION}-XXXXXXXX")"
 export RELEASE_CARGO_WORK_DIR
 export CARGO_TARGET_DIR="$RELEASE_CARGO_WORK_DIR/target"
 export TMPDIR="$RELEASE_CARGO_WORK_DIR/tmp"
@@ -445,6 +528,53 @@ proof is not proof of an empty bypass list.
    git diff --cached --quiet "$source_commit" --
    ```
 
+   Generate the retained CI-profile E2E evidence from that bound source.
+   Predeclare the exact timestamped artifact directory, make the private
+   clone's Git metadata non-writable, and keep Cargo outputs outside the clone.
+   The producer independently captures and recaptures the exact source
+   commit/tree/index/flags/raw bytes, rejects ignored source inputs outside
+   approved generated-output roots, redacts diagnostics, and binds every
+   retained diagnostic by SHA-256 and byte count. Retain the complete run in
+   Git so the release gate can bind the contract, result records, and
+   diagnostic bytes to release HEAD:
+
+   ```bash
+   set -euo pipefail
+   release_checkout="$(pwd -P)"
+   e2e_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+   e2e_artifact_dir="$release_checkout/tests/e2e_results/$e2e_timestamp"
+   test ! -e "$e2e_artifact_dir"
+   mkdir -m 700 "$e2e_artifact_dir"
+   find -P "$release_checkout/.git" -xdev ! -type l \
+     -exec chmod a-w -- {} +
+   e2e_status=0
+   E2E_ARTIFACT_DIR="$e2e_artifact_dir" \
+   VERIFY_CARGO_RUNNER=local \
+     ./scripts/e2e/run_all.sh --profile ci --skip-lint || e2e_status=$?
+   git_metadata_restore_status=0
+   find -P "$release_checkout/.git" -xdev ! -type l \
+     -exec chmod u+w -- {} + || git_metadata_restore_status=$?
+   test "$git_metadata_restore_status" -eq 0
+   test "$e2e_status" -eq 0
+   test "$(jq -r .source_commit "$e2e_artifact_dir/evidence_contract.json")" = \
+     "$source_commit"
+   test "$(jq -r .source_commit "$e2e_artifact_dir/environment.json")" = \
+     "$source_commit"
+   test "$(jq -r .source_commit "$e2e_artifact_dir/summary.json")" = \
+     "$source_commit"
+   e2e_source_snapshot="$(jq -r .source_snapshot \
+     "$e2e_artifact_dir/evidence_contract.json")"
+   [[ "$e2e_source_snapshot" =~ ^sha256:[0-9a-f]{64}$ ]]
+   test "$(jq -r .source_snapshot "$e2e_artifact_dir/environment.json")" = \
+     "$e2e_source_snapshot"
+   test "$(jq -r .source_snapshot "$e2e_artifact_dir/summary.json")" = \
+     "$e2e_source_snapshot"
+   # Keep the ignored run un-staged until the conformance generator has taken
+   # its clean-HEAD source snapshot. The evidence commit below stages both
+   # families together only after every producer has finished.
+   test -z "$(git status --porcelain=v2 --untracked-files=all)"
+   ```
+
 3. Generate source-bound conformance evidence explicitly. Do not copy forward
    a historical `CERTIFIED` verdict: unless the canonical full-certification
    pipeline has been rerun successfully against this exact source commit,
@@ -458,6 +588,18 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   export CI_RUN_ID="manual-${RELEASE_TAG}-${WORKFLOW_BASELINE_UTC_DATE}"
+   export CI_CORRELATION_ID="${CI_RUN_ID}-conformance"
+   cargo test --locked --test ext_conformance_diff \
+     --features ext-conformance load_time_benchmark_official -- \
+     --ignored --exact --nocapture
+   cargo test --locked --test ext_conformance_scenarios \
+     --features ext-conformance scenario_conformance_suite -- \
+     --exact --nocapture
+   cargo test --locked --test ext_conformance_scenarios \
+     --features ext-conformance parity_runner -- --exact --nocapture
+   cargo test --locked --test extensions_policy_negative \
+     negative_conformance_report -- --exact --nocapture
    PI_GENERATE_CONFORMANCE_REPORT=1 \
      cargo test --locked --test conformance_report \
      generate_conformance_report -- --exact --nocapture
@@ -505,9 +647,21 @@ proof is not proof of an empty bypass list.
      docs/evidence/dropin-certification-verdict.json \
      tests/ext_conformance/reports/CONFORMANCE_REPORT.md \
      tests/ext_conformance/reports/conformance_summary.json
-   # Ordinary local report outputs are ignored; this source-bound event log is
-   # intentionally retained as release evidence.
-   git add -f tests/ext_conformance/reports/conformance_events.jsonl
+   # Raw producer outputs are normally ignored. This release deliberately
+   # retains only the exact decision inputs and referenced per-extension logs,
+   # together with the complete E2E run, so the gate can authenticate them at
+   # HEAD instead of trusting summary counters.
+   git add -f -- \
+     "$e2e_artifact_dir" \
+     tests/ext_conformance/reports/conformance_events.jsonl \
+     tests/ext_conformance/reports/load_time_benchmark.json \
+     tests/ext_conformance/reports/scenario_conformance.json \
+     tests/ext_conformance/reports/smoke_triage.json \
+     tests/ext_conformance/reports/extensions/*.jsonl \
+     tests/ext_conformance/reports/parity/parity_events.jsonl \
+     tests/ext_conformance/reports/parity/extensions/*.jsonl \
+     tests/ext_conformance/reports/negative/negative_events.jsonl \
+     tests/ext_conformance/reports/negative/triage.json
    ubs --staged --only=rust .
    ./scripts/reconcile_beads_ledger.sh
    git commit -m "Record ${RELEASE_TAG} release evidence [skip actions]"
@@ -554,14 +708,16 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
-   git push origin main
-   git push origin main:master
+   origin_push_guarded \
+     refs/heads/main:refs/heads/main \
+     refs/heads/main:refs/heads/master
    branch_source_commit="$(git rev-parse 'HEAD^{commit}')"
    test "$(git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')" = \
      "$branch_source_commit"
    test "$(git ls-remote origin refs/heads/master | awk 'NR == 1 {print $1}')" = \
      "$branch_source_commit"
    verify_workflow_baseline_unchanged after-branch-sync
+   disable_origin_push
    ```
 
 4. From that final clean evidence commit, build and inspect the exact Cargo
@@ -637,12 +793,38 @@ proof is not proof of an empty bypass list.
    set -euo pipefail
    test "$RELEASE_VERSION" = "0.2.0"
    test "$RELEASE_TAG" = "v0.2.0"
-   test "$(git rev-parse --show-toplevel)" = "/data/projects/pi_agent_rust"
    source_commit="$(awk -F= '$1 == "source_commit" {print $2}' "$proof_file")"
    [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
+   test "$(pwd -P)" = "$release_checkout"
    test "$(git rev-parse 'HEAD^{commit}')" = "$source_commit"
    test "$(git rev-parse 'main^{commit}')" = "$source_commit"
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
+
+   # The audited preserved DSR lane is intentionally pinned to the canonical
+   # project path. Prove that a child-only bubblewrap mount presents this exact
+   # private clone there without modifying, moving, or fast-forwarding the
+   # shared checkout outside the namespace.
+   test "$release_source_checkout" = /data/projects/pi_agent_rust
+   test "$release_checkout" != "$release_source_checkout"
+   test "$(command -v bwrap)" = /usr/bin/bwrap
+   bwrap_source_receipt="$MANUAL_RELEASE_STATE_DIR/bwrap-source-preflight.txt"
+   test ! -e "$bwrap_source_receipt"
+   (
+     set -C
+     bwrap --die-with-parent --new-session --bind / / \
+       --bind "$release_checkout" /data/projects/pi_agent_rust \
+       --chdir /data/projects/pi_agent_rust \
+       /usr/bin/bash --noprofile --norc -c '
+         set -euo pipefail
+         expected_commit="$1"
+         test "$(pwd -P)" = /data/projects/pi_agent_rust
+         test "$(/usr/local/bin/git rev-parse "HEAD^{commit}")" = "$expected_commit"
+         test "$(/usr/local/bin/git rev-parse "main^{commit}")" = "$expected_commit"
+         test -z "$(/usr/local/bin/git status --porcelain=v2 --untracked-files=all)"
+         printf "source_commit=%s\n" "$expected_commit"
+       ' bash "$source_commit" > "$bwrap_source_receipt"
+   )
+   test "$(cat "$bwrap_source_receipt")" = "source_commit=$source_commit"
 
    git fetch --no-tags origin \
      refs/heads/main:refs/remotes/origin/main \
@@ -904,7 +1086,10 @@ proof is not proof of an empty bypass list.
    test ! -e "$build_receipt"
    (
      set -C
-     "$PRESERVED_DSR_WRAPPER" \
+     bwrap --die-with-parent --new-session --bind / / \
+       --bind "$release_checkout" /data/projects/pi_agent_rust \
+       --chdir /data/projects/pi_agent_rust \
+       "$PRESERVED_DSR_WRAPPER" \
        --run-id "$DSR_BUILD_RUN_ID" \
        --state-dir "$PRESERVED_DSR_STATE_DIR" \
        --output-dir "$RAW_RELEASE_DIR" -- \
@@ -1630,10 +1815,11 @@ proof is not proof of an empty bypass list.
    test -z "$(git ls-remote --tags origin \
      "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
    verify_workflow_baseline_unchanged immediately-before-tag-push
-   git push origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+   origin_push_guarded "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
    remote_tag_commit="$(git ls-remote --tags origin \
      "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')"
    test "$remote_tag_commit" = "$source_commit"
+   disable_origin_push
    posttag_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-after-tag.json"
    posttag_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-after-tag.txt"
    test ! -e "$posttag_workflows" && test ! -e "$posttag_workflow_ids"

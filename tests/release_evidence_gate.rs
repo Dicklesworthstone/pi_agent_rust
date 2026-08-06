@@ -2325,8 +2325,8 @@ fn validate_performance_budget_summary(
         ));
     }
 
-    if claim_ready && now.signed_duration_since(generated_at) > maximum_age {
-        return Err("performance summary is too stale to authorize claims".to_string());
+    if now.signed_duration_since(generated_at) > maximum_age {
+        return Err("performance summary is too stale for release admission".to_string());
     }
 
     Ok(PerformanceClaimValidation { claim_ready })
@@ -2550,7 +2550,7 @@ fn validate_performance_artifact_at_head(
     context: &PerformanceGitContext,
     artifact_path: &str,
     head: &str,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let full_path = contained_regular_artifact_path(context, artifact_path)?;
     let tree_entry = perf_git_output_at(
         context,
@@ -2609,7 +2609,7 @@ fn validate_performance_artifact_at_head(
     if live_bytes != head_bytes {
         return Err("performance summary current bytes do not exactly match HEAD".to_string());
     }
-    Ok(())
+    Ok(head_bytes)
 }
 
 fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
@@ -2662,14 +2662,15 @@ fn validate_performance_source_binding_at_with_finalizer<F>(
     artifact_path: &str,
     source_commit: &str,
     before_final_check: F,
-) -> Result<(), String>
+) -> Result<Vec<u8>, String>
 where
     F: FnOnce() -> Result<(), String>,
 {
     let context = performance_git_context(root)?;
     let head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     validate_performance_checkout_clean(&context)?;
-    validate_performance_artifact_at_head(&context, artifact_path, &head)?;
+    let initial_artifact_bytes =
+        validate_performance_artifact_at_head(&context, artifact_path, &head)?;
 
     let source_expression = format!("{source_commit}^{{commit}}");
     let resolved = perf_git_stdout_at(&context, &["rev-parse", "--verify", &source_expression])?;
@@ -2728,18 +2729,12 @@ where
     }
 
     before_final_check()?;
-    let final_head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    if final_head != head {
-        return Err(
-            "performance repository HEAD changed during source binding validation".to_string(),
-        );
-    }
     validate_performance_checkout_clean(&context)?;
-    validate_performance_artifact_at_head(&context, artifact_path, &head)?;
-    let final_head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
-    if final_head != head {
+    let final_artifact_bytes =
+        validate_performance_artifact_at_head(&context, artifact_path, &head)?;
+    if final_artifact_bytes != initial_artifact_bytes {
         return Err(
-            "performance repository HEAD changed during source binding validation".to_string(),
+            "performance summary bytes changed during source binding validation".to_string(),
         );
     }
     validate_performance_checkout_clean(&context)?;
@@ -2749,14 +2744,14 @@ where
             "performance repository HEAD changed during source binding validation".to_string(),
         );
     }
-    Ok(())
+    Ok(final_artifact_bytes)
 }
 
 fn validate_performance_source_binding_at(
     root: &Path,
     artifact_path: &str,
     source_commit: &str,
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     validate_performance_source_binding_at_with_finalizer(
         root,
         artifact_path,
@@ -2765,11 +2760,87 @@ fn validate_performance_source_binding_at(
     )
 }
 
-fn validate_performance_source_binding(source_commit: &str) -> Result<(), String> {
-    validate_performance_source_binding_at(
+fn validate_performance_head_binding_at(
+    root: &Path,
+    artifact_path: &str,
+) -> Result<Vec<u8>, String> {
+    let context = performance_git_context(root)?;
+    let head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    validate_performance_checkout_clean(&context)?;
+    let initial_artifact_bytes =
+        validate_performance_artifact_at_head(&context, artifact_path, &head)?;
+    validate_performance_checkout_clean(&context)?;
+    let final_artifact_bytes =
+        validate_performance_artifact_at_head(&context, artifact_path, &head)?;
+    if final_artifact_bytes != initial_artifact_bytes {
+        return Err("performance summary bytes changed during HEAD binding validation".to_string());
+    }
+    validate_performance_checkout_clean(&context)?;
+    let final_head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if final_head != head {
+        return Err(
+            "performance repository HEAD changed during HEAD binding validation".to_string(),
+        );
+    }
+    Ok(final_artifact_bytes)
+}
+
+fn load_source_bound_performance_summary_at_with_probe<F>(
+    root: &Path,
+    artifact_path: &str,
+    after_unbound_probe: F,
+) -> Result<(Value, bool), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let context = performance_git_context(root)?;
+    let full_path = contained_regular_artifact_path(&context, artifact_path)?;
+    let probed_bytes = std::fs::read(&full_path)
+        .map_err(|err| format!("performance summary probe is unreadable: {err}"))?;
+    let probed_summary = parse_release_json(&probed_bytes)
+        .map_err(|err| format!("performance summary probe is invalid JSON: {err}"))?;
+    let probed_source_commit = probed_summary
+        .get("source_commit")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    after_unbound_probe()?;
+
+    let (bound_bytes, source_binding_valid) =
+        if let Some(source_commit) = probed_source_commit.as_deref() {
+            (
+                validate_performance_source_binding_at(root, artifact_path, source_commit)?,
+                true,
+            )
+        } else {
+            (
+                validate_performance_head_binding_at(root, artifact_path)?,
+                false,
+            )
+        };
+    if bound_bytes != probed_bytes {
+        return Err(
+            "performance summary changed between its initial parse and source binding".to_string(),
+        );
+    }
+    let bound_summary = parse_release_json(&bound_bytes)
+        .map_err(|err| format!("source-bound performance summary is invalid JSON: {err}"))?;
+    if probed_source_commit.as_deref().is_some()
+        && bound_summary.get("source_commit").and_then(Value::as_str)
+            != probed_source_commit.as_deref()
+    {
+        return Err(
+            "source-bound performance summary disagrees with its probed source_commit".to_string(),
+        );
+    }
+    Ok((bound_summary, source_binding_valid))
+}
+
+fn load_source_bound_performance_summary() -> Result<(Value, bool), String> {
+    load_source_bound_performance_summary_at_with_probe(
         &repo_root(),
         PERFORMANCE_BUDGET_SUMMARY_PATH,
-        source_commit,
+        || Ok(()),
     )
 }
 
@@ -2986,6 +3057,39 @@ fn fixture_git_context_and_head(root: &Path) -> (PerformanceGitContext, String) 
     (context, head)
 }
 
+fn install_hostile_head_replacement(root: &Path) -> String {
+    let head = fixture_git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .trim()
+        .to_string();
+    let tree = fixture_git_output(root, &["rev-parse", "--verify", "HEAD^{tree}"])
+        .trim()
+        .to_string();
+    let replacement = fixture_git_output(
+        root,
+        &[
+            "-c",
+            "user.name=Pi release-gate fixture",
+            "-c",
+            "user.email=pi-release-gate@example.invalid",
+            "commit-tree",
+            &tree,
+            "-m",
+            "hostile replacement commit without release ancestry",
+        ],
+    )
+    .trim()
+    .to_string();
+    fixture_git_output(
+        root,
+        &[
+            "update-ref",
+            &format!("refs/pi-hostile-replacements/{head}"),
+            &replacement,
+        ],
+    );
+    "refs/pi-hostile-replacements/".to_string()
+}
+
 fn commit_performance_binding_fixture(root: &Path, message: &str) -> String {
     fixture_git_output(root, &["add", "--all"]);
     fixture_git_output(
@@ -3047,6 +3151,54 @@ fn retained_performance_binding_fixture(packaged_evidence: bool) -> (PathBuf, St
     (root, source_commit)
 }
 
+fn e2e_source_snapshot_from_clean_checkout(root: &Path, source_commit: &str) -> String {
+    fn update_framed(digest: &mut Sha256, value: &[u8]) {
+        digest.update(value.len().to_string().as_bytes());
+        digest.update(b":");
+        digest.update(value);
+    }
+
+    let context = performance_git_context(root).expect("resolve E2E fixture Git context");
+    let tree_bytes = perf_git_output_at(
+        &context,
+        &["ls-tree", "-r", "-z", "--full-tree", source_commit],
+    )
+    .expect("capture E2E fixture source tree");
+    let index_bytes = perf_git_output_at(&context, &["ls-files", "--stage", "-z"])
+        .expect("capture E2E fixture index");
+    let flag_bytes = perf_git_output_at(&context, &["ls-files", "-v", "-z"])
+        .expect("capture E2E fixture index flags");
+
+    let mut digest = Sha256::new();
+    update_framed(&mut digest, b"pi.e2e.source_snapshot.v1");
+    update_framed(&mut digest, source_commit.as_bytes());
+    update_framed(&mut digest, &tree_bytes);
+    update_framed(&mut digest, &index_bytes);
+    update_framed(&mut digest, &flag_bytes);
+
+    for record in tree_bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .expect("E2E fixture tree record tab");
+        let metadata = &record[..tab];
+        let path = &record[tab + 1..];
+        let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3, "E2E fixture tree metadata");
+        let mode = fields[0];
+        let object_id = std::str::from_utf8(fields[2]).expect("UTF-8 E2E fixture object ID");
+        let blob = perf_git_output_at(&context, &["cat-file", "blob", object_id])
+            .expect("read E2E fixture source blob");
+        update_framed(&mut digest, path);
+        update_framed(&mut digest, mode);
+        update_framed(&mut digest, &blob);
+    }
+    format!("sha256:{:x}", digest.finalize())
+}
+
 fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
     let base = std::env::var_os("TMPDIR")
         .map_or_else(std::env::temp_dir, PathBuf::from)
@@ -3061,73 +3213,518 @@ fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
     .expect("write E2E fixture Cargo.toml");
     std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
         .expect("write E2E fixture source");
+    std::fs::write(
+        root.join(".gitignore"),
+        "tests/e2e_results/**/output.log\ntests/e2e_results/**/test-log.jsonl\ntests/e2e_results/**/artifact-index.jsonl\n",
+    )
+    .expect("write E2E fixture diagnostic ignore rules");
+    std::fs::create_dir_all(root.join("tests")).expect("create E2E fixture tests directory");
+    std::fs::write(
+        root.join("tests/suite_classification.toml"),
+        "[suite.unit]\nfiles = [\"release_evidence_gate\"]\n\n[suite.vcr]\nfiles = [\"vcr_probe\"]\n\n[suite.e2e]\nfiles = [\"e2e_extension_registration\"]\n",
+    )
+    .expect("write E2E fixture suite classification");
+    for test_name in [
+        "release_evidence_gate",
+        "vcr_probe",
+        "e2e_extension_registration",
+    ] {
+        std::fs::write(
+            root.join("tests").join(format!("{test_name}.rs")),
+            "#[test]\nfn fixture() {}\n",
+        )
+        .expect("write E2E fixture integration test");
+    }
     fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
     let source_commit = commit_performance_binding_fixture(&root, "initial E2E source snapshot");
+    let source_snapshot = e2e_source_snapshot_from_clean_checkout(&root, &source_commit);
 
-    let evidence_dir = root.join("tests/e2e_results/20260805T010203Z");
-    let suite_dir = evidence_dir.join("smoke");
+    let generated = Utc::now();
+    let generated_at = generated.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let run_timestamp = generated.format("%Y%m%dT%H%M%SZ").to_string();
+    let evidence_dir = root.join(format!("tests/e2e_results/{run_timestamp}"));
+    let suite_name = "e2e_extension_registration";
+    let suite_dir = evidence_dir.join(suite_name);
     std::fs::create_dir_all(&suite_dir).expect("create E2E fixture evidence directory");
     let correlation_id = "release-gate-e2e-fixture";
-    let artifact_dir = "tests/e2e_results/20260805T010203Z";
-    let suite_result = json!({
-        "suite": "smoke",
+    let artifact_dir = evidence_dir.to_str().expect("UTF-8 E2E artifact directory");
+    let mut suite_result = json!({
+        "schema": "pi.e2e.result.v1",
+        "result_kind": "suite",
+        "correlation_id": correlation_id,
+        "suite": suite_name,
         "exit_code": 0,
+        "duration_ms": 1,
         "passed": 1,
         "failed": 0,
         "ignored": 0,
-        "total": 1
+        "total": 1,
+        "log_file": suite_dir.join("output.log"),
+        "test_log_jsonl": suite_dir.join("test-log.jsonl"),
+        "artifact_index_jsonl": suite_dir.join("artifact-index.jsonl"),
+        "timestamp": run_timestamp
     });
-    let documents = [
+    let unit_names = ["release_evidence_gate", "vcr_probe"];
+    let mut unit_results = unit_names
+        .iter()
+        .map(|target| {
+            let target_dir = evidence_dir.join("unit").join(target);
+            json!({
+                "schema": "pi.e2e.result.v1",
+                "result_kind": "unit",
+                "correlation_id": correlation_id,
+                "target": target,
+                "exit_code": 0,
+                "duration_ms": 1,
+                "passed": 1,
+                "failed": 0,
+                "ignored": 0,
+                "total": 1,
+                "log_file": target_dir.join("output.log"),
+                "test_log_jsonl": target_dir.join("test-log.jsonl"),
+                "artifact_index_jsonl": target_dir.join("artifact-index.jsonl"),
+                "timestamp": run_timestamp
+            })
+        })
+        .collect::<Vec<_>>();
+    let write_diagnostics = |directory: &Path| {
+        std::fs::create_dir_all(directory).expect("create E2E diagnostic directory");
+        std::fs::write(
+            directory.join("output.log"),
+            "test result: ok. 1 passed; 0 failed; 0 ignored\n",
+        )
+        .expect("write E2E output log");
+        std::fs::write(
+            directory.join("test-log.jsonl"),
+            "{\"schema\":\"pi.test.log.v1\",\"category\":\"harness\",\"message\":\"fixture\"}\n",
+        )
+        .expect("write E2E structured test log");
+        std::fs::write(directory.join("artifact-index.jsonl"), b"")
+            .expect("write E2E artifact index");
+    };
+    write_diagnostics(&suite_dir);
+    let diagnostic_artifacts = |directory: &Path| {
+        let binding = |name: &str| {
+            let path = directory.join(name);
+            let bytes = std::fs::read(&path).expect("read E2E fixture diagnostic");
+            json!({
+                "path": path,
+                "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
+                "size_bytes": bytes.len()
+            })
+        };
+        json!({
+            "schema": "pi.e2e.diagnostic_artifacts.v1",
+            "output_log": binding("output.log"),
+            "test_log_jsonl": binding("test-log.jsonl"),
+            "artifact_index_jsonl": binding("artifact-index.jsonl")
+        })
+    };
+    suite_result["diagnostic_artifacts"] = diagnostic_artifacts(&suite_dir);
+    let lib_dir = evidence_dir.join("lib");
+    std::fs::create_dir_all(&lib_dir).expect("create E2E lib result directory");
+    std::fs::write(
+        lib_dir.join("output.log"),
+        "test result: ok. 1 passed; 0 failed; 0 ignored\n",
+    )
+    .expect("write E2E lib output log");
+    let lib_output = std::fs::read(lib_dir.join("output.log")).expect("read E2E lib output log");
+    let lib_result = json!({
+        "schema": "pi.e2e.result.v1",
+        "result_kind": "lib",
+        "correlation_id": correlation_id,
+        "target": "lib",
+        "exit_code": 0,
+        "duration_ms": 1,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "total": 1,
+        "log_file": lib_dir.join("output.log"),
+        "diagnostic_artifacts": {
+            "schema": "pi.e2e.diagnostic_artifacts.v1",
+            "output_log": {
+                "path": lib_dir.join("output.log"),
+                "sha256": format!("sha256:{:x}", Sha256::digest(&lib_output)),
+                "size_bytes": lib_output.len()
+            },
+            "test_log_jsonl": null,
+            "artifact_index_jsonl": null
+        },
+        "timestamp": run_timestamp
+    });
+    let runner_outcome_path = evidence_dir.join("runner_outcome.json");
+    let runner_outcome = json!({
+        "schema": "pi.e2e.runner_outcome.v1",
+        "generated_at": generated_at,
+        "timestamp": run_timestamp,
+        "profile": "ci",
+        "artifact_dir": artifact_dir,
+        "correlation_id": correlation_id,
+        "source_commit": source_commit,
+        "source_snapshot": source_snapshot,
+        "status": "pass",
+        "exit_code": 0,
+        "source_snapshot_verified": true,
+        "failed_phases": []
+    });
+
+    let environment_path = evidence_dir.join("environment.json");
+    let summary_path = evidence_dir.join("summary.json");
+    let mut checks = Vec::new();
+    let mut add_check = |id: &str, path: &Path| {
+        checks.push(json!({
+            "id": id,
+            "path": path,
+            "diagnostics": "fixture proof",
+            "ok": true
+        }));
+    };
+    for id in [
+        "run.source_commit_format",
+        "run.source_snapshot_format",
+        "contract.source_commit_matches_run",
+        "contract.source_snapshot_matches_run",
+    ] {
+        add_check(id, &evidence_dir.join("evidence_contract.json"));
+    }
+    for id in [
+        "environment",
+        "environment.json_parse",
+        "environment.keys",
+        "environment.schema",
+        "environment.correlation_id_nonempty",
+        "environment.generated_at_matches_run",
+        "environment.source_commit_format",
+        "environment.source_snapshot_format",
+        "environment.source_commit_matches_run",
+        "environment.source_snapshot_matches_run",
+        "environment.git_sha_matches_source_commit",
+    ] {
+        add_check(id, &environment_path);
+    }
+    for id in [
+        "summary",
+        "summary.json_parse",
+        "summary.keys",
+        "summary.schema",
+        "summary.correlation_id_nonempty",
+        "summary.generated_at_matches_run",
+        "summary.source_commit_format",
+        "summary.source_snapshot_format",
+        "summary.source_commit_matches_run",
+        "summary.source_snapshot_matches_run",
+        "run.correlation_id_matches_environment",
+        "run.generated_at_matches_environment",
+        "run.source_commit_matches_environment",
+        "run.source_snapshot_matches_environment",
+        "summary.failed_suites_matches_suite_results",
+        "summary.lib_matches_result",
+        "summary.runner_outcome_matches_file",
+    ] {
+        add_check(id, &summary_path);
+    }
+    for id in [
+        "runner_outcome",
+        "runner_outcome.json_parse",
+        "runner_outcome.keys",
+        "runner_outcome.keys_exact",
+        "runner_outcome.schema",
+        "runner_outcome.generated_at_matches_run",
+        "runner_outcome.timestamp_matches_run",
+        "runner_outcome.profile_matches_run",
+        "runner_outcome.artifact_dir_matches_run",
+        "runner_outcome.correlation_id_matches_run",
+        "runner_outcome.source_commit_matches_run",
+        "runner_outcome.source_snapshot_matches_run",
+        "runner_outcome.status_pass",
+        "runner_outcome.exit_code_zero",
+        "runner_outcome.source_snapshot_verified",
+        "runner_outcome.failed_phases_empty",
+    ] {
+        add_check(id, &runner_outcome_path);
+    }
+    let lib_result_path = lib_dir.join("result.json");
+    for suffix in [
+        "",
+        ".json_parse",
+        ".keys",
+        ".schema",
+        ".kind",
+        ".name",
+        ".correlation_id_matches_summary",
+        ".exit_code_zero",
+        ".duration_ms_nonnegative",
+        ".counts_nonnegative",
+        ".counts_consistent",
+        ".tests_executed",
+        ".timestamp_matches_run",
+        ".diagnostic_artifacts.object",
+        ".diagnostic_artifacts.keys_exact",
+        ".diagnostic_artifacts.schema",
+        ".log_file_nonempty",
+        ".log_file_path_matches",
+    ] {
+        add_check(&format!("lib:lib:result{suffix}"), &lib_result_path);
+    }
+    for suffix in [
+        ".object",
+        ".keys",
+        ".path_matches",
+        ".sha256_format",
+        ".size_format",
+    ] {
+        add_check(
+            &format!("lib:lib:result.diagnostic_artifacts.output_log{suffix}"),
+            &lib_result_path,
+        );
+    }
+    for suffix in [
+        ".regular_non_executable",
+        ".stable_read",
+        ".size_matches",
+        ".sha256_matches",
+    ] {
+        add_check(
+            &format!("lib:lib:result.diagnostic_artifacts.output_log{suffix}"),
+            &lib_dir.join("output.log"),
+        );
+    }
+    for id in [
+        "lib:lib:result.log_file_exists",
+        "lib:lib:result.log_file_budget",
+        "lib:lib:result.log_file_redaction",
+    ] {
+        add_check(id, &lib_dir.join("output.log"));
+    }
+    for field in ["test_log_jsonl", "artifact_index_jsonl"] {
+        add_check(
+            &format!("lib:lib:result.diagnostic_artifacts.{field}_null"),
+            &lib_result_path,
+        );
+    }
+    for (target, result) in unit_names.iter().zip(&mut unit_results) {
+        let result_path = evidence_dir.join("unit").join(target).join("result.json");
+        std::fs::create_dir_all(result_path.parent().expect("unit result parent"))
+            .expect("create E2E unit result directory");
+        write_diagnostics(result_path.parent().expect("unit result parent"));
+        result["diagnostic_artifacts"] =
+            diagnostic_artifacts(result_path.parent().expect("unit result parent"));
+        std::fs::write(
+            &result_path,
+            serde_json::to_vec_pretty(result).expect("serialize E2E unit result"),
+        )
+        .expect("write E2E unit result");
+        for suffix in [
+            "",
+            ".json_parse",
+            ".keys",
+            ".schema",
+            ".kind",
+            ".name",
+            ".correlation_id_matches_summary",
+        ] {
+            add_check(&format!("unit:{target}:result{suffix}"), &result_path);
+        }
+        let target_dir = result_path.parent().expect("unit result parent");
+        for field in ["log_file", "test_log_jsonl", "artifact_index_jsonl"] {
+            add_check(
+                &format!("unit:{target}:result.{field}_nonempty"),
+                &result_path,
+            );
+            add_check(
+                &format!("unit:{target}:result.{field}_path_matches"),
+                &result_path,
+            );
+        }
+        for suffix in ["object", "schema"] {
+            add_check(
+                &format!("unit:{target}:result.diagnostic_artifacts.{suffix}"),
+                &result_path,
+            );
+        }
+        for (field, artifact) in [
+            ("output_log", "output.log"),
+            ("test_log_jsonl", "test-log.jsonl"),
+            ("artifact_index_jsonl", "artifact-index.jsonl"),
+        ] {
+            let prefix = format!("unit:{target}:result.diagnostic_artifacts.{field}");
+            for suffix in [
+                "object",
+                "keys",
+                "path_matches",
+                "sha256_format",
+                "size_format",
+            ] {
+                add_check(&format!("{prefix}.{suffix}"), &result_path);
+            }
+            for suffix in [
+                "regular_non_executable",
+                "stable_read",
+                "size_matches",
+                "sha256_matches",
+            ] {
+                add_check(&format!("{prefix}.{suffix}"), &target_dir.join(artifact));
+            }
+        }
+        for id in [
+            format!("unit:{target}:result.log_file_exists"),
+            format!("unit:{target}:result.log_file_budget"),
+            format!("unit:{target}:result.log_file_redaction"),
+        ] {
+            add_check(&id, &target_dir.join("output.log"));
+        }
+        for id in [
+            format!("unit:{target}.test_log_jsonl.file_budget"),
+            format!("unit:{target}.test_log_jsonl.redaction_scan"),
+            format!("unit:{target}.test_log_jsonl.minimum_signal_harness_category"),
+        ] {
+            add_check(&id, &target_dir.join("test-log.jsonl"));
+        }
+        for id in [
+            format!("unit:{target}.artifact_index_jsonl.file_budget"),
+            format!("unit:{target}.artifact_index_jsonl.redaction_scan"),
+        ] {
+            add_check(&id, &target_dir.join("artifact-index.jsonl"));
+        }
+    }
+    for suffix in [
+        "",
+        ".json_parse",
+        ".keys",
+        ".schema",
+        ".kind",
+        ".name",
+        ".correlation_id_matches_summary",
+    ] {
+        add_check(
+            &format!("suite:{suite_name}:result{suffix}"),
+            &suite_dir.join("result.json"),
+        );
+    }
+    for field in ["log_file", "test_log_jsonl", "artifact_index_jsonl"] {
+        add_check(
+            &format!("suite:{suite_name}:result.{field}_nonempty"),
+            &suite_dir.join("result.json"),
+        );
+        add_check(
+            &format!("suite:{suite_name}:result.{field}_path_matches"),
+            &suite_dir.join("result.json"),
+        );
+    }
+    for suffix in ["object", "schema"] {
+        add_check(
+            &format!("suite:{suite_name}:result.diagnostic_artifacts.{suffix}"),
+            &suite_dir.join("result.json"),
+        );
+    }
+    for (field, artifact) in [
+        ("output_log", "output.log"),
+        ("test_log_jsonl", "test-log.jsonl"),
+        ("artifact_index_jsonl", "artifact-index.jsonl"),
+    ] {
+        let prefix = format!("suite:{suite_name}:result.diagnostic_artifacts.{field}");
+        for suffix in [
+            "object",
+            "keys",
+            "path_matches",
+            "sha256_format",
+            "size_format",
+        ] {
+            add_check(
+                &format!("{prefix}.{suffix}"),
+                &suite_dir.join("result.json"),
+            );
+        }
+        for suffix in [
+            "regular_non_executable",
+            "stable_read",
+            "size_matches",
+            "sha256_matches",
+        ] {
+            add_check(&format!("{prefix}.{suffix}"), &suite_dir.join(artifact));
+        }
+    }
+    for id in [
+        format!("suite:{suite_name}:result.log_file_exists"),
+        format!("suite:{suite_name}:result.log_file_budget"),
+        format!("suite:{suite_name}:result.log_file_redaction"),
+    ] {
+        add_check(&id, &suite_dir.join("output.log"));
+    }
+    for id in [
+        format!("suite:{suite_name}.test_log_jsonl.file_budget"),
+        format!("suite:{suite_name}.test_log_jsonl.redaction_scan"),
+        format!("suite:{suite_name}.test_log_jsonl.minimum_signal_harness_category"),
+    ] {
+        add_check(&id, &suite_dir.join("test-log.jsonl"));
+    }
+    for id in [
+        format!("suite:{suite_name}.artifact_index_jsonl.file_budget"),
+        format!("suite:{suite_name}.artifact_index_jsonl.redaction_scan"),
+    ] {
+        add_check(&id, &suite_dir.join("artifact-index.jsonl"));
+    }
+
+    let documents = vec![
         (
             evidence_dir.join("evidence_contract.json"),
             json!({
                 "schema": "pi.evidence.contract.v1",
+                "generated_at": generated_at,
                 "profile": "ci",
                 "strict_conformance": false,
                 "status": "pass",
                 "errors": [],
-                "checks": [{
-                    "id": "fixture",
-                    "path": "tests/e2e_results/20260805T010203Z/summary.json",
-                    "diagnostics": "",
-                    "ok": true
-                }],
+                "checks": checks,
                 "correlation_id": correlation_id,
-                "artifact_dir": artifact_dir
+                "artifact_dir": artifact_dir,
+                "source_commit": source_commit,
+                "source_snapshot": source_snapshot,
+                "runner_outcome": {
+                    "schema": "pi.e2e.runner_outcome.v1",
+                    "path": runner_outcome_path,
+                    "status": "pass",
+                    "exit_code": 0
+                }
             }),
         ),
         (
             evidence_dir.join("environment.json"),
             json!({
                 "schema": "pi.e2e.environment.v1",
+                "generated_at": generated_at,
                 "profile": "ci",
                 "rerun_from": null,
                 "correlation_id": correlation_id,
                 "artifact_dir": artifact_dir,
-                "unit_targets": ["release_evidence_gate"],
-                "e2e_suites": ["smoke"],
-                "git_sha": source_commit
+                "shard": {"kind": "none", "name": "unsharded", "index": null, "total": null},
+                "unit_targets": unit_names,
+                "e2e_suites": [suite_name],
+                "git_sha": source_commit,
+                "source_commit": source_commit,
+                "source_snapshot": source_snapshot
             }),
         ),
         (
             evidence_dir.join("summary.json"),
             json!({
                 "schema": "pi.e2e.summary.v1",
+                "generated_at": generated_at,
                 "profile": "ci",
                 "rerun_from": null,
                 "correlation_id": correlation_id,
                 "artifact_dir": artifact_dir,
-                "total_units": 1,
-                "passed_units": 1,
+                "shard": {"kind": "none", "name": "unsharded", "index": null, "total": null},
+                "source_commit": source_commit,
+                "source_snapshot": source_snapshot,
+                "total_units": unit_results.len(),
+                "passed_units": unit_results.len(),
                 "failed_units": 0,
-                "unit_targets": [{
-                    "target": "release_evidence_gate",
-                    "exit_code": 0,
-                    "passed": 1,
-                    "failed": 0,
-                    "ignored": 0,
-                    "total": 1
-                }],
+                "failed_unit_names": [],
+                "lib": lib_result,
+                "runner_outcome": runner_outcome,
+                "unit_targets": unit_results,
                 "total_suites": 1,
                 "passed_suites": 1,
                 "failed_suites": 0,
@@ -3135,6 +3732,8 @@ fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
                 "suites": [suite_result]
             }),
         ),
+        (lib_dir.join("result.json"), lib_result),
+        (runner_outcome_path, runner_outcome),
         (suite_dir.join("result.json"), suite_result),
     ];
     for (path, document) in documents {
@@ -3144,8 +3743,684 @@ fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
         )
         .expect("write E2E fixture document");
     }
+    fixture_git_output(&root, &["add", "-f", "--", "tests/e2e_results"]);
     commit_performance_binding_fixture(&root, "record E2E evidence follow-up");
     (root, evidence_dir)
+}
+
+fn retained_conformance_evidence_fixture() -> (PathBuf, PathBuf, String) {
+    let base = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("pi-release-evidence-gate-fixtures");
+    std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    let root = base.join(format!(
+        "conformance-binding-fixture-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let summary_path = root.join("tests/ext_conformance/reports/conformance_summary.json");
+    std::fs::create_dir_all(root.join("src")).expect("create conformance fixture source directory");
+    std::fs::create_dir_all(summary_path.parent().expect("conformance summary parent"))
+        .expect("create conformance fixture reports directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"release-gate-conformance-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\ninclude = [\"/Cargo.toml\", \"/src/**\"]\n",
+    )
+    .expect("write conformance fixture Cargo.toml");
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
+        .expect("write conformance fixture source");
+    std::fs::write(root.join(".gitignore"), "tests/ext_conformance/reports/*\n")
+        .expect("write conformance fixture evidence ignore rule");
+    let manifest_path = root.join("tests/ext_conformance/VALIDATED_MANIFEST.json");
+    std::fs::create_dir_all(manifest_path.parent().expect("conformance manifest parent"))
+        .expect("create conformance fixture manifest directory");
+    let capabilities = json!({
+        "registers_tools": true,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": false
+    });
+    let registrations = json!({
+        "tools": ["fixture_tool"],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ext.validated-manifest.v1",
+            "generated_at": "2026-01-01T00:00:00Z",
+            "extensions": [
+                {
+                    "id": "fixture-a",
+                    "entry_path": "fixture-a/index.ts",
+                    "source_tier": "fixture-tier",
+                    "conformance_tier": 1,
+                    "capabilities": capabilities.clone(),
+                    "registrations": registrations.clone()
+                },
+                {
+                    "id": "fixture-b",
+                    "entry_path": "fixture-b/index.ts",
+                    "source_tier": "fixture-tier",
+                    "conformance_tier": 1,
+                    "capabilities": capabilities.clone(),
+                    "registrations": registrations.clone()
+                }
+            ]
+        }))
+        .expect("serialize conformance fixture manifest"),
+    )
+    .expect("write conformance fixture manifest");
+    for extension_id in ["fixture-a", "fixture-b"] {
+        let artifact = root.join(format!(
+            "tests/ext_conformance/artifacts/{extension_id}/index.ts"
+        ));
+        std::fs::create_dir_all(artifact.parent().expect("fixture artifact parent"))
+            .expect("create fixture artifact directory");
+        std::fs::write(&artifact, "export default {};\n").expect("write fixture artifact");
+        let golden = root.join(format!(
+            "tests/ext_conformance/fixtures/{extension_id}.json"
+        ));
+        std::fs::create_dir_all(golden.parent().expect("golden fixture parent"))
+            .expect("create golden fixture directory");
+        std::fs::write(&golden, "{}\n").expect("write golden fixture");
+    }
+    fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
+    let source_commit = commit_performance_binding_fixture(&root, "initial conformance source");
+    let context = performance_git_context(&root).expect("resolve conformance fixture Git context");
+    let source_tree = perf_git_output_at(
+        &context,
+        &["ls-tree", "-r", "-z", "--full-tree", &source_commit],
+    )
+    .expect("capture conformance fixture source tree");
+    let source_tree_sha256 = format!("{:x}", Sha256::digest(source_tree));
+    let generated = Utc::now();
+    let generated_seconds = generated.to_rfc3339_opts(SecondsFormat::Secs, true);
+    let generated_millis = generated.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let reports = root.join("tests/ext_conformance/reports");
+
+    std::fs::write(
+        reports.join("load_time_benchmark.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ext.load_time_benchmark.v1",
+            "generated_at": generated_seconds,
+            "counts": {"total": 2, "ts_success": 2, "rust_success": 2, "paired": 2},
+            "results": [
+                {
+                    "extension": "fixture-a/index.ts",
+                    "ts": {"success": true, "error": null, "load_time_ms": 1},
+                    "rust": {"success": true, "error": null, "load_time_ms": 2},
+                    "ratio": 2.0
+                },
+                {
+                    "extension": "fixture-b/index.ts",
+                    "ts": {"success": true, "error": null, "load_time_ms": 1},
+                    "rust": {"success": true, "error": null, "load_time_ms": 2},
+                    "ratio": 2.0
+                }
+            ]
+        }))
+        .expect("serialize load-time fixture"),
+    )
+    .expect("write load-time fixture");
+    std::fs::write(
+        reports.join("scenario_conformance.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ext.scenario_conformance.v1",
+            "generated_at": generated_seconds,
+            "counts": {"total": 2, "pass": 2, "fail": 0, "error": 0, "skip": 0},
+            "pass_rate_pct": 100.0,
+            "results": [
+                {
+                    "extension_id": "fixture-a",
+                    "scenario_id": "scenario-a",
+                    "status": "pass",
+                    "duration_ms": 1,
+                    "summary": "fixture A passed"
+                },
+                {
+                    "extension_id": "fixture-b",
+                    "scenario_id": "scenario-b",
+                    "status": "pass",
+                    "duration_ms": 1,
+                    "summary": "fixture B passed"
+                }
+            ]
+        }))
+        .expect("serialize scenario fixture"),
+    )
+    .expect("write scenario fixture");
+    std::fs::write(
+        reports.join("smoke_triage.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ext.smoke_triage.v1",
+            "generated_at": generated_seconds,
+            "counts": {"total": 2, "pass": 2, "fail": 0, "error": 0, "skip": 0},
+            "pass_rate_pct": 100.0,
+            "extensions": [
+                {
+                    "extension_id": "fixture-a",
+                    "pass": 1, "fail": 0, "error": 0, "skip": 0,
+                    "failures": [], "failure_categories": {}
+                },
+                {
+                    "extension_id": "fixture-b",
+                    "pass": 1, "fail": 0, "error": 0, "skip": 0,
+                    "failures": [], "failure_categories": {}
+                }
+            ]
+        }))
+        .expect("serialize smoke fixture"),
+    )
+    .expect("write smoke fixture");
+
+    let parity_dir = reports.join("parity");
+    let negative_dir = reports.join("negative");
+    std::fs::create_dir_all(&parity_dir).expect("create parity fixture directory");
+    std::fs::create_dir_all(&negative_dir).expect("create negative fixture directory");
+    let parity_events = ["fixture-a", "fixture-b"]
+        .iter()
+        .enumerate()
+        .map(|(index, extension_id)| {
+            serde_json::to_string(&json!({
+                "schema": "pi.ext.parity.v1",
+                "ts": generated_millis,
+                "run_id": "fixture-parity-run",
+                "extension_id": extension_id,
+                "scenario_id": format!("parity-{index}"),
+                "kind": "tool",
+                "summary": "fixture parity match",
+                "source_tier": "fixture-tier",
+                "runtime_tier": "legacy-js",
+                "status": "match",
+                "ts_ms": 1,
+                "rust_ms": 1,
+                "diffs": [],
+                "error": null,
+                "skip_reason": null
+            }))
+            .expect("serialize parity fixture event")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(parity_dir.join("parity_events.jsonl"), parity_events)
+        .expect("write parity fixture events");
+    let negative_event = serde_json::to_string(&json!({
+        "schema": "pi.ext.negative_conformance.v1",
+        "ts": generated_millis,
+        "test_name": "empty_cap_strict",
+        "capability": "",
+        "mode": "strict",
+        "reason": "empty_capability",
+        "expected_decision": "deny",
+        "actual_decision": "Deny",
+        "status": "pass",
+        "duration_ms": 1
+    }))
+    .expect("serialize negative fixture event")
+        + "\n";
+    std::fs::write(negative_dir.join("negative_events.jsonl"), negative_event)
+        .expect("write negative fixture events");
+    std::fs::write(
+        negative_dir.join("triage.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ext.negative_triage.v1",
+            "generated_at": generated_seconds,
+            "counts": {"total": 1, "pass": 1, "fail": 0},
+            "pass_rate_pct": 100.0
+        }))
+        .expect("serialize negative triage fixture"),
+    )
+    .expect("write negative triage fixture");
+
+    for extension_id in ["fixture-a", "fixture-b"] {
+        let smoke_log = reports.join(format!("extensions/{extension_id}.jsonl"));
+        let parity_log = reports.join(format!("parity/extensions/{extension_id}.jsonl"));
+        std::fs::create_dir_all(smoke_log.parent().expect("smoke log parent"))
+            .expect("create smoke log directory");
+        std::fs::create_dir_all(parity_log.parent().expect("parity log parent"))
+            .expect("create parity log directory");
+        std::fs::write(&smoke_log, "{\"status\":\"pass\"}\n").expect("write smoke evidence log");
+        std::fs::write(
+            &parity_log,
+            serde_json::to_string(&json!({
+                "scenario_id": if extension_id == "fixture-a" {
+                    "parity-0"
+                } else {
+                    "parity-1"
+                },
+                "extension_id": extension_id,
+                "kind": "tool",
+                "summary": "fixture parity match",
+                "status": "match",
+                "source_tier": "fixture-tier",
+                "runtime_tier": "legacy-js",
+                "ts_ms": 1,
+                "rust_ms": 1
+            }))
+            .expect("serialize parity evidence log")
+                + "\n",
+        )
+        .expect("write parity evidence log");
+    }
+
+    let events_path = root.join("tests/ext_conformance/reports/conformance_events.jsonl");
+    let events = ["fixture-a", "fixture-b"]
+        .iter()
+        .map(|extension_id| {
+            serde_json::to_string(&json!({
+                "schema": "pi.ext.conformance_report.v2",
+                "ts": generated_millis.clone(),
+                "extension_id": extension_id,
+                "version": null,
+                "source_tier": "fixture-tier",
+                "conformance_tier": 1,
+                "artifact_path": format!(
+                    "tests/ext_conformance/artifacts/{extension_id}/index.ts"
+                ),
+                "evidence": {
+                    "fixture": format!("tests/ext_conformance/fixtures/{extension_id}.json"),
+                    "smoke_log": format!(
+                        "tests/ext_conformance/reports/extensions/{extension_id}.jsonl"
+                    ),
+                    "parity_log": format!(
+                        "tests/ext_conformance/reports/parity/extensions/{extension_id}.jsonl"
+                    )
+                },
+                "capabilities": capabilities.clone(),
+                "registrations": registrations.clone(),
+                "rust_load_ms": 2,
+                "ts_load_ms": 1,
+                "load_ratio": 2.0,
+                "scenario_pass": 1,
+                "scenario_fail": 0,
+                "scenario_skip": 0,
+                "smoke_pass": 1,
+                "smoke_fail": 0,
+                "parity_match": 1,
+                "parity_mismatch": 0,
+                "failures": [],
+                "overall_status": "PASS"
+            }))
+            .expect("serialize conformance fixture event")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&events_path, events).expect("write conformance fixture events");
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ext.conformance_summary.v2",
+            "generated_at": generated_seconds,
+            "run_id": "fixture-run",
+            "correlation_id": "fixture-correlation",
+            "git_commit": source_commit,
+            "source_tree_sha256": source_tree_sha256,
+            "counts": {
+                "total": 2,
+                "pass": 2,
+                "fail": 0,
+                "na": 0,
+                "tested": 2
+            },
+            "pass_rate_pct": 100.0,
+            "coverage_rate_pct": 100.0,
+            "negative": {"pass": 1, "fail": 0},
+            "per_tier": {
+                "fixture-tier": {"total": 2, "pass": 2, "fail": 0, "na": 0}
+            },
+            "evidence": {
+                "golden_fixtures": 2,
+                "smoke_logs": 2,
+                "parity_logs": 2,
+                "load_time_benchmarks": 2
+            }
+        }))
+        .expect("serialize conformance binding summary"),
+    )
+    .expect("write conformance binding summary");
+    fixture_git_output(&root, &["add", "-f", "--", "tests/ext_conformance/reports"]);
+    commit_performance_binding_fixture(&root, "record conformance summary evidence");
+    (root, summary_path, source_commit)
+}
+
+fn run_retained_conformance_validator(root: &Path, summary_path: &Path) -> std::process::Output {
+    let marker = "if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then";
+    let args = [
+        root.to_str().expect("UTF-8 conformance fixture root"),
+        summary_path
+            .to_str()
+            .expect("UTF-8 conformance fixture summary"),
+        "90",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    run_release_gate_python(command, &program)
+}
+
+fn rewrite_first_conformance_event(root: &Path, mutate: impl FnOnce(&mut Value)) {
+    let path = root.join("tests/ext_conformance/reports/conformance_events.jsonl");
+    let contents = std::fs::read_to_string(&path).expect("read conformance events fixture");
+    let mut lines = contents.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut first: Value = serde_json::from_str(&lines[0]).expect("parse first conformance event");
+    mutate(&mut first);
+    lines[0] = serde_json::to_string(&first).expect("serialize mutated conformance event");
+    std::fs::write(path, lines.join("\n") + "\n").expect("write mutated conformance events");
+}
+
+#[test]
+fn release_gate_conformance_rejects_pass_with_failing_counter() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    rewrite_first_conformance_event(&root, |event| {
+        event["scenario_pass"] = json!(0);
+        event["scenario_fail"] = json!(1);
+        event["failures"] = json!(["retained failure"]);
+        event["overall_status"] = json!("PASS");
+    });
+    commit_performance_binding_fixture(&root, "record contradictory PASS event");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(!output.status.success(), "contradictory PASS event passed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overall_status contradicts its retained counters"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_all_pass_with_zero_proof() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    rewrite_first_conformance_event(&root, |event| {
+        for field in [
+            "scenario_pass",
+            "scenario_fail",
+            "scenario_skip",
+            "smoke_pass",
+            "smoke_fail",
+            "parity_match",
+            "parity_mismatch",
+        ] {
+            event[field] = json!(0);
+        }
+        event["rust_load_ms"] = Value::Null;
+        event["ts_load_ms"] = Value::Null;
+        event["load_ratio"] = Value::Null;
+        event["failures"] = json!([]);
+        event["overall_status"] = json!("PASS");
+    });
+    commit_performance_binding_fixture(&root, "record proof-free PASS event");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(!output.status.success(), "proof-free PASS event passed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overall_status contradicts its retained counters"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_negative_failure() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let negative_event_path =
+        root.join("tests/ext_conformance/reports/negative/negative_events.jsonl");
+    let mut event: Value = serde_json::from_str(
+        std::fs::read_to_string(&negative_event_path)
+            .expect("read negative event")
+            .trim_end(),
+    )
+    .expect("parse negative event");
+    event["actual_decision"] = json!("Allow");
+    event["status"] = json!("fail");
+    std::fs::write(
+        &negative_event_path,
+        serde_json::to_string(&event).expect("serialize failing negative event") + "\n",
+    )
+    .expect("write failing negative event");
+    let triage_path = root.join("tests/ext_conformance/reports/negative/triage.json");
+    let mut triage: Value =
+        serde_json::from_slice(&std::fs::read(&triage_path).expect("read negative triage fixture"))
+            .expect("parse negative triage fixture");
+    triage["counts"] = json!({"total": 1, "pass": 0, "fail": 1});
+    triage["pass_rate_pct"] = json!(0.0);
+    std::fs::write(
+        &triage_path,
+        serde_json::to_vec_pretty(&triage).expect("serialize failing negative triage"),
+    )
+    .expect("write failing negative triage");
+    let mut summary: Value = serde_json::from_slice(
+        &std::fs::read(&summary_path).expect("read conformance summary fixture"),
+    )
+    .expect("parse conformance summary fixture");
+    summary["negative"] = json!({"pass": 0, "fail": 1});
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize negative-failure summary"),
+    )
+    .expect("write negative-failure summary");
+    commit_performance_binding_fixture(&root, "record negative conformance failure");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "negative failure passed release admission"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("negative.fail must be zero"), "{stderr}");
+}
+
+#[test]
+fn release_gate_conformance_rejects_self_reported_negative_pass() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let negative_event_path =
+        root.join("tests/ext_conformance/reports/negative/negative_events.jsonl");
+    let mut event: Value = serde_json::from_str(
+        std::fs::read_to_string(&negative_event_path)
+            .expect("read negative event")
+            .trim_end(),
+    )
+    .expect("parse negative event");
+    event["actual_decision"] = json!("Allow");
+    std::fs::write(
+        &negative_event_path,
+        serde_json::to_string(&event).expect("serialize contradictory negative event") + "\n",
+    )
+    .expect("write contradictory negative event");
+    commit_performance_binding_fixture(&root, "record self-reported negative pass");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "self-reported negative pass contradicted by its decisions was admitted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status contradicts its decisions"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_parity_error_omitted_from_main_events() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let parity_log = root.join("tests/ext_conformance/reports/parity/extensions/fixture-a.jsonl");
+    let mut contents = std::fs::read_to_string(&parity_log).expect("read parity evidence log");
+    contents.push_str(
+        &serde_json::to_string(&json!({
+            "scenario_id": "parity-error-omitted",
+            "extension_id": "fixture-a",
+            "kind": "tool",
+            "summary": "fixture parity oracle error",
+            "status": "ts_error",
+            "source_tier": "fixture-tier",
+            "runtime_tier": "legacy-js",
+            "error": "fixture TypeScript oracle failed",
+            "ts_ms": 1,
+            "rust_ms": 1
+        }))
+        .expect("serialize omitted parity error"),
+    );
+    contents.push('\n');
+    std::fs::write(&parity_log, contents).expect("write omitted parity error");
+    commit_performance_binding_fixture(&root, "record omitted parity error outcome");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "a parity error absent from parity_events.jsonl was admitted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is missing from parity_events.jsonl"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_parity_log_event_disagreement() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let parity_log = root.join("tests/ext_conformance/reports/parity/extensions/fixture-a.jsonl");
+    let mut record: Value = serde_json::from_str(
+        std::fs::read_to_string(&parity_log)
+            .expect("read parity evidence log")
+            .trim_end(),
+    )
+    .expect("parse parity evidence log");
+    record["status"] = json!("mismatch");
+    record["diffs"] = json!(["fixture mismatch"]);
+    std::fs::write(
+        &parity_log,
+        serde_json::to_string(&record).expect("serialize contradictory parity log") + "\n",
+    )
+    .expect("write contradictory parity log");
+    commit_performance_binding_fixture(&root, "record contradictory parity log");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "a parity log/main-event outcome disagreement was admitted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("status disagrees with the per-extension log"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_noncanonical_parity_event_fields() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let events_path = root.join("tests/ext_conformance/reports/parity/parity_events.jsonl");
+    let contents = std::fs::read_to_string(&events_path).expect("read parity event stream");
+    let mut lines = contents.lines();
+    let mut first: Value = serde_json::from_str(lines.next().expect("first parity event"))
+        .expect("parse first parity event");
+    first["unbound_extra_field"] = json!(true);
+    let mut rewritten =
+        vec![serde_json::to_string(&first).expect("serialize noncanonical parity event")];
+    rewritten.extend(lines.map(str::to_string));
+    std::fs::write(&events_path, rewritten.join("\n") + "\n")
+        .expect("write noncanonical parity event stream");
+    commit_performance_binding_fixture(&root, "record noncanonical parity event");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "a parity event with extra unbound fields was admitted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid canonical schema"), "{stderr}");
+}
+
+#[test]
+fn release_gate_conformance_rejects_parity_diagnostics_for_wrong_outcome() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let events_path = root.join("tests/ext_conformance/reports/parity/parity_events.jsonl");
+    let contents = std::fs::read_to_string(&events_path).expect("read parity event stream");
+    let mut lines = contents.lines();
+    let mut first: Value = serde_json::from_str(lines.next().expect("first parity event"))
+        .expect("parse first parity event");
+    first["error"] = json!("contradictory error on a matching result");
+    let mut rewritten =
+        vec![serde_json::to_string(&first).expect("serialize contradictory parity event")];
+    rewritten.extend(lines.map(str::to_string));
+    std::fs::write(&events_path, rewritten.join("\n") + "\n")
+        .expect("write contradictory parity event stream");
+    commit_performance_binding_fixture(&root, "record contradictory parity diagnostics");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "a matching parity event carrying error diagnostics was admitted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("diagnostics for the wrong outcome"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_negative_summary_source_mismatch() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let mut summary: Value = serde_json::from_slice(
+        &std::fs::read(&summary_path).expect("read conformance summary fixture"),
+    )
+    .expect("parse conformance summary fixture");
+    summary["negative"] = json!({"pass": 2, "fail": 0});
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize mismatched negative summary"),
+    )
+    .expect("write mismatched negative summary");
+    commit_performance_binding_fixture(&root, "record mismatched negative summary");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "mismatched negative summary passed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("negative.pass does not match retained negative conformance evidence"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_conformance_rejects_untracked_raw_decision_source() {
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    fixture_git_output(
+        &root,
+        &[
+            "update-index",
+            "--force-remove",
+            "tests/ext_conformance/reports/load_time_benchmark.json",
+        ],
+    );
+    commit_performance_binding_fixture(&root, "untrack raw conformance decision source");
+
+    let output = run_retained_conformance_validator(&root, &summary_path);
+    assert!(
+        !output.status.success(),
+        "untracked raw decision source passed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("load-time benchmark must be one tracked blob in release HEAD"),
+        "{stderr}"
+    );
 }
 
 fn retained_dropin_evidence_fixture() -> (PathBuf, PathBuf, PathBuf) {
@@ -3206,6 +4481,195 @@ fn retained_dropin_evidence_fixture() -> (PathBuf, PathBuf, PathBuf) {
     )
     .expect("write drop-in binding verdict");
     commit_performance_binding_fixture(&root, "record drop-in verdict evidence");
+    (root, contract_path, verdict_path)
+}
+
+fn retained_certified_dropin_lane_fixture(
+    actual_lane_verdict: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let base = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("pi-release-evidence-gate-fixtures");
+    std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    let root = base.join(format!(
+        "certified-dropin-lane-fixture-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let contract_path = root.join("docs/contracts/dropin-certification-contract.json");
+    let verdict_path = root.join("docs/evidence/dropin-certification-verdict.json");
+    let lane_path = root.join("tests/full_suite_gate/certification_verdict.json");
+    std::fs::create_dir_all(root.join("src"))
+        .expect("create certified drop-in fixture source directory");
+    for path in [&contract_path, &verdict_path, &lane_path] {
+        std::fs::create_dir_all(path.parent().expect("certified drop-in fixture parent"))
+            .expect("create certified drop-in fixture directory");
+    }
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"release-gate-certified-dropin-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\ninclude = [\"/Cargo.toml\", \"/src/**\"]\n",
+    )
+    .expect("write certified drop-in fixture Cargo.toml");
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
+        .expect("write certified drop-in fixture source");
+
+    let contract = require_json("docs/contracts/dropin-certification-contract.json");
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&contract).expect("serialize certified drop-in contract"),
+    )
+    .expect("write certified drop-in contract");
+    let hard_gates = contract
+        .get("hard_gates")
+        .and_then(Value::as_array)
+        .expect("canonical drop-in contract hard gates");
+    let mut evidence_paths = Vec::<String>::new();
+    for gate in hard_gates {
+        for artifact in gate
+            .get("required_artifacts")
+            .and_then(Value::as_array)
+            .expect("canonical gate required artifacts")
+        {
+            let path = artifact.as_str().expect("canonical required artifact path");
+            if !evidence_paths.iter().any(|existing| existing == path) {
+                evidence_paths.push(path.to_string());
+            }
+            let fixture_path = root.join(path);
+            if let Some(parent) = fixture_path.parent() {
+                std::fs::create_dir_all(parent).expect("create certified drop-in evidence parent");
+            }
+            let contents =
+                if fixture_path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    b"{}\n".as_slice()
+                } else {
+                    b"certified drop-in fixture evidence\n".as_slice()
+                };
+            std::fs::write(&fixture_path, contents)
+                .expect("write certified drop-in evidence fixture");
+        }
+    }
+    let lane_generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+    let canonical_lane = require_json("tests/full_suite_gate/certification_verdict.json");
+    let mut lane_gates = canonical_lane["gates"]
+        .as_array()
+        .expect("canonical certification lane gates")
+        .clone();
+    for gate in &mut lane_gates {
+        gate["status"] = json!("pass");
+    }
+    let (summary, promotion_rules) = if actual_lane_verdict == "pass" {
+        (
+            json!({
+                "total_gates": 20,
+                "passed": 20,
+                "failed": 0,
+                "warned": 0,
+                "skipped": 0,
+                "waived": 0,
+                "blocking_pass": 14,
+                "blocking_total": 14,
+                "all_blocking_pass": true
+            }),
+            json!({
+                "can_promote": true,
+                "blocker_gates": [],
+                "waiver_gates": [],
+                "conditions": ["All blocking gates pass (including waivers)"]
+            }),
+        )
+    } else {
+        lane_gates[0]["status"] = json!("fail");
+        (
+            json!({
+                "total_gates": 20,
+                "passed": 19,
+                "failed": 1,
+                "warned": 0,
+                "skipped": 0,
+                "waived": 0,
+                "blocking_pass": 13,
+                "blocking_total": 14,
+                "all_blocking_pass": false
+            }),
+            json!({
+                "can_promote": false,
+                "blocker_gates": ["non_mock_unit"],
+                "waiver_gates": [],
+                "conditions": ["Blocking gates still failing: non_mock_unit"]
+            }),
+        )
+    };
+    std::fs::write(
+        &lane_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ci.certification_lane.v1",
+            "lane": "full",
+            "generated_at": lane_generated_at.clone(),
+            "verdict": actual_lane_verdict,
+            "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
+            "gates": lane_gates,
+            "waiver_audit": {
+                "schema": "pi.ci.waiver_audit.v1",
+                "generated_at": lane_generated_at.clone(),
+                "total_waivers": 0,
+                "active": 0,
+                "expired": 0,
+                "expiring_soon": 0,
+                "invalid": 0,
+                "waivers": [],
+                "raw_waivers": []
+            },
+            "waivers_applied": [],
+            "summary": summary,
+            "promotion_rules": promotion_rules,
+            "rerun_guidance": {
+                "preflight_command": "cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact",
+                "full_command": "cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact",
+                "single_gate_template": "See reproduce_command field on each gate"
+            }
+        }))
+        .expect("serialize actual certification lane fixture"),
+    )
+    .expect("write actual certification lane fixture");
+
+    fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
+    let source_commit = commit_performance_binding_fixture(&root, "initial certified source");
+    let hard_gate_results = hard_gates
+        .iter()
+        .map(|gate| {
+            json!({
+                "gate_id": gate["gate_id"],
+                "status": "pass",
+                "blocking": gate["blocking"],
+                "detail": null,
+                "bead": gate["owner_issue_primary"],
+                "artifact_paths": gate["required_artifacts"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence_index = evidence_paths
+        .iter()
+        .map(|path| json!({"path": path, "exists": true}))
+        .collect::<Vec<_>>();
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.dropin.certification_verdict.v1",
+            "git_commit": source_commit,
+            "generated_at_utc": lane_generated_at,
+            "overall_verdict": "CERTIFIED",
+            "hard_gate_results": hard_gate_results,
+            "blocking_reasons": [],
+            "evidence_index": evidence_index,
+            "source": {
+                "certification_lane_artifact": "tests/full_suite_gate/certification_verdict.json",
+                "lane_schema": "pi.ci.certification_lane.v1",
+                "lane_verdict": "pass"
+            }
+        }))
+        .expect("serialize certified drop-in verdict fixture"),
+    )
+    .expect("write certified drop-in verdict fixture");
+    commit_performance_binding_fixture(&root, "record certified drop-in verdict evidence");
     (root, contract_path, verdict_path)
 }
 
@@ -3342,6 +4806,106 @@ fn release_gate_embedded_python_rejects_nested_duplicate_json_keys() {
 
 #[cfg(unix)]
 #[test]
+fn release_gate_embedded_e2e_validator_rejects_failed_lib_result() {
+    let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let lib_path = evidence_dir.join("lib/result.json");
+    let mut lib: Value =
+        serde_json::from_slice(&std::fs::read(&lib_path).expect("read lib result"))
+            .expect("parse lib result");
+    lib["exit_code"] = json!(1);
+    lib["passed"] = json!(0);
+    lib["failed"] = json!(1);
+    std::fs::write(
+        &lib_path,
+        serde_json::to_vec_pretty(&lib).expect("serialize failed lib result"),
+    )
+    .expect("write failed lib result");
+    let summary_path = evidence_dir.join("summary.json");
+    let mut summary: Value =
+        serde_json::from_slice(&std::fs::read(&summary_path).expect("read E2E summary"))
+            .expect("parse E2E summary");
+    summary["lib"] = lib;
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize failed-lib summary"),
+    )
+    .expect("write failed-lib summary");
+    commit_performance_binding_fixture(&root, "record failed inline-lib result");
+
+    let args = [
+        root.to_str().expect("UTF-8 failed-lib root"),
+        evidence_dir.to_str().expect("UTF-8 failed-lib evidence"),
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("inline-lib tests did not exit successfully"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_e2e_validator_rejects_failed_runner_outcome() {
+    let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let outcome_path = evidence_dir.join("runner_outcome.json");
+    let mut outcome: Value =
+        serde_json::from_slice(&std::fs::read(&outcome_path).expect("read runner outcome"))
+            .expect("parse runner outcome");
+    outcome["status"] = json!("fail");
+    outcome["exit_code"] = json!(1);
+    outcome["source_snapshot_verified"] = json!(false);
+    outcome["failed_phases"] = json!(["evidence_contract"]);
+    std::fs::write(
+        &outcome_path,
+        serde_json::to_vec_pretty(&outcome).expect("serialize failed runner outcome"),
+    )
+    .expect("write failed runner outcome");
+    let summary_path = evidence_dir.join("summary.json");
+    let mut summary: Value =
+        serde_json::from_slice(&std::fs::read(&summary_path).expect("read E2E summary"))
+            .expect("parse E2E summary");
+    summary["runner_outcome"] = outcome;
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize failed-outcome summary"),
+    )
+    .expect("write failed-outcome summary");
+    let contract_path = evidence_dir.join("evidence_contract.json");
+    let mut contract: Value =
+        serde_json::from_slice(&std::fs::read(&contract_path).expect("read evidence contract"))
+            .expect("parse evidence contract");
+    contract["runner_outcome"]["status"] = json!("fail");
+    contract["runner_outcome"]["exit_code"] = json!(1);
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&contract).expect("serialize failed-outcome contract"),
+    )
+    .expect("write failed-outcome contract");
+    commit_performance_binding_fixture(&root, "record failed runner outcome");
+
+    let args = [
+        root.to_str().expect("UTF-8 failed-outcome root"),
+        evidence_dir
+            .to_str()
+            .expect("UTF-8 failed-outcome evidence"),
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("runner outcome exit_code must be zero"),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3351,7 +4915,7 @@ fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
         .to_str()
         .expect("UTF-8 E2E fixture evidence path");
     let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
-    let (command, program) = release_gate_python_command(marker, &[root_arg, evidence_arg]);
+    let (command, program) = release_gate_python_command(marker, &[root_arg, evidence_arg, "168"]);
     let positive = run_release_gate_python(command, &program);
     assert!(
         positive.status.success(),
@@ -3383,7 +4947,7 @@ fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
     let wrapper = wrapper_dir.join("git");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\nif [ ! -f \"$PI_E2E_RESTORE_MARKER\" ]; then\n  cp \"$PI_E2E_ORIGINAL\" \"$PI_E2E_TARGET\" || exit 97\n  : > \"$PI_E2E_RESTORE_MARKER\" || exit 98\nfi\nexec \"$PI_E2E_REAL_GIT\" \"$@\"\n",
+        "#!/bin/sh\nif [ ! -f \"$PI_E2E_RESTORE_MARKER\" ]; then\n  case \" $* \" in\n    *\" rev-parse --verify HEAD^{commit} \"*)\n      cp \"$PI_E2E_ORIGINAL\" \"$PI_E2E_TARGET\" || exit 97\n      : > \"$PI_E2E_RESTORE_MARKER\" || exit 98\n      ;;\n  esac\nfi\nexec \"$PI_E2E_REAL_GIT\" \"$@\"\n",
     )
     .expect("write E2E Git wrapper");
     let mut permissions = std::fs::metadata(&wrapper)
@@ -3397,7 +4961,8 @@ fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
     let mut wrapped_path_entries = vec![wrapper_dir];
     wrapped_path_entries.extend(std::env::split_paths(&original_path_env));
     let wrapped_path = std::env::join_paths(wrapped_path_entries).expect("construct wrapped PATH");
-    let (mut command, program) = release_gate_python_command(marker, &[root_arg, evidence_arg]);
+    let (mut command, program) =
+        release_gate_python_command(marker, &[root_arg, evidence_arg, "168"]);
     command
         .env("PATH", wrapped_path)
         .env("PI_E2E_REAL_GIT", &real_git)
@@ -3418,6 +4983,69 @@ fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
     );
 }
 
+#[test]
+fn release_gate_embedded_e2e_validator_rejects_untracked_diagnostic_substitution() {
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let diagnostic = evidence_dir
+        .join("unit")
+        .join("release_evidence_gate")
+        .join("output.log");
+    fixture_git_output(
+        &root,
+        &[
+            "update-index",
+            "--force-remove",
+            "--",
+            diagnostic
+                .strip_prefix(&root)
+                .expect("repository-relative diagnostic")
+                .to_str()
+                .expect("UTF-8 diagnostic path"),
+        ],
+    );
+    fixture_git_output(
+        &root,
+        &[
+            "-c",
+            "user.name=Pi release-gate fixture",
+            "-c",
+            "user.email=pi-release-gate@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "remove retained E2E diagnostic from HEAD",
+        ],
+    );
+    assert!(
+        fixture_git_output(
+            &root,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+                "--no-renames",
+            ],
+        )
+        .is_empty(),
+        "the ignored diagnostic substitution must evade ordinary Git cleanliness"
+    );
+
+    let args = [
+        root.to_str().expect("UTF-8 diagnostic fixture root"),
+        evidence_dir
+            .to_str()
+            .expect("UTF-8 diagnostic fixture evidence"),
+        "168",
+    ];
+    let (command, program) =
+        release_gate_python_command("if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then", &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(stdout.contains("not tracked by release HEAD"), "{stdout}");
+}
+
 #[cfg(unix)]
 #[test]
 fn release_gate_embedded_e2e_validator_rejects_live_executable_mode() {
@@ -3436,7 +5064,7 @@ fn release_gate_embedded_e2e_validator_rejects_live_executable_mode() {
         .expect("UTF-8 E2E fixture evidence path");
     let (command, program) = release_gate_python_command(
         "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then",
-        &[root_arg, evidence_arg],
+        &[root_arg, evidence_arg, "168"],
     );
     let output = run_release_gate_python(command, &program);
     assert!(
@@ -3447,6 +5075,314 @@ fn release_gate_embedded_e2e_validator_rejects_live_executable_mode() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.starts_with("fail|"), "{stdout}");
     assert!(stdout.contains("must not be executable"), "{stdout}");
+}
+
+#[test]
+fn release_gate_embedded_e2e_validator_rejects_missing_future_and_stale_freshness() {
+    let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+
+    let (missing_root, missing_evidence) = retained_e2e_evidence_fixture();
+    let contract_path = missing_evidence.join("evidence_contract.json");
+    let mut contract: Value = serde_json::from_slice(
+        &std::fs::read(&contract_path).expect("read missing-timestamp E2E contract"),
+    )
+    .expect("parse missing-timestamp E2E contract");
+    contract
+        .as_object_mut()
+        .expect("E2E contract object")
+        .remove("generated_at");
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&contract).expect("serialize missing-timestamp E2E contract"),
+    )
+    .expect("write missing-timestamp E2E contract");
+    commit_performance_binding_fixture(&missing_root, "remove E2E generated_at fixture");
+    let args = [
+        missing_root.to_str().expect("UTF-8 missing-timestamp root"),
+        missing_evidence
+            .to_str()
+            .expect("UTF-8 missing-timestamp evidence"),
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("must each contain generated_at"),
+        "{stdout}"
+    );
+
+    let (future_root, future_evidence) = retained_e2e_evidence_fixture();
+    let future = (Utc::now() + Duration::minutes(6)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    for name in ["evidence_contract.json", "environment.json", "summary.json"] {
+        let path = future_evidence.join(name);
+        let mut payload: Value = serde_json::from_slice(
+            &std::fs::read(&path).expect("read future-timestamp E2E document"),
+        )
+        .expect("parse future-timestamp E2E document");
+        payload["generated_at"] = Value::String(future.clone());
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&payload).expect("serialize future-timestamp E2E document"),
+        )
+        .expect("write future-timestamp E2E document");
+    }
+    commit_performance_binding_fixture(&future_root, "future-date E2E evidence fixture");
+    let args = [
+        future_root.to_str().expect("UTF-8 future-timestamp root"),
+        future_evidence
+            .to_str()
+            .expect("UTF-8 future-timestamp evidence"),
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("more than five minutes in the future"),
+        "{stdout}"
+    );
+
+    let (stale_root, stale_evidence) = retained_e2e_evidence_fixture();
+    let args = [
+        stale_root.to_str().expect("UTF-8 stale-limit root"),
+        stale_evidence.to_str().expect("UTF-8 stale-limit evidence"),
+        "0",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(stdout.contains("E2E evidence is stale"), "{stdout}");
+}
+
+#[test]
+fn release_gate_embedded_e2e_validator_rejects_partial_ci_scope() {
+    let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let environment_path = evidence_dir.join("environment.json");
+    let summary_path = evidence_dir.join("summary.json");
+    let mut environment: Value = serde_json::from_slice(
+        &std::fs::read(&environment_path).expect("read partial-scope E2E environment"),
+    )
+    .expect("parse partial-scope E2E environment");
+    environment["unit_targets"] = json!(["release_evidence_gate"]);
+    std::fs::write(
+        &environment_path,
+        serde_json::to_vec_pretty(&environment).expect("serialize partial-scope environment"),
+    )
+    .expect("write partial-scope environment");
+
+    let mut summary: Value = serde_json::from_slice(
+        &std::fs::read(&summary_path).expect("read partial-scope E2E summary"),
+    )
+    .expect("parse partial-scope E2E summary");
+    summary["unit_targets"] = Value::Array(vec![summary["unit_targets"][0].clone()]);
+    summary["total_units"] = json!(1);
+    summary["passed_units"] = json!(1);
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize partial-scope summary"),
+    )
+    .expect("write partial-scope summary");
+    commit_performance_binding_fixture(&root, "record partial CI evidence fixture");
+
+    let args = [
+        root.to_str().expect("UTF-8 partial-scope root"),
+        evidence_dir.to_str().expect("UTF-8 partial-scope evidence"),
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("integration scope does not match source classification"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_e2e_validator_recomputes_the_source_snapshot() {
+    let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let forged_snapshot = format!("sha256:{}", "0".repeat(64));
+    for name in ["evidence_contract.json", "environment.json", "summary.json"] {
+        let path = evidence_dir.join(name);
+        let mut payload: Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read source-bound E2E document"))
+                .expect("parse source-bound E2E document");
+        payload["source_snapshot"] = Value::String(forged_snapshot.clone());
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&payload).expect("serialize forged E2E source snapshot"),
+        )
+        .expect("write forged E2E source snapshot");
+    }
+    commit_performance_binding_fixture(&root, "forge E2E source snapshot fixture");
+
+    let args = [
+        root.to_str().expect("UTF-8 forged-source root"),
+        evidence_dir.to_str().expect("UTF-8 forged-source evidence"),
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("does not match the independently recomputed source commit"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_conformance_validator_detects_product_to_evidence_rename() {
+    let marker = "if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then";
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let evidence_copy = root.join("tests/ext_conformance/reports/renamed_product.rs");
+    std::fs::copy(root.join("src/lib.rs"), &evidence_copy)
+        .expect("copy product bytes into the conformance evidence namespace");
+    fixture_git_output(
+        &root,
+        &["add", "tests/ext_conformance/reports/renamed_product.rs"],
+    );
+    fixture_git_output(&root, &["update-index", "--force-remove", "src/lib.rs"]);
+    fixture_git_output(
+        &root,
+        &[
+            "-c",
+            "user.name=Pi release-gate fixture",
+            "-c",
+            "user.email=pi-release-gate@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "represent product deletion plus evidence addition",
+        ],
+    );
+
+    let args = [
+        root.to_str().expect("UTF-8 rename fixture root"),
+        summary_path.to_str().expect("UTF-8 rename fixture summary"),
+        "90",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        !output.status.success(),
+        "rename attack unexpectedly passed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("non-evidence path changed after conformance source commit: src/lib.rs"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_conformance_validator_rejects_partial_scenario_inventory() {
+    let marker = "if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then";
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let events_path = root.join("tests/ext_conformance/reports/conformance_events.jsonl");
+    let events = std::fs::read_to_string(&events_path).expect("read complete conformance events");
+    let first_event = events.lines().next().expect("first conformance event");
+    std::fs::write(&events_path, format!("{first_event}\n"))
+        .expect("write partial conformance event inventory");
+    let mut summary: Value = serde_json::from_slice(
+        &std::fs::read(&summary_path).expect("read partial conformance summary"),
+    )
+    .expect("parse partial conformance summary");
+    summary["counts"] = json!({"total": 1, "pass": 1, "fail": 0, "na": 0, "tested": 1});
+    summary["per_tier"] = json!({"fixture-tier": {"total": 1, "pass": 1, "fail": 0, "na": 0}});
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize partial conformance summary"),
+    )
+    .expect("write partial conformance summary");
+    commit_performance_binding_fixture(&root, "record partial conformance evidence fixture");
+
+    let args = [
+        root.to_str().expect("UTF-8 partial conformance root"),
+        summary_path
+            .to_str()
+            .expect("UTF-8 partial conformance summary"),
+        "90",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        !output.status.success(),
+        "partial conformance inventory passed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conformance event inventory does not exactly cover the source manifest"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_embedded_conformance_validator_rechecks_final_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let marker = "if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then";
+    let (root, summary_path, _) = retained_conformance_evidence_fixture();
+    let wrapper_dir = root
+        .parent()
+        .expect("conformance fixture parent")
+        .join(format!(
+            "conformance-final-wrapper-{}",
+            uuid::Uuid::new_v4()
+        ));
+    std::fs::create_dir_all(&wrapper_dir).expect("create conformance final wrapper directory");
+    let wrapper = wrapper_dir.join("git");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\ncase \" $* \" in\n  *\" rev-parse --verify HEAD^{commit} \"*)\n    count=0\n    if [ -f \"$PI_CONFORMANCE_COUNT\" ]; then IFS= read -r count < \"$PI_CONFORMANCE_COUNT\"; fi\n    count=$((count + 1))\n    printf '%s\\n' \"$count\" > \"$PI_CONFORMANCE_COUNT\" || exit 97\n    if [ \"$count\" -eq 2 ]; then printf ' ' >> \"$PI_CONFORMANCE_TARGET\" || exit 98; fi\n    ;;\nesac\nexec \"$PI_CONFORMANCE_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("write conformance final Git wrapper");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("conformance final wrapper metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions)
+        .expect("make conformance final Git wrapper executable");
+    let counter = wrapper_dir.join("head-count");
+    let real_git = git_executable_on_path();
+    let current_path = std::env::var_os("PATH").expect("PATH for conformance final test");
+    let mut wrapped_path = vec![wrapper_dir];
+    wrapped_path.extend(std::env::split_paths(&current_path));
+    let wrapped_path = std::env::join_paths(wrapped_path).expect("construct wrapped PATH");
+    let args = [
+        root.to_str().expect("UTF-8 final-recheck fixture root"),
+        summary_path
+            .to_str()
+            .expect("UTF-8 final-recheck fixture summary"),
+        "90",
+        "168",
+    ];
+    let (mut command, program) = release_gate_python_command(marker, &args);
+    command
+        .env("PATH", wrapped_path)
+        .env("PI_CONFORMANCE_REAL_GIT", real_git)
+        .env("PI_CONFORMANCE_COUNT", counter)
+        .env("PI_CONFORMANCE_TARGET", &summary_path);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        !output.status.success(),
+        "late conformance-summary mutation unexpectedly passed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("conformance summary bytes changed during validation"),
+        "{stderr}"
+    );
 }
 
 #[cfg(unix)]
@@ -3560,6 +5496,404 @@ fn release_gate_embedded_dropin_validator_binds_parsed_bytes_and_modes() {
             "{label}: {stdout}"
         );
     }
+}
+
+#[test]
+fn release_gate_embedded_dropin_validator_rejects_self_reported_lane_pass() {
+    let marker = "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"";
+
+    let (root, contract_path, verdict_path) = retained_certified_dropin_lane_fixture("pass");
+    let args = [
+        root.to_str().expect("UTF-8 passing drop-in fixture root"),
+        contract_path
+            .to_str()
+            .expect("UTF-8 passing drop-in contract path"),
+        verdict_path
+            .to_str()
+            .expect("UTF-8 passing drop-in verdict path"),
+        "0",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "passing drop-in lane child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("pass|"),
+        "the fully bound passing lane fixture must reach the positive decision: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let (root, contract_path, verdict_path) = retained_certified_dropin_lane_fixture("fail");
+    let args = [
+        root.to_str().expect("UTF-8 certified drop-in fixture root"),
+        contract_path
+            .to_str()
+            .expect("UTF-8 certified drop-in contract path"),
+        verdict_path
+            .to_str()
+            .expect("UTF-8 certified drop-in verdict path"),
+        "0",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "the drop-in validator reports a lane mismatch through stdout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("does not match canonical passing gate non_mock_unit"),
+        "a verdict's self-reported lane pass must not override the actual lane artifact: {stdout}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_dropin_validator_rejects_skeletal_stale_and_contradictory_lanes() {
+    let marker = "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"";
+
+    let (skeletal_root, contract_path, verdict_path) =
+        retained_certified_dropin_lane_fixture("pass");
+    std::fs::write(
+        skeletal_root.join("tests/full_suite_gate/certification_verdict.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.ci.certification_lane.v1",
+            "verdict": "pass"
+        }))
+        .expect("serialize skeletal lane"),
+    )
+    .expect("write skeletal lane");
+    let skeletal_source =
+        commit_performance_binding_fixture(&skeletal_root, "record skeletal lane fixture");
+    let mut skeletal_verdict: Value =
+        serde_json::from_slice(&std::fs::read(&verdict_path).expect("read skeletal-lane verdict"))
+            .expect("parse skeletal-lane verdict");
+    skeletal_verdict["git_commit"] = Value::String(skeletal_source);
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&skeletal_verdict).expect("serialize skeletal-lane verdict"),
+    )
+    .expect("write skeletal-lane verdict");
+    commit_performance_binding_fixture(&skeletal_root, "bind skeletal lane verdict");
+    let args = [
+        skeletal_root.to_str().expect("UTF-8 skeletal lane root"),
+        contract_path.to_str().expect("UTF-8 skeletal contract"),
+        verdict_path.to_str().expect("UTF-8 skeletal verdict"),
+        "0",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(stdout.contains("top-level fields"), "{stdout}");
+
+    let (stale_root, contract_path, verdict_path) = retained_certified_dropin_lane_fixture("pass");
+    let lane_path = stale_root.join("tests/full_suite_gate/certification_verdict.json");
+    let mut stale_lane: Value =
+        serde_json::from_slice(&std::fs::read(&lane_path).expect("read stale certification lane"))
+            .expect("parse stale certification lane");
+    let stale_time =
+        (Utc::now() - Duration::hours(169)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    stale_lane["generated_at"] = Value::String(stale_time.clone());
+    stale_lane["waiver_audit"]["generated_at"] = Value::String(stale_time);
+    std::fs::write(
+        &lane_path,
+        serde_json::to_vec_pretty(&stale_lane).expect("serialize stale certification lane"),
+    )
+    .expect("write stale certification lane");
+    let stale_source = commit_performance_binding_fixture(&stale_root, "record stale lane fixture");
+    let mut stale_verdict: Value =
+        serde_json::from_slice(&std::fs::read(&verdict_path).expect("read stale-lane verdict"))
+            .expect("parse stale-lane verdict");
+    stale_verdict["git_commit"] = Value::String(stale_source);
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&stale_verdict).expect("serialize stale-lane verdict"),
+    )
+    .expect("write stale-lane verdict");
+    commit_performance_binding_fixture(&stale_root, "bind stale lane verdict");
+    let args = [
+        stale_root.to_str().expect("UTF-8 stale lane root"),
+        contract_path.to_str().expect("UTF-8 stale contract"),
+        verdict_path.to_str().expect("UTF-8 stale verdict"),
+        "0",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("certification lane evidence is stale"),
+        "{stdout}"
+    );
+
+    let (contradictory_root, contract_path, verdict_path) =
+        retained_certified_dropin_lane_fixture("pass");
+    let lane_path = contradictory_root.join("tests/full_suite_gate/certification_verdict.json");
+    let mut contradictory: Value = serde_json::from_slice(
+        &std::fs::read(&lane_path).expect("read contradictory certification lane"),
+    )
+    .expect("parse contradictory certification lane");
+    contradictory["summary"]["passed"] = json!(19);
+    std::fs::write(
+        &lane_path,
+        serde_json::to_vec_pretty(&contradictory)
+            .expect("serialize contradictory certification lane"),
+    )
+    .expect("write contradictory certification lane");
+    let contradictory_source = commit_performance_binding_fixture(
+        &contradictory_root,
+        "record contradictory lane fixture",
+    );
+    let mut contradictory_verdict: Value = serde_json::from_slice(
+        &std::fs::read(&verdict_path).expect("read contradictory-lane verdict"),
+    )
+    .expect("parse contradictory-lane verdict");
+    contradictory_verdict["git_commit"] = Value::String(contradictory_source);
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&contradictory_verdict)
+            .expect("serialize contradictory-lane verdict"),
+    )
+    .expect("write contradictory-lane verdict");
+    commit_performance_binding_fixture(&contradictory_root, "bind contradictory lane verdict");
+    let args = [
+        contradictory_root
+            .to_str()
+            .expect("UTF-8 contradictory lane root"),
+        contract_path
+            .to_str()
+            .expect("UTF-8 contradictory contract"),
+        verdict_path.to_str().expect("UTF-8 contradictory verdict"),
+        "0",
+        "168",
+    ];
+    let (command, program) = release_gate_python_command(marker, &args);
+    let output = run_release_gate_python(command, &program);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("summary does not describe 20 canonical passing gates"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_git_wrappers_ignore_hostile_replacement_objects() {
+    let e2e_marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+    let (e2e_root, evidence_dir) = retained_e2e_evidence_fixture();
+    let replacement_base = install_hostile_head_replacement(&e2e_root);
+    let environment = parse_release_json(
+        &std::fs::read(evidence_dir.join("environment.json"))
+            .expect("read E2E replacement fixture environment"),
+    )
+    .expect("parse E2E replacement fixture environment");
+    let source_commit = environment
+        .get("git_sha")
+        .and_then(Value::as_str)
+        .expect("E2E fixture source commit");
+
+    let mut hostile_git = std::process::Command::new("git");
+    hostile_git.arg("-C").arg(&e2e_root);
+    scrub_git_environment(&mut hostile_git);
+    let hostile_ancestry = hostile_git
+        .env_remove("GIT_NO_REPLACE_OBJECTS")
+        .env("GIT_REPLACE_REF_BASE", &replacement_base)
+        .args(["merge-base", "--is-ancestor", source_commit, "HEAD"])
+        .output()
+        .expect("run raw Git under hostile replacement refs");
+    assert_eq!(
+        hostile_ancestry.status.code(),
+        Some(1),
+        "fixture replacement must actually erase the source ancestry"
+    );
+
+    let e2e_root_arg = e2e_root.to_str().expect("UTF-8 E2E replacement root");
+    let evidence_arg = evidence_dir
+        .to_str()
+        .expect("UTF-8 E2E replacement evidence path");
+    let (mut command, program) =
+        release_gate_python_command(e2e_marker, &[e2e_root_arg, evidence_arg, "168"]);
+    command
+        .env("GIT_REPLACE_REF_BASE", &replacement_base)
+        .env("GIT_NO_REPLACE_OBJECTS", "0");
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "E2E hostile replacement child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("pass|"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let conformance_marker = "if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then";
+    let (conformance_root, summary_path, source_commit) = retained_conformance_evidence_fixture();
+    let replacement_base = install_hostile_head_replacement(&conformance_root);
+    let mut hostile_git = std::process::Command::new("git");
+    hostile_git.arg("-C").arg(&conformance_root);
+    scrub_git_environment(&mut hostile_git);
+    let hostile_ancestry = hostile_git
+        .env_remove("GIT_NO_REPLACE_OBJECTS")
+        .env("GIT_REPLACE_REF_BASE", &replacement_base)
+        .args(["merge-base", "--is-ancestor", &source_commit, "HEAD"])
+        .output()
+        .expect("run raw conformance Git under hostile replacement refs");
+    assert_eq!(
+        hostile_ancestry.status.code(),
+        Some(1),
+        "fixture replacement must erase the conformance source ancestry"
+    );
+
+    let args = [
+        conformance_root
+            .to_str()
+            .expect("UTF-8 conformance replacement root"),
+        summary_path
+            .to_str()
+            .expect("UTF-8 conformance replacement summary"),
+        "90",
+        "168",
+    ];
+    let (mut command, program) = release_gate_python_command(conformance_marker, &args);
+    command
+        .env("GIT_REPLACE_REF_BASE", replacement_base)
+        .env("GIT_NO_REPLACE_OBJECTS", "0");
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "conformance hostile replacement child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("2\t2\t0\t0\t2\t100\t1\t{source_commit}\tfixture-run\tfixture-correlation\n"),
+        "conformance validator must preserve the real source ancestry under a hostile ambient Git context"
+    );
+
+    let dropin_marker =
+        "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"";
+    let (dropin_root, contract_path, verdict_path) = retained_dropin_evidence_fixture();
+    let replacement_base = install_hostile_head_replacement(&dropin_root);
+    let args = [
+        dropin_root
+            .to_str()
+            .expect("UTF-8 drop-in replacement root"),
+        contract_path
+            .to_str()
+            .expect("UTF-8 drop-in replacement contract"),
+        verdict_path
+            .to_str()
+            .expect("UTF-8 drop-in replacement verdict"),
+        "0",
+        "168",
+    ];
+    let (mut command, program) = release_gate_python_command(dropin_marker, &args);
+    command
+        .env("GIT_REPLACE_REF_BASE", replacement_base)
+        .env("GIT_NO_REPLACE_OBJECTS", "0");
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "drop-in hostile replacement child failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("warn|"), "{stdout}");
+    assert!(
+        stdout.contains("release-source drop-in verdict is not certified"),
+        "hostile Git context must not divert the drop-in validator into a provenance warning: {stdout}"
+    );
+    assert!(
+        !stdout.contains("not an ancestor"),
+        "drop-in replacement-object attack changed the validator decision: {stdout}"
+    );
+}
+
+#[test]
+fn release_gate_embedded_git_wrappers_are_pinned_and_sanitized() {
+    for (label, marker, requires_binding_call) in [
+        (
+            "repository snapshot",
+            "capture_repository_snapshot() {",
+            false,
+        ),
+        ("E2E", "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then", true),
+        (
+            "conformance",
+            "if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then",
+            true,
+        ),
+        (
+            "performance",
+            "if [[ -f \"$PERFORMANCE_SUMMARY\" ]]; then",
+            true,
+        ),
+        (
+            "drop-in",
+            "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"",
+            true,
+        ),
+    ] {
+        let program = release_gate_embedded_python(marker);
+        assert!(
+            program.contains("not key.startswith(\"GIT_\")"),
+            "{label} Git wrapper must discard every ambient GIT_* variable"
+        );
+        assert!(
+            program.contains("env[\"GIT_NO_REPLACE_OBJECTS\"] = \"1\""),
+            "{label} Git wrapper must disable replacement objects"
+        );
+        for assignment in [
+            "env[\"GIT_CONFIG_GLOBAL\"] = os.devnull",
+            "env[\"GIT_CONFIG_NOSYSTEM\"] = \"1\"",
+            "env[\"GIT_LITERAL_PATHSPECS\"] = \"1\"",
+            "env[\"GIT_NO_REPLACE_OBJECTS\"] = \"1\"",
+            "env[\"GIT_OPTIONAL_LOCKS\"] = \"0\"",
+            "env[\"GIT_TERMINAL_PROMPT\"] = \"0\"",
+        ] {
+            assert!(
+                program.contains(assignment),
+                "{label} Git wrapper is missing exact environment control {assignment}"
+            );
+        }
+        assert!(
+            program.contains("\"--git-dir\"") && program.contains("\"--work-tree\""),
+            "{label} Git wrapper must pin the resolved repository context"
+        );
+        for setting in ["core.bare=false", "core.fsmonitor=false", "core.worktree="] {
+            assert!(
+                program.contains(setting),
+                "{label} Git wrapper is missing pinned setting {setting}"
+            );
+        }
+        assert!(
+            program.contains("--show-toplevel") && program.contains("--absolute-git-dir"),
+            "{label} Git wrapper must probe both sides of its repository binding"
+        );
+        if requires_binding_call {
+            assert!(
+                program.matches("verify_repository_binding()").count() >= 2,
+                "{label} must invoke verify_repository_binding(), not merely define it"
+            );
+        }
+    }
+
+    let conformance = release_gate_embedded_python("if [[ -f \"$CONFORMANCE_SUMMARY\" ]]; then");
+    assert!(
+        conformance.contains("git_result(\"merge-base\", \"--is-ancestor\", source_commit, head)"),
+        "conformance ancestry must use the hardened Git wrapper"
+    );
 }
 
 #[test]
@@ -4166,15 +6500,8 @@ fn performance_source_binding_rejects_head_advance_during_validation() {
 
 #[test]
 fn performance_budgets_report_has_exact_v2_contract() {
-    let summary = require_json("tests/perf/reports/budget_summary.json");
-    let source_binding_valid = summary
-        .get("source_commit")
-        .and_then(Value::as_str)
-        .is_some_and(|source_commit| {
-            validate_performance_source_binding(source_commit)
-                .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
-            true
-        });
+    let (summary, source_binding_valid) = load_source_bound_performance_summary()
+        .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
     let validated = validate_performance_budget_summary(
         &summary,
         Utc::now(),
@@ -4189,6 +6516,42 @@ fn performance_budgets_report_has_exact_v2_contract() {
             "v0.2.0 must remain explicitly performance-claims-NOT-authorized"
         );
     }
+}
+
+#[test]
+fn performance_summary_parse_cannot_be_substituted_before_source_binding() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    let summary_path = root.join(PERFORMANCE_BUDGET_SUMMARY_PATH);
+    let committed_summary = serde_json::to_vec(&json!({
+        "fixture": true,
+        "source_commit": source_commit,
+    }))
+    .expect("serialize committed performance summary");
+    std::fs::write(&summary_path, &committed_summary)
+        .expect("write committed source-bound performance summary");
+    commit_performance_binding_fixture(&root, "add source-bound performance summary");
+
+    let substituted_summary = serde_json::to_vec(&json!({
+        "fixture": false,
+        "source_commit": source_commit,
+    }))
+    .expect("serialize substituted performance summary");
+    std::fs::write(&summary_path, substituted_summary)
+        .expect("substitute bytes before the unbound parse");
+
+    let error = load_source_bound_performance_summary_at_with_probe(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        || {
+            std::fs::write(&summary_path, &committed_summary)
+                .map_err(|err| format!("restore committed performance summary: {err}"))
+        },
+    )
+    .expect_err("restoring different bytes before binding must not validate the parsed payload");
+    assert!(
+        error.contains("changed between its initial parse and source binding"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -4223,6 +6586,12 @@ fn performance_contract_accepts_coherent_blocked_no_data() {
     assert!(
         validate_performance_budget_summary(&future, now, Duration::hours(168), false).is_err(),
         "an impossible future timestamp is malformed even when claims remain blocked"
+    );
+
+    let stale = blocked_performance_summary_fixture(now - Duration::hours(169));
+    assert!(
+        validate_performance_budget_summary(&stale, now, Duration::hours(168), false).is_err(),
+        "blocked/NO_DATA evidence must still satisfy the configured freshness limit"
     );
 
     for (run_id, correlation_id) in [
