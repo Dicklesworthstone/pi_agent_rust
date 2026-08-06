@@ -1125,6 +1125,115 @@ fn e2e_cli_extension_compat_ledger_keeps_cli_extensions_with_no_extensions() {
 }
 
 #[test]
+fn e2e_cli_fetch_models_is_a_standalone_stdout_command() {
+    let harness = CliTestHarness::new("e2e_cli_fetch_models_is_a_standalone_stdout_command");
+    let result = harness.run(&["--fetch-models", "openai"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert!(
+        result.stdout.lines().any(|line| !line.trim().is_empty()),
+        "fetch-models should print model IDs to stdout"
+    );
+    assert!(
+        result
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .all(|line| !line.chars().any(char::is_whitespace)),
+        "stdout must contain one machine-friendly model ID per line: {}",
+        result.stdout
+    );
+    assert!(
+        !result.stdout.contains("\u{1b}[?1049") && !result.stderr.contains("\u{1b}[?1049"),
+        "fetch-models must never enter the alternate-screen TUI"
+    );
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        "showing the static registry instead",
+    );
+    let sessions_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_SESSIONS_DIR")
+            .expect("isolated sessions dir"),
+    );
+    assert!(
+        !sessions_dir.exists(),
+        "standalone model discovery must not initialize a TUI session"
+    );
+}
+
+#[test]
+fn e2e_cli_list_models_reads_the_persisted_fetched_catalog() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_list_models_reads_the_persisted_fetched_catalog");
+    harness.env.insert(
+        "OPENROUTER_API_KEY".to_string(),
+        "test-only-openrouter-key".to_string(),
+    );
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    );
+    fs::create_dir_all(&agent_dir).expect("create isolated agent dir");
+    fs::write(
+        agent_dir.join("models.fetched.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.models.fetched.v1",
+            "providers": {
+                "openrouter": {
+                    "models": [{"id": "issue-150-live-model"}]
+                }
+            }
+        }))
+        .expect("serialize fetched catalog"),
+    )
+    .expect("write fetched catalog");
+
+    let result = harness.run(&["--list-models", "issue-150-live-model"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(&harness.harness, &result.stdout, "openrouter");
+    assert_contains(&harness.harness, &result.stdout, "issue-150-live-model");
+}
+
+#[test]
+fn e2e_cli_persist_models_rejects_static_fallback() {
+    let harness = CliTestHarness::new("e2e_cli_persist_models_rejects_static_fallback");
+    let result = harness.run(&["--fetch-models", "openai", "--persist-models"]);
+
+    assert_exit_code(&harness.harness, &result, 1);
+    assert!(
+        result.stdout.is_empty(),
+        "a rejected persistence request must not emit a misleading catalog"
+    );
+    assert_contains(&harness.harness, &result.stderr, "Refusing to persist");
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    );
+    assert!(
+        !agent_dir.join("models.fetched.json").exists(),
+        "static fallback must never be persisted"
+    );
+}
+
+#[test]
+fn e2e_cli_refresh_models_requires_a_live_result() {
+    let harness = CliTestHarness::new("e2e_cli_refresh_models_requires_a_live_result");
+    let result = harness.run(&["--fetch-models", "openai", "--refresh-models"]);
+
+    assert_exit_code(&harness.harness, &result, 1);
+    assert!(result.stdout.is_empty(), "strict refresh must not print fallback rows");
+    assert_contains(&harness.harness, &result.stderr, "api_key");
+}
+
+#[test]
 fn e2e_cli_version_flag() {
     let harness = CliTestHarness::new("e2e_cli_version_flag");
     let result = harness.run(&["--version"]);
