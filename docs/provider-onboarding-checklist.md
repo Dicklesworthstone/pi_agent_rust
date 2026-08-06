@@ -283,7 +283,7 @@ If the provider uses non-standard auth (OAuth, service keys, device flow):
 - **OAuth (browser-based):** See Anthropic OAuth (`start_anthropic_oauth`, `complete_anthropic_oauth`)
 - **Device flow:** See GitHub Copilot (`start_github_device_flow`)
 - **Service key (client credentials):** See SAP AI Core (`resolve_sap_credentials`)
-- **AWS IAM:** See Bedrock (`resolve_bedrock_credentials`)
+- **AWS IAM:** See Bedrock (`resolve_aws_credentials_async`)
 
 ### Step 11: Add Runtime Resolution
 
@@ -348,7 +348,7 @@ Each provider must satisfy the test obligations defined in its metadata (`Provid
 
 ### Contract Tests
 
-**Location:** `tests/provider_native_contract.rs` or `tests/provider_streaming_conformance.rs`
+**Location:** `tests/provider_native_contract.rs` or `tests/provider_streaming.rs`
 
 - VCR cassette-based tests verifying real API wire format
 - Tool call round-trips

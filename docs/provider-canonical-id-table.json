@@ -487,21 +487,6 @@
     {
       "aliases": [],
       "auth_env_keys": [
-        "GITHUB_TOKEN"
-      ],
-      "canonical_id": "github-models",
-      "onboarding_mode": "oai-compatible-preset",
-      "routing": {
-        "api": "openai-completions",
-        "auth_header": true,
-        "base_url": "https://models.github.ai/inference",
-        "context_window": 128000,
-        "max_tokens": 16384
-      }
-    },
-    {
-      "aliases": [],
-      "auth_env_keys": [
         "HELICONE_API_KEY"
       ],
       "canonical_id": "helicone",
@@ -1465,5 +1450,5 @@
   ],
   "schema_version": "1.0",
   "total_aliases": 51,
-  "total_providers": 95
+  "total_providers": 94
 }

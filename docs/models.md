@@ -7,6 +7,30 @@ Pi loads available models from a built-in registry and an optional user-defined 
 | Path | Description |
 |------|-------------|
 | `~/.pi/agent/models.json` | User-defined model overrides and custom providers |
+| `~/.pi/agent/models.fetched.json` | Generated v2 live-catalog membership; managed only by `--persist-models` |
+
+Do not hand-edit `models.fetched.json`. Its provider/model IDs are bound to the
+fetching endpoint and transport shape by a non-secret fingerprint and timestamp. The
+fingerprint excludes credential values, URL query values, and header values, so it
+cannot serve as an offline credential verifier. It binds recognized credential-query
+ordered name/presence shape (including exact query-name casing) and
+case-insensitive header name/presence shape. A non-empty query/header value
+outside a recognized credential channel may select a tenant or deployment; Pi
+therefore refuses persistence for that route and ignores legacy generated membership
+under such a current route. Pi ignores mismatched generated rows and asks you to
+refresh them. Because the fingerprint deliberately excludes credential values,
+switching accounts without changing the endpoint/transport shape does not
+invalidate saved membership automatically; rerun
+`--fetch-models <provider> --refresh-models --persist-models` after such a switch.
+Inference requests still resolve the current account's credential, while only
+the opt-in saved model list can remain stale. Hand-authored `models.json` remains
+authoritative.
+
+Legacy `pi.models.fetched.v1` files lack the endpoint and transport provenance
+required by v2 and are preserved rather than overwritten automatically. Move
+the legacy file aside to `models.fetched.v1.backup.json`, then run a verified
+live `--fetch-models <provider> --refresh-models --persist-models` command to
+create a v2 catalog.
 
 ## Schema
 
@@ -28,7 +52,7 @@ The root object contains a `providers` map.
 |-------|------|-------------|
 | `baseUrl` | string | Base API URL (e.g. `https://api.openai.com/v1`) |
 | `api` | string | Protocol adapter (e.g. `openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `google-vertex`) |
-| `apiKey` | string | API key, env var name, or shell command (see Secret Resolution) |
+| `apiKey` | string | Fallback API key, env var name, or shell command after normal runtime credential resolution (see Secret Resolution) |
 | `models` | object[] | List of models. If omitted, provider settings override built-in config for that provider. |
 | `headers` | object | Custom HTTP headers |
 | `authHeader` | boolean | If true, sends key in `Authorization: Bearer <key>` |
@@ -131,6 +155,11 @@ Azure requires resource-specific URLs and `api-key` header instead of Bearer tok
 ## Secret Resolution
 
 API keys can be plain strings, environment variables, or shell commands.
+
+Normal runtime credentials—explicit overrides, provider environment variables,
+stored auth, and supported external-provider credentials—take precedence over
+the provider route's `apiKey`. The `models.json` value is used only when normal
+runtime resolution finds no non-empty credential.
 
 - **Environment Variable**: If the string matches an env var name (e.g. `OPENAI_API_KEY`), it is resolved.
 - **Shell Command**: Prefix with `!` to execute a command.

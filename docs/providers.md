@@ -44,9 +44,12 @@ Extension-provided providers route through the extension provider bridge in `src
 
 ### Machine-Readable Classification (`bd-3uqg.1.4`)
 
-Canonical planning artifact: `docs/provider-implementation-modes.json`
+Historical planning artifact: `docs/provider-implementation-modes.json`
 
-This JSON is the execution source-of-truth for provider onboarding mode selection:
+That JSON freezes the 2026-02-13 planning decision and is not current runtime
+authority. For the live tree, use `src/provider_metadata.rs` for registration
+and `src/providers/mod.rs` plus factory tests for dispatch. Its historical mode
+vocabulary was:
 
 | Mode | Planning Meaning |
 |------|------------------|
@@ -55,7 +58,7 @@ This JSON is the execution source-of-truth for provider onboarding mode selectio
 | `gateway-wrapper-routing` | Acts as gateway/meta-router/alias-routing surface; prioritize routing-policy and diagnostics guarantees. |
 | `deferred` | Explicitly not in current implementation wave; retained for planning completeness. |
 
-Current artifact coverage (`docs/provider-implementation-modes.json`):
+Historical snapshot coverage (`docs/provider-implementation-modes.json`):
 - 93 upstream union IDs classified (no gaps)
 - 6 supplemental Pi alias IDs classified
 - 99 total entries with explicit profile, rationale, and runtime status
@@ -113,7 +116,7 @@ Batch B1 provider IDs integrated and lock-tested:
 Verification artifacts:
 - Metadata + factory route lock: [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_presets_resolve_metadata_defaults_and_factory_route`)
 - OpenAI-compatible stream path/auth lock (`alibaba-cn`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_alibaba_cn_openai_compat_streams_use_chat_completions_path_and_bearer_auth`)
-- Anthropic-compatible stream path/auth lock (`kimi-for-coding`, `minimax*`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key`)
+- Anthropic-compatible direct-key stream path/auth lock (`kimi-for-coding`, `minimax*`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_anthropic_compat_streams_use_messages_path_and_x_api_key`); Kimi device/external-token bearer behavior is locked in [`src/providers/anthropic.rs`](../src/providers/anthropic.rs) (`test_stream_kimi_oauth_uses_bearer_and_kimi_headers`)
 - Family coherence lock (`moonshot`/`kimi` alias vs `kimi-for-coding`, `alibaba` vs `alibaba-cn`): [`tests/provider_factory.rs`](../tests/provider_factory.rs) (`wave_b1_family_coherence_with_existing_moonshot_and_alibaba_mappings`)
 - Representative smoke/e2e artifacts (offline VCR harness): [`tests/provider_native_verify.rs`](../tests/provider_native_verify.rs) (`wave_b1_smoke::b1_alibaba_cn_*`, `wave_b1_smoke::b1_kimi_for_coding_*`, `wave_b1_smoke::b1_minimax_*`) with fixtures under [`tests/fixtures/vcr/verify_alibaba-cn_*.json`](../tests/fixtures/vcr/verify_alibaba-cn_simple_text.json), [`tests/fixtures/vcr/verify_kimi-for-coding_*.json`](../tests/fixtures/vcr/verify_kimi-for-coding_simple_text.json), and [`tests/fixtures/vcr/verify_minimax_*.json`](../tests/fixtures/vcr/verify_minimax_simple_text.json)
 
@@ -265,7 +268,7 @@ Wave C execution status:
 | `google-gemini-cli` | `gemini-cli` | text + image + reasoning | `google-gemini-cli` | Project-scoped Code Assist endpoint | Google OAuth via `/login google-gemini-cli` plus project ID | `native-adapter-required` | Dispatchable through the Gemini CLI path | [gemini](../src/providers/gemini.rs), [models](../src/models.rs), [metadata](../tests/provider_metadata_comprehensive.rs) |
 | `google-antigravity` | `antigravity` | text + image + reasoning | `google-gemini-cli` | Project-scoped Antigravity endpoint | Google OAuth via `/login google-antigravity` plus project ID | `native-adapter-required` | Dispatchable through the Gemini CLI path with Antigravity routing | [gemini](../src/providers/gemini.rs), [models](../src/models.rs), [metadata](../tests/provider_metadata_comprehensive.rs) |
 | `google-vertex` | `vertexai` | text + image + reasoning + tool-calls | `google-vertex` | `https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/{publisher}/models/{model}` | `Authorization: Bearer` (`GOOGLE_CLOUD_API_KEY`, alt `VERTEX_API_KEY`) | `native-implemented` | Implemented and dispatchable; supports Google (Gemini) and Anthropic publishers | [unit](../src/providers/vertex.rs), [factory](../src/providers/mod.rs), [metadata](../tests/provider_metadata_comprehensive.rs) |
-| `cohere` | - | text + tool-calls | `cohere-chat` | `https://api.cohere.com/v2` (normalized to `/chat`) | `Authorization: Bearer` (`COHERE_API_KEY`) | `native-implemented` | Implemented and dispatchable | [unit](../tests/provider_streaming/cohere.rs), [contract](../tests/provider_backward_lock.rs), [cassette](../tests/fixtures/vcr/cohere_simple_text.json), e2e expansion tracked in `bd-3uqg.8.4` |
+| `cohere` | - | text + tool-calls | `cohere-chat` | `https://api.cohere.com/v2` (normalized to `/chat`) | `Authorization: Bearer` (`COHERE_API_KEY`) | `native-implemented` | Implemented and dispatchable | [unit](../tests/provider_streaming/cohere.rs), [contract](../tests/provider_backward_lock.rs), [cassette](../tests/fixtures/vcr/verify_cohere_simple_text.json), e2e expansion tracked in `bd-3uqg.8.4` |
 | `azure-openai` | `azure`, `azure_openai`, `azure-cognitive-services`, `azure-openai-responses` | text + tool-calls | Azure chat/completions path | `https://{resource}.openai.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` or `https://{resource}.cognitiveservices.azure.com/openai/deployments/{deployment}/chat/completions?api-version={version}` | `api-key` header (`AZURE_OPENAI_API_KEY`) | `native-implemented` | Dispatchable through provider factory with deterministic resource/deployment/api-version resolution from env + model/base_url | [unit](../tests/provider_streaming/azure.rs), [contract](../tests/provider_backward_lock.rs), [e2e](../tests/e2e_live.rs), [cassette](../tests/fixtures/vcr/azure_simple_text.json) |
 | `groq` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.groq.com/openai/v1` | `Authorization: Bearer` (`GROQ_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `deepinfra` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.deepinfra.com/v1/openai` | `Authorization: Bearer` (`DEEPINFRA_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
@@ -274,7 +277,7 @@ Wave C execution status:
 | `mistral` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.mistral.ai/v1` | `Authorization: Bearer` (`MISTRAL_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `moonshotai` | `moonshot`, `kimi` | text (+ OAI-compatible tools) | `openai-completions` | `https://api.moonshot.ai/v1` | `Authorization: Bearer` (`MOONSHOT_API_KEY`, fallback `KIMI_API_KEY`) | `oai-compatible-preset` (`moonshot`,`kimi` are `alias-only`) | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [alias-roundtrip](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `moonshotai-cn` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.moonshot.cn/v1` | `Authorization: Bearer` (`MOONSHOT_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_moonshotai-cn_simple_text.json) |
-| `kimi-for-coding` | - | text + image (Anthropic-compatible) | `anthropic-messages` | `https://api.kimi.com/coding/v1/messages` | `x-api-key` (`KIMI_API_KEY`) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_kimi-for-coding_simple_text.json) |
+| `kimi-for-coding` | - | text + image (Anthropic-compatible) | `anthropic-messages` | `https://api.kimi.com/coding/v1/messages` | `x-api-key` for `sk-*` direct keys; `Authorization: Bearer` plus Kimi device headers for `/login` and external Kimi tokens (`KIMI_API_KEY` is the direct-env source) | `oai-compatible-preset` (preset fallback) | Dispatchable through Anthropic API fallback route | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [bearer/direct-key unit tests](../src/providers/anthropic.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_kimi-for-coding_simple_text.json) |
 | `dashscope` | `alibaba`, `qwen` | text (+ OAI-compatible tools) | `openai-completions` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | `Authorization: Bearer` (`DASHSCOPE_API_KEY`, fallback `QWEN_API_KEY`) | `oai-compatible-preset` (`alibaba`,`qwen` are `alias-only`) | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), e2e expansion tracked in `bd-3uqg.8.4` |
 | `alibaba-cn` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `Authorization: Bearer` (`DASHSCOPE_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_alibaba-cn_simple_text.json) |
 | `modelscope` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api-inference.modelscope.cn/v1` | `Authorization: Bearer` (`MODELSCOPE_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify harness](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_modelscope_simple_text.json) |
@@ -298,7 +301,7 @@ Wave C execution status:
 | `zai-coding-plan` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://api.z.ai/api/coding/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zai-coding-plan_simple_text.json) |
 | `zhipuai` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://open.bigmodel.cn/api/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zhipuai_simple_text.json) |
 | `zhipuai-coding-plan` | - | text (+ OAI-compatible tools) | `openai-completions` | `https://open.bigmodel.cn/api/coding/paas/v4` | `Authorization: Bearer` (`ZHIPU_API_KEY`) | `oai-compatible-preset` | Dispatchable through OpenAI-compatible fallback | [metadata](../tests/provider_metadata_comprehensive.rs), [factory](../tests/provider_factory.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_zhipuai-coding-plan_simple_text.json) |
-| `amazon-bedrock` | `bedrock` | text + tool-calls | `bedrock-converse-stream` | Region-based AWS endpoint | SigV4/Bearer (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_PROFILE`, `AWS_REGION`) | `native-adapter-required` | VCR-verified (4 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_bedrock_simple_text.json), [parity-report](provider-native-parity-report.json) |
+| `amazon-bedrock` | `bedrock` | text + tool-calls | `bedrock-converse-stream` | Region-based AWS endpoint | Explicit `--api-key`/request bearer override first; otherwise `AWS_BEARER_TOKEN_BEDROCK` or SigV4 from a complete env key pair, static/SSO profile, or stored credential (`AWS_REGION`/`AWS_DEFAULT_REGION`) | `native-adapter-required` | VCR-verified (4 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_bedrock_simple_text.json), [parity-report](provider-native-parity-report.json) |
 | `sap-ai-core` | `sap` | text + tool-calls | OAuth2 + OpenAI-compatible | SAP AI Core service URL | OAuth2 client credentials (`AICORE_SERVICE_KEY`, `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`, `SAP_AI_CORE_TOKEN_URL`, `SAP_AI_CORE_SERVICE_URL`) | `native-adapter-required` | VCR-verified (6 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_sap_ai_core_simple_text.json), [parity-report](provider-native-parity-report.json) |
 | `github-copilot` | `copilot` | text + tool-calls | Copilot chat/completions | `https://api.githubcopilot.com` | `Authorization: Bearer` (`GITHUB_COPILOT_API_KEY`, `GITHUB_TOKEN`) | `native-adapter-required` | VCR-verified (6 scenarios) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_copilot_simple_text.json), [parity-report](provider-native-parity-report.json) |
 | `gitlab` | `gitlab-duo` | text | GitLab AI API | GitLab instance URL | `Authorization: Bearer` (`GITLAB_TOKEN`, `GITLAB_API_KEY`) | `native-adapter-required` | VCR-verified (5 scenarios, no tool_call) | [metadata](../tests/provider_metadata_comprehensive.rs), [native-verify](../tests/provider_native_verify.rs), [cassette](../tests/fixtures/vcr/verify_gitlab_simple_text.json), [parity-report](provider-native-parity-report.json) |
@@ -309,6 +312,12 @@ Wave C execution status:
 ## Historical Verification Status Summary
 
 The status table below is historical evidence from `docs/provider-native-parity-report.json` (`report.generated_at`: `2026-02-12T16:45:00Z`). It should not be used as the current native-module inventory. For the current source inventory, use the provider-count rule above and the governance test that checks `src/providers/*.rs`.
+
+The same historical boundary applies to `provider-baseline-audit.json`,
+`provider-parity-checklist.json`, `provider-parity-reconciliation*.json`,
+`provider-gaps-audit-report.json`, and `provider-closure-truth-table.json`.
+Those frozen artifacts retain their original bytes and era-specific counts for
+provenance; none is current release authority.
 
 At the time of that report, all native and preset providers had at least metadata + factory verification. The VCR-verified provider count in that snapshot was 29 out of 85 canonical IDs.
 
@@ -324,7 +333,9 @@ At the time of that report, all native and preset providers had at least metadat
 
 Consolidated parity report: [`docs/provider-native-parity-report.json`](provider-native-parity-report.json)
 
-Full deferred/high-risk inventory lives in `docs/provider-implementation-modes.json`.
+The historical deferred/high-risk inventory lives in
+`docs/provider-implementation-modes.json`; it must not override the live
+registry or factory.
 
 ## Historical Already-Covered vs Missing Snapshot
 
@@ -359,13 +370,19 @@ The following providers are recognized in upstream catalogs but explicitly defer
 
 ### Batch A1-A4 VCR Gap
 
-34 providers are fully metadata-registered and factory-verified but lack individual VCR fixtures: `302ai`, `abacus`, `aihubmix`, `bailing`, `berget`, `chutes`, `cortecs`, `fastrouter`, `firmware`, `friendli`, `github-models`, `helicone`, `huggingface`, `iflowcn`, `inception`, `inference`, `io-net`, `jiekou`, `lucidquery`, `moark`, `morph`, `nano-gpt`, `nova`, `novita-ai`, `nvidia`, `poe`, `privatemode-ai`, `requesty`, `submodel`, `synthetic`, `vivgrid`, `vultr`, `wandb`, `xiaomi`.
+33 providers are fully metadata-registered and factory-verified but lack individual VCR fixtures: `302ai`, `abacus`, `aihubmix`, `bailing`, `berget`, `chutes`, `cortecs`, `fastrouter`, `firmware`, `friendli`, `helicone`, `huggingface`, `iflowcn`, `inception`, `inference`, `io-net`, `jiekou`, `lucidquery`, `moark`, `morph`, `nano-gpt`, `nova`, `novita-ai`, `nvidia`, `poe`, `privatemode-ai`, `requesty`, `submodel`, `synthetic`, `vivgrid`, `vultr`, `wandb`, `xiaomi`.
 
 These providers are dispatchable through the OpenAI-compatible fallback and pass metadata + factory tests. Individual VCR fixture expansion is tracked in `bd-3uqg.8.4`.
 
+`github-models` is intentionally absent from the active provider registry:
+GitHub retired the GitHub Models service on 2026-07-30. This does not affect the
+separate `github-copilot` native provider.
+
 ### Implementation Modes Reference
 
-Deferred classification profiles are documented in [`docs/provider-implementation-modes.json`](provider-implementation-modes.json). Key profile definitions:
+Historical deferred classification profiles are documented in
+[`docs/provider-implementation-modes.json`](provider-implementation-modes.json).
+Key profile definitions at the time were:
 
 | Profile | Meaning |
 |---------|---------|
@@ -381,7 +398,9 @@ When updating the Canonical Provider Matrix table or related sections, follow th
 ### Adding a New Provider Row
 
 1. Add the canonical metadata entry in `src/provider_metadata.rs` first.
-2. Run `cargo test provider_metadata_comprehensive provider_factory -- --nocapture` to confirm metadata + factory pass.
+2. Run `cargo test --test provider_metadata_comprehensive -- --nocapture`, then
+   `cargo test --test provider_factory -- --nocapture`, to confirm metadata and
+   factory behavior independently.
 3. Add the provider row to the matrix table above, filling all columns:
    - **Canonical ID**: from `PROVIDER_METADATA.canonical_id`
    - **Aliases**: from `PROVIDER_METADATA.aliases` (dash-separated list, or `-` if none)
@@ -407,7 +426,9 @@ When new VCR fixtures are added in `tests/fixtures/vcr/verify_*.json`:
 1. Confirm the graduation condition in the Deferred Providers table is met.
 2. Remove the provider from the Deferred Providers table.
 3. Add it to the Canonical Provider Matrix with full evidence links.
-4. Update `docs/provider-implementation-modes.json` entry to reflect new status.
+4. If a new planning snapshot is intentionally commissioned, replace the
+   historical implementation-mode artifact as a whole with fresh provenance;
+   do not edit it piecemeal and present mixed-era counts as current.
 5. Close the associated tracking bead.
 
 ### Source-of-Truth Cross-References
@@ -421,7 +442,7 @@ When new VCR fixtures are added in `tests/fixtures/vcr/verify_*.json`:
 | Factory routing tests | `tests/provider_factory.rs` | 144 assertions covering factory dispatch |
 | Native verify harness (VCR) | `tests/provider_native_verify.rs` | 206 offline streaming/error replay tests |
 | Parity report | `docs/provider-native-parity-report.json` | Consolidated per-provider pass/fail matrix |
-| Implementation modes | `docs/provider-implementation-modes.json` | Classification profiles and deferral rationale |
+| Historical implementation modes | `docs/provider-implementation-modes.json` | Frozen 2026-02-13 classification provenance; not live runtime authority |
 | Onboarding playbook | `docs/provider-onboarding-playbook.md` | Execution guide for adding/configuring providers |
 
 ## Alias Migration Notes
@@ -497,7 +518,7 @@ pi --provider google --model gemini-2.5-flash -p "Hello"
 
 ### Common Pitfalls
 
-- **`kimi` vs `kimi-for-coding`**: `kimi` is an alias for `moonshotai` (OpenAI-compatible). `kimi-for-coding` is a distinct canonical ID that routes through `anthropic-messages` with `KIMI_API_KEY`. Do not conflate them.
+- **`kimi` vs `kimi-for-coding`**: `kimi` is an alias for `moonshotai` (OpenAI-compatible). `kimi-for-coding` is a distinct canonical ID that routes through `anthropic-messages`. A `sk-*` direct key (including via `KIMI_API_KEY`) uses `x-api-key`; `/login kimi-for-coding` and external Kimi access tokens use `Authorization: Bearer` plus Kimi device headers. Do not conflate the providers or the two Kimi wire-auth lanes.
 - **`alibaba` vs `alibaba-cn`**: `alibaba` routes to the international DashScope endpoint. `alibaba-cn` is a distinct canonical ID routing to the CN endpoint (`dashscope.aliyuncs.com`). Both use `DASHSCOPE_API_KEY`.
 - **`moonshotai` vs `moonshotai-cn`**: Same auth key (`MOONSHOT_API_KEY`), but distinct base URLs (`api.moonshot.ai` vs `api.moonshot.cn`). `moonshotai-cn` is a distinct canonical ID, not an alias.
 - **`openrouter` vs `open-router`**: `open-router` is an alias that resolves to canonical `openrouter`. OpenRouter-specific model aliases (for example `gpt-4o-mini`, `claude-3.5-sonnet`) normalize to canonical upstream IDs during lookup/ad-hoc resolution.
@@ -514,9 +535,15 @@ Alias resolution is tested by:
 
 Credential resolution precedence (runtime):
 1. explicit CLI override (`--api-key`)
-2. provider env vars from metadata (ordered; includes shared fallbacks like `GOOGLE_API_KEY` then `GEMINI_API_KEY`)
-3. persisted `auth.json` credential (`ApiKey` or unexpired OAuth `access_token`)
-4. inline `models.json` `apiKey` fallback (resolved from literal/env/file/shell sources)
+2. persisted `auth.json` OAuth or bearer credential (an unexpired OAuth `access_token` or `BearerToken`)
+3. provider env vars from metadata (ordered; includes shared fallbacks like `GOOGLE_API_KEY` then `GEMINI_API_KEY`)
+4. persisted `auth.json` API key
+5. supported credentials auto-detected from another local coding CLI (global auth storage only)
+
+After the auth resolver exhausts those five sources, model selection can use an
+inline `models.json` `apiKey` fallback (resolved from literal/env/file/shell
+sources). Canonical IDs and aliases share the same stored credential lookup;
+canonical alias resolution is not a later precedence tier.
 
 Auth diagnostics and redaction contract:
 - All auth diagnostics emit `redaction_policy=redact-secrets` and never include raw secrets in user-facing hints.

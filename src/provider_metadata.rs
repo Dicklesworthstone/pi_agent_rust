@@ -566,23 +566,9 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         }),
         test_obligations: TEST_REQUIRED,
     },
-    ProviderMetadata {
-        canonical_id: "github-models",
-        display_name: Some("GitHub Models"),
-        aliases: &[],
-        auth_env_keys: &["GITHUB_TOKEN"],
-        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
-        routing_defaults: Some(ProviderRoutingDefaults {
-            api: "openai-completions",
-            base_url: "https://models.github.ai/inference",
-            auth_header: true,
-            reasoning: true,
-            input: &INPUT_TEXT,
-            context_window: 128_000,
-            max_tokens: 16_384,
-        }),
-        test_obligations: TEST_REQUIRED,
-    },
+    // `github-models` is intentionally absent. GitHub retired the Models
+    // catalog, inference API, and BYOK service on 2026-07-30. The separate
+    // `github-copilot` native adapter remains supported.
     ProviderMetadata {
         canonical_id: "helicone",
         display_name: Some("Helicone"),
@@ -2081,11 +2067,10 @@ mod tests {
     }
 
     #[test]
-    fn batch_a2_metadata_resolves_all_eight_providers() {
+    fn batch_a2_metadata_resolves_all_active_providers() {
         let ids = [
             "firmware",
             "friendli",
-            "github-models",
             "helicone",
             "huggingface",
             "iflowcn",
@@ -2107,7 +2092,6 @@ mod tests {
     fn batch_a2_env_keys_match_upstream_registry() {
         assert_eq!(provider_auth_env_keys("firmware"), &["FIRMWARE_API_KEY"]);
         assert_eq!(provider_auth_env_keys("friendli"), &["FRIENDLI_TOKEN"]);
-        assert_eq!(provider_auth_env_keys("github-models"), &["GITHUB_TOKEN"]);
         assert_eq!(provider_auth_env_keys("helicone"), &["HELICONE_API_KEY"]);
         assert_eq!(provider_auth_env_keys("huggingface"), &["HF_TOKEN"]);
         assert_eq!(provider_auth_env_keys("iflowcn"), &["IFLOW_API_KEY"]);
@@ -2120,7 +2104,6 @@ mod tests {
         let ids = [
             "firmware",
             "friendli",
-            "github-models",
             "helicone",
             "huggingface",
             "iflowcn",
@@ -2140,7 +2123,6 @@ mod tests {
         let ids = [
             "firmware",
             "friendli",
-            "github-models",
             "helicone",
             "huggingface",
             "iflowcn",
@@ -2164,6 +2146,18 @@ mod tests {
         urls.sort_unstable();
         urls.dedup();
         assert_eq!(urls.len(), ids.len(), "duplicate base URLs detected");
+    }
+
+    #[test]
+    fn retired_github_models_is_not_exposed_but_github_copilot_remains() {
+        assert!(provider_metadata("github-models").is_none());
+        assert!(provider_routing_defaults("github-models").is_none());
+        let copilot = provider_metadata("github-copilot").expect("GitHub Copilot metadata");
+        assert_eq!(copilot.canonical_id, "github-copilot");
+        assert_eq!(
+            copilot.onboarding,
+            ProviderOnboardingMode::NativeAdapterRequired
+        );
     }
 
     // ── Batch A3 tests ────────────────────────────────────────────────

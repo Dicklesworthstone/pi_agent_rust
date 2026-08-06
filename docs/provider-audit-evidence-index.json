@@ -1,8 +1,15 @@
 {
   "schema": "pi.qa.audit_evidence_index.v1",
   "bead_id": "bd-3uqg.12.2.1",
+  "artifact_status": "historical_snapshot",
+  "current_release_authority": false,
+  "superseded_by": [
+    "src/provider_metadata.rs",
+    "docs/provider-auth-crosswalk.json",
+    "scripts/check_provider_discrepancy_ledger.py"
+  ],
   "generated_at_utc": "2026-02-14T00:40:00Z",
-  "purpose": "Reproducible evidence index for provider parity audit — allows future agents to replay all verifications without session context",
+  "purpose": "Historical 2026-02-14 provider-parity evidence index. Commands and expected counts are retained for provenance and are not current release gates.",
 
   "verification_commands": {
     "upstream_parity": {

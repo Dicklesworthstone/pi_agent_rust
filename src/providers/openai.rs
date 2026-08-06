@@ -8,6 +8,12 @@
 
 use std::borrow::Cow;
 
+use crate::auth::{
+    AUTH_RESOLUTION_LOCK_TIMEOUT, AuthStorage, AuthStorageLoadFailure,
+    resolve_ambient_sap_auth_token_with_client, resolve_sap_auth_candidate_with_client,
+    resolve_sap_auth_token_with_client,
+};
+use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
@@ -23,6 +29,7 @@ use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 // ============================================================================
@@ -31,6 +38,7 @@ use std::pin::Pin;
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
 
@@ -75,6 +83,24 @@ fn authorization_override(
         })
 }
 
+fn redacted_api_error_body(body: &str, secrets: &[&str]) -> String {
+    crate::auth::redact_known_secrets_bounded(body, secrets, MAX_API_ERROR_BODY_BYTES)
+}
+
+fn push_api_error_secret(secrets: &mut Vec<String>, value: &str, authorization: bool) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    secrets.push(value.to_string());
+    if authorization && let Some(separator) = value.find(char::is_whitespace) {
+        let credential = value[separator..].trim();
+        if !credential.is_empty() {
+            secrets.push(credential.to_string());
+        }
+    }
+}
+
 fn first_non_empty_env(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|key| {
         std::env::var(key)
@@ -105,6 +131,7 @@ pub struct OpenAIProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    auth_path_override: Option<PathBuf>,
     /// Whether the model is a reasoning model. Gates the DeepSeek thinking
     /// dialect so non-reasoning DeepSeek models (e.g. `deepseek-chat`) never
     /// emit `thinking`/`reasoning_effort` (gh #114). Defaults to `false`; the
@@ -121,6 +148,7 @@ impl OpenAIProvider {
             base_url: OPENAI_API_URL.to_string(),
             provider: "openai".to_string(),
             compat: None,
+            auth_path_override: None,
             reasoning: false,
         }
     }
@@ -160,6 +188,19 @@ impl OpenAIProvider {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_auth_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.auth_path_override = Some(path.into());
+        self
+    }
+
+    fn auth_path(&self) -> PathBuf {
+        self.auth_path_override
+            .clone()
+            .unwrap_or_else(Config::auth_path)
+    }
+
     /// Attach provider-specific compatibility overrides.
     ///
     /// Overrides are applied during request building (field names, headers,
@@ -191,6 +232,10 @@ impl OpenAIProvider {
         } else {
             None
         }
+    }
+
+    fn is_sap_ai_core(&self) -> bool {
+        canonical_provider_id(&self.provider).is_some_and(|canonical| canonical == "sap-ai-core")
     }
 
     /// Build the request body for the OpenAI API.
@@ -368,10 +413,59 @@ impl Provider for OpenAIProvider {
         let auth_value = if authorization_override.is_some() {
             None
         } else {
-            let resolved = options
+            // SAP supports either a direct bearer or a service-key JSON candidate. Classify every
+            // candidate before constructing the Authorization header so legacy ApiKey entries can
+            // never leak a service key verbatim. The explicit lane remains highest precedence and
+            // bypasses auth-file loading when it contains a direct bearer.
+            let resolved = if self.is_sap_ai_core() {
+                if let Some(candidate) = options
+                    .api_key
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                {
+                    resolve_sap_auth_candidate_with_client(&self.client, candidate).await?
+                } else {
+                    match AuthStorage::load_with_lock_timeout_classified(
+                        self.auth_path(),
+                        AUTH_RESOLUTION_LOCK_TIMEOUT,
+                    ) {
+                        Ok(auth) => {
+                            resolve_sap_auth_token_with_client(&self.client, &auth, None).await?
+                        }
+                        Err(failure @ AuthStorageLoadFailure::LockTimeout(_)) => {
+                            return Err(failure.into_error());
+                        }
+                        Err(AuthStorageLoadFailure::Other(load_error)) => {
+                            let ambient =
+                                resolve_ambient_sap_auth_token_with_client(&self.client).await?;
+                            if ambient.is_some() {
+                                tracing::warn!(
+                                    error = %load_error,
+                                    "stored SAP credentials are unavailable; using complete ambient credentials"
+                                );
+                                ambient
+                            } else {
+                                return Err(Error::auth(format!(
+                                    "Failed to load SAP AI Core credentials: {load_error}"
+                                )));
+                            }
+                        }
+                    }
+                }
+            } else if let Some(key) = options
                 .api_key
-                .clone()
-                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+            {
+                Some(key.to_string())
+            } else {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|key| key.trim().to_string())
+                    .filter(|key| !key.is_empty())
+            };
             match resolved {
                 Some(key) => Some(key),
                 // Local / self-hosted providers (ollama, llamacpp, mistralrs, …)
@@ -379,6 +473,11 @@ impl Provider for OpenAIProvider {
                 // API key. For these we proceed without an Authorization header
                 // instead of failing, matching how ollama already works. (#104)
                 None if crate::provider_metadata::provider_is_keyless_local(self.name()) => None,
+                None if self.is_sap_ai_core() => {
+                    return Err(Error::auth(
+                        "SAP AI Core requires AICORE_SERVICE_KEY, the SAP_AI_CORE_* split credential variables, a stored service key, or an explicit bearer token.",
+                    ));
+                }
                 None => {
                     return Err(Error::provider(
                         self.name(),
@@ -397,7 +496,7 @@ impl Provider for OpenAIProvider {
             .post(&self.base_url)
             .header("Accept", "text/event-stream");
 
-        if let Some(auth_value) = auth_value {
+        if let Some(auth_value) = auth_value.as_deref() {
             request = request.header("Authorization", format!("Bearer {auth_value}"));
         }
 
@@ -445,9 +544,49 @@ impl Provider for OpenAIProvider {
         let status = response.status();
         if !(200..300).contains(&status) {
             let body = response
-                .text()
+                .text_limited(MAX_API_ERROR_BODY_BYTES)
                 .await
                 .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+            let mut secrets = Vec::new();
+            for value in [auth_value.as_deref(), authorization_override.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                push_api_error_secret(&mut secrets, value, true);
+            }
+            if let Some(headers) = self
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+            {
+                for (name, value) in headers {
+                    push_api_error_secret(
+                        &mut secrets,
+                        value,
+                        name.eq_ignore_ascii_case("authorization"),
+                    );
+                }
+            }
+            for (name, value) in &options.headers {
+                push_api_error_secret(
+                    &mut secrets,
+                    value,
+                    name.eq_ignore_ascii_case("authorization"),
+                );
+            }
+            if let Ok(url) = url::Url::parse(&self.base_url) {
+                secrets.extend(
+                    url.query_pairs()
+                        .map(|(_, value)| value.into_owned())
+                        .filter(|value| !value.is_empty()),
+                );
+                push_api_error_secret(&mut secrets, url.username(), false);
+                if let Some(password) = url.password() {
+                    push_api_error_secret(&mut secrets, password, false);
+                }
+            }
+            let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+            let body = redacted_api_error_body(&body, &secret_refs);
             return Err(Error::provider(
                 &self.provider,
                 format!("OpenAI API error (HTTP {status}): {body}"),
@@ -1469,6 +1608,7 @@ fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthCredential;
     use asupersync::runtime::RuntimeBuilder;
     use futures::{StreamExt, stream};
     use serde::{Deserialize, Serialize};
@@ -2069,6 +2209,209 @@ mod tests {
         let body: Value = serde_json::from_str(&captured.body).expect("request body json");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn stream_error_redacts_transmitted_bearer_credential() {
+        let secret = "provider-\"secret\\with&reserved=characters";
+        let header_secret = "custom-\"header\\credential";
+        let query_secret = "query-secret-value";
+        let response_json = serde_json::json!({
+            "authorizationEcho": secret,
+            "customHeaderEcho": header_secret,
+            "queryEcho": query_secret,
+        })
+        .to_string();
+        let response_body = format!("upstream error: {response_json}");
+        let (base_url, request_rx) = spawn_test_server(401, "application/json", &response_body);
+        let provider = OpenAIProvider::new("gpt-4o")
+            .with_base_url(format!("{base_url}?api_key={query_secret}"));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let mut options = StreamOptions {
+            api_key: Some(secret.to_string()),
+            ..Default::default()
+        };
+        options
+            .headers
+            .insert("x-api-key".to_string(), header_secret.to_string());
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let error = runtime.block_on(async {
+            match provider.stream(&context, &options).await {
+                Ok(_) => panic!("HTTP error must not produce a stream"),
+                Err(error) => error,
+            }
+        });
+        let message = error.to_string();
+        assert!(message.contains("HTTP 401"), "{message}");
+        assert!(message.contains("[REDACTED]"), "{message}");
+        assert!(!message.contains(secret), "credential leaked: {message}");
+        assert!(
+            !message.contains("provider-"),
+            "escaped credential leaked: {message}"
+        );
+        assert!(
+            !message.contains("custom-"),
+            "header credential leaked: {message}"
+        );
+        assert!(
+            !message.contains(query_secret),
+            "query credential leaked: {message}"
+        );
+        request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured error request");
+
+        let expanding = redacted_api_error_body(&"x".repeat(MAX_API_ERROR_BODY_BYTES), &["x"]);
+        assert!(
+            expanding.len() <= MAX_API_ERROR_BODY_BYTES,
+            "redaction expansion exceeded the final API error bound"
+        );
+    }
+
+    #[test]
+    fn sap_stream_exchanges_service_key_before_sending_bearer_header() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp_dir.path().join("auth.json");
+        let (token_url, token_request_rx) = spawn_test_server(
+            200,
+            "application/json",
+            r#"{"access_token":"sap-access-token"}"#,
+        );
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        let service_key_json = json!({
+            "clientid": "sap-client",
+            // ubs:ignore test fixture credential, not live secret.
+            "clientsecret": "sap-secret",
+            "url": token_url,
+            "serviceurls": {
+                "AI_API_URL": "https://api.ai.sap.example.com"
+            }
+        })
+        .to_string();
+        auth.set(
+            "sap-ai-core",
+            // Legacy auth files stored the complete service-key JSON in the generic ApiKey lane.
+            // It must be exchanged, never forwarded as the bearer value.
+            AuthCredential::ApiKey {
+                key: service_key_json.clone(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let (inference_url, inference_request_rx) =
+            spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("deployment-a")
+            .with_provider_name("sap-ai-core")
+            .with_base_url(inference_url)
+            .with_auth_path(auth_path);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions::default();
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let token_request = token_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured token request");
+        assert!(token_request.body.contains("grant_type=client_credentials"));
+        assert!(token_request.body.contains("client_id=sap-client"));
+
+        let inference_request = inference_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured inference request");
+        let authorization = inference_request
+            .headers
+            .get("authorization")
+            .expect("SAP inference authorization header");
+        assert_eq!(
+            authorization, "Bearer sap-access-token",
+            "legacy service-key JSON must be exchanged before inference"
+        );
+        assert!(!authorization.contains(&service_key_json));
+        assert!(!authorization.contains("sap-secret"));
+        assert!(!inference_request.body.contains(&service_key_json));
+        assert!(!inference_request.body.contains("sap-secret"));
+    }
+
+    #[test]
+    fn sap_stream_uses_stored_direct_bearer_without_requiring_service_key() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = temp_dir.path().join("auth.json");
+        let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::BearerToken {
+                token: "stored-sap-bearer".to_string(),
+            },
+        );
+        auth.save().expect("save auth");
+
+        let (inference_url, inference_request_rx) =
+            spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = OpenAIProvider::new("deployment-a")
+            .with_provider_name("sap-ai-core")
+            .with_base_url(inference_url)
+            .with_auth_path(auth_path);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider
+                .stream(&context, &StreamOptions::default())
+                .await
+                .expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let inference_request = inference_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured inference request");
+        assert_eq!(
+            inference_request
+                .headers
+                .get("authorization")
+                .map(String::as_str),
+            Some("Bearer stored-sap-bearer")
+        );
     }
 
     /// Drive `provider.stream()` once against `base_url` with no API key and

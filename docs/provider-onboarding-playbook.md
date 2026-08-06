@@ -99,14 +99,22 @@ Selection pipeline:
 1. Model entry is chosen (`--provider/--model`, defaults, or scoped models) in `../src/app.rs`.
 2. API key resolution is attempted in this order:
    - `--api-key`
+   - unexpired OAuth/bearer credential in `auth.json`
    - provider env vars (`provider_auth_env_keys` via `../src/provider_metadata.rs`)
-   - `auth.json`
+   - stored API key in `auth.json`
+   - supported external coding-CLI credential (global auth storage only)
    - `models.json` `providers.<id>.apiKey` (fallback)
 3. Provider route is selected in `resolve_provider_route(...)` in `../src/providers/mod.rs`.
 4. A concrete provider implementation is created in `create_provider(...)`.
 
 Important caveat:
-- `github-copilot` resolves credentials from the model entry `api_key` (populated from `auth.json` or `models.json` provider `apiKey`) and then falls back to `GITHUB_COPILOT_API_KEY` / `GITHUB_TOKEN`. Ensure one of those sources is configured.
+- `github-copilot` participates in the same generic resolution chain. Its
+  provider env order is `GITHUB_COPILOT_API_KEY`, then `GITHUB_TOKEN`; a valid
+  stored bearer/OAuth credential still outranks ambient env, and an inline
+  `models.json` provider key is only the app-level fallback.
+- `amazon-bedrock` and `sap-ai-core` are request-time/provider-managed auth
+  routes. Do not document AWS region/profile/session-token components or SAP
+  client credentials as raw bearer API keys.
 
 ## Provider family map
 

@@ -3,10 +3,13 @@
 //! This provider targets the Bedrock Converse API and maps its non-streaming
 //! JSON response into Pi stream events.
 
-use crate::auth::{AuthStorage, AwsResolvedCredentials, resolve_aws_credentials_async};
+use crate::auth::{
+    AUTH_RESOLUTION_LOCK_TIMEOUT, AuthStorage, AuthStorageLoadFailure, AwsResolvedCredentials,
+    resolve_ambient_aws_credentials_async, resolve_aws_credentials_async,
+};
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::http::client::Client;
+use crate::http::client::{Client, RequestBuilder};
 use crate::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
     ToolResultMessage, Usage, UserContent,
@@ -21,6 +24,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 #[cfg(test)]
 use std::path::Path;
@@ -30,8 +34,94 @@ use url::Url;
 
 const DEFAULT_REGION: &str = "us-east-1";
 const BEDROCK_SERVICE: &str = "bedrock";
+const MAX_BEDROCK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_BEDROCK_ERROR_SNIPPET_BYTES: usize = 8 * 1024;
+const SIGV4_OWNED_HEADERS: [&str; 6] = [
+    "authorization",
+    "host",
+    "content-type",
+    "x-amz-date",
+    "x-amz-content-sha256",
+    "x-amz-security-token",
+];
 
 type HmacSha256 = Hmac<Sha256>;
+
+fn bedrock_region_with_env<F>(mut env: F) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    env("AWS_REGION")
+        .and_then(|region| {
+            let region = region.trim();
+            (!region.is_empty()).then(|| region.to_string())
+        })
+        .or_else(|| {
+            env("AWS_DEFAULT_REGION").and_then(|region| {
+                let region = region.trim();
+                (!region.is_empty()).then(|| region.to_string())
+            })
+        })
+        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+}
+
+fn bedrock_error_snippet(response: &str, secrets: &[String]) -> String {
+    let secret_refs = secrets.iter().map(String::as_str).collect::<Vec<_>>();
+    crate::auth::redact_known_secrets_bounded(
+        response,
+        &secret_refs,
+        MAX_BEDROCK_ERROR_SNIPPET_BYTES,
+    )
+}
+
+fn apply_bedrock_headers<'a>(
+    mut request: RequestBuilder<'a>,
+    headers: &HashMap<String, String>,
+    response_secrets: &mut Vec<String>,
+) -> Result<RequestBuilder<'a>> {
+    for (name, value) in headers {
+        response_secrets.push(value.clone());
+        if name.eq_ignore_ascii_case("Authorization")
+            && let Some(separator) = value.find(char::is_whitespace)
+            && !value[separator..].trim().is_empty()
+        {
+            response_secrets.push(value[separator..].trim().to_string());
+        }
+        request = request.try_header(name, value)?;
+    }
+    Ok(request)
+}
+
+fn validate_sigv4_header_ownership(headers: &HashMap<String, String>, source: &str) -> Result<()> {
+    let mut collisions = headers
+        .keys()
+        .filter(|name| {
+            let normalized = name.to_ascii_lowercase();
+            SIGV4_OWNED_HEADERS
+                .iter()
+                .any(|owned| name.eq_ignore_ascii_case(owned))
+                // AWS requires every outbound x-amz-* header to appear in the
+                // canonical and signed-header sets. This signer deliberately
+                // owns that namespace so custom headers cannot be sent unsigned.
+                || normalized.starts_with("x-amz-")
+        })
+        .map(|name| name.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    collisions.sort_unstable();
+    collisions.dedup();
+
+    if collisions.is_empty() {
+        return Ok(());
+    }
+
+    Err(Error::provider(
+        "amazon-bedrock",
+        format!(
+            "{source} must not set SigV4-owned Bedrock header(s): {}. Authorization, Host, Content-Type, and the entire x-amz-* namespace are generated from the exact signed request; use explicit bearer authentication if a proxy requires custom Authorization semantics",
+            collisions.join(", ")
+        ),
+    ))
+}
 
 #[derive(Debug, Clone)]
 enum BedrockAuth {
@@ -130,14 +220,51 @@ impl BedrockProvider {
             .unwrap_or_else(Config::auth_path)
     }
 
-    fn load_auth_storage(&self) -> Result<AuthStorage> {
-        AuthStorage::load(self.auth_path())
-            .map_err(|err| Error::auth(format!("Failed to load Bedrock credentials: {err}")))
+    fn load_auth_storage(&self) -> std::result::Result<AuthStorage, AuthStorageLoadFailure> {
+        AuthStorage::load_with_lock_timeout_classified(
+            self.auth_path(),
+            AUTH_RESOLUTION_LOCK_TIMEOUT,
+        )
     }
 
     async fn resolve_auth_context(&self, options: &StreamOptions) -> Result<BedrockAuthContext> {
-        let auth_storage = self.load_auth_storage()?;
-        if let Some(resolved) = resolve_aws_credentials_async(&auth_storage, &self.client).await? {
+        // `StreamOptions.api_key` is the explicit direct-bearer override contract for Bedrock.
+        // Check it before auto-detected AWS credentials so CLI/SDK callers can deterministically
+        // override a profile or ambient SigV4 chain. Generic auth resolution deliberately never
+        // puts AWS_REGION, AWS_PROFILE, session tokens, or access-key IDs into this lane.
+        if let Some(token) = options
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+        {
+            return Ok(BedrockAuthContext {
+                auth: BedrockAuth::Bearer {
+                    token: token.to_string(),
+                },
+                region: bedrock_region_with_env(|name| std::env::var(name).ok()),
+            });
+        }
+
+        let resolved = match self.load_auth_storage() {
+            Ok(auth_storage) => resolve_aws_credentials_async(&auth_storage, &self.client).await?,
+            Err(failure @ AuthStorageLoadFailure::LockTimeout(_)) => {
+                return Err(failure.into_error());
+            }
+            Err(AuthStorageLoadFailure::Other(load_error)) => {
+                let ambient = resolve_ambient_aws_credentials_async(&self.client).await?;
+                if ambient.is_some() {
+                    tracing::warn!(
+                        error = %load_error,
+                        "stored Bedrock credentials are unavailable; using ambient AWS credentials"
+                    );
+                    ambient
+                } else {
+                    return Err(load_error);
+                }
+            }
+        };
+        if let Some(resolved) = resolved {
             return Ok(match resolved {
                 AwsResolvedCredentials::Sigv4 {
                     access_key_id,
@@ -159,26 +286,9 @@ impl BedrockProvider {
             });
         }
 
-        if let Some(token) = options
-            .api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-        {
-            return Ok(BedrockAuthContext {
-                auth: BedrockAuth::Bearer {
-                    token: token.to_string(),
-                },
-                region: std::env::var("AWS_REGION")
-                    .ok()
-                    .or_else(|| std::env::var("AWS_DEFAULT_REGION").ok())
-                    .unwrap_or_else(|| DEFAULT_REGION.to_string()),
-            });
-        }
-
         Err(Error::auth(
             "Amazon Bedrock requires AWS credentials. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_BEARER_TOKEN_BEDROCK, AWS_PROFILE (static or SSO), or store amazon-bedrock credentials in auth.json. \
-             For SSO profiles, run: aws sso login --profile <name>",
+             For SSO profiles, run: aws sso login --profile <name>. An explicit direct bearer token may be passed via --api-key or StreamOptions.api_key.",
         ))
     }
 
@@ -359,6 +469,99 @@ impl BedrockProvider {
         }));
         events
     }
+
+    fn validate_auth_header_ownership(
+        &self,
+        auth_context: &BedrockAuthContext,
+        options: &StreamOptions,
+    ) -> Result<()> {
+        if matches!(&auth_context.auth, BedrockAuth::Sigv4 { .. }) {
+            if let Some(custom_headers) = self
+                .compat
+                .as_ref()
+                .and_then(|compat| compat.custom_headers.as_ref())
+            {
+                validate_sigv4_header_ownership(custom_headers, "compat.customHeaders")?;
+            }
+            validate_sigv4_header_ownership(&options.headers, "StreamOptions.headers")?;
+        }
+        Ok(())
+    }
+
+    fn authenticated_request<'a>(
+        &'a self,
+        url: &Url,
+        body: &[u8],
+        auth_context: BedrockAuthContext,
+        options: &StreamOptions,
+    ) -> Result<(RequestBuilder<'a>, Vec<String>)> {
+        let mut request = self
+            .client
+            .post(url.as_str())
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json");
+        let mut response_secrets = url
+            .query_pairs()
+            .map(|(_, value)| value.into_owned())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        if !url.username().is_empty() {
+            response_secrets.push(url.username().to_string());
+        }
+        if let Some(password) = url.password().filter(|password| !password.is_empty()) {
+            response_secrets.push(password.to_string());
+        }
+
+        match auth_context.auth {
+            BedrockAuth::Bearer { token } => {
+                response_secrets.push(token.clone());
+                request = request.header("Authorization", format!("Bearer {token}"));
+            }
+            BedrockAuth::Sigv4 {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                let signing_headers = build_sigv4_headers(
+                    url,
+                    body,
+                    &access_key_id,
+                    &secret_access_key,
+                    session_token.as_deref(),
+                    &auth_context.region,
+                    Utc::now(),
+                )?;
+                response_secrets.push(access_key_id);
+                response_secrets.push(secret_access_key);
+                response_secrets.push(signing_headers.authorization.clone());
+                if let Some((_, signature)) =
+                    signing_headers.authorization.rsplit_once("Signature=")
+                    && !signature.trim().is_empty()
+                {
+                    response_secrets.push(signature.trim().to_string());
+                }
+                if let Some(token) = session_token {
+                    response_secrets.push(token);
+                }
+                request = request
+                    .header("Authorization", signing_headers.authorization)
+                    .header("x-amz-date", signing_headers.amz_date)
+                    .header("x-amz-content-sha256", signing_headers.payload_hash);
+                if let Some(token) = signing_headers.security_token {
+                    response_secrets.push(token.clone());
+                    request = request.header("x-amz-security-token", token);
+                }
+            }
+        }
+
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = apply_bedrock_headers(request, custom_headers, &mut response_secrets)?;
+        }
+        request = apply_bedrock_headers(request, &options.headers, &mut response_secrets)?;
+        Ok((request, response_secrets))
+    }
 }
 
 #[async_trait]
@@ -389,73 +592,36 @@ impl Provider for BedrockProvider {
         })?;
 
         let auth_context = self.resolve_auth_context(options).await?;
+        // Reject caller-owned signing headers before endpoint parsing or an inference request.
+        // Credential discovery necessarily happens first so bearer mode can retain its custom
+        // Authorization semantics, but a malformed endpoint override must not mask a SigV4
+        // ownership violation.
+        self.validate_auth_header_ownership(&auth_context, options)?;
         let url = self.converse_url(&auth_context.region)?;
-
-        let mut request = self
-            .client
-            .post(url.as_str())
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-
-        match auth_context.auth {
-            BedrockAuth::Bearer { token } => {
-                request = request.header("Authorization", format!("Bearer {token}"));
-            }
-            BedrockAuth::Sigv4 {
-                access_key_id,
-                secret_access_key,
-                session_token,
-            } => {
-                let signing_headers = build_sigv4_headers(
-                    &url,
-                    &body,
-                    &access_key_id,
-                    &secret_access_key,
-                    session_token.as_deref(),
-                    &auth_context.region,
-                    Utc::now(),
-                )?;
-                request = request
-                    .header("Authorization", signing_headers.authorization)
-                    .header("x-amz-date", signing_headers.amz_date)
-                    .header("x-amz-content-sha256", signing_headers.payload_hash);
-                if let Some(token) = signing_headers.security_token {
-                    request = request.header("x-amz-security-token", token);
-                }
-            }
-        }
-
-        if let Some(compat) = &self.compat
-            && let Some(custom_headers) = &compat.custom_headers
-        {
-            for (name, value) in custom_headers {
-                request = request.header(name, value);
-            }
-        }
-
-        for (name, value) in &options.headers {
-            request = request.header(name, value);
-        }
+        let (request, response_secrets) =
+            self.authenticated_request(&url, &body, auth_context, options)?;
 
         let response = request.body(body).send().await?;
         let status = response.status();
         let response_text = response
-            .text()
+            .text_limited(MAX_BEDROCK_RESPONSE_BYTES)
             .await
             .unwrap_or_else(|err| format!("<failed to read body: {err}>"));
 
         if !(200..300).contains(&status) {
+            let response_snippet = bedrock_error_snippet(&response_text, &response_secrets);
             return Err(Error::provider(
                 "amazon-bedrock",
-                format!("Bedrock Converse API error (HTTP {status}): {response_text}"),
+                format!("Bedrock Converse API error (HTTP {status}): {response_snippet}"),
             ));
         }
 
         let parsed: BedrockConverseResponse =
             serde_json::from_str(&response_text).map_err(|err| {
+                let response_snippet = bedrock_error_snippet(&response_text, &response_secrets);
                 Error::provider(
                     "amazon-bedrock",
-                    format!("Failed to parse Bedrock response: {err}\nData: {response_text}"),
+                    format!("Failed to parse Bedrock response: {err}\nData: {response_snippet}"),
                 )
             })?;
 
@@ -1009,8 +1175,103 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::AuthCredential;
     use chrono::TimeZone as _;
     use serde_json::json;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct CapturedBedrockRequest {
+        headers: HashMap<String, String>,
+        body: Vec<u8>,
+    }
+
+    fn spawn_bedrock_test_server() -> (String, mpsc::Receiver<CapturedBedrockRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind Bedrock test server");
+        let address = listener.local_addr().expect("Bedrock test server address");
+        let (sender, receiver) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accept Bedrock request");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("set Bedrock request read timeout");
+
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            let header_end = loop {
+                let read = socket.read(&mut chunk).expect("read Bedrock request");
+                assert!(read > 0, "Bedrock request ended before its headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(position) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    break position;
+                }
+            };
+
+            let header_text = String::from_utf8_lossy(&request[..header_end]);
+            let headers = header_text
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+                .collect::<HashMap<_, _>>();
+            let content_length = headers
+                .get("content-length")
+                .and_then(|value| value.parse::<usize>().ok())
+                .expect("Bedrock request content-length");
+            let body_start = header_end + 4;
+            while request.len().saturating_sub(body_start) < content_length {
+                let read = socket.read(&mut chunk).expect("read Bedrock request body");
+                assert!(read > 0, "Bedrock request ended before its body");
+                request.extend_from_slice(&chunk[..read]);
+            }
+            sender
+                .send(CapturedBedrockRequest {
+                    headers,
+                    body: request[body_start..body_start + content_length].to_vec(),
+                })
+                .expect("capture Bedrock request");
+
+            let response_body = serde_json::to_string(&json!({
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"text": "ok"}]
+                    }
+                },
+                "stopReason": "end_turn",
+                "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2}
+            }))
+            .expect("serialize Bedrock response");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .expect("write Bedrock response");
+        });
+
+        (format!("http://{address}"), receiver)
+    }
+
+    fn write_test_sigv4_auth(path: &Path) {
+        let mut stored = AuthStorage::load(path.to_path_buf()).expect("load Bedrock test auth");
+        stored.set(
+            "amazon-bedrock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIDEXAMPLE".to_string(),
+                // ubs:ignore test fixture credential, not a live secret.
+                secret_access_key: "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                session_token: Some("session-token".to_string()),
+                region: Some("us-west-2".to_string()),
+            },
+        );
+        stored.save().expect("save Bedrock test auth");
+    }
 
     fn test_context_with_tools() -> Context<'static> {
         Context {
@@ -1060,6 +1321,58 @@ mod tests {
             }]
             .into(),
         }
+    }
+
+    #[test]
+    fn error_snippet_redacts_credentials_and_bounds_untrusted_body() {
+        let secret = "bedrock-session-token".to_string();
+        let response = format!(
+            "upstream echoed x-amz-security-token={secret} {}",
+            "x".repeat(MAX_BEDROCK_ERROR_SNIPPET_BYTES)
+        );
+        let snippet = bedrock_error_snippet(&response, std::slice::from_ref(&secret));
+        assert!(snippet.contains("[REDACTED]"), "{snippet}");
+        assert!(!snippet.contains(&secret), "credential leaked: {snippet}");
+        assert!(snippet.ends_with("...[truncated]"), "{snippet}");
+        assert!(
+            snippet.len() <= MAX_BEDROCK_ERROR_SNIPPET_BYTES,
+            "untrusted error snippet exceeded its hard bound"
+        );
+
+        let expanding = bedrock_error_snippet(
+            &"x".repeat(MAX_BEDROCK_ERROR_SNIPPET_BYTES),
+            &["x".to_string()],
+        );
+        assert!(
+            expanding.len() <= MAX_BEDROCK_ERROR_SNIPPET_BYTES,
+            "redaction expansion exceeded the final output bound"
+        );
+
+        let boundary_secret = "LEAK_BOUNDARY_CREDENTIAL".to_string();
+        let boundary_body = format!(
+            "{}{}",
+            "x".repeat(MAX_BEDROCK_ERROR_SNIPPET_BYTES - 8),
+            boundary_secret
+        );
+        let boundary =
+            bedrock_error_snippet(&boundary_body, std::slice::from_ref(&boundary_secret));
+        assert!(
+            !boundary.contains("LEAK"),
+            "credential prefix leaked: {boundary}"
+        );
+        assert!(boundary.len() <= MAX_BEDROCK_ERROR_SNIPPET_BYTES);
+
+        let escaped_secret = "bedrock-\"quoted\\credential".to_string();
+        let escaped_body = format!(
+            "upstream error: {}",
+            serde_json::json!({"echo": escaped_secret})
+        );
+        let escaped = bedrock_error_snippet(&escaped_body, std::slice::from_ref(&escaped_secret));
+        assert!(
+            !escaped.contains("bedrock-"),
+            "credential leaked: {escaped}"
+        );
+        assert!(escaped.contains("[REDACTED]"), "{escaped}");
     }
 
     #[test]
@@ -1152,6 +1465,171 @@ mod tests {
     }
 
     #[test]
+    fn sigv4_header_ownership_rejects_every_mixed_case_collision() {
+        for (name, canonical_name) in [
+            ("aUtHoRiZaTiOn", "authorization"),
+            ("hOsT", "host"),
+            ("cOnTeNt-TyPe", "content-type"),
+            ("X-AmZ-DaTe", "x-amz-date"),
+            ("x-AmZ-CoNtEnT-ShA256", "x-amz-content-sha256"),
+            ("X-aMz-SeCuRiTy-ToKeN", "x-amz-security-token"),
+            ("X-AmZ-CuStOm-MeTaDaTa", "x-amz-custom-metadata"),
+        ] {
+            let headers = HashMap::from([(name.to_string(), "attacker-value".to_string())]);
+            let error = validate_sigv4_header_ownership(&headers, "test headers")
+                .expect_err("mixed-case SigV4-owned header must be rejected");
+            let message = error.to_string();
+            assert!(message.contains(canonical_name), "{message}");
+            assert!(message.contains("SigV4-owned"), "{message}");
+        }
+    }
+
+    #[test]
+    fn sigv4_header_collision_fails_before_endpoint_construction_or_inference_request() {
+        let temp_dir = tempfile::tempdir().expect("Bedrock collision auth directory");
+        let auth_path = temp_dir.path().join("auth.json");
+        write_test_sigv4_auth(&auth_path);
+        let provider = BedrockProvider::new("model")
+            .with_auth_path(auth_path)
+            .with_base_url("not a valid endpoint URL");
+        let context = test_context_with_tools();
+        let options = StreamOptions {
+            headers: HashMap::from([(
+                "aUtHoRiZaTiOn".to_string(),
+                "Bearer must-not-replace-sigv4".to_string(),
+            )]),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let error = runtime
+            .block_on(async { provider.stream(&context, &options).await })
+            .err()
+            .expect("header collision must fail");
+        let message = error.to_string();
+        assert!(message.contains("StreamOptions.headers"), "{message}");
+        assert!(message.contains("authorization"), "{message}");
+        assert!(
+            !message.contains("Invalid base URL"),
+            "ownership validation must run before endpoint construction: {message}"
+        );
+    }
+
+    #[test]
+    fn sigv4_benign_compat_header_survives_without_changing_signature() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let temp_dir = tempfile::tempdir().expect("Bedrock benign-header auth directory");
+        let auth_path = temp_dir.path().join("auth.json");
+        write_test_sigv4_auth(&auth_path);
+        let provider = BedrockProvider::new("model")
+            .with_auth_path(auth_path)
+            .with_base_url(&base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(HashMap::from([(
+                    "X-Bedrock-Trace".to_string(),
+                    "trace-value".to_string(),
+                )])),
+                ..CompatConfig::default()
+            }));
+        let context = test_context_with_tools();
+        let options = StreamOptions::default();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let result = runtime.block_on(async { provider.stream(&context, &options).await });
+        assert!(result.is_ok(), "Bedrock request failed: {:?}", result.err());
+
+        let captured = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("capture Bedrock request");
+        assert_eq!(
+            captured.headers.get("x-bedrock-trace").map(String::as_str),
+            Some("trace-value")
+        );
+        assert_eq!(
+            captured.headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            captured
+                .headers
+                .get("x-amz-security-token")
+                .map(String::as_str),
+            Some("session-token")
+        );
+
+        let amz_date = captured
+            .headers
+            .get("x-amz-date")
+            .expect("signed x-amz-date");
+        let signing_time = chrono::NaiveDateTime::parse_from_str(amz_date, "%Y%m%dT%H%M%SZ")
+            .expect("parse x-amz-date")
+            .and_utc();
+        let request_url =
+            Url::parse(&format!("{base_url}/model/model/converse")).expect("Bedrock request URL");
+        let expected = build_sigv4_headers(
+            &request_url,
+            &captured.body,
+            "AKIDEXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+            Some("session-token"),
+            "us-west-2",
+            signing_time,
+        )
+        .expect("rebuild observed signature");
+        assert_eq!(
+            captured.headers.get("authorization"),
+            Some(&expected.authorization)
+        );
+        assert_eq!(
+            captured.headers.get("x-amz-content-sha256"),
+            Some(&expected.payload_hash)
+        );
+        assert!(
+            !expected.authorization.contains("x-bedrock-trace"),
+            "benign custom headers remain outside the fixed SigV4 signed-header set"
+        );
+    }
+
+    #[test]
+    fn explicit_bearer_mode_keeps_custom_authorization_semantics() {
+        let (base_url, captured_request) = spawn_bedrock_test_server();
+        let provider = BedrockProvider::new("model")
+            .with_base_url(base_url)
+            .with_compat(Some(CompatConfig {
+                custom_headers: Some(HashMap::from([(
+                    "aUtHoRiZaTiOn".to_string(),
+                    "ProxyScheme proxy-credential".to_string(),
+                )])),
+                ..CompatConfig::default()
+            }));
+        let context = test_context_with_tools();
+        let options = StreamOptions {
+            api_key: Some("direct-bearer-token".to_string()),
+            ..StreamOptions::default()
+        };
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let result = runtime.block_on(async { provider.stream(&context, &options).await });
+        assert!(result.is_ok(), "Bedrock request failed: {:?}", result.err());
+
+        let captured = captured_request
+            .recv_timeout(Duration::from_secs(2))
+            .expect("capture Bedrock bearer request");
+        assert_eq!(
+            captured.headers.get("authorization").map(String::as_str),
+            Some("ProxyScheme proxy-credential"),
+            "explicit bearer mode retains custom proxy-auth replacement semantics"
+        );
+        assert!(
+            !captured.headers.contains_key("x-amz-date"),
+            "bearer mode must remain separate from SigV4 header ownership"
+        );
+    }
+
+    #[test]
     fn response_to_message_maps_tool_use_and_usage() {
         let provider = BedrockProvider::new("anthropic.claude-3-5-sonnet-20240620-v1:0");
         let response: BedrockConverseResponse = serde_json::from_value(json!({
@@ -1179,10 +1657,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_auth_context_uses_stream_option_api_key_fallback() {
+    fn resolve_auth_context_uses_stream_option_api_key_override() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let provider =
-            BedrockProvider::new("model").with_auth_path(temp_dir.path().join("auth.json"));
+        let auth_path = temp_dir.path().join("auth.json");
+        let mut stored = AuthStorage::load(auth_path.clone()).expect("load auth");
+        stored.set(
+            "amazon-bedrock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIA_STORED".to_string(),
+                // ubs:ignore test fixture credential, not live secret.
+                secret_access_key: "stored-secret".to_string(),
+                session_token: None,
+                region: Some("us-west-2".to_string()),
+            },
+        );
+        stored.save().expect("save auth");
+
+        let provider = BedrockProvider::new("model").with_auth_path(auth_path);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -1195,7 +1686,23 @@ mod tests {
                 .await
                 .expect("resolve auth context")
         });
-        assert!(matches!(auth.auth, BedrockAuth::Bearer { .. }));
+        assert!(matches!(
+            auth.auth,
+            BedrockAuth::Bearer { ref token } if token == "bedrock-bearer"
+        ));
+    }
+
+    #[test]
+    fn explicit_bearer_region_trims_and_falls_back_across_region_env_vars() {
+        let region = bedrock_region_with_env(|name| match name {
+            "AWS_REGION" => Some("   ".to_string()),
+            "AWS_DEFAULT_REGION" => Some("  eu-west-1  ".to_string()),
+            _ => None,
+        });
+        assert_eq!(region, "eu-west-1");
+
+        let default_region = bedrock_region_with_env(|_| Some("  ".to_string()));
+        assert_eq!(default_region, DEFAULT_REGION);
     }
 
     fn make_bedrock_tool_result(content: Vec<ContentBlock>, is_error: bool) -> ToolResultMessage {

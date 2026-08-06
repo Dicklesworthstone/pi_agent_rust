@@ -4,6 +4,11 @@ Generated at (UTC): `2026-02-13T04:48:33Z`
 
 Machine-readable artifact: `docs/provider-baseline-audit.json`
 
+> Historical snapshot: the counts and execution guidance below describe the
+> 2026-02-13 `bd-3uqg.11` planning baseline. They are not current registry or
+> release evidence. Use `src/provider_metadata.rs`, `src/providers/mod.rs`, and
+> the provider metadata/factory tests for the live tree.
+
 ## Summary
 
 - Upstream union providers: **90**
@@ -42,5 +47,5 @@ Machine-readable artifact: `docs/provider-baseline-audit.json`
 
 ## Execution Guidance
 
-- Use this matrix as the source of truth for `bd-3uqg.11` provider-gap execution.
+- For historical `bd-3uqg.11` reconstruction only, use this frozen matrix.
 - Prioritize `high` risk rows, then `medium` rows that block parity completeness.

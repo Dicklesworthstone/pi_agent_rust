@@ -1,32 +1,52 @@
 {
-  "schema": "pi.docs.provider_auth_crosswalk.v1",
+  "schema": "pi.docs.provider_auth_crosswalk.v2",
   "bead_id": "bd-3uqg.9.3.2",
-  "generated_at_utc": "2026-02-14T00:40:00Z",
-  "generated_by": "LilacCat (Claude Opus 4.6)",
-  "description": "Canonical/alias/env-key auth crosswalk covering all 87 Pi providers. Includes env key precedence, base URL defaults/overrides, and high-confusion mappings with test evidence references.",
+  "generated_at_utc": "2026-08-06T09:40:00Z",
+  "generated_by": "manual source reconciliation against src/provider_metadata.rs and auth runtime tests",
+  "description": "Canonical/alias/env-key auth crosswalk covering all 94 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
 
-  "api_key_resolution_precedence": {
-    "description": "How Pi resolves API keys for any provider (src/auth.rs resolve_api_key())",
-    "steps": [
-      {"priority": 1, "source": "Explicit override parameter (--api-key CLI flag or programmatic override)", "note": "Highest priority, always wins"},
-      {"priority": 2, "source": "Environment variables (checked in order from auth_env_keys list)", "note": "First match wins; e.g., for google: GOOGLE_API_KEY then GEMINI_API_KEY"},
-      {"priority": 3, "source": "auth.json file (~/.pi/agent/auth.json, keyed by canonical provider ID)", "note": "Persisted credentials from /login command"},
-      {"priority": 4, "source": "Canonical ID fallback (if alias used, looks up canonical's auth.json entry)", "note": "Ensures aliases share auth state"}
-    ],
-    "evidence": "src/auth.rs:320-353"
+  "provider_row_contract": {
+    "auth_method": "Primary request-wire authentication method ID from request_auth_methods.",
+    "additional_auth_methods": "Optional additional request-wire method IDs supported when the credential type selects a different wire lane.",
+    "credential_acquisition": "Resolve the provider ID through credential_acquisition.overrides; providers without an override use credential_acquisition.default_methods."
   },
 
-  "auth_method_patterns": {
+  "schema_migration_from_v1": {
+    "renamed_sections": {
+      "api_key_resolution_precedence": "generic_direct_credential_precedence",
+      "auth_method_patterns": "request_auth_methods"
+    },
+    "note": "Frozen historical snapshots may contain the imprecise prose label api_key_resolution. It was never a live JSON section; use generic_direct_credential_precedence in v2."
+  },
+
+  "generic_direct_credential_precedence": {
+    "description": "How AuthStorage::resolve_api_key() resolves complete direct API-key/bearer values. This lane intentionally excludes structured credentials that require a provider-owned resolver.",
+    "steps": [
+      {"priority": 1, "source": "Explicit override parameter (--api-key CLI flag or programmatic override)", "note": "Highest priority, always wins"},
+      {"priority": 2, "source": "Stored OAuth or bearer credential in auth.json", "note": "An unexpired OAuth access token or BearerToken outranks ambient environment variables"},
+      {"priority": 3, "source": "Direct-token environment variables (checked in provider order)", "note": "First non-empty direct token wins; structured AWS and SAP acquisition variables are excluded from this generic lane"},
+      {"priority": 4, "source": "Stored API key in auth.json", "note": "Resolved only after the provider environment variables are exhausted"},
+      {"priority": 5, "source": "Supported external coding-CLI credential", "note": "Auto-detected only when using Pi's global auth storage; aliases share canonical lookup at every applicable tier"}
+    ],
+    "model_entry_fallback": "After AuthStorage returns no credential, app-level model selection may use the resolved inline models.json apiKey value.",
+    "provider_owned_exceptions": {
+      "amazon-bedrock": "Only AWS_BEARER_TOKEN_BEDROCK is a direct-token environment value. Access-key pairs, session tokens, profiles, regions, SSO, and every stored Bedrock credential are deferred to the provider-owned AWS resolver so env/profile/stored precedence stays consistent; AWS key components are sent as SigV4, never as a bearer api_key.",
+      "sap-ai-core": "AICORE_SERVICE_KEY and SAP_AI_CORE_* split credentials are acquisition inputs. They are exchanged for an OAuth access token before the inference request; the raw JSON, client ID, secret, token URL, and service URL never enter the bearer lane."
+    },
+    "evidence": "src/auth.rs:AuthStorage::resolve_api_key_with_env_lookup; src/providers/bedrock.rs:BedrockProvider::resolve_auth_context; src/providers/openai.rs:OpenAIProvider::resolve_sap_access_token; src/main.rs:resolve_selection_with_auth"
+  },
+
+  "request_auth_methods": {
     "bearer_token": {
       "header": "Authorization: Bearer {API_KEY}",
-      "providers_count": 73,
-      "description": "Standard OpenAI-compatible pattern used by most providers"
+      "providers_count": 84,
+      "description": "Bearer value on the inference request. How the value was acquired (direct key, OAuth, device flow, external CLI, Bedrock override, or SAP exchange) is modeled separately."
     },
     "x_api_key": {
       "header": "X-API-Key: {API_KEY}",
-      "providers_count": 1,
-      "providers": ["anthropic"],
-      "description": "Anthropic's custom auth header"
+      "providers_count": 7,
+      "providers": ["anthropic", "kimi-for-coding", "minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan", "zenmux"],
+      "description": "Anthropic API-key request lane. Anthropic OAuth and Kimi device/external tokens instead use bearer_token."
     },
     "api_key_header": {
       "header": "api-key: {API_KEY}",
@@ -40,22 +60,87 @@
       "providers": ["google"],
       "description": "Google/Gemini passes key as URL parameter"
     },
-    "anthropic_messages_api": {
-      "header": "X-API-Key: {API_KEY}",
-      "providers_count": 6,
-      "providers": ["kimi-for-coding", "minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan", "zenmux"],
-      "description": "Anthropic Messages API proxies using X-API-Key pattern"
-    },
-    "aws_credential_chain": {
+    "aws_sigv4": {
       "mechanism": "IAM SigV4 signing (not API key)",
       "providers_count": 1,
       "providers": ["amazon-bedrock"],
-      "description": "AWS standard credential chain: env vars → profile → instance metadata"
+      "description": "Bedrock inference request signed from a complete AWS credential chain"
     },
     "no_auth_required": {
-      "providers_count": 1,
-      "providers": ["ollama"],
+      "providers_count": 3,
+      "providers": ["ollama", "llamacpp", "mistralrs"],
       "description": "Local inference server, no authentication needed"
+    }
+  },
+
+  "credential_acquisition": {
+    "description": "Credential acquisition produces the input used by a request_auth_methods lane; it is not itself a wire/header classification.",
+    "default_methods": ["direct_api_key"],
+    "overrides": {
+      "anthropic": ["direct_api_key", "oauth_login", "external_cli_credentials"],
+      "openai": ["direct_api_key", "external_cli_credentials"],
+      "openai-codex": ["oauth_login", "external_cli_credentials"],
+      "google-gemini-cli": ["oauth_login", "external_cli_credentials"],
+      "google-antigravity": ["oauth_login", "external_cli_credentials"],
+      "github-copilot": ["direct_api_key", "oauth_login", "copilot_device_oauth", "copilot_session_exchange"],
+      "gitlab": ["direct_api_key", "oauth_login"],
+      "amazon-bedrock": ["aws_credential_chain", "direct_bearer_override"],
+      "sap-ai-core": ["sap_client_credentials_exchange", "direct_bearer_override"],
+      "ollama": ["no_credentials"],
+      "llamacpp": ["no_credentials"],
+      "mistralrs": ["no_credentials"],
+      "kimi-for-coding": ["direct_api_key", "kimi_device_oauth", "external_cli_credentials"]
+    },
+    "methods": {
+      "direct_api_key": {
+        "providers_count": 86,
+        "description": "Complete API key supplied explicitly, through a provider API-key environment variable, or from stored ApiKey auth."
+      },
+      "oauth_login": {
+        "providers_count": 6,
+        "providers": ["anthropic", "openai-codex", "google-gemini-cli", "google-antigravity", "github-copilot", "gitlab"],
+        "description": "Interactive browser OAuth login stores an access token or, for Copilot, the GitHub token used by the required session-token exchange."
+      },
+      "external_cli_credentials": {
+        "providers_count": 6,
+        "providers": ["anthropic", "openai", "openai-codex", "google-gemini-cli", "google-antigravity", "kimi-for-coding"],
+        "description": "Credential auto-detected from a supported Claude, Codex, Gemini, or Kimi CLI installation."
+      },
+      "kimi_device_oauth": {
+        "providers_count": 1,
+        "providers": ["kimi-for-coding"],
+        "description": "Kimi RFC 8628-style device authorization and token polling; the resulting access token uses the bearer request lane and Kimi device headers."
+      },
+      "copilot_device_oauth": {
+        "providers_count": 1,
+        "providers": ["github-copilot"],
+        "description": "GitHub device authorization obtains the GitHub token used by Copilot's required session-token exchange."
+      },
+      "copilot_session_exchange": {
+        "providers_count": 1,
+        "providers": ["github-copilot"],
+        "description": "The selected GitHub credential is exchanged for a short-lived Copilot session token; only that session token is sent as the inference bearer."
+      },
+      "aws_credential_chain": {
+        "providers_count": 1,
+        "providers": ["amazon-bedrock"],
+        "description": "Complete SigV4 credentials from an environment access-key pair, static/SSO profile, or stored AWS credentials."
+      },
+      "direct_bearer_override": {
+        "providers_count": 2,
+        "providers": ["amazon-bedrock", "sap-ai-core"],
+        "description": "Explicit CLI/StreamOptions, stored direct bearer value, or the Bedrock-specific AWS_BEARER_TOKEN_BEDROCK environment value. An explicit Bedrock override deterministically outranks the automatic AWS chain; a direct SAP bearer bypasses service-key exchange."
+      },
+      "sap_client_credentials_exchange": {
+        "providers_count": 1,
+        "providers": ["sap-ai-core"],
+        "description": "AICORE_SERVICE_KEY JSON, split SAP_AI_CORE_* environment inputs, or a stored ServiceKey is exchanged for the bearer token sent to inference."
+      },
+      "no_credentials": {
+        "providers_count": 3,
+        "providers": ["ollama", "llamacpp", "mistralrs"],
+        "description": "No credential acquisition is required."
+      }
     }
   },
 
@@ -68,7 +153,7 @@
         "mechanism": "Alias registered in provider_metadata.rs:1412",
         "confusion_source": "Upstream surfaces use 'azure', Pi canonical is 'azure-openai'",
         "env_key": "AZURE_OPENAI_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- azure"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "azure-cognitive-services",
@@ -76,7 +161,7 @@
         "mechanism": "Alias registered in provider_metadata.rs:1412",
         "confusion_source": "Legacy Azure service name still used in some docs",
         "env_key": "AZURE_OPENAI_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- azure_cognitive"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "fireworks-ai",
@@ -84,7 +169,7 @@
         "mechanism": "Alias registered in provider_metadata.rs:251",
         "confusion_source": "Official company name is 'Fireworks AI' but Pi uses short 'fireworks'",
         "env_key": "FIREWORKS_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- fireworks"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "qwen",
@@ -92,7 +177,7 @@
         "mechanism": "Alias registered in provider_metadata.rs",
         "confusion_source": "Qwen is the model family, Alibaba/DashScope is the provider",
         "env_key": "DASHSCOPE_API_KEY or QWEN_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- qwen"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "kimi",
@@ -100,7 +185,7 @@
         "mechanism": "Alias registered in provider_metadata.rs",
         "confusion_source": "Kimi is the product name, Moonshot AI is the provider. Note: kimi-for-coding is a SEPARATE provider",
         "env_key": "MOONSHOT_API_KEY or KIMI_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- kimi"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "google-vertex-anthropic",
@@ -108,7 +193,7 @@
         "mechanism": "Alias registered in provider_metadata.rs:1351",
         "confusion_source": "Anthropic models available through Google Vertex, but it's still the Vertex provider",
         "env_key": "GOOGLE_CLOUD_API_KEY or VERTEX_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- google_vertex_anthropic"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "gemini",
@@ -116,7 +201,7 @@
         "mechanism": "Alias registered in provider_metadata.rs",
         "confusion_source": "Gemini is the model family, Google is the provider canonical ID",
         "env_key": "GOOGLE_API_KEY or GEMINI_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- gemini"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "grok",
@@ -124,7 +209,7 @@
         "mechanism": "Alias registered in provider_metadata.rs",
         "confusion_source": "Grok is the model, xAI is the provider company",
         "env_key": "XAI_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- grok"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       },
       {
         "user_input": "together",
@@ -132,30 +217,36 @@
         "mechanism": "Alias registered in provider_metadata.rs",
         "confusion_source": "Together AI commonly referred to as just 'together'",
         "env_key": "TOGETHER_API_KEY or TOGETHER_AI_API_KEY",
-        "test_evidence": "cargo test canonical_provider_id -- together"
+        "test_evidence": "cargo test --test provider_metadata_comprehensive every_alias_resolves_to_its_canonical_id -- --exact"
       }
     ]
   },
 
   "providers": [
-    {"canonical_id": "anthropic", "aliases": [], "env_keys": ["ANTHROPIC_API_KEY"], "auth_method": "x_api_key", "base_url": "https://api.anthropic.com/v1/messages", "tier": "native"},
+    {"canonical_id": "anthropic", "aliases": [], "env_keys": ["ANTHROPIC_API_KEY"], "auth_method": "x_api_key", "additional_auth_methods": ["bearer_token"], "base_url": "https://api.anthropic.com/v1/messages", "tier": "native", "notes": "Direct API keys use X-API-Key; OAuth and external Claude credentials use Authorization Bearer"},
     {"canonical_id": "openai", "aliases": [], "env_keys": ["OPENAI_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.openai.com/v1", "tier": "native"},
+    {"canonical_id": "openai-codex", "aliases": ["codex", "chatgpt-codex"], "env_keys": [], "auth_method": "bearer_token", "base_url": "https://chatgpt.com/backend-api/codex/responses", "tier": "native_adapter", "notes": "Use /login openai-codex or an auto-detected Codex credential"},
     {"canonical_id": "google", "aliases": ["gemini"], "env_keys": ["GOOGLE_API_KEY", "GEMINI_API_KEY"], "auth_method": "url_parameter", "base_url": "https://generativelanguage.googleapis.com/v1beta", "tier": "native"},
+    {"canonical_id": "google-gemini-cli", "aliases": ["gemini-cli"], "env_keys": [], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter", "notes": "Use /login google-gemini-cli or an auto-detected Gemini CLI credential"},
+    {"canonical_id": "google-antigravity", "aliases": ["antigravity"], "env_keys": [], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter", "notes": "Use /login google-antigravity or an auto-detected Gemini CLI credential"},
     {"canonical_id": "cohere", "aliases": [], "env_keys": ["COHERE_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.cohere.com/v2", "tier": "native"},
-    {"canonical_id": "azure-openai", "aliases": ["azure", "azure-cognitive-services"], "env_keys": ["AZURE_OPENAI_API_KEY"], "auth_method": "api_key_header", "base_url": null, "tier": "native_adapter", "notes": "Requires azure_deployment config; base URL includes resource name and deployment"},
-    {"canonical_id": "amazon-bedrock", "aliases": ["bedrock"], "env_keys": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_REGION"], "auth_method": "aws_credential_chain", "base_url": null, "tier": "native_adapter", "notes": "Uses AWS IAM SigV4 signing, not API key"},
+    {"canonical_id": "cursor", "aliases": ["cursor-agent"], "env_keys": ["CURSOR_API_KEY", "CURSOR_ACCESS_TOKEN"], "auth_method": "bearer_token", "base_url": "https://api2.cursor.sh/agent.v1.AgentService/Run", "tier": "native"},
+    {"canonical_id": "azure-openai", "aliases": ["azure", "azure_openai", "azure-cognitive-services", "azure-openai-responses"], "env_keys": ["AZURE_OPENAI_API_KEY"], "auth_method": "api_key_header", "base_url": null, "tier": "native_adapter", "notes": "Requires azure_deployment config; base URL includes resource name and deployment"},
+    {"canonical_id": "amazon-bedrock", "aliases": ["bedrock"], "env_keys": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_BEARER_TOKEN_BEDROCK", "AWS_PROFILE", "AWS_REGION"], "auth_method": "aws_sigv4", "additional_auth_methods": ["bearer_token"], "base_url": null, "tier": "native_adapter", "notes": "Complete AWS credentials use SigV4; an explicit direct bearer override or AWS_BEARER_TOKEN_BEDROCK uses Authorization Bearer"},
     {"canonical_id": "google-vertex", "aliases": ["vertexai", "google-vertex-anthropic"], "env_keys": ["GOOGLE_CLOUD_API_KEY", "VERTEX_API_KEY"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter"},
-    {"canonical_id": "github-copilot", "aliases": ["copilot", "github-copilot-enterprise"], "env_keys": ["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter"},
-    {"canonical_id": "gitlab", "aliases": ["gitlab-duo"], "env_keys": ["GITLAB_TOKEN", "GITLAB_API_KEY"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter"},
-    {"canonical_id": "sap-ai-core", "aliases": ["sap"], "env_keys": ["AICORE_SERVICE_KEY", "SAP_AI_CORE_CLIENT_ID", "SAP_AI_CORE_CLIENT_SECRET", "SAP_AI_CORE_TOKEN_URL", "SAP_AI_CORE_SERVICE_URL"], "auth_method": "oauth_client_credentials", "base_url": null, "tier": "native_adapter"},
+    {"canonical_id": "github-copilot", "aliases": ["copilot", "github-copilot-enterprise"], "env_keys": ["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter", "notes": "Direct or browser/device OAuth supplies a GitHub credential; Pi exchanges it for the short-lived Copilot session token sent to inference"},
+    {"canonical_id": "gitlab", "aliases": ["gitlab-duo"], "env_keys": ["GITLAB_TOKEN", "GITLAB_API_KEY"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter", "notes": "Accepts a direct GitLab token or a token obtained through the built-in GitLab browser OAuth flow"},
+    {"canonical_id": "sap-ai-core", "aliases": ["sap"], "env_keys": ["AICORE_SERVICE_KEY", "SAP_AI_CORE_CLIENT_ID", "SAP_AI_CORE_CLIENT_SECRET", "SAP_AI_CORE_TOKEN_URL", "SAP_AI_CORE_SERVICE_URL"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter", "notes": "Service-key or split client credentials are exchanged first; only the resulting access token is sent as Authorization Bearer"},
     {"canonical_id": "v0", "aliases": [], "env_keys": ["V0_API_KEY"], "auth_method": "bearer_token", "base_url": null, "tier": "native_adapter"},
     {"canonical_id": "groq", "aliases": [], "env_keys": ["GROQ_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.groq.com/openai/v1", "tier": "oai_compat"},
     {"canonical_id": "deepinfra", "aliases": ["deep-infra"], "env_keys": ["DEEPINFRA_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.deepinfra.com/v1/openai", "tier": "oai_compat"},
     {"canonical_id": "cerebras", "aliases": [], "env_keys": ["CEREBRAS_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.cerebras.ai/v1", "tier": "oai_compat"},
+    {"canonical_id": "atlascloud", "aliases": ["atlas-cloud", "atlas"], "env_keys": ["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.atlascloud.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "openrouter", "aliases": ["open-router"], "env_keys": ["OPENROUTER_API_KEY"], "auth_method": "bearer_token", "base_url": "https://openrouter.ai/api/v1", "tier": "oai_compat"},
     {"canonical_id": "mistral", "aliases": ["mistralai"], "env_keys": ["MISTRAL_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.mistral.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "moonshotai", "aliases": ["moonshot", "kimi"], "env_keys": ["MOONSHOT_API_KEY", "KIMI_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.moonshot.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "alibaba", "aliases": ["dashscope", "qwen"], "env_keys": ["DASHSCOPE_API_KEY", "QWEN_API_KEY"], "auth_method": "bearer_token", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", "tier": "oai_compat"},
+    {"canonical_id": "alibaba-us", "aliases": [], "env_keys": ["DASHSCOPE_API_KEY", "QWEN_API_KEY"], "auth_method": "bearer_token", "base_url": "https://dashscope-us.aliyuncs.com/compatible-mode/v1", "tier": "oai_compat"},
     {"canonical_id": "deepseek", "aliases": ["deep-seek"], "env_keys": ["DEEPSEEK_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.deepseek.com", "tier": "oai_compat"},
     {"canonical_id": "fireworks", "aliases": ["fireworks-ai"], "env_keys": ["FIREWORKS_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.fireworks.ai/inference/v1", "tier": "oai_compat"},
     {"canonical_id": "togetherai", "aliases": ["together", "together-ai"], "env_keys": ["TOGETHER_API_KEY", "TOGETHER_AI_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.together.xyz/v1", "tier": "oai_compat"},
@@ -163,15 +254,17 @@
     {"canonical_id": "xai", "aliases": ["grok", "x-ai"], "env_keys": ["XAI_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.x.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "huggingface", "aliases": ["hf", "hugging-face"], "env_keys": ["HF_TOKEN"], "auth_method": "bearer_token", "base_url": "https://router.huggingface.co/v1", "tier": "oai_compat"},
     {"canonical_id": "nvidia", "aliases": ["nim", "nvidia-nim"], "env_keys": ["NVIDIA_API_KEY"], "auth_method": "bearer_token", "base_url": "https://integrate.api.nvidia.com/v1", "tier": "oai_compat"},
-    {"canonical_id": "ollama", "aliases": [], "env_keys": [], "auth_method": "none", "base_url": "http://127.0.0.1:11434/v1", "tier": "local", "notes": "No authentication required — local inference server"},
+    {"canonical_id": "ollama", "aliases": [], "env_keys": [], "auth_method": "no_auth_required", "base_url": "http://127.0.0.1:11434/v1", "tier": "local", "notes": "No authentication required — local inference server"},
     {"canonical_id": "lmstudio", "aliases": ["lm-studio"], "env_keys": ["LMSTUDIO_API_KEY"], "auth_method": "bearer_token", "base_url": "http://127.0.0.1:1234/v1", "tier": "local"},
+    {"canonical_id": "llamacpp", "aliases": ["llama-cpp", "llama.cpp", "llama-server"], "env_keys": [], "auth_method": "no_auth_required", "base_url": "http://127.0.0.1:8080/v1", "tier": "local", "notes": "No authentication required — local inference server"},
+    {"canonical_id": "mistralrs", "aliases": ["mistral.rs", "mistral-rs"], "env_keys": [], "auth_method": "no_auth_required", "base_url": "http://127.0.0.1:1234/v1", "tier": "local", "notes": "No authentication required — local inference server"},
     {"canonical_id": "ollama-cloud", "aliases": [], "env_keys": ["OLLAMA_API_KEY"], "auth_method": "bearer_token", "base_url": "https://ollama.com/v1", "tier": "oai_compat"},
-    {"canonical_id": "kimi-for-coding", "aliases": [], "env_keys": ["KIMI_API_KEY"], "auth_method": "anthropic_messages_api", "base_url": "https://api.kimi.com/coding/v1/messages", "tier": "anthropic_proxy"},
-    {"canonical_id": "minimax", "aliases": [], "env_keys": ["MINIMAX_API_KEY"], "auth_method": "anthropic_messages_api", "base_url": "https://api.minimax.io/anthropic/v1/messages", "tier": "anthropic_proxy"},
-    {"canonical_id": "minimax-cn", "aliases": [], "env_keys": ["MINIMAX_CN_API_KEY"], "auth_method": "anthropic_messages_api", "base_url": "https://api.minimaxi.com/anthropic/v1/messages", "tier": "anthropic_proxy"},
-    {"canonical_id": "minimax-coding-plan", "aliases": [], "env_keys": ["MINIMAX_API_KEY"], "auth_method": "anthropic_messages_api", "base_url": "https://api.minimax.io/anthropic/v1/messages", "tier": "anthropic_proxy"},
-    {"canonical_id": "minimax-cn-coding-plan", "aliases": [], "env_keys": ["MINIMAX_CN_API_KEY"], "auth_method": "anthropic_messages_api", "base_url": "https://api.minimaxi.com/anthropic/v1/messages", "tier": "anthropic_proxy"},
-    {"canonical_id": "zenmux", "aliases": [], "env_keys": ["ZENMUX_API_KEY"], "auth_method": "anthropic_messages_api", "base_url": "https://zenmux.ai/api/anthropic/v1/messages", "tier": "anthropic_proxy"},
+    {"canonical_id": "kimi-for-coding", "aliases": ["kimi-coding", "kimi-code"], "env_keys": ["KIMI_API_KEY"], "auth_method": "x_api_key", "additional_auth_methods": ["bearer_token"], "base_url": "https://api.kimi.com/coding/v1/messages", "tier": "anthropic_proxy", "notes": "sk-* API keys use X-API-Key; device-flow and external Kimi CLI access tokens use Authorization Bearer plus Kimi device headers"},
+    {"canonical_id": "minimax", "aliases": [], "env_keys": ["MINIMAX_API_KEY"], "auth_method": "x_api_key", "base_url": "https://api.minimax.io/anthropic/v1/messages", "tier": "anthropic_proxy"},
+    {"canonical_id": "minimax-cn", "aliases": [], "env_keys": ["MINIMAX_CN_API_KEY"], "auth_method": "x_api_key", "base_url": "https://api.minimaxi.com/anthropic/v1/messages", "tier": "anthropic_proxy"},
+    {"canonical_id": "minimax-coding-plan", "aliases": [], "env_keys": ["MINIMAX_API_KEY"], "auth_method": "x_api_key", "base_url": "https://api.minimax.io/anthropic/v1/messages", "tier": "anthropic_proxy"},
+    {"canonical_id": "minimax-cn-coding-plan", "aliases": [], "env_keys": ["MINIMAX_CN_API_KEY"], "auth_method": "x_api_key", "base_url": "https://api.minimaxi.com/anthropic/v1/messages", "tier": "anthropic_proxy"},
+    {"canonical_id": "zenmux", "aliases": [], "env_keys": ["ZENMUX_API_KEY"], "auth_method": "x_api_key", "base_url": "https://zenmux.ai/api/anthropic/v1/messages", "tier": "anthropic_proxy"},
     {"canonical_id": "302ai", "aliases": [], "env_keys": ["302AI_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.302.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "abacus", "aliases": [], "env_keys": ["ABACUS_API_KEY"], "auth_method": "bearer_token", "base_url": "https://routellm.abacus.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "aihubmix", "aliases": [], "env_keys": ["AIHUBMIX_API_KEY"], "auth_method": "bearer_token", "base_url": "https://aihubmix.com/v1", "tier": "oai_compat"},
@@ -185,7 +278,6 @@
     {"canonical_id": "fastrouter", "aliases": [], "env_keys": ["FASTROUTER_API_KEY"], "auth_method": "bearer_token", "base_url": "https://go.fastrouter.ai/api/v1", "tier": "oai_compat"},
     {"canonical_id": "firmware", "aliases": [], "env_keys": ["FIRMWARE_API_KEY"], "auth_method": "bearer_token", "base_url": "https://app.firmware.ai/api/v1", "tier": "oai_compat"},
     {"canonical_id": "friendli", "aliases": [], "env_keys": ["FRIENDLI_TOKEN"], "auth_method": "bearer_token", "base_url": "https://api.friendli.ai/serverless/v1", "tier": "oai_compat"},
-    {"canonical_id": "github-models", "aliases": [], "env_keys": ["GITHUB_TOKEN"], "auth_method": "bearer_token", "base_url": "https://models.github.ai/inference", "tier": "oai_compat"},
     {"canonical_id": "helicone", "aliases": [], "env_keys": ["HELICONE_API_KEY"], "auth_method": "bearer_token", "base_url": "https://ai-gateway.helicone.ai/v1", "tier": "oai_compat"},
     {"canonical_id": "iflowcn", "aliases": [], "env_keys": ["IFLOW_API_KEY"], "auth_method": "bearer_token", "base_url": "https://apis.iflow.cn/v1", "tier": "oai_compat"},
     {"canonical_id": "inception", "aliases": [], "env_keys": ["INCEPTION_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.inceptionlabs.ai/v1", "tier": "oai_compat"},
@@ -214,7 +306,7 @@
     {"canonical_id": "synthetic", "aliases": [], "env_keys": ["SYNTHETIC_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.synthetic.new/v1", "tier": "oai_compat"},
     {"canonical_id": "upstage", "aliases": [], "env_keys": ["UPSTAGE_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.upstage.ai/v1/solar", "tier": "oai_compat"},
     {"canonical_id": "venice", "aliases": [], "env_keys": ["VENICE_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.venice.ai/api/v1", "tier": "oai_compat"},
-    {"canonical_id": "vercel", "aliases": [], "env_keys": ["AI_GATEWAY_API_KEY"], "auth_method": "bearer_token", "base_url": "https://ai-gateway.vercel.sh/v1", "tier": "oai_compat"},
+    {"canonical_id": "vercel", "aliases": ["vercel-ai-gateway"], "env_keys": ["AI_GATEWAY_API_KEY"], "auth_method": "bearer_token", "base_url": "https://ai-gateway.vercel.sh/v1", "tier": "oai_compat"},
     {"canonical_id": "vivgrid", "aliases": [], "env_keys": ["VIVGRID_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.vivgrid.com/v1", "tier": "oai_compat"},
     {"canonical_id": "vultr", "aliases": [], "env_keys": ["VULTR_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.vultrinference.com/v1", "tier": "oai_compat"},
     {"canonical_id": "wandb", "aliases": [], "env_keys": ["WANDB_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.inference.wandb.ai/v1", "tier": "oai_compat"},
@@ -230,7 +322,7 @@
   "acceptance_criteria_compliance": {
     "criterion_1": {
       "requirement": "Crosswalk covers canonical IDs, common aliases, env key precedence, and base URL defaults/overrides",
-      "status": "PASS — all 87 providers listed with canonical_id, aliases, env_keys, auth_method, base_url, and tier"
+      "status": "PASS — all 94 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
     },
     "criterion_2": {
       "requirement": "Includes high-confusion mappings (azure, azure-cognitive-services, fireworks-ai, qwen, kimi, google-vertex-anthropic)",
@@ -238,7 +330,7 @@
     },
     "criterion_3": {
       "requirement": "Crosswalk references test evidence validating alias and auth resolution behavior",
-      "status": "PASS — each confusion mapping includes test_evidence command; api_key_resolution_precedence references src/auth.rs:320-353"
+      "status": "PASS — each confusion mapping uses one valid provider_metadata_comprehensive test filter; request and acquisition method references/counts are checked against this schema"
     }
   }
 }

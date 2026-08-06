@@ -1,9 +1,16 @@
 {
   "schema": "pi.qa.provider_auth_playbook_validation.v1",
   "bead_id": "bd-3uqg.9.3.4",
+  "artifact_status": "historical_snapshot",
+  "current_release_authority": false,
+  "superseded_by": [
+    "docs/provider-auth-crosswalk.json",
+    "tests/provider_metadata_comprehensive.rs",
+    "scripts/check_provider_discrepancy_ledger.py"
+  ],
   "generated_at_utc": "2026-02-14T01:35:00Z",
   "generated_by": "LilacCat (Claude Opus 4.6)",
-  "description": "Validates auth troubleshooting playbook documents (bd-3uqg.9.3.1/2/3) against executable code references, VCR cassettes, and test evidence.",
+  "description": "Historical validation snapshot from 2026-02-14. Its counts, line references, and PASS verdict are not current release evidence; use the listed superseding sources.",
 
   "inputs_validated": [
     "docs/provider-auth-failure-signatures.json (bd-3uqg.9.3.1)",
@@ -120,7 +127,7 @@
       "tests/fixtures/vcr/cohere_auth_failure_401.json",
       "tests/fixtures/vcr/cohere_rate_limit_429.json"
     ],
-    "verdict": "Auth troubleshooting playbook is fully validated against executable code references. All documented diagnostic codes, redaction patterns, resolution chains, and test references match the implementation. Two missing Cohere VCR cassettes were created to close the evidence gap."
+    "verdict": "HISTORICAL_ONLY — this records the 2026-02-14 result and must not be interpreted as validation of the current tree."
   },
 
   "acceptance_criteria_compliance": {

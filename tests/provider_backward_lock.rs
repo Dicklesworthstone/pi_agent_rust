@@ -869,7 +869,6 @@ fn factory_routes_batch_a2_providers_correctly() {
     let cases = [
         ("firmware", "https://app.firmware.ai/api/v1"),
         ("friendli", "https://api.friendli.ai/serverless/v1"),
-        ("github-models", "https://models.github.ai/inference"),
         ("helicone", "https://ai-gateway.helicone.ai/v1"),
         ("huggingface", "https://router.huggingface.co/v1"),
         ("iflowcn", "https://apis.iflow.cn/v1"),

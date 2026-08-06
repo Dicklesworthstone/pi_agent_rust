@@ -3,7 +3,7 @@
 Auth failure modes and exact remediation paths for each gap and longtail
 provider, linked to test evidence and the error hint system in `src/error.rs`.
 
-Generated: 2026-02-13
+Reconciled against the live registry and auth runtime: 2026-08-06
 
 ## Quick Reference
 
@@ -26,7 +26,9 @@ Generated: 2026-02-13
 
 This crosswalk maps every user-visible provider name (including upstream aliases from opencode and models.dev) to the Pi canonical ID, accepted aliases, auth env vars, and default endpoint. Use this when a user reports "missing provider" or confusion about which name to use.
 
-**Total**: 95 canonical providers, 51 aliases, 100% upstream coverage.
+**Total**: 94 registered canonical provider IDs and 51 aliases. Registration
+coverage is not a claim that every ID has an executable native route; use
+`pi --list-providers` and the implementation-mode evidence for runtime status.
 
 ### Native providers (dedicated adapter)
 
@@ -100,6 +102,13 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `minimax-cn-coding-plan` | — | `MINIMAX_CN_API_KEY` | `https://api.minimaxi.com/anthropic/v1/messages` |
 | `zenmux` | — | `ZENMUX_API_KEY` | `https://zenmux.ai/api/anthropic/v1/messages` |
 
+`kimi-for-coding` has two intentional request-auth lanes. A `sk-*` direct API
+key, including one supplied through `KIMI_API_KEY`, is sent as `x-api-key`.
+Tokens obtained by `/login kimi-for-coding` or imported from the Kimi CLI are
+sent as `Authorization: Bearer` with the required Kimi device headers. Do not
+diagnose the absence of `x-api-key` as a failure when an OAuth/external token is
+active.
+
 ### OpenAI-compatible presets (longtail)
 
 | Canonical ID | Aliases | Auth env vars | Default endpoint |
@@ -117,7 +126,6 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `fastrouter` | — | `FASTROUTER_API_KEY` | `https://go.fastrouter.ai/api/v1` |
 | `firmware` | — | `FIRMWARE_API_KEY` | `https://app.firmware.ai/api/v1` |
 | `friendli` | — | `FRIENDLI_TOKEN` | `https://api.friendli.ai/serverless/v1` |
-| `github-models` | — | `GITHUB_TOKEN` | `https://models.github.ai/inference` |
 | `helicone` | — | `HELICONE_API_KEY` | `https://ai-gateway.helicone.ai/v1` |
 | `iflowcn` | — | `IFLOW_API_KEY` | `https://apis.iflow.cn/v1` |
 | `inception` | — | `INCEPTION_API_KEY` | `https://api.inceptionlabs.ai/v1` |
@@ -200,9 +208,12 @@ Some distinct canonical IDs share environment variables (intentional for provide
 | `MINIMAX_API_KEY` | `minimax`, `minimax-coding-plan` |
 | `MINIMAX_CN_API_KEY` | `minimax-cn`, `minimax-cn-coding-plan` |
 | `CLOUDFLARE_API_TOKEN` | `cloudflare-ai-gateway`, `cloudflare-workers-ai` |
-| `GITHUB_TOKEN` | `github-copilot`, `github-models` |
 
-**Validation**: `cargo test --test provider_metadata_comprehensive -- canonical_id_snapshot alias_mapping_snapshot`
+**Validation**: `cargo test --test provider_metadata_comprehensive provider_auth_reference_artifacts_match_runtime_metadata -- --exact`
+
+The former `github-models` preset was removed after GitHub retired the GitHub
+Models service on 2026-07-30. `github-copilot` is a separate native provider and
+remains supported.
 
 ## Failure Mode Matrix
 
@@ -444,8 +455,11 @@ The `AuthDiagnosticCode` enum (`src/error.rs:67-81`) provides stable machine cod
 
 ### Amazon Bedrock
 
-**Auth mechanism**: AWS SigV4 signing OR Bearer token
-**Env vars**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION`
+**Auth mechanism**: An explicit `--api-key`/per-request bearer override wins;
+otherwise use `AWS_BEARER_TOKEN_BEDROCK` or AWS SigV4 signing.
+**Env vars**: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (optionally
+`AWS_SESSION_TOKEN`), `AWS_BEARER_TOKEN_BEDROCK`, `AWS_PROFILE` or
+`AWS_DEFAULT_PROFILE`, and `AWS_REGION` or `AWS_DEFAULT_REGION`
 
 | Failure mode | HTTP status | Response body shape | Diagnostic code | VCR cassette |
 |-------------|------------|--------------------|-----------------|----|
@@ -453,9 +467,15 @@ The `AuthDiagnosticCode` enum (`src/error.rs:67-81`) provides stable machine cod
 | Invalid credentials | 401 | `{"__type":"UnrecognizedClientException","message":"..."}` | `InvalidApiKey` | `verify_bedrock_error_auth_401.json` |
 | Wrong region | 403 | `{"__type":"AccessDeniedException","message":"..."}` | `MissingRegion` | — |
 
-**User-facing message**: `"Amazon Bedrock requires AWS credentials. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_BEARER_TOKEN_BEDROCK, or store amazon-bedrock credentials in auth.json."`
-**Unique**: Multi-credential chain (SigV4 keys, bearer token, auth.json, AWS profile). SigV4 signing at request time.
-**Source**: `src/providers/bedrock.rs:138-182, 448-452, 802-866`
+**User-facing message**: `"Amazon Bedrock requires AWS credentials. Set AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_BEARER_TOKEN_BEDROCK, AWS_PROFILE (static or SSO), or store amazon-bedrock credentials in auth.json. For SSO profiles, run: aws sso login --profile <name>. An explicit direct bearer token may be passed via --api-key or StreamOptions.api_key."`
+**Unique**: A non-empty explicit direct bearer override takes precedence over
+all automatic AWS sources. Without one, the resolver checks the Bedrock bearer
+env token, complete env IAM keys, a static or SSO profile, then stored
+credentials. A region alone, profile name alone, access-key ID alone, or orphan
+session token is never treated as a bearer credential. SigV4 signing occurs at
+request time.
+**Source**: `src/providers/bedrock.rs` (`BedrockProvider::resolve_auth_context`,
+request signing) and `src/auth.rs` (`resolve_aws_credentials_async`)
 
 ### GitHub Copilot
 
@@ -523,9 +543,18 @@ Providers follow distinct error envelope formats:
 The auth system (`src/auth.rs`) resolves credentials in this order:
 
 1. **Explicit override** — `--api-key` flag or per-request key
-2. **Environment variables** — provider-specific vars from `provider_auth_env_keys()`
-3. **auth.json** — persisted credentials at `~/.pi/agent/auth.json`
-4. **Canonical fallback** — alias providers fall back to canonical (e.g., `openai-responses` → `openai`)
+2. **Stored OAuth or bearer token** — an unexpired OAuth access token or a
+   `BearerToken` entry in `~/.pi/agent/auth.json`
+3. **Environment variables** — provider-specific vars from
+   `provider_auth_env_keys()`, in their documented order
+4. **Stored API key** — an `ApiKey` entry in `~/.pi/agent/auth.json`
+5. **External coding-CLI credential** — supported credentials auto-detected
+   from another local coding CLI, only when using Pi's global auth storage
+
+Canonical IDs and aliases share credential lookup at each applicable tier; alias
+resolution is not a separate, lower-priority credential source. If all five auth
+sources are absent, model selection can still use an inline `models.json`
+`apiKey` fallback.
 
 **OAuth proactive refresh**: tokens refresh 10 minutes before expiry to avoid mid-request expiration.
 

@@ -109,7 +109,7 @@
       "user_impact": "Users typing common provider names (together, grok, hf, nim, pplx, etc.) got 'provider not found' errors despite the provider being fully implemented.",
       "evidence": "bd-3uqg.14.3.4 comments: Gap 1, src/provider_metadata.rs alias fields, tests/provider_metadata_comprehensive.rs alias snapshot, docs/provider-auth-troubleshooting.md provider name crosswalk",
       "remediation_status": "fixed",
-      "remediation_note": "Provider docs now report 95 canonical providers and 51 aliases. src/provider_metadata.rs covers the high-traffic UX aliases from bd-tuh3g plus later aliases such as nanogpt, novita, zhipu, glm, lm-studio, vercel-ai-gateway, copilot, gitlab-duo, Codex, Gemini CLI, Antigravity, Kimi coding, and Azure variants. bd-ryg6j.3 reviewed the remaining no-alias and under-aliased longtail providers against repo-backed evidence; remaining canonical-only providers are exact-branded, regional/coding-plan variants, or ambiguous without a concrete upstream/docs reference.",
+      "remediation_note": "Provider docs now report 94 registered canonical providers and 51 aliases. src/provider_metadata.rs covers the high-traffic UX aliases from bd-tuh3g plus later aliases such as nanogpt, novita, zhipu, glm, lm-studio, vercel-ai-gateway, copilot, gitlab-duo, Codex, Gemini CLI, Antigravity, Kimi coding, and Azure variants. bd-ryg6j.3 reviewed the remaining no-alias and under-aliased longtail providers against repo-backed evidence; remaining canonical-only providers are exact-branded, regional/coding-plan variants, or ambiguous without a concrete upstream/docs reference.",
       "remediation_beads": ["bd-tuh3g", "bd-ryg6j.3"],
       "affected_providers": ["togetherai", "xai", "huggingface", "nvidia", "lmstudio", "deepseek", "perplexity", "deepinfra", "mistral", "siliconflow"]
     },
@@ -283,7 +283,7 @@
       "user_impact": "Users have no reference table showing canonical IDs, aliases, common brand names, and auth env keys in one place.",
       "evidence": "docs/providers.md canonical provider matrix and alias migration table; docs/provider-auth-troubleshooting.md provider name crosswalk with canonical IDs, aliases, auth env vars, and endpoints",
       "remediation_status": "fixed",
-      "remediation_note": "--list-providers remains the runtime discovery surface, and static docs now provide the requested provider-name crosswalk. docs/providers.md records source-of-truth references and docs/provider-auth-troubleshooting.md reports 95 canonical providers, 51 aliases, and env-key/endpoint mappings. scripts/check_provider_discrepancy_ledger.py now fails closed if the checked crosswalk drifts from src/provider_metadata.rs.",
+      "remediation_note": "--list-providers remains the runtime discovery surface, and static docs now provide the requested provider-name crosswalk. docs/providers.md records source-of-truth references and docs/provider-auth-troubleshooting.md reports 94 registered canonical providers, 51 aliases, and env-key/endpoint mappings. scripts/check_provider_discrepancy_ledger.py now fails closed if the checked crosswalk drifts from src/provider_metadata.rs.",
       "remediation_beads": ["bd-3gsk0", "bd-8t27h.7", "bd-ryg6j.1", "bd-ryg6j.2", "bd-ryg6j.4"],
       "affected_providers": ["all"]
     },

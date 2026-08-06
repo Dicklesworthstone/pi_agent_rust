@@ -1,60 +1,86 @@
 # Provider Canonical ID + Alias Policy (`bd-3uqg.1.3`)
 
 Generated: `2026-02-10T04:38:00Z`
+Last reviewed: `2026-08-06`
 Depends on: bd-3uqg.1.1 (upstream snapshot), bd-3uqg.1.2 (baseline audit)
 
 ## Normalization Algorithm
 
 When a user supplies a provider ID (CLI flag, config, env var), apply these steps in order:
 
-1. **Trim** leading/trailing whitespace
-2. **Lowercase** to ASCII lowercase
-3. **Hyphenate** replace underscores with hyphens (`amazon_bedrock` -> `amazon-bedrock`)
-4. **Alias resolve** lookup in alias table; if found, replace with canonical ID
-5. **Passthrough** if not in alias table, use as-is (supports custom/extension providers)
+1. **Trim** leading/trailing whitespace.
+2. **Match** registered canonical IDs and aliases case-insensitively.
+3. **Canonicalize** a match to the canonical ID stored in `PROVIDER_METADATA`.
+4. **No built-in match** is returned for an unknown ID; custom and extension
+   routing handles declared IDs outside this built-in lookup.
 
-**Rationale**: models.dev uses lowercase-hyphenated for all 87 IDs. Underscore tolerance prevents common user errors.
+**Rationale**: [`src/provider_metadata.rs`](../src/provider_metadata.rs) is the
+runtime authority. Underscore spellings are accepted only when explicitly
+registered as aliases (for example, `azure_openai`); Pi does not apply a generic
+underscore-to-hyphen rewrite.
 
 ## Conflict Resolution Rules
 
-1. **models.dev wins**: When all sources agree, use that ID. When sources disagree, prefer models.dev as canonical.
-2. **opencode aliases**: opencode IDs that differ from models.dev become aliases (e.g., `gemini` -> `google`, `bedrock` -> `amazon-bedrock`, `copilot` -> `github-copilot`, `vertexai` -> `google-vertex`).
-3. **Pi legacy aliases**: Where pi used a non-standard ID, the upstream ID becomes canonical and the pi ID becomes an alias with deprecation notice.
+1. **Runtime metadata wins**: `PROVIDER_METADATA` defines active Pi canonical IDs and aliases.
+2. **Verified upstream aliases**: an upstream spelling that differs from Pi's canonical ID can be registered as an alias after its routing and auth behavior are verified.
+3. **Retired services stay retired**: an ID may remain in historical upstream snapshots without remaining in the active runtime registry.
 4. **Regional variants**: IDs like `alibaba-cn`, `moonshotai-cn` are distinct canonical IDs, not aliases.
 5. **Coding-plan variants**: IDs like `minimax-coding-plan` are distinct canonical IDs.
-6. **Extension providers**: Use their extension-declared ID as-is; no alias normalization.
+6. **Extension providers**: Declared-ID semantics are owned outside the built-in metadata lookup.
 
 ## Deprecation Posture
 
-**Policy**: Soft deprecation with warning log, hard removal after 2 minor versions.
-
-| Deprecated ID | Canonical ID | Reason |
-|--------------|-------------|--------|
-| `fireworks` | `fireworks-ai` | Pi used `fireworks`, upstream canonical is `fireworks-ai` |
-| `azure-openai` | `azure` | Pi used `azure-openai`, models.dev canonical is `azure` |
-
-Both deprecated IDs will continue to work via alias resolution. A deprecation warning will be logged when they are used.
+Only explicitly registered aliases are accepted. There are currently no active
+canonical-ID deprecations. `fireworks` and `azure-openai` are the runtime
+canonical IDs; `fireworks-ai` and the Azure spellings are aliases.
 
 ## Alias Lookup Table
 
 | Alias | Canonical ID | Origin |
 |-------|-------------|--------|
-| `azure-openai` | `azure` | Pi legacy |
+| `antigravity` | `google-antigravity` | Pi runtime |
+| `atlas`, `atlas-cloud` | `atlascloud` | Pi runtime |
+| `azure`, `azure_openai`, `azure-cognitive-services`, `azure-openai-responses` | `azure-openai` | Pi runtime |
 | `bedrock` | `amazon-bedrock` | opencode |
-| `copilot` | `github-copilot` | opencode |
+| `codex`, `chatgpt-codex` | `openai-codex` | Pi runtime |
+| `copilot`, `github-copilot-enterprise` | `github-copilot` | opencode + Pi runtime |
+| `cursor-agent` | `cursor` | Pi runtime |
 | `dashscope` | `alibaba` | Pi alias |
-| `fireworks` | `fireworks-ai` | Pi legacy |
+| `deep-infra` | `deepinfra` | Pi runtime |
+| `deep-seek` | `deepseek` | Pi runtime |
+| `fireworks-ai` | `fireworks` | Pi runtime |
 | `gemini` | `google` | opencode |
+| `gemini-cli` | `google-gemini-cli` | Pi runtime |
+| `gitlab-duo` | `gitlab` | opencode |
+| `glm`, `zhipu` | `zhipuai` | Pi runtime |
+| `google-vertex-anthropic`, `vertexai` | `google-vertex` | models.dev + opencode |
+| `grok`, `x-ai` | `xai` | Pi runtime |
+| `hf`, `hugging-face` | `huggingface` | Pi runtime |
 | `kimi` | `moonshotai` | Pi alias |
+| `kimi-code`, `kimi-coding` | `kimi-for-coding` | Pi runtime |
+| `llama-cpp`, `llama.cpp`, `llama-server` | `llamacpp` | Pi runtime |
+| `lm-studio` | `lmstudio` | Pi runtime |
+| `mistral-rs`, `mistral.rs` | `mistralrs` | Pi runtime |
+| `mistralai` | `mistral` | Pi runtime |
 | `moonshot` | `moonshotai` | Pi alias |
+| `nanogpt` | `nano-gpt` | Pi runtime |
+| `nim`, `nvidia-nim` | `nvidia` | Pi runtime |
+| `novita` | `novita-ai` | Pi runtime |
+| `open-router` | `openrouter` | Pi runtime |
+| `pplx` | `perplexity` | Pi runtime |
 | `qwen` | `alibaba` | Pi alias |
-| `vertexai` | `google-vertex` | opencode |
+| `sap` | `sap-ai-core` | opencode |
+| `silicon-flow` | `siliconflow` | Pi runtime |
+| `together`, `together-ai` | `togetherai` | Pi runtime |
+| `vercel-ai-gateway` | `vercel` | Pi runtime |
 
-Total: 10 aliases mapping to 7 distinct canonical IDs.
+Total: 51 aliases across 33 canonical IDs.
 
-## Canonical ID Registry (88 IDs)
+## Canonical ID Registry (94 active IDs)
 
-Derived from the union of models.dev (87), opencode (11), and codex (3), after deduplication:
+Mirrors the active runtime registry. The machine-readable source is
+[`provider-canonical-id-table.json`](provider-canonical-id-table.json); the
+policy JSON mirrors the same 94 IDs and 51 aliases.
 
 | Canonical ID | Has Aliases | Source(s) |
 |-------------|------------|-----------|
@@ -63,10 +89,11 @@ Derived from the union of models.dev (87), opencode (11), and codex (3), after d
 | aihubmix | no | models.dev |
 | alibaba | yes (dashscope, qwen) | models.dev |
 | alibaba-cn | no | models.dev |
+| alibaba-us | no | Pi runtime |
 | amazon-bedrock | yes (bedrock) | models.dev + opencode |
 | anthropic | no | all |
-| azure | yes (azure-openai) | models.dev |
-| azure-cognitive-services | no | models.dev |
+| atlascloud | yes (atlas, atlas-cloud) | Pi runtime |
+| azure-openai | yes (azure, azure_openai, azure-cognitive-services, azure-openai-responses) | Pi runtime |
 | bailing | no | models.dev |
 | baseten | no | models.dev |
 | berget | no | models.dev |
@@ -76,110 +103,116 @@ Derived from the union of models.dev (87), opencode (11), and codex (3), after d
 | cloudflare-workers-ai | no | models.dev + opencode |
 | cohere | no | models.dev |
 | cortecs | no | models.dev |
-| deepinfra | no | models.dev |
-| deepseek | no | models.dev |
+| cursor | yes (cursor-agent) | Pi runtime |
+| deepinfra | yes (deep-infra) | models.dev |
+| deepseek | yes (deep-seek) | models.dev |
 | fastrouter | no | models.dev |
-| fireworks-ai | yes (fireworks) | models.dev |
+| fireworks | yes (fireworks-ai) | Pi runtime |
 | firmware | no | models.dev |
 | friendli | no | models.dev |
-| github-copilot | yes (copilot) | models.dev + opencode |
-| github-copilot-enterprise | no | opencode |
-| github-models | no | models.dev |
-| gitlab | no | models.dev + opencode |
+| github-copilot | yes (copilot, github-copilot-enterprise) | models.dev + opencode |
+| gitlab | yes (gitlab-duo) | models.dev + opencode |
 | google | yes (gemini) | models.dev + opencode |
-| google-vertex | yes (vertexai) | models.dev + opencode |
-| google-vertex-anthropic | no | models.dev |
+| google-antigravity | yes (antigravity) | Pi runtime |
+| google-gemini-cli | yes (gemini-cli) | Pi runtime |
+| google-vertex | yes (vertexai, google-vertex-anthropic) | models.dev + opencode |
 | groq | no | models.dev + opencode |
 | helicone | no | models.dev |
-| huggingface | no | models.dev |
+| huggingface | yes (hf, hugging-face) | models.dev |
 | iflowcn | no | models.dev |
 | inception | no | models.dev |
 | inference | no | models.dev |
 | io-net | no | models.dev |
 | jiekou | no | models.dev |
-| kimi-for-coding | no | models.dev |
+| kimi-for-coding | yes (kimi-coding, kimi-code) | models.dev |
 | llama | no | models.dev |
-| lmstudio | no | models.dev + codex |
+| llamacpp | yes (llama-cpp, llama.cpp, llama-server) | Pi runtime |
+| lmstudio | yes (lm-studio) | models.dev + codex |
 | lucidquery | no | models.dev |
 | minimax | no | models.dev |
 | minimax-cn | no | models.dev |
 | minimax-cn-coding-plan | no | models.dev |
 | minimax-coding-plan | no | models.dev |
-| mistral | no | models.dev |
+| mistral | yes (mistralai) | models.dev |
+| mistralrs | yes (mistral-rs, mistral.rs) | Pi runtime |
 | moark | no | models.dev |
 | modelscope | no | models.dev |
 | moonshotai | yes (moonshot, kimi) | models.dev |
 | moonshotai-cn | no | models.dev |
 | morph | no | models.dev |
-| nano-gpt | no | models.dev |
+| nano-gpt | yes (nanogpt) | models.dev |
 | nebius | no | models.dev |
 | nova | no | models.dev |
-| novita-ai | no | models.dev |
-| nvidia | no | models.dev |
+| novita-ai | yes (novita) | models.dev |
+| nvidia | yes (nim, nvidia-nim) | models.dev |
 | ollama | no | codex |
 | ollama-cloud | no | models.dev |
 | openai | no | all |
+| openai-codex | yes (codex, chatgpt-codex) | Pi runtime |
 | opencode | no | models.dev + opencode |
-| openrouter | no | models.dev + opencode |
+| openrouter | yes (open-router) | models.dev + opencode |
 | ovhcloud | no | models.dev |
-| perplexity | no | models.dev |
+| perplexity | yes (pplx) | models.dev |
 | poe | no | models.dev |
 | privatemode-ai | no | models.dev |
 | requesty | no | models.dev |
-| sap-ai-core | no | models.dev + opencode |
+| sap-ai-core | yes (sap) | models.dev + opencode |
 | scaleway | no | models.dev |
-| siliconflow | no | models.dev |
+| siliconflow | yes (silicon-flow) | models.dev |
 | siliconflow-cn | no | models.dev |
+| stackit | no | Pi runtime |
 | submodel | no | models.dev |
 | synthetic | no | models.dev |
-| togetherai | no | models.dev |
+| togetherai | yes (together, together-ai) | models.dev |
 | upstage | no | models.dev |
 | v0 | no | models.dev |
 | venice | no | models.dev |
-| vercel | no | models.dev + opencode |
+| vercel | yes (vercel-ai-gateway) | models.dev + opencode |
 | vivgrid | no | models.dev |
 | vultr | no | models.dev |
 | wandb | no | models.dev |
-| xai | no | models.dev + opencode |
+| xai | yes (grok, x-ai) | models.dev + opencode |
 | xiaomi | no | models.dev |
 | zai | no | models.dev |
 | zai-coding-plan | no | models.dev |
 | zenmux | no | models.dev + opencode |
-| zhipuai | no | models.dev |
+| zhipuai | yes (zhipu, glm) | models.dev |
 | zhipuai-coding-plan | no | models.dev |
 
-## Pi Migration Actions Required
+## Credential Resolution Precedence
 
-Only 2 IDs need migration (both non-breaking):
+`AuthStorage::resolve_api_key` applies this order:
 
-| Current Pi ID | Canonical ID | Action | Breaking? |
-|--------------|-------------|--------|-----------|
-| `azure-openai` | `azure` | Rename in factory + auth; keep `azure-openai` as alias | No |
-| `fireworks` | `fireworks-ai` | Rename in ad-hoc defaults + auth; keep `fireworks` as alias | No |
+1. explicit override;
+2. stored unexpired OAuth access token or `BearerToken`;
+3. provider environment variables in metadata order;
+4. stored `ApiKey`;
+5. a supported credential auto-detected from another local coding CLI, only
+   when Pi's global auth storage is in use.
 
-Files affected:
-- `src/providers/azure.rs`: `name()` returns `"azure"` instead of `"azure-openai"`
-- `src/providers/mod.rs`: Factory match arm `"azure"` instead of `"azure-openai"`
-- `src/auth.rs`: `env_keys_for_provider` match arms for both canonical + aliases
-- `src/models.rs`: `ad_hoc_provider_defaults` match arms updated
+Canonical IDs and aliases share stored and external credential lookup. Alias
+resolution is not a separate precedence tier. If the auth resolver returns no
+credential, app-level model selection can still use an inline `models.json`
+`apiKey` fallback.
+
+## Retired Provider IDs
+
+`github-models` is not an active canonical ID or alias. GitHub retired that
+service on 2026-07-30. This does not remove or rename `github-copilot`, which is
+a separate supported native provider.
 
 ## Implementation Guidance
 
-The normalization function should be added to `src/models.rs` or a new `src/provider_id.rs`:
+Use the existing runtime metadata functions rather than maintaining a second
+normalization implementation:
 
 ```rust
-fn normalize_provider_id(raw: &str) -> String {
-    let normalized = raw.trim().to_ascii_lowercase().replace('_', "-");
-    match ALIAS_TABLE.get(normalized.as_str()) {
-        Some(canonical) => canonical.to_string(),
-        None => normalized,
-    }
-}
+use pi::provider_metadata::{canonical_provider_id, provider_auth_env_keys};
+
+let canonical = canonical_provider_id(user_input);
+let auth_env_keys = provider_auth_env_keys(user_input);
 ```
 
-This function should be called at all provider ID entry points:
-- CLI argument parsing
-- Config file loading
-- `ad_hoc_model_entry()` lookup
-- `env_keys_for_provider()` lookup
-- `create_provider()` factory selection
+Provider entry points should resolve through `provider_metadata()` or
+`canonical_provider_id()` before selecting built-in routing or credentials.
+Custom and extension routing handles the no-built-in-match case separately.

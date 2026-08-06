@@ -4,7 +4,15 @@ Quick-win longtail provider mappings, explicit deferrals with user impact, and
 links to passing test evidence so decisions are auditable and reproducible.
 
 Generated: 2026-02-13
-Source of truth: `src/provider_metadata.rs`
+
+> Historical snapshot: provider lists, counts, deferrals, and commands below
+> describe the 2026-02-13 audit and are retained for provenance. They are not
+> current release authority. Current registry and dispatch truth live in
+> `src/provider_metadata.rs`, `src/providers/mod.rs`, and their executable tests.
+
+Updated 2026-08-06: the former `github-models` quick-win route was removed
+after GitHub retired the GitHub Models service on 2026-07-30. The separate
+`github-copilot` native provider remains supported.
 
 ## Quick-Win Providers (Implemented + Tested)
 
@@ -109,7 +117,6 @@ pattern: set the env var, use `--provider <id>`.
 | chutes | `https://llm.chutes.ai/v1` | `CHUTES_API_KEY` |
 | cortecs | `https://api.cortecs.ai/v1` | `CORTECS_API_KEY` |
 | friendli | `https://api.friendli.ai/serverless/v1` | `FRIENDLI_TOKEN` |
-| github-models | `https://models.github.ai/inference` | `GITHUB_TOKEN` |
 | helicone | `https://ai-gateway.helicone.ai/v1` | `HELICONE_API_KEY` |
 | inference | `https://inference.net/v1` | `INFERENCE_API_KEY` |
 | nano-gpt | `https://nano-gpt.com/api/v1` | `NANO_GPT_API_KEY` |
