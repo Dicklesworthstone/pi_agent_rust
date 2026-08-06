@@ -2536,13 +2536,8 @@ pub fn process_file_arguments(
         } else {
             UNIX_ACCESS_READ
         };
-        ensure_effective_mode_access(
-            &meta,
-            &absolute_path,
-            required_access,
-            "@file reading",
-        )
-        .map_err(|err| Error::tool("read", err.to_string()))?;
+        ensure_effective_mode_access(&meta, &absolute_path, required_access, "@file reading")
+            .map_err(|err| Error::tool("read", err.to_string()))?;
         if meta.is_dir() {
             append_file_notice_block(
                 &mut out.text,
@@ -4671,18 +4666,16 @@ impl Tool for EditTool {
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
         let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit")?;
 
-        let meta = std_metadata_async(&absolute_path)
-            .await
-            .map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Failed to access file {}: {err}", input.path),
-                };
-                Error::tool("edit", message)
-            })?;
+        let meta = std_metadata_async(&absolute_path).await.map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Failed to access file {}: {err}", input.path),
+            };
+            Error::tool("edit", message)
+        })?;
 
         if !meta.is_file() {
             return Err(Error::tool(
@@ -5918,18 +5911,16 @@ impl Tool for FindTool {
         // Overfetch one result so limit notices only appear after confirmed overflow.
         let scan_limit = effective_limit.saturating_add(1);
 
-        let search_metadata = std_metadata_async(&search_path)
-            .await
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    Error::tool("find", format!("Path not found: {}", search_path.display()))
-                } else {
-                    Error::tool(
-                        "find",
-                        format!("Cannot access path {}: {err}", search_path.display()),
-                    )
-                }
-            })?;
+        let search_metadata = std_metadata_async(&search_path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::tool("find", format!("Path not found: {}", search_path.display()))
+            } else {
+                Error::tool(
+                    "find",
+                    format!("Cannot access path {}: {err}", search_path.display()),
+                )
+            }
+        })?;
         ensure_ancestors_searchable(&search_path)
             .await
             .map_err(|err| {
@@ -7296,7 +7287,8 @@ async fn get_file_lines_async<'a>(
         cache.insert(path.to_path_buf(), Vec::new());
         return &[];
     }
-    if let Err(err) = ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_READ, "file reading")
+    if let Err(err) =
+        ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_READ, "file reading")
     {
         tracing::debug!("Failed to read grep file {}: {err}", path.display());
         cache.insert(path.to_path_buf(), Vec::new());
@@ -7739,18 +7731,16 @@ impl Tool for HashlineEditTool {
         let absolute_path = enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit")?;
 
         // Check file size
-        let metadata = std_metadata_async(&absolute_path)
-            .await
-            .map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Cannot read file metadata: {err}"),
-                };
-                Error::tool("hashline_edit", message)
-            })?;
+        let metadata = std_metadata_async(&absolute_path).await.map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Cannot read file metadata: {err}"),
+            };
+            Error::tool("hashline_edit", message)
+        })?;
         if !metadata.is_file() {
             return Err(Error::tool(
                 "hashline_edit",

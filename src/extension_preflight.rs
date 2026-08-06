@@ -841,9 +841,7 @@ fn validate_extension_scan_input(path: &Path) -> std::io::Result<bool> {
 /// as `input.js -> locked/extension.js`.
 #[cfg(unix)]
 fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
-    use crate::platform::{
-        UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, ensure_effective_mode_access,
-    };
+    use crate::platform::{UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, ensure_effective_mode_access};
 
     ensure_extension_scan_ancestors_searchable(path)?;
     let canonical_path = std::fs::canonicalize(path)?;
@@ -3686,7 +3684,9 @@ pi.exec("ls");
         assert_eq!(report.verdict, PreflightVerdict::Fail);
         assert!(report.findings.iter().any(|finding| {
             finding.category == FindingCategory::AnalysisInput
-                && finding.message.contains("Failed to access extension source")
+                && finding
+                    .message
+                    .contains("Failed to access extension source")
                 && finding.message.contains("Permission denied")
                 && finding.message.contains(&blocked_dir.display().to_string())
         }));
@@ -3724,12 +3724,199 @@ pi.exec("ls");
         assert_eq!(report.verdict, PreflightVerdict::Fail);
         assert!(report.findings.iter().any(|finding| {
             finding.category == FindingCategory::AnalysisInput
-                && finding.message.contains("Failed to access extension source")
+                && finding
+                    .message
+                    .contains("Failed to access extension source")
                 && finding.message.contains("Permission denied")
                 && finding
                     .message
                     .contains(&blocked_file.display().to_string())
         }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_scans_reject_extension_below_unsearchable_parent() {
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let blocked_parent = temp_dir.path().join("blocked-parent");
+        std::fs::create_dir(&blocked_parent).expect("create blocked parent");
+        let entry = blocked_parent.join("extension.js");
+        std::fs::write(&entry, "eval('must not be scanned');\n").expect("write extension");
+        let mode_guard = ModeRestoreGuard::deny_all(&blocked_parent);
+
+        let permission_result = validate_extension_scan_input(&entry);
+        let preflight = analyzer.analyze(&entry);
+        let security = SecurityScanner::scan_path("blocked-parent", &entry, &entry);
+
+        mode_guard.restore();
+
+        let permission_error = permission_result
+            .expect_err("an extension below a mode-000 parent must fail its typed input probe");
+        assert_eq!(
+            permission_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            permission_error
+                .to_string()
+                .contains(&blocked_parent.display().to_string()),
+            "permission error must identify the blocked ancestor: {permission_error}"
+        );
+
+        assert_eq!(preflight.verdict, PreflightVerdict::Fail);
+        assert_eq!(preflight.findings.len(), 1);
+        assert_eq!(
+            preflight.findings[0].category,
+            FindingCategory::AnalysisInput
+        );
+        assert!(
+            preflight.findings[0]
+                .message
+                .to_ascii_lowercase()
+                .contains("permission denied")
+        );
+
+        assert_eq!(security.findings.len(), 1);
+        assert_eq!(
+            security.findings[0].rule_id,
+            SecurityRuleId::ScanInputFailure
+        );
+        assert!(
+            security.findings[0]
+                .rationale
+                .to_ascii_lowercase()
+                .contains("permission denied")
+        );
+        assert!(
+            !security
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == SecurityRuleId::EvalUsage),
+            "security scan must not read source below a blocked parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_scans_reject_terminal_symlink_below_unsearchable_target_parent() {
+        use std::os::unix::fs::symlink;
+
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let blocked_parent = temp_dir.path().join("blocked-target-parent");
+        std::fs::create_dir(&blocked_parent).expect("create blocked target parent");
+        let target = blocked_parent.join("target.js");
+        std::fs::write(&target, "eval('must not be scanned');\n").expect("write target");
+        let link = temp_dir.path().join("extension-link.js");
+        symlink(&target, &link).expect("create terminal extension symlink");
+        let mode_guard = ModeRestoreGuard::deny_all(&blocked_parent);
+
+        let permission_result = validate_extension_scan_input(&link);
+        let preflight = analyzer.analyze(&link);
+        let security = SecurityScanner::scan_path("blocked-symlink", &link, &link);
+
+        mode_guard.restore();
+
+        assert!(link.try_exists().expect("probe restored symlink target"));
+        let permission_error = permission_result
+            .expect_err("a symlink into a mode-000 parent must fail its typed input probe");
+        assert_eq!(
+            permission_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+
+        assert_eq!(preflight.verdict, PreflightVerdict::Fail);
+        assert_eq!(preflight.findings.len(), 1);
+        assert_eq!(
+            preflight.findings[0].category,
+            FindingCategory::AnalysisInput
+        );
+        assert!(
+            preflight.findings[0]
+                .message
+                .to_ascii_lowercase()
+                .contains("permission denied")
+        );
+
+        assert_eq!(security.findings.len(), 1);
+        assert_eq!(
+            security.findings[0].rule_id,
+            SecurityRuleId::ScanInputFailure
+        );
+        assert!(
+            security.findings[0]
+                .rationale
+                .to_ascii_lowercase()
+                .contains("permission denied")
+        );
+        assert!(
+            !security
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == SecurityRuleId::EvalUsage),
+            "security scan must not read a terminal symlink through a blocked target parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_scans_use_owner_mode_class_without_falling_through_to_other() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let entry = temp_dir.path().join("owner-class.js");
+        std::fs::write(&entry, "eval('must not be scanned');\n").expect("write extension");
+        assert_eq!(
+            std::fs::metadata(&entry)
+                .expect("stat owned extension")
+                .uid(),
+            rustix::process::geteuid().as_raw(),
+            "fixture must be owned by the effective test identity"
+        );
+        // Other has read, but Unix selects the owner class and must not fall
+        // through when the owner's read bit is absent.
+        let mode_guard = ModeRestoreGuard::apply(&entry, 0o004);
+
+        let permission_result = validate_extension_scan_input(&entry);
+        let preflight = analyzer.analyze(&entry);
+        let security = SecurityScanner::scan_path("owner-class", &entry, &entry);
+
+        mode_guard.restore();
+
+        let permission_error = permission_result
+            .expect_err("owner mode class without read must deny the extension scan");
+        assert_eq!(
+            permission_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(
+            permission_error
+                .to_string()
+                .contains("Unix owner mode class")
+        );
+        assert_eq!(preflight.verdict, PreflightVerdict::Fail);
+        assert_eq!(preflight.findings.len(), 1);
+        assert_eq!(
+            preflight.findings[0].category,
+            FindingCategory::AnalysisInput
+        );
+        assert_eq!(security.findings.len(), 1);
+        assert_eq!(
+            security.findings[0].rule_id,
+            SecurityRuleId::ScanInputFailure
+        );
+        assert!(
+            !security
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == SecurityRuleId::EvalUsage),
+            "security scan must not fall through to the other mode class"
+        );
     }
 
     #[test]

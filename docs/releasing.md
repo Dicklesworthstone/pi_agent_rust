@@ -242,8 +242,9 @@ actual Cargo/Rust compiler directory first on `PATH`. Record the original
 Cargo/Rust entrypoints and the selected actual binaries, including resolved
 paths, SHA-256 digests, and verbose versions. Also record the resolved paths and
 SHA-256 digests of `bash`, `git`, `python3`, `rustup`, `cargo`, `rustc`, `gh`,
-`jq`, `ssh`, `sha256sum`, and `bwrap` in the state directory before relying on
-them for a release gate or publication step. During the E2E run,
+`jq`, `ssh`, `sha256sum`, `bwrap`, `yq`, `uuidgen`, `curl`, `scp`, `tar`, and
+`file` in the state directory before relying on them for a release gate or
+publication step. During the E2E run,
 make the clone's `.git` metadata non-writable so tests cannot move HEAD or
 alter the index, and keep Cargo target and temporary output outside the clone.
 The worktree remains writable because ordinary tests legitimately emit ignored
@@ -409,14 +410,17 @@ test "$(grep -Fc 'release: 1.98.0-nightly' \
   "$release_rust_tool_receipt")" = 4
 release_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-tools.sha256"
 test ! -e "$release_tool_receipt"
-for release_tool in bash git python3 rustup cargo rustc gh jq ssh sha256sum bwrap; do
+for release_tool in \
+  bash git python3 rustup cargo rustc gh jq ssh sha256sum bwrap \
+  yq uuidgen curl scp tar file
+do
   release_tool_path="$(command -v "$release_tool")"
   test -n "$release_tool_path"
   release_tool_path="$(realpath -e -- "$release_tool_path")"
   test -f "$release_tool_path" && test ! -L "$release_tool_path"
   sha256sum -- "$release_tool_path"
 done > "$release_tool_receipt"
-test "$(wc -l < "$release_tool_receipt")" -eq 11
+test "$(wc -l < "$release_tool_receipt")" -eq 17
 release_cargo_parent="$MANUAL_RELEASE_STATE_DIR/controller-cargo"
 test ! -e "$release_cargo_parent" && test ! -L "$release_cargo_parent"
 mkdir -m 700 "$release_cargo_parent"
@@ -956,7 +960,7 @@ proof is not proof of an empty bypass list.
    test ! -e "$bwrap_source_receipt"
    (
      set -C
-     bwrap --die-with-parent --new-session --bind / / \
+     bwrap --die-with-parent --new-session --bind / / --dev-bind /dev /dev \
        --bind "$release_checkout" /data/projects/pi_agent_rust \
        --chdir /data/projects/pi_agent_rust \
        /usr/bin/bash --noprofile --norc -c '
@@ -1231,7 +1235,7 @@ proof is not proof of an empty bypass list.
    test ! -e "$build_receipt"
    (
      set -C
-     bwrap --die-with-parent --new-session --bind / / \
+     bwrap --die-with-parent --new-session --bind / / --dev-bind /dev /dev \
        --bind "$release_checkout" /data/projects/pi_agent_rust \
        --chdir /data/projects/pi_agent_rust \
        "$PRESERVED_DSR_WRAPPER" \
