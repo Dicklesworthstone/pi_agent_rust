@@ -86,6 +86,193 @@ fn initialize_fixture_git_workspace(root: &Path) -> TestResult {
     Ok(())
 }
 
+fn canonical_dropin_contract_fixture() -> serde_json::Value {
+    let hard_gates = (1..=12)
+        .map(|number| {
+            json!({
+                "gate_id": format!("G{number:02}-fixture-gate"),
+                "blocking": number != 6,
+                "owner_issue_primary": format!("bd-gate-{number:02}"),
+                "required_artifacts": [format!("docs/evidence/gate-{number:02}.json")]
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "schema": "pi.dropin.certification_contract.v1",
+        "hard_gates": hard_gates,
+        "release_process_enforcement": {
+            "verdict_artifact_contract": {
+                "path": "docs/evidence/dropin-certification-verdict.json",
+                "schema": "pi.dropin.certification_verdict.v1",
+                "required_fields": [
+                    "git_commit",
+                    "generated_at_utc",
+                    "overall_verdict",
+                    "hard_gate_results",
+                    "blocking_reasons",
+                    "evidence_index"
+                ]
+            }
+        }
+    })
+}
+
+fn canonical_certification_lane_fixture(generated_at: &str) -> TestResult<serde_json::Value> {
+    let canonical_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/full_suite_gate/certification_verdict.json");
+    let canonical: serde_json::Value = serde_json::from_slice(&fs::read(canonical_path)?)?;
+    let mut gates = canonical["gates"]
+        .as_array()
+        .ok_or("canonical certification lane gates must be an array")?
+        .clone();
+    for gate in &mut gates {
+        gate["status"] = json!("pass");
+        gate.as_object_mut()
+            .ok_or("canonical certification lane gate must be an object")?
+            .remove("detail");
+    }
+    let blocking_total = gates
+        .iter()
+        .filter(|gate| gate["blocking"].as_bool() == Some(true))
+        .count();
+    let total_gates = gates.len();
+    Ok(json!({
+        "schema": "pi.ci.certification_lane.v1",
+        "lane": "full",
+        "generated_at": generated_at,
+        "verdict": "pass",
+        "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
+        "gates": gates,
+        "waiver_audit": {
+            "schema": "pi.ci.waiver_audit.v1",
+            "generated_at": generated_at,
+            "total_waivers": 0,
+            "active": 0,
+            "expired": 0,
+            "expiring_soon": 0,
+            "invalid": 0,
+            "waivers": [],
+            "raw_waivers": []
+        },
+        "waivers_applied": [],
+        "summary": {
+            "total_gates": total_gates,
+            "passed": total_gates,
+            "failed": 0,
+            "warned": 0,
+            "skipped": 0,
+            "waived": 0,
+            "blocking_pass": blocking_total,
+            "blocking_total": blocking_total,
+            "all_blocking_pass": true
+        },
+        "promotion_rules": {
+            "can_promote": true,
+            "blocker_gates": [],
+            "waiver_gates": [],
+            "conditions": ["All blocking gates pass (including waivers)"]
+        },
+        "rerun_guidance": {
+            "preflight_command": "cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact",
+            "full_command": "cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact",
+            "single_gate_template": "See reproduce_command field on each gate"
+        }
+    }))
+}
+
+fn commit_fixture_path(root: &Path, path: &str, message: &str) -> TestResult {
+    run_fixture_git(root, &["add", path])?;
+    run_fixture_git(root, &["commit", "-m", message])?;
+    Ok(())
+}
+
+fn install_canonical_dropin_claim_fixture(root: &Path) -> TestResult {
+    let lane = canonical_certification_lane_fixture("2026-05-13T00:00:00.000Z")?;
+    install_canonical_dropin_claim_fixture_with_lane(root, &lane)
+}
+
+fn install_canonical_dropin_claim_fixture_with_lane(
+    root: &Path,
+    lane: &serde_json::Value,
+) -> TestResult {
+    let contract = canonical_dropin_contract_fixture();
+    write_fixture(
+        root,
+        "docs/contracts/dropin-certification-contract.json",
+        &serde_json::to_string_pretty(&contract)?,
+    )?;
+    for number in 1..=12 {
+        write_fixture(
+            root,
+            &format!("docs/evidence/gate-{number:02}.json"),
+            &serde_json::to_string_pretty(&json!({
+                "schema": "fixture.dropin_gate.v1",
+                "gate": number,
+                "status": "pass"
+            }))?,
+        )?;
+    }
+    write_fixture(
+        root,
+        "tests/full_suite_gate/certification_verdict.json",
+        &serde_json::to_string_pretty(lane)?,
+    )?;
+    initialize_fixture_git_workspace(root)?;
+    let source_commit = fixture_git_output(root, &["rev-parse", "HEAD"])?;
+
+    let hard_gate_results = contract["hard_gates"]
+        .as_array()
+        .ok_or("fixture contract hard_gates must be an array")?
+        .iter()
+        .map(|gate| {
+            json!({
+                "gate_id": gate["gate_id"],
+                "status": "pass",
+                "blocking": gate["blocking"],
+                "detail": null,
+                "artifact_paths": gate["required_artifacts"],
+                "bead": gate["owner_issue_primary"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence_index = contract["hard_gates"]
+        .as_array()
+        .ok_or("fixture contract hard_gates must be an array")?
+        .iter()
+        .map(|gate| {
+            json!({
+                "path": gate["required_artifacts"][0],
+                "exists": true
+            })
+        })
+        .collect::<Vec<_>>();
+    let verdict = json!({
+        "schema": "pi.dropin.certification_verdict.v1",
+        "git_commit": source_commit,
+        "generated_at_utc": "2026-05-13T00:00:00Z",
+        "overall_verdict": "CERTIFIED",
+        "hard_gate_results": hard_gate_results,
+        "blocking_reasons": [],
+        "evidence_index": evidence_index,
+        "source": {
+            "certification_lane_artifact": "tests/full_suite_gate/certification_verdict.json",
+            "lane_schema": "pi.ci.certification_lane.v1",
+            "lane_verdict": "pass"
+        },
+        "claim_surface": "release_facing"
+    });
+    fs::write(
+        root.join("docs/evidence/dropin-certification-verdict.json"),
+        serde_json::to_vec_pretty(&verdict)?,
+    )?;
+    commit_fixture_path(
+        root,
+        "docs/evidence/dropin-certification-verdict.json",
+        "bind canonical drop-in verdict",
+    )?;
+    Ok(())
+}
+
 fn bind_fixture_performance_summary_to_source(root: &Path) -> TestResult {
     initialize_fixture_git_workspace(root)?;
     let source_commit = fixture_git_output(root, &["rev-parse", "HEAD"])?;
@@ -962,6 +1149,544 @@ fn evidence_ingestion_rejects_invalid_utf8_without_lossy_replacement() -> TestRe
 }
 
 #[test]
+fn canonical_dropin_verdict_admits_only_complete_source_bound_contract_evidence() -> TestResult {
+    let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
+
+    let graph = build_fixture_graph(temp.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        verdict.metadata.get("strict_replacement_claim_allowed"),
+        Some(&json!(true))
+    );
+
+    let bundle = SemanticContextBundlePlanner::new(&graph).plan(&ContextBundleRequest {
+        query: Some("dropin certification verdict".to_string()),
+        budget: ContextBundleBudget {
+            max_items: 16,
+            max_bytes: 32 * 1024,
+        },
+        ..ContextBundleRequest::default()
+    });
+    assert!(bundle.selected_items.iter().any(|item| {
+        item.source_path == "docs/evidence/dropin-certification-verdict.json"
+            && item.reason.contains("current_release_claim_evidence")
+    }));
+    Ok(())
+}
+
+#[test]
+fn noncanonical_dropin_verdict_schema_never_admits_or_gains_claim_score() -> TestResult {
+    let temp = fixture_workspace()?;
+    let shadow_path = "docs/evidence/shadow/dropin-certification-verdict.json";
+    write_fixture(
+        temp.path(),
+        shadow_path,
+        &serde_json::to_string_pretty(&json!({
+            "schema": "pi.dropin.certification_verdict.v1",
+            "generated_at_utc": "2026-05-13T00:00:00Z",
+            "overall_verdict": "CERTIFIED",
+            "claim_surface": "release_facing"
+        }))?,
+    )?;
+
+    let graph = build_fixture_graph(temp.path())?;
+    let shadow = node_with_source(&graph, SemanticNodeType::EvidenceArtifact, shadow_path)?;
+    assert_eq!(
+        shadow.freshness_status,
+        Some(EvidenceFreshnessStatus::Malformed)
+    );
+    assert_eq!(
+        shadow.metadata.get("freshness_reason"),
+        Some(&json!("dropin_verdict_noncanonical_path"))
+    );
+    assert_eq!(
+        shadow.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        shadow.metadata.get("strict_replacement_claim_allowed"),
+        None
+    );
+
+    let bundle = SemanticContextBundlePlanner::new(&graph).plan(&ContextBundleRequest {
+        query: Some("dropin certification verdict".to_string()),
+        budget: ContextBundleBudget {
+            max_items: 32,
+            max_bytes: 64 * 1024,
+        },
+        ..ContextBundleRequest::default()
+    });
+    assert!(!bundle.selected_items.iter().any(|item| {
+        item.source_path == shadow_path && item.reason.contains("current_release_claim_evidence")
+    }));
+    Ok(())
+}
+
+#[test]
+fn skeletal_or_forged_certified_verdicts_never_admit_or_gain_claim_score() -> TestResult {
+    let skeletal = fixture_workspace()?;
+    let graph = build_fixture_graph(skeletal.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.freshness_status,
+        Some(EvidenceFreshnessStatus::Malformed)
+    );
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    let bundle = SemanticContextBundlePlanner::new(&graph).plan(&ContextBundleRequest {
+        query: Some("dropin certification verdict".to_string()),
+        budget: ContextBundleBudget {
+            max_items: 16,
+            max_bytes: 32 * 1024,
+        },
+        ..ContextBundleRequest::default()
+    });
+    assert!(!bundle.selected_items.iter().any(|item| {
+        item.source_path == "docs/evidence/dropin-certification-verdict.json"
+            && item.reason.contains("current_release_claim_evidence")
+    }));
+
+    for mutation in [
+        "missing_gate",
+        "non_pass_gate",
+        "blocking_reason",
+        "evidence_order",
+        "source_lane",
+        "source_commit",
+    ] {
+        let temp = fixture_workspace()?;
+        install_canonical_dropin_claim_fixture(temp.path())?;
+        let path = temp
+            .path()
+            .join("docs/evidence/dropin-certification-verdict.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        match mutation {
+            "missing_gate" => {
+                value["hard_gate_results"]
+                    .as_array_mut()
+                    .ok_or("fixture hard_gate_results must be an array")?
+                    .pop();
+            }
+            "non_pass_gate" => value["hard_gate_results"][0]["status"] = json!("fail"),
+            "blocking_reason" => value["blocking_reasons"] = json!(["forged override"]),
+            "evidence_order" => value["evidence_index"]
+                .as_array_mut()
+                .ok_or("fixture evidence_index must be an array")?
+                .swap(0, 1),
+            "source_lane" => value["source"]["lane_verdict"] = json!("fail"),
+            "source_commit" => {
+                value["git_commit"] = json!("0000000000000000000000000000000000000000");
+            }
+            unexpected => return Err(format!("unexpected mutation: {unexpected}").into()),
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+        commit_fixture_path(
+            temp.path(),
+            "docs/evidence/dropin-certification-verdict.json",
+            &format!("forge verdict {mutation}"),
+        )?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(false)),
+            "mutation {mutation} must fail closed"
+        );
+        assert_eq!(
+            verdict.metadata.get("strict_replacement_claim_allowed"),
+            Some(&json!(false)),
+            "mutation {mutation} must suppress strict replacement claims"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_verdict_requires_immutable_head_bound_input_bytes() -> TestResult {
+    for path in [
+        "docs/contracts/dropin-certification-contract.json",
+        "docs/evidence/dropin-certification-verdict.json",
+        "docs/evidence/gate-01.json",
+    ] {
+        let temp = fixture_workspace()?;
+        install_canonical_dropin_claim_fixture(temp.path())?;
+        let full_path = temp.path().join(path);
+        let mut bytes = fs::read(&full_path)?;
+        bytes.push(b'\n');
+        fs::write(full_path, bytes)?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(false)),
+            "dirty canonical input {path} must fail closed"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_dropin_verdict_requires_head_bound_input_modes() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
+    let path = temp.path().join("docs/evidence/gate-01.json");
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(path, permissions)?;
+
+    let graph = build_fixture_graph(temp.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_dropin_verdict_rejects_committed_executable_decision_input() -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
+    let path = temp
+        .path()
+        .join("docs/evidence/dropin-certification-verdict.json");
+    let mut permissions = fs::metadata(&path)?.permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    fs::set_permissions(&path, permissions)?;
+    commit_fixture_path(
+        temp.path(),
+        "docs/evidence/dropin-certification-verdict.json",
+        "forge executable verdict mode",
+    )?;
+
+    let graph = build_fixture_graph(temp.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        verdict.metadata.get("freshness_reason"),
+        Some(&json!("dropin_verdict_provenance_not_regular_at_head"))
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_verdict_freshness_uses_only_generated_at_utc() -> TestResult {
+    let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
+    let path = temp
+        .path()
+        .join("docs/evidence/dropin-certification-verdict.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    value["generated_at_utc"] = json!("2025-01-01T00:00:00Z");
+    value["generated_at"] = json!("2026-05-13T00:00:00Z");
+    fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+    commit_fixture_path(
+        temp.path(),
+        "docs/evidence/dropin-certification-verdict.json",
+        "forge alternate freshness timestamp",
+    )?;
+
+    let graph = build_fixture_graph(temp.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.freshness_status,
+        Some(EvidenceFreshnessStatus::Stale)
+    );
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        verdict.metadata.get("generated_at"),
+        Some(&json!("2025-01-01T00:00:00Z"))
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_verdict_uses_release_gate_age_limit() -> TestResult {
+    for (generated_at, expected_status, expected_allowed) in [
+        (
+            "2026-05-06T00:00:00Z",
+            EvidenceFreshnessStatus::Current,
+            true,
+        ),
+        (
+            "2026-05-05T23:59:59Z",
+            EvidenceFreshnessStatus::Stale,
+            false,
+        ),
+    ] {
+        let temp = fixture_workspace()?;
+        install_canonical_dropin_claim_fixture(temp.path())?;
+        let path = temp
+            .path()
+            .join("docs/evidence/dropin-certification-verdict.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        value["generated_at_utc"] = json!(generated_at);
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+        commit_fixture_path(
+            temp.path(),
+            "docs/evidence/dropin-certification-verdict.json",
+            &format!("set verdict age {generated_at}"),
+        )?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(verdict.freshness_status, Some(expected_status));
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(expected_allowed))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_verdict_requires_actual_passing_lane_bytes() -> TestResult {
+    for mutation in [
+        "minimal_pass",
+        "wrong_schema",
+        "non_full_lane",
+        "partial_inventory",
+        "gate_identity",
+        "summary_contradiction",
+        "gate_status_contradiction",
+        "promotion_contradiction",
+        "conditions_contradiction",
+        "invented_waiver",
+    ] {
+        let temp = fixture_workspace()?;
+        let mut lane = canonical_certification_lane_fixture("2026-05-13T00:00:00.000Z")?;
+        match mutation {
+            "minimal_pass" => {
+                lane = json!({
+                "schema": "pi.ci.certification_lane.v1",
+                "lane": "full",
+                "verdict": "pass"
+                });
+            }
+            "wrong_schema" => lane["schema"] = json!("fixture.attacker_lane.v99"),
+            "non_full_lane" => lane["lane"] = json!("preflight"),
+            "partial_inventory" => {
+                lane["gates"]
+                    .as_array_mut()
+                    .ok_or("fixture lane gates must be an array")?
+                    .pop();
+                lane["summary"]["total_gates"] = json!(19);
+                lane["summary"]["passed"] = json!(19);
+                lane["summary"]["blocking_pass"] = json!(13);
+                lane["summary"]["blocking_total"] = json!(13);
+            }
+            "gate_identity" => lane["gates"][0]["id"] = json!("attacker_gate"),
+            "summary_contradiction" => lane["summary"]["passed"] = json!(19),
+            "gate_status_contradiction" => lane["gates"][0]["status"] = json!("fail"),
+            "promotion_contradiction" => {
+                lane["promotion_rules"]["can_promote"] = json!(false);
+            }
+            "conditions_contradiction" => {
+                lane["promotion_rules"]["conditions"] = json!(["trust me"]);
+            }
+            "invented_waiver" => {
+                lane["gates"][0]["status"] = json!("fail");
+                lane["gates"][0]["detail"] = json!("forged waiver");
+                lane["waiver_audit"] = json!({
+                    "schema": "pi.ci.waiver_audit.v1",
+                    "generated_at": "2026-05-13T00:00:00.000Z",
+                    "total_waivers": 1,
+                    "active": 1,
+                    "expired": 0,
+                    "expiring_soon": 0,
+                    "invalid": 0,
+                    "waivers": [{
+                        "gate_id": "non_mock_unit",
+                        "status": "active",
+                        "days_remaining": 10
+                    }],
+                    "raw_waivers": [{
+                        "gate_id": "non_mock_unit",
+                        "owner": "attacker",
+                        "created": "2026-05-01",
+                        "expires": "2026-05-23",
+                        "bead": "bd-attacker",
+                        "reason": "self-authorized",
+                        "scope": "full",
+                        "remove_when": "never"
+                    }]
+                });
+                lane["waivers_applied"] = json!(["non_mock_unit"]);
+                lane["summary"]["passed"] = json!(19);
+                lane["summary"]["waived"] = json!(1);
+                lane["promotion_rules"]["waiver_gates"] = json!(["non_mock_unit"]);
+                lane["promotion_rules"]["conditions"] = json!([
+                    "All blocking gates pass (including waivers)",
+                    "Waivers active for: non_mock_unit (review before release)"
+                ]);
+            }
+            unexpected => return Err(format!("unexpected mutation: {unexpected}").into()),
+        }
+        install_canonical_dropin_claim_fixture_with_lane(temp.path(), &lane)?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(false)),
+            "lane mutation {mutation} must fail closed"
+        );
+        assert_eq!(
+            verdict.metadata.get("freshness_reason"),
+            Some(&json!("dropin_verdict_source_lane_invalid"))
+        );
+    }
+
+    let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
+    fs::write(
+        temp.path()
+            .join("tests/full_suite_gate/certification_verdict.json"),
+        b"{ not valid JSON",
+    )?;
+    commit_fixture_path(
+        temp.path(),
+        "tests/full_suite_gate/certification_verdict.json",
+        "forge malformed lane",
+    )?;
+    let graph = build_fixture_graph(temp.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        verdict.metadata.get("freshness_reason"),
+        Some(&json!("dropin_verdict_source_lane_invalid"))
+    );
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_lane_uses_exact_168_hour_age_boundary() -> TestResult {
+    for (generated_at, expected_status, expected_allowed) in [
+        (
+            "2026-05-06T00:00:00.000Z",
+            EvidenceFreshnessStatus::Current,
+            true,
+        ),
+        (
+            "2026-05-05T23:59:59.999Z",
+            EvidenceFreshnessStatus::Malformed,
+            false,
+        ),
+    ] {
+        let temp = fixture_workspace()?;
+        let lane = canonical_certification_lane_fixture(generated_at)?;
+        install_canonical_dropin_claim_fixture_with_lane(temp.path(), &lane)?;
+        let graph = build_fixture_graph(temp.path())?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(verdict.freshness_status, Some(expected_status));
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(expected_allowed))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_verdict_rejects_non_evidence_source_descendants() -> TestResult {
+    let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
+    let source_path = temp.path().join("src/lib.rs");
+    let mut source = fs::read_to_string(&source_path)?;
+    source.push_str("\npub fn post_certification_change() {}\n");
+    fs::write(source_path, source)?;
+    commit_fixture_path(temp.path(), "src/lib.rs", "change release source")?;
+
+    let graph = build_fixture_graph(temp.path())?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        verdict.metadata.get("freshness_reason"),
+        Some(&json!("dropin_verdict_source_commit_not_release_bound"))
+    );
+    Ok(())
+}
+
+#[test]
 fn canonical_critical_evidence_validators_ignore_payload_schema_dispatch() -> TestResult {
     for schema in [None, Some("fixture.attacker_budget.v99")] {
         let temp = fixture_workspace()?;
@@ -1046,12 +1771,18 @@ fn evidence_freshness_rejects_timestamps_beyond_clock_skew() -> TestResult {
     );
 
     let temp = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(temp.path())?;
     let path = temp
         .path()
         .join("docs/evidence/dropin-certification-verdict.json");
     let mut verdict: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
-    verdict["generated_at"] = json!("2026-05-13T00:05:01Z");
+    verdict["generated_at_utc"] = json!("2026-05-13T00:05:01Z");
     fs::write(&path, serde_json::to_vec_pretty(&verdict)?)?;
+    commit_fixture_path(
+        temp.path(),
+        "docs/evidence/dropin-certification-verdict.json",
+        "forge future verdict timestamp",
+    )?;
     let graph = build_fixture_graph(temp.path())?;
     let node = node_with_source(
         &graph,
@@ -1066,6 +1797,65 @@ fn evidence_freshness_rejects_timestamps_beyond_clock_skew() -> TestResult {
         node.metadata.get("release_claim_allowed"),
         Some(&json!(false))
     );
+    Ok(())
+}
+
+#[test]
+fn generic_release_evidence_defaults_to_fourteen_day_freshness() -> TestResult {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(reference_time()?),
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+    for (generated_at, expected_status, expected_allowed) in [
+        (
+            "2026-04-29T00:00:00Z",
+            EvidenceFreshnessStatus::Current,
+            true,
+        ),
+        (
+            "2026-04-28T23:59:59Z",
+            EvidenceFreshnessStatus::Stale,
+            false,
+        ),
+    ] {
+        let evidence = json!({
+            "schema": "fixture.release_evidence.v1",
+            "generated_at": generated_at,
+            "claim_surface": "release_facing"
+        });
+        let classification = classify_evidence_freshness(&evidence, &options);
+        assert_eq!(classification.0, expected_status);
+        assert_eq!(classification.1, expected_allowed);
+    }
+    Ok(())
+}
+
+#[test]
+fn ordinary_evidence_defaults_to_exact_twenty_four_hour_freshness() -> TestResult {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(reference_time()?),
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+    for (generated_at, expected_status, expected_allowed) in [
+        (
+            "2026-05-12T00:00:00Z",
+            EvidenceFreshnessStatus::Current,
+            true,
+        ),
+        (
+            "2026-05-11T23:59:59Z",
+            EvidenceFreshnessStatus::Stale,
+            false,
+        ),
+    ] {
+        let evidence = json!({
+            "schema": "fixture.ordinary_evidence.v1",
+            "generated_at": generated_at
+        });
+        let classification = classify_evidence_freshness(&evidence, &options);
+        assert_eq!(classification.0, expected_status);
+        assert_eq!(classification.1, expected_allowed);
+    }
     Ok(())
 }
 
@@ -1139,6 +1929,95 @@ fn performance_budget_freshness_requires_current_global_claim_readiness() -> Tes
         EvidenceFreshnessStatus::HistoricalSnapshot
     );
     assert!(!historical_classification.1);
+    Ok(())
+}
+
+#[test]
+fn canonical_performance_budget_uses_release_gate_age_limit() -> TestResult {
+    for (generated_at, expected_status, expected_allowed) in [
+        (
+            "2026-05-06T00:00:00.000Z",
+            EvidenceFreshnessStatus::Current,
+            true,
+        ),
+        (
+            "2026-05-05T23:59:59.000Z",
+            EvidenceFreshnessStatus::Stale,
+            false,
+        ),
+    ] {
+        let temp = fixture_workspace()?;
+        bind_fixture_performance_summary_to_source(temp.path())?;
+        let path = temp.path().join("tests/perf/reports/budget_summary.json");
+        let mut summary: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        summary["generated_at"] = json!(generated_at);
+        fs::write(&path, serde_json::to_vec_pretty(&summary)?)?;
+        commit_fixture_path(
+            temp.path(),
+            "tests/perf/reports/budget_summary.json",
+            &format!("set performance evidence age {generated_at}"),
+        )?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let performance = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "tests/perf/reports/budget_summary.json",
+        )?;
+        assert_eq!(performance.freshness_status, Some(expected_status));
+        assert_eq!(
+            performance.metadata.get("release_claim_allowed"),
+            Some(&json!(expected_allowed))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn canonical_blocked_performance_budget_still_enforces_age_limit() -> TestResult {
+    for (generated_at, expected_status) in [
+        (
+            "2026-05-06T00:00:00.000Z",
+            EvidenceFreshnessStatus::Uncertified,
+        ),
+        ("2026-05-05T23:59:59.999Z", EvidenceFreshnessStatus::Stale),
+    ] {
+        let temp = fixture_workspace()?;
+        bind_fixture_performance_summary_to_source(temp.path())?;
+        let path = temp.path().join("tests/perf/reports/budget_summary.json");
+        let mut summary: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let total_budgets = summary["total_budgets"]
+            .as_u64()
+            .ok_or("fixture total_budgets must be an integer")?;
+        summary["generated_at"] = json!(generated_at);
+        summary["budget_results"][1]["actual"] = serde_json::Value::Null;
+        summary["budget_results"][1]["status"] = json!("NO_DATA");
+        summary["pass"] = json!(total_budgets - 1);
+        summary["no_data"] = json!(1);
+        summary["claim_readiness"] = json!({
+            "status": "blocked",
+            "performance_claims_authorized": false,
+            "blocking_reason_codes": ["budget_data_missing"]
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&summary)?)?;
+        commit_fixture_path(
+            temp.path(),
+            "tests/perf/reports/budget_summary.json",
+            &format!("set blocked performance evidence age {generated_at}"),
+        )?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let performance = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "tests/perf/reports/budget_summary.json",
+        )?;
+        assert_eq!(performance.freshness_status, Some(expected_status));
+        assert_eq!(
+            performance.metadata.get("release_claim_allowed"),
+            Some(&json!(false))
+        );
+    }
     Ok(())
 }
 
@@ -1776,22 +2655,27 @@ fn builder_indexes_workspace_surfaces_and_classifies_fail_closed() -> TestResult
         );
     }
 
-    let stale = node_with_source(
+    let dropin_verdict = node_with_source(
         &graph,
         SemanticNodeType::EvidenceArtifact,
         "docs/evidence/dropin-certification-verdict.json",
     )?;
-    assert_eq!(stale.freshness_status, Some(EvidenceFreshnessStatus::Stale));
     assert_eq!(
-        stale.metadata.get("release_claim_allowed"),
+        dropin_verdict.freshness_status,
+        Some(EvidenceFreshnessStatus::Malformed)
+    );
+    assert_eq!(
+        dropin_verdict.metadata.get("release_claim_allowed"),
         Some(&json!(false))
     );
     assert_eq!(
-        stale.metadata.get("claim_gate_status"),
-        Some(&json!("blocked_stale"))
+        dropin_verdict.metadata.get("claim_gate_status"),
+        Some(&json!("blocked_malformed"))
     );
     assert_eq!(
-        stale.metadata.get("strict_replacement_claim_allowed"),
+        dropin_verdict
+            .metadata
+            .get("strict_replacement_claim_allowed"),
         Some(&json!(false))
     );
 

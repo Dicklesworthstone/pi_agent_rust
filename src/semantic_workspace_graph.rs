@@ -25,7 +25,8 @@ pub const SEMANTIC_WORKSPACE_GRAPH_SCHEMA: &str = "pi.semantic_workspace_graph.v
 pub const GRAPH_BUILDER_SCHEMA: &str = "pi.semantic_workspace_graph.builder_trace.v1";
 pub const SEMANTIC_CONTEXT_BUNDLE_SCHEMA: &str = "pi.semantic_context_bundle.v1";
 
-const DEFAULT_STALE_AFTER_DAYS: i64 = 90;
+const DEFAULT_STALE_AFTER_DAYS: i64 = 1;
+const RELEASE_FACING_EVIDENCE_STALE_AFTER_DAYS: i64 = 14;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 const DEFAULT_CONTEXT_CACHE_TTL_SECONDS: u64 = 15 * 60;
 const CONTEXT_PRIVACY_POLICY_VERSION: &str = "pi.context_privacy.v1";
@@ -2050,8 +2051,232 @@ fn classify_in_progress_bead(
 
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
+const DROPIN_CERTIFICATION_CONTRACT_PATH: &str =
+    "docs/contracts/dropin-certification-contract.json";
+const DROPIN_CERTIFICATION_CONTRACT_SCHEMA: &str = "pi.dropin.certification_contract.v1";
 const DROPIN_CERTIFICATION_VERDICT_PATH: &str = "docs/evidence/dropin-certification-verdict.json";
 const DROPIN_CERTIFICATION_VERDICT_SCHEMA: &str = "pi.dropin.certification_verdict.v1";
+const DROPIN_CERTIFICATION_LANE_PATH: &str = "tests/full_suite_gate/certification_verdict.json";
+const DROPIN_CERTIFICATION_LANE_SCHEMA: &str = "pi.ci.certification_lane.v1";
+const DROPIN_MAX_EVIDENCE_AGE_HOURS: i64 = 168;
+const DROPIN_CERTIFICATION_LANE_POLICY: &str = "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.";
+const DROPIN_LANE_TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema",
+    "lane",
+    "generated_at",
+    "verdict",
+    "policy",
+    "gates",
+    "waiver_audit",
+    "waivers_applied",
+    "summary",
+    "promotion_rules",
+    "rerun_guidance",
+];
+#[derive(Clone, Copy)]
+struct DropinLaneGateIdentity {
+    id: &'static str,
+    name: &'static str,
+    bead: &'static str,
+    blocking: bool,
+    artifact_path: &'static str,
+    reproduce_command: Option<&'static str>,
+}
+
+const DROPIN_FULL_LANE_GATES: &[DropinLaneGateIdentity] = &[
+    DropinLaneGateIdentity {
+        id: "non_mock_unit",
+        name: "Non-mock unit compliance",
+        bead: "bd-1f42.2.6",
+        blocking: true,
+        artifact_path: "docs/non-mock-rubric.json",
+        reproduce_command: Some("cargo test --test non_mock_compliance_gate -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "e2e_log_contract",
+        name: "E2E log contract and transcripts",
+        bead: "bd-1f42.3.6",
+        blocking: false,
+        artifact_path: "tests/e2e_results",
+        reproduce_command: None,
+    },
+    DropinLaneGateIdentity {
+        id: "ext_must_pass",
+        name: "Extension must-pass gate",
+        bead: "bd-1f42.4.4",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+        reproduce_command: Some(
+            "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "ext_provider_compat",
+        name: "Extension provider compatibility matrix",
+        bead: "bd-1f42.4.6",
+        blocking: false,
+        artifact_path: "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+        reproduce_command: Some(
+            "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "evidence_bundle",
+        name: "Unified evidence bundle",
+        bead: "bd-1f42.6.8",
+        blocking: false,
+        artifact_path: "tests/evidence_bundle/index.json",
+        reproduce_command: Some(
+            "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "cross_platform",
+        name: "Cross-platform matrix validation",
+        bead: "bd-1f42.6.7",
+        blocking: true,
+        artifact_path: "tests/cross_platform_reports/linux/platform_report.json",
+        reproduce_command: Some(
+            "cargo test --test ci_cross_platform_matrix -- cross_platform_matrix --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "conformance_regression",
+        name: "Conformance regression gate",
+        bead: "bd-1f42.4",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/regression_verdict.json",
+        reproduce_command: Some("cargo test --test conformance_regression_gate -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "conformance_pass_rate",
+        name: "Conformance pass rate >= 80%",
+        bead: "bd-1f42.4",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/conformance_summary.json",
+        reproduce_command: Some("cargo test --test conformance_report -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "suite_classification",
+        name: "Suite classification guard",
+        bead: "bd-1f42.6.1",
+        blocking: true,
+        artifact_path: "tests/suite_classification.toml",
+        reproduce_command: None,
+    },
+    DropinLaneGateIdentity {
+        id: "traceability_matrix",
+        name: "Requirement traceability matrix",
+        bead: "bd-1f42.6.4",
+        blocking: false,
+        artifact_path: "docs/traceability_matrix.json",
+        reproduce_command: None,
+    },
+    DropinLaneGateIdentity {
+        id: "e2e_scenario_matrix",
+        name: "Canonical E2E scenario matrix",
+        bead: "bd-1f42.8.5.1",
+        blocking: false,
+        artifact_path: "docs/e2e_scenario_matrix.json",
+        reproduce_command: Some("python3 scripts/check_traceability_matrix.py"),
+    },
+    DropinLaneGateIdentity {
+        id: "provider_gap_matrix",
+        name: "Provider gap test matrix coverage",
+        bead: "bd-3uqg.11.11.5",
+        blocking: false,
+        artifact_path: "docs/provider-gaps-test-matrix.json",
+        reproduce_command: Some(
+            "cargo test --test provider_native_contract --test e2e_provider_scenarios -- --nocapture",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "sec_conformance",
+        name: "SEC-6.4 security compatibility conformance",
+        bead: "bd-1a2cu",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/sec_conformance_verdict.json",
+        reproduce_command: Some("cargo test --test sec_compatibility_conformance -- --nocapture"),
+    },
+    DropinLaneGateIdentity {
+        id: "perf3x_bead_coverage",
+        name: "PERF-3X bead-to-artifact coverage audit",
+        bead: "bd-3ar8v.6.11",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/perf3x_bead_coverage_audit.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- perf3x_bead_coverage_contract_is_well_formed --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "practical_finish_checkpoint",
+        name: "Practical-finish checkpoint (docs-only residual filter)",
+        bead: "bd-3ar8v.6.9",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/practical_finish_checkpoint.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "extension_remediation_backlog",
+        name: "Extension remediation backlog artifact integrity",
+        bead: "bd-3ar8v.6.8",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/extension_remediation_backlog.json",
+        reproduce_command: Some(
+            "cargo test --test qa_certification_dossier -- certification_dossier --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "opportunity_matrix_integrity",
+        name: "Opportunity matrix artifact integrity",
+        bead: "bd-3ar8v.6.1",
+        blocking: true,
+        artifact_path: "tests/perf/reports/opportunity_matrix.json",
+        reproduce_command: Some(
+            "cargo test --test release_evidence_gate -- phase1_weighted_attribution_contract_links_phase5_consumers --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "parameter_sweeps_integrity",
+        name: "Parameter sweeps artifact integrity",
+        bead: "bd-3ar8v.6.2",
+        blocking: true,
+        artifact_path: "tests/perf/reports/parameter_sweeps.json",
+        reproduce_command: Some(
+            "cargo test --test release_evidence_gate -- parameter_sweeps_contract_links_phase1_matrix_and_readiness --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "conformance_stress_lineage",
+        name: "Conformance+stress lineage coherence",
+        bead: "bd-3ar8v.6.3",
+        blocking: true,
+        artifact_path: "tests/ext_conformance/reports/conformance_summary.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- conformance_stress_lineage_passes_with_valid_artifacts --nocapture --exact",
+        ),
+    },
+    DropinLaneGateIdentity {
+        id: "waiver_lifecycle",
+        name: "Waiver lifecycle compliance",
+        bead: "bd-1f42.8.8.1",
+        blocking: true,
+        artifact_path: "tests/full_suite_gate/waiver_audit.json",
+        reproduce_command: Some(
+            "cargo test --test ci_full_suite_gate -- waiver_lifecycle_audit --nocapture --exact",
+        ),
+    },
+];
+const DROPIN_VERDICT_REQUIRED_FIELDS: &[&str] = &[
+    "git_commit",
+    "generated_at_utc",
+    "overall_verdict",
+    "hard_gate_results",
+    "blocking_reasons",
+    "evidence_index",
+];
 const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
     "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
@@ -2712,6 +2937,21 @@ fn classify_performance_budget_claim(
             "performance_budget_claim_readiness_malformed".to_string(),
         ));
     };
+    if options.reference_time_utc.is_some_and(|reference_time| {
+        evidence_age_exceeds_policy(
+            value,
+            options,
+            artifact_source_path,
+            generated_at,
+            reference_time,
+        )
+    }) {
+        return Some((
+            EvidenceFreshnessStatus::Stale,
+            false,
+            "generated_at_older_than_policy".to_string(),
+        ));
+    }
     if !validated.claim_ready {
         return Some((
             EvidenceFreshnessStatus::Uncertified,
@@ -2743,6 +2983,26 @@ fn classify_performance_budget_claim(
             false,
             reason.to_string(),
         )),
+    }
+}
+
+fn evidence_age_exceeds_policy(
+    value: &Value,
+    options: &SemanticWorkspaceGraphBuildOptions,
+    artifact_source_path: Option<&str>,
+    generated_at: DateTime<Utc>,
+    reference_time: DateTime<Utc>,
+) -> bool {
+    let evidence_age = reference_time.signed_duration_since(generated_at);
+    if matches!(
+        artifact_source_path,
+        Some(DROPIN_CERTIFICATION_VERDICT_PATH | PERF_BUDGET_SUMMARY_PATH)
+    ) {
+        evidence_age > Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS)
+    } else if value.get("claim_surface").and_then(Value::as_str) == Some("release_facing") {
+        evidence_age > Duration::days(RELEASE_FACING_EVIDENCE_STALE_AFTER_DAYS)
+    } else {
+        evidence_age > Duration::days(options.stale_after_days)
     }
 }
 
@@ -2895,6 +3155,13 @@ fn repository_git_command(context: &RepositoryGitContext) -> Command {
     }
     command.env("GIT_LITERAL_PATHSPECS", "1");
     command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_TERMINAL_PROMPT", "0");
     command
 }
 
@@ -3600,6 +3867,1105 @@ fn performance_source_binding_failure(
     )
 }
 
+#[derive(Debug)]
+struct DropinGateSpec {
+    gate_id: String,
+    blocking: bool,
+    owner_issue: String,
+    required_artifacts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DropinClaimFailure {
+    Unavailable(&'static str),
+    Invalid(&'static str),
+}
+
+fn dropin_canonical_repo_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    let invalid_prefix = path.is_empty()
+        || path.contains('\\')
+        || path.contains('\0')
+        || path.starts_with('/')
+        || bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    !invalid_prefix
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+}
+
+fn dropin_full_git_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn dropin_generated_at_is_canonical(value: &Value) -> bool {
+    let Some(raw) = value.as_str() else {
+        return false;
+    };
+    let bytes = raw.as_bytes();
+    let shape = bytes.len() >= 20
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes.last() == Some(&b'Z')
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16)
+                || index + 1 == bytes.len()
+                || (index == 19 && bytes.len() > 20 && *byte == b'.')
+                || byte.is_ascii_digit()
+        })
+        && (bytes.len() == 20 || bytes.len() > 21);
+    shape
+        && DateTime::parse_from_rfc3339(raw)
+            .is_ok_and(|parsed| parsed.offset().local_minus_utc() == 0)
+}
+
+fn dropin_gate_id_is_canonical(gate_id: &str, expected_number: usize) -> bool {
+    let expected_prefix = format!("G{expected_number:02}-");
+    let Some(suffix) = gate_id.strip_prefix(&expected_prefix) else {
+        return false;
+    };
+    !suffix.is_empty()
+        && suffix.split('-').all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        })
+}
+
+fn dropin_contract_gate_specs(contract: &Value) -> Result<Vec<DropinGateSpec>, DropinClaimFailure> {
+    let object = contract.as_object().ok_or(DropinClaimFailure::Invalid(
+        "dropin_verdict_contract_invalid",
+    ))?;
+    if object.get("schema").and_then(Value::as_str) != Some(DROPIN_CERTIFICATION_CONTRACT_SCHEMA) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+    let verdict_contract = object
+        .get("release_process_enforcement")
+        .and_then(Value::as_object)
+        .and_then(|enforcement| enforcement.get("verdict_artifact_contract"))
+        .and_then(Value::as_object)
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    if verdict_contract.get("path").and_then(Value::as_str)
+        != Some(DROPIN_CERTIFICATION_VERDICT_PATH)
+        || verdict_contract.get("schema").and_then(Value::as_str)
+            != Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+    let required_fields = verdict_contract
+        .get("required_fields")
+        .and_then(Value::as_array)
+        .and_then(|fields| fields.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    let expected_fields = DROPIN_VERDICT_REQUIRED_FIELDS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if required_fields.len() != expected_fields.len()
+        || required_fields.iter().copied().collect::<BTreeSet<_>>() != expected_fields
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+
+    let hard_gates = object
+        .get("hard_gates")
+        .and_then(Value::as_array)
+        .filter(|gates| gates.len() == 12)
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
+    hard_gates
+        .iter()
+        .enumerate()
+        .map(|(index, gate)| {
+            let gate = gate.as_object().ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_contract_invalid",
+            ))?;
+            let gate_id = gate
+                .get("gate_id")
+                .and_then(Value::as_str)
+                .filter(|gate_id| dropin_gate_id_is_canonical(gate_id, index + 1))
+                .ok_or(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ))?;
+            let blocking = gate.get("blocking").and_then(Value::as_bool).ok_or(
+                DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"),
+            )?;
+            let owner_issue = gate
+                .get("owner_issue_primary")
+                .and_then(Value::as_str)
+                .filter(|owner| !owner.is_empty())
+                .ok_or(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ))?;
+            let required_artifacts = gate
+                .get("required_artifacts")
+                .and_then(Value::as_array)
+                .filter(|artifacts| !artifacts.is_empty())
+                .and_then(|artifacts| {
+                    artifacts
+                        .iter()
+                        .map(Value::as_str)
+                        .map(|artifact| artifact.filter(|path| dropin_canonical_repo_path(path)))
+                        .collect::<Option<Vec<_>>>()
+                })
+                .ok_or(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ))?;
+            if required_artifacts
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != required_artifacts.len()
+            {
+                return Err(DropinClaimFailure::Invalid(
+                    "dropin_verdict_contract_invalid",
+                ));
+            }
+            Ok(DropinGateSpec {
+                gate_id: gate_id.to_string(),
+                blocking,
+                owner_issue: owner_issue.to_string(),
+                required_artifacts: required_artifacts.into_iter().map(str::to_string).collect(),
+            })
+        })
+        .collect()
+}
+
+fn dropin_verdict_payload(
+    verdict: &Value,
+    gate_specs: &[DropinGateSpec],
+) -> Result<(String, Vec<String>), DropinClaimFailure> {
+    let object = verdict.as_object().ok_or(DropinClaimFailure::Invalid(
+        "dropin_verdict_contract_invalid",
+    ))?;
+    if DROPIN_VERDICT_REQUIRED_FIELDS
+        .iter()
+        .any(|field| !object.contains_key(*field))
+        || object.get("schema").and_then(Value::as_str) != Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+        || object.get("overall_verdict").and_then(Value::as_str) != Some("CERTIFIED")
+        || !object
+            .get("generated_at_utc")
+            .is_some_and(dropin_generated_at_is_canonical)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+
+    let source_commit = object
+        .get("git_commit")
+        .and_then(Value::as_str)
+        .filter(|commit| dropin_full_git_oid(commit))
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_invalid",
+        ))?;
+    let hard_gate_results = object
+        .get("hard_gate_results")
+        .and_then(Value::as_array)
+        .filter(|gates| gates.len() == gate_specs.len())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_hard_gates_invalid",
+        ))?;
+    for (gate, expected) in hard_gate_results.iter().zip(gate_specs) {
+        let Some(gate) = gate.as_object() else {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_hard_gates_invalid",
+            ));
+        };
+        let detail_valid = gate
+            .get("detail")
+            .is_none_or(|detail| detail.is_null() || detail.is_string());
+        let artifacts_match = gate
+            .get("artifact_paths")
+            .and_then(Value::as_array)
+            .and_then(|artifacts| {
+                artifacts
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+            })
+            .is_some_and(|artifacts| {
+                artifacts
+                    == expected
+                        .required_artifacts
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+            });
+        if gate.get("gate_id").and_then(Value::as_str) != Some(expected.gate_id.as_str())
+            || gate.get("status").and_then(Value::as_str) != Some("pass")
+            || gate.get("blocking").and_then(Value::as_bool) != Some(expected.blocking)
+            || gate.get("bead").and_then(Value::as_str) != Some(expected.owner_issue.as_str())
+            || !detail_valid
+            || !artifacts_match
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_hard_gates_invalid",
+            ));
+        }
+    }
+
+    if object
+        .get("blocking_reasons")
+        .and_then(Value::as_array)
+        .is_none_or(|reasons| !reasons.is_empty())
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_blocking_reasons_invalid",
+        ));
+    }
+    let source =
+        object
+            .get("source")
+            .and_then(Value::as_object)
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+    if source
+        .get("certification_lane_artifact")
+        .and_then(Value::as_str)
+        != Some(DROPIN_CERTIFICATION_LANE_PATH)
+        || source.get("lane_schema").and_then(Value::as_str)
+            != Some(DROPIN_CERTIFICATION_LANE_SCHEMA)
+        || source.get("lane_verdict").and_then(Value::as_str) != Some("pass")
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let expected_evidence_paths = gate_specs
+        .iter()
+        .flat_map(|gate| gate.required_artifacts.iter())
+        .fold(Vec::<String>::new(), |mut paths, artifact| {
+            if !paths.contains(artifact) {
+                paths.push(artifact.clone());
+            }
+            paths
+        });
+    let evidence_index = object
+        .get("evidence_index")
+        .and_then(Value::as_array)
+        .filter(|index| !index.is_empty())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_evidence_index_invalid",
+        ))?;
+    let mut evidence_paths = Vec::with_capacity(evidence_index.len());
+    for entry in evidence_index {
+        let Some(entry) = entry.as_object() else {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_evidence_index_invalid",
+            ));
+        };
+        let Some(path) = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|path| dropin_canonical_repo_path(path))
+        else {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_evidence_index_invalid",
+            ));
+        };
+        if entry.len() != 2
+            || !entry.contains_key("exists")
+            || entry.get("exists").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_evidence_index_invalid",
+            ));
+        }
+        evidence_paths.push(path.to_string());
+    }
+    if evidence_paths != expected_evidence_paths
+        || evidence_paths.iter().collect::<BTreeSet<_>>().len() != evidence_paths.len()
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_evidence_index_invalid",
+        ));
+    }
+    Ok((source_commit.to_string(), evidence_paths))
+}
+
+#[derive(Debug)]
+struct DropinLaneWaiverAudit {
+    generated_at: DateTime<Utc>,
+    expired: u64,
+    invalid: u64,
+    eligible_gate_ids: BTreeSet<String>,
+}
+
+fn dropin_lane_time_is_current(
+    value: &Value,
+    reference_time: DateTime<Utc>,
+) -> Result<DateTime<Utc>, DropinClaimFailure> {
+    let generated_at = performance_generated_at(value)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if generated_at > reference_time + Duration::minutes(5)
+        || reference_time.signed_duration_since(generated_at)
+            > Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    Ok(generated_at)
+}
+
+fn dropin_lane_waiver_audit(
+    value: &Value,
+    reference_time: DateTime<Utc>,
+) -> Result<DropinLaneWaiverAudit, DropinClaimFailure> {
+    const FIELDS: &[&str] = &[
+        "schema",
+        "generated_at",
+        "total_waivers",
+        "active",
+        "expired",
+        "expiring_soon",
+        "invalid",
+        "waivers",
+        "raw_waivers",
+    ];
+    let audit = performance_exact_object(value, FIELDS, &[], "certification lane waiver_audit")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if audit.get("schema").and_then(Value::as_str) != Some("pi.ci.waiver_audit.v1") {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let generated_at = dropin_lane_time_is_current(&audit["generated_at"], reference_time)?;
+    let total = performance_uint(&audit["total_waivers"], "waiver_audit.total_waivers")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let active = performance_uint(&audit["active"], "waiver_audit.active")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let expired = performance_uint(&audit["expired"], "waiver_audit.expired")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let expiring_soon = performance_uint(&audit["expiring_soon"], "waiver_audit.expiring_soon")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let invalid = performance_uint(&audit["invalid"], "waiver_audit.invalid")
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let validations = audit["waivers"]
+        .as_array()
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    let raw_waivers = audit["raw_waivers"]
+        .as_array()
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    if total != u64::try_from(raw_waivers.len()).unwrap_or(u64::MAX)
+        || u64::try_from(validations.len()).unwrap_or(u64::MAX)
+            != active
+                .checked_add(expired)
+                .and_then(|count| count.checked_add(expiring_soon))
+                .and_then(|count| count.checked_add(invalid))
+                .unwrap_or(u64::MAX)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    // Strict replacement claims never rely on waivers. This also prevents a
+    // self-authored lane from promoting itself with invented lifecycle data.
+    if total != 0
+        || active != 0
+        || expired != 0
+        || expiring_soon != 0
+        || invalid != 0
+        || !validations.is_empty()
+        || !raw_waivers.is_empty()
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let mut validation_statuses = BTreeMap::new();
+    for validation in validations {
+        let validation = performance_exact_object(
+            validation,
+            &["gate_id", "status"],
+            &["detail", "days_remaining"],
+            "certification lane waiver validation",
+        )
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        let gate_id =
+            performance_nonempty_string(&validation["gate_id"], "waiver validation gate_id")
+                .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        let status = validation["status"]
+            .as_str()
+            .filter(|status| matches!(*status, "active" | "expired" | "expiring_soon" | "invalid"))
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        if validation
+            .get("detail")
+            .is_some_and(|detail| !detail.is_string())
+            || validation
+                .get("days_remaining")
+                .is_some_and(|days| days.as_i64().is_none())
+            || validation_statuses
+                .insert(gate_id.to_string(), status.to_string())
+                .is_some()
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+    }
+    let observed_counts = ["active", "expired", "expiring_soon", "invalid"].map(|status| {
+        u64::try_from(
+            validation_statuses
+                .values()
+                .filter(|observed| observed.as_str() == status)
+                .count(),
+        )
+        .unwrap_or(u64::MAX)
+    });
+    if observed_counts != [active, expired, expiring_soon, invalid] {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let mut raw_scopes = BTreeMap::new();
+    for waiver in raw_waivers {
+        let waiver = performance_exact_object(
+            waiver,
+            &[
+                "gate_id",
+                "owner",
+                "created",
+                "expires",
+                "bead",
+                "reason",
+                "scope",
+                "remove_when",
+            ],
+            &[],
+            "certification lane raw waiver",
+        )
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        for field in [
+            "gate_id",
+            "owner",
+            "created",
+            "expires",
+            "bead",
+            "reason",
+            "scope",
+            "remove_when",
+        ] {
+            performance_nonempty_string(&waiver[field], field)
+                .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        }
+        let gate_id = waiver["gate_id"].as_str().unwrap_or_default();
+        let scope = waiver["scope"]
+            .as_str()
+            .filter(|scope| matches!(*scope, "full" | "preflight" | "both"))
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        if raw_scopes
+            .insert(gate_id.to_string(), scope.to_string())
+            .is_some()
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+    }
+    if raw_scopes.keys().collect::<BTreeSet<_>>()
+        != validation_statuses.keys().collect::<BTreeSet<_>>()
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let eligible_gate_ids = validation_statuses
+        .into_iter()
+        .filter(|(gate_id, status)| {
+            matches!(status.as_str(), "active" | "expiring_soon")
+                && raw_scopes
+                    .get(gate_id)
+                    .is_some_and(|scope| matches!(scope.as_str(), "full" | "both"))
+        })
+        .map(|(gate_id, _)| gate_id)
+        .collect();
+    Ok(DropinLaneWaiverAudit {
+        generated_at,
+        expired,
+        invalid,
+        eligible_gate_ids,
+    })
+}
+
+fn validate_dropin_certification_lane(
+    lane: &Value,
+    reference_time: DateTime<Utc>,
+) -> Result<(), DropinClaimFailure> {
+    let lane = performance_exact_object(
+        lane,
+        DROPIN_LANE_TOP_LEVEL_FIELDS,
+        &[],
+        "drop-in certification lane",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if lane["schema"].as_str() != Some(DROPIN_CERTIFICATION_LANE_SCHEMA)
+        || lane["lane"].as_str() != Some("full")
+        || lane["policy"].as_str() != Some(DROPIN_CERTIFICATION_LANE_POLICY)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let lane_generated_at = dropin_lane_time_is_current(&lane["generated_at"], reference_time)?;
+    let waiver_audit = dropin_lane_waiver_audit(&lane["waiver_audit"], reference_time)?;
+    if waiver_audit.generated_at > lane_generated_at
+        || lane_generated_at.signed_duration_since(waiver_audit.generated_at) > Duration::minutes(5)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    let waivers_applied = lane["waivers_applied"]
+        .as_array()
+        .and_then(|waivers| {
+            waivers
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    let waived = waivers_applied.iter().copied().collect::<BTreeSet<_>>();
+    if waived.len() != waivers_applied.len()
+        || waived
+            .iter()
+            .any(|gate_id| !waiver_audit.eligible_gate_ids.contains(*gate_id))
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let gates = lane["gates"]
+        .as_array()
+        .filter(|gates| gates.len() == DROPIN_FULL_LANE_GATES.len())
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ))?;
+    let mut gate_ids = BTreeSet::new();
+    let mut gate_rows = Vec::with_capacity(gates.len());
+    for (gate, expected) in gates.iter().zip(DROPIN_FULL_LANE_GATES) {
+        let gate = performance_exact_object(
+            gate,
+            &["id", "name", "bead", "status", "blocking"],
+            &["artifact_path", "detail", "reproduce_command"],
+            "certification lane gate",
+        )
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        for field in ["id", "name", "bead"] {
+            performance_nonempty_string(&gate[field], field)
+                .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+        }
+        let id = gate["id"].as_str().unwrap_or_default();
+        let status = gate["status"]
+            .as_str()
+            .filter(|status| matches!(*status, "pass" | "fail" | "warn" | "skip"))
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        let blocking = gate["blocking"]
+            .as_bool()
+            .ok_or(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ))?;
+        if id != expected.id
+            || gate["name"].as_str() != Some(expected.name)
+            || gate["bead"].as_str() != Some(expected.bead)
+            || blocking != expected.blocking
+            || gate.get("artifact_path").and_then(Value::as_str) != Some(expected.artifact_path)
+            || gate.get("reproduce_command").and_then(Value::as_str) != expected.reproduce_command
+            || !gate_ids.insert(id)
+            || waived.contains(id) && !matches!(status, "fail" | "warn")
+            || gate.get("artifact_path").is_some_and(|path| {
+                path.as_str()
+                    .is_none_or(|path| !dropin_canonical_repo_path(path))
+            })
+            || gate
+                .get("detail")
+                .is_some_and(|detail| detail.as_str().is_none_or(str::is_empty))
+            || gate
+                .get("reproduce_command")
+                .is_some_and(|command| command.as_str().is_none_or(str::is_empty))
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+        gate_rows.push((id, status, blocking));
+    }
+    if waived.iter().any(|gate_id| !gate_ids.contains(gate_id)) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let passed = gate_rows
+        .iter()
+        .filter(|(_, status, _)| *status == "pass")
+        .count();
+    let failed = gate_rows
+        .iter()
+        .filter(|(id, status, _)| *status == "fail" && !waived.contains(id))
+        .count();
+    let warned = gate_rows
+        .iter()
+        .filter(|(id, status, _)| *status == "warn" && !waived.contains(id))
+        .count();
+    let skipped = gate_rows
+        .iter()
+        .filter(|(_, status, _)| *status == "skip")
+        .count();
+    let blocking_total = gate_rows
+        .iter()
+        .filter(|(_, _, blocking)| *blocking)
+        .count();
+    let blocking_pass = gate_rows
+        .iter()
+        .filter(|(id, status, blocking)| *blocking && (*status == "pass" || waived.contains(id)))
+        .count();
+    let all_blocking_pass = blocking_pass == blocking_total;
+    let expected_verdict = if all_blocking_pass && failed == 0 {
+        "pass"
+    } else if all_blocking_pass {
+        "warn"
+    } else {
+        "fail"
+    };
+    if lane["verdict"].as_str() != Some(expected_verdict) || expected_verdict != "pass" {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let summary = performance_exact_object(
+        &lane["summary"],
+        &[
+            "total_gates",
+            "passed",
+            "failed",
+            "warned",
+            "skipped",
+            "waived",
+            "blocking_pass",
+            "blocking_total",
+            "all_blocking_pass",
+        ],
+        &[],
+        "certification lane summary",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    for (field, expected) in [
+        ("total_gates", gates.len()),
+        ("passed", passed),
+        ("failed", failed),
+        ("warned", warned),
+        ("skipped", skipped),
+        ("waived", waived.len()),
+        ("blocking_pass", blocking_pass),
+        ("blocking_total", blocking_total),
+    ] {
+        if performance_uint(&summary[field], field).ok()
+            != Some(u64::try_from(expected).unwrap_or(u64::MAX))
+        {
+            return Err(DropinClaimFailure::Invalid(
+                "dropin_verdict_source_lane_invalid",
+            ));
+        }
+    }
+    if summary["all_blocking_pass"].as_bool() != Some(all_blocking_pass) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let promotion = performance_exact_object(
+        &lane["promotion_rules"],
+        &["can_promote", "blocker_gates", "waiver_gates", "conditions"],
+        &[],
+        "certification lane promotion_rules",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let blocker_gates = gate_rows
+        .iter()
+        .filter(|(id, status, blocking)| {
+            *blocking && *status != "pass" && *status != "skip" && !waived.contains(id)
+        })
+        .map(|(id, _, _)| *id)
+        .collect::<Vec<_>>();
+    let actual_blockers = promotion["blocker_gates"]
+        .as_array()
+        .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+    let actual_waivers = promotion["waiver_gates"]
+        .as_array()
+        .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>());
+    let actual_conditions = promotion["conditions"].as_array().and_then(|conditions| {
+        conditions
+            .iter()
+            .map(Value::as_str)
+            .collect::<Option<Vec<_>>>()
+    });
+    let mut expected_conditions = vec!["All blocking gates pass (including waivers)".to_string()];
+    if !waivers_applied.is_empty() {
+        expected_conditions.push(format!(
+            "Waivers active for: {} (review before release)",
+            waivers_applied.join(", ")
+        ));
+    }
+    let can_promote = all_blocking_pass && waiver_audit.expired == 0 && waiver_audit.invalid == 0;
+    if promotion["can_promote"].as_bool() != Some(can_promote)
+        || !can_promote
+        || actual_blockers.as_deref() != Some(blocker_gates.as_slice())
+        || actual_waivers.as_deref() != Some(waivers_applied.as_slice())
+        || actual_conditions.as_deref()
+            != Some(
+                expected_conditions
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+            )
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+
+    let rerun = performance_exact_object(
+        &lane["rerun_guidance"],
+        &["preflight_command", "full_command", "single_gate_template"],
+        &[],
+        "certification lane rerun_guidance",
+    )
+    .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    if rerun["preflight_command"].as_str()
+        != Some("cargo test --test ci_full_suite_gate -- preflight_fast_fail --nocapture --exact")
+        || rerun["full_command"].as_str()
+            != Some(
+                "cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact",
+            )
+        || rerun["single_gate_template"].as_str()
+            != Some("See reproduce_command field on each gate")
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn dropin_head_regular_blob(
+    context: &RepositoryGitContext,
+    head: &str,
+    source_path: &str,
+    require_non_executable: bool,
+) -> Result<Vec<u8>, DropinClaimFailure> {
+    if !dropin_canonical_repo_path(source_path) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_path_invalid",
+        ));
+    }
+    let relative = Path::new(source_path);
+    let tree_entry = git_output(
+        context,
+        &["ls-tree", "-z", "--full-tree", head, "--", source_path],
+    )
+    .ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let entries = canonical_nul_records(&tree_entry).ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let entry = entries
+        .as_slice()
+        .first()
+        .copied()
+        .filter(|_| entries.len() == 1)
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_not_tracked_at_head",
+        ))?;
+    let (mode, object_type, oid, recorded_path) = parse_canonical_git_record(entry).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let mode_is_valid = if require_non_executable {
+        mode == b"100644"
+    } else {
+        matches!(mode, b"100644" | b"100755")
+    };
+    if recorded_path != source_path.as_bytes() || !mode_is_valid || object_type != b"blob" {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_not_regular_at_head",
+        ));
+    }
+    let oid = std::str::from_utf8(oid).map_err(|_| {
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable")
+    })?;
+    let head_bytes = git_output(context, &["cat-file", "blob", oid]).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let worktree_bytes = tracked_worktree_blob(&context.worktree, relative, mode).ok_or(
+        DropinClaimFailure::Invalid("dropin_verdict_provenance_not_regular_at_head"),
+    )?;
+    if worktree_bytes != head_bytes {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_provenance_bytes_do_not_match_head",
+        ));
+    }
+    Ok(head_bytes)
+}
+
+fn dropin_repository_state(
+    context: &RepositoryGitContext,
+    head: &str,
+) -> Result<(), DropinClaimFailure> {
+    match performance_repository_state_failure(context, head) {
+        None => Ok(()),
+        Some(PerformanceSourceBindingFailure::Unavailable) => Err(DropinClaimFailure::Unavailable(
+            "dropin_verdict_source_binding_unavailable",
+        )),
+        Some(PerformanceSourceBindingFailure::Invalid(_)) => Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_repository_not_clean",
+        )),
+    }
+}
+
+fn dropin_source_binding(
+    context: &RepositoryGitContext,
+    source_commit: &str,
+    head: &str,
+) -> Result<(), DropinClaimFailure> {
+    let source_expression = format!("{source_commit}^{{commit}}");
+    let resolved_source = git_stdout(context, &["rev-parse", "--verify", &source_expression])
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_unresolvable",
+        ))?;
+    if resolved_source != source_commit {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_not_exact",
+        ));
+    }
+    if source_commit == head {
+        return Ok(());
+    }
+    let ancestor = repository_git_command(context)
+        .args(["merge-base", "--is-ancestor", source_commit, head])
+        .output()
+        .map_err(|_| {
+            DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable")
+        })?;
+    if !ancestor.status.success() {
+        return Err(if ancestor.status.code() == Some(1) {
+            DropinClaimFailure::Invalid("dropin_verdict_source_commit_not_ancestor")
+        } else {
+            DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable")
+        });
+    }
+
+    let changed_paths = git_output(
+        context,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            source_commit,
+            head,
+        ],
+    )
+    .ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let changed_paths = canonical_nul_records(&changed_paths).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let changed_paths = changed_paths
+        .iter()
+        .map(|path| std::str::from_utf8(path).ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or(DropinClaimFailure::Unavailable(
+            "dropin_verdict_source_binding_unavailable",
+        ))?;
+    if changed_paths
+        .iter()
+        .any(|path| !dropin_canonical_repo_path(path))
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_not_release_bound",
+        ));
+    }
+    let package_patterns = if changed_paths
+        .iter()
+        .any(|path| path.starts_with("docs/evidence/"))
+    {
+        let cargo_expression = format!("{source_commit}:Cargo.toml");
+        let cargo_toml = git_output(context, &["show", &cargo_expression])
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or(DropinClaimFailure::Unavailable(
+                "dropin_verdict_source_binding_unavailable",
+            ))?;
+        source_package_include_patterns(&cargo_toml).ok_or(DropinClaimFailure::Unavailable(
+            "dropin_verdict_source_binding_unavailable",
+        ))?
+    } else {
+        Vec::new()
+    };
+    let allowed_prefixes = [
+        "docs/evidence/",
+        "tests/ext_conformance/reports/",
+        "tests/perf/reports/",
+        "tests/cross_platform_reports/",
+        "tests/franken_node_compat/reports/",
+        "tests/evidence_bundle/",
+        "tests/certification/",
+    ];
+    let evidence_only = changed_paths.iter().all(|path| {
+        let packaged_docs_evidence = path.starts_with("docs/evidence/")
+            && performance_path_is_packaged(path, &package_patterns) != Some(false);
+        !packaged_docs_evidence
+            && allowed_prefixes
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+    });
+    if !evidence_only {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_commit_not_release_bound",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dropin_verdict_claim(
+    value: &Value,
+    repository_root: Option<&Path>,
+    captured_artifact_bytes: Option<&[u8]>,
+    reference_time_utc: Option<DateTime<Utc>>,
+) -> Result<(), DropinClaimFailure> {
+    let verdict_object = value.as_object().ok_or(DropinClaimFailure::Invalid(
+        "dropin_verdict_contract_invalid",
+    ))?;
+    if DROPIN_VERDICT_REQUIRED_FIELDS
+        .iter()
+        .any(|field| !verdict_object.contains_key(*field))
+        || !verdict_object
+            .get("generated_at_utc")
+            .is_some_and(dropin_generated_at_is_canonical)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ));
+    }
+    let repository_root = repository_root.ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_binding_unavailable",
+    ))?;
+    let captured_artifact_bytes = captured_artifact_bytes.ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let reference_time = reference_time_utc.ok_or(DropinClaimFailure::Unavailable(
+        "dropin_verdict_source_lane_freshness_unavailable",
+    ))?;
+    let context = repository_git_context(repository_root).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    let head = git_stdout(&context, &["rev-parse", "--verify", "HEAD^{commit}"]).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    dropin_repository_state(&context, &head)?;
+
+    let verdict_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_VERDICT_PATH, true)?;
+    if verdict_bytes != captured_artifact_bytes {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_artifact_changed_since_ingestion",
+        ));
+    }
+    let contract_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_CONTRACT_PATH, true)?;
+    let contract_text = std::str::from_utf8(&contract_bytes)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"))?;
+    let contract = parse_evidence_json(contract_text)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"))?;
+    let gate_specs = dropin_contract_gate_specs(&contract)?;
+    let (source_commit, evidence_paths) = dropin_verdict_payload(value, &gate_specs)?;
+    let lane_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_LANE_PATH, true)?;
+    let lane_text = std::str::from_utf8(&lane_bytes)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    let lane = parse_evidence_json(lane_text)
+        .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
+    validate_dropin_certification_lane(&lane, reference_time)?;
+    dropin_source_binding(&context, &source_commit, &head)?;
+
+    let mut provenance_paths = vec![
+        DROPIN_CERTIFICATION_CONTRACT_PATH.to_string(),
+        DROPIN_CERTIFICATION_VERDICT_PATH.to_string(),
+        DROPIN_CERTIFICATION_LANE_PATH.to_string(),
+    ];
+    provenance_paths.extend(evidence_paths);
+    let mut seen = BTreeSet::new();
+    for path in provenance_paths {
+        if seen.insert(path.clone()) {
+            let require_non_executable = matches!(
+                path.as_str(),
+                DROPIN_CERTIFICATION_CONTRACT_PATH
+                    | DROPIN_CERTIFICATION_VERDICT_PATH
+                    | DROPIN_CERTIFICATION_LANE_PATH
+            );
+            dropin_head_regular_blob(&context, &head, &path, require_non_executable)?;
+        }
+    }
+
+    let current_head = git_stdout(&context, &["rev-parse", "--verify", "HEAD^{commit}"]).ok_or(
+        DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
+    )?;
+    if current_head != head {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_repository_head_changed",
+        ));
+    }
+    dropin_repository_state(&context, &head)?;
+    let final_verdict_bytes =
+        dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_VERDICT_PATH, true)?;
+    if final_verdict_bytes != captured_artifact_bytes {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_artifact_changed_during_validation",
+        ));
+    }
+    Ok(())
+}
+
 pub fn classify_evidence_freshness(
     value: &Value,
     options: &SemanticWorkspaceGraphBuildOptions,
@@ -3615,6 +4981,15 @@ fn classify_evidence_freshness_in_repository(
     captured_artifact_bytes: Option<&[u8]>,
 ) -> (EvidenceFreshnessStatus, bool, String) {
     let canonical_performance_budget = artifact_source_path == Some(PERF_BUDGET_SUMMARY_PATH);
+    if value.get("schema").and_then(Value::as_str) == Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+        && artifact_source_path != Some(DROPIN_CERTIFICATION_VERDICT_PATH)
+    {
+        return (
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "dropin_verdict_noncanonical_path".to_string(),
+        );
+    }
     if canonical_performance_budget
         && let Some(classification) = classify_performance_budget_claim(
             value,
@@ -3650,6 +5025,25 @@ fn classify_evidence_freshness_in_repository(
                 false,
                 "overall_verdict_not_certified".to_string(),
             );
+        }
+        if let Err(failure) = validate_dropin_verdict_claim(
+            value,
+            repository_root,
+            captured_artifact_bytes,
+            options.reference_time_utc,
+        ) {
+            return match failure {
+                DropinClaimFailure::Unavailable(reason) => (
+                    EvidenceFreshnessStatus::Uncertified,
+                    false,
+                    reason.to_string(),
+                ),
+                DropinClaimFailure::Invalid(reason) => (
+                    EvidenceFreshnessStatus::Malformed,
+                    false,
+                    reason.to_string(),
+                ),
+            };
         }
     }
 
@@ -3690,7 +5084,12 @@ fn classify_evidence_freshness_in_repository(
         );
     }
 
-    let Some(generated_at) = evidence_generated_at(value) else {
+    let generated_at = if artifact_source_path == Some(DROPIN_CERTIFICATION_VERDICT_PATH) {
+        value.get("generated_at_utc").and_then(Value::as_str)
+    } else {
+        evidence_generated_at(value)
+    };
+    let Some(generated_at) = generated_at else {
         return (
             EvidenceFreshnessStatus::FreshnessUnknown,
             false,
@@ -3723,11 +5122,14 @@ fn classify_evidence_freshness_in_repository(
         );
     }
 
-    if reference_time_utc
-        .signed_duration_since(generated_at_utc)
-        .num_days()
-        > options.stale_after_days
-    {
+    let stale = evidence_age_exceeds_policy(
+        value,
+        options,
+        artifact_source_path,
+        generated_at_utc,
+        reference_time_utc,
+    );
+    if stale {
         (
             EvidenceFreshnessStatus::Stale,
             false,
@@ -3910,7 +5312,12 @@ fn evidence_artifact_node(
     let mut metadata = BTreeMap::new();
     let privacy = classify_node_privacy(source_path, Some(value));
     metadata.insert("artifact_schema".to_string(), json!(artifact_schema));
-    if let Some(generated_at) = evidence_generated_at(value) {
+    let generated_at = if source_path == DROPIN_CERTIFICATION_VERDICT_PATH {
+        value.get("generated_at_utc").and_then(Value::as_str)
+    } else {
+        evidence_generated_at(value)
+    };
+    if let Some(generated_at) = generated_at {
         metadata.insert("generated_at".to_string(), json!(generated_at));
     }
     if let Some(claim_surface) = value.get("claim_surface").and_then(Value::as_str) {
@@ -3961,7 +5368,7 @@ fn evidence_artifact_node(
         "suppresses_release_claim_context".to_string(),
         json!(!release_claim_allowed),
     );
-    if source_path.ends_with("dropin-certification-verdict.json") {
+    if source_path == DROPIN_CERTIFICATION_VERDICT_PATH {
         metadata.insert(
             "strict_replacement_claim_allowed".to_string(),
             json!(release_claim_allowed),
@@ -4997,7 +6404,14 @@ fn redact_error_message(message: &str) -> String {
 
 #[cfg(test)]
 mod git_record_parser_tests {
-    use super::{canonical_nul_records, parse_canonical_git_record};
+    use super::{
+        canonical_nul_records, parse_canonical_git_record, repository_git_command,
+        repository_git_context, trusted_git_executable,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::process::Command;
 
     #[test]
     fn accepts_only_canonical_git_record_headers() {
@@ -5041,5 +6455,55 @@ mod git_record_parser_tests {
         ] {
             assert_eq!(canonical_nul_records(malformed), None);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_git_commands_ignore_hostile_global_configuration() {
+        let temp = tempfile::tempdir().expect("create Git command fixture");
+        let repository = temp.path().join("repository");
+        let git = trusted_git_executable().expect("trusted Git executable");
+        let init = Command::new(git)
+            .args(["init", "-b", "main"])
+            .arg(&repository)
+            .output()
+            .expect("initialize Git command fixture");
+        assert!(init.status.success());
+        let context = repository_git_context(&repository).expect("trusted Git context");
+
+        let command = repository_git_command(&context);
+        let env = command
+            .get_envs()
+            .map(|(key, value)| (key.to_os_string(), value.map(OsString::from)))
+            .collect::<BTreeMap<_, _>>();
+        for (key, expected) in [
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_LITERAL_PATHSPECS", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_OPTIONAL_LOCKS", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+        ] {
+            assert_eq!(
+                env.get(&OsString::from(key)).and_then(Option::as_deref),
+                Some(std::ffi::OsStr::new(expected)),
+                "missing sanitized Git environment control {key}"
+            );
+        }
+
+        let hostile_home = temp.path().join("hostile-home");
+        fs::create_dir(&hostile_home).expect("create hostile Git home");
+        fs::write(
+            hostile_home.join(".gitconfig"),
+            "[user]\nname = Hostile Global Identity\n",
+        )
+        .expect("write hostile global Git configuration");
+        let global_lookup = repository_git_command(&context)
+            .env("HOME", &hostile_home)
+            .args(["config", "--global", "--get", "user.name"])
+            .output()
+            .expect("probe sanitized global Git configuration");
+        assert!(!global_lookup.status.success());
+        assert!(global_lookup.stdout.is_empty());
     }
 }
