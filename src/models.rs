@@ -871,10 +871,7 @@ impl ModelRegistry {
                         );
                     }
                     Err(error) => {
-                        errors.push(format!(
-                            "{error}\n\nFile: {}",
-                            catalog_path.display()
-                        ));
+                        errors.push(format!("{error}\n\nFile: {}", catalog_path.display()));
                     }
                 }
             }
@@ -3964,7 +3961,8 @@ mod tests {
                 }
             }
         });
-        let manual_bytes = serde_json::to_vec_pretty(&manual_json).expect("serialize manual config");
+        let manual_bytes =
+            serde_json::to_vec_pretty(&manual_json).expect("serialize manual config");
         std::fs::write(&models_path, &manual_bytes).expect("write manual models.json");
 
         let registry = ModelRegistry::load(&auth, Some(models_path.clone()));

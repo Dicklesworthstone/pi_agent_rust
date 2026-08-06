@@ -184,7 +184,9 @@ pub fn clear_model_cache() {
 /// The static-registry fallback never errors as long as the provider is
 /// known — at worst it returns an empty `Vec`.
 pub async fn fetch_provider_models(provider: &str, api_key: &str) -> Result<Vec<String>> {
-    Ok(fetch_provider_model_catalog(provider, api_key).await?.models)
+    Ok(fetch_provider_model_catalog(provider, api_key)
+        .await?
+        .models)
 }
 
 /// Fetch a provider catalog while retaining whether the rows came from a
@@ -211,11 +213,9 @@ pub async fn fetch_provider_model_catalog(
 /// Force a refresh, bypassing any cached entry. Only a successful, non-empty
 /// live response replaces the cache entry; failures are returned to the caller.
 pub async fn refresh_provider_models(provider: &str, api_key: &str) -> Result<Vec<String>> {
-    Ok(
-        refresh_provider_model_catalog(provider, api_key)
-            .await?
-            .models,
-    )
+    Ok(refresh_provider_model_catalog(provider, api_key)
+        .await?
+        .models)
 }
 
 /// Force a genuinely live refresh, bypassing the cache and rejecting network,
@@ -242,11 +242,7 @@ pub async fn refresh_provider_model_catalog(
     })
 }
 
-async fn fetch_and_cache(
-    provider: &str,
-    key: &str,
-    api_key: &str,
-) -> Result<ProviderModelCatalog> {
+async fn fetch_and_cache(provider: &str, key: &str, api_key: &str) -> Result<ProviderModelCatalog> {
     // Only cache results from a successful live fetch — caching the
     // static-registry fallback would pin a stale answer for 5 minutes and
     // silently swallow the next call even after the user adds the missing
@@ -693,12 +689,8 @@ mod tests {
             ],
         )
         .expect("persist OpenRouter catalog");
-        persist_provider_model_catalog(
-            &models_path,
-            "groq",
-            &["groq-model".to_string()],
-        )
-        .expect("persist Groq catalog");
+        persist_provider_model_catalog(&models_path, "groq", &["groq-model".to_string()])
+            .expect("persist Groq catalog");
 
         assert_eq!(
             std::fs::read(&models_path).expect("read manual models.json"),
@@ -736,7 +728,10 @@ mod tests {
             &["openai/gpt-test".to_string()],
         )
         .expect_err("malformed generated catalog must fail closed");
-        assert!(error.to_string().contains("Refusing to overwrite"), "{error}");
+        assert!(
+            error.to_string().contains("Refusing to overwrite"),
+            "{error}"
+        );
         assert_eq!(
             std::fs::read(&fetched_path).expect("re-read fetched catalog"),
             original,

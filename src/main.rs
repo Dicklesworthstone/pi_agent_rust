@@ -1043,12 +1043,7 @@ async fn run(
     }
 
     if let Some(provider) = cli.fetch_models.take() {
-        handle_fetch_models(
-            &provider,
-            cli.refresh_models,
-            cli.persist_models,
-        )
-        .await?;
+        handle_fetch_models(&provider, cli.refresh_models, cli.persist_models).await?;
         return Ok(());
     }
 
@@ -5626,11 +5621,8 @@ async fn handle_fetch_models(provider: &str, refresh: bool, persist: bool) -> Re
             );
         }
         let models_path = default_models_path(&Config::global_dir());
-        let fetched_path = pi::providers::persist_provider_model_catalog(
-            &models_path,
-            provider,
-            &catalog.models,
-        )?;
+        let fetched_path =
+            pi::providers::persist_provider_model_catalog(&models_path, provider, &catalog.models)?;
         eprintln!(
             "Persisted {} models for {provider:?} to {}",
             catalog.models.len(),

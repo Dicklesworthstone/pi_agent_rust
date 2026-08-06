@@ -1229,7 +1229,10 @@ fn e2e_cli_refresh_models_requires_a_live_result() {
     let result = harness.run(&["--fetch-models", "openai", "--refresh-models"]);
 
     assert_exit_code(&harness.harness, &result, 1);
-    assert!(result.stdout.is_empty(), "strict refresh must not print fallback rows");
+    assert!(
+        result.stdout.is_empty(),
+        "strict refresh must not print fallback rows"
+    );
     assert_contains(&harness.harness, &result.stderr, "api_key");
 }
 
