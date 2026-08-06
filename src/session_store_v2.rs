@@ -279,6 +279,25 @@ fn open_or_create_windows_artifact_parent(
     Ok((absolute_path, guards))
 }
 
+#[cfg(windows)]
+fn validate_windows_regular_file_path_matches(
+    path: &Path,
+    opened_file: &File,
+    operation: &str,
+) -> Result<()> {
+    let current_metadata = fs::symlink_metadata(path)?;
+    let opened_metadata = opened_file.metadata()?;
+    reject_non_private_regular_file(path, &current_metadata)?;
+    reject_non_private_regular_file(path, &opened_metadata)?;
+    if artifact_file_identity(&current_metadata) != artifact_file_identity(&opened_metadata) {
+        return Err(Error::session(format!(
+            "artifact path changed before {operation}: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_nofollow_componentwise(
     path: &Path,
@@ -745,10 +764,10 @@ fn open_private_directory(path: &Path, create: bool) -> Result<File> {
 
 fn validate_private_directory_entry(path: &Path) -> Result<()> {
     let directory = open_directory_nofollow(path, false)?;
-    let metadata = directory.metadata()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
+        let metadata = directory.metadata()?;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(Error::session(format!(
                 "session-store directory has non-private permissions: {}",
@@ -756,6 +775,8 @@ fn validate_private_directory_entry(path: &Path) -> Result<()> {
             )));
         }
     }
+    #[cfg(not(unix))]
+    drop(directory);
     Ok(())
 }
 
@@ -1011,18 +1032,11 @@ where
         reopen_named_regular_file_matching(&source_directory, source_name, &source_file, source)?;
 
     #[cfg(windows)]
-    {
-        let current_metadata = fs::symlink_metadata(&source_operation_path)?;
-        reject_non_private_regular_file(&source_operation_path, &current_metadata)?;
-        if artifact_file_identity(&current_metadata)
-            != artifact_file_identity(&source_file.metadata()?)
-        {
-            return Err(Error::session(format!(
-                "artifact source path changed before publication: {}",
-                source_operation_path.display()
-            )));
-        }
-    }
+    validate_windows_regular_file_path_matches(
+        &source_operation_path,
+        &source_file,
+        "publication",
+    )?;
 
     #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))]
     rustix::fs::renameat_with(
@@ -1051,14 +1065,11 @@ where
         validate_windows_artifact_directory_guards(&source_parent_guards)?;
         validate_windows_artifact_directory_guards(&target_parent_guards)?;
         fs::hard_link(&source_operation_path, &target_operation_path)?;
-        let target_metadata = fs::symlink_metadata(&target_operation_path)?;
-        reject_non_private_regular_file(&target_operation_path, &target_metadata)?;
-        if artifact_file_identity(&target_metadata) != source_identity {
-            return Err(Error::session(format!(
-                "published artifact identity does not match its retained source: {}",
-                target_operation_path.display()
-            )));
-        }
+        validate_windows_regular_file_path_matches(
+            &target_operation_path,
+            &source_file,
+            "identity verification",
+        )?;
         drop(source_file);
         fs::remove_file(&source_operation_path)?;
         validate_windows_artifact_directory_guards(&source_parent_guards)?;
@@ -1116,14 +1127,7 @@ where
 
     #[cfg(windows)]
     {
-        let current_metadata = fs::symlink_metadata(&operation_path)?;
-        reject_non_private_regular_file(&operation_path, &current_metadata)?;
-        if artifact_file_identity(&current_metadata) != artifact_file_identity(&file.metadata()?) {
-            return Err(Error::session(format!(
-                "artifact path changed before removal: {}",
-                operation_path.display()
-            )));
-        }
+        validate_windows_regular_file_path_matches(&operation_path, &file, "removal")?;
         drop(file);
     }
 
