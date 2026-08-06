@@ -2,7 +2,7 @@
 
 Status: Active  
 Primary bead: `bd-k5q5.4.6`  
-Last updated: 2026-02-08
+Last updated: 2026-08-06
 
 This document models realistic abuse paths against the extension runtime and maps each threat to code-level controls and executable tests.
 
@@ -10,7 +10,7 @@ This document models realistic abuse paths against the extension runtime and map
 
 In-scope components:
 - `PiJsRuntime` host bridge (`src/extensions_js.rs`)
-- hostcall capability policy (`src/extensions.rs`, `src/config.rs`, `src/extension_dispatcher.rs`)
+- hostcall capability policy (`src/extensions.rs`, `src/extensions/protocol.rs`, `src/extensions/extension_manager_impl.rs`, `src/config.rs`, `src/extension_dispatcher.rs`)
 - JS compatibility shims (`node:fs`, `node:child_process`, `node:http`, etc.)
 - extension event dispatch and registration surfaces
 
@@ -72,8 +72,8 @@ Attacker goals:
   - deny on resolved outside-root host fallback path.
 - Evidence:
   - `tests/security_fs_escape.rs` normalization/write confinement suite
-  - `tests/extensions.rs::fs_connector_denies_path_traversal_outside_cwd`
-  - `tests/extensions.rs::fs_connector_denies_symlink_escape`
+  - `src/extensions/tests/core.rs::fs_connector_denies_path_traversal_outside_cwd`
+  - `src/extensions/tests/core.rs::fs_connector_denies_symlink_escape`
 
 ### T3: Capability-policy bypass via method/capability mismatch
 - Vector: forging `capability` different from method semantics.
@@ -83,7 +83,8 @@ Attacker goals:
   - dispatcher rejection for invalid/mismatched capability requests.
 - Evidence:
   - `tests/extensions_policy_negative.rs` capability mapping tests
-  - parity/adapter tests under `src/extensions.rs` unit suite
+  - `src/extensions/tests/core.rs::required_capability_for_host_call_maps_tools_and_fs_ops`
+  - parity/adapter tests under `src/extensions/tests/runtime_parity.rs`
 
 ### T4: Dangerous hostcalls enabled unintentionally
 - Vector: ambiguous defaults or unknown profile names.
@@ -104,7 +105,8 @@ Attacker goals:
   - deny fallback when prompt manager/UI channel is unavailable.
 - Evidence:
   - `tests/extensions_policy_negative.rs`
-  - `tests/extensions.rs` prompt/denial path tests
+  - prompt/denial tests under `src/extensions/tests/core.rs`
+  - `src/extensions/tests/shared_dispatch.rs::shared_dispatch_prompt_without_manager_fails_closed`
 
 ## 6. Abuse-case Test Matrix
 

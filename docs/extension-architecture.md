@@ -87,7 +87,7 @@ Declarative specification for loading a native descriptor extension:
 - `entry_path` -- canonical `PathBuf` to `*.native.json`
 - `name`, `version`, `api_version` -- metadata from `extension.json`
 
-### `RegisterPayload` (`src/extensions.rs:2017`)
+### `RegisterPayload` (`src/extensions.rs`)
 
 Data returned by an extension's `activate()` call:
 
@@ -101,7 +101,7 @@ Data returned by an extension's `activate()` call:
 Every `pi.*()` call from JavaScript enqueues a `HostcallRequest` on the
 hostcall channel. The QuickJS thread blocks on the response.
 
-### `HostcallKind` (`src/extensions_js.rs:249`)
+### `HostcallKind` (`src/extensions_js.rs`)
 
 ```rust
 pub enum HostcallKind {
@@ -121,11 +121,11 @@ pub enum HostcallKind {
 HostcallRequest
   │
   ▼
-dispatch_hostcall_with_runtime()     [extensions.rs:6873]
+dispatch_hostcall_with_runtime()     [src/extensions.rs]
   ├── 1. Test interceptor check (short-circuit for mocking)
   ├── 2. Convert to canonical HostCallPayload
   ├── 3. Build HostCallContext (policy, tools, http, manager)
-  ├── 4. dispatch_host_call_shared()  [connectors.rs]
+  ├── 4. dispatch_host_call_shared()  [src/extensions.rs]
   │       └── capability derivation + policy check
   └── 5. Kind-specific handler:
           ├── dispatch_hostcall_tool()     → ToolRegistry.execute()
@@ -139,7 +139,7 @@ dispatch_hostcall_with_runtime()     [extensions.rs:6873]
 
 ### Session Operations
 
-`dispatch_hostcall_session()` (`extensions.rs:7311`) routes `op` values to
+`dispatch_hostcall_session()` (`src/extensions.rs`) routes `op` values to
 `ExtensionSession` trait methods:
 
 | JS call                          | Session method                    |
@@ -154,7 +154,7 @@ dispatch_hostcall_with_runtime()     [extensions.rs:6873]
 | `pi.session("getThinkingLevel")` | `get_thinking_level()`            |
 | `pi.session("setLabel", id, l)`  | `set_label(target_id, label)`     |
 
-The `ExtensionSession` trait (`extensions.rs:2458`) is implemented by:
+The `ExtensionSession` trait (`src/extensions.rs`) is implemented by:
 
 - `SessionHandle` (`session.rs`) -- production session backed by SQLite
 - `InteractiveExtensionSession` (`interactive.rs`) -- TUI interactive mode
@@ -162,7 +162,7 @@ The `ExtensionSession` trait (`extensions.rs:2458`) is implemented by:
 
 ### Event Operations
 
-`dispatch_hostcall_events()` (`extensions.rs:7646`) handles registration
+`dispatch_hostcall_events()` (`src/extensions.rs`) handles registration
 API calls:
 
 | JS call                              | Action                          |
@@ -178,7 +178,7 @@ API calls:
 
 ## Capability Policy
 
-### Policy Model (`src/extensions.rs:1139-1155`)
+### Policy Model (`src/extensions.rs`)
 
 ```rust
 pub enum ExtensionPolicyMode {
@@ -200,7 +200,7 @@ Default policy (`Prompt` mode):
 - **Allowed**: `read`, `write`, `http`, `events`, `session`
 - **Denied**: `exec`, `env`
 
-### Policy Profiles (`src/extensions.rs:1069`)
+### Policy Profiles (`src/extensions.rs`)
 
 | Profile      | Mode        | Allowed caps              | Denied caps   |
 |-------------|-------------|---------------------------|---------------|
@@ -217,7 +217,7 @@ allow_dangerous = false # override to allow exec/env
 
 CLI override: `--extension-policy safe`
 
-### Precedence Chain (`src/extensions.rs:1190-1209`)
+### Precedence Chain (`src/extensions.rs`)
 
 Policy evaluation follows strict precedence:
 
@@ -366,18 +366,39 @@ requiring token-based auth.
 | Stress         | Concurrent load + memory profiling | `tests/extensions_stress.rs`    |
 | Security       | FS escape, policy negative tests   | `tests/security_*.rs`           |
 
+The crate-local characterization suite is routed by
+`src/extensions/tests.rs` and split by behavior under
+`src/extensions/tests/`: `core`, `registration`, `baseline`, `risk_math`,
+`enforcement`, `policy_transition`, `exec_security`, `event_timeouts`,
+`concurrency`, `reactor`, `shared_dispatch`, `runtime_parity`, `ui_protocol`,
+and `security_alerts`. Keeping those names as test-path domains makes a focused
+command such as `cargo test extensions::tests::reactor` stable without putting
+the full suite back into the production façade.
+
 Test interceptor: `HostcallInterceptor` trait allows test code to
 short-circuit hostcall dispatch, returning predetermined outcomes without
 touching real tools, network, or filesystem.
 
 ## File Map
 
-| File                        | Responsibility                                    |
-|-----------------------------|---------------------------------------------------|
-| `src/extensions.rs`         | ExtensionManager, policy, dispatch, lifecycle     |
-| `src/extensions_js.rs`      | QuickJS runtime, virtual modules, HostcallKind    |
-| `src/extension_dispatcher.rs`| ExtensionSession impls, NullSession, TestSession |
-| `src/config.rs`             | ExtensionPolicyConfig, resolved policy            |
-| `src/providers/mod.rs`      | ExtensionStreamSimpleProvider                     |
-| `src/connectors.rs`         | Shared ABI dispatch, HttpConnector                |
-| `src/auth.rs`               | OAuth token management for extension providers    |
+| File | Responsibility |
+|------|----------------|
+| `src/extensions.rs` | Stable public façade; public type definitions, manager state, and shared dispatch entry points |
+| `src/extensions/extension_manager_impl.rs` | `ExtensionManager` lifecycle, policy, registry, and event-orchestration implementation |
+| `src/extensions/protocol.rs` | Versioned message validation plus hostcall reactor, marshalling, and opcode internals |
+| `src/extensions/fs_connector.rs` | Capability-scoped filesystem connector implementation |
+| `src/extensions/exec_mediation.rs` | Dangerous-command classification and secret-broker policy implementation |
+| `src/extensions/permission_drift.rs` | Permission snapshot drift classification and evidence |
+| `src/extensions/event_coalescer_impl.rs` | Coalesced event-dispatch implementation |
+| `src/extensions/native_runtime_duplicate_scaffold.rs` | Active deterministic native descriptor runtime |
+| `src/extensions/native_runtime_experimental.rs` | Retained, compile-disabled native runtime prototype |
+| `src/extensions/wasm_host.rs` | Feature-gated Wasmtime component host and its conformance tests |
+| `src/extensions/compatibility.rs` | Extension compatibility scanner |
+| `src/extensions/policy_snapshot_tests.rs` | Compiled-policy snapshot characterization tests |
+| `src/extensions/tests.rs`, `src/extensions/tests/` | Test router and behavior-domain unit/characterization suites |
+| `src/extensions_js.rs` | QuickJS runtime, virtual modules, and `HostcallKind` |
+| `src/extension_dispatcher.rs` | `ExtensionSession` implementations and dispatcher integration |
+| `src/config.rs` | `ExtensionPolicyConfig` and resolved policy |
+| `src/providers/mod.rs` | `ExtensionStreamSimpleProvider` |
+| `src/connectors/mod.rs`, `src/connectors/http.rs` | Shared connector façade and `HttpConnector` implementation |
+| `src/auth.rs` | OAuth token management for extension providers |

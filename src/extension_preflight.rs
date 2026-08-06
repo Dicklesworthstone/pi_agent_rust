@@ -825,14 +825,27 @@ impl<'a> PreflightAnalyzer<'a> {
 /// absent.
 fn validate_extension_scan_input(path: &Path) -> std::io::Result<bool> {
     #[cfg(unix)]
-    ensure_extension_scan_ancestors_searchable(path)?;
+    {
+        let access_context = crate::platform::EffectiveModeAccessContext::current()?;
+        ensure_extension_scan_ancestors_searchable(path, &access_context)?;
 
-    if !path.try_exists()? {
-        return Ok(false);
+        if !path.try_exists()? {
+            return Ok(false);
+        }
+
+        validate_extension_scan_permissions_after_lexical(path, &access_context)?;
+        Ok(true)
     }
 
-    validate_extension_scan_permissions(path)?;
-    Ok(true)
+    #[cfg(not(unix))]
+    {
+        if !path.try_exists()? {
+            return Ok(false);
+        }
+
+        validate_extension_scan_permissions(path)?;
+        Ok(true)
+    }
 }
 
 /// Require search access through both the lexical input path and its canonical
@@ -841,11 +854,20 @@ fn validate_extension_scan_input(path: &Path) -> std::io::Result<bool> {
 /// as `input.js -> locked/extension.js`.
 #[cfg(unix)]
 fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
-    use crate::platform::{UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, ensure_effective_mode_access};
+    let access_context = crate::platform::EffectiveModeAccessContext::current()?;
+    ensure_extension_scan_ancestors_searchable(path, &access_context)?;
+    validate_extension_scan_permissions_after_lexical(path, &access_context)
+}
 
-    ensure_extension_scan_ancestors_searchable(path)?;
+#[cfg(unix)]
+fn validate_extension_scan_permissions_after_lexical(
+    path: &Path,
+    access_context: &crate::platform::EffectiveModeAccessContext,
+) -> std::io::Result<()> {
+    use crate::platform::{UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH};
+
     let canonical_path = std::fs::canonicalize(path)?;
-    ensure_extension_scan_ancestors_searchable(&canonical_path)?;
+    ensure_extension_scan_ancestors_searchable(&canonical_path, access_context)?;
 
     let mut pending = vec![canonical_path];
     while let Some(scan_path) = pending.pop() {
@@ -854,7 +876,7 @@ fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
         if metadata.is_file() {
             // A direct security-scan input is read even when its extension is
             // not JS-like. Descendant files enter `pending` only when scannable.
-            ensure_effective_mode_access(
+            access_context.ensure(
                 &metadata,
                 &scan_path,
                 UNIX_ACCESS_READ,
@@ -867,7 +889,7 @@ fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
             continue;
         }
 
-        ensure_effective_mode_access(
+        access_context.ensure(
             &metadata,
             &scan_path,
             UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
@@ -899,8 +921,11 @@ fn validate_extension_scan_permissions(_path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn ensure_extension_scan_ancestors_searchable(path: &Path) -> std::io::Result<()> {
-    use crate::platform::{UNIX_ACCESS_SEARCH, ensure_effective_mode_access};
+fn ensure_extension_scan_ancestors_searchable(
+    path: &Path,
+    access_context: &crate::platform::EffectiveModeAccessContext,
+) -> std::io::Result<()> {
+    use crate::platform::UNIX_ACCESS_SEARCH;
 
     let absolute_path = if path.is_absolute() {
         path.to_path_buf()
@@ -920,7 +945,7 @@ fn ensure_extension_scan_ancestors_searchable(path: &Path) -> std::io::Result<()
                         format!("Not a directory: {}", directory.display()),
                     ));
                 }
-                ensure_effective_mode_access(
+                access_context.ensure(
                     &metadata,
                     directory,
                     UNIX_ACCESS_SEARCH,
@@ -3917,6 +3942,139 @@ pi.exec("ls");
                 .any(|finding| finding.rule_id == SecurityRuleId::EvalUsage),
             "security scan must not fall through to the other mode class"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_walk_ignores_only_directories_ignored_by_both_scanners() {
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+
+        assert!(extension_scan_directory_is_ignored_by_all(
+            &temp_dir.path().join("node_modules")
+        ));
+        assert!(extension_scan_directory_is_ignored_by_all(
+            &temp_dir.path().join(".git")
+        ));
+        for name in ["target", "dist", ".hidden"] {
+            assert!(
+                !extension_scan_directory_is_ignored_by_all(&temp_dir.path().join(name)),
+                "{name} is still read by at least one scanner"
+            );
+        }
+
+        let mut mode_guards = Vec::new();
+        for name in ["node_modules", ".git"] {
+            let ignored_dir = temp_dir.path().join(name);
+            std::fs::create_dir(&ignored_dir).expect("create ignored directory");
+            std::fs::write(
+                ignored_dir.join("ignored.js"),
+                "eval('ignored by both scanners');\n",
+            )
+            .expect("write ignored source");
+            mode_guards.push(ModeRestoreGuard::deny_all(&ignored_dir));
+        }
+
+        let permission_result = validate_extension_scan_input(temp_dir.path());
+        let preflight = analyzer.analyze(temp_dir.path());
+        let security =
+            SecurityScanner::scan_path("ignored-by-both", temp_dir.path(), temp_dir.path());
+
+        for guard in mode_guards {
+            guard.restore();
+        }
+
+        assert!(permission_result.expect("validate ignored directories"));
+        assert_eq!(preflight.verdict, PreflightVerdict::Pass);
+        assert!(preflight.findings.is_empty());
+        assert!(security.findings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_walk_covers_directories_read_by_either_scanner() {
+        for name in ["target", ".hidden"] {
+            let policy = ExtensionPolicy::default();
+            let analyzer = PreflightAnalyzer::new(&policy, None);
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let blocked_dir = temp_dir.path().join(name);
+            std::fs::create_dir(&blocked_dir).expect("create scanner-specific directory");
+            std::fs::write(
+                blocked_dir.join("blocked.js"),
+                "eval('must not be scanned');\n",
+            )
+            .expect("write blocked source");
+            let mode_guard = ModeRestoreGuard::deny_all(&blocked_dir);
+
+            let permission_result = validate_extension_scan_input(temp_dir.path());
+            let preflight = analyzer.analyze(temp_dir.path());
+            let security =
+                SecurityScanner::scan_path("scanner-union", temp_dir.path(), temp_dir.path());
+
+            mode_guard.restore();
+
+            let permission_error = permission_result
+                .expect_err("a directory read by either scanner must be permission-validated");
+            assert_eq!(
+                permission_error.kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            assert!(
+                permission_error
+                    .to_string()
+                    .contains(&blocked_dir.display().to_string()),
+                "permission error must identify {name}: {permission_error}"
+            );
+            assert_eq!(preflight.verdict, PreflightVerdict::Fail);
+            assert_eq!(preflight.findings.len(), 1);
+            assert_eq!(
+                preflight.findings[0].category,
+                FindingCategory::AnalysisInput
+            );
+            assert_eq!(security.findings.len(), 1);
+            assert_eq!(
+                security.findings[0].rule_id,
+                SecurityRuleId::ScanInputFailure
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_scans_ignore_nested_symlinks_consistently() {
+        use std::os::unix::fs::symlink;
+
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let extension_root = temp_dir.path().join("extension");
+        std::fs::create_dir(&extension_root).expect("create extension root");
+        let blocked_target_parent = temp_dir.path().join("blocked-target");
+        std::fs::create_dir(&blocked_target_parent).expect("create blocked target parent");
+        let target = blocked_target_parent.join("target.js");
+        std::fs::write(&target, "eval('nested symlink target');\n")
+            .expect("write nested symlink target");
+        let nested_link = extension_root.join("nested.js");
+        symlink(&target, &nested_link).expect("create nested source symlink");
+        let mode_guard = ModeRestoreGuard::deny_all(&blocked_target_parent);
+
+        let permission_result = validate_extension_scan_input(&extension_root);
+        let preflight = analyzer.analyze(&extension_root);
+        let security =
+            SecurityScanner::scan_path("nested-symlink", &extension_root, &extension_root);
+
+        mode_guard.restore();
+
+        assert!(
+            nested_link
+                .try_exists()
+                .expect("probe restored symlink target")
+        );
+        assert!(permission_result.expect("ignore nested symlink"));
+        assert_eq!(preflight.verdict, PreflightVerdict::Pass);
+        assert!(preflight.findings.is_empty());
+        assert!(security.findings.is_empty());
     }
 
     #[test]

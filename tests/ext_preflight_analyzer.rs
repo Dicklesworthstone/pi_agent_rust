@@ -59,6 +59,94 @@ fn compatibility_contracts_keep_their_public_type_identity() {
 }
 
 #[test]
+fn decomposed_extension_contracts_keep_their_public_type_identity() {
+    macro_rules! assert_extension_type_identity {
+        ($($name:ident),+ $(,)?) => {
+            $(
+                assert_eq!(
+                    std::any::type_name::<pi::extensions::$name>(),
+                    concat!("pi::extensions::", stringify!($name)),
+                );
+            )+
+        };
+    }
+
+    assert_extension_type_identity!(
+        FsOp,
+        FsScopes,
+        FsConnector,
+        ExtensionPermissionTrust,
+        ExtensionPermissionSnapshot,
+        ExtensionPermissionDriftClass,
+        ExtensionPermissionRiskLevel,
+        ExtensionPermissionProvenanceStatus,
+        ExtensionPermissionDriftVerdict,
+        ExtensionPermissionDriftReport,
+        DangerousCommandClass,
+        ExecRiskTier,
+        ExecMediationPolicy,
+        ExecMediationResult,
+        SecretBrokerPolicy,
+        ExecMediationLedgerEntry,
+        SecretBrokerLedgerEntry,
+        ExecMediationArtifact,
+        SecretBrokerArtifact,
+        ExtensionMessage,
+        ExtensionBody,
+        RegisterPayload,
+        CapabilityManifest,
+        CapabilityRequirement,
+        CapabilityScope,
+        CapabilityProvenance,
+        CapabilityIntegrityAttestation,
+        CapabilityPublisherAttestation,
+        ToolCallPayload,
+        ToolResultPayload,
+        HostCallPayload,
+        HostCallErrorCode,
+        HostCallError,
+        HostStreamChunk,
+        HostStreamBackpressure,
+        HostResultPayload,
+        CommonHostcallOpcode,
+        HostcallReactorConfig,
+        HostcallReactorRequest,
+        HostcallReactorCompletion,
+        HostcallReactorBackpressure,
+        HostcallReactorTelemetry,
+        HostcallReactorMesh,
+        SlashCommandPayload,
+        SlashResultPayload,
+        EventHookPayload,
+        LogPayload,
+        LogCorrelation,
+        LogSource,
+        LogComponent,
+        LogLevel,
+        ErrorPayload,
+        ExtensionUiRequest,
+        ExtensionUiResponse,
+        ExtensionDeliverAs,
+        ExtensionSendMessage,
+        ExtensionSendUserMessage,
+        ExtensionAiCompletionRequest,
+    );
+
+    assert_eq!(
+        std::any::type_name::<pi::extensions::HostCallContext<'static>>(),
+        "pi::extensions::HostCallContext<'_>",
+    );
+    assert_eq!(
+        std::any::type_name::<&dyn pi::extensions::ExtensionSession>(),
+        "&dyn pi::extensions::ExtensionSession",
+    );
+    assert_eq!(
+        std::any::type_name::<&dyn pi::extensions::ExtensionHostActions>(),
+        "&dyn pi::extensions::ExtensionHostActions",
+    );
+}
+
+#[test]
 fn empty_extension_reports_pass() {
     let report = analyze_source("// empty extension\n");
     assert_eq!(report.verdict, PreflightVerdict::Pass);
