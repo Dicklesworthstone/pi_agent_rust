@@ -116,7 +116,7 @@ fn build_verdict(checks: &[ConformanceCheck], generated_at: String) -> SecConfor
         "fail"
     };
 
-    let report = SecConformanceVerdict {
+    SecConformanceVerdict {
         schema: "pi.sec.compatibility_conformance.v1".to_string(),
         generated_at,
         bead: "bd-1a2cu".to_string(),
@@ -129,9 +129,7 @@ fn build_verdict(checks: &[ConformanceCheck], generated_at: String) -> SecConfor
         threshold_pct: threshold,
         checks: checks.to_vec(),
         categories,
-    };
-
-    report
+    }
 }
 
 fn validate_verdict_payload(report: &SecConformanceVerdict, checks: &[ConformanceCheck]) -> String {

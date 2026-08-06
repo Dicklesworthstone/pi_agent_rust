@@ -1323,7 +1323,7 @@ fn emit_compat_events_jsonl() {
         assert!(
             roundtripped
                 .get("ts")
-                .is_some_and(|value| value.is_string()),
+                .is_some_and(serde_json::Value::is_string),
             "compatibility event timestamp must be a string"
         );
         lines.push(line);

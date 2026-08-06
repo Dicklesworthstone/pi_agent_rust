@@ -554,7 +554,6 @@ fn ingest_parity_report(statuses: &mut BTreeMap<String, ExtensionStatus>, report
         let status = statuses.entry(ext_id.to_string()).or_default();
         match status_str {
             "match" => status.parity_match += 1,
-            "mismatch" | "ts_error" | "rust_error" => status.parity_mismatch += 1,
             "skip" => {}
             _ => status.parity_mismatch += 1,
         }

@@ -8605,16 +8605,16 @@ fn assert_view_bounded(surface: &str, view: &str, terminal_height: usize) {
 const TUI_PERF_ARTIFACT_GENERATION_ENV: &str = "PI_GENERATE_TUI_PERF_ARTIFACTS";
 
 fn tui_perf_artifact_generation_enabled() -> bool {
-    match std::env::var(TUI_PERF_ARTIFACT_GENERATION_ENV) {
-        Err(std::env::VarError::NotPresent) => false,
-        Ok(value) if value == "1" => true,
-        Ok(value) => {
-            panic!("{TUI_PERF_ARTIFACT_GENERATION_ENV} must be unset or exactly '1', got {value:?}")
-        }
-        Err(std::env::VarError::NotUnicode(value)) => {
-            panic!("{TUI_PERF_ARTIFACT_GENERATION_ENV} must contain valid UTF-8, got {value:?}")
-        }
-    }
+    let Some(value) = std::env::var_os(TUI_PERF_ARTIFACT_GENERATION_ENV) else {
+        return false;
+    };
+    assert_eq!(
+        value,
+        std::ffi::OsStr::new("1"),
+        "{TUI_PERF_ARTIFACT_GENERATION_ENV} must be unset or exactly '1', got {}",
+        value.display()
+    );
+    true
 }
 
 fn write_verified_perf_artifact(path: &std::path::Path, payload: &str) {
