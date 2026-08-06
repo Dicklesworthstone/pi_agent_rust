@@ -111,6 +111,155 @@ fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn unix_mode_grants_any_class(mode: u32, required_bits: u32) -> bool {
+    [6, 3, 0]
+        .into_iter()
+        .any(|shift| ((mode >> shift) & required_bits) == required_bits)
+}
+
+#[cfg(unix)]
+fn unix_mode_permission_denied(path: &Path, operation: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!(
+            "{operation} denied by Unix mode bits for {}",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(unix)]
+fn ensure_session_ancestors_searchable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut ancestor = path.parent();
+    while let Some(directory) = ancestor {
+        if directory.as_os_str().is_empty() {
+            break;
+        }
+
+        match std::fs::metadata(directory) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !unix_mode_grants_any_class(metadata.permissions().mode(), 0o1) =>
+            {
+                return Err(unix_mode_permission_denied(directory, "path traversal"));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        ancestor = directory.parent();
+    }
+
+    Ok(())
+}
+
+/// Probe a session path without allowing UID 0 to reinterpret a directory
+/// with no search bits as accessible. The real filesystem probe remains the
+/// final authority for ownership, ACLs, and platform-specific errors.
+pub(crate) fn session_path_try_exists(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    ensure_session_ancestors_searchable(path)?;
+
+    path.try_exists()
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_session_file_readable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    ensure_session_ancestors_searchable(path)?;
+    let metadata = std::fs::metadata(path)?;
+    if !unix_mode_grants_any_class(metadata.permissions().mode(), 0o4) {
+        return Err(unix_mode_permission_denied(path, "read"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_session_file_readable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_session_directory_readable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    ensure_session_ancestors_searchable(path)?;
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_dir() && !unix_mode_grants_any_class(metadata.permissions().mode(), 0o5) {
+        return Err(unix_mode_permission_denied(path, "directory listing"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_session_directory_readable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_session_file_writable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    ensure_session_ancestors_searchable(path)?;
+    let metadata = std::fs::metadata(path)?;
+    if !unix_mode_grants_any_class(metadata.permissions().mode(), 0o2) {
+        return Err(unix_mode_permission_denied(path, "write"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_session_file_writable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_session_file_read_write(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    ensure_session_ancestors_searchable(path)?;
+    let metadata = std::fs::metadata(path)?;
+    if !unix_mode_grants_any_class(metadata.permissions().mode(), 0o6) {
+        return Err(unix_mode_permission_denied(path, "read-write access"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_session_file_read_write(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_session_parent_writable(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let parent = path
+        .parent()
+        .filter(|candidate| !candidate.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure_session_ancestors_searchable(parent)?;
+    let metadata = std::fs::metadata(parent)?;
+    if metadata.is_dir() && !unix_mode_grants_any_class(metadata.permissions().mode(), 0o3) {
+        return Err(unix_mode_permission_denied(parent, "file creation"));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ensure_session_parent_writable(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 fn save_jsonl_full_rewrite_blocking(
     path: &Path,
     sessions_root: &Path,
@@ -119,6 +268,7 @@ fn save_jsonl_full_rewrite_blocking(
     persisted_entry_count: usize,
     header_dirty: bool,
 ) -> Result<(SessionHeader, Vec<SessionEntry>)> {
+    ensure_session_parent_writable(path).map_err(|err| crate::Error::Io(Box::new(err)))?;
     let _lock = lock_session_persistence(path)?;
     let (header_to_write, entries_to_write) =
         prepare_jsonl_full_rewrite(path, header, entries, persisted_entry_count, header_dirty)?;
@@ -171,6 +321,7 @@ fn append_jsonl_entries_blocking(
     message_count: u64,
     session_name: Option<String>,
 ) -> Result<()> {
+    ensure_session_file_writable(path).map_err(|err| crate::Error::Io(Box::new(err)))?;
     let _lock = lock_session_persistence(path)?;
     let mut file = std::fs::OpenOptions::new()
         .append(true)
@@ -225,10 +376,7 @@ fn prepare_jsonl_full_rewrite(
     let local_pending = &entries[pending_start..];
     let mut header_to_write = header.clone();
 
-    if path
-        .try_exists()
-        .map_err(|e| crate::Error::Io(Box::new(e)))?
-    {
+    if session_path_try_exists(path).map_err(|e| crate::Error::Io(Box::new(e)))? {
         let (disk_session, _) = open_jsonl_blocking(path.to_path_buf())?;
         if !header_dirty {
             header_to_write = disk_session.header;
@@ -1659,11 +1807,12 @@ impl Session {
     }
 
     async fn open_path_with_diagnostics(path: PathBuf) -> Result<(Self, SessionOpenDiagnostics)> {
-        if !path.exists() {
+        if !session_path_try_exists(&path).map_err(|err| Error::Io(Box::new(err)))? {
             return Err(crate::Error::SessionNotFound {
                 path: path.display().to_string(),
             });
         }
+        ensure_session_file_readable(&path).map_err(|err| Error::Io(Box::new(err)))?;
 
         if path
             .extension()
@@ -3842,6 +3991,8 @@ async fn scan_sessions_on_disk(
                 let mut entries = Vec::new();
                 let mut refreshed_entries = Vec::new();
                 let mut failed_paths = Vec::new();
+                ensure_session_directory_readable(&path_buf)
+                    .map_err(|err| Error::Io(Box::new(err)))?;
                 let dir_entries = std::fs::read_dir(&path_buf)
                     .map_err(|e| Error::session(format!("Failed to read sessions: {e}")))?;
 
@@ -3909,6 +4060,7 @@ struct PartialEntry {
 }
 
 fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
+    ensure_session_file_readable(path).map_err(|err| Error::Io(Box::new(err)))?;
     let file = std::fs::File::open(path)
         .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
     let mut reader = BufReader::new(file);
@@ -4808,6 +4960,7 @@ const JSONL_PARSE_BATCH_SIZE: usize = 8192;
 /// finalization) for the fastest possible open path.
 #[allow(clippy::too_many_lines)]
 fn open_jsonl_blocking(path_buf: PathBuf) -> Result<(Session, SessionOpenDiagnostics)> {
+    ensure_session_file_readable(&path_buf).map_err(|err| crate::Error::Io(Box::new(err)))?;
     let file = std::fs::File::open(&path_buf).map_err(|e| crate::Error::Io(Box::new(e)))?;
     let mut reader = std::io::BufReader::new(file);
 
@@ -5786,11 +5939,59 @@ mod tests {
         };
     }
 
+    #[cfg(unix)]
+    struct UnixModeGuard {
+        path: PathBuf,
+        original: Option<std::fs::Permissions>,
+    }
+
+    #[cfg(unix)]
+    impl UnixModeGuard {
+        fn apply(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let original = std::fs::metadata(path)
+                .expect("permission fixture metadata")
+                .permissions();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("apply permission fixture mode");
+            Self {
+                path: path.to_path_buf(),
+                original: Some(original),
+            }
+        }
+
+        fn restore(&mut self) {
+            if let Some(original) = self.original.as_ref() {
+                std::fs::set_permissions(&self.path, original.clone())
+                    .expect("restore permission fixture mode");
+                self.original = None;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnixModeGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                let _ = std::fs::set_permissions(&self.path, original);
+            }
+        }
+    }
+
     fn make_test_message(text: &str) -> SessionMessage {
         SessionMessage::User {
             content: UserContent::Text(text.to_string()),
             timestamp: Some(0),
         }
+    }
+
+    #[cfg(unix)]
+    fn assert_permission_denied(error: &crate::Error) {
+        let crate::Error::Io(io_error) = error else {
+            test_fail!("expected typed I/O error, got {error}");
+        };
+        assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     fn make_test_assistant_message(text: &str, total_tokens: u64) -> SessionMessage {
@@ -9513,7 +9714,6 @@ mod tests {
     #[test]
     fn split_indexed_session_entries_keeps_permission_denied_path_out_of_missing_bucket() {
         use crate::session_index::SessionMeta;
-        use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
         let guarded_dir = temp.path().join("guarded");
@@ -9521,17 +9721,9 @@ mod tests {
         let session_path = guarded_dir.join("session.jsonl");
         std::fs::write(&session_path, b"{\"version\":\"3\"}\n").expect("write session file");
 
-        let original_mode = std::fs::metadata(&guarded_dir)
-            .expect("guarded dir metadata")
-            .permissions()
-            .mode();
-        std::fs::set_permissions(&guarded_dir, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod guarded dir");
+        let mut mode_guard = UnixModeGuard::apply(&guarded_dir, 0o000);
 
-        assert!(
-            session_path.try_exists().is_err(),
-            "expected permission-denied path probe for inaccessible parent directory"
-        );
+        let denied_probe = session_path_try_exists(&session_path);
 
         let meta = SessionMeta {
             path: session_path.display().to_string(),
@@ -9546,8 +9738,11 @@ mod tests {
 
         let (entries, missing_paths) = split_indexed_session_entries(vec![meta]);
 
-        std::fs::set_permissions(&guarded_dir, std::fs::Permissions::from_mode(original_mode))
-            .expect("restore guarded dir permissions");
+        mode_guard.restore();
+
+        let denied = denied_probe
+            .expect_err("an indexed path below a mode-000 directory must fail its existence probe");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
 
         assert!(
             missing_paths.is_empty(),
@@ -9560,19 +9755,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn test_continue_recent_in_dir_prunes_unreadable_cached_entry_on_open_failure() {
-        use std::os::unix::fs::PermissionsExt;
-
         let temp = tempfile::tempdir().unwrap();
         let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
         session.append_message(make_test_message("first"));
 
         run_async(async { session.save().await }).expect("save session");
         let path = session.path.clone().expect("session path");
-
-        let original_mode = std::fs::metadata(&path)
-            .expect("session metadata")
-            .permissions()
-            .mode();
 
         let index = SessionIndex::for_sessions_root(temp.path());
         index.index_session(&session).expect("index session");
@@ -9582,16 +9770,20 @@ mod tests {
             .display()
             .to_string();
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
-            .expect("chmod unreadable");
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o000);
+
+        let denied_probe = ensure_session_file_readable(&path);
 
         let resumed = run_async(async {
             Session::continue_recent_in_dir(Some(temp.path()), &Config::default()).await
         })
         .expect("continue recent");
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode))
-            .expect("restore permissions");
+        mode_guard.restore();
+
+        let denied = denied_probe
+            .expect_err("a mode-000 session must fail the production readability preflight");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
 
         assert!(resumed.path.is_none(), "expected a fresh unsaved session");
         assert_eq!(resumed.session_dir, Some(temp.path().to_path_buf()));
@@ -11246,7 +11438,9 @@ mod tests {
         run_async(async { session.save().await }).unwrap();
         let path = session.path.clone().unwrap();
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        // Retained intentionally: this is a successful atomic-rewrite test of
+        // mode-bit preservation, not a permission-denied fault fixture.
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
 
         session.set_model_header(Some("new-provider".to_string()), None, None);
         session.append_message(make_test_message("second"));
@@ -11254,6 +11448,7 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o444, "full rewrite must preserve existing mode bits");
+        mode_guard.restore();
     }
 
     #[test]
@@ -11554,6 +11749,7 @@ mod tests {
         assert_eq!(session.appends_since_checkpoint, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn crash_persisted_count_unchanged_on_append_failure() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -11567,30 +11763,14 @@ mod tests {
         let path = session.path.clone().unwrap();
         session.append_message(make_test_message("msg B"));
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
-                // Some environments (for example root-run test runners) bypass chmod restrictions.
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-                return;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return;
-        }
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
 
         let result = run_async(async { session.save().await });
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        mode_guard.restore();
 
-        assert!(result.is_err());
+        let error = result.expect_err("append to a mode-0444 session must fail");
+        assert_permission_denied(&error);
         assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         run_async(async { session.save().await }).unwrap();
@@ -11718,6 +11898,7 @@ mod tests {
         assert_eq!(value, 7);
     }
 
+    #[cfg(unix)]
     #[test]
     fn crash_entries_survive_failed_full_rewrite() {
         // Entries are cloned during full rewrite to avoid losing them if the async future drops.
@@ -11733,40 +11914,25 @@ mod tests {
         session.set_model_header(Some("new-provider".to_string()), None, None);
         session.append_message(make_test_message("msg B"));
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let parent = path.parent().unwrap();
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o555)).unwrap();
-            if tempfile::NamedTempFile::new_in(parent).is_ok() {
-                // Some environments (for example root-run test runners) bypass chmod restrictions.
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-                return;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return;
-        }
+        let parent = path.parent().unwrap();
+        let mut mode_guard = UnixModeGuard::apply(parent, 0o555);
 
         let result = run_async(async { session.save().await });
-        assert!(result.is_err());
+
+        mode_guard.restore();
+
+        let error = result.expect_err("full rewrite below a mode-0555 directory must fail");
+        assert_permission_denied(&error);
 
         assert_eq!(session.entries.len(), 2, "entries restored");
         assert_eq!(session.entry_index.len(), 2);
         assert!(session.header_dirty);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let parent = path.parent().unwrap();
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
         run_async(async { session.save().await }).unwrap();
         assert!(!session.header_dirty);
     }
 
+    #[cfg(unix)]
     #[test]
     fn crash_metrics_accumulate_across_failure_recovery() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -11781,33 +11947,20 @@ mod tests {
         assert_eq!(m.flush_succeeded, 1);
         assert_eq!(m.flush_failed, 0);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
-                // Some environments (for example root-run test runners) bypass chmod restrictions.
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-                return;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return;
-        }
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
 
         session.append_message(make_test_message("msg B"));
-        let _ = run_async(async { session.save().await });
+        let result = run_async(async { session.save().await });
+
+        mode_guard.restore();
+
+        let error = result.expect_err("append to a mode-0444 session must fail");
+        assert_permission_denied(&error);
 
         let m = session.autosave_metrics();
         assert_eq!(m.flush_failed, 1);
         assert!(m.pending_mutations > 0);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
         run_async(async { session.save().await }).unwrap();
 
         let m = session.autosave_metrics();
@@ -11887,6 +12040,7 @@ mod tests {
         assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 20);
     }
 
+    #[cfg(unix)]
     #[test]
     fn crash_append_retry_after_transient_failure() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -11899,30 +12053,15 @@ mod tests {
 
         session.append_message(make_test_message("msg B"));
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
-            if std::fs::OpenOptions::new().append(true).open(&path).is_ok() {
-                // Some environments (for example root-run test runners) bypass chmod restrictions.
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-                return;
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            return;
-        }
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
 
         let result = run_async(async { session.save().await });
-        assert!(result.is_err());
-        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
+        mode_guard.restore();
+
+        let error = result.expect_err("append to a mode-0444 session must fail");
+        assert_permission_denied(&error);
+        assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 1);
 
         run_async(async { session.save().await }).unwrap();
         assert_eq!(session.persisted_entry_count.load(Ordering::SeqCst), 2);

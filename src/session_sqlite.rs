@@ -39,11 +39,19 @@ fn map_sqlite_result<T>(result: std::result::Result<T, SqliteError>) -> Result<T
 }
 
 fn open_sqlite_connection_read_only(path: &Path) -> Result<SqliteConnection> {
+    crate::session::ensure_session_file_readable(path).map_err(|err| Error::Io(Box::new(err)))?;
     let config = SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::read_only());
     map_sqlite_result(SqliteConnection::open(&config))
 }
 
 fn open_sqlite_connection_read_write(path: &Path) -> Result<SqliteConnection> {
+    // SQLite may create or update WAL/SHM sidecars beside an existing database,
+    // so the parent must remain creatable as well as the database read-write.
+    crate::session::ensure_session_parent_writable(path).map_err(|err| Error::Io(Box::new(err)))?;
+    if crate::session::session_path_try_exists(path).map_err(|err| Error::Io(Box::new(err)))? {
+        crate::session::ensure_session_file_read_write(path)
+            .map_err(|err| Error::Io(Box::new(err)))?;
+    }
     let config = SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::create_read_write());
     map_sqlite_result(SqliteConnection::open(&config))
 }
@@ -75,7 +83,7 @@ fn append_sidecar_suffix(path: &Path, suffix: &str) -> PathBuf {
 fn set_private_permissions_if_present(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
-    if path.try_exists().map_err(|err| Error::Io(Box::new(err)))? {
+    if crate::session::session_path_try_exists(path).map_err(|err| Error::Io(Box::new(err)))? {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|err| {
             Error::session(format!(
                 "Failed to secure SQLite session artifact {}: {err}",
@@ -158,7 +166,7 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
     let metrics = session_metrics::global();
     let _timer = metrics.start_timer(&metrics.sqlite_load);
 
-    if !path.exists() {
+    if !crate::session::session_path_try_exists(path).map_err(|err| Error::Io(Box::new(err)))? {
         return Err(Error::SessionNotFound {
             path: path.display().to_string(),
         });
@@ -194,7 +202,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
     let metrics = session_metrics::global();
     let _timer = metrics.start_timer(&metrics.sqlite_load_meta);
 
-    if !path.exists() {
+    if !crate::session::session_path_try_exists(path).map_err(|err| Error::Io(Box::new(err)))? {
         return Err(Error::SessionNotFound {
             path: path.display().to_string(),
         });
@@ -257,6 +265,59 @@ mod tests {
     use super::*;
     use crate::model::UserContent;
     use crate::session::{EntryBase, MessageEntry, SessionInfoEntry, SessionMessage};
+
+    #[cfg(unix)]
+    struct UnixModeGuard {
+        path: PathBuf,
+        original: Option<std::fs::Permissions>,
+    }
+
+    #[cfg(unix)]
+    impl UnixModeGuard {
+        fn apply(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let original = std::fs::metadata(path)
+                .expect("permission fixture metadata")
+                .permissions();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("apply permission fixture mode");
+            Self {
+                path: path.to_path_buf(),
+                original: Some(original),
+            }
+        }
+
+        fn restore(&mut self) {
+            if let Some(original) = self.original.as_ref() {
+                std::fs::set_permissions(&self.path, original.clone())
+                    .expect("restore permission fixture mode");
+                self.original = None;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnixModeGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                let _ = std::fs::set_permissions(&self.path, original);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_permission_denied(error: &Error) {
+        let kind = match error {
+            Error::Io(io_error) => Some(io_error.kind()),
+            _ => None,
+        };
+        assert_eq!(
+            kind,
+            Some(std::io::ErrorKind::PermissionDenied),
+            "expected typed PermissionDenied error, got {error}"
+        );
+    }
 
     fn dummy_base() -> EntryBase {
         EntryBase {
@@ -701,8 +762,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_paths_accept_read_only_sqlite_files() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("readonly.sqlite");
         let header = SessionHeader {
@@ -717,12 +776,9 @@ mod tests {
         futures::executor::block_on(async { save_session(&path, &header, &entries).await })
             .expect("save sqlite session");
 
-        let original_mode = std::fs::metadata(&path)
-            .expect("sqlite metadata")
-            .permissions()
-            .mode();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
-            .expect("chmod readonly sqlite");
+        // Retained intentionally: this verifies that read-only load paths need
+        // read permission only and never attempt to mutate the database.
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
 
         let (loaded_header, loaded_entries) =
             futures::executor::block_on(async { load_session(&path).await })
@@ -730,14 +786,53 @@ mod tests {
         let meta = futures::executor::block_on(async { load_session_meta(&path).await })
             .expect("load readonly sqlite meta");
 
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(original_mode))
-            .expect("restore sqlite permissions");
-
         assert_eq!(loaded_header.id, header.id);
         assert_eq!(loaded_entries.len(), entries.len());
         assert_eq!(meta.header.id, header.id);
         assert_eq!(meta.message_count, 1);
         assert_eq!(meta.name.as_deref(), Some("Read Only"));
+        mode_guard.restore();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_session_rejects_read_only_sqlite_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("readonly-save.sqlite");
+        let original_header = SessionHeader {
+            id: "sqlite-readonly-save".to_string(),
+            ..SessionHeader::default()
+        };
+        let original_entries = vec![message_entry()];
+
+        futures::executor::block_on(async {
+            save_session(&path, &original_header, &original_entries).await
+        })
+        .expect("seed sqlite session");
+
+        let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
+        let replacement_header = SessionHeader {
+            id: "sqlite-replacement".to_string(),
+            ..SessionHeader::default()
+        };
+        let result = futures::executor::block_on(async {
+            save_session(
+                &path,
+                &replacement_header,
+                &[message_entry(), message_entry()],
+            )
+            .await
+        });
+        mode_guard.restore();
+
+        let error = result.expect_err("saving a mode-0444 SQLite session must fail");
+        assert_permission_denied(&error);
+
+        let (loaded_header, loaded_entries) =
+            futures::executor::block_on(async { load_session(&path).await })
+                .expect("reload original sqlite session");
+        assert_eq!(loaded_header.id, original_header.id);
+        assert_eq!(loaded_entries.len(), original_entries.len());
     }
 
     #[cfg(unix)]

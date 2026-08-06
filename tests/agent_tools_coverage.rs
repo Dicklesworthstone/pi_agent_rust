@@ -51,6 +51,42 @@ use std::time::Instant;
 // Helpers
 // ===========================================================================
 
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: std::path::PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn set(path: &std::path::Path, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let original = std::fs::metadata(path)
+            .expect("stat permission fixture")
+            .permissions();
+        let mut restricted = original.clone();
+        restricted.set_mode(mode);
+        std::fs::set_permissions(path, restricted).expect("set permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::set_permissions(&self.path, self.original.clone()) {
+            eprintln!(
+                "failed to restore permissions for {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 /// Unified result from a tool execute() call: either Ok(ToolOutput) or Err(Error).
 /// For testing we treat both as "the tool produced a result" - either explicit
 /// ToolOutput or an error that the agent would wrap.
@@ -564,35 +600,25 @@ fn tool_write_deeply_nested_dirs() {
 #[cfg(unix)]
 #[test]
 fn tool_read_permission_denied() {
-    use std::os::unix::fs::PermissionsExt;
-
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("read_perm_denied");
         let target = h.create_file("noperm.txt", b"secret\n");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _mode_guard = UnixModeGuard::set(&target, 0o000);
 
         let tool = pi::tools::ReadTool::new(h.temp_dir());
         let input = json!({ "path": target.to_string_lossy() });
         let result = exec_tool(&tool, "read-perm-1", input).await;
 
-        // Restore permissions for cleanup
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-        // If the process is running as root (or in a container with root privileges),
-        // the read might succeed despite 0o000 permissions. We shouldn't fail the test then.
-        if !result.is_error {
-            assert!(result.text.contains("secret"));
-            return;
-        }
-
         assert!(result.is_error, "reading no-permission file should error");
         let text_lower = result.text.to_lowercase();
         assert!(
-            text_lower.contains("permission")
-                || text_lower.contains("denied")
-                || text_lower.contains("error"),
+            text_lower.contains("permission denied"),
             "should mention permission denied: got {}",
             result.text
+        );
+        assert!(
+            !result.text.contains("secret"),
+            "permission failure must not disclose file content"
         );
     });
 }
@@ -601,25 +627,30 @@ fn tool_read_permission_denied() {
 #[cfg(unix)]
 #[test]
 fn tool_edit_permission_denied() {
-    use std::os::unix::fs::PermissionsExt;
-
     asupersync::test_utils::run_test(|| async {
         let h = TestHarness::new("edit_perm_denied");
         let target = h.create_file("readonly.txt", b"old content\n");
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let _mode_guard = UnixModeGuard::set(&target, 0o444);
 
         let tool = pi::tools::EditTool::new(h.temp_dir());
         let input = json!({
             "path": target.to_string_lossy(),
-            "old": "old content",
-            "new": "new content"
+            "oldText": "old content",
+            "newText": "new content"
         });
         let result = exec_tool(&tool, "edit-perm-1", input).await;
 
-        // Restore permissions for cleanup
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
-
         assert!(result.is_error, "editing read-only file should error");
+        assert!(
+            result.text.to_lowercase().contains("permission denied"),
+            "edit should report PermissionDenied: {}",
+            result.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read unchanged fixture"),
+            "old content\n",
+            "permission failure must leave the file unchanged"
+        );
     });
 }
 

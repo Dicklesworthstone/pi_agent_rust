@@ -68,6 +68,40 @@ fn fd_available() -> bool {
             .is_ok()
 }
 
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: std::path::PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn set(path: &Path, mode: u32) -> Self {
+        let original = fs::metadata(path)
+            .expect("stat permission fixture")
+            .permissions();
+        let mut restricted = original.clone();
+        restricted.set_mode(mode);
+        fs::set_permissions(path, restricted).expect("set permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Err(err) = fs::set_permissions(&self.path, self.original.clone()) {
+            eprintln!(
+                "failed to restore permissions for {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // Read Tool
 // ===========================================================================
@@ -481,9 +515,7 @@ fn write_permission_denied_reports_clear_error() {
     let h = TestHarness::new("write_permission_denied_reports_clear_error");
     let readonly_dir = h.temp_path("readonly");
     fs::create_dir_all(&readonly_dir).expect("create readonly dir");
-    let mut perms = fs::metadata(&readonly_dir).expect("metadata").permissions();
-    perms.set_mode(0o555);
-    fs::set_permissions(&readonly_dir, perms).expect("chmod readonly");
+    let _mode_guard = UnixModeGuard::set(&readonly_dir, 0o555);
 
     let target = readonly_dir.join("out.txt");
     let registry = make_registry(h.temp_dir());
@@ -497,18 +529,11 @@ fn write_permission_denied_reports_clear_error() {
         .await
     });
 
-    // Ensure tempdir cleanup isn't permission-blocked.
-    let mut cleanup_perms = fs::metadata(&readonly_dir)
-        .expect("cleanup metadata")
-        .permissions();
-    cleanup_perms.set_mode(0o755);
-    fs::set_permissions(&readonly_dir, cleanup_perms).expect("restore permissions");
-
     let err = output.expect_err("write should fail in readonly directory");
     let msg = err.to_string().to_ascii_lowercase();
     h.log().info("result", format!("error={msg}"));
     assert!(
-        msg.contains("permission") || msg.contains("denied"),
+        msg.contains("permission denied"),
         "expected permission-denied diagnostics, got: {msg}"
     );
 }

@@ -25,6 +25,8 @@ use std::future::Future;
 use std::io::Write as _;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +38,57 @@ fn run_async<T>(future: impl Future<Output = T>) -> T {
         .build()
         .expect("build runtime");
     runtime.block_on(future)
+}
+
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: PathBuf,
+    original: Option<std::fs::Permissions>,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn apply(path: &Path, mode: u32) -> Self {
+        let original = std::fs::metadata(path)
+            .expect("permission fixture metadata")
+            .permissions();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("apply permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original: Some(original),
+        }
+    }
+
+    fn restore(&mut self) {
+        if let Some(original) = self.original.as_ref() {
+            std::fs::set_permissions(&self.path, original.clone())
+                .expect("restore permission fixture mode");
+            self.original = None;
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            let _ = std::fs::set_permissions(&self.path, original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn assert_permission_denied(error: &pi::Error) {
+    let kind = match error {
+        pi::Error::Io(io_error) => Some(io_error.kind()),
+        _ => None,
+    };
+    assert_eq!(
+        kind,
+        Some(std::io::ErrorKind::PermissionDenied),
+        "expected typed PermissionDenied error, got {error}"
+    );
 }
 
 fn make_msg(text: &str) -> SessionMessage {
@@ -385,6 +438,7 @@ fn fault_inject_stale_temp_file_after_interrupted_rewrite() {
 // Phase 4: Autosave queue state machine under fault injection
 // ===========================================================================
 
+#[cfg(unix)]
 #[test]
 fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
     let mut trace = TraceLog::new();
@@ -427,11 +481,9 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
 
     // Enqueue more mutations then force a save failure.
     session.append_message(make_msg("will-fail"));
-    // Simulate IO failure: make the file read-only.
-    let original_permissions = std::fs::metadata(&path).unwrap().permissions();
-    let mut readonly = original_permissions.clone();
-    readonly.set_mode(0o444);
-    std::fs::set_permissions(&path, readonly).unwrap();
+    // Simulate a real append failure. Session persistence honors explicit Unix
+    // mode bits even for UID 0, so the same fault reaches every test identity.
+    let mut mode_guard = UnixModeGuard::apply(&path, 0o444);
     trace.log("FAULT", "make_readonly", "set session file to read-only");
 
     // Attempt save — should fail.
@@ -442,15 +494,18 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
         format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
-    // Restore permissions.
-    let mut writable = original_permissions;
-    writable.set_mode(0o644);
-    std::fs::set_permissions(&path, writable).unwrap();
+    mode_guard.restore();
     trace.log(
         "RECOVER",
         "restore_permissions",
         "restored write permissions",
     );
+
+    let error = result.expect_err("save of a mode-0444 session must fail");
+    assert_permission_denied(&error);
+    let metrics_after_fault = session.autosave_metrics();
+    assert_eq!(metrics_after_fault.flush_failed, 1);
+    assert!(metrics_after_fault.pending_mutations > 0);
 
     // Retry save — should succeed now.
     let result = run_async(async { session.save().await });
@@ -471,6 +526,9 @@ fn fault_inject_autosave_queue_mutation_tracking_through_faults() {
             final_metrics.pending_mutations,
         ),
     );
+    assert_eq!(final_metrics.flush_succeeded, 2);
+    assert_eq!(final_metrics.flush_failed, 1);
+    assert_eq!(final_metrics.pending_mutations, 0);
 
     // Verify full round-trip.
     let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
@@ -816,6 +874,7 @@ fn fault_inject_v2_store_segment_corruption_recovery() {
 // Phase 9: Save to read-only directory simulating filesystem error
 // ===========================================================================
 
+#[cfg(unix)]
 #[test]
 fn fault_inject_save_to_readonly_filesystem() {
     let mut trace = TraceLog::new();
@@ -828,30 +887,11 @@ fn fault_inject_save_to_readonly_filesystem() {
     let path = session.path.clone().unwrap();
     trace.log("SETUP", "initial_save", "1 entry saved");
 
-    // Make parent directory read-only to simulate ENOSPC-like conditions.
+    // Make the parent directory non-writable. Session persistence honors the
+    // explicit mode bits even for UID 0, keeping this fault deterministic.
     let parent = path.parent().unwrap();
-    let orig_perms = std::fs::metadata(parent).unwrap().permissions();
-    let mut readonly_perms = orig_perms.clone();
-    readonly_perms.set_mode(0o555);
-    std::fs::set_permissions(parent, readonly_perms).unwrap();
+    let mut mode_guard = UnixModeGuard::apply(parent, 0o555);
     trace.log("FAULT", "make_parent_readonly", "directory set to r-x");
-
-    // Some execution environments (for example root-capable workers) can still
-    // create files after chmod 0555. Probe this so assertions stay deterministic.
-    let probe_path = parent.join(".readonly-probe");
-    let readonly_enforced = std::fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&probe_path)
-        .map_or(true, |_| {
-            let _ = std::fs::remove_file(&probe_path);
-            false
-        });
-    trace.log(
-        "FAULT",
-        "readonly_probe",
-        format!("readonly_enforced={readonly_enforced}"),
-    );
 
     // Force full rewrite by dirtying header.
     session.set_model_header(Some("test".to_string()), None, None);
@@ -863,40 +903,22 @@ fn fault_inject_save_to_readonly_filesystem() {
         format!("result: {}", if result.is_ok() { "ok" } else { "err" }),
     );
 
-    if readonly_enforced {
-        // The save should fail because we can't create temp files in readonly dir.
-        assert!(
-            result.is_err(),
-            "save to read-only directory should fail\nTrace:\n{}",
-            trace.dump()
-        );
-    } else {
-        // Root-capable environments may bypass directory mode restrictions.
-        assert!(
-            result.is_ok(),
-            "save unexpectedly failed in readonly-bypass environment\nTrace:\n{}",
-            trace.dump()
-        );
-    }
-
-    // Restore permissions.
-    let mut restored_perms = orig_perms;
-    restored_perms.set_mode(0o755);
-    std::fs::set_permissions(parent, restored_perms).unwrap();
+    mode_guard.restore();
     trace.log(
         "RECOVER",
         "restore_permissions",
         "directory permissions restored",
     );
 
-    // Original file should still be intact if the readonly fault was enforced.
-    // Otherwise, expect the save to have succeeded with the new entry present.
+    let error = result.expect_err("full rewrite in a mode-0555 directory must fail");
+    assert_permission_denied(&error);
+
+    // Atomic rewrite failure must leave the original file intact.
     let loaded = run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
-    let expected_len = if readonly_enforced { 1 } else { 2 };
     assert_eq!(
         loaded.entries.len(),
-        expected_len,
-        "unexpected persisted entry count after readonly fault probe\nTrace:\n{}",
+        1,
+        "unexpected persisted entry count after read-only fault\nTrace:\n{}",
         trace.dump()
     );
 

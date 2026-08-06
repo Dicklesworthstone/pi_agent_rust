@@ -14,6 +14,40 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn set(path: &Path, mode: u32) -> Self {
+        let original = std::fs::metadata(path)
+            .expect("stat permission fixture")
+            .permissions();
+        let mut restricted = original.clone();
+        restricted.set_mode(mode);
+        std::fs::set_permissions(path, restricted).expect("set permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::set_permissions(&self.path, self.original.clone()) {
+            eprintln!(
+                "failed to restore permissions for {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 mod read_tool {
     use super::*;
 
@@ -448,9 +482,7 @@ mod read_tool {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new("read_permission_denied_is_reported");
             let path = harness.create_file("secret.txt", b"top secret");
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o000);
-            std::fs::set_permissions(&path, perms).unwrap();
+            let _mode_guard = UnixModeGuard::set(&path, 0o000);
 
             let tool = pi::tools::ReadTool::new(harness.temp_dir());
             let input = serde_json::json!({
@@ -468,7 +500,10 @@ mod read_tool {
                     ctx.push(("message".into(), message.clone()));
                 });
             assert!(message.contains("Tool error: read:"));
-            assert!(message.to_lowercase().contains("permission"));
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "read should report PermissionDenied: {message}"
+            );
         });
     }
 
@@ -563,9 +598,7 @@ mod write_tool {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new("write_permission_denied_is_reported");
             let dir = harness.create_dir("readonly");
-            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-            perms.set_mode(0o500);
-            std::fs::set_permissions(&dir, perms).unwrap();
+            let _mode_guard = UnixModeGuard::set(&dir, 0o500);
 
             let tool = pi::tools::WriteTool::new(harness.temp_dir());
             let input = serde_json::json!({
@@ -584,6 +617,10 @@ mod write_tool {
                     ctx.push(("message".into(), message.clone()));
                 });
             assert!(message.contains("Tool error: write:"));
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "write should report PermissionDenied: {message}"
+            );
         });
     }
 
@@ -822,9 +859,7 @@ mod edit_tool {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new("edit_permission_denied_is_reported");
             let path = harness.create_file("locked.txt", b"secret");
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o000);
-            std::fs::set_permissions(&path, perms).unwrap();
+            let _mode_guard = UnixModeGuard::set(&path, 0o000);
 
             let tool = pi::tools::EditTool::new(harness.temp_dir());
             let input = serde_json::json!({
@@ -838,7 +873,45 @@ mod edit_tool {
                 .await
                 .expect_err("should error");
             let message = err.to_string().to_lowercase();
-            assert!(message.contains("permission"));
+            assert!(
+                message.contains("permission denied"),
+                "edit should report PermissionDenied: {message}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_edit_unsearchable_parent_is_reported() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("edit_unsearchable_parent_is_reported");
+            let locked_dir = harness.create_dir("locked_parent");
+            let path = harness.create_file("locked_parent/target.txt", b"secret");
+            let mode_guard = UnixModeGuard::set(&locked_dir, 0o000);
+
+            let tool = pi::tools::EditTool::new(harness.temp_dir());
+            let input = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "oldText": "secret",
+                "newText": "public"
+            });
+
+            let err = tool
+                .execute("test-id", input, None)
+                .await
+                .expect_err("an unsearchable parent must block editing");
+            let message = err.to_string().to_lowercase();
+            assert!(
+                message.contains("permission denied"),
+                "edit should report ancestor PermissionDenied: {message}"
+            );
+
+            drop(mode_guard);
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read restored fixture"),
+                "secret",
+                "permission failure must leave the file unchanged"
+            );
         });
     }
 
@@ -1038,6 +1111,38 @@ mod grep_tool {
                     ctx.push(("message".into(), message.clone()));
                 });
             assert!(message.contains("Cannot access path"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_grep_permission_denied_is_reported() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("grep_permission_denied_is_reported");
+            let dir = harness.create_dir("locked");
+            harness.create_file("locked/secret.txt", b"needle\n");
+            let _mode_guard = UnixModeGuard::set(&dir, 0o000);
+
+            let tool = pi::tools::GrepTool::new(harness.temp_dir());
+            let input = serde_json::json!({
+                "pattern": "needle",
+                "path": dir.to_string_lossy()
+            });
+
+            let err = tool
+                .execute("test-id", input, None)
+                .await
+                .expect_err("mode-000 search root should be rejected");
+            let message = err.to_string();
+            assert!(message.contains("Tool error: grep:"));
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "grep should report PermissionDenied: {message}"
+            );
+            assert!(
+                !message.contains("needle"),
+                "permission failure must not disclose scanned content"
+            );
         });
     }
 
@@ -1329,6 +1434,32 @@ mod find_tool {
                     ctx.push(("message".into(), message.clone()));
                 });
             assert!(message.contains("Path not found"));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_find_permission_denied_is_reported() {
+        asupersync::test_utils::run_test(|| async {
+            let harness = TestHarness::new("find_permission_denied_is_reported");
+            let dir = harness.create_dir("locked");
+            let _mode_guard = UnixModeGuard::set(&dir, 0o000);
+            let tool = pi::tools::FindTool::new(harness.temp_dir());
+            let input = serde_json::json!({
+                "pattern": "*.txt",
+                "path": dir.to_string_lossy()
+            });
+
+            let err = tool
+                .execute("test-id", input, None)
+                .await
+                .expect_err("mode-000 search root should be rejected");
+            let message = err.to_string();
+            assert!(message.contains("Tool error: find:"));
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "find should report PermissionDenied: {message}"
+            );
         });
     }
 
@@ -1634,9 +1765,7 @@ mod ls_tool {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new("ls_permission_denied_is_reported");
             let dir = harness.create_dir("locked");
-            let mut perms = std::fs::metadata(&dir).unwrap().permissions();
-            perms.set_mode(0o000);
-            std::fs::set_permissions(&dir, perms).unwrap();
+            let _mode_guard = UnixModeGuard::set(&dir, 0o000);
 
             let tool = pi::tools::LsTool::new(harness.temp_dir());
             let input = serde_json::json!({
@@ -1649,6 +1778,10 @@ mod ls_tool {
                 .expect_err("should error");
             let message = err.to_string();
             assert!(message.contains("Cannot read directory"));
+            assert!(
+                message.to_lowercase().contains("permission denied"),
+                "ls should report PermissionDenied: {message}"
+            );
         });
     }
 

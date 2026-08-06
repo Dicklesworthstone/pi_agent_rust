@@ -522,7 +522,14 @@ impl<'a> PreflightAnalyzer<'a> {
         }
 
         let scanner = CompatibilityScanner::new(path.to_path_buf());
-        let ledger = match scanner.scan_path(path) {
+        #[cfg(unix)]
+        let scan_result = validate_extension_scan_permissions(path)
+            .map_err(crate::error::Error::from)
+            .and_then(|()| scanner.scan_path(path));
+        #[cfg(not(unix))]
+        let scan_result = scanner.scan_path(path);
+
+        let ledger = match scan_result {
             Ok(ledger) => ledger,
             Err(err) => {
                 return PreflightReport::from_findings(
@@ -791,6 +798,93 @@ impl<'a> PreflightAnalyzer<'a> {
             });
         }
     }
+}
+
+/// Enforce ordinary Unix source-read and directory-traversal semantics even
+/// when Pi runs as UID 0. Root can bypass mode-bit checks, but an extension
+/// path for which no permission class grants the required access is
+/// intentionally inaccessible and must fail preflight just as it would for an
+/// unprivileged process.
+#[cfg(unix)]
+fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    const DIRECTORY_ACCESS_CLASSES: [u32; 3] = [0o500, 0o050, 0o005];
+    const FILE_READ_CLASSES: [u32; 3] = [0o400, 0o040, 0o004];
+
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(scan_path) = pending.pop() {
+        let metadata = std::fs::metadata(&scan_path)?;
+        let mode = metadata.permissions().mode();
+
+        if metadata.is_file() {
+            let has_read = FILE_READ_CLASSES
+                .iter()
+                .any(|required| mode & required == *required);
+            if extension_scan_file_is_js_like(&scan_path) && !has_read {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "Permission denied while scanning extension source file {}: mode {:04o} grants no permission class read access",
+                        scan_path.display(),
+                        mode & 0o7777
+                    ),
+                ));
+            }
+            continue;
+        }
+
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let has_read_and_search = DIRECTORY_ACCESS_CLASSES
+            .iter()
+            .any(|required| mode & required == *required);
+        if !has_read_and_search {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "Permission denied while scanning extension source directory {}: mode {:04o} grants no permission class both read and search access",
+                    scan_path.display(),
+                    mode & 0o7777
+                ),
+            ));
+        }
+
+        for entry in std::fs::read_dir(&scan_path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let child = entry.path();
+            if file_type.is_dir() {
+                let ignored = child
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        matches!(name, "node_modules" | "target" | "dist" | ".git")
+                    });
+                if !ignored {
+                    pending.push(child);
+                }
+            } else if file_type.is_file() && extension_scan_file_is_js_like(&child) {
+                pending.push(child);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn extension_scan_file_is_js_like(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            matches!(
+                extension,
+                "ts" | "js" | "tsx" | "jsx" | "mjs" | "cjs" | "mts" | "cts"
+            )
+        })
 }
 
 // ============================================================================
@@ -2903,6 +2997,48 @@ mod tests {
     use super::*;
     use crate::extensions::ExtensionPolicy;
 
+    #[cfg(unix)]
+    struct ModeRestoreGuard {
+        path: std::path::PathBuf,
+        original: Option<std::fs::Permissions>,
+    }
+
+    #[cfg(unix)]
+    impl ModeRestoreGuard {
+        fn deny_all(path: &Path) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let original = std::fs::metadata(path)
+                .expect("stat permission fixture")
+                .permissions();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
+                .expect("block permission fixture");
+            Self {
+                path: path.to_path_buf(),
+                original: Some(original),
+            }
+        }
+
+        fn restore(mut self) {
+            let original = self
+                .original
+                .as_ref()
+                .expect("permission guard must be armed")
+                .clone();
+            std::fs::set_permissions(&self.path, original).expect("restore permission fixture");
+            self.original = None;
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ModeRestoreGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                let _ = std::fs::set_permissions(&self.path, original);
+            }
+        }
+    }
+
     // ---- ModuleSupport ----
 
     #[test]
@@ -3405,8 +3541,6 @@ pi.exec("ls");
     #[cfg(unix)]
     #[test]
     fn analyze_unreadable_nested_directory_fails_closed() {
-        use std::os::unix::fs::PermissionsExt;
-
         let policy = ExtensionPolicy::default();
         let analyzer = PreflightAnalyzer::new(&policy, None);
         let temp_dir = tempfile::tempdir().expect("tempdir");
@@ -3417,14 +3551,26 @@ pi.exec("ls");
         std::fs::create_dir_all(&blocked_dir).expect("mkdir blocked dir");
         std::fs::write(blocked_dir.join("hidden.js"), "import fs from 'fs';\n")
             .expect("write blocked entry");
-        std::fs::set_permissions(&blocked_dir, PermissionsExt::from_mode(0o000))
-            .expect("chmod blocked dir");
+        let mode_guard = ModeRestoreGuard::deny_all(&blocked_dir);
 
+        let permission_result = validate_extension_scan_permissions(temp_dir.path());
         let report = analyzer.analyze(temp_dir.path());
 
-        std::fs::set_permissions(&blocked_dir, PermissionsExt::from_mode(0o755))
-            .expect("restore blocked dir perms");
+        mode_guard.restore();
 
+        let permission_error = permission_result
+            .expect_err("mode-blocked directory must fail before extension traversal");
+        assert_eq!(
+            permission_error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "mode-blocked directory must produce a typed PermissionDenied error"
+        );
+        assert!(
+            permission_error
+                .to_string()
+                .contains(&blocked_dir.display().to_string()),
+            "permission error must identify the blocked directory"
+        );
         assert_eq!(
             report.extension_id,
             temp_dir
@@ -3437,7 +3583,48 @@ pi.exec("ls");
         assert!(report.findings.iter().any(|finding| {
             finding.category == FindingCategory::AnalysisInput
                 && finding.message.contains("Failed to scan extension source")
+                && finding.message.contains("Permission denied")
                 && finding.message.contains(&blocked_dir.display().to_string())
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn analyze_unreadable_single_file_fails_closed() {
+        let policy = ExtensionPolicy::default();
+        let analyzer = PreflightAnalyzer::new(&policy, None);
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let blocked_file = temp_dir.path().join("blocked.js");
+        std::fs::write(&blocked_file, "import fs from 'fs';\n").expect("write blocked extension");
+        let mode_guard = ModeRestoreGuard::deny_all(&blocked_file);
+
+        let permission_result = validate_extension_scan_permissions(&blocked_file);
+        let report = analyzer.analyze(&blocked_file);
+
+        mode_guard.restore();
+
+        let permission_error = permission_result
+            .expect_err("mode-blocked extension file must fail before source read");
+        assert_eq!(
+            permission_error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "mode-blocked extension file must produce a typed PermissionDenied error"
+        );
+        assert!(
+            permission_error
+                .to_string()
+                .contains(&blocked_file.display().to_string()),
+            "permission error must identify the blocked extension file"
+        );
+        assert_eq!(report.extension_id, "blocked.js");
+        assert_eq!(report.verdict, PreflightVerdict::Fail);
+        assert!(report.findings.iter().any(|finding| {
+            finding.category == FindingCategory::AnalysisInput
+                && finding.message.contains("Failed to scan extension source")
+                && finding.message.contains("Permission denied")
+                && finding
+                    .message
+                    .contains(&blocked_file.display().to_string())
         }));
     }
 

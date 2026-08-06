@@ -45,6 +45,40 @@ fn fd_available() -> bool {
         .is_ok_and(|s| s.success())
 }
 
+#[cfg(unix)]
+struct UnixModeGuard {
+    path: std::path::PathBuf,
+    original: std::fs::Permissions,
+}
+
+#[cfg(unix)]
+impl UnixModeGuard {
+    fn set(path: &std::path::Path, mode: u32) -> Self {
+        let original = std::fs::metadata(path)
+            .expect("stat permission fixture")
+            .permissions();
+        let mut restricted = original.clone();
+        restricted.set_mode(mode);
+        std::fs::set_permissions(path, restricted).expect("set permission fixture mode");
+        Self {
+            path: path.to_path_buf(),
+            original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UnixModeGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::set_permissions(&self.path, self.original.clone()) {
+            eprintln!(
+                "failed to restore permissions for {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
 // ===========================================================================
 // Read Tool — Hardened
 // ===========================================================================
@@ -404,12 +438,10 @@ mod write_hardened {
     #[cfg(unix)]
     #[test]
     fn write_readonly_existing_file_fails() {
-        use std::os::unix::fs::PermissionsExt;
-
         asupersync::test_utils::run_test(|| async {
             let h = TestHarness::new("write_readonly_existing_file_fails");
             let path = h.create_file("readonly-write.txt", b"old content");
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+            let _mode_guard = UnixModeGuard::set(&path, 0o444);
 
             let tool = pi::tools::WriteTool::new(h.temp_dir());
             let input = serde_json::json!({
@@ -431,8 +463,6 @@ mod write_hardened {
                 "old content",
                 "readonly file must remain unchanged"
             );
-
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         });
     }
 }
@@ -591,9 +621,7 @@ mod edit_hardened {
         asupersync::test_utils::run_test(|| async {
             let h = TestHarness::new("edit_readonly_file_fails");
             let path = h.create_file("readonly.txt", b"immutable content");
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o444);
-            std::fs::set_permissions(&path, perms).unwrap();
+            let _mode_guard = UnixModeGuard::set(&path, 0o444);
 
             let tool = pi::tools::EditTool::new(h.temp_dir());
             let input = serde_json::json!({
@@ -607,11 +635,9 @@ mod edit_hardened {
                 .expect_err("should fail on readonly");
             let msg = err.to_string().to_lowercase();
             h.log().info("verify", format!("error={msg}"));
-            // EditTool opens with read+write; readonly file causes open failure.
-            // Legacy behavior: all access failures are reported as "File not found".
             assert!(
-                msg.contains("not found") || msg.contains("permission") || msg.contains("denied"),
-                "should report access error: {msg}"
+                msg.contains("permission denied"),
+                "should report PermissionDenied: {msg}"
             );
             // Verify the file content was NOT modified.
             let disk = std::fs::read_to_string(&path).unwrap();
@@ -619,11 +645,6 @@ mod edit_hardened {
                 disk, "immutable content",
                 "readonly file must not be modified"
             );
-
-            // Cleanup: restore perms
-            let mut restore = std::fs::metadata(&path).unwrap().permissions();
-            restore.set_mode(0o644);
-            std::fs::set_permissions(&path, restore).unwrap();
         });
     }
 

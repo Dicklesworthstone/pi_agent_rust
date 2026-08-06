@@ -390,7 +390,7 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
 }
 
 fn indexed_session_path_is_missing(path: &Path) -> bool {
-    match path.try_exists() {
+    match crate::session::session_path_try_exists(path) {
         Ok(exists) => !exists,
         Err(err) => {
             tracing::warn!(
@@ -447,6 +447,17 @@ fn scan_sessions_on_disk(
 ) -> ScanSessionsResult {
     let mut out = Vec::new();
     let mut failed_paths = Vec::new();
+    if let Err(err) = crate::session::ensure_session_directory_readable(project_session_dir) {
+        tracing::warn!(
+            path = %project_session_dir.display(),
+            error = %err,
+            "Failed to read project session directory; retaining indexed rows"
+        );
+        return ScanSessionsResult {
+            metas: out,
+            failed_paths,
+        };
+    }
     let Ok(entries) = fs::read_dir(project_session_dir) else {
         return ScanSessionsResult {
             metas: out,
@@ -599,6 +610,46 @@ mod tests {
     use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
     #[cfg(feature = "sqlite-sessions")]
     use std::future::Future;
+
+    #[cfg(unix)]
+    struct UnixModeGuard {
+        path: PathBuf,
+        original: Option<fs::Permissions>,
+    }
+
+    #[cfg(unix)]
+    impl UnixModeGuard {
+        fn apply(path: &Path, mode: u32) -> Self {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let original = fs::metadata(path)
+                .expect("permission fixture metadata")
+                .permissions();
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .expect("apply permission fixture mode");
+            Self {
+                path: path.to_path_buf(),
+                original: Some(original),
+            }
+        }
+
+        fn restore(&mut self) {
+            if let Some(original) = self.original.as_ref() {
+                fs::set_permissions(&self.path, original.clone())
+                    .expect("restore permission fixture mode");
+                self.original = None;
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for UnixModeGuard {
+        fn drop(&mut self) {
+            if let Some(original) = self.original.take() {
+                let _ = fs::set_permissions(&self.path, original);
+            }
+        }
+    }
 
     fn make_meta(path: &Path) -> SessionMeta {
         SessionMeta {
@@ -1305,8 +1356,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn list_sessions_for_project_keeps_permission_denied_row_indexed() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = tempfile::tempdir().expect("tempdir");
         let base_dir = tmp.path().join("sessions");
         let cwd = tmp.path().join("repo");
@@ -1330,22 +1379,21 @@ mod tests {
         let index = SessionIndex::for_sessions_root(&base_dir);
         index.reindex_all().expect("seed session index");
 
-        let original_mode = fs::metadata(&project_dir)
-            .expect("project dir metadata")
-            .permissions()
-            .mode();
-        fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o000))
-            .expect("chmod project dir");
+        let mut mode_guard = UnixModeGuard::apply(&project_dir, 0o000);
 
-        assert!(
-            session_path.try_exists().is_err(),
-            "expected permission-denied path probe for inaccessible project session directory"
-        );
+        let denied_probe = crate::session::session_path_try_exists(&session_path);
+        let denied_scan = crate::session::ensure_session_directory_readable(&project_dir);
 
         let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
 
-        fs::set_permissions(&project_dir, fs::Permissions::from_mode(original_mode))
-            .expect("restore project dir permissions");
+        mode_guard.restore();
+
+        let denied = denied_probe
+            .expect_err("a path below a mode-000 project directory must fail its existence probe");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
+        let denied = denied_scan
+            .expect_err("listing a mode-000 project session directory must fail permission checks");
+        assert_eq!(denied.kind(), std::io::ErrorKind::PermissionDenied);
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].path, session_path.display().to_string());
