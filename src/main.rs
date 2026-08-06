@@ -89,6 +89,7 @@ const USAGE_ERROR_PATTERNS: &[&str] = &[
     "unsupported swarm-replay-preview policy",
     "unknown --only categories",
     "--only must include at least one category",
+    "--fetch-models cannot be combined",
     "theme file not found",
     "theme spec is empty",
 ];
@@ -124,8 +125,116 @@ fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::Ex
     }
 }
 
-fn parse_cli_from_env() -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
-    parse_cli_args(std::env::args().collect())
+type ParsedCliEnvironment = (cli::Cli, Vec<cli::ExtensionCliFlag>, Vec<String>);
+
+fn parse_cli_from_env() -> Result<Option<ParsedCliEnvironment>> {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    Ok(parse_cli_args(raw_args.clone())?
+        .map(|(cli, extension_flags)| (cli, extension_flags, raw_args)))
+}
+
+fn validate_fetch_models_is_standalone(
+    cli: &cli::Cli,
+    extension_flags: &[cli::ExtensionCliFlag],
+    raw_args: &[String],
+) -> Result<()> {
+    if cli.fetch_models.is_none() {
+        return Ok(());
+    }
+
+    let mut conflicts = Vec::new();
+    if cli.version {
+        conflicts.push("--version");
+    }
+    if cli.explain_extension_policy {
+        conflicts.push("--explain-extension-policy");
+    }
+    if cli.explain_repair_policy {
+        conflicts.push("--explain-repair-policy");
+    }
+    if cli.list_models.is_some() {
+        conflicts.push("--list-models");
+    }
+    if cli.list_providers {
+        conflicts.push("--list-providers");
+    }
+    if cli.export.is_some() {
+        conflicts.push("--export");
+    }
+    if cli.rpc || cli.mode.as_deref().is_some_and(|mode| mode != "text") {
+        conflicts.push("RPC/JSON mode");
+    }
+    if cli.acp {
+        conflicts.push("--acp");
+    }
+    if cli.command.is_some() {
+        conflicts.push("a subcommand");
+    }
+    if !cli.args.is_empty() {
+        conflicts.push("prompt or file arguments");
+    }
+    if !cli.extension.is_empty() || !extension_flags.is_empty() {
+        conflicts.push("extension arguments");
+    }
+    if raw_args.iter().skip(1).any(|argument| {
+        matches!(argument.as_str(), "--provider" | "--model" | "--tools")
+            || argument.starts_with("--provider=")
+            || argument.starts_with("--model=")
+            || argument.starts_with("--tools=")
+    }) {
+        conflicts.push("provider, model, or tool-selection arguments");
+    }
+    if cli.models.is_some() {
+        conflicts.push("--models");
+    }
+    if cli.thinking.is_some() {
+        conflicts.push("--thinking");
+    }
+    if cli.system_prompt.is_some() || cli.append_system_prompt.is_some() {
+        conflicts.push("system-prompt arguments");
+    }
+    if cli.r#continue
+        || cli.resume
+        || cli.session.is_some()
+        || cli.session_dir.is_some()
+        || cli.no_session
+        || cli.session_durability.is_some()
+    {
+        conflicts.push("session arguments");
+    }
+    if cli.no_mouse_capture {
+        conflicts.push("--no-mouse-capture");
+    }
+    if cli.verbose {
+        conflicts.push("--verbose");
+    }
+    if cli.no_tools {
+        conflicts.push("--no-tools");
+    }
+    if cli.extension_policy.is_some() || cli.repair_policy.is_some() {
+        conflicts.push("policy arguments");
+    }
+    if !cli.skill.is_empty() || !cli.prompt_template.is_empty() {
+        conflicts.push("skill or prompt-template arguments");
+    }
+    if cli.theme.is_some() || !cli.theme_path.is_empty() {
+        conflicts.push("theme arguments");
+    }
+    if cli.hide_cwd_in_prompt {
+        conflicts.push("--hide-cwd-in-prompt");
+    }
+    if cli.max_tool_iterations.is_some() {
+        conflicts.push("--max-tool-iterations");
+    }
+
+    if conflicts.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "--fetch-models cannot be combined with {}; run model discovery as a standalone command",
+            conflicts.join(", ")
+        )
+    }
 }
 
 fn reload_model_registry_with_extra_entries(
@@ -278,9 +387,11 @@ fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
-    let Some((mut cli, extension_flags)) = parse_cli_from_env()? else {
+    let Some((mut cli, extension_flags, raw_args)) = parse_cli_from_env()? else {
         return Ok(());
     };
+
+    validate_fetch_models_is_standalone(&cli, &extension_flags, &raw_args)?;
 
     if cli.version {
         print_version();
@@ -528,7 +639,11 @@ fn main_impl() -> Result<()> {
         }
     }
 
-    if cli.command.is_none() && !cli.acp && cli.mode.as_deref().is_none_or(|mode| mode.ne("rpc")) {
+    if cli.command.is_none()
+        && cli.fetch_models.is_none()
+        && !cli.acp
+        && cli.mode.as_deref().is_none_or(|mode| mode.ne("rpc"))
+    {
         let stdin_content = read_piped_stdin()?;
         pi::app::apply_piped_stdin(&mut cli, stdin_content);
     }
@@ -547,6 +662,7 @@ fn main_impl() -> Result<()> {
         }
     });
     if cli.command.is_none()
+        && cli.fetch_models.is_none()
         && early_mode.eq("text")
         && cli.export.is_none()
         && cli.file_args().is_empty()
@@ -1031,8 +1147,8 @@ async fn run(
     // constructed so the client's single resolution path sees it. The
     // `--request-timeout` flag is bound to the PI_HTTP_REQUEST_TIMEOUT_SECS env
     // var via clap, so `cli.request_timeout` already reflects either the flag
-    // or that env var. Config-file values are applied later (lower precedence)
-    // once config is loaded. See pi_agent_rust#90.
+    // or that env var. Config-file values are applied at the lowest precedence
+    // before the first provider request. See pi_agent_rust#90.
     if let Some(secs) = cli.request_timeout {
         pi::http::client::set_request_timeout_override(secs);
     }
@@ -1043,7 +1159,18 @@ async fn run(
     }
 
     if let Some(provider) = cli.fetch_models.take() {
-        handle_fetch_models(&provider, cli.refresh_models, cli.persist_models).await?;
+        if cli.request_timeout.is_none()
+            && let Some(secs) = Config::load()?.request_timeout_secs
+        {
+            pi::http::client::set_request_timeout_override(secs);
+        }
+        handle_fetch_models(
+            &provider,
+            cli.api_key.as_deref(),
+            cli.refresh_models,
+            cli.persist_models,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -5502,20 +5629,106 @@ fn should_fingerprint_model_env_var(key: &str) -> bool {
         .any(|meta| meta.auth_env_keys.contains(&key))
 }
 
-fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) {
-    hasher.update(path.to_string_lossy().as_bytes());
-    match fs::metadata(path) {
+const LIST_MODELS_CACHE_FINGERPRINT_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+#[cfg(unix)]
+fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
+    let descriptor = rustix::fs::open(
+        path,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(io::Error::from)?;
+    Ok(fs::File::from(descriptor))
+}
+
+#[cfg(not(unix))]
+fn open_fingerprint_file(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    true
+}
+
+fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) -> bool {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    hasher.update((path_bytes.len() as u64).to_le_bytes());
+    hasher.update(path_bytes);
+    match fs::symlink_metadata(path) {
         Ok(meta) => {
             hasher.update([1]);
+            if !meta.file_type().is_file() || meta.len() > LIST_MODELS_CACHE_FINGERPRINT_MAX_BYTES {
+                hasher.update([5]);
+                return false;
+            }
             hasher.update(meta.len().to_le_bytes());
-            if let Ok(modified) = meta.modified()
+            let modified = meta.modified().ok();
+            if let Some(modified) = modified
                 && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
             {
                 hasher.update(duration.as_secs().to_le_bytes());
                 hasher.update(duration.subsec_nanos().to_le_bytes());
             }
+            let Ok(file) = open_fingerprint_file(path) else {
+                hasher.update([3]);
+                return false;
+            };
+            let Ok(capacity) = usize::try_from(meta.len()) else {
+                hasher.update([4]);
+                return false;
+            };
+            let mut contents = Vec::with_capacity(capacity);
+            let mut limited = file.take(LIST_MODELS_CACHE_FINGERPRINT_MAX_BYTES + 1);
+            if limited.read_to_end(&mut contents).is_err()
+                || contents.len() as u64 != meta.len()
+                || contents.len() as u64 > LIST_MODELS_CACHE_FINGERPRINT_MAX_BYTES
+            {
+                hasher.update([4]);
+                return false;
+            }
+            let Ok(opened_after) = limited.get_ref().metadata() else {
+                hasher.update([6]);
+                return false;
+            };
+            let Ok(after) = fs::symlink_metadata(path) else {
+                hasher.update([6]);
+                return false;
+            };
+            if !opened_after.file_type().is_file()
+                || !same_file_identity(&meta, &opened_after)
+                || opened_after.len() != meta.len()
+                || opened_after.modified().ok() != modified
+                || !after.file_type().is_file()
+                || !same_file_identity(&opened_after, &after)
+                || after.len() != meta.len()
+                || after.modified().ok() != modified
+            {
+                hasher.update([7]);
+                return false;
+            }
+            hasher.update([2]);
+            hasher.update(contents);
+            true
         }
-        Err(_) => hasher.update([0]),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            hasher.update([0]);
+            true
+        }
+        Err(_) => {
+            hasher.update([8]);
+            false
+        }
     }
 }
 
@@ -5523,18 +5736,26 @@ fn list_models_cache_path(models_path: &Path) -> Option<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
     hasher.update(pi::models::model_catalog_cache_fingerprint().to_le_bytes());
-    append_file_fingerprint(&mut hasher, &Config::auth_path());
-    append_file_fingerprint(&mut hasher, models_path);
-    append_file_fingerprint(&mut hasher, &fetched_models_path(models_path));
+    if !append_file_fingerprint(&mut hasher, &Config::auth_path())
+        || !append_file_fingerprint(&mut hasher, models_path)
+        || !append_file_fingerprint(&mut hasher, &fetched_models_path(models_path))
+    {
+        return None;
+    }
 
-    let mut env_vars = std::env::vars()
-        .filter(|(key, _)| should_fingerprint_model_env_var(key))
+    let mut env_vars = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            let key = key.into_string().ok()?;
+            should_fingerprint_model_env_var(&key).then_some((key, value))
+        })
         .collect::<Vec<_>>();
     env_vars.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     for (key, value) in env_vars {
         hasher.update(key.as_bytes());
         hasher.update([0xff]);
-        hasher.update(value.as_bytes());
+        let value = value.as_os_str().as_encoded_bytes();
+        hasher.update((value.len() as u64).to_le_bytes());
+        hasher.update(value);
         hasher.update([0x00]);
     }
 
@@ -5580,12 +5801,18 @@ fn save_list_models_cache(models_path: &Path, payload: &ListModelsCachePayload) 
     }
 }
 
-async fn handle_fetch_models(provider: &str, refresh: bool, persist: bool) -> Result<()> {
-    // Resolve the API key: prefer the user's auth.json credential for the
-    // provider, then fall back to environment variables advertised in the
-    // canonical metadata.  An empty key triggers the static-registry path
-    // inside `fetch_provider_models` itself.
-    let api_key = resolve_provider_api_key(provider);
+async fn handle_fetch_models(
+    provider: &str,
+    api_key_override: Option<&str>,
+    refresh: bool,
+    persist: bool,
+) -> Result<()> {
+    // Use the normal credential resolver: an explicit CLI override wins, then
+    // stored OAuth/Bearer credentials, provider environment variables, stored
+    // API keys, and supported external-CLI credentials. An empty key is valid
+    // for keyless local providers; keyed providers degrade to the static
+    // registry path unless refresh is strict.
+    let api_key = resolve_provider_api_key(provider, api_key_override);
 
     let catalog = if refresh {
         pi::providers::refresh_provider_model_catalog(provider, &api_key).await
@@ -5593,28 +5820,15 @@ async fn handle_fetch_models(provider: &str, refresh: bool, persist: bool) -> Re
         pi::providers::fetch_provider_model_catalog(provider, &api_key).await
     };
 
-    let catalog = match catalog {
-        Ok(catalog) => catalog,
-        Err(err) => {
-            return Err(anyhow::anyhow!(err.to_string()));
-        }
-    };
+    let catalog = catalog.map_err(anyhow::Error::new)?;
 
-    if matches!(
+    let used_static_fallback = matches!(
         catalog.source,
         pi::providers::ModelCatalogSource::StaticFallback
-    ) {
-        eprintln!(
-            "Warning: live model discovery for {provider:?} was unavailable; \
-             showing the static registry instead. Use --refresh-models to require a live result."
-        );
-    }
+    );
 
     if persist {
-        if matches!(
-            catalog.source,
-            pi::providers::ModelCatalogSource::StaticFallback
-        ) {
+        if used_static_fallback {
             bail!(
                 "Refusing to persist the static fallback for {provider:?}; \
                  configure provider credentials and retry a successful live fetch"
@@ -5631,24 +5845,34 @@ async fn handle_fetch_models(provider: &str, refresh: bool, persist: bool) -> Re
     }
 
     if catalog.models.is_empty() {
-        eprintln!(
-            "No models available for {provider:?} (static registry is empty and live fetch failed). \
-             Check the provider name and credentials."
+        bail!(
+            "No models available for {provider:?}: live discovery failed and the static registry \
+             has no matching entries. Check the provider name and credentials."
         );
-    } else {
-        let stdout = io::stdout();
-        let mut out = io::BufWriter::new(stdout.lock());
-        for id in &catalog.models {
-            writeln!(out, "{id}")?;
-        }
-        out.flush()?;
     }
+
+    if used_static_fallback {
+        eprintln!(
+            "Warning: live model discovery for {provider:?} was unavailable; \
+             showing the static registry instead. Use --refresh-models to require a live result."
+        );
+    }
+
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    for id in &catalog.models {
+        writeln!(out, "{id}")?;
+    }
+    out.flush()?;
     Ok(())
 }
 
-fn resolve_provider_api_key(provider: &str) -> String {
+fn resolve_provider_api_key(provider: &str, override_key: Option<&str>) -> String {
+    if let Some(key) = override_key.map(str::trim).filter(|key| !key.is_empty()) {
+        return key.to_string();
+    }
     if let Ok(auth) = AuthStorage::load(Config::auth_path())
-        && let Some(key) = auth.api_key(provider)
+        && let Some(key) = auth.resolve_api_key(provider, None)
         && !key.trim().is_empty()
     {
         return key;
@@ -7167,6 +7391,55 @@ mod tests {
     fn exit_code_classifier_defaults_to_general_failure() {
         let runtime_err = anyhow::Error::new(pi::error::Error::auth("missing key"));
         assert_eq!(exit_code_for_error(&runtime_err), EXIT_CODE_FAILURE);
+    }
+
+    #[test]
+    fn fetch_models_api_key_override_has_highest_precedence() {
+        assert_eq!(
+            resolve_provider_api_key("openai", Some("  explicit-cli-key  ")),
+            "explicit-cli-key"
+        );
+    }
+
+    #[test]
+    fn file_fingerprint_binds_content_even_when_size_and_mtime_match() {
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("models.fetched.json");
+        fs::write(&path, b"first").expect("write first bytes");
+        let original_mtime = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("first mtime");
+        let digest = |path: &Path| {
+            let mut hasher = Sha256::new();
+            assert!(append_file_fingerprint(&mut hasher, path));
+            format!("{:x}", hasher.finalize())
+        };
+        let first = digest(&path);
+
+        fs::write(&path, b"other").expect("replace with same-length bytes");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_system_time(original_mtime))
+            .expect("restore exact mtime");
+        assert_eq!(fs::metadata(&path).expect("metadata").len(), 5);
+        assert_ne!(
+            first,
+            digest(&path),
+            "same-size, same-mtime replacements must invalidate the list-models cache"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_fingerprint_rejects_symlink_to_non_regular_input_without_opening_it() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("models.fetched.json");
+        symlink("/dev/zero", &path).expect("create device symlink");
+        let mut hasher = Sha256::new();
+        assert!(
+            !append_file_fingerprint(&mut hasher, &path),
+            "non-regular or symlinked cache inputs must disable the fast-path cache"
+        );
     }
 
     #[test]

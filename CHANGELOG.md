@@ -14,7 +14,7 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
-## [v0.2.0] — 2026-08-05 — Release
+## [v0.2.0] — 2026-08-06 — Release
 
 ### Breaking Changes
 
@@ -29,6 +29,10 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 - **The minimum supported Rust version is now 1.95** — published crate metadata
   declares Rust 1.95, while repository release builds remain reproducibly
   pinned to `nightly-2026-07-05`.
+- **Static model-catalog lookup is now fallible** —
+  `pi::providers::static_registry_models` returns `Result<Vec<String>>` so
+  malformed, unsafe, or resource-exceeding local catalog data cannot be
+  mistaken for a valid empty fallback.
 
 ### Features
 
@@ -44,6 +48,13 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   resume with a bounded continuation budget, refusal details remain structured,
   extension-registered providers can stream through the provider factory, and
   the built-in catalog includes GPT-5.6 Sol, Terra, and Luna seeds.
+- **Live provider catalogs are usable outside the TUI** — `--fetch-models`
+  prints model IDs and exits, `--refresh-models` requires a genuine live
+  response, and `--persist-models` atomically records only successful fetched
+  provider/model IDs in `models.fetched.json`. The generated catalog feeds
+  future `--list-models` and interactive model pickers without rewriting or
+  overriding hand-authored `models.json`. Fixes
+  [#150](https://github.com/Dicklesworthstone/pi_agent_rust/issues/150).
 - **Injectable model credential resolution** — harnesses and SDK embedders can
   load the model registry without ambient process credentials affecting model
   availability, while production continues to use `AuthStorage`.

@@ -1165,6 +1165,146 @@ fn e2e_cli_fetch_models_is_a_standalone_stdout_command() {
 }
 
 #[test]
+fn e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers() {
+    let harness =
+        CliTestHarness::new("e2e_cli_fetch_models_uses_models_json_route_credentials_and_headers");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind catalog fixture");
+    let address = listener.local_addr().expect("fixture address");
+    listener
+        .set_nonblocking(true)
+        .expect("make fixture accept bounded");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "catalog fixture was never called"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept catalog request: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("bound fixture request read");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let count = stream.read(&mut chunk).expect("read catalog request");
+            assert!(count > 0, "catalog request ended before its headers");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        let body = br#"{"data":[{"id":"z/model"},{"id":"a/model"}]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write catalog response headers");
+        stream.write_all(body).expect("write catalog response");
+        String::from_utf8(request).expect("request headers are UTF-8")
+    });
+
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    );
+    fs::create_dir_all(&agent_dir).expect("create isolated agent dir");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": {
+                "acme": {
+                    "api": "openai-completions",
+                    "baseUrl": format!("http://{address}/v1"),
+                    "apiKey": "models-json-secret",
+                    "authHeader": true,
+                    "headers": {
+                        "Authorization": "   ",
+                        "x-catalog-tenant": "tenant-a"
+                    }
+                }
+            }
+        }))
+        .expect("serialize custom catalog route"),
+    )
+    .expect("write custom catalog route");
+
+    let result = harness.run(&[
+        "--fetch-models",
+        "acme",
+        "--refresh-models",
+        "--request-timeout",
+        "5",
+    ]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_eq!(result.stdout, "a/model\nz/model\n");
+    let request = server.join().expect("catalog fixture thread");
+    let request_lower = request.to_ascii_lowercase();
+    assert!(
+        request.starts_with("GET /v1/models HTTP/1.1\r\n"),
+        "{request}"
+    );
+    assert!(
+        request_lower.contains("authorization: bearer models-json-secret\r\n"),
+        "{request}"
+    );
+    assert_eq!(
+        request_lower.matches("authorization:").count(),
+        1,
+        "blank custom Authorization must not replace or duplicate generated auth: {request}"
+    );
+    assert!(
+        request_lower.contains("x-catalog-tenant: tenant-a\r\n"),
+        "{request}"
+    );
+}
+
+#[test]
+fn e2e_cli_fetch_models_ignores_text_input_guards() {
+    let harness = CliTestHarness::new("e2e_cli_fetch_models_ignores_text_input_guards");
+    for presentation_flag in ["--print", "--mode=text"] {
+        let result = harness.run(&["--fetch-models", "openai", presentation_flag]);
+        assert_exit_code(&harness.harness, &result, 0);
+        assert!(
+            result.stdout.lines().any(|line| !line.trim().is_empty()),
+            "{presentation_flag} must not make standalone model discovery require prompt input"
+        );
+    }
+}
+
+#[test]
+fn e2e_cli_fetch_models_rejects_ambiguous_terminal_actions() {
+    let harness = CliTestHarness::new("e2e_cli_fetch_models_rejects_ambiguous_terminal_actions");
+    let cases: &[&[&str]] = &[
+        &["--fetch-models", "openai", "--list-models"],
+        &["--fetch-models", "openai", "--list-providers"],
+        &["--fetch-models", "openai", "--mode=json"],
+        &["--fetch-models", "openai", "--thinking", "high"],
+        &["--fetch-models", "openai", "--session", "ignored.jsonl"],
+        &["--fetch-models", "openai", "--no-tools"],
+        &["--fetch-models", "openai", "--theme", "dark"],
+        &["--fetch-models", "openai", "--provider", "openai"],
+        &["--fetch-models", "openai", "ignored prompt"],
+    ];
+    for args in cases {
+        let result = harness.run(args);
+        assert_exit_code(&harness.harness, &result, 2);
+        assert_contains(
+            &harness.harness,
+            &result.stderr,
+            "--fetch-models cannot be combined",
+        );
+    }
+}
+
+#[test]
 fn e2e_cli_list_models_reads_the_persisted_fetched_catalog() {
     let mut harness =
         CliTestHarness::new("e2e_cli_list_models_reads_the_persisted_fetched_catalog");
@@ -1234,6 +1374,90 @@ fn e2e_cli_refresh_models_requires_a_live_result() {
         "strict refresh must not print fallback rows"
     );
     assert_contains(&harness.harness, &result.stderr, "api_key");
+}
+
+#[test]
+fn e2e_cli_fetch_models_rejects_unknown_empty_catalog() {
+    let harness = CliTestHarness::new("e2e_cli_fetch_models_rejects_unknown_empty_catalog");
+    let result = harness.run(&["--fetch-models", "definitely-not-a-provider"]);
+
+    assert_exit_code(&harness.harness, &result, 1);
+    assert!(
+        result.stdout.is_empty(),
+        "unknown providers must not look successful"
+    );
+    assert_contains(&harness.harness, &result.stderr, "No models available");
+    assert_contains(
+        &harness.harness,
+        &result.stderr,
+        "definitely-not-a-provider",
+    );
+}
+
+#[test]
+fn e2e_cli_fetch_models_rejects_unsafe_static_fallback_ids() {
+    let harness = CliTestHarness::new("e2e_cli_fetch_models_rejects_unsafe_static_fallback_ids");
+    let agent_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("isolated agent dir"),
+    );
+    fs::create_dir_all(&agent_dir).expect("create isolated agent dir");
+    fs::write(
+        agent_dir.join("models.json"),
+        serde_json::to_vec_pretty(&json!({
+            "providers": {
+                "openai": {
+                    "models": [{"id": "unsafe\nmodel"}]
+                }
+            }
+        }))
+        .expect("serialize unsafe manual catalog"),
+    )
+    .expect("write unsafe manual catalog");
+
+    let result = harness.run(&["--fetch-models", "openai"]);
+    assert_exit_code(&harness.harness, &result, 1);
+    assert!(result.stdout.is_empty());
+    assert_contains(&harness.harness, &result.stderr, "not printable ASCII");
+}
+
+#[test]
+fn e2e_cli_fetch_models_does_not_wait_for_stdin_eof() {
+    let harness = CliTestHarness::new("e2e_cli_fetch_models_does_not_wait_for_stdin_eof");
+    let mut command = Command::new(&harness.binary_path);
+    command
+        .args(["--fetch-models", "openai"])
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("GROQ_API_KEY")
+        .envs(harness.env.clone())
+        .current_dir(harness.harness.temp_dir())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command.spawn().expect("run pi with held-open stdin");
+    let held_stdin = child.stdin.take().expect("child stdin pipe");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll fetch-models process") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("terminate stuck fetch-models process");
+            drop(held_stdin);
+            child.wait().expect("reap stuck fetch-models process");
+            panic!("standalone --fetch-models waited for stdin EOF");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    drop(held_stdin);
+    assert!(
+        status.success(),
+        "fetch-models should ignore an open stdin pipe"
+    );
 }
 
 #[test]

@@ -7,10 +7,11 @@ use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
 use regex::Regex;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -219,7 +220,218 @@ pub struct OAuthConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelsConfig {
+    #[serde(deserialize_with = "deserialize_model_providers")]
     pub providers: HashMap<String, ProviderConfig>,
+}
+
+fn deserialize_model_providers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, ProviderConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ProvidersVisitor;
+
+    impl<'de> Visitor<'de> for ProvidersVisitor {
+        type Value = HashMap<String, ProviderConfig>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a map of model-provider configurations with unique keys")
+        }
+
+        fn visit_map<A>(self, mut entries: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut providers = HashMap::with_capacity(
+                entries
+                    .size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_FETCHED_PROVIDERS),
+            );
+            while let Some(provider) = entries.next_key::<String>()? {
+                if providers.contains_key(&provider) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate JSON object key {provider:?} in models.json providers"
+                    )));
+                }
+                let config = entries.next_value::<ProviderConfig>()?;
+                providers.insert(provider, config);
+            }
+            Ok(providers)
+        }
+    }
+
+    deserializer.deserialize_map(ProvidersVisitor)
+}
+
+pub(crate) const FETCHED_MODELS_SCHEMA: &str = "pi.models.fetched.v1";
+pub(crate) const MAX_FETCHED_CATALOG_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_FETCHED_PROVIDERS: usize = 128;
+pub(crate) const MAX_FETCHED_PROVIDER_ID_BYTES: usize = 256;
+pub(crate) const MAX_FETCHED_MODELS_PER_PROVIDER: usize = 4_096;
+pub(crate) const MAX_FETCHED_MODEL_ID_BYTES: usize = 512;
+pub(crate) const MAX_FETCHED_MODEL_BYTES_PER_PROVIDER: usize = 2 * 1024 * 1024;
+
+pub(crate) fn is_safe_model_catalog_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+}
+
+/// Strict on-disk shape for the generated catalog.
+///
+/// Keeping this separate from [`ModelsConfig`] prevents a generated file from
+/// silently acquiring routing, credential, or compatibility fields that only
+/// belong in user-authored `models.json`.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedFetchedCatalog {
+    pub(crate) schema: String,
+    #[serde(deserialize_with = "deserialize_fetched_providers")]
+    pub(crate) providers: BTreeMap<String, PersistedFetchedProvider>,
+}
+
+impl Default for PersistedFetchedCatalog {
+    fn default() -> Self {
+        Self {
+            schema: FETCHED_MODELS_SCHEMA.to_string(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedFetchedProvider {
+    #[serde(deserialize_with = "deserialize_fetched_models")]
+    pub(crate) models: Vec<PersistedFetchedModel>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PersistedFetchedModel {
+    pub(crate) id: String,
+}
+
+fn deserialize_fetched_providers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, PersistedFetchedProvider>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ProvidersVisitor;
+
+    impl<'de> Visitor<'de> for ProvidersVisitor {
+        type Value = BTreeMap<String, PersistedFetchedProvider>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded map of generated model providers")
+        }
+
+        fn visit_map<A>(self, mut entries: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut providers = BTreeMap::new();
+            let mut canonical_providers = HashSet::new();
+            while let Some(provider) = entries.next_key::<String>()? {
+                if providers.len() >= MAX_FETCHED_PROVIDERS {
+                    return Err(serde::de::Error::custom(format!(
+                        "generated model catalog exceeds {MAX_FETCHED_PROVIDERS} providers"
+                    )));
+                }
+                if !is_safe_model_catalog_identifier(&provider, MAX_FETCHED_PROVIDER_ID_BYTES) {
+                    return Err(serde::de::Error::custom(
+                        "generated model catalog contains an invalid provider ID",
+                    ));
+                }
+                if providers.contains_key(&provider) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate JSON object key {provider:?}"
+                    )));
+                }
+                let canonical = canonical_provider_key(&provider);
+                if !canonical_providers.insert(canonical.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "generated model catalog contains duplicate aliases for provider {canonical:?}"
+                    )));
+                }
+                let config = entries.next_value::<PersistedFetchedProvider>()?;
+                providers.insert(provider, config);
+            }
+            Ok(providers)
+        }
+    }
+
+    deserializer.deserialize_map(ProvidersVisitor)
+}
+
+fn deserialize_fetched_models<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<PersistedFetchedModel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct ModelsVisitor;
+
+    impl<'de> Visitor<'de> for ModelsVisitor {
+        type Value = Vec<PersistedFetchedModel>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a bounded sequence of generated model IDs")
+        }
+
+        fn visit_seq<A>(self, mut rows: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut models = Vec::with_capacity(
+                rows.size_hint()
+                    .unwrap_or_default()
+                    .min(MAX_FETCHED_MODELS_PER_PROVIDER),
+            );
+            let mut total_bytes = 0usize;
+            while let Some(model) = rows.next_element::<PersistedFetchedModel>()? {
+                if models.len() >= MAX_FETCHED_MODELS_PER_PROVIDER {
+                    return Err(serde::de::Error::custom(format!(
+                        "generated provider exceeds {MAX_FETCHED_MODELS_PER_PROVIDER} models"
+                    )));
+                }
+                if !is_safe_model_catalog_identifier(&model.id, MAX_FETCHED_MODEL_ID_BYTES) {
+                    return Err(serde::de::Error::custom(
+                        "generated model catalog contains an invalid model ID",
+                    ));
+                }
+                total_bytes = total_bytes.checked_add(model.id.len()).ok_or_else(|| {
+                    serde::de::Error::custom("generated model catalog model-ID size overflow")
+                })?;
+                if total_bytes > MAX_FETCHED_MODEL_BYTES_PER_PROVIDER {
+                    return Err(serde::de::Error::custom(format!(
+                        "generated provider exceeds {MAX_FETCHED_MODEL_BYTES_PER_PROVIDER} model-ID bytes"
+                    )));
+                }
+                models.push(model);
+            }
+            Ok(models)
+        }
+    }
+
+    deserializer.deserialize_seq(ModelsVisitor)
+}
+
+/// Effective provider settings used by OpenAI-compatible model discovery.
+///
+/// This mirrors the provider-level merge performed for normal inference so a
+/// `models.json` endpoint, credential, header, or auth-header override cannot
+/// silently diverge from `--fetch-models`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelCatalogProviderConfig {
+    pub(crate) base_url: String,
+    pub(crate) api: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) auth_header: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -363,14 +575,14 @@ fn canonicalize_openrouter_model_id(model_id: &str) -> String {
     }
 }
 
-fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String {
+pub(crate) fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String {
     if canonical_provider_id(provider).is_some_and(|canonical| canonical == "openrouter") {
         return canonicalize_openrouter_model_id(model_id);
     }
     model_id.trim().to_string()
 }
 
-fn normalized_registry_key(provider: &str, model_id: &str) -> (String, String) {
+pub(crate) fn normalized_registry_key(provider: &str, model_id: &str) -> (String, String) {
     let provider = provider.trim();
     let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
     let canonical_model_id = canonicalize_model_id_for_provider(canonical_provider, model_id);
@@ -854,26 +1066,49 @@ impl ModelRegistry {
 
         if let Some(path) = models_path {
             let fetched_path = fetched_models_path(&path);
-            for catalog_path in [&fetched_path, &path] {
-                if !catalog_path.exists() {
-                    continue;
-                }
-                match load_models_config(catalog_path) {
-                    Ok(config) => {
-                        // Generated catalogs are intentionally applied first.
-                        // The user's models.json is applied second so every
-                        // manual provider/model override keeps final authority.
-                        apply_custom_models(
-                            resolve_api_key,
-                            &mut models,
-                            &config,
-                            catalog_path.parent(),
-                        );
-                    }
+            let manual_config = match fs::symlink_metadata(&path) {
+                Ok(_) => match load_models_config(&path) {
+                    Ok(config) => Some(config),
                     Err(error) => {
-                        errors.push(format!("{error}\n\nFile: {}", catalog_path.display()));
+                        errors.push(format!("{error}\n\nFile: {}", path.display()));
+                        None
                     }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    errors.push(format!(
+                        "Failed to inspect model catalog {}: {error}",
+                        path.display()
+                    ));
+                    None
                 }
+            };
+
+            match fs::symlink_metadata(&fetched_path) {
+                Ok(_) => match load_fetched_models_config(&fetched_path) {
+                    Ok(config) => apply_fetched_models(
+                        resolve_api_key,
+                        &mut models,
+                        &config,
+                        manual_config.as_ref(),
+                        fetched_path.parent(),
+                    ),
+                    Err(error) => {
+                        errors.push(format!("{error}\n\nFile: {}", fetched_path.display()));
+                    }
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => errors.push(format!(
+                    "Failed to inspect generated model catalog {}: {error}",
+                    fetched_path.display()
+                )),
+            }
+
+            if let Some(config) = manual_config {
+                // User-authored models.json is intentionally applied last so
+                // every manual provider/model override keeps final authority
+                // over the generated catalog.
+                apply_custom_models(resolve_api_key, &mut models, &config, path.parent());
             }
         }
 
@@ -1193,6 +1428,47 @@ fn custom_provider_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
     let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
     ad_hoc_provider_defaults(canonical_provider)
         .or_else(|| native_adapter_seed_defaults(canonical_provider))
+}
+
+fn provider_has_catalog_route(provider: &str, config: &ProviderConfig) -> bool {
+    custom_provider_defaults(provider).is_some()
+        || config
+            .base_url
+            .as_deref()
+            .is_some_and(|base_url| !base_url.trim().is_empty())
+}
+
+fn resolved_provider_transport(
+    provider: &str,
+    config: &ProviderConfig,
+) -> (Option<AdHocProviderDefaults>, String, String, bool) {
+    let defaults = custom_provider_defaults(provider);
+    let default_api = defaults.map_or("openai-completions", |value| value.api);
+    let requested_api = config.api.as_deref().unwrap_or(default_api);
+    let api = requested_api
+        .parse::<Api>()
+        .unwrap_or_else(|_| Api::Custom(requested_api.to_string()))
+        .to_string();
+    let base_url = config.base_url.clone().unwrap_or_else(|| {
+        defaults.map_or_else(
+            || {
+                api_fallback_base_url(&api)
+                    .unwrap_or("https://api.openai.com/v1")
+                    .to_string()
+            },
+            |value| {
+                if value.base_url.is_empty() {
+                    api_fallback_base_url(&api).unwrap_or_default().to_string()
+                } else {
+                    value.base_url.to_string()
+                }
+            },
+        )
+    });
+    let auth_header = config
+        .auth_header
+        .unwrap_or_else(|| defaults.is_some_and(|value| value.auth_header));
+    (defaults, api, base_url, auth_header)
 }
 
 fn legacy_provider_ids() -> HashSet<String> {
@@ -2059,6 +2335,89 @@ fn built_in_models(
     models
 }
 
+fn canonical_provider_key(provider: &str) -> String {
+    canonical_provider_id(provider)
+        .unwrap_or(provider)
+        .to_ascii_lowercase()
+}
+
+fn fetched_model_key(provider: &str, model_id: &str) -> (String, String) {
+    let canonical_provider = canonical_provider_key(provider);
+    let canonical_model = canonicalize_model_id_for_provider(&canonical_provider, model_id);
+    (canonical_provider, canonical_model.to_ascii_lowercase())
+}
+
+/// Apply the exact membership returned by live discovery while retaining rich
+/// built-in metadata for model IDs Pi already knows.
+///
+/// Newly discovered IDs use provider defaults; disappeared IDs stay absent.
+/// This avoids turning a persisted catalog refresh into a silent
+/// capability/context-window downgrade for every known model in that provider.
+fn apply_fetched_models(
+    auth: &impl ModelCredentialResolver,
+    models: &mut Vec<ModelEntry>,
+    config: &ModelsConfig,
+    manual_config: Option<&ModelsConfig>,
+    base_dir: Option<&Path>,
+) {
+    let config = ModelsConfig {
+        providers: config
+            .providers
+            .iter()
+            .filter_map(|(provider, config)| {
+                let canonical = canonical_provider_key(provider);
+                let has_builtin_route = custom_provider_defaults(provider).is_some()
+                    || models.iter().any(|entry| {
+                        canonical_provider_key(&entry.model.provider) == canonical
+                    });
+                let has_manual_route = manual_config.is_some_and(|manual| {
+                    manual.providers.iter().any(|(candidate, candidate_config)| {
+                        canonical_provider_key(candidate) == canonical
+                            && provider_has_catalog_route(candidate, candidate_config)
+                    })
+                });
+                if has_builtin_route || has_manual_route {
+                    Some((provider.clone(), config.clone()))
+                } else {
+                    tracing::warn!(
+                        provider = %provider,
+                        "Ignoring generated model membership without a built-in or models.json provider route"
+                    );
+                    None
+                }
+            })
+            .collect(),
+    };
+    let fetched_providers = config
+        .providers
+        .keys()
+        .map(|provider| canonical_provider_key(provider))
+        .collect::<HashSet<_>>();
+    let preserved = models
+        .iter()
+        .filter(|entry| fetched_providers.contains(&canonical_provider_key(&entry.model.provider)))
+        .map(|entry| {
+            (
+                fetched_model_key(&entry.model.provider, &entry.model.id),
+                entry.clone(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    apply_custom_models(auth, models, &config, base_dir);
+
+    for entry in models
+        .iter_mut()
+        .filter(|entry| fetched_providers.contains(&canonical_provider_key(&entry.model.provider)))
+    {
+        if let Some(existing) =
+            preserved.get(&fetched_model_key(&entry.model.provider, &entry.model.id))
+        {
+            entry.clone_from(existing);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn apply_custom_models(
     auth: &impl ModelCredentialResolver,
@@ -2068,31 +2427,8 @@ fn apply_custom_models(
 ) {
     for (provider_id, provider_cfg) in &config.providers {
         let provider_id_str = provider_id.as_str();
-        let provider_defaults = custom_provider_defaults(provider_id);
-        let default_api = provider_defaults.map_or("openai-completions", |defaults| defaults.api);
-        let provider_api = provider_cfg.api.as_deref().unwrap_or(default_api);
-        let provider_api_parsed: Api = provider_api
-            .parse()
-            .unwrap_or_else(|_| Api::Custom(provider_api.to_string()));
-        let provider_api_string = provider_api_parsed.to_string();
-        let provider_base = provider_cfg.base_url.clone().unwrap_or_else(|| {
-            provider_defaults.map_or_else(
-                || {
-                    api_fallback_base_url(provider_api_string.as_str())
-                        .unwrap_or("https://api.openai.com/v1")
-                        .to_string()
-                },
-                |defaults| {
-                    if defaults.base_url.is_empty() {
-                        api_fallback_base_url(provider_api_string.as_str())
-                            .unwrap_or_default()
-                            .to_string()
-                    } else {
-                        defaults.base_url.to_string()
-                    }
-                },
-            )
-        });
+        let (provider_defaults, provider_api_string, provider_base, auth_header) =
+            resolved_provider_transport(provider_id, provider_cfg);
 
         let provider_headers = resolve_headers_with_base(provider_cfg.headers.as_ref(), base_dir);
         let canonical_provider = canonical_provider_id(provider_id).unwrap_or(provider_id_str);
@@ -2109,10 +2445,6 @@ fn apply_custom_models(
             .as_deref()
             .and_then(|value| resolve_value_with_base(value, base_dir))
             .or_else(|| auth.resolve_api_key(canonical_provider, None));
-
-        let auth_header = provider_cfg
-            .auth_header
-            .unwrap_or_else(|| provider_defaults.is_some_and(|defaults| defaults.auth_header));
 
         if provider_defaults.is_some() {
             tracing::debug!(
@@ -2185,7 +2517,10 @@ fn apply_custom_models(
                 continue;
             }
 
-            let model_api = model_cfg.api.as_deref().unwrap_or(provider_api);
+            let model_api = model_cfg
+                .api
+                .as_deref()
+                .unwrap_or(provider_api_string.as_str());
             let model_api_parsed: Api = model_api
                 .parse()
                 .unwrap_or_else(|_| Api::Custom(model_api.to_string()));
@@ -2513,15 +2848,89 @@ pub fn default_models_path(agent_dir: &Path) -> PathBuf {
 }
 
 /// Path for the generated, opt-in provider catalog stored beside
-/// `models.json`. The generated file is loaded before `models.json`, ensuring
+/// `models.json`.
+///
+/// The generated file is loaded before `models.json`, ensuring
 /// that user-authored configuration always wins without either file being
 /// merged or rewritten on disk.
 pub fn fetched_models_path(models_path: &Path) -> PathBuf {
     models_path.with_file_name("models.fetched.json")
 }
 
+fn open_regular_file_for_read(path: &Path, allow_final_symlink: bool) -> std::io::Result<fs::File> {
+    let initial_metadata = fs::symlink_metadata(path)?;
+    let resolved_path = if initial_metadata.file_type().is_symlink() && allow_final_symlink {
+        fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let metadata = fs::symlink_metadata(&resolved_path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || (initial_metadata.file_type().is_symlink() && !allow_final_symlink)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "model catalog path must be a regular, non-symlink file",
+        ));
+    }
+
+    #[cfg(unix)]
+    let file = {
+        let descriptor = rustix::fs::open(
+            &resolved_path,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK,
+            rustix::fs::Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        fs::File::from(descriptor)
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(&resolved_path)?;
+
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "model catalog path changed to a non-regular file while opening it",
+        ));
+    }
+    Ok(file)
+}
+
+fn read_bounded_model_catalog(
+    path: &Path,
+    max_bytes: usize,
+    description: &str,
+    allow_final_symlink: bool,
+) -> std::io::Result<String> {
+    let file = open_regular_file_for_read(path, allow_final_symlink)?;
+    if file.metadata()?.len() > max_bytes as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} exceeds {max_bytes} bytes"),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} exceeds {max_bytes} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} is not valid UTF-8: {error}"),
+        )
+    })
+}
+
 fn load_models_config(path: &Path) -> std::result::Result<ModelsConfig, Error> {
-    std::fs::read_to_string(path)
+    read_bounded_model_catalog(path, MAX_FETCHED_CATALOG_BYTES, "model catalog", true)
         .map_err(|error| {
             Error::config(format!(
                 "Failed to read model catalog {}: {error}",
@@ -2529,6 +2938,193 @@ fn load_models_config(path: &Path) -> std::result::Result<ModelsConfig, Error> {
             ))
         })
         .and_then(|contents| serde_json::from_str::<ModelsConfig>(&contents).map_err(Error::from))
+}
+
+pub(crate) fn resolve_model_catalog_provider_config(
+    provider: &str,
+    models_path: &Path,
+) -> std::result::Result<Option<ModelCatalogProviderConfig>, Error> {
+    let config = match fs::symlink_metadata(models_path) {
+        Ok(_) => Some(load_models_config(models_path)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(Error::config(format!(
+                "Failed to inspect model catalog {}: {error}",
+                models_path.display()
+            )));
+        }
+    };
+
+    let target_provider = canonical_provider_key(provider);
+    let mut matching_configs = config.as_ref().into_iter().flat_map(|config| {
+        config
+            .providers
+            .iter()
+            .filter(|(configured, _)| canonical_provider_key(configured) == target_provider)
+    });
+    let configured = matching_configs.next();
+    if matching_configs.next().is_some() {
+        return Err(Error::config(format!(
+            "models.json contains multiple provider aliases matching {provider:?}; keep one canonical provider entry"
+        )));
+    }
+
+    if configured.is_none() && custom_provider_defaults(provider).is_none() {
+        return Ok(None);
+    }
+
+    let empty_config = ProviderConfig::default();
+    let (configured_provider, provider_config) = configured
+        .map_or((provider, &empty_config), |(configured, config)| {
+            (configured.as_str(), config)
+        });
+    if !provider_has_catalog_route(configured_provider, provider_config) {
+        return Err(Error::config(format!(
+            "models.json provider {configured_provider:?} requires a non-empty baseUrl before live model discovery"
+        )));
+    }
+    let (_, api, base_url, auth_header) =
+        resolved_provider_transport(configured_provider, provider_config);
+    let base_dir = models_path.parent();
+    let api_key = provider_config
+        .api_key
+        .as_deref()
+        .and_then(|value| resolve_value_with_base(value, base_dir));
+    let headers = resolve_headers_with_base(provider_config.headers.as_ref(), base_dir);
+
+    Ok(Some(ModelCatalogProviderConfig {
+        base_url,
+        api,
+        api_key,
+        headers,
+        auth_header,
+    }))
+}
+
+fn load_fetched_models_config(path: &Path) -> std::result::Result<ModelsConfig, Error> {
+    let contents = read_generated_catalog(path).map_err(|error| {
+        Error::config(format!(
+            "Failed to read generated model catalog {}: {error}",
+            path.display()
+        ))
+    })?;
+    let catalog = parse_persisted_fetched_catalog(&contents).map_err(|error| {
+        Error::config(format!(
+            "Invalid generated model catalog {}: {error}",
+            path.display()
+        ))
+    })?;
+
+    let providers = catalog
+        .providers
+        .into_iter()
+        .map(|(provider, fetched)| {
+            let models = fetched
+                .models
+                .into_iter()
+                .map(|model| ModelConfig {
+                    id: model.id,
+                    ..ModelConfig::default()
+                })
+                .collect();
+            (
+                provider,
+                ProviderConfig {
+                    models: Some(models),
+                    ..ProviderConfig::default()
+                },
+            )
+        })
+        .collect();
+    Ok(ModelsConfig { providers })
+}
+
+pub(crate) fn parse_persisted_fetched_catalog(
+    contents: &str,
+) -> std::result::Result<PersistedFetchedCatalog, Error> {
+    let mut deserializer = serde_json::Deserializer::from_str(contents);
+    let catalog = PersistedFetchedCatalog::deserialize(&mut deserializer).map_err(Error::from)?;
+    deserializer.end().map_err(Error::from)?;
+    validate_persisted_fetched_catalog(&catalog)?;
+    Ok(catalog)
+}
+
+pub(crate) fn validate_persisted_fetched_catalog(
+    catalog: &PersistedFetchedCatalog,
+) -> std::result::Result<(), Error> {
+    if catalog.schema != FETCHED_MODELS_SCHEMA {
+        return Err(Error::config(format!(
+            "Unsupported generated model catalog schema {:?}; expected {FETCHED_MODELS_SCHEMA:?}",
+            catalog.schema
+        )));
+    }
+
+    if catalog.providers.len() > MAX_FETCHED_PROVIDERS {
+        return Err(Error::config(format!(
+            "Generated model catalog contains {} providers; maximum is {MAX_FETCHED_PROVIDERS}",
+            catalog.providers.len()
+        )));
+    }
+
+    let mut canonical_providers = HashSet::new();
+    for (provider, fetched) in &catalog.providers {
+        if !is_safe_model_catalog_identifier(provider, MAX_FETCHED_PROVIDER_ID_BYTES) {
+            return Err(Error::config(
+                "Generated model catalog contains an invalid provider ID",
+            ));
+        }
+        let canonical = canonical_provider_key(provider);
+        if !canonical_providers.insert(canonical.clone()) {
+            return Err(Error::config(format!(
+                "Generated model catalog contains duplicate aliases for provider {canonical:?}"
+            )));
+        }
+        let mut seen_model_ids = HashSet::new();
+        if fetched.models.is_empty() {
+            return Err(Error::config(format!(
+                "Generated model catalog contains an empty model list for provider {provider:?}"
+            )));
+        }
+        if fetched.models.len() > MAX_FETCHED_MODELS_PER_PROVIDER {
+            return Err(Error::config(format!(
+                "Generated model catalog contains {} models for provider {provider:?}; maximum is {MAX_FETCHED_MODELS_PER_PROVIDER}",
+                fetched.models.len()
+            )));
+        }
+        let total_model_id_bytes = fetched
+            .models
+            .iter()
+            .try_fold(0usize, |total, model| total.checked_add(model.id.len()))
+            .ok_or_else(|| Error::config("Generated model catalog model-ID size overflow"))?;
+        if total_model_id_bytes > MAX_FETCHED_MODEL_BYTES_PER_PROVIDER {
+            return Err(Error::config(format!(
+                "Generated model catalog contains {total_model_id_bytes} model-ID bytes for provider {provider:?}; maximum is {MAX_FETCHED_MODEL_BYTES_PER_PROVIDER}"
+            )));
+        }
+        for model in &fetched.models {
+            if !is_safe_model_catalog_identifier(&model.id, MAX_FETCHED_MODEL_ID_BYTES) {
+                return Err(Error::config(format!(
+                    "Generated model catalog contains an invalid model ID for provider {provider:?}"
+                )));
+            }
+            if !seen_model_ids.insert(normalized_registry_key(provider, &model.id)) {
+                return Err(Error::config(format!(
+                    "Generated model catalog contains duplicate registry identity for model ID {:?} and provider {provider:?}",
+                    model.id
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn read_generated_catalog(path: &Path) -> std::io::Result<String> {
+    read_bounded_model_catalog(
+        path,
+        MAX_FETCHED_CATALOG_BYTES,
+        "generated model catalog",
+        false,
+    )
 }
 
 // === Ad-hoc model support ===
@@ -3929,6 +4525,229 @@ mod tests {
     }
 
     #[test]
+    fn model_catalog_discovery_uses_resolved_custom_provider_transport() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        let key_path = dir.path().join("catalog-key.txt");
+        std::fs::write(&key_path, "custom-catalog-key\n").expect("write catalog key");
+        std::fs::write(
+            &models_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "providers": {
+                    "acme": {
+                        "baseUrl": "https://models.acme.example/openai/v1",
+                        "api": "openai-completions",
+                        "apiKey": "file:catalog-key.txt",
+                        "authHeader": false,
+                        "headers": {"x-acme-key": "header-secret"}
+                    }
+                }
+            }))
+            .expect("serialize models.json"),
+        )
+        .expect("write models.json");
+
+        let route = resolve_model_catalog_provider_config("acme", &models_path)
+            .expect("resolve custom discovery route")
+            .expect("custom provider route");
+        assert_eq!(route.base_url, "https://models.acme.example/openai/v1");
+        assert_eq!(route.api, "openai-completions");
+        assert_eq!(route.api_key.as_deref(), Some("custom-catalog-key"));
+        assert!(!route.auth_header);
+        assert_eq!(
+            route.headers.get("x-acme-key").map(String::as_str),
+            Some("header-secret")
+        );
+    }
+
+    #[test]
+    fn model_catalog_discovery_honors_builtin_endpoint_override() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{"providers":{"ollama":{"baseUrl":"http://127.0.0.1:11000/v1"}}}"#,
+        )
+        .expect("write ollama override");
+
+        let route = resolve_model_catalog_provider_config("ollama", &models_path)
+            .expect("resolve ollama discovery route")
+            .expect("built-in provider route");
+        assert_eq!(route.base_url, "http://127.0.0.1:11000/v1");
+        assert_eq!(route.api, "openai-completions");
+        assert!(!route.auth_header);
+    }
+
+    #[test]
+    fn model_catalog_discovery_rejects_ambiguous_provider_aliases() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(&models_path, r#"{"providers":{"openai":{},"OpenAI":{}}}"#)
+            .expect("write ambiguous aliases");
+
+        let error = resolve_model_catalog_provider_config("openai", &models_path)
+            .expect_err("ambiguous provider aliases must fail deterministically");
+        assert!(
+            error.to_string().contains("multiple provider aliases"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn model_catalog_discovery_rejects_exact_and_escaped_duplicate_provider_keys() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        for contents in [
+            r#"{"providers":{"openai":{"baseUrl":"https://safe.example/v1"},"openai":{"baseUrl":"https://attacker.example/v1"}}}"#,
+            r#"{"providers":{"openai":{"baseUrl":"https://safe.example/v1"},"\u006fpenai":{"baseUrl":"https://attacker.example/v1"}}}"#,
+        ] {
+            std::fs::write(&models_path, contents).expect("write duplicate provider route");
+            let error = resolve_model_catalog_provider_config("openai", &models_path)
+                .expect_err("duplicate provider routes must fail closed");
+            assert!(
+                error.to_string().contains("duplicate JSON object key"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_catalog_parser_rejects_duplicate_fields_aliases_and_trailing_data() {
+        for (label, contents, expected) in [
+            (
+                "duplicate top-level schema",
+                r#"{"schema":"pi.models.fetched.v1","schema":"pi.models.fetched.v1","providers":{"openai":{"models":[{"id":"model"}]}}}"#,
+                "duplicate field",
+            ),
+            (
+                "duplicate model id",
+                r#"{"schema":"pi.models.fetched.v1","providers":{"openai":{"models":[{"id":"first","id":"second"}]}}}"#,
+                "duplicate field",
+            ),
+            (
+                "canonical provider aliases",
+                r#"{"schema":"pi.models.fetched.v1","providers":{"openai":{"models":[{"id":"first"}]},"OpenAI":{"models":[{"id":"second"}]}}}"#,
+                "duplicate aliases",
+            ),
+            (
+                "escaped exact provider key",
+                r#"{"schema":"pi.models.fetched.v1","providers":{"openai":{"models":[{"id":"first"}]},"\u006fpenai":{"models":[{"id":"second"}]}}}"#,
+                "duplicate JSON object key",
+            ),
+            (
+                "trailing JSON value",
+                r#"{"schema":"pi.models.fetched.v1","providers":{"openai":{"models":[{"id":"model"}]}}} {}"#,
+                "trailing characters",
+            ),
+        ] {
+            let error = parse_persisted_fetched_catalog(contents)
+                .expect_err("malformed generated catalog must fail closed");
+            assert!(error.to_string().contains(expected), "{label}: {error}");
+        }
+    }
+
+    #[test]
+    fn generated_catalog_parser_enforces_provider_and_model_cardinality_during_decode() {
+        let providers = (0..=MAX_FETCHED_PROVIDERS)
+            .map(|index| {
+                (
+                    format!("provider-{index}"),
+                    serde_json::json!({"models": [{"id": "model"}]}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let provider_payload = serde_json::json!({
+            "schema": FETCHED_MODELS_SCHEMA,
+            "providers": providers,
+        });
+        let error = parse_persisted_fetched_catalog(&provider_payload.to_string())
+            .expect_err("provider cap must be enforced while decoding");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+
+        let models = (0..=MAX_FETCHED_MODELS_PER_PROVIDER)
+            .map(|index| serde_json::json!({"id": format!("model-{index}")}))
+            .collect::<Vec<_>>();
+        let model_payload = serde_json::json!({
+            "schema": FETCHED_MODELS_SCHEMA,
+            "providers": {"openai": {"models": models}},
+        });
+        let error = parse_persisted_fetched_catalog(&model_payload.to_string())
+            .expect_err("model cap must be enforced while decoding");
+        assert!(error.to_string().contains("exceeds"), "{error}");
+    }
+
+    #[test]
+    fn model_catalog_discovery_rejects_custom_provider_without_explicit_endpoint() {
+        let dir = tempdir().expect("tempdir");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &models_path,
+            r#"{"providers":{"acme":{"apiKey":"must-not-be-sent-elsewhere"}}}"#,
+        )
+        .expect("write incomplete custom route");
+
+        let error = resolve_model_catalog_provider_config("acme", &models_path)
+            .expect_err("a custom provider must not inherit OpenAI's public endpoint");
+        assert!(error.to_string().contains("non-empty baseUrl"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manual_model_catalog_symlink_to_regular_file_remains_supported() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().expect("tempdir");
+        let target = dir.path().join("actual-models.json");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            &target,
+            r#"{"providers":{"acme":{"baseUrl":"https://acme.example/v1"}}}"#,
+        )
+        .expect("write model catalog target");
+        symlink(&target, &models_path).expect("symlink model catalog");
+
+        assert!(
+            resolve_model_catalog_provider_config("acme", &models_path)
+                .expect("read symlinked manual catalog")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_model_catalog_fifo_is_rejected_without_opening() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("models.fetched.json");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .expect("run mkfifo");
+        assert!(status.success(), "mkfifo must create the test fixture");
+
+        let error = read_generated_catalog(&path)
+            .expect_err("a FIFO must be rejected instead of blocking for a writer");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("regular"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_registry_reports_broken_catalog_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        symlink(dir.path().join("missing-models.json"), &models_path)
+            .expect("create broken model catalog symlink");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let error = registry
+            .error()
+            .expect("a configured but unreadable catalog must not be silently ignored");
+        assert!(error.contains("Failed to read model catalog"), "{error}");
+    }
+
+    #[test]
     fn model_registry_loads_fetched_catalog_before_manual_models_json() {
         let (dir, auth) = test_auth_storage();
         let models_path = dir.path().join("models.json");
@@ -3937,11 +4756,9 @@ mod tests {
             "schema": "pi.models.fetched.v1",
             "providers": {
                 "shared-provider": {
-                    "baseUrl": "https://generated.example/v1",
                     "models": [{"id": "generated-shared"}]
                 },
-                "fetched-only": {
-                    "baseUrl": "https://fetched.example/v1",
+                "openai": {
                     "models": [{"id": "fetched-model"}]
                 }
             }
@@ -3968,8 +4785,8 @@ mod tests {
         let registry = ModelRegistry::load(&auth, Some(models_path.clone()));
 
         assert!(
-            registry.find("fetched-only", "fetched-model").is_some(),
-            "providers absent from manual config must survive"
+            registry.find("openai", "fetched-model").is_some(),
+            "generated membership with a built-in provider route must survive"
         );
         let manual = registry
             .find("shared-provider", "manual-shared")
@@ -3987,6 +4804,120 @@ mod tests {
             manual_bytes,
             "loading generated models must never rewrite user models.json"
         );
+    }
+
+    #[test]
+    fn fetched_custom_provider_requires_an_explicit_manual_endpoint() {
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            fetched_models_path(&models_path),
+            r#"{"schema":"pi.models.fetched.v1","providers":{"acme":{"models":[{"id":"acme-live"}]}}}"#,
+        )
+        .expect("write fetched catalog");
+        std::fs::write(&models_path, r#"{"providers":{"acme":{}}}"#)
+            .expect("write route-less manual catalog");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        assert!(
+            registry.find("acme", "acme-live").is_none(),
+            "generated membership must not synthesize an OpenAI endpoint for a custom provider"
+        );
+    }
+
+    #[test]
+    fn fetched_catalog_preserves_known_model_metadata_with_live_membership() {
+        let (dir, auth) = test_auth_storage();
+        let baseline = ModelRegistry::load(&auth, None)
+            .find("openai", "gpt-5.6")
+            .expect("built-in GPT-5.6");
+        let models_path = dir.path().join("models.json");
+        std::fs::write(
+            fetched_models_path(&models_path),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA,
+                "providers": {
+                    "openai": {
+                        "models": [
+                            {"id": "gpt-5.6"},
+                            {"id": "new-live-model"}
+                        ]
+                    }
+                }
+            }))
+            .expect("serialize fetched catalog"),
+        )
+        .expect("write fetched catalog");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let preserved = registry
+            .find("openai", "gpt-5.6")
+            .expect("known fetched model");
+        assert_eq!(preserved.model.api, baseline.model.api);
+        assert_eq!(preserved.model.base_url, baseline.model.base_url);
+        assert_eq!(
+            preserved.model.context_window,
+            baseline.model.context_window
+        );
+        assert_eq!(preserved.model.max_tokens, baseline.model.max_tokens);
+        assert_eq!(preserved.model.reasoning, baseline.model.reasoning);
+        assert_eq!(preserved.supports_max(), baseline.supports_max());
+        assert!(registry.find("openai", "new-live-model").is_some());
+        assert!(
+            registry.find("openai", "gpt-4o").is_none(),
+            "models absent from the live membership must not be reintroduced"
+        );
+    }
+
+    #[test]
+    fn fetched_catalog_rejects_wrong_schema_and_user_only_fields() {
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        let fetched_path = fetched_models_path(&models_path);
+        std::fs::write(
+            &fetched_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "pi.models.fetched.v999",
+                "providers": {
+                    "openrouter": {
+                        "models": [{"id": "untrusted-generated-model"}]
+                    }
+                }
+            }))
+            .expect("serialize invalid fetched catalog"),
+        )
+        .expect("write invalid fetched catalog");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+        let error = registry.error().expect("generated schema error");
+        assert!(
+            error.contains("Unsupported generated model catalog schema"),
+            "{error}"
+        );
+        assert!(
+            registry
+                .find("openrouter", "untrusted-generated-model")
+                .is_none(),
+            "invalid generated input must fail closed"
+        );
+
+        std::fs::write(
+            &fetched_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": FETCHED_MODELS_SCHEMA,
+                "providers": {
+                    "openrouter": {
+                        "apiKey": "must-not-be-accepted-here",
+                        "models": [{"id": "untrusted-generated-model"}]
+                    }
+                }
+            }))
+            .expect("serialize invalid fetched fields"),
+        )
+        .expect("write invalid fetched fields");
+        let registry = ModelRegistry::load(&auth, Some(models_path));
+        let error = registry.error().expect("generated field error");
+        assert!(error.contains("Invalid generated model catalog"), "{error}");
     }
 
     #[test]
@@ -5058,6 +5989,14 @@ mod tests {
     fn default_models_path_joins_correctly() {
         let path = default_models_path(Path::new("/home/user/.pi"));
         assert_eq!(path, PathBuf::from("/home/user/.pi/models.json"));
+    }
+
+    #[test]
+    fn fetched_provider_bound_covers_supported_provider_inventory() {
+        assert!(
+            crate::provider_metadata::PROVIDER_METADATA.len() <= MAX_FETCHED_PROVIDERS,
+            "generated catalog provider cap must cover every supported provider"
+        );
     }
 
     // ─── ModelsConfig deserialization ────────────────────────────────

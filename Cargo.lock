@@ -4506,6 +4506,7 @@ dependencies = [
  "rich_rust",
  "ring",
  "rquickjs",
+ "rustix",
  "scrypt",
  "semver",
  "serde",

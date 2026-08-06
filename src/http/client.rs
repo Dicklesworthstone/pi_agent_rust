@@ -180,6 +180,14 @@ fn resolve_timeout(_setting: RequestTimeout, _url: &str) -> Option<std::time::Du
     None
 }
 
+/// Resolve the same provider-aware/global timeout used by an otherwise
+/// unmodified [`RequestBuilder`]. Finite, non-streaming operations can use this
+/// to add an overall wall-clock deadline in addition to the client's
+/// connect/write/header and body-idle bounds.
+pub(crate) fn effective_default_request_timeout(url: &str) -> Option<std::time::Duration> {
+    resolve_timeout(RequestTimeout::Default, url)
+}
+
 /// Build a self-documenting timeout error message that tells the user the
 /// timeout that fired and how to raise it. Adds Ollama/local-provider-specific
 /// guidance (cold-start model load, model not pulled) when the target is a
@@ -334,6 +342,15 @@ impl<'a> RequestBuilder<'a> {
         let key = key.into();
         let value = value.into();
         validate_request_header(&key, &value)?;
+        let replaces_existing = self
+            .headers
+            .iter()
+            .any(|(existing_key, _)| existing_key.eq_ignore_ascii_case(&key));
+        if !replaces_existing && self.headers.len() >= MAX_REQUEST_HEADERS {
+            return Err(Error::api(format!(
+                "HTTP request exceeds the {MAX_REQUEST_HEADERS}-header limit"
+            )));
+        }
         self.upsert_header(key, value);
         Ok(self)
     }
@@ -667,10 +684,29 @@ impl Response {
     }
 
     pub async fn text(self) -> Result<String> {
+        self.text_limited(MAX_TEXT_BODY_BYTES).await
+    }
+
+    /// Collect the response body with a caller-specific byte limit.
+    ///
+    /// This is useful for small structured endpoints whose safe bound is much
+    /// tighter than the generic response limit.
+    pub async fn text_limited(self, max_bytes: usize) -> Result<String> {
+        let bytes = self.bytes_limited(max_bytes).await?;
+
+        match String::from_utf8(bytes) {
+            Ok(s) => Ok(s),
+            Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        }
+    }
+
+    /// Collect response bytes without changing invalid UTF-8, bounded by a
+    /// caller-specific limit.
+    pub async fn bytes_limited(self, max_bytes: usize) -> Result<Vec<u8>> {
         let stream = wrap_stream_with_idle_timeout(self.stream, self.timeout_info);
-        let bytes = stream
+        stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
-                if acc.len().saturating_add(chunk.len()) > MAX_TEXT_BODY_BYTES {
+                if acc.len().saturating_add(chunk.len()) > max_bytes {
                     return Err(std::io::Error::other("response body too large"));
                 }
                 acc.extend_from_slice(&chunk);
@@ -687,12 +723,7 @@ impl Response {
                 } else {
                     Error::from(err)
                 }
-            })?;
-
-        match String::from_utf8(bytes) {
-            Ok(s) => Ok(s),
-            Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
-        }
+            })
     }
 }
 
@@ -2152,6 +2183,34 @@ mod tests {
     }
 
     #[test]
+    fn request_builder_try_header_reports_capacity_and_still_allows_replacement() {
+        let client = Client::new();
+        let mut builder = client.post("https://api.example.com");
+        for i in 0..MAX_REQUEST_HEADERS {
+            builder = builder
+                .try_header(format!("X-Header-{i}"), "value")
+                .expect("headers within the cap");
+        }
+
+        let Err(error) = builder.try_header("X-Over-Limit", "must-not-be-dropped-silently") else {
+            panic!("a distinct header beyond the cap must be reported");
+        };
+        assert!(error.to_string().contains("header limit"), "{error}");
+
+        let mut replaceable = client.post("https://api.example.com");
+        for i in 0..MAX_REQUEST_HEADERS {
+            replaceable = replaceable
+                .try_header(format!("X-Header-{i}"), "value")
+                .expect("headers within the cap");
+        }
+        replaceable = replaceable
+            .try_header("x-header-0", "replacement")
+            .expect("case-insensitive replacement at capacity");
+        assert_eq!(replaceable.headers.len(), MAX_REQUEST_HEADERS);
+        assert_eq!(replaceable.headers[0].1, "replacement");
+    }
+
+    #[test]
     fn request_builder_json() {
         let client = Client::new();
         let builder = client
@@ -2616,6 +2675,25 @@ mod tests {
             let result = response.text().await;
             assert!(result.is_ok());
             assert_eq!(result.unwrap().len(), MAX_TEXT_BODY_BYTES);
+        });
+    }
+
+    #[test]
+    fn response_text_limited_honors_caller_specific_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let chunks: Vec<std::io::Result<Vec<u8>>> =
+                vec![Ok(b"1234".to_vec()), Ok(b"5".to_vec())];
+            let response = Response {
+                status: 200,
+                headers: Vec::new(),
+                stream: Box::pin(futures::stream::iter(chunks)),
+                timeout_info: None,
+            };
+            let error = response
+                .text_limited(4)
+                .await
+                .expect_err("fifth byte must exceed the endpoint-specific limit");
+            assert!(error.to_string().contains("too large"), "{error}");
         });
     }
 

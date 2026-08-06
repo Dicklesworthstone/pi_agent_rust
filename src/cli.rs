@@ -88,6 +88,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "theme"
         | "theme-path"
         | "max-tool-iterations"
+        | "request-timeout"
         | "export"
         | "fetch-models" => (true, false),
         "list-models" => (true, true),
@@ -1021,6 +1022,8 @@ mod tests {
                 "openrouter",
                 "--refresh-models",
                 "--persist-models",
+                "--request-timeout",
+                "17",
             ]
             .into_iter()
             .map(str::to_string)
@@ -1031,6 +1034,7 @@ mod tests {
         assert_eq!(parsed.cli.fetch_models.as_deref(), Some("openrouter"));
         assert!(parsed.cli.refresh_models);
         assert!(parsed.cli.persist_models);
+        assert_eq!(parsed.cli.request_timeout, Some(17));
         assert!(
             parsed.extension_flags.is_empty(),
             "built-in model flags must not be reclassified as extension flags"
