@@ -205,12 +205,12 @@ The report tags test-double usage by:
 - `double_identifier` and `double_type`
 - `risk` and rationale
 
-Current baseline snapshot (from `report_id=bd-1f42.8.1-test-double-inventory-v2`, generated `2026-02-13T04:24:50Z`):
+Current baseline snapshot (from `report_id=bd-1f42.8.1-test-double-inventory-v2`, generated `2026-02-13T04:24:50Z`; extension-decomposition locators refreshed `2026-08-06`):
 
-- `entry_count`: 267
+- `entry_count`: 265
 - `module_count`: 21
 - suite distribution:
-  - `unit-inline`: 116
+  - `unit-inline`: 114
   - `vcr`: 73
   - `unit`: 16
   - `e2e`: 26
@@ -219,7 +219,7 @@ Current baseline snapshot (from `report_id=bd-1f42.8.1-test-double-inventory-v2`
 Top risk clusters:
 
 - `src/extension_dispatcher` (86 entries, high)
-- `src/extensions` (22 entries, high)
+- `src/extensions/tests` (20 entries, high)
 - `tests/extensions_provider_oauth` (28 entries, high)
 - `tests/e2e_provider_scenarios` (23 entries, high)
 - `tests/mock_spec_validation` (11 entries, high)
@@ -262,7 +262,7 @@ Each mock/stub usage outside Suite 1 must be explicitly allowlisted here with ra
 | `PackageCommandStubs` | `tests/e2e_cli.rs` | 3 | Offline npm/git stubs for CLI E2E; logged to JSONL. | infra | Permanent: real npm/git operations are non-deterministic. |
 | `RecordingSession` | `tests/extensions_message_session.rs` | 2 | Session API surface testing. | bd-m9rk | Replace with `SessionHandle` (real session). Most usages already migrated. |
 | `RecordingHostActions` | `tests/e2e_message_session_control.rs` | 2 | Extension host action recording; needed where agent loop provides host actions. | bd-m9rk | Evaluate if agent-loop integration test can replace recording. |
-| `MockHostActions` | `src/extensions.rs` (unit tests) | 2 | In-module stub for `sendMessage`/`sendUserMessage`. | bd-m9rk | Replace with real session-based dispatch once full integration test exists. |
+| `MockHostActions` | `src/extensions/tests/registration.rs` (unit tests) | 2 | In-module stub for `sendMessage`/`sendUserMessage`. | bd-m9rk | Replace with real session-based dispatch once full integration test exists. |
 
 **Process for adding new exceptions:** Open a bead with rationale. Get review. Add to this table
 with the bead ID. Add the `<path>:<Identifier>` entry to `.no-mock-allowlist` at repo root (the

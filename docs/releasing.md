@@ -32,13 +32,18 @@ below. No other workflow or ad hoc operator command is an authorized publisher.
 In the automated lane, `release.yml` first creates or safely completes a
 verified GitHub draft, builds and inspects the exact `.crate` without a secret,
 then passes the crate and a source-bound checksum receipt to a fresh
-review-gated runner. The fresh runner executes
-`cargo publish --locked --registry crates-io`; its custom Cargo credential
-provider supplies the token
-for canonical crates.io read requests without writing a publication receipt,
-and supplies it for a publish request only when Cargo presents the exact
-verified crate name/version/SHA-256. The workflow then requires crates.io to
-report the exact, non-yanked version before it makes the GitHub release public.
+review-gated runner. The fresh runner captures the review-gated secret into a
+non-exported shell variable, removes it from the step environment, and repeats
+the final crate, provider, and effective Cargo-configuration proofs without a
+secret. It then hands the token to exactly one process chain that executes
+`cargo publish --locked --no-verify --registry crates-io`. The package and
+dry-run proofs have already completed before that handoff; `--no-verify`
+prevents Cargo from rebuilding the package while build scripts could inherit
+the publication credential. Its custom Cargo credential provider supplies the
+token for canonical crates.io read requests without writing a publication
+receipt, and supplies it for a publish request only when Cargo presents the
+exact verified crate name/version/SHA-256. The workflow then requires crates.io
+to report the exact, non-yanked version before it makes the GitHub release public.
 Pre-releases skip crates.io entirely.
 
 Release and publish workflows resolve the sibling-project crates from crates.io
@@ -223,8 +228,8 @@ Until then, `0.x` releases may still change behavior to improve correctness/pari
 ## Manual DSR lane (no GitHub Actions)
 
 Use this lane when the release is intentionally built and published from the
-operator hosts. It does not dispatch, rerun, or otherwise invoke a GitHub
-Actions workflow. The frozen Windows build leg uses DSR host `wsurf`, mapped
+operator hosts. It does not query, dispatch, rerun, cancel, or otherwise use a
+GitHub Actions workflow as execution or evidence. The frozen Windows build leg uses DSR host `wsurf`, mapped
 to SSH host `oldsurface`; `wlap` is only the post-build Windows execution-smoke
 host. Keep every pushed release-preparation, source, and evidence
 commit marked with `[skip actions]`; the commit ultimately referenced by the
@@ -240,11 +245,31 @@ ignored or untracked files into it. Pin `RUSTUP_TOOLCHAIN` for the entire
 fail-fast session, bypass the RCH Cargo wrapper, and put the rustup-selected
 actual Cargo/Rust compiler directory first on `PATH`. Record the original
 Cargo/Rust entrypoints and the selected actual binaries, including resolved
-paths, SHA-256 digests, and verbose versions. Also record the resolved paths and
-SHA-256 digests of `bash`, `git`, `python3`, `rustup`, `cargo`, `rustc`, `gh`,
-`jq`, `ssh`, `sha256sum`, `bwrap`, `yq`, `uuidgen`, `curl`, `scp`, `tar`, and
-`file` in the state directory before relying on them for a release gate or
-publication step. During the E2E run,
+paths, SHA-256 digests, and verbose versions. After the minimal bootstrap that
+creates the private clone and state directory, record every pre-existing
+controller executable explicitly invoked by this runbook or by the audited
+repository-owned gate, test, and script command surface as an exact
+`(label, SHA-256, requested path, resolved path)` tuple. Re-resolve and rehash
+that inventory at every major boundary and immediately before each remote
+mutation; a receipt that is merely written once is not an execution binding.
+
+This operator-tool receipt does **not** claim complete transitive process
+closure. Cargo/Rust entrypoints and the rustup-selected `cargo`/`rustc` binaries
+are bound separately above, but descendants selected internally by Cargo,
+rustc, native linker drivers, proc macros, dependency build scripts, or the OS
+loader are outside `operator-tools.tsv`; so are fixture executables generated
+inside isolated test directories and commands executed on remote build/smoke
+hosts. The lane makes no byte-identity claim for those excluded descendants.
+Their exclusion must not be described as a complete build-tool closure without
+a new, fresh exec-trace/allowlist proof against the exact release source.
+Shell builtins (including `pwd` and the controller's `kill`) are instead bound
+to the verified running controller Bash; they are deliberately absent from the
+ordinary PATH-tool rows. The `path-kill` row separately binds the external
+executable reached by Rust child-process PATH lookup. Every ordinary
+receipt-listed PATH tool must resolve as a file, never an alias, function, or
+builtin, with Bash command hashing disabled.
+
+During the E2E run,
 make the clone's `.git` metadata non-writable so tests cannot move HEAD or
 alter the index, and keep Cargo target and temporary output outside the clone.
 The worktree remains writable because ordinary tests legitimately emit ignored
@@ -261,26 +286,84 @@ absolute evidence path remains resolvable.
 Before opening the fail-fast session, freeze every release-source change in one
 or more commits whose subjects end in `[skip actions]`, and leave the checkout
 completely clean. Run the lane as one fail-fast Bash session (`set -euo
-pipefail`); do not copy a later publication command in isolation. Start by
+pipefail`), launched from the current operator shell with `exec /bin/bash
+--noprofile --norc -p`. Privileged Bash mode is used here only as
+process-dispatch hardening: it
+rejects imported shell functions and startup files; it is not an authorization
+escalation. The block verifies that exact clean-shell contract before trusting
+any PATH lookup. Do not copy a later publication command in isolation. Start by
 binding all operator state to the intended stable version, a fresh directory
 outside the checkout, the fixed audited smoke hosts (`trj`, `mmini`, and
 `wlap`), and the audited controller's ARM64 sysroot. Linux AMD64 executes
 natively on `trj`. Linux ARM64 executes explicitly under `qemu-aarch64` on that
 x86_64 host; that is target-runtime emulation, not a hardware-native ARM64
 claim. `mmini` must support both native ARM64 execution and Rosetta x86_64
-execution, and `wlap` must report an x86_64 Windows runtime. Replace the three
+execution, and `wlap` must report an x86_64 Windows runtime. Replace the
 explicit operator-supplied values before running this block:
 
 ```bash
 set -euo pipefail
+set +x
 umask 077
+[[ -n "${BASH_VERSION:-}" && "$-" == *p* ]]
+builtin hash -r
+builtin set +h
+[[ "$-" != *h* ]]
+builtin shopt -u expand_aliases
+if builtin shopt -q expand_aliases; then
+  exit 1
+fi
+(( ${#BASH_ALIASES[@]} == 0 ))
+builtin unalias -a
+while IFS= builtin read -r -d '' release_env_entry; do
+  case "${release_env_entry%%=*}" in
+    BASH_FUNC_*)
+      builtin printf 'refusing exported shell function environment\n' >&2
+      exit 1
+      ;;
+  esac
+done < "/proc/$$/environ"
+builtin unset release_env_entry
+builtin unset BASH_ENV ENV CDPATH GLOBIGNORE
+[[ ! -v BASH_ENV && ! -v ENV ]]
+release_tool_names=(
+  realpath sha256sum bash git python3 rustup cargo rustc gh jq ssh bwrap yq
+  uuidgen curl scp tar file dirname awk grep wc stat id mktemp date sort cmp comm
+  sed find chmod head tail tee tr cat mkdir env uname df nproc sysctl ubs br
+  rg timeout base64 flock mv od basename sleep cp paste am bv cut dd fd mkfifo
+  pgrep ps rch rm sh tmux touch which install rmdir xz yes ls seq whoami
+)
+release_path_descendant_tool_names=(kill)
+for release_tool in \
+    "${release_tool_names[@]}" "${release_path_descendant_tool_names[@]}"; do
+  if builtin declare -F "$release_tool" >/dev/null; then
+    builtin printf 'controller function shadows tool: %s\n' "$release_tool" >&2
+    exit 1
+  fi
+done
 export RUSTUP_TOOLCHAIN="nightly-2026-07-05"
 export RCH_CARGO_WRAPPER_BYPASS=1
 test "$RUSTUP_TOOLCHAIN" = nightly-2026-07-05
 test "$RCH_CARGO_WRAPPER_BYPASS" = 1
-release_cargo_entrypoint="$(type -P cargo)"
-release_rustc_entrypoint="$(type -P rustc)"
-release_rustup_entrypoint="$(type -P rustup)"
+# Capture the crates.io credential into one non-exported shell variable before
+# starting any subprocess. The release shell keeps it unavailable to git,
+# rustup, Cargo gates, tests, evidence generators, DSR, and packaging until the
+# single checksum-gated publication process in step 8.
+if [[ -n "${CARGO_REGISTRY_TOKEN:-}" &&
+      -n "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
+  [[ "$CARGO_REGISTRY_TOKEN" == "$CARGO_REGISTRIES_CRATES_IO_TOKEN" ]]
+fi
+release_crates_io_token="${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}"
+[[ -n "$release_crates_io_token" ]]
+(( ${#release_crates_io_token} <= 4096 ))
+case "$release_crates_io_token" in *$'\n'*|*$'\r'*) exit 1 ;; esac
+builtin export -n release_crates_io_token
+[[ -z "${PI_CRATES_IO_RELEASE_TOKEN:-}" ]]
+builtin unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN \
+  PI_CRATES_IO_RELEASE_TOKEN
+release_cargo_entrypoint="$(builtin type -P -- cargo)"
+release_rustc_entrypoint="$(builtin type -P -- rustc)"
+release_rustup_entrypoint="$(builtin type -P -- rustup)"
 test -n "$release_cargo_entrypoint"
 test -n "$release_rustc_entrypoint"
 test -n "$release_rustup_entrypoint"
@@ -293,8 +376,8 @@ test -f "$release_rustc_actual" && test ! -L "$release_rustc_actual"
 release_rust_bin="$(dirname -- "$release_cargo_actual")"
 test "$(dirname -- "$release_rustc_actual")" = "$release_rust_bin"
 export PATH="$release_rust_bin:$PATH"
-test "$(realpath -e -- "$(type -P cargo)")" = "$release_cargo_actual"
-test "$(realpath -e -- "$(type -P rustc)")" = "$release_rustc_actual"
+test "$(realpath -e -- "$(builtin type -P -- cargo)")" = "$release_cargo_actual"
+test "$(realpath -e -- "$(builtin type -P -- rustc)")" = "$release_rustc_actual"
 case "$(cargo --version)" in
   'cargo 1.98.0-nightly ('*) ;;
   *) printf 'unexpected pinned Cargo version\n' >&2; exit 1 ;;
@@ -304,7 +387,6 @@ case "$(rustc --version)" in
   *) printf 'unexpected pinned rustc version\n' >&2; exit 1 ;;
 esac
 export RELEASE_VERSION="X.Y.Z"
-export MANUAL_RELEASE_STATE_DIR="/path/outside/checkout/pi_agent_rust-vX.Y.Z-release-state"
 export LINUX_AMD64_SMOKE_HOST="trj"
 export LINUX_ARM64_SMOKE_HOST="trj"
 export LINUX_ARM64_QEMU_SYSROOT="/operator/supplied/aarch64/sysroot"
@@ -313,7 +395,7 @@ export WINDOWS_AMD64_SMOKE_HOST="wlap"
 [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 export RELEASE_TAG="v${RELEASE_VERSION}"
 test "$RELEASE_TAG" != "vX.Y.Z"
-release_source_checkout="$(pwd -P)"
+release_source_checkout="$(builtin pwd -P)"
 test "$release_source_checkout" = /data/projects/pi_agent_rust
 test -z "$(git status --porcelain=v2 --untracked-files=all)"
 source_commit="$(git rev-parse 'HEAD^{commit}')"
@@ -323,7 +405,20 @@ case "$(git show -s --format=%s "$source_commit")" in
 esac
 release_clone_id="$(uuidgen | tr '[:upper:]' '[:lower:]')"
 [[ "$release_clone_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
-release_checkout="/data/tmp/pi_agent_rust-v${RELEASE_VERSION}-release-$release_clone_id"
+export MANUAL_RELEASE_ROOT="/data/tmp/pi_agent_rust-v${RELEASE_VERSION}-release-$release_clone_id"
+export MANUAL_RELEASE_STATE_DIR="$MANUAL_RELEASE_ROOT/state"
+release_checkout="$MANUAL_RELEASE_ROOT/checkout"
+case "$MANUAL_RELEASE_ROOT" in
+  /data/tmp/pi_agent_rust-v"$RELEASE_VERSION"-release-"$release_clone_id") ;;
+  *) exit 1 ;;
+esac
+case "$MANUAL_RELEASE_ROOT" in
+  "$release_source_checkout"|"$release_source_checkout"/*) exit 1 ;;
+esac
+test ! -e "$MANUAL_RELEASE_ROOT" && test ! -L "$MANUAL_RELEASE_ROOT"
+mkdir -m 700 "$MANUAL_RELEASE_ROOT"
+test "$(realpath -e -- "$MANUAL_RELEASE_ROOT")" = "$MANUAL_RELEASE_ROOT"
+test "$(stat -c '%a:%u' "$MANUAL_RELEASE_ROOT")" = "700:$(id -u)"
 test ! -e "$release_checkout" && test ! -L "$release_checkout"
 git clone --no-local --no-hardlinks --single-branch --branch main \
   "$release_source_checkout" "$release_checkout"
@@ -337,35 +432,30 @@ test "$(git -C "$release_checkout" remote get-url origin)" = "$release_remote_ur
 test "$(git -C "$release_checkout" remote get-url --push origin)" = \
   no-push://pi-agent-rust-v0.2.0-release-guard
 cd "$release_checkout"
-test "$(pwd -P)" = "$release_checkout"
+test "$(builtin pwd -P)" = "$release_checkout"
 
-disable_origin_push() {
-  git remote set-url --push origin \
-    no-push://pi-agent-rust-v0.2.0-release-guard || return
-  local -a release_push_urls
+assert_origin_push_disabled() {
+  local -a release_fetch_urls release_push_urls
+  mapfile -t release_fetch_urls < <(git remote get-url --all origin)
+  test "${#release_fetch_urls[@]}" -eq 1 || return
+  test "${release_fetch_urls[0]}" = "$release_remote_url" || return
   mapfile -t release_push_urls < <(git remote get-url --push --all origin)
   test "${#release_push_urls[@]}" -eq 1 || return
   test "${release_push_urls[0]}" = \
     no-push://pi-agent-rust-v0.2.0-release-guard
 }
-enable_origin_push() {
-  local -a release_fetch_urls release_push_urls
-  mapfile -t release_fetch_urls < <(git remote get-url --all origin)
-  test "${#release_fetch_urls[@]}" -eq 1 || return
-  test "${release_fetch_urls[0]}" = "$release_remote_url" || return
-  git remote set-url --push origin "$release_remote_url" || return
-  mapfile -t release_push_urls < <(git remote get-url --push --all origin)
-  test "${#release_push_urls[@]}" -eq 1 || return
-  test "${release_push_urls[0]}" = "$release_remote_url"
-}
 origin_push_guarded() {
   local push_status=0 guard_status=0
-  { enable_origin_push && git push --atomic origin "$@"; } || push_status=$?
-  disable_origin_push || guard_status=$?
+  # Push to the reviewed URL explicitly; never make the configured `origin`
+  # push URL live, even transiently.  An interrupted controller therefore
+  # leaves the persistent no-push guard intact.
+  { assert_origin_push_disabled &&
+    git push --atomic "$release_remote_url" "$@"; } || push_status=$?
+  assert_origin_push_disabled || guard_status=$?
   test "$guard_status" -eq 0 || return "$guard_status"
   return "$push_status"
 }
-disable_origin_push
+assert_origin_push_disabled
 test "$LINUX_AMD64_SMOKE_HOST" = trj
 test "$LINUX_ARM64_SMOKE_HOST" = trj
 test "$LINUX_ARM64_QEMU_SYSROOT" != "/operator/supplied/aarch64/sysroot"
@@ -374,14 +464,6 @@ case "$LINUX_ARM64_QEMU_SYSROOT" in *'/../'*|*'/..'|*'//'*) exit 1 ;; esac
 test "$DARWIN_SMOKE_HOST" = mmini
 test "$WINDOWS_AMD64_SMOKE_HOST" = wlap
 test -z "${PI_CRATES_IO_RELEASE_TOKEN:-}"
-if [[ -n "${CARGO_REGISTRY_TOKEN:-}" &&
-      -n "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
-  test "$CARGO_REGISTRY_TOKEN" = "$CARGO_REGISTRIES_CRATES_IO_TOKEN"
-fi
-release_crates_io_token="${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}"
-test -n "$release_crates_io_token"
-export -n release_crates_io_token
-unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
 release_rust_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-rust-tools.txt"
@@ -406,21 +488,153 @@ record_release_rust_tool() {
 } > "$release_rust_tool_receipt")
 test "$(grep -Ec '^\[(cargo|rustc)-(entrypoint|actual)\]$' \
   "$release_rust_tool_receipt")" = 4
-test "$(grep -Fc 'release: 1.98.0-nightly' \
+test "$(grep -Fxc 'release: 1.98.0-nightly' \
   "$release_rust_tool_receipt")" = 4
-release_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-tools.sha256"
+release_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-tools.tsv"
 test ! -e "$release_tool_receipt"
-for release_tool in \
-  bash git python3 rustup cargo rustc gh jq ssh sha256sum bwrap \
-  yq uuidgen curl scp tar file
-do
-  release_tool_path="$(command -v "$release_tool")"
-  test -n "$release_tool_path"
-  release_tool_path="$(realpath -e -- "$release_tool_path")"
-  test -f "$release_tool_path" && test ! -L "$release_tool_path"
-  sha256sum -- "$release_tool_path"
-done > "$release_tool_receipt"
-test "$(wc -l < "$release_tool_receipt")" -eq 17
+release_requested_tool_labels=(
+  bin-sh usr-bin-node home-bun home-bun-node bin-bash bin-echo
+)
+release_requested_tool_paths=(
+  /bin/sh /usr/bin/node /home/ubuntu/.bun/bin/bun /home/ubuntu/.bun/bin/node
+  /bin/bash /bin/echo
+)
+test "${#release_requested_tool_labels[@]}" -eq \
+  "${#release_requested_tool_paths[@]}"
+record_operator_tool() {
+  local release_tool="$1"
+  local requested_path="$2"
+  local resolved_path digest_line digest
+  [[ "$release_tool" =~ ^[a-zA-Z0-9._-]+$ ]]
+  test -n "$requested_path"
+  [[ "$requested_path" == /* ]]
+  [[ "$requested_path" != *$'\t'* && "$requested_path" != *$'\n'* ]]
+  resolved_path="$(realpath -e -- "$requested_path")"
+  test -f "$resolved_path" && test ! -L "$resolved_path"
+  [[ "$resolved_path" != *$'\t'* && "$resolved_path" != *$'\n'* ]]
+  digest_line="$(sha256sum -- "$resolved_path")"
+  digest="${digest_line%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+  printf '%s\t%s\t%s\t%s\n' \
+    "$release_tool" "$digest" "$requested_path" "$resolved_path"
+}
+(set -C; {
+  for release_tool in "${release_tool_names[@]}"; do
+    test "$(builtin type -t -- "$release_tool")" = file
+    release_tool_requested_path="$(builtin type -P -- "$release_tool")"
+    record_operator_tool "$release_tool" "$release_tool_requested_path"
+  done
+  for release_tool in "${release_path_descendant_tool_names[@]}"; do
+    release_tool_requested_path="$(builtin type -P -- "$release_tool")"
+    record_operator_tool "path-$release_tool" "$release_tool_requested_path"
+  done
+  for ((release_tool_index=0;
+        release_tool_index<${#release_requested_tool_labels[@]};
+        release_tool_index++)); do
+    record_operator_tool \
+      "${release_requested_tool_labels[$release_tool_index]}" \
+      "${release_requested_tool_paths[$release_tool_index]}"
+  done
+} > "$release_tool_receipt")
+
+verify_operator_tools() {
+  local release_tool expected_digest expected_requested_path expected_resolved_path
+  local expected_tool recognized release_tool_index actual_requested_path
+  local actual_resolved_path actual_digest_line actual_digest expected_count
+  local verified_count=0
+  local -A seen_tools=()
+  test -f "$release_tool_receipt" && test ! -L "$release_tool_receipt"
+  [[ "$-" != *h* ]]
+  if builtin shopt -q expand_aliases; then
+    return 1
+  fi
+  (( ${#BASH_ALIASES[@]} == 0 ))
+  while IFS=$'\t' read -r release_tool expected_digest \
+      expected_requested_path expected_resolved_path; do
+    [[ "$release_tool" =~ ^[a-zA-Z0-9._-]+$ ]]
+    [[ "$expected_digest" =~ ^[0-9a-f]{64}$ ]]
+    test -n "$expected_requested_path" && test -n "$expected_resolved_path"
+    [[ "$expected_requested_path" == /* && "$expected_resolved_path" == /* ]]
+    recognized=false
+    actual_requested_path=""
+    for expected_tool in "${release_tool_names[@]}"; do
+      if test "$release_tool" = "$expected_tool"; then
+        recognized=true
+        test "$(builtin type -t -- "$release_tool")" = file
+        actual_requested_path="$(builtin type -P -- "$release_tool")"
+        break
+      fi
+    done
+    if test "$recognized" = false; then
+      for expected_tool in "${release_path_descendant_tool_names[@]}"; do
+        if test "$release_tool" = "path-$expected_tool"; then
+          recognized=true
+          actual_requested_path="$(builtin type -P -- "$expected_tool")"
+          break
+        fi
+      done
+    fi
+    if test "$recognized" = false; then
+      for ((release_tool_index=0;
+            release_tool_index<${#release_requested_tool_labels[@]};
+            release_tool_index++)); do
+        if test "$release_tool" = \
+            "${release_requested_tool_labels[$release_tool_index]}"; then
+          recognized=true
+          actual_requested_path="${release_requested_tool_paths[$release_tool_index]}"
+          break
+        fi
+      done
+    fi
+    test "$recognized" = true
+    test -z "${seen_tools[$release_tool]+present}"
+    seen_tools["$release_tool"]=1
+    test "$actual_requested_path" = "$expected_requested_path"
+    actual_resolved_path="$(realpath -e -- "$actual_requested_path")"
+    test "$actual_resolved_path" = "$expected_resolved_path"
+    test -f "$actual_resolved_path" && test ! -L "$actual_resolved_path"
+    actual_digest_line="$(sha256sum -- "$actual_resolved_path")"
+    actual_digest="${actual_digest_line%% *}"
+    test "$actual_digest" = "$expected_digest"
+    verified_count=$((verified_count + 1))
+  done < "$release_tool_receipt"
+  expected_count=$((${#release_tool_names[@]} + \
+    ${#release_path_descendant_tool_names[@]} + \
+    ${#release_requested_tool_labels[@]}))
+  test "$verified_count" -eq "$expected_count"
+  for expected_tool in "${release_tool_names[@]}"; do
+    test "${seen_tools[$expected_tool]+present}" = present
+  done
+  for expected_tool in "${release_path_descendant_tool_names[@]}"; do
+    test "${seen_tools[path-$expected_tool]+present}" = present
+  done
+  for expected_tool in "${release_requested_tool_labels[@]}"; do
+    test "${seen_tools[$expected_tool]+present}" = present
+  done
+}
+
+operator_tool_path() {
+  local release_tool="$1"
+  local match_count resolved_path
+  [[ "$release_tool" =~ ^[a-zA-Z0-9._-]+$ ]]
+  match_count="$(awk -F '\t' -v tool="$release_tool" '
+    $1 == tool { count += 1 }
+    END { print count + 0 }
+  ' "$release_tool_receipt")"
+  test "$match_count" -eq 1
+  resolved_path="$(awk -F '\t' -v tool="$release_tool" \
+    '$1 == tool { print $4 }' "$release_tool_receipt")"
+  test -n "$resolved_path"
+  printf '%s\n' "$resolved_path"
+}
+verify_operator_tools
+release_bash_path="$(operator_tool_path bash)"
+release_realpath_path="$(operator_tool_path realpath)"
+release_bwrap_path="$(operator_tool_path bwrap)"
+release_git_path="$(operator_tool_path git)"
+release_sha256sum_path="$(operator_tool_path sha256sum)"
+release_controller_bash="$("$release_realpath_path" -e -- "/proc/$$/exe")"
+test "$release_controller_bash" = "$release_bash_path"
 release_cargo_parent="$MANUAL_RELEASE_STATE_DIR/controller-cargo"
 test ! -e "$release_cargo_parent" && test ! -L "$release_cargo_parent"
 mkdir -m 700 "$release_cargo_parent"
@@ -431,184 +645,51 @@ RELEASE_CARGO_WORK_DIR="$(mktemp -d \
 export RELEASE_CARGO_WORK_DIR
 export CARGO_TARGET_DIR="$RELEASE_CARGO_WORK_DIR/target"
 export TMPDIR="$RELEASE_CARGO_WORK_DIR/tmp"
-[[ "$CARGO_TARGET_DIR" == /* && "$TMPDIR" == /* ]]
+export RELEASE_BUILD_HOME="$RELEASE_CARGO_WORK_DIR/home"
+export RELEASE_BUILD_CARGO_HOME="$RELEASE_CARGO_WORK_DIR/cargo-home"
+[[ "$CARGO_TARGET_DIR" == /* && "$TMPDIR" == /* &&
+   "$RELEASE_BUILD_HOME" == /* && "$RELEASE_BUILD_CARGO_HOME" == /* ]]
 test ! -e "$CARGO_TARGET_DIR" && test ! -e "$TMPDIR"
-mkdir -m 700 "$CARGO_TARGET_DIR" "$TMPDIR"
-(set -C; printf 'cargo_target_dir=%s\ntmpdir=%s\n' \
-  "$CARGO_TARGET_DIR" "$TMPDIR" \
+test ! -e "$RELEASE_BUILD_HOME" && test ! -e "$RELEASE_BUILD_CARGO_HOME"
+mkdir -m 700 "$CARGO_TARGET_DIR" "$TMPDIR" \
+  "$RELEASE_BUILD_HOME" "$RELEASE_BUILD_CARGO_HOME"
+(set -C; printf \
+  'cargo_target_dir=%s\ntmpdir=%s\nbuild_home=%s\nbuild_cargo_home=%s\n' \
+  "$CARGO_TARGET_DIR" "$TMPDIR" "$RELEASE_BUILD_HOME" \
+  "$RELEASE_BUILD_CARGO_HOME" \
   > "$MANUAL_RELEASE_STATE_DIR/local-build-paths.txt")
+release_build_env() {
+  env -i \
+    PATH="$PATH" \
+    HOME="$RELEASE_BUILD_HOME" \
+    CARGO_HOME="$RELEASE_BUILD_CARGO_HOME" \
+    CARGO_TARGET_DIR="$CARGO_TARGET_DIR" \
+    TMPDIR="$TMPDIR" \
+    XDG_CACHE_HOME="$RELEASE_BUILD_HOME/.cache" \
+    XDG_CONFIG_HOME="$RELEASE_BUILD_HOME/.config" \
+    XDG_DATA_HOME="$RELEASE_BUILD_HOME/.local/share" \
+    RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
+    RCH_CARGO_WRAPPER_BYPASS="$RCH_CARGO_WRAPPER_BYPASS" \
+    GIT_CONFIG_GLOBAL=/dev/null \
+    GIT_CONFIG_NOSYSTEM=1 \
+    LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC TERM=dumb NO_COLOR=1 \
+    RUST_BACKTRACE=1 CARGO_TERM_COLOR=never \
+    USER="${USER:-release}" LOGNAME="${LOGNAME:-${USER:-release}}" \
+    "$@"
+}
+release_build_env cargo --version >/dev/null
 RELEASE_REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 export RELEASE_REPOSITORY
 test "$RELEASE_REPOSITORY" = "Dicklesworthstone/pi_agent_rust"
 test -z "$(git status --porcelain=v2 --untracked-files=all)"
 
-# Fuzz and conformance have daily 02:00 UTC schedules. A baseline is valid only
-# after both current-day scheduled run IDs exist, and this lane must finish on
-# the same UTC date. Their queued/running/completed states may evolve and are
-# recorded but are not part of the invariant. A new current-day run ID or any
-# incremented run_attempt in the fixed window spanning the 31 prior UTC days
-# plus the baseline UTC day is a stop condition. This conservative 32-day
-# interval covers GitHub's 30-day rerun eligibility even at a boundary. Never
-# recapture either baseline mid-release.
-WORKFLOW_BASELINE_UTC_DATE="$(date -u +%F)"
-export WORKFLOW_BASELINE_UTC_DATE
-workflow_window_start="${WORKFLOW_BASELINE_UTC_DATE}T02:00:00Z"
-workflow_window_end="$(python3 - "$WORKFLOW_BASELINE_UTC_DATE" <<'PY'
-from datetime import date, datetime, time, timedelta, timezone
-import sys
-
-day = date.fromisoformat(sys.argv[1]) + timedelta(days=1)
-print(datetime.combine(day, time.min, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"))
-PY
-)"
-[[ "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$workflow_window_start" ]]
-for scheduled_workflow in fuzz.yml conformance.yml; do
-  scheduled_proof="$MANUAL_RELEASE_STATE_DIR/scheduled-${scheduled_workflow%.yml}.json"
-  test ! -e "$scheduled_proof"
-  gh api -H 'Accept: application/vnd.github+json' \
-    "/repos/${RELEASE_REPOSITORY}/actions/workflows/${scheduled_workflow}/runs?event=schedule&per_page=100" \
-    > "$scheduled_proof"
-  jq -e \
-    --arg start "$workflow_window_start" \
-    --arg end "$workflow_window_end" '
-    (.workflow_runs | type) == "array" and
-    ([.workflow_runs[] |
-      select(.event == "schedule" and .created_at >= $start and .created_at < $end)] |
-      length) >= 1 and
-    all(.workflow_runs[] |
-      select(.event == "schedule" and .created_at >= $start and .created_at < $end);
-      (.id | type) == "number" and .id > 0 and
-      (.status | type) == "string" and (.status | length) > 0)
-  ' "$scheduled_proof" >/dev/null
-done
-workflow_baseline="$MANUAL_RELEASE_STATE_DIR/github-actions-baseline.json"
-workflow_baseline_proof="$MANUAL_RELEASE_STATE_DIR/github-actions-baseline.txt"
-test ! -e "$workflow_baseline" && test ! -e "$workflow_baseline_proof"
-gh api --paginate -H 'Accept: application/vnd.github+json' \
-  "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-  | jq -s '(.[0].total_count // -1) as $reported |
-    [.[].workflow_runs[]] as $runs |
-    {reported_total_count: $reported,
-     page_total_counts_consistent: all(.[]; .total_count == $reported),
-     total_count: ($runs | length), workflow_runs: $runs}' \
-  > "$workflow_baseline"
-jq -e '
-  (.reported_total_count | type) == "number" and
-  .reported_total_count == .total_count and
-  .page_total_counts_consistent == true and
-  (.total_count | type) == "number" and .total_count > 0 and
-  (.workflow_runs | type) == "array" and
-  .total_count == (.workflow_runs | length) and
-  all(.workflow_runs[];
-    (.id | type) == "number" and .id > 0 and
-    (.status | type) == "string" and (.status | length) > 0) and
-  ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
-' "$workflow_baseline" >/dev/null
-(set -C; jq -r '.workflow_runs[].id' "$workflow_baseline" \
-  | LC_ALL=C sort -n > "$workflow_baseline_proof")
-test -s "$workflow_baseline_proof"
-export WORKFLOW_BASELINE_IDS="$workflow_baseline_proof"
-
-WORKFLOW_RERUN_WINDOW_START="$(python3 - "$WORKFLOW_BASELINE_UTC_DATE" <<'PY'
-from datetime import date, datetime, time, timedelta, timezone
-import sys
-
-day = date.fromisoformat(sys.argv[1]) - timedelta(days=31)
-print(datetime.combine(day, time.min, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"))
-PY
-)"
-WORKFLOW_RERUN_WINDOW_END="$workflow_window_end"
-export WORKFLOW_RERUN_WINDOW_START WORKFLOW_RERUN_WINDOW_END
-workflow_attempt_baseline="$MANUAL_RELEASE_STATE_DIR/github-actions-attempt-baseline.json"
-workflow_attempt_baseline_proof="$MANUAL_RELEASE_STATE_DIR/github-actions-attempt-baseline.txt"
-test ! -e "$workflow_attempt_baseline" \
-  && test ! -e "$workflow_attempt_baseline_proof"
-gh api --paginate -H 'Accept: application/vnd.github+json' \
-  "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_RERUN_WINDOW_START}..${WORKFLOW_RERUN_WINDOW_END}&per_page=100" \
-  | jq -s '(.[0].total_count // -1) as $reported |
-    [.[].workflow_runs[]] as $runs |
-    {reported_total_count: $reported,
-     page_total_counts_consistent: all(.[]; .total_count == $reported),
-     total_count: ($runs | length), workflow_runs: $runs}' \
-  > "$workflow_attempt_baseline"
-jq -e '
-  (.reported_total_count | type) == "number" and
-  .reported_total_count == .total_count and
-  .page_total_counts_consistent == true and
-  (.total_count | type) == "number" and .total_count > 0 and
-  (.workflow_runs | type) == "array" and
-  .total_count == (.workflow_runs | length) and
-  all(.workflow_runs[];
-    (.id | type) == "number" and .id > 0 and
-    (.run_attempt | type) == "number" and .run_attempt >= 1) and
-  ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
-' "$workflow_attempt_baseline" >/dev/null
-(set -C; jq -r '.workflow_runs[] | [.id, .run_attempt] | @tsv' \
-  "$workflow_attempt_baseline" | LC_ALL=C sort -n -k1,1 \
-  > "$workflow_attempt_baseline_proof")
-test -s "$workflow_attempt_baseline_proof"
-export WORKFLOW_BASELINE_ATTEMPTS="$workflow_attempt_baseline_proof"
-
-verify_workflow_baseline_unchanged() {
-  local checkpoint="$1"
-  [[ "$checkpoint" =~ ^[a-z0-9-]+$ ]]
-  test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
-  local snapshot="$MANUAL_RELEASE_STATE_DIR/github-actions-${checkpoint}.json"
-  local ids="$MANUAL_RELEASE_STATE_DIR/github-actions-${checkpoint}.txt"
-  test ! -e "$snapshot" && test ! -e "$ids"
-  gh api --paginate -H 'Accept: application/vnd.github+json' \
-    "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-    | jq -s '(.[0].total_count // -1) as $reported |
-      [.[].workflow_runs[]] as $runs |
-      {reported_total_count: $reported,
-       page_total_counts_consistent: all(.[]; .total_count == $reported),
-       total_count: ($runs | length), workflow_runs: $runs}' \
-    > "$snapshot"
-  jq -e '
-    (.reported_total_count | type) == "number" and
-    .reported_total_count == .total_count and
-    .page_total_counts_consistent == true and
-    (.total_count | type) == "number" and .total_count > 0 and
-    (.workflow_runs | type) == "array" and
-    .total_count == (.workflow_runs | length) and
-    all(.workflow_runs[];
-      (.id | type) == "number" and .id > 0 and
-      (.status | type) == "string" and (.status | length) > 0) and
-    ([.workflow_runs[].id] | length) ==
-      ([.workflow_runs[].id] | unique | length)
-  ' "$snapshot" >/dev/null
-  (set -C; jq -r '.workflow_runs[].id' "$snapshot" \
-    | LC_ALL=C sort -n > "$ids")
-  cmp "$WORKFLOW_BASELINE_IDS" "$ids"
-
-  local attempt_snapshot="$MANUAL_RELEASE_STATE_DIR/github-actions-attempts-${checkpoint}.json"
-  local attempts="$MANUAL_RELEASE_STATE_DIR/github-actions-attempts-${checkpoint}.txt"
-  test ! -e "$attempt_snapshot" && test ! -e "$attempts"
-  gh api --paginate -H 'Accept: application/vnd.github+json' \
-    "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_RERUN_WINDOW_START}..${WORKFLOW_RERUN_WINDOW_END}&per_page=100" \
-    | jq -s '(.[0].total_count // -1) as $reported |
-      [.[].workflow_runs[]] as $runs |
-      {reported_total_count: $reported,
-       page_total_counts_consistent: all(.[]; .total_count == $reported),
-       total_count: ($runs | length), workflow_runs: $runs}' \
-    > "$attempt_snapshot"
-  jq -e '
-    (.reported_total_count | type) == "number" and
-    .reported_total_count == .total_count and
-    .page_total_counts_consistent == true and
-    (.total_count | type) == "number" and .total_count > 0 and
-    (.workflow_runs | type) == "array" and
-    .total_count == (.workflow_runs | length) and
-    all(.workflow_runs[];
-      (.id | type) == "number" and .id > 0 and
-      (.run_attempt | type) == "number" and .run_attempt >= 1) and
-    ([.workflow_runs[].id] | length) ==
-      ([.workflow_runs[].id] | unique | length)
-  ' "$attempt_snapshot" >/dev/null
-  (set -C; jq -r '.workflow_runs[] | [.id, .run_attempt] | @tsv' \
-    "$attempt_snapshot" | LC_ALL=C sort -n -k1,1 > "$attempts")
-  cmp "$WORKFLOW_BASELINE_ATTEMPTS" "$attempts"
-}
+# This lane intentionally has no GitHub Actions dependency. Every build,
+# conformance run, test, platform smoke, package check, and publication
+# reconciliation is executed directly by the operator and retained below.
+# Do not query, dispatch, rerun, cancel, or otherwise use Actions as evidence.
+MANUAL_RELEASE_RUN_ID="manual-${RELEASE_TAG}-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+export MANUAL_RELEASE_RUN_ID
+[[ "$MANUAL_RELEASE_RUN_ID" =~ ^manual-v[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f-]{36}$ ]]
 ```
 
 Before step 1, prove the active immutable tag ruleset again. The rule must
@@ -619,6 +700,7 @@ changed:
 
 ```bash
 set -euo pipefail
+verify_operator_tools
 ruleset_inventory="$MANUAL_RELEASE_STATE_DIR/tag-ruleset-inventory.json"
 ruleset_details="$MANUAL_RELEASE_STATE_DIR/tag-ruleset-details.json"
 test ! -e "$ruleset_inventory" && test ! -e "$ruleset_details"
@@ -654,10 +736,11 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
-   cargo fmt --check
-   cargo check --locked --all-targets --features internal-legacy-capture
-   cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings
-   cargo test --locked --all-targets --features internal-legacy-capture
+   verify_operator_tools
+   release_build_env cargo fmt --check
+   release_build_env cargo check --locked --all-targets --features internal-legacy-capture
+   release_build_env cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings
+   release_build_env cargo test --locked --all-targets --features internal-legacy-capture
    ```
 
 2. Bind the already-clean release source before generating tracked evidence.
@@ -666,6 +749,7 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
    source_commit="$(git rev-parse 'HEAD^{commit}')"
    source_subject="$(git show -s --format=%s "$source_commit")"
    case "$source_subject" in
@@ -689,7 +773,8 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
-   release_checkout="$(pwd -P)"
+   verify_operator_tools
+   release_checkout="$(builtin pwd -P)"
    e2e_timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
    e2e_artifact_dir="$release_checkout/tests/e2e_results/$e2e_timestamp"
    test ! -e "$e2e_artifact_dir"
@@ -697,8 +782,9 @@ proof is not proof of an empty bypass list.
    find -P "$release_checkout/.git" -xdev ! -type l \
      -exec chmod a-w -- {} +
    e2e_status=0
-   E2E_ARTIFACT_DIR="$e2e_artifact_dir" \
-   VERIFY_CARGO_RUNNER=local \
+   release_build_env \
+     E2E_ARTIFACT_DIR="$e2e_artifact_dir" \
+     VERIFY_CARGO_RUNNER=local \
      ./scripts/e2e/run_all.sh --profile ci --skip-lint || e2e_status=$?
    git_metadata_restore_status=0
    find -P "$release_checkout/.git" -xdev ! -type l \
@@ -737,22 +823,28 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
-   export CI_RUN_ID="manual-${RELEASE_TAG}-${WORKFLOW_BASELINE_UTC_DATE}"
+   verify_operator_tools
+   export CI_RUN_ID="$MANUAL_RELEASE_RUN_ID"
    export CI_CORRELATION_ID="${CI_RUN_ID}-conformance"
-   cargo test --locked --test ext_conformance_diff \
+   release_build_env CI_RUN_ID="$CI_RUN_ID" CI_CORRELATION_ID="$CI_CORRELATION_ID" \
+     cargo test --locked --test ext_conformance_diff \
      --features ext-conformance load_time_benchmark_official -- \
      --ignored --exact --nocapture
-   cargo test --locked --test ext_conformance_scenarios \
+   release_build_env CI_RUN_ID="$CI_RUN_ID" CI_CORRELATION_ID="$CI_CORRELATION_ID" \
+     cargo test --locked --test ext_conformance_scenarios \
      --features ext-conformance scenario_conformance_suite -- \
      --exact --nocapture
-   cargo test --locked --test ext_conformance_scenarios \
+   release_build_env CI_RUN_ID="$CI_RUN_ID" CI_CORRELATION_ID="$CI_CORRELATION_ID" \
+     cargo test --locked --test ext_conformance_scenarios \
      --features ext-conformance parity_runner -- --exact --nocapture
-   cargo test --locked --test extensions_policy_negative \
+   release_build_env CI_RUN_ID="$CI_RUN_ID" CI_CORRELATION_ID="$CI_CORRELATION_ID" \
+     cargo test --locked --test extensions_policy_negative \
      negative_conformance_report -- --exact --nocapture
-   PI_GENERATE_CONFORMANCE_REPORT=1 \
+   release_build_env CI_RUN_ID="$CI_RUN_ID" CI_CORRELATION_ID="$CI_CORRELATION_ID" \
+     PI_GENERATE_CONFORMANCE_REPORT=1 \
      cargo test --locked --test conformance_report \
      generate_conformance_report -- --exact --nocapture
-   RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
+   release_build_env RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
    import json
    import os
    import re
@@ -811,19 +903,27 @@ proof is not proof of an empty bypass list.
      tests/ext_conformance/reports/parity/extensions/*.jsonl \
      tests/ext_conformance/reports/negative/negative_events.jsonl \
      tests/ext_conformance/reports/negative/triage.json
-   ubs --staged --only=rust .
-   ./scripts/reconcile_beads_ledger.sh
+   release_build_env ubs --staged --only=rust .
+   release_build_env ./scripts/reconcile_beads_ledger.sh
    git commit -m "Record ${RELEASE_TAG} release evidence [skip actions]"
+   evidence_commit="$(git rev-parse 'HEAD^{commit}')"
+   evidence_subject="$(git show -s --format=%s "$evidence_commit")"
+   case "$evidence_subject" in
+     *'[skip actions]') ;;
+     *) printf 'release-evidence HEAD lacks [skip actions]: %s\n' \
+          "$evidence_subject" >&2; exit 1 ;;
+   esac
 
    release_gate_report="$MANUAL_RELEASE_STATE_DIR/release-gate-report.json"
    test ! -e "$release_gate_report"
    (
      set -C
-     RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
-     RELEASE_GATE_REQUIRE_QUALITY=1 \
-     RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=0 \
-     RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=0 \
-     RELEASE_GATE_CARGO_RUNNER=local \
+     release_build_env \
+       RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
+       RELEASE_GATE_REQUIRE_QUALITY=1 \
+       RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=0 \
+       RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=0 \
+       RELEASE_GATE_CARGO_RUNNER=local \
        ./scripts/release_gate.sh --no-rch --report > "$release_gate_report"
    )
    jq -e '
@@ -857,6 +957,13 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
+   branch_source_subject="$(git show -s --format=%s HEAD)"
+   case "$branch_source_subject" in
+     *'[skip actions]') ;;
+     *) printf 'branch-push HEAD lacks [skip actions]: %s\n' \
+          "$branch_source_subject" >&2; exit 1 ;;
+   esac
    origin_push_guarded \
      refs/heads/main:refs/heads/main \
      refs/heads/main:refs/heads/master
@@ -865,8 +972,7 @@ proof is not proof of an empty bypass list.
      "$branch_source_commit"
    test "$(git ls-remote origin refs/heads/master | awk 'NR == 1 {print $1}')" = \
      "$branch_source_commit"
-   verify_workflow_baseline_unchanged after-branch-sync
-   disable_origin_push
+   assert_origin_push_disabled
    ```
 
 4. From that final clean evidence commit, build and inspect the exact Cargo
@@ -876,7 +982,8 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
-   cargo package --locked
+   verify_operator_tools
+   release_build_env cargo package --locked
    crate_path="${CARGO_TARGET_DIR:-target}/package/pi_agent_rust-${RELEASE_VERSION}.crate"
    test -f "$crate_path" && test ! -L "$crate_path"
    source_commit="$(git rev-parse 'HEAD^{commit}')"
@@ -893,7 +1000,7 @@ proof is not proof of an empty bypass list.
    (set -C; printf 'source_commit=%s\npackage_sha256=%s\npackage_size=%s\n' \
      "$source_commit" "$package_sha256" "$package_size" > "$proof_file")
 
-   cargo publish --dry-run --locked
+   release_build_env cargo publish --dry-run --locked
    test -f "$crate_path" && test ! -L "$crate_path"
    test "$(tar -xOf "$crate_path" \
      "pi_agent_rust-${RELEASE_VERSION}/.cargo_vcs_info.json" \
@@ -940,13 +1047,20 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
    test "$RELEASE_VERSION" = "0.2.0"
    test "$RELEASE_TAG" = "v0.2.0"
    source_commit="$(awk -F= '$1 == "source_commit" {print $2}' "$proof_file")"
    [[ "$source_commit" =~ ^[0-9a-f]{40}$ ]]
-   test "$(pwd -P)" = "$release_checkout"
+   test "$(builtin pwd -P)" = "$release_checkout"
    test "$(git rev-parse 'HEAD^{commit}')" = "$source_commit"
    test "$(git rev-parse 'main^{commit}')" = "$source_commit"
+   tag_source_subject="$(git show -s --format=%s "$source_commit")"
+   case "$tag_source_subject" in
+     *'[skip actions]') ;;
+     *) printf 'tag source lacks [skip actions]: %s\n' \
+          "$tag_source_subject" >&2; exit 1 ;;
+   esac
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
 
    # The audited preserved DSR lane is intentionally pinned to the canonical
@@ -955,23 +1069,24 @@ proof is not proof of an empty bypass list.
    # shared checkout outside the namespace.
    test "$release_source_checkout" = /data/projects/pi_agent_rust
    test "$release_checkout" != "$release_source_checkout"
-   test "$(command -v bwrap)" = /usr/bin/bwrap
    bwrap_source_receipt="$MANUAL_RELEASE_STATE_DIR/bwrap-source-preflight.txt"
    test ! -e "$bwrap_source_receipt"
    (
      set -C
-     bwrap --die-with-parent --new-session --bind / / --dev-bind /dev /dev \
+     "$release_bwrap_path" \
+       --die-with-parent --new-session --bind / / --dev-bind /dev /dev \
        --bind "$release_checkout" /data/projects/pi_agent_rust \
        --chdir /data/projects/pi_agent_rust \
-       /usr/bin/bash --noprofile --norc -c '
+       "$release_bash_path" --noprofile --norc -c '
          set -euo pipefail
-         expected_commit="$1"
-         test "$(pwd -P)" = /data/projects/pi_agent_rust
-         test "$(/usr/local/bin/git rev-parse "HEAD^{commit}")" = "$expected_commit"
-         test "$(/usr/local/bin/git rev-parse "main^{commit}")" = "$expected_commit"
-         test -z "$(/usr/local/bin/git status --porcelain=v2 --untracked-files=all)"
+         git_path="$1"
+         expected_commit="$2"
+         test "$(builtin pwd -P)" = /data/projects/pi_agent_rust
+         test "$("$git_path" rev-parse "HEAD^{commit}")" = "$expected_commit"
+         test "$("$git_path" rev-parse "main^{commit}")" = "$expected_commit"
+         test -z "$("$git_path" status --porcelain=v2 --untracked-files=all)"
          printf "source_commit=%s\n" "$expected_commit"
-       ' bash "$source_commit" > "$bwrap_source_receipt"
+       ' bash "$release_git_path" "$source_commit" > "$bwrap_source_receipt"
    )
    test "$(cat "$bwrap_source_receipt")" = "source_commit=$source_commit"
 
@@ -986,19 +1101,34 @@ proof is not proof of an empty bypass list.
    export PRESERVED_DSR_LANE="/data/tmp/dsr-preserve-pi-v0.2.0-d33f69b8-9756-4181-9de8-8b30671a9976"
    export PRESERVED_DSR_WRAPPER="$PRESERVED_DSR_LANE/preserved-pi-build"
    export PRESERVED_DSR_AUDIT="$PRESERVED_DSR_LANE/PRESERVATION_LANE_AUDIT.md"
-   test -x "$PRESERVED_DSR_WRAPPER" && test ! -L "$PRESERVED_DSR_WRAPPER"
-   test -f "$PRESERVED_DSR_AUDIT" && test ! -L "$PRESERVED_DSR_AUDIT"
-   test "$(stat -c '%a' "$PRESERVED_DSR_WRAPPER")" = 700
-   test "$(stat -c '%a' "$PRESERVED_DSR_AUDIT")" = 400
-   test "$(sha256sum "$PRESERVED_DSR_WRAPPER" | awk '{print $1}')" = \
-     7c1c3528229f89eadea62d72eb692b4a5f089e037e008c153544c35701f93f75
-   test "$(sha256sum "$PRESERVED_DSR_AUDIT" | awk '{print $1}')" = \
-     308b9ce092b34bac3224a91390452721475a9cb96a9ba9b4a164fcc2666662dc
-   test "$(sha256sum "$PRESERVED_DSR_LANE/preservation-manifest.sha256" \
-     | awk '{print $1}')" = \
-     d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
-   (cd "$PRESERVED_DSR_LANE" && \
-     sha256sum --check --status preservation-manifest.sha256)
+   expected_preserved_wrapper_sha256=\
+7c1c3528229f89eadea62d72eb692b4a5f089e037e008c153544c35701f93f75
+   expected_preserved_audit_sha256=\
+308b9ce092b34bac3224a91390452721475a9cb96a9ba9b4a164fcc2666662dc
+   expected_preservation_manifest_sha256=\
+d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
+
+   verify_preserved_dsr_inputs() {
+     test -x "$PRESERVED_DSR_WRAPPER" && test ! -L "$PRESERVED_DSR_WRAPPER"
+     test -f "$PRESERVED_DSR_AUDIT" && test ! -L "$PRESERVED_DSR_AUDIT"
+     test -f "$PRESERVED_DSR_LANE/preservation-manifest.sha256"
+     test ! -L "$PRESERVED_DSR_LANE/preservation-manifest.sha256"
+     test "$(stat -c '%a' "$PRESERVED_DSR_WRAPPER")" = 700
+     test "$(stat -c '%a' "$PRESERVED_DSR_AUDIT")" = 400
+     test "$(stat -c '%a' \
+       "$PRESERVED_DSR_LANE/preservation-manifest.sha256")" = 400
+     test "$(sha256sum "$PRESERVED_DSR_WRAPPER" | awk '{print $1}')" = \
+       "$expected_preserved_wrapper_sha256"
+     test "$(sha256sum "$PRESERVED_DSR_AUDIT" | awk '{print $1}')" = \
+       "$expected_preserved_audit_sha256"
+     test "$(sha256sum \
+       "$PRESERVED_DSR_LANE/preservation-manifest.sha256" | awk '{print $1}')" = \
+       "$expected_preservation_manifest_sha256"
+     (cd "$PRESERVED_DSR_LANE" && \
+       sha256sum --check --strict --status preservation-manifest.sha256)
+   }
+   verify_operator_tools
+   verify_preserved_dsr_inputs
    preserved_inputs="$MANUAL_RELEASE_STATE_DIR/preserved-lane-inputs.sha256"
    test ! -e "$preserved_inputs"
    (set -C; sha256sum \
@@ -1006,6 +1136,8 @@ proof is not proof of an empty bypass list.
      "$PRESERVED_DSR_AUDIT" \
      "$PRESERVED_DSR_LANE/preservation-manifest.sha256" \
      > "$preserved_inputs")
+   test "$(wc -l < "$preserved_inputs" | tr -d '[:space:]')" = 3
+   sha256sum --check --strict --status "$preserved_inputs"
 
    windows_preflight_ps1="$MANUAL_RELEASE_STATE_DIR/windows-dsr-msvc-link-preflight.ps1"
    windows_preflight_receipt="$MANUAL_RELEASE_STATE_DIR/windows-dsr-msvc-link-preflight.json"
@@ -1227,17 +1359,38 @@ proof is not proof of an empty bypass list.
    DSR_BUILD_RUN_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
    export DSR_BUILD_RUN_ID
    [[ "$DSR_BUILD_RUN_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
-   export PRESERVED_DSR_STATE_DIR="/data/tmp/pi-v0.2.0-dsr-state-$DSR_BUILD_RUN_ID"
-   export RAW_RELEASE_DIR="/data/tmp/pi-v0.2.0-raw-assets-$DSR_BUILD_RUN_ID"
+   export PRESERVED_DSR_STATE_DIR="$MANUAL_RELEASE_ROOT/dsr-state-$DSR_BUILD_RUN_ID"
+   export RAW_RELEASE_DIR="$MANUAL_RELEASE_ROOT/raw-assets-$DSR_BUILD_RUN_ID"
+   case "$PRESERVED_DSR_STATE_DIR:$RAW_RELEASE_DIR" in
+     "$MANUAL_RELEASE_ROOT"/*:"$MANUAL_RELEASE_ROOT"/*) ;;
+     *) exit 1 ;;
+   esac
    build_receipt="$MANUAL_RELEASE_STATE_DIR/preserved-build-$DSR_BUILD_RUN_ID.json"
    test ! -e "$PRESERVED_DSR_STATE_DIR" && test ! -L "$PRESERVED_DSR_STATE_DIR"
    test ! -e "$RAW_RELEASE_DIR" && test ! -L "$RAW_RELEASE_DIR"
    test ! -e "$build_receipt"
+   # Re-resolve the operator toolchain and rehash the preserved lane at the
+   # last possible point. Inside the namespace the whole lane is mounted
+   # read-only, and the mounted bytes are checked again before exec.
+   verify_operator_tools
+   verify_preserved_dsr_inputs
+   sha256sum --check --strict --status "$preserved_inputs"
    (
      set -C
-     bwrap --die-with-parent --new-session --bind / / --dev-bind /dev /dev \
+     "$release_bwrap_path" \
+       --die-with-parent --new-session --bind / / --dev-bind /dev /dev \
+       --ro-bind "$PRESERVED_DSR_LANE" "$PRESERVED_DSR_LANE" \
        --bind "$release_checkout" /data/projects/pi_agent_rust \
        --chdir /data/projects/pi_agent_rust \
+       "$release_bash_path" --noprofile --norc -c '
+         set -euo pipefail
+         sha256sum_path="$1"
+         preserved_receipt="$2"
+         preserved_wrapper="$3"
+         shift 3
+         "$sha256sum_path" --check --strict --status "$preserved_receipt"
+         exec "$preserved_wrapper" "$@"
+       ' bash "$release_sha256sum_path" "$preserved_inputs" \
        "$PRESERVED_DSR_WRAPPER" \
        --run-id "$DSR_BUILD_RUN_ID" \
        --state-dir "$PRESERVED_DSR_STATE_DIR" \
@@ -1246,6 +1399,28 @@ proof is not proof of an empty bypass list.
        --targets linux/amd64,linux/arm64,darwin/amd64,darwin/arm64,windows/amd64 \
        --only-native --jobs 1 > "$build_receipt"
    )
+   # These values come from the receipt that was revalidated inside the
+   # read-only execution mount. They, rather than duplicated literals, feed
+   # every retained/public packaging receipt below.
+   test "$(grep -Fc "$PRESERVED_DSR_WRAPPER" "$preserved_inputs")" = 1
+   test "$(grep -Fc "$PRESERVED_DSR_AUDIT" "$preserved_inputs")" = 1
+   test "$(grep -Fc \
+     "$PRESERVED_DSR_LANE/preservation-manifest.sha256" \
+     "$preserved_inputs")" = 1
+   preserved_wrapper_sha256="$(awk -v path="$PRESERVED_DSR_WRAPPER" \
+     '$2 == path {print $1}' "$preserved_inputs")"
+   preserved_audit_sha256="$(awk -v path="$PRESERVED_DSR_AUDIT" \
+     '$2 == path {print $1}' "$preserved_inputs")"
+   preservation_manifest_sha256="$(awk \
+     -v path="$PRESERVED_DSR_LANE/preservation-manifest.sha256" \
+     '$2 == path {print $1}' "$preserved_inputs")"
+   test "$preserved_wrapper_sha256" = "$expected_preserved_wrapper_sha256"
+   test "$preserved_audit_sha256" = "$expected_preserved_audit_sha256"
+   test "$preservation_manifest_sha256" = \
+     "$expected_preservation_manifest_sha256"
+   printf 'preserved_wrapper_sha256=%s\npreserved_audit_sha256=%s\npreservation_manifest_sha256=%s\n' \
+     "$preserved_wrapper_sha256" "$preserved_audit_sha256" \
+     "$preservation_manifest_sha256" >> "$proof_file"
 
    raw_manifest="$RAW_RELEASE_DIR/pi-v0.2.0-manifest.json"
    jq -e \
@@ -1353,10 +1528,14 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
    test "$(git rev-parse 'HEAD^{commit}')" = "$source_commit"
    test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$source_commit"
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
    test -f "$raw_manifest" && test ! -L "$raw_manifest"
+   verify_operator_tools
+   verify_preserved_dsr_inputs
+   sha256sum --check --strict --status "$preserved_inputs"
    export RELEASE_ARTIFACT_DIR="$MANUAL_RELEASE_STATE_DIR/artifacts"
    packaging_receipt="$MANUAL_RELEASE_STATE_DIR/deterministic-packaging.json"
    test ! -e "$RELEASE_ARTIFACT_DIR" && test ! -L "$RELEASE_ARTIFACT_DIR"
@@ -1372,9 +1551,9 @@ proof is not proof of an empty bypass list.
      RAW_MANIFEST="$raw_manifest" \
      DSR_BUILD_RUN_ID="$DSR_BUILD_RUN_ID" \
      RELEASE_ARTIFACT_DIR="$RELEASE_ARTIFACT_DIR" \
-     PRESERVED_WRAPPER_SHA256="7c1c3528229f89eadea62d72eb692b4a5f089e037e008c153544c35701f93f75" \
-     PRESERVED_AUDIT_SHA256="308b9ce092b34bac3224a91390452721475a9cb96a9ba9b4a164fcc2666662dc" \
-     PRESERVATION_MANIFEST_SHA256="d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b" \
+     PRESERVED_WRAPPER_SHA256="$preserved_wrapper_sha256" \
+     PRESERVED_AUDIT_SHA256="$preserved_audit_sha256" \
+     PRESERVATION_MANIFEST_SHA256="$preservation_manifest_sha256" \
      python3 - > "$packaging_receipt" <<'PY'
    import hashlib
    import io
@@ -1509,6 +1688,14 @@ proof is not proof of an empty bypass list.
    raw_dir = Path(os.environ["RAW_RELEASE_DIR"])
    raw_manifest_path = Path(os.environ["RAW_MANIFEST"])
    output_dir = Path(os.environ["RELEASE_ARTIFACT_DIR"])
+   preservation_lane = {
+       "wrapper_sha256": os.environ["PRESERVED_WRAPPER_SHA256"],
+       "audit_sha256": os.environ["PRESERVED_AUDIT_SHA256"],
+       "manifest_sha256": os.environ["PRESERVATION_MANIFEST_SHA256"],
+   }
+   if any(re.fullmatch(r"[0-9a-f]{64}", value) is None
+          for value in preservation_lane.values()):
+       fail("preservation-lane execution receipt contains an invalid digest")
    if re.fullmatch(r"[0-9a-f]{40}", commit) is None:
        fail("source commit is not a full SHA-1")
    if re.fullmatch(
@@ -1779,11 +1966,7 @@ proof is not proof of an empty bypass list.
                    "hardware_native_build_proven": False,
                    "operator_retained_receipt_sha256": sha256_bytes(environment_bytes),
                },
-               "preservation_lane": {
-                   "wrapper_sha256": os.environ["PRESERVED_WRAPPER_SHA256"],
-                   "audit_sha256": os.environ["PRESERVED_AUDIT_SHA256"],
-                   "manifest_sha256": os.environ["PRESERVATION_MANIFEST_SHA256"],
-               },
+               "preservation_lane": preservation_lane,
            },
            "packaging": {
                "source_date_epoch": source_epoch,
@@ -1832,6 +2015,7 @@ proof is not proof of an empty bypass list.
        "source_commit": commit,
        "source_date_epoch": source_epoch,
        "raw_manifest_sha256": aggregate_sha,
+       "preservation_lane": preservation_lane,
        "assets": [digest(output_dir / name) for name in sorted(expected_public)],
    }
    print(json.dumps(receipt, indent=2, sort_keys=True))
@@ -1880,7 +2064,10 @@ proof is not proof of an empty bypass list.
          --arg version "$RELEASE_VERSION" \
          --arg commit "$source_commit" \
          --arg run "$DSR_BUILD_RUN_ID" \
-         --arg aggregate "$aggregate_sha256" '
+         --arg aggregate "$aggregate_sha256" \
+         --arg wrapper "$preserved_wrapper_sha256" \
+         --arg audit "$preserved_audit_sha256" \
+         --arg preservation_manifest "$preservation_manifest_sha256" '
          .schema == "pi.release.dsr_build_manifest.v1" and
          .tag == $tag and .version == $version and
          .pi_agent_rust == $commit and .raw_build.run_id == $run and
@@ -1890,6 +2077,11 @@ proof is not proof of an empty bypass list.
          .raw_build.build_environment.hardware_native_build_proven == false and
          (.raw_build.build_environment.operator_retained_receipt_sha256 |
            test("^[0-9a-f]{64}$")) and
+         .raw_build.preservation_lane == {
+           wrapper_sha256: $wrapper,
+           audit_sha256: $audit,
+           manifest_sha256: $preservation_manifest
+         } and
          (has("rustc") | not) and
          (.archive.sha256 | test("^[0-9a-f]{64}$")) and
          (.archive.size | type) == "number" and .archive.size > 0 and
@@ -1902,10 +2094,18 @@ proof is not proof of an empty bypass list.
    jq -e \
      --arg tag "$RELEASE_TAG" \
      --arg commit "$source_commit" \
-     --arg aggregate "$aggregate_sha256" '
+     --arg aggregate "$aggregate_sha256" \
+     --arg wrapper "$preserved_wrapper_sha256" \
+     --arg audit "$preserved_audit_sha256" \
+     --arg preservation_manifest "$preservation_manifest_sha256" '
      .schema == "pi.release.deterministic_packaging_receipt.v1" and
      .tag == $tag and .source_commit == $commit and
      .raw_manifest_sha256 == $aggregate and
+     .preservation_lane == {
+       wrapper_sha256: $wrapper,
+       audit_sha256: $audit,
+       manifest_sha256: $preservation_manifest
+     } and
      (.assets | length) == 12 and
      ([.assets[].name] | length) == ([.assets[].name] | unique | length)
    ' "$packaging_receipt" >/dev/null
@@ -1923,16 +2123,16 @@ proof is not proof of an empty bypass list.
      "$(sha256sum "$packaging_receipt" | awk '{print $1}')" >> "$proof_file"
    ```
 
-   Finally, re-check the immutable-tag rule and remote branch tips, then push
-   the already-created annotated tag. Do not recreate or move it after the raw
-   build or packaging stage:
+   Define the exact remote-tag reconciler now, but do not call it yet. The local
+   annotated tag is reversible; the protected remote tag is not. Its first
+   invocation is deliberately deferred until all five target-runtime smokes
+   pass. A retry may adopt the remote tag only when both the annotated tag
+   object ID and peeled commit exactly match the retained local objects. Any
+   other state fails closed; the function never moves or deletes a tag:
 
    ```bash
    set -euo pipefail
-   test "$(git rev-parse 'HEAD^{commit}')" = "$source_commit"
-   test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
-   test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$source_commit"
-   test -z "$(git status --porcelain=v2 --untracked-files=all)"
+   verify_operator_tools
    immutable_ruleset_id="$(jq -er 'first(.[] |
      select(.target == "tag" and .enforcement == "active" and
        ((.conditions.ref_name.include | index("refs/tags/v*")) != null or
@@ -1942,68 +2142,72 @@ proof is not proof of an empty bypass list.
        ([.rules[].type] | index("deletion")) != null and
        (.bypass_actors | type) == "array" and .bypass_actors == [])) | .id' \
      "$ruleset_details")"
-   pretag_ruleset="$MANUAL_RELEASE_STATE_DIR/pre-tag-ruleset.json"
-   test ! -e "$pretag_ruleset"
-   gh api -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/rulesets/${immutable_ruleset_id}?includes_parents=true" \
-     > "$pretag_ruleset"
-   jq -e '
-     .target == "tag" and .enforcement == "active" and
-     ((.conditions.ref_name.include | index("refs/tags/v*")) != null or
-      (.conditions.ref_name.include | index("~ALL")) != null) and
-     .conditions.ref_name.exclude == [] and
-     ([.rules[].type] | index("update")) != null and
-     ([.rules[].type] | index("deletion")) != null and
-     (.bypass_actors | type) == "array" and .bypass_actors == []
-   ' "$pretag_ruleset" >/dev/null
-   git fetch --no-tags origin \
-     refs/heads/main:refs/remotes/origin/main \
-     refs/heads/master:refs/remotes/origin/master
-   test "$(git rev-parse 'origin/main^{commit}')" = "$source_commit"
-   test "$(git rev-parse 'origin/master^{commit}')" = "$source_commit"
-   test -z "$(git ls-remote --tags origin \
-     "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
-   verify_workflow_baseline_unchanged immediately-before-tag-push
-   origin_push_guarded "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-   remote_tag_commit="$(git ls-remote --tags origin \
-     "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')"
-   test "$remote_tag_commit" = "$source_commit"
-   disable_origin_push
-   posttag_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-after-tag.json"
-   posttag_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-after-tag.txt"
-   test ! -e "$posttag_workflows" && test ! -e "$posttag_workflow_ids"
-   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
-   gh api --paginate -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-     | jq -s '(.[0].total_count // -1) as $reported |
-       [.[].workflow_runs[]] as $runs |
-       {reported_total_count: $reported,
-        page_total_counts_consistent: all(.[]; .total_count == $reported),
-        total_count: ($runs | length), workflow_runs: $runs}' \
-     > "$posttag_workflows"
-   jq -e '
-     (.reported_total_count | type) == "number" and
-     .reported_total_count == .total_count and
-     .page_total_counts_consistent == true and
-     (.total_count | type) == "number" and .total_count > 0 and
-     .total_count == (.workflow_runs | length) and
-     all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
-     ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
-   ' "$posttag_workflows" >/dev/null
-   (set -C; jq -r '.workflow_runs[].id' "$posttag_workflows" \
-     | LC_ALL=C sort -n > "$posttag_workflow_ids")
-   cmp "$WORKFLOW_BASELINE_IDS" "$posttag_workflow_ids"
-   verify_workflow_baseline_unchanged immediately-after-tag-push
+
+   reconcile_exact_remote_tag() {
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     local pretag_ruleset local_tag_object remote_refs
+     local remote_tag_object remote_tag_commit push_status=0
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     verify_operator_tools
+     test "$(git rev-parse 'HEAD^{commit}')" = "$source_commit"
+     test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+     test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$source_commit"
+     test -z "$(git status --porcelain=v2 --untracked-files=all)"
+     local_tag_object="$(git rev-parse "refs/tags/$RELEASE_TAG")"
+     [[ "$local_tag_object" =~ ^[0-9a-f]{40}$ ]]
+
+     pretag_ruleset="$attempt_dir/pre-tag-ruleset.json"
+     test ! -e "$pretag_ruleset"
+     gh api -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/rulesets/${immutable_ruleset_id}?includes_parents=true" \
+       > "$pretag_ruleset"
+     jq -e '
+       .target == "tag" and .enforcement == "active" and
+       ((.conditions.ref_name.include | index("refs/tags/v*")) != null or
+        (.conditions.ref_name.include | index("~ALL")) != null) and
+       .conditions.ref_name.exclude == [] and
+       ([.rules[].type] | index("update")) != null and
+       ([.rules[].type] | index("deletion")) != null and
+       (.bypass_actors | type) == "array" and .bypass_actors == []
+     ' "$pretag_ruleset" >/dev/null
+     git fetch --no-tags origin \
+       refs/heads/main:refs/remotes/origin/main \
+       refs/heads/master:refs/remotes/origin/master
+     test "$(git rev-parse 'origin/main^{commit}')" = "$source_commit"
+     test "$(git rev-parse 'origin/master^{commit}')" = "$source_commit"
+
+     remote_refs="$(git ls-remote --tags origin \
+       "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+     if test -z "$remote_refs"; then
+       set +e
+       origin_push_guarded "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+       push_status=$?
+       set -e
+     fi
+     assert_origin_push_disabled
+     remote_tag_object="$(git ls-remote --tags origin \
+       "refs/tags/$RELEASE_TAG" | awk 'NR == 1 {print $1}')"
+     remote_tag_commit="$(git ls-remote --tags origin \
+       "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')"
+     test "$remote_tag_object" = "$local_tag_object"
+     test "$remote_tag_commit" = "$source_commit"
+     (set -C; printf \
+       'attempt_id=%s\npush_exit=%s\ntag_object=%s\ntag_commit=%s\n' \
+       "$attempt_id" "$push_status" "$remote_tag_object" \
+       "$remote_tag_commit" > "$attempt_dir/remote-tag-reconciliation.txt")
+   }
    ```
 
-7. Create one new GitHub draft directly by API, bind it to the returned release
-   database ID, and upload exactly 12 assets to that ID. Do **not** run
+7. Prepare the frozen GitHub release body and define an exact draft/asset
+   reconciler, but do not call it yet. Do **not** run
    `dsr release`: its recovery-oriented transport may adopt an existing release
-   and may remove its upload-state file, while this lane requires exclusive
-   creation and preserves every receipt. A failed or partial creation is a stop
-   condition requiring manual investigation; this lane never deletes a release,
-   asset, state directory, or receipt and never resumes by adopting existing
-   state.
+   and may remove its upload-state file. This lane preserves every receipt and
+   may retry within the still-running fail-fast session only by reconciling the
+   authenticated remote inventory to the exact retained tag, body, and asset bytes. It never
+   deletes or replaces a release, asset, state directory, or receipt. An extra,
+   duplicate, differently sized, or byte-mismatched remote asset is a hard stop.
 
    The release body is also a frozen publication input. It must contain the
    exact `v0.2.0` section extracted from `CHANGELOG.md` at the tagged source,
@@ -2014,6 +2218,7 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
    expected_source_commit="$(awk -F= '$1 == "source_commit" {print $2}' "$proof_file")"
    expected_crate_sha256="$(awk -F= '$1 == "package_sha256" {print $2}' "$proof_file")"
    expected_crate_size="$(awk -F= '$1 == "package_size" {print $2}' "$proof_file")"
@@ -2022,7 +2227,6 @@ proof is not proof of an empty bypass list.
    [[ "$expected_crate_size" =~ ^[0-9]+$ ]]
    test "$(git rev-parse 'HEAD^{commit}')" = "$expected_source_commit"
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
-   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
 
    verdict_source="$(jq -er '
      select(.schema == "pi.dropin.certification_verdict.v1" and
@@ -2096,72 +2300,135 @@ proof is not proof of an empty bypass list.
    PY
    sha256sum "$release_body" > "$MANUAL_RELEASE_STATE_DIR/release-body.sha256"
 
-   # The tag endpoint intentionally hides drafts. Prove nonexistence from the
-   # authenticated, fully paginated release inventory, which includes drafts.
-   precreate_inventory="$MANUAL_RELEASE_STATE_DIR/github-releases-precreate.json"
-   test ! -e "$precreate_inventory"
-   gh api --paginate -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
-     | jq -s 'add' > "$precreate_inventory"
-   jq -e --arg tag "$RELEASE_TAG" '
-     type == "array" and
-     all(.[];
-       (.id | type) == "number" and .id > 0 and
-       (.tag_name | type) == "string") and
-     ([.[].id] | length) == ([.[].id] | unique | length) and
-     ([.[] | select(.tag_name == $tag)] | length) == 0
-   ' "$precreate_inventory" >/dev/null
+   release_identity_receipt="$MANUAL_RELEASE_STATE_DIR/github-release-identity.json"
 
-   draft_payload="$MANUAL_RELEASE_STATE_DIR/github-draft-create-payload.json"
-   draft_created="$MANUAL_RELEASE_STATE_DIR/github-draft-created.json"
-   test ! -e "$draft_payload" && test ! -e "$draft_created"
-   jq -n \
-     --arg tag "$RELEASE_TAG" \
-     --arg commit "$expected_source_commit" \
-     --arg title "$RELEASE_TAG" \
-     --rawfile body "$release_body" \
-     '{tag_name: $tag, target_commitish: $commit, name: $title,
-       body: $body, draft: true, prerelease: false}' \
-     > "$draft_payload"
-   verify_workflow_baseline_unchanged immediately-before-draft-creation
-   gh api --method POST \
-     -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/releases" \
-     --input "$draft_payload" > "$draft_created"
-   release_id="$(jq -er '
-     select((.id | type) == "number" and .id > 0) | .id
-   ' "$draft_created")"
-   created_target_commitish="$(jq -er '
-     .target_commitish | select(type == "string" and length > 0)
-   ' "$draft_created")"
-   test "$created_target_commitish" = "$expected_source_commit"
-   release_id_receipt="$MANUAL_RELEASE_STATE_DIR/github-release-id.txt"
-   test ! -e "$release_id_receipt"
-   (set -C; printf 'release_id=%s\ntag=%s\ntarget_commitish=%s\n' \
-     "$release_id" "$RELEASE_TAG" "$created_target_commitish" \
-     > "$release_id_receipt")
+   reconcile_exact_github_draft() {
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     local create_status=0
+     local precreate_inventory draft_payload draft_created create_response
+     local postcreate_inventory release_id_receipt expected_upload_template
+     local release_upload_url expected_assets remote_assets
+     local release_id created_target_commitish
+     local asset asset_path upload_response asset_size asset_count
+     local upload_status upload_attempt metadata_after_asset asset_id
+     local downloaded_asset upload_receipts
+     local -a EXPECTED_ASSETS
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     verify_operator_tools
+
+     # The tag endpoint intentionally hides drafts. The authenticated paginated
+     # inventory is authoritative. Zero matches permits creation; one match is
+     # adopted only after every immutable field and byte is proved below.
+     precreate_inventory="$attempt_dir/github-releases-before-reconcile.json"
+     test ! -e "$precreate_inventory"
+     gh api --paginate -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
+       | jq -s 'add' > "$precreate_inventory"
+     jq -e --arg tag "$RELEASE_TAG" '
+       type == "array" and
+       all(.[];
+         (.id | type) == "number" and .id > 0 and
+         (.tag_name | type) == "string") and
+       ([.[].id] | length) == ([.[].id] | unique | length) and
+       ([.[] | select(.tag_name == $tag)] | length) <= 1
+     ' "$precreate_inventory" >/dev/null
+
+     draft_payload="$attempt_dir/github-draft-create-payload.json"
+     draft_created="$attempt_dir/github-draft-reconciled.json"
+     test ! -e "$draft_payload" && test ! -e "$draft_created"
+     jq -n \
+       --arg tag "$RELEASE_TAG" \
+       --arg commit "$expected_source_commit" \
+       --arg title "$RELEASE_TAG" \
+       --rawfile body "$release_body" \
+       '{tag_name: $tag, target_commitish: $commit, name: $title,
+         body: $body, draft: true, prerelease: false}' \
+       > "$draft_payload"
+     if test "$(jq --arg tag "$RELEASE_TAG" \
+       '[.[] | select(.tag_name == $tag)] | length' \
+       "$precreate_inventory")" = 0; then
+       create_response="$attempt_dir/github-draft-create-response.json"
+       test ! -e "$create_response"
+       set +e
+       (set -C; gh api --method POST \
+         -H 'Accept: application/vnd.github+json' \
+         "/repos/${RELEASE_REPOSITORY}/releases" \
+         --input "$draft_payload" > "$create_response")
+       create_status=$?
+       set -e
+     fi
+
+     # A lost POST response is not interpreted from its exit status. Refetch the
+     # authenticated inventory and accept exactly one matching tag or fail.
+     postcreate_inventory="$attempt_dir/github-releases-after-reconcile.json"
+     test ! -e "$postcreate_inventory"
+     gh api --paginate -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
+       | jq -s 'add' > "$postcreate_inventory"
+     release_id="$(jq -er --arg tag "$RELEASE_TAG" '
+       select(type == "array") |
+       [.[] | select(.tag_name == $tag)] |
+       select(length == 1) | .[0].id |
+       select(type == "number" and . > 0)
+     ' "$postcreate_inventory")"
+     gh api -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" > "$draft_created"
+     created_target_commitish="$(jq -er '
+       .target_commitish | select(type == "string" and length > 0)
+     ' "$draft_created")"
+
+     # GitHub documents target_commitish as unused when tag_name already
+     # exists. The protected annotated tag object and peeled commit are the
+     # commit authority; this receipt freezes the API metadata value and ID so
+     # later retries can detect metadata substitution without misusing it as
+     # tag-target proof.
+     test ! -L "$release_identity_receipt"
+     if test ! -e "$release_identity_receipt"; then
+       (set -C; jq -n \
+         --argjson id "$release_id" \
+         --arg tag "$RELEASE_TAG" \
+         --arg target_commitish "$created_target_commitish" \
+         '{schema: "pi.release.github_identity.v1", id: $id,
+           tag: $tag, target_commitish: $target_commitish}' \
+         > "$release_identity_receipt")
+     fi
+     test -f "$release_identity_receipt" && test ! -L "$release_identity_receipt"
+     jq -e \
+       --argjson id "$release_id" \
+       --arg tag "$RELEASE_TAG" \
+       --arg target_commitish "$created_target_commitish" '
+       .schema == "pi.release.github_identity.v1" and
+       .id == $id and .tag == $tag and
+       .target_commitish == $target_commitish
+     ' "$release_identity_receipt" >/dev/null
+     release_id_receipt="$attempt_dir/github-release-id.txt"
+     test ! -e "$release_id_receipt"
+     (set -C; printf \
+       'attempt_id=%s\ncreate_exit=%s\nrelease_id=%s\ntag=%s\ntarget_commitish=%s\n' \
+       "$attempt_id" "$create_status" "$release_id" "$RELEASE_TAG" \
+       "$created_target_commitish" \
+       > "$release_id_receipt")
    expected_upload_template="https://uploads.github.com/repos/${RELEASE_REPOSITORY}/releases/${release_id}/assets{?name,label}"
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
-     --arg target "$expected_source_commit" \
+     --arg target_commitish "$created_target_commitish" \
      --arg upload "$expected_upload_template" \
      --rawfile body "$release_body" \
      '.id == $id and .draft == true and .prerelease == false and
-       .tag_name == $tag and .target_commitish == $target and
+       .tag_name == $tag and .target_commitish == $target_commitish and
        .name == $tag and .body == $body and
        .upload_url == $upload and
-       (.assets | type) == "array" and (.assets | length) == 0' \
+       (.assets | type) == "array" and
+       ([.assets[].id] | length) == ([.assets[].id] | unique | length) and
+       ([.assets[].name] | length) == ([.assets[].name] | unique | length)' \
      "$draft_created" >/dev/null
-   postcreate_inventory="$MANUAL_RELEASE_STATE_DIR/github-releases-postcreate.json"
-   test ! -e "$postcreate_inventory"
-   gh api --paginate -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
-     | jq -s 'add' > "$postcreate_inventory"
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
-     --arg target "$expected_source_commit" '
+     --arg target_commitish "$created_target_commitish" '
      type == "array" and
      all(.[];
        (.id | type) == "number" and .id > 0 and
@@ -2170,7 +2437,7 @@ proof is not proof of an empty bypass list.
      ([.[] | select(.tag_name == $tag)] | length) == 1 and
      ([.[] | select(.tag_name == $tag and .id == $id and
        .draft == true and .prerelease == false and
-       .target_commitish == $target)] | length) == 1
+       .target_commitish == $target_commitish)] | length) == 1
    ' "$postcreate_inventory" >/dev/null
    release_upload_url="$(jq -er '
      .upload_url | sub("\\{\\?name,label\\}$"; "") |
@@ -2191,7 +2458,13 @@ proof is not proof of an empty bypass list.
      build-manifest-pi-darwin-arm64.json
      build-manifest-pi-windows-amd64.json
    )
-   upload_receipts="$MANUAL_RELEASE_STATE_DIR/github-upload-responses"
+   expected_assets="$(printf '%s\n' "${EXPECTED_ASSETS[@]}" | LC_ALL=C sort)"
+   remote_assets="$(jq -r '.assets[].name' "$draft_created" | LC_ALL=C sort)"
+   test -z "$remote_assets" || \
+     test "$(comm -23 \
+       <(printf '%s\n' "$remote_assets") \
+       <(printf '%s\n' "$expected_assets"))" = ""
+   upload_receipts="$attempt_dir/github-upload-reconciled"
    test ! -e "$upload_receipts" && test ! -L "$upload_receipts"
    mkdir -m 700 "$upload_receipts"
    for asset in "${EXPECTED_ASSETS[@]}"; do
@@ -2200,33 +2473,72 @@ proof is not proof of an empty bypass list.
      upload_response="$upload_receipts/${asset}.json"
      test -f "$asset_path" && test ! -L "$asset_path" && test -s "$asset_path"
      test ! -e "$upload_response"
-     (set -C; gh api --method POST \
-       -H 'Accept: application/vnd.github+json' \
-       -H 'Content-Type: application/octet-stream' \
-       --input "$asset_path" \
-       "${release_upload_url}?name=${asset}" \
-       > "$upload_response")
-     jq -e \
-       --arg name "$asset" \
-       --argjson size "$(wc -c < "$asset_path" | tr -d '[:space:]')" '
-       (.id | type) == "number" and .id > 0 and
-       .name == $name and .size == $size and .state == "uploaded" and
-       .content_type == "application/octet-stream"
-     ' "$upload_response" >/dev/null
+     asset_size="$(wc -c < "$asset_path" | tr -d '[:space:]')"
+     asset_count="$(jq --arg name "$asset" \
+       '[.assets[] | select(.name == $name)] | length' "$draft_created")"
+     test "$asset_count" = 0 || test "$asset_count" = 1
+     upload_status=0
+     if test "$asset_count" = 0; then
+       upload_attempt="$attempt_dir/github-upload-attempt-${asset}.json"
+       test ! -e "$upload_attempt"
+       set +e
+       (set -C; gh api --method POST \
+         -H 'Accept: application/vnd.github+json' \
+         -H 'Content-Type: application/octet-stream' \
+         --input "$asset_path" \
+         "${release_upload_url}?name=${asset}" \
+         > "$upload_attempt")
+       upload_status=$?
+       set -e
+     fi
+     metadata_after_asset="$attempt_dir/github-release-after-${asset}.json"
+     test ! -e "$metadata_after_asset"
+     gh api -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
+       > "$metadata_after_asset"
+     asset_id="$(jq -er \
+       --arg name "$asset" --argjson size "$asset_size" '
+       [.assets[] | select(
+         .name == $name and .size == $size and .state == "uploaded" and
+         (.id | type) == "number" and .id > 0)] |
+       select(length == 1) | .[0].id
+     ' "$metadata_after_asset")"
+     downloaded_asset="$attempt_dir/github-asset-${asset}"
+     test ! -e "$downloaded_asset" && test ! -L "$downloaded_asset"
+     (set -C; gh api -H 'Accept: application/octet-stream' \
+       "/repos/${RELEASE_REPOSITORY}/releases/assets/${asset_id}" \
+       > "$downloaded_asset")
+     cmp "$asset_path" "$downloaded_asset"
+     (set -C; jq -e \
+       --arg name "$asset" --argjson id "$asset_id" \
+       --argjson size "$asset_size" '
+       first(.assets[] | select(
+         .id == $id and .name == $name and .size == $size and
+         .state == "uploaded"))
+     ' "$metadata_after_asset" > "$upload_response")
+     (set -C; printf 'upload_exit=%s\nasset_id=%s\n' \
+       "$upload_status" "$asset_id" \
+       > "$attempt_dir/github-upload-${asset}.txt")
+     draft_created="$metadata_after_asset"
    done
-   printf 'release_id=%s\nrelease_target_commitish=%s\nrelease_body_sha256=%s\n' \
+   test "$(jq -r '.assets[].name' "$draft_created" | LC_ALL=C sort)" = \
+     "$expected_assets"
+   (set -C; printf \
+     'release_id=%s\nrelease_target_commitish=%s\nrelease_body_sha256=%s\n' \
      "$release_id" "$created_target_commitish" \
      "$(sha256sum "$release_body" | awk '{print $1}')" \
-     >> "$proof_file"
+     > "$attempt_dir/github-draft-reconciliation.txt")
+   }
    ```
 
    Define one verifier and use it both immediately before and immediately after
    public publication. It binds the database ID, draft/public state, annotated
-   tag target, title, body, prerelease flag, exact 12-name inventory, and every
-   downloaded byte:
+   tag object and peeled commit, frozen API metadata, title, body, prerelease
+   flag, exact 12-name inventory, and every downloaded byte:
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
    EXPECTED_ASSETS=(
      pi-linux-amd64.tar.xz
      pi-linux-arm64.tar.xz
@@ -2258,17 +2570,33 @@ proof is not proof of an empty bypass list.
      local inventory="$MANUAL_RELEASE_STATE_DIR/github-releases-${label}.json"
      local metadata="$MANUAL_RELEASE_STATE_DIR/github-release-${label}.json"
      local download_dir="$MANUAL_RELEASE_STATE_DIR/github-assets-${label}"
+     local expected_release_id recorded_target_commitish remote_assets
+     local remote_tag_object remote_tag_commit local_tag_object
      test "$expected_draft" = true || test "$expected_draft" = false
+     [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]]
+     verify_operator_tools
+     test -f "$release_identity_receipt" && test ! -L "$release_identity_receipt"
+     expected_release_id="$(jq -er '
+       select(.schema == "pi.release.github_identity.v1") |
+       .id | select(type == "number" and . > 0)
+     ' "$release_identity_receipt")"
+     recorded_target_commitish="$(jq -er '
+       select(.schema == "pi.release.github_identity.v1") |
+       .target_commitish | select(type == "string" and length > 0)
+     ' "$release_identity_receipt")"
+     jq -e --arg tag "$RELEASE_TAG" '
+       .schema == "pi.release.github_identity.v1" and .tag == $tag
+     ' "$release_identity_receipt" >/dev/null
      test ! -e "$inventory" && test ! -e "$metadata"
      test ! -e "$download_dir"
      gh api --paginate -H 'Accept: application/vnd.github+json' \
        "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
        | jq -s 'add' > "$inventory"
      jq -e \
-       --argjson id "$release_id" \
+       --argjson id "$expected_release_id" \
        --argjson draft "$expected_draft" \
        --arg tag "$RELEASE_TAG" \
-       --arg target "$expected_source_commit" '
+       --arg target_commitish "$recorded_target_commitish" '
        type == "array" and
        all(.[];
          (.id | type) == "number" and .id > 0 and
@@ -2277,19 +2605,19 @@ proof is not proof of an empty bypass list.
        ([.[] | select(.tag_name == $tag)] | length) == 1 and
        ([.[] | select(.tag_name == $tag and .id == $id and
          .draft == $draft and .prerelease == false and
-         .target_commitish == $target)] | length) == 1
+         .target_commitish == $target_commitish)] | length) == 1
      ' "$inventory" >/dev/null
      gh api -H 'Accept: application/vnd.github+json' \
-       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
+       "/repos/${RELEASE_REPOSITORY}/releases/${expected_release_id}" \
        > "$metadata"
      jq -e \
-       --argjson id "$release_id" \
+       --argjson id "$expected_release_id" \
        --argjson draft "$expected_draft" \
        --arg tag "$RELEASE_TAG" \
-       --arg target "$expected_source_commit" \
+       --arg target_commitish "$recorded_target_commitish" \
        --rawfile body "$release_body" \
        '.id == $id and .draft == $draft and .prerelease == false and
-        .tag_name == $tag and .target_commitish == $target and
+        .tag_name == $tag and .target_commitish == $target_commitish and
         .name == $tag and .body == $body and
         (.assets | type) == "array" and (.assets | length) == 12 and
         ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
@@ -2300,32 +2628,22 @@ proof is not proof of an empty bypass list.
           .state == "uploaded" and
           (.size | type) == "number" and .size > 0)' \
        "$metadata" >/dev/null
-     local remote_assets
      remote_assets="$(jq -r '.assets[].name' "$metadata" | LC_ALL=C sort)"
      test "$remote_assets" = "$expected_assets"
      mkdir -m 700 "$download_dir"
      for asset in "${EXPECTED_ASSETS[@]}"; do
-       local local_asset upload_response recorded_asset_id recorded_asset_size
-       local downloaded_asset
+       local local_asset recorded_asset_id recorded_asset_size downloaded_asset
        local_asset="$RELEASE_ARTIFACT_DIR/$asset"
-       upload_response="$upload_receipts/${asset}.json"
        downloaded_asset="$download_dir/$asset"
-       test -f "$upload_response" && test ! -L "$upload_response"
+       recorded_asset_size="$(wc -c < "$local_asset" | tr -d '[:space:]')"
        recorded_asset_id="$(jq -er \
          --arg name "$asset" \
-         --argjson size "$(wc -c < "$local_asset" | tr -d '[:space:]')" '
-         select(.name == $name and .size == $size and .state == "uploaded" and
-           (.id | type) == "number" and .id > 0) | .id
-       ' "$upload_response")"
-       recorded_asset_size="$(wc -c < "$local_asset" | tr -d '[:space:]')"
-       jq -e \
-         --arg name "$asset" \
-         --argjson id "$recorded_asset_id" \
          --argjson size "$recorded_asset_size" '
-         ([.assets[] | select(
-           .id == $id and .name == $name and .state == "uploaded" and
-           .size == $size)] | length) == 1
-       ' "$metadata" >/dev/null
+         [.assets[] | select(
+           .name == $name and .state == "uploaded" and .size == $size and
+           (.id | type) == "number" and .id > 0)] |
+         select(length == 1) | .[0].id
+       ' "$metadata")"
        test ! -e "$downloaded_asset" && test ! -L "$downloaded_asset"
        (set -C; gh api \
          -H 'Accept: application/octet-stream' \
@@ -2336,39 +2654,110 @@ proof is not proof of an empty bypass list.
          "$recorded_asset_size"
        cmp "$local_asset" "$downloaded_asset"
      done
-     local remote_tag_object remote_tag_commit
+     local_tag_object="$(git rev-parse "refs/tags/$RELEASE_TAG")"
      remote_tag_object="$(git ls-remote --tags origin \
        "refs/tags/$RELEASE_TAG" | awk 'NR == 1 {print $1}')"
      remote_tag_commit="$(git ls-remote --tags origin \
        "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')"
      [[ "$remote_tag_object" =~ ^[0-9a-f]{40}$ ]]
+     test "$remote_tag_object" = "$local_tag_object"
      test "$remote_tag_object" != "$remote_tag_commit"
      test "$remote_tag_commit" = "$expected_source_commit"
    }
 
-   verify_exact_release true draft-after-bind
+   reconcile_exact_github_publication() {
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     local release_id current_metadata current_draft
+     local public_payload public_response patch_attempted=false patch_status=0
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     verify_operator_tools
+     test -f "$release_identity_receipt" && test ! -L "$release_identity_receipt"
+     release_id="$(jq -er '
+       select(.schema == "pi.release.github_identity.v1") |
+       .id | select(type == "number" and . > 0)
+     ' "$release_identity_receipt")"
+     current_metadata="$attempt_dir/github-release-before-publication.json"
+     test ! -e "$current_metadata"
+     gh api -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
+       > "$current_metadata"
+     current_draft="$(jq -er '
+       .draft | select(type == "boolean")
+     ' "$current_metadata")"
+     verify_exact_release "$current_draft" "before-public-${attempt_id}"
+
+     if test "$current_draft" = true; then
+       public_payload="$attempt_dir/github-public-payload.json"
+       public_response="$attempt_dir/github-public-response.json"
+       test ! -e "$public_payload" && test ! -e "$public_response"
+       jq -n \
+         --arg tag "$RELEASE_TAG" \
+         --arg title "$RELEASE_TAG" \
+         --rawfile body "$release_body" \
+         '{tag_name: $tag, name: $title,
+           body: $body, draft: false, prerelease: false}' \
+         > "$public_payload"
+       patch_attempted=true
+       set +e
+       (set -C; gh api --method PATCH \
+         -H 'Accept: application/vnd.github+json' \
+         "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
+         --input "$public_payload" > "$public_response")
+       patch_status=$?
+       set -e
+     fi
+
+     # The authenticated inventory and downloaded bytes, not the PATCH process
+     # status or response body, are authoritative after an ambiguous network
+     # result. A retry sees the exact public state and skips the PATCH.
+     verify_exact_release false "after-public-${attempt_id}"
+     (set -C; printf \
+       'attempt_id=%s\nrelease_id=%s\npatch_attempted=%s\npatch_exit=%s\n' \
+       "$attempt_id" "$release_id" "$patch_attempted" "$patch_status" \
+       > "$attempt_dir/github-publication-reconciliation.txt")
+   }
+
    ```
 
-   Before step 8 can publish the crate, execute the exact five retained raw
+   Before crossing the immutable remote boundary, execute the exact five retained raw
    binaries on their target runtimes. Archive inspection, file-format checks,
    cross-compilation success, and executing only the controller's Linux binary
    are not substitutes. Linux AMD64 runs natively. The audited Linux ARM64 leg
    runs explicitly through `qemu-aarch64` plus the selected ARM64 sysroot on the
    configured x86_64 host and is labeled `qemu-emulated`; it is not presented
    as hardware-native. The macOS x86_64 leg runs under Rosetta explicitly,
-   while the macOS ARM64 leg runs natively. Every remote directory and local
-   receipt is unique and retained; these commands intentionally perform no
-   cleanup.
+   while the macOS ARM64 leg runs natively. Each attempt receives a fresh UUID,
+   remote directory, and local evidence directory. A failed attempt is retained
+   intact and never reused. The controller makes at most three attempts in this
+   shell and promotes a proof only after one attempt produces exactly five
+   successful receipts; these commands intentionally perform no cleanup.
 
    ```bash
    set -euo pipefail
-   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+   verify_operator_tools
 
-   smoke_unix_raw_binary() {
+   run_target_runtime_smoke_attempt() (
+     set -euo pipefail
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     case "$attempt_dir" in
+       "$MANUAL_RELEASE_STATE_DIR"/target-smoke-"$attempt_id") ;;
+       *) exit 2 ;;
+     esac
+     verify_operator_tools
+
+     smoke_unix_raw_binary() {
      local label="$1"
      local host="$2"
      local raw_name="$3"
-     local qemu_sysroot="${4:-}"
+     # OpenSSH does not reliably preserve an empty final argument.  Use an
+     # explicit sentinel so the remote positional contract always has five
+     # arguments and remains checkable under `set -u`.
+     local qemu_sysroot="${4:-not-applicable}"
      local raw_path="$RAW_RELEASE_DIR/$raw_name"
      local expected_sha remote_dir receipt receipt_label
      [[ "$label" =~ ^(linux|darwin)-(amd64|arm64)$ ]]
@@ -2379,16 +2768,16 @@ proof is not proof of an empty bypass list.
        select(test("^[0-9a-f]{64}$"))
      ' "$raw_manifest")"
      test "$(sha256sum "$raw_path" | awk '{print $1}')" = "$expected_sha"
-     remote_dir="pi-agent-rust-${RELEASE_TAG}-${DSR_BUILD_RUN_ID}-${label}"
+     remote_dir="pi-agent-rust-${RELEASE_TAG}-${DSR_BUILD_RUN_ID}-${attempt_id}-${label}"
      [[ "$remote_dir" =~ ^[A-Za-z0-9._-]+$ ]]
      receipt_label="$label"
      if test "$label" = linux-arm64; then
        receipt_label="linux-arm64-qemu-emulated"
        test "$qemu_sysroot" = "$LINUX_ARM64_QEMU_SYSROOT"
      else
-       test -z "$qemu_sysroot"
+       test "$qemu_sysroot" = not-applicable
      fi
-     receipt="$MANUAL_RELEASE_STATE_DIR/smoke-${receipt_label}.txt"
+     receipt="$attempt_dir/smoke-${receipt_label}.txt"
      test ! -e "$receipt"
 
      ssh "$host" sh -s -- "$remote_dir" <<'REMOTE'
@@ -2417,6 +2806,12 @@ proof is not proof of an empty bypass list.
    host_arch="$(uname -m)"
    qemu_version="not-applicable"
    emulated_uname="not-applicable"
+
+   if test "$label" = linux-arm64; then
+     test "$qemu_sysroot" != not-applicable
+   else
+     test "$qemu_sysroot" = not-applicable
+   fi
 
    case "$label" in
      linux-amd64)
@@ -2513,12 +2908,12 @@ proof is not proof of an empty bypass list.
    ' "$raw_manifest")"
    test -f "$windows_raw" && test ! -L "$windows_raw" && test -s "$windows_raw"
    test "$(sha256sum "$windows_raw" | awk '{print $1}')" = "$windows_expected_sha"
-   windows_remote_dir="pi-agent-rust-${RELEASE_TAG}-${DSR_BUILD_RUN_ID}-windows-amd64"
+   windows_remote_dir="pi-agent-rust-${RELEASE_TAG}-${DSR_BUILD_RUN_ID}-${attempt_id}-windows-amd64"
    [[ "$windows_remote_dir" =~ ^[A-Za-z0-9._-]+$ ]]
-   windows_setup_ps="$MANUAL_RELEASE_STATE_DIR/windows-smoke-setup.ps1"
-   windows_smoke_ps="$MANUAL_RELEASE_STATE_DIR/windows-smoke-run.ps1"
-   windows_setup_receipt="$MANUAL_RELEASE_STATE_DIR/windows-smoke-setup.txt"
-   windows_receipt="$MANUAL_RELEASE_STATE_DIR/smoke-windows-amd64.txt"
+   windows_setup_ps="$attempt_dir/windows-smoke-setup.ps1"
+   windows_smoke_ps="$attempt_dir/windows-smoke-run.ps1"
+   windows_setup_receipt="$attempt_dir/windows-smoke-setup.txt"
+   windows_receipt="$attempt_dir/smoke-windows-amd64.txt"
    test ! -e "$windows_setup_ps" && test ! -e "$windows_smoke_ps"
    test ! -e "$windows_setup_receipt" && test ! -e "$windows_receipt"
    WINDOWS_REMOTE_DIR="$windows_remote_dir" \
@@ -2581,32 +2976,190 @@ proof is not proof of an empty bypass list.
    (set -C; ssh "$WINDOWS_AMD64_SMOKE_HOST" \
      powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -Command - < "$windows_setup_ps" > "$windows_setup_receipt" 2>&1)
-   grep -Fq 'status=ready' "$windows_setup_receipt"
+   test "$(tr -d '\r' < "$windows_setup_receipt" |
+     grep -Fxc 'status=ready')" = 1
    scp -- "$windows_raw" \
      "${WINDOWS_AMD64_SMOKE_HOST}:${windows_remote_dir}/pi.exe"
    (set -C; ssh "$WINDOWS_AMD64_SMOKE_HOST" \
      powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
        -Command - < "$windows_smoke_ps" > "$windows_receipt" 2>&1)
-   grep -Fq 'status=success' "$windows_receipt"
-   grep -Fq 'label=windows-amd64' "$windows_receipt"
-   grep -Fq "sha256=$windows_expected_sha" "$windows_receipt"
+   test "$(tr -d '\r' < "$windows_receipt" |
+     grep -Fxc 'status=success')" = 1
+   test "$(tr -d '\r' < "$windows_receipt" |
+     grep -Fxc 'label=windows-amd64')" = 1
+   test "$(tr -d '\r' < "$windows_receipt" |
+     grep -Fxc "sha256=$windows_expected_sha")" = 1
 
    SMOKE_RECEIPTS=(
-     "$MANUAL_RELEASE_STATE_DIR/smoke-linux-amd64.txt"
-     "$MANUAL_RELEASE_STATE_DIR/smoke-linux-arm64-qemu-emulated.txt"
-     "$MANUAL_RELEASE_STATE_DIR/smoke-darwin-amd64.txt"
-     "$MANUAL_RELEASE_STATE_DIR/smoke-darwin-arm64.txt"
-     "$MANUAL_RELEASE_STATE_DIR/smoke-windows-amd64.txt"
+     "$attempt_dir/smoke-linux-amd64.txt"
+     "$attempt_dir/smoke-linux-arm64-qemu-emulated.txt"
+     "$attempt_dir/smoke-darwin-amd64.txt"
+     "$attempt_dir/smoke-darwin-arm64.txt"
+     "$attempt_dir/smoke-windows-amd64.txt"
    )
    test "${#SMOKE_RECEIPTS[@]}" = 5
    for smoke_receipt in "${SMOKE_RECEIPTS[@]}"; do
      test -f "$smoke_receipt" && test ! -L "$smoke_receipt" \
        && test -s "$smoke_receipt"
-     test "$(grep -Fc 'status=success' "$smoke_receipt")" = 1
+     test "$(tr -d '\r' < "$smoke_receipt" |
+       grep -Fxc 'status=success')" = 1
    done
-   sha256sum "${SMOKE_RECEIPTS[@]}" \
-     > "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+   (set -C; sha256sum "${SMOKE_RECEIPTS[@]}" \
+     > "$attempt_dir/target-runtime-smokes.sha256")
+   test "$(wc -l < "$attempt_dir/target-runtime-smokes.sha256" | tr -d '[:space:]')" = 5
+   sha256sum --check --strict "$attempt_dir/target-runtime-smokes.sha256"
+   (set -C; printf \
+     'attempt_id=%s\nproof_sha256=%s\nstate=exact\n' \
+     "$attempt_id" \
+     "$(sha256sum "$attempt_dir/target-runtime-smokes.sha256" | awk '{print $1}')" \
+     > "$attempt_dir/target-runtime-smokes-success.txt")
+   )
+
+   smoke_attempt_limit=3
+   smoke_attempt_index=0
+   successful_smoke_attempt_id=
+   successful_smoke_attempt_dir=
+   smoke_attempt_status=1
+   while test "$smoke_attempt_index" -lt "$smoke_attempt_limit"; do
+     smoke_attempt_index=$((smoke_attempt_index + 1))
+     SMOKE_ATTEMPT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+     [[ "$SMOKE_ATTEMPT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     smoke_attempt_dir="$MANUAL_RELEASE_STATE_DIR/target-smoke-$SMOKE_ATTEMPT_ID"
+     test ! -e "$smoke_attempt_dir" && test ! -L "$smoke_attempt_dir"
+     mkdir -m 700 "$smoke_attempt_dir"
+
+     run_target_runtime_smoke_attempt \
+       "$SMOKE_ATTEMPT_ID" "$smoke_attempt_dir" &
+     smoke_attempt_pid=$!
+     set +e
+     wait "$smoke_attempt_pid"
+     smoke_attempt_status=$?
+     set -e
+     if test "$smoke_attempt_status" -eq 0; then
+       attempt_smoke_proof="$smoke_attempt_dir/target-runtime-smokes.sha256"
+       test -f "$attempt_smoke_proof" && test ! -L "$attempt_smoke_proof"
+       test "$(wc -l < "$attempt_smoke_proof" | tr -d '[:space:]')" = 5
+       sha256sum --check --strict "$attempt_smoke_proof"
+       attempt_smoke_success="$smoke_attempt_dir/target-runtime-smokes-success.txt"
+       test -f "$attempt_smoke_success" && test ! -L "$attempt_smoke_success" \
+         && test -s "$attempt_smoke_success"
+       test "$(grep -Fxc "attempt_id=$SMOKE_ATTEMPT_ID" \
+         "$attempt_smoke_success")" = 1
+       test "$(grep -Fxc 'state=exact' "$attempt_smoke_success")" = 1
+       test "$(grep -Fxc \
+         "proof_sha256=$(sha256sum "$attempt_smoke_proof" | awk '{print $1}')" \
+         "$attempt_smoke_success")" = 1
+       successful_smoke_attempt_id="$SMOKE_ATTEMPT_ID"
+       successful_smoke_attempt_dir="$smoke_attempt_dir"
+       break
+     fi
+
+     (set -C; printf \
+       'attempt_id=%s\nattempt_index=%s\nsmoke_exit=%s\nstate=unresolved\n' \
+       "$SMOKE_ATTEMPT_ID" "$smoke_attempt_index" "$smoke_attempt_status" \
+       > "$smoke_attempt_dir/target-runtime-smokes-unresolved.txt")
+   done
+
+   test "$smoke_attempt_status" -eq 0
+   test -n "$successful_smoke_attempt_id"
+   test -d "$successful_smoke_attempt_dir" \
+     && test ! -L "$successful_smoke_attempt_dir"
+   successful_attempt_smoke_proof="$successful_smoke_attempt_dir/target-runtime-smokes.sha256"
+   canonical_smoke_proof="$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+   test ! -e "$canonical_smoke_proof" && test ! -L "$canonical_smoke_proof"
+   (set -C; cat "$successful_attempt_smoke_proof" > "$canonical_smoke_proof")
+   cmp "$successful_attempt_smoke_proof" "$canonical_smoke_proof"
+   test "$(wc -l < "$canonical_smoke_proof" | tr -d '[:space:]')" = 5
+   sha256sum --check --strict "$canonical_smoke_proof"
+   smoke_success_receipt="$MANUAL_RELEASE_STATE_DIR/target-runtime-smoke-success.txt"
+   test ! -e "$smoke_success_receipt" && test ! -L "$smoke_success_receipt"
+   (set -C; printf \
+     'attempt_id=%s\nattempt_dir=%s\nproof_sha256=%s\nstate=exact\n' \
+     "$successful_smoke_attempt_id" "$successful_smoke_attempt_dir" \
+     "$(sha256sum "$canonical_smoke_proof" | awk '{print $1}')" \
+     > "$smoke_success_receipt")
+
+   reconcile_post_boundary_attempt() (
+     set -euo pipefail
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     local smoke_proof="$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+     local smoke_receipt="$MANUAL_RELEASE_STATE_DIR/target-runtime-smoke-success.txt"
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     case "$attempt_dir" in
+       "$MANUAL_RELEASE_STATE_DIR"/post-boundary-"$attempt_id") ;;
+       *) exit 2 ;;
+     esac
+     verify_operator_tools
+     test -f "$smoke_receipt" && test ! -L "$smoke_receipt" \
+       && test -s "$smoke_receipt"
+     test "$(grep -Fxc 'state=exact' "$smoke_receipt")" = 1
+     test "$(grep -Fxc \
+       "proof_sha256=$(sha256sum "$smoke_proof" | awk '{print $1}')" \
+       "$smoke_receipt")" = 1
+     sha256sum --check --strict "$smoke_proof"
+     reconcile_exact_remote_tag "$attempt_id" "$attempt_dir"
+     reconcile_exact_github_draft "$attempt_id" "$attempt_dir"
+     verify_exact_release true "draft-${attempt_id}"
+     test -f "$attempt_dir/remote-tag-reconciliation.txt" \
+       && test ! -L "$attempt_dir/remote-tag-reconciliation.txt"
+     test -f "$attempt_dir/github-draft-reconciliation.txt" \
+       && test ! -L "$attempt_dir/github-draft-reconciliation.txt"
+     (set -C; printf 'attempt_id=%s\nstate=exact\n' "$attempt_id" \
+       > "$attempt_dir/post-boundary-reconciliation.txt")
+   )
+
+   # This is the first irreversible remote mutation. Every reversible package,
+   # archive, and target-runtime check is complete. Each retry receives a fresh
+   # append-only attempt directory, then adopts only byte-identical state.
+   POST_BOUNDARY_ATTEMPT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   export POST_BOUNDARY_ATTEMPT_ID
+   [[ "$POST_BOUNDARY_ATTEMPT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+   post_boundary_attempt_dir="$MANUAL_RELEASE_STATE_DIR/post-boundary-$POST_BOUNDARY_ATTEMPT_ID"
+   test ! -e "$post_boundary_attempt_dir" && test ! -L "$post_boundary_attempt_dir"
+   mkdir -m 700 "$post_boundary_attempt_dir"
+   post_boundary_reconcile_status=0
+   set +e
+   (
+     set -euo pipefail
+     reconcile_post_boundary_attempt \
+       "$POST_BOUNDARY_ATTEMPT_ID" "$post_boundary_attempt_dir"
+   )
+   post_boundary_reconcile_status=$?
+   set -e
+   if test "$post_boundary_reconcile_status" -eq 0; then
+     post_boundary_success_receipt="$post_boundary_attempt_dir/post-boundary-reconciliation.txt"
+     test -f "$post_boundary_success_receipt" \
+       && test ! -L "$post_boundary_success_receipt" \
+       && test -s "$post_boundary_success_receipt"
+     test "$(grep -Fxc "attempt_id=$POST_BOUNDARY_ATTEMPT_ID" \
+       "$post_boundary_success_receipt")" = 1
+     test "$(grep -Fxc 'state=exact' "$post_boundary_success_receipt")" = 1
+   else
+     (set -C; printf \
+       'attempt_id=%s\nreconciliation_exit=%s\nstate=unresolved\n' \
+       "$POST_BOUNDARY_ATTEMPT_ID" "$post_boundary_reconcile_status" \
+       > "$post_boundary_attempt_dir/post-boundary-unresolved.txt")
+     printf '%s\n' \
+       'tag/draft reconciliation is unresolved; retained all attempt state' >&2
+   fi
    ```
+
+   If a network/API command fails or its response is lost after this boundary
+   while the controlling fail-fast shell remains alive, preserve the same
+   private checkout, `MANUAL_RELEASE_STATE_DIR`, local tag, package proof, raw
+   binaries, artifacts, smoke receipts, and release body. Do not restart steps
+   1–7, create a different body, or delete partial remote state. In that same
+   shell, choose a new UUID/attempt directory and rerun only the boundary block
+   beginning with `POST_BOUNDARY_ATTEMPT_ID=...`. The foreground subshell
+   retains fail-fast behavior while the parent captures its status without
+   putting the reconciler in a Bash conditional. The tag reconciler requires
+   the exact annotated object and peeled commit; the draft reconciler requires
+   the exact tag/target/title/body/state and adopts an asset only after
+   downloading and comparing its bytes. This is the sole authorized retry
+   path. If the controlling shell terminates, stop: this runbook does not
+   provide a standalone post-boundary resume bootstrap.
 
 8. On the clean publisher checkout at the exact tagged commit, materialize and
    preserve the checksum-gated Cargo credential provider from the frozen
@@ -2617,9 +3170,17 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
+   test "$post_boundary_reconcile_status" -eq 0
+   post_boundary_success_receipt="$post_boundary_attempt_dir/post-boundary-reconciliation.txt"
+   test -f "$post_boundary_success_receipt" \
+     && test ! -L "$post_boundary_success_receipt" \
+     && test -s "$post_boundary_success_receipt"
+   test "$(grep -Fxc "attempt_id=$POST_BOUNDARY_ATTEMPT_ID" \
+     "$post_boundary_success_receipt")" = 1
+   test "$(grep -Fxc 'state=exact' "$post_boundary_success_receipt")" = 1
    test "$(git rev-parse 'HEAD^{commit}')" = "$expected_source_commit"
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
-   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
    smoke_proof="$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
    test -f "$smoke_proof" && test ! -L "$smoke_proof"
    test "$(wc -l < "$smoke_proof" | tr -d '[:space:]')" = 5
@@ -2631,7 +3192,7 @@ proof is not proof of an empty bypass list.
    (set -C; git show \
      "$expected_source_commit:.github/workflows/release.yml" > "$frozen_workflow")
    test "$(sha256sum "$frozen_workflow" | awk '{print $1}')" = \
-     b90f193d5eff25ea2809d1f78fd51a0e5b9d941f3240579ac97bb6d54a36fb59
+     df6b169fd80b34fb219154bb4255cf574b6a5130a504c60a1b192607aac3f2fd
    FROZEN_WORKFLOW="$frozen_workflow" PROVIDER_PATH="$provider" python3 - <<'PY'
    import os
    from pathlib import Path
@@ -2673,6 +3234,7 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   verify_operator_tools
    PROVIDER_PATH="$provider" \
    SELF_TEST_DIR="$MANUAL_RELEASE_STATE_DIR" \
    PACKAGE_VERSION="$RELEASE_VERSION" \
@@ -2747,37 +3309,69 @@ proof is not proof of an empty bypass list.
    ```
 
    Recreate the package on this isolated publisher path and match the source
-   proof before reading the token. Then force both Cargo credential settings to
-   the reviewed provider at command-line precedence. The provider supplies the
+   proof before exposing the captured token to any subprocess. Then force both
+   Cargo credential settings to the reviewed provider at command-line
+   precedence. The provider supplies the
    token for Cargo's canonical crates.io read request without creating a
    publication receipt. For a publish request, it supplies the token and writes
    the receipt only when Cargo itself presents the exact crate name, version,
-   registry, and SHA-256.
+   registry, and SHA-256. Every build and dry-run happens before the real token
+   enters any subprocess environment. The real publish therefore uses
+   `--no-verify`:
+   Cargo's default publish verification builds the packaged source, and any
+   package or dependency build script would otherwise inherit the token. The
+   checksum-gated provider still proves that Cargo is uploading the exact crate
+   bytes already built and verified without the secret.
 
    ```bash
    set -euo pipefail
-   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+   verify_operator_tools
    sha256sum --check --strict \
      "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
    verify_exact_release true immediately-before-crates-publication
    manifest_abs="$(realpath Cargo.toml)"
+   publisher_home="$MANUAL_RELEASE_STATE_DIR/publisher-home"
    publisher_cargo_home="$MANUAL_RELEASE_STATE_DIR/publisher-cargo-home"
    publisher_cwd="$MANUAL_RELEASE_STATE_DIR/publisher-cwd"
    publisher_target_dir="$MANUAL_RELEASE_STATE_DIR/publisher-target"
-   test ! -e "$publisher_cargo_home" && test ! -e "$publisher_cwd"
+   publisher_tmp_dir="$MANUAL_RELEASE_STATE_DIR/publisher-tmp"
+   test ! -e "$publisher_home" && test ! -L "$publisher_home"
+   test ! -e "$publisher_cargo_home" && test ! -L "$publisher_cargo_home"
+   test ! -e "$publisher_cwd" && test ! -L "$publisher_cwd"
    test ! -e "$publisher_target_dir" && test ! -L "$publisher_target_dir"
+   test ! -e "$publisher_tmp_dir" && test ! -L "$publisher_tmp_dir"
    mkdir -m 700 \
-     "$publisher_cargo_home" "$publisher_cwd" "$publisher_target_dir"
-   (set -C; printf 'publisher_cargo_home=%s\npublisher_cwd=%s\npublisher_target_dir=%s\n' \
-     "$publisher_cargo_home" "$publisher_cwd" "$publisher_target_dir" \
+     "$publisher_home" "$publisher_cargo_home" "$publisher_cwd" \
+     "$publisher_target_dir" "$publisher_tmp_dir"
+   (set -C; printf \
+     'publisher_home=%s\npublisher_cargo_home=%s\npublisher_cwd=%s\npublisher_target_dir=%s\npublisher_tmp_dir=%s\n' \
+     "$publisher_home" "$publisher_cargo_home" "$publisher_cwd" \
+     "$publisher_target_dir" "$publisher_tmp_dir" \
      > "$MANUAL_RELEASE_STATE_DIR/publisher-paths.txt")
-   (
-     cd "$publisher_cwd"
-     env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
+   publisher_env() {
+     env -i \
+       PATH="$PATH" \
+       HOME="$publisher_home" \
        CARGO_HOME="$publisher_cargo_home" \
        CARGO_TARGET_DIR="$publisher_target_dir" \
-       cargo publish --manifest-path "$manifest_abs" --dry-run --locked \
-         --registry crates-io
+       TMPDIR="$publisher_tmp_dir" \
+       XDG_CACHE_HOME="$publisher_home/.cache" \
+       XDG_CONFIG_HOME="$publisher_home/.config" \
+       XDG_DATA_HOME="$publisher_home/.local/share" \
+       RUSTUP_TOOLCHAIN="$RUSTUP_TOOLCHAIN" \
+       RCH_CARGO_WRAPPER_BYPASS="$RCH_CARGO_WRAPPER_BYPASS" \
+       GIT_CONFIG_GLOBAL=/dev/null \
+       GIT_CONFIG_NOSYSTEM=1 \
+       LANG=C.UTF-8 LC_ALL=C.UTF-8 TZ=UTC TERM=dumb NO_COLOR=1 \
+       RUST_BACKTRACE=1 CARGO_TERM_COLOR=never \
+       USER="${USER:-release}" LOGNAME="${LOGNAME:-${USER:-release}}" \
+       "$@"
+   }
+   publisher_env cargo --version >/dev/null
+   (
+     cd "$publisher_cwd"
+     publisher_env cargo publish --manifest-path "$manifest_abs" \
+       --dry-run --locked --registry crates-io
    )
    publisher_crate="$publisher_target_dir/package/pi_agent_rust-${RELEASE_VERSION}.crate"
    test -f "$publisher_crate" && test ! -L "$publisher_crate"
@@ -2786,21 +3380,19 @@ proof is not proof of an empty bypass list.
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
    test "$(sha256sum "$provider" | awk '{print $1}')" = "$provider_sha256"
 
-   registry_credential_config="$(PROVIDER_PATH="$provider" python3 - <<'PY'
+   registry_credential_config="$(publisher_env PROVIDER_PATH="$provider" python3 - <<'PY'
    import json, os
    print("registry.credential-provider=" + json.dumps(os.environ["PROVIDER_PATH"]))
    PY
    )"
-   named_credential_config="$(PROVIDER_PATH="$provider" python3 - <<'PY'
+   named_credential_config="$(publisher_env PROVIDER_PATH="$provider" python3 - <<'PY'
    import json, os
    print("registries.crates-io.credential-provider=" + json.dumps(os.environ["PROVIDER_PATH"]))
    PY
    )"
    actual_registry_provider="$(
      cd "$publisher_cwd"
-     env -u PI_CRATES_IO_RELEASE_TOKEN -u CARGO_REGISTRY_TOKEN \
-       -u CARGO_REGISTRIES_CRATES_IO_TOKEN CARGO_HOME="$publisher_cargo_home" \
-       cargo -Z unstable-options config get registry.credential-provider \
+     publisher_env cargo -Z unstable-options config get registry.credential-provider \
          --format=json-value \
          --config 'registry.credential-provider="/bin/false"' \
          --config "$registry_credential_config" \
@@ -2809,9 +3401,7 @@ proof is not proof of an empty bypass list.
    )"
    actual_named_provider="$(
      cd "$publisher_cwd"
-     env -u PI_CRATES_IO_RELEASE_TOKEN -u CARGO_REGISTRY_TOKEN \
-       -u CARGO_REGISTRIES_CRATES_IO_TOKEN CARGO_HOME="$publisher_cargo_home" \
-       cargo -Z unstable-options config get registries.crates-io.credential-provider \
+     publisher_env cargo -Z unstable-options config get registries.crates-io.credential-provider \
          --format=json-value \
          --config 'registry.credential-provider="/bin/false"' \
          --config "$registry_credential_config" \
@@ -2820,6 +3410,45 @@ proof is not proof of an empty bypass list.
    )"
    test "$(jq -er '.' <<<"$actual_registry_provider")" = "$provider"
    test "$(jq -er '.' <<<"$actual_named_provider")" = "$provider"
+
+   publish_exact_crate_with_scoped_token() {
+     local credential_receipt="$1"
+     local controller_token="$release_crates_io_token"
+     [[ -n "$controller_token" ]]
+     (( ${#controller_token} <= 4096 ))
+     case "$controller_token" in *$'\n'*|*$'\r'*) return 2 ;; esac
+     builtin export -n controller_token
+
+     # Keep the real token out of argv and the controller environment. The
+     # left side is a Bash builtin writing to an anonymous pipe. The clean
+     # publisher child reads exactly one validated line, exports it only for
+     # Cargo's final process image, replaces stdin with /dev/null so Cargo
+     # cannot consume credential bytes, and then execs the no-verify upload.
+     builtin printf '%s\n' "$controller_token" |
+       publisher_env \
+         PI_EXPECTED_CRATE_NAME=pi_agent_rust \
+         PI_EXPECTED_CRATE_VERSION="$RELEASE_VERSION" \
+         PI_EXPECTED_CRATE_SHA256="$expected_crate_sha256" \
+         PI_CREDENTIAL_RECEIPT="$credential_receipt" \
+         "$release_bash_path" --noprofile --norc -c '
+           set -euo pipefail
+           [[ -z "${PI_CRATES_IO_RELEASE_TOKEN:-}" ]]
+           IFS= read -r scoped_release_token
+           [[ -n "$scoped_release_token" ]]
+           (( ${#scoped_release_token} <= 4096 ))
+           case "$scoped_release_token" in *$'"'"'\n'"'"'*|*$'"'"'\r'"'"'*) exit 2 ;; esac
+           export PI_CRATES_IO_RELEASE_TOKEN="$scoped_release_token"
+           unset scoped_release_token
+           exec 0</dev/null
+           cd "$1"
+           shift
+           exec cargo publish --manifest-path "$1" --locked --no-verify \
+             --registry crates-io \
+             --config "$2" \
+             --config "$3"
+         ' bash "$publisher_cwd" "$manifest_abs" \
+           "$registry_credential_config" "$named_credential_config"
+   }
 
    precrate_ruleset="$MANUAL_RELEASE_STATE_DIR/pre-crates-publication-ruleset.json"
    test ! -e "$precrate_ruleset"
@@ -2835,65 +3464,15 @@ proof is not proof of an empty bypass list.
      ([.rules[].type] | index("deletion")) != null and
      (.bypass_actors | type) == "array" and .bypass_actors == []
    ' "$precrate_ruleset" >/dev/null
-   verify_workflow_baseline_unchanged immediately-before-crates-publication
 
-   actual_receipt="$MANUAL_RELEASE_STATE_DIR/pi-crates-credential-receipt.json"
-   test ! -e "$actual_receipt"
-   test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = "$expected_crate_sha256"
-   test -z "${PI_CRATES_IO_RELEASE_TOKEN:-}"
-   test -n "$release_crates_io_token"
-   PI_CRATES_IO_RELEASE_TOKEN="$release_crates_io_token"
-   unset release_crates_io_token
-   export PI_CRATES_IO_RELEASE_TOKEN
-   trap 'unset PI_CRATES_IO_RELEASE_TOKEN' EXIT
-   set +e
-   (
-     cd "$publisher_cwd"
-     env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
-       CARGO_HOME="$publisher_cargo_home" \
-       CARGO_TARGET_DIR="$publisher_target_dir" \
-       PI_EXPECTED_CRATE_NAME=pi_agent_rust \
-       PI_EXPECTED_CRATE_VERSION="$RELEASE_VERSION" \
-       PI_EXPECTED_CRATE_SHA256="$expected_crate_sha256" \
-       PI_CREDENTIAL_RECEIPT="$actual_receipt" \
-       cargo publish --manifest-path "$manifest_abs" --locked \
-         --registry crates-io \
-         --config "$registry_credential_config" \
-         --config "$named_credential_config"
-   )
-   cargo_status=$?
-   set -e
-   unset PI_CRATES_IO_RELEASE_TOKEN
-   trap - EXIT
-   test -f "$publisher_crate" && test ! -L "$publisher_crate"
-   test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = \
-     "$expected_crate_sha256"
-   test "$(wc -c < "$publisher_crate" | tr -d '[:space:]')" = \
-     "$expected_crate_size"
-   test -f "$actual_receipt" && test ! -L "$actual_receipt"
-   jq -e \
-     --arg version "$RELEASE_VERSION" \
-     --arg sha "$expected_crate_sha256" '
-     .schema == "pi.release.cargo_credential_receipt.v1" and
-     .name == "pi_agent_rust" and .version == $version and
-     .crate_sha256 == $sha and .registry_name == "crates-io" and
-     (.registry_index_url == "sparse+https://index.crates.io/" or
-      .registry_index_url == "https://github.com/rust-lang/crates.io-index")
-   ' "$actual_receipt" >/dev/null
-   printf 'cargo_publish_exit=%s\ncredential_receipt_sha256=%s\n' \
-     "$cargo_status" "$(sha256sum "$actual_receipt" | awk '{print $1}')" \
-     >> "$proof_file"
-   ```
-
-   A nonzero Cargo exit is not success, but it can be an ambiguous network
-   result. In every case, the following exact crates.io reconciliation is the
-   authority. It must observe the non-yanked canonical name/version and exact
-   checksum before GitHub publication; otherwise stop.
-
-   ```bash
-   set -euo pipefail
-   PACKAGE_VERSION="$RELEASE_VERSION" \
-   CRATE_SHA256="$expected_crate_sha256" python3 - <<'PY'
+   record_exact_crates_state() {
+     local output="$1"
+     local max_attempts="$2"
+     test ! -e "$output" && test ! -L "$output"
+     [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]]
+     OUTPUT="$output" MAX_ATTEMPTS="$max_attempts" \
+       PACKAGE_VERSION="$RELEASE_VERSION" \
+       CRATE_SHA256="$expected_crate_sha256" python3 - <<'PY'
    import json
    import os
    import re
@@ -2901,130 +3480,300 @@ proof is not proof of an empty bypass list.
    import urllib.error
    import urllib.parse
    import urllib.request
+   from pathlib import Path
+
+   MAX_RESPONSE_BYTES = 1024 * 1024
+
+   def strict_object(pairs):
+       result = {}
+       for key, value in pairs:
+           if key in result:
+               raise SystemExit(f"duplicate crates.io response key: {key!r}")
+           result[key] = value
+       return result
 
    endpoint = (
        "https://crates.io/api/v1/crates/pi_agent_rust/"
        + urllib.parse.quote(os.environ["PACKAGE_VERSION"], safe="")
    )
-   version = None
-   for attempt in range(60):
+   max_attempts = int(os.environ["MAX_ATTEMPTS"])
+   state = "absent"
+   for attempt in range(1, max_attempts + 1):
        request = urllib.request.Request(
            endpoint,
-           headers={"Accept": "application/json", "User-Agent": "pi-agent-rust-manual-release"},
+           headers={
+               "Accept": "application/json",
+               "User-Agent": "pi-agent-rust-manual-release",
+           },
        )
        try:
            with urllib.request.urlopen(request, timeout=30) as response:
-               body = response.read(1024 * 1024 + 1)
+               body = response.read(MAX_RESPONSE_BYTES + 1)
        except urllib.error.HTTPError as exc:
            if exc.code != 404:
                raise
        else:
-           if len(body) > 1024 * 1024:
+           if len(body) > MAX_RESPONSE_BYTES:
                raise SystemExit("crates.io response exceeds 1 MiB")
-           payload = json.loads(body)
+           payload = json.loads(body, object_pairs_hook=strict_object)
            version = payload.get("version") if isinstance(payload, dict) else None
-           if version is not None:
-               break
-       if attempt != 59:
+           if not isinstance(version, dict) \
+               or version.get("crate") != "pi_agent_rust" \
+               or version.get("num") != os.environ["PACKAGE_VERSION"] \
+               or version.get("yanked") is not False \
+               or version.get("checksum") != os.environ["CRATE_SHA256"] \
+               or re.fullmatch(r"[0-9a-f]{64}", version.get("checksum", "")) is None:
+               raise SystemExit(
+                   "existing crates.io version identity/checksum/yank state differs"
+               )
+           state = "exact"
+           break
+       if attempt != max_attempts:
            time.sleep(5)
-   if not isinstance(version, dict) or version.get("crate") != "pi_agent_rust" \
-       or version.get("num") != os.environ["PACKAGE_VERSION"] \
-       or version.get("yanked") is not False \
-       or version.get("checksum") != os.environ["CRATE_SHA256"] \
-       or re.fullmatch(r"[0-9a-f]{64}", version.get("checksum", "")) is None:
-       raise SystemExit("crates.io did not reconcile to the exact verified crate")
+   receipt = {
+       "schema": "pi.release.crates_reconciliation.v1",
+       "state": state,
+       "attempts": attempt,
+       "name": "pi_agent_rust",
+       "version": os.environ["PACKAGE_VERSION"],
+       "expected_checksum": os.environ["CRATE_SHA256"],
+   }
+   with Path(os.environ["OUTPUT"]).open("x", encoding="utf-8") as handle:
+       json.dump(receipt, handle, indent=2, sort_keys=True)
+       handle.write("\n")
    PY
+   }
+
+   reconcile_exact_crates_publication() {
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     local before_state after_state actual_receipt
+     local cargo_status=not-run receipt_sha256=not-applicable post_attempts=1
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     case "$attempt_dir" in
+       "$MANUAL_RELEASE_STATE_DIR"/crates-"$attempt_id") ;;
+       *) exit 2 ;;
+     esac
+     verify_operator_tools
+     verify_exact_release true "before-crates-${attempt_id}"
+     sha256sum --check --strict \
+       "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+     test -f "$publisher_crate" && test ! -L "$publisher_crate"
+     test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = \
+       "$expected_crate_sha256"
+     test "$(wc -c < "$publisher_crate" | tr -d '[:space:]')" = \
+       "$expected_crate_size"
+     test "$(sha256sum "$provider" | awk '{print $1}')" = "$provider_sha256"
+
+     before_state="$attempt_dir/crates-before.json"
+     record_exact_crates_state "$before_state" 1
+     if ! jq -e '.state == "exact"' "$before_state" >/dev/null; then
+       jq -e '.state == "absent"' "$before_state" >/dev/null
+       actual_receipt="$attempt_dir/pi-crates-credential-receipt.json"
+       test ! -e "$actual_receipt"
+       test -z "${PI_CRATES_IO_RELEASE_TOKEN:-}"
+       test -n "${release_crates_io_token:-}"
+       set +e
+       (
+         set -euo pipefail
+         publish_exact_crate_with_scoped_token "$actual_receipt"
+       )
+       cargo_status=$?
+       set -e
+       if test -e "$actual_receipt"; then
+         test -f "$actual_receipt" && test ! -L "$actual_receipt"
+         jq -e \
+           --arg version "$RELEASE_VERSION" \
+           --arg sha "$expected_crate_sha256" '
+           .schema == "pi.release.cargo_credential_receipt.v1" and
+           .name == "pi_agent_rust" and .version == $version and
+           .crate_sha256 == $sha and .registry_name == "crates-io" and
+           (.registry_index_url == "sparse+https://index.crates.io/" or
+            .registry_index_url == "https://github.com/rust-lang/crates.io-index")
+         ' "$actual_receipt" >/dev/null
+         receipt_sha256="$(sha256sum "$actual_receipt" | awk '{print $1}')"
+       else
+         test "$cargo_status" -ne 0
+       fi
+       post_attempts=60
+     fi
+
+     # Cargo's exit status can be ambiguous. The authoritative registry read is
+     # the authority. A retry always performs that read before it can expose the
+     # token or issue another publish request.
+     after_state="$attempt_dir/crates-after.json"
+     record_exact_crates_state "$after_state" "$post_attempts"
+     jq -e '.state == "exact"' "$after_state" >/dev/null
+     (set -C; printf \
+       'attempt_id=%s\ncargo_publish_exit=%s\ncredential_receipt_sha256=%s\nregistry_state=exact\n' \
+       "$attempt_id" "$cargo_status" "$receipt_sha256" \
+       > "$attempt_dir/crates-publication-reconciliation.txt")
+   }
+
+   CRATES_ATTEMPT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   export CRATES_ATTEMPT_ID
+   [[ "$CRATES_ATTEMPT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+   crates_attempt_dir="$MANUAL_RELEASE_STATE_DIR/crates-$CRATES_ATTEMPT_ID"
+   test ! -e "$crates_attempt_dir" && test ! -L "$crates_attempt_dir"
+   mkdir -m 700 "$crates_attempt_dir"
+   crates_reconcile_status=0
+   set +e
+   (
+     set -euo pipefail
+     reconcile_exact_crates_publication \
+       "$CRATES_ATTEMPT_ID" "$crates_attempt_dir"
+   )
+   crates_reconcile_status=$?
+   set -e
+   if test "$crates_reconcile_status" -eq 0; then
+     successful_crates_receipt="$crates_attempt_dir/crates-publication-reconciliation.txt"
+     test -f "$successful_crates_receipt" \
+       && test ! -L "$successful_crates_receipt" \
+       && test -s "$successful_crates_receipt"
+     test "$(grep -Fxc "attempt_id=$CRATES_ATTEMPT_ID" \
+       "$successful_crates_receipt")" = 1
+     test "$(grep -Fxc 'registry_state=exact' \
+       "$successful_crates_receipt")" = 1
+     unset release_crates_io_token
+   else
+     (set -C; printf \
+       'attempt_id=%s\nreconciliation_exit=%s\nregistry_state=unresolved\n' \
+       "$CRATES_ATTEMPT_ID" "$crates_reconcile_status" \
+       > "$crates_attempt_dir/crates-publication-unresolved.txt")
+     printf '%s\n' \
+       'crates.io publication is unresolved; retained state and token for reconciliation' \
+       >&2
+   fi
    ```
 
-9. Make GitHub public last. Immediately before the PATCH, re-check the unchanged
-   current-day workflow run-ID set and fixed 32-day run-attempt ledger, immutable tag
-   rule, tag object/target, exact
-   draft ID/state/title/body/prerelease, all 12 names and bytes, retained runtime
-   receipts, and the crates.io checksum. PATCH by the recorded release database
-   ID, then repeat the exact release verifier immediately afterward.
+   If Cargo or the crates.io query has an ambiguous failure, retain the exact
+   publisher crate, provider, draft release, and state directory. Do not infer
+   publication from Cargo's exit code and do not blindly rerun `cargo publish`.
+   The foreground subshell remains fail-fast while the parent captures its
+   status and deliberately leaves the shell alive and the
+   token in its non-exported variable when reconciliation is unresolved. Choose
+   a fresh `CRATES_ATTEMPT_ID`/attempt directory and run the same block again.
+   The reconciler adopts an already-present exact non-yanked checksum before
+   reading the token; a conflicting registry identity or checksum is a
+   permanent stop. Do not continue to step 9 unless
+   `crates_reconcile_status=0` and the successful attempt receipt exists.
+   If the controlling shell terminates after any immutable remote mutation,
+   stop this lane: retained receipts are diagnostic evidence, not a standalone
+   resume bootstrap, and publication must not be reconstructed by copying
+   isolated commands from this document.
+
+9. Make GitHub public last. Immediately before publication reconciliation,
+   re-check the immutable tag rule, tag object/peeled target, exact release
+   ID/state/title/body/prerelease,
+   all 12 names and bytes, retained runtime receipts, and the crates.io checksum.
+   If the retained release is still a draft, PATCH by the recorded database ID;
+   if an earlier PATCH response was lost but the exact release is already public,
+   adopt it without sending another PATCH. In both cases, repeat the exact verifier.
 
    ```bash
    set -euo pipefail
-   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
-   sha256sum --check --strict \
-     "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
-   prepublic_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-before-publication.json"
-   prepublic_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-before-publication.txt"
-   test ! -e "$prepublic_workflows" && test ! -e "$prepublic_workflow_ids"
-   gh api --paginate -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-     | jq -s '(.[0].total_count // -1) as $reported |
-       [.[].workflow_runs[]] as $runs |
-       {reported_total_count: $reported,
-        page_total_counts_consistent: all(.[]; .total_count == $reported),
-        total_count: ($runs | length), workflow_runs: $runs}' \
-     > "$prepublic_workflows"
-   jq -e '
-     (.reported_total_count | type) == "number" and
-     .reported_total_count == .total_count and
-     .page_total_counts_consistent == true and
-     (.total_count | type) == "number" and .total_count > 0 and
-     .total_count == (.workflow_runs | length) and
-     all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
-     ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
-   ' "$prepublic_workflows" >/dev/null
-   (set -C; jq -r '.workflow_runs[].id' "$prepublic_workflows" \
-     | LC_ALL=C sort -n > "$prepublic_workflow_ids")
-   cmp "$WORKFLOW_BASELINE_IDS" "$prepublic_workflow_ids"
-   verify_workflow_baseline_unchanged immediately-before-publication
-   prepublic_ruleset="$MANUAL_RELEASE_STATE_DIR/pre-public-ruleset.json"
-   test ! -e "$prepublic_ruleset"
-   gh api -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/rulesets/${immutable_ruleset_id}?includes_parents=true" \
-     > "$prepublic_ruleset"
-   jq -e '
-     .target == "tag" and .enforcement == "active" and
-     ((.conditions.ref_name.include | index("refs/tags/v*")) != null or
-      (.conditions.ref_name.include | index("~ALL")) != null) and
-     .conditions.ref_name.exclude == [] and
-     ([.rules[].type] | index("update")) != null and
-     ([.rules[].type] | index("deletion")) != null and
-     (.bypass_actors | type) == "array" and .bypass_actors == []
-   ' "$prepublic_ruleset" >/dev/null
+   verify_operator_tools
+   test "$crates_reconcile_status" -eq 0
+   successful_crates_receipt="$crates_attempt_dir/crates-publication-reconciliation.txt"
+   test -f "$successful_crates_receipt" && test ! -L "$successful_crates_receipt" \
+     && test -s "$successful_crates_receipt"
+   test "$(grep -Fxc 'registry_state=exact' "$successful_crates_receipt")" = 1
 
-   verify_exact_release true immediately-before-publication
-   registry_checksum="$(curl -fsS -A 'pi-agent-rust-manual-release' \
-     "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
-     | jq -er --arg version "$RELEASE_VERSION" '
-       select(.version.crate == "pi_agent_rust" and
-              .version.num == $version and .version.yanked == false and
-              (.version.checksum | test("^[0-9a-f]{64}$"))) |
-       .version.checksum')"
-   test "$registry_checksum" = "$expected_crate_sha256"
+   reconcile_final_publication_attempt() (
+     set -euo pipefail
+     local attempt_id="$1"
+     local attempt_dir="$2"
+     local crates_receipt="$3"
+     local prepublic_ruleset registry_checksum post_registry_checksum
+     local github_receipt github_receipt_sha256
+     [[ "$attempt_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+     test -d "$attempt_dir" && test ! -L "$attempt_dir"
+     case "$attempt_dir" in
+       "$MANUAL_RELEASE_STATE_DIR"/publication-"$attempt_id") ;;
+       *) exit 2 ;;
+     esac
+     verify_operator_tools
+     test -f "$crates_receipt" && test ! -L "$crates_receipt" \
+       && test -s "$crates_receipt"
+     test "$(grep -Fxc 'registry_state=exact' "$crates_receipt")" = 1
+     sha256sum --check --strict \
+       "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+     prepublic_ruleset="$attempt_dir/pre-public-ruleset.json"
+     test ! -e "$prepublic_ruleset"
+     gh api -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/rulesets/${immutable_ruleset_id}?includes_parents=true" \
+       > "$prepublic_ruleset"
+     jq -e '
+       .target == "tag" and .enforcement == "active" and
+       ((.conditions.ref_name.include | index("refs/tags/v*")) != null or
+        (.conditions.ref_name.include | index("~ALL")) != null) and
+       .conditions.ref_name.exclude == [] and
+       ([.rules[].type] | index("update")) != null and
+       ([.rules[].type] | index("deletion")) != null and
+       (.bypass_actors | type) == "array" and .bypass_actors == []
+     ' "$prepublic_ruleset" >/dev/null
 
-   public_payload="$MANUAL_RELEASE_STATE_DIR/github-public-payload.json"
-   public_response="$MANUAL_RELEASE_STATE_DIR/github-public-response.json"
-   test ! -e "$public_payload" && test ! -e "$public_response"
-   jq -n \
-     --arg tag "$RELEASE_TAG" \
-     --arg title "$RELEASE_TAG" \
-     --rawfile body "$release_body" \
-     '{tag_name: $tag, name: $title,
-       body: $body, draft: false, prerelease: false}' \
-     > "$public_payload"
-   gh api --method PATCH \
-     -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
-     --input "$public_payload" > "$public_response"
-   jq -e \
-     --argjson id "$release_id" \
-     --arg tag "$RELEASE_TAG" \
-     --arg target "$expected_source_commit" \
-     --rawfile body "$release_body" \
-     '.id == $id and .draft == false and .prerelease == false and
-      .tag_name == $tag and .target_commitish == $target and
-      .name == $tag and .body == $body' \
-   "$public_response" >/dev/null
-   verify_exact_release false immediately-after-publication
-   verify_workflow_baseline_unchanged immediately-after-publication
-   test "$(curl -fsS -A 'pi-agent-rust-manual-release' \
-     "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
-     | jq -er '.version.checksum')" = "$expected_crate_sha256"
+     registry_checksum="$(curl -fsS -A 'pi-agent-rust-manual-release' \
+       "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
+       | jq -er --arg version "$RELEASE_VERSION" '
+         select(.version.crate == "pi_agent_rust" and
+                .version.num == $version and .version.yanked == false and
+                (.version.checksum | test("^[0-9a-f]{64}$"))) |
+         .version.checksum')"
+     test "$registry_checksum" = "$expected_crate_sha256"
+     reconcile_exact_github_publication "$attempt_id" "$attempt_dir"
+     post_registry_checksum="$(curl -fsS -A 'pi-agent-rust-manual-release' \
+       "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
+       | jq -er --arg version "$RELEASE_VERSION" '
+         select(.version.crate == "pi_agent_rust" and
+                .version.num == $version and .version.yanked == false and
+                (.version.checksum | test("^[0-9a-f]{64}$"))) |
+         .version.checksum')"
+     test "$post_registry_checksum" = "$expected_crate_sha256"
+     github_receipt="$attempt_dir/github-publication-reconciliation.txt"
+     test -f "$github_receipt" && test ! -L "$github_receipt" \
+       && test -s "$github_receipt"
+     test "$(grep -Fxc "attempt_id=$attempt_id" "$github_receipt")" = 1
+     github_receipt_sha256="$(sha256sum "$github_receipt" | awk '{print $1}')"
+     (set -C; printf \
+       'attempt_id=%s\ngithub_receipt_sha256=%s\nregistry_checksum=%s\nstate=exact\n' \
+       "$attempt_id" "$github_receipt_sha256" "$post_registry_checksum" \
+       > "$attempt_dir/publication-attempt-success.txt")
+   )
+
+   PUBLICATION_ATTEMPT_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   export PUBLICATION_ATTEMPT_ID
+   [[ "$PUBLICATION_ATTEMPT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
+   publication_attempt_dir="$MANUAL_RELEASE_STATE_DIR/publication-$PUBLICATION_ATTEMPT_ID"
+   test ! -e "$publication_attempt_dir" && test ! -L "$publication_attempt_dir"
+   mkdir -m 700 "$publication_attempt_dir"
+   publication_reconcile_status=0
+   set +e
+   (
+     set -euo pipefail
+     reconcile_final_publication_attempt \
+       "$PUBLICATION_ATTEMPT_ID" "$publication_attempt_dir" \
+       "$successful_crates_receipt"
+   )
+   publication_reconcile_status=$?
+   set -e
+   if test "$publication_reconcile_status" -eq 0; then
+     publication_success_receipt="$publication_attempt_dir/publication-attempt-success.txt"
+     test -f "$publication_success_receipt" \
+       && test ! -L "$publication_success_receipt" \
+       && test -s "$publication_success_receipt"
+     test "$(grep -Fxc "attempt_id=$PUBLICATION_ATTEMPT_ID" \
+       "$publication_success_receipt")" = 1
+     test "$(grep -Fxc 'state=exact' "$publication_success_receipt")" = 1
+   else
+     (set -C; printf \
+       'attempt_id=%s\nreconciliation_exit=%s\nstate=unresolved\n' \
+       "$PUBLICATION_ATTEMPT_ID" "$publication_reconcile_status" \
+       > "$publication_attempt_dir/publication-attempt-unresolved.txt")
+     printf '%s\n' \
+       'GitHub publication is unresolved; retained all attempt state' >&2
+   fi
    ```
 
    All provider code, its frozen-workflow source, hashes, self-test receipts,
@@ -3035,23 +3784,37 @@ proof is not proof of an empty bypass list.
    hash, duplicate/extra asset, metadata drift, mismatched byte, or unexpected
    public state is a stop condition.
 
-10. Verify the now-public installer path from an isolated home, confirm
-    crates.io still serves the exact non-yanked version/checksum, and prove the
-    current-day GitHub Actions run-ID set plus fixed 32-day `(run ID, run_attempt)`
-    ledger are byte-for-byte identical to their pre-release baselines. This is
-    installer and publication verification, not
-    the first binary smoke: all five exact binaries already executed in step 7
-    and their retained receipt hashes must still pass. Workflow run statuses
-    may evolve, but a new run ID or incremented run attempt is a stop condition.
-    Do not dispatch or rerun a workflow to obtain evidence and do not recapture
-    either baseline.
+   If the PATCH or its verification query has an ambiguous failure, retain the
+   same release identity receipt, body, artifacts, tag, crates.io proof, and
+   state directory. Choose a fresh `PUBLICATION_ATTEMPT_ID`/attempt directory
+   and rerun only this step. The foreground subshell remains fail-fast while
+   its parent captures the status and retains an unresolved receipt.
+   The reconciler verifies the current state first,
+   sends PATCH only for the exact retained draft, and adopts an already-public
+   release only after the full metadata, remote tag, inventory, and byte checks
+   pass. It never deletes, replaces, or moves remote state.
+
+10. Verify the now-public installer path from an isolated home and confirm
+    crates.io still serves the exact non-yanked version/checksum. This is
+    installer and publication verification, not the first binary smoke: all
+    five exact binaries already executed in step 7 and their retained receipt
+    hashes must still pass. This manual lane neither reads from nor writes to
+    GitHub Actions.
 
     ```bash
     set -euo pipefail
-    test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+    verify_operator_tools
+    test "$publication_reconcile_status" -eq 0
+    publication_success_receipt="$publication_attempt_dir/publication-attempt-success.txt"
+    test -f "$publication_success_receipt" \
+      && test ! -L "$publication_success_receipt" \
+      && test -s "$publication_success_receipt"
+    test "$(grep -Fxc "attempt_id=$PUBLICATION_ATTEMPT_ID" \
+      "$publication_success_receipt")" = 1
+    test "$(grep -Fxc 'state=exact' "$publication_success_receipt")" = 1
     sha256sum --check --strict "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
 
-    public_download_dir="$MANUAL_RELEASE_STATE_DIR/github-assets-immediately-after-publication"
+    public_download_dir="$MANUAL_RELEASE_STATE_DIR/github-assets-after-public-${PUBLICATION_ATTEMPT_ID}"
     public_installer="$public_download_dir/install.sh"
     test -f "$public_installer" && test ! -L "$public_installer" \
       && test -s "$public_installer"
@@ -3062,21 +3825,35 @@ proof is not proof of an empty bypass list.
     test ! -e "$installer_receipt"
     mkdir -m 700 \
       "$installer_root" "$installer_root/home" "$installer_root/state" \
-      "$installer_root/bin"
+      "$installer_root/bin" "$installer_root/tmp"
+    installer_lock="$installer_root/install.lock.d"
+    test ! -e "$installer_lock" && test ! -L "$installer_lock"
     (set -C; \
       HOME="$installer_root/home" \
       XDG_STATE_HOME="$installer_root/state" \
+      TMPDIR="$installer_root/tmp" \
+      PI_INSTALLER_RETAIN_TEMP=1 \
+      PI_INSTALLER_LOCK_DIR="$installer_lock" \
       AGENT_SKILLS_ENABLED=0 \
       bash "$public_installer" \
         --yes --version "$RELEASE_TAG" --dest "$installer_root/bin" \
         --verify --no-gum --no-completions --no-agent-skills \
         > "$installer_receipt" 2>&1)
+    test -d "$installer_lock" && test ! -L "$installer_lock"
+    test -f "$installer_lock/pid" && test ! -L "$installer_lock/pid"
+    test "$(find "$installer_root/tmp" -mindepth 1 -maxdepth 1 -type d |
+      wc -l | tr -d '[:space:]')" -ge 1
+    grep -F 'Retaining installer temporary directory:' \
+      "$installer_receipt" >/dev/null
+    grep -F "Retaining installer lock directory: $installer_lock" \
+      "$installer_receipt" >/dev/null
     installer_state="$installer_root/state/pi-agent-rust/install-state.env"
     test -f "$installer_state" && test ! -L "$installer_state"
     (
       set -euo pipefail
       # This state file was produced by the exact downloaded installer whose
       # bytes were compared above; source it only inside the isolated subshell.
+      # shellcheck disable=SC1090
       source "$installer_state"
       test "$PIAR_INSTALL_VERSION" = "$RELEASE_TAG"
       test "$PIAR_INSTALL_SOURCE" = release
@@ -3095,30 +3872,6 @@ proof is not proof of an empty bypass list.
     ) >> "$installer_receipt"
     grep -Fx 'post_public_installer_status=success' "$installer_receipt" >/dev/null
 
-    postrelease_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-after-release.json"
-    postrelease_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-after-release.txt"
-    test ! -e "$postrelease_workflows" && test ! -e "$postrelease_workflow_ids"
-    gh api --paginate -H 'Accept: application/vnd.github+json' \
-      "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-      | jq -s '(.[0].total_count // -1) as $reported |
-        [.[].workflow_runs[]] as $runs |
-        {reported_total_count: $reported,
-         page_total_counts_consistent: all(.[]; .total_count == $reported),
-         total_count: ($runs | length), workflow_runs: $runs}' \
-      > "$postrelease_workflows"
-    jq -e '
-      (.reported_total_count | type) == "number" and
-      .reported_total_count == .total_count and
-      .page_total_counts_consistent == true and
-      (.total_count | type) == "number" and .total_count > 0 and
-      .total_count == (.workflow_runs | length) and
-      all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
-      ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
-    ' "$postrelease_workflows" >/dev/null
-    (set -C; jq -r '.workflow_runs[].id' "$postrelease_workflows" \
-      | LC_ALL=C sort -n > "$postrelease_workflow_ids")
-    cmp "$WORKFLOW_BASELINE_IDS" "$postrelease_workflow_ids"
-    verify_workflow_baseline_unchanged after-post-public-installer
     curl -fsS -A 'pi-agent-rust-manual-release' \
       "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
       | jq -e \
@@ -3165,10 +3918,8 @@ For branches opened before this gate was introduced:
 - The selected publication lane has its own complete proof:
   - automated lane: CI is green on `main` (Linux/macOS/Windows), and the
     protected automated release-governance gate is satisfied
-  - manual/no-Actions lane: every fail-fast manual gate above is green, the
-    current-day workflow run-ID set and fixed 32-day `(run ID, run_attempt)` ledger
-    remain identical to their original baselines, and no workflow was dispatched
-    or rerun to manufacture evidence
+  - manual/no-Actions lane: every fail-fast manual gate above is green and no
+    workflow was queried, dispatched, rerun, canceled, or used as evidence
 - Local gates are green:
   - `cargo fmt --check`
   - `cargo check --locked --all-targets --features internal-legacy-capture`

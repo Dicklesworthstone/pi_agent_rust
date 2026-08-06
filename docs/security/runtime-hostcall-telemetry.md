@@ -91,5 +91,7 @@ Only hashes are emitted:
 - Deserialization is backward-readable via serde defaults for additive fields.
 
 Coverage is enforced by unit + integration tests in:
-- `src/extensions.rs` runtime-risk test section
+- `src/extensions/tests/core.rs` hostcall feature-classification tests
+- `src/extensions/tests/reactor.rs` runtime telemetry recording tests
+- `src/extensions/tests/shared_dispatch.rs` feature-vector and telemetry-schema tests
 - `tests/e2e_runtime_risk_telemetry.rs`

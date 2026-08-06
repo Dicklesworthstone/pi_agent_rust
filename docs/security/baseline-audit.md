@@ -5,6 +5,14 @@
 > **Author:** Claude Opus agent
 > **Date:** 2026-02-14
 > **Cross-reference:** [SEC-1.1 Threat Model](threat-model.md) (bd-3jyg8)
+>
+> **Coordinate scope:** Every numeric source-line coordinate below is a
+> 2026-02-14 audit snapshot, not a current line-number contract. After the
+> extension decomposition, the stable façade and shared dispatch remain in
+> `src/extensions.rs`; hostcall validation lives in
+> `src/extensions/protocol.rs`; manager risk/ledger methods live in
+> `src/extensions/extension_manager_impl.rs`; and the filesystem connector
+> implementation lives in `src/extensions/fs_connector.rs`.
 
 ---
 
@@ -28,8 +36,9 @@ informational design asymmetries.
 Every finding in this audit references a concrete code path (file, line number,
 function name). Findings were produced by:
 
-1. Reading all security-relevant source files (`extensions.rs`, `extensions_js.rs`,
-   `tools.rs`, `providers/mod.rs`, `agent.rs`, `config.rs`, `permissions.rs`).
+1. Reading all security-relevant source files (`extensions.rs`, its
+   `extensions/` implementation modules, `extensions_js.rs`, `tools.rs`,
+   `providers/mod.rs`, `agent.rs`, `config.rs`, `permissions.rs`).
 2. Tracing every hostcall from JS entry point through policy check to connector dispatch.
 3. Comparing each control surface with the equivalent Node.js/Bun ambient model.
 4. Classifying gaps using the threat IDs from [SEC-1.1](threat-model.md) (T1-T8).
@@ -43,7 +52,7 @@ and running the existing test suite (`cargo test` targets referenced inline).
 
 ### 3.1 Capability-Gated Hostcall Dispatch
 
-**Code:** `src/extensions.rs` lines 7229-7355
+**Code (2026-02-14 snapshot):** `src/extensions.rs` lines 7229-7355
 **Function:** `dispatch_host_call_shared()`
 
 Every JS-to-Rust call flows through a single chokepoint:
@@ -74,7 +83,7 @@ exercised without policy evaluation.
 
 ### 3.2 Policy Profiles
 
-**Code:** `src/extensions.rs` lines 1370-1484
+**Code (2026-02-14 snapshot):** `src/extensions.rs` lines 1370-1484
 **Functions:** `PolicyProfile::to_policy()`, `ExtensionPolicy::default()`
 
 | Profile | Mode | Default Caps | Denied Caps | Unknown Caps |
@@ -221,7 +230,7 @@ from URLs are all available with no interposition.
 
 ### 3.8 Audit Ledger
 
-**Code:** `src/extensions.rs` lines 1549-1572, 3643-3700
+**Code (2026-02-14 snapshot):** `src/extensions.rs` lines 1549-1572, 3643-3700
 
 **Runtime risk ledger** — append-only, hash-chained:
 
@@ -249,7 +258,7 @@ verify/replay helpers exist for forensic analysis.
 
 ### 3.9 Capability Requirement Mapping
 
-**Code:** `src/extensions.rs` lines 1954-2016
+**Code (2026-02-14 snapshot):** `src/extensions.rs` lines 1954-2016
 **Function:** `required_capability_for_host_call_static()`
 
 | Method | Sub-operation | Required Capability |
@@ -274,7 +283,7 @@ lower-privilege capability to bypass policy.
 
 ### 3.10 Runtime Risk Controller
 
-**Code:** `src/extensions.rs` lines 1486-1573, 1671+
+**Code (2026-02-14 snapshot):** `src/extensions.rs` lines 1486-1573, 1671+
 
 | Setting | Default | Purpose |
 |---------|---------|---------|
@@ -311,7 +320,8 @@ prediction residuals, and hash-chained evidence.
 
 **Severity:** Medium
 **Threat ID:** T3 (Dangerous Capability Misconfiguration)
-**Location:** `src/extensions.rs` line ~2220
+**Location (2026-02-14 snapshot):** `src/extensions.rs` line ~2220
+**Current owner:** `src/extensions/fs_connector.rs` (`FsConnector` implementation)
 
 **Current code:**
 ```rust
@@ -331,7 +341,7 @@ connector path.
 **Status:** Fixed. `FsConnector` threads `extension_id` through policy evaluation
 and enforces per-extension overrides.
 
-**Test:** `cargo test extensions::tests::fs_connector_respects_per_extension_deny`
+**Test:** `cargo test extensions::tests::core::fs_connector_respects_per_extension_deny`
 (added).
 
 ---
@@ -439,7 +449,7 @@ Linux pattern can be adapted using platform-specific fd path resolution).
 
 **Severity:** Low
 **Threat ID:** T7 (Persistent Over-Grant)
-**Location:** `src/extensions.rs` lines 8118-8278
+**Location (2026-02-14 snapshot):** `src/extensions.rs` lines 8118-8278
 
 **Current design:** A single `"session"` capability gates all session operations:
 `get_state`, `get_messages`, `set_name`, `set_model`, `set_label`, etc.
@@ -464,7 +474,7 @@ backward compatibility.
 
 **Severity:** Informational
 **Threat ID:** T4 (Runtime Abuse)
-**Location:** `src/extensions.rs` line 1507
+**Location (2026-02-14 snapshot):** `src/extensions.rs` line 1507
 
 **Current default:** `enabled: false`
 

@@ -85,13 +85,17 @@ Extension loader + compatibility scanner
 - Shared hostcall dispatcher and policy gate:
   `dispatch_host_call_shared` in `src/extensions.rs`
 - Runtime risk scoring, action selection, and evidence recording:
-  `evaluate_runtime_risk` and `record_runtime_risk_outcome` in `src/extensions.rs`
+  `evaluate_runtime_risk` and `record_runtime_risk_outcome` in
+  `src/extensions/extension_manager_impl.rs`
 - Hash-chained runtime risk ledger and replay/tamper checks:
-  `runtime_risk_push_ledger` plus verify/replay helpers in `src/extensions.rs`
+  `runtime_risk_push_ledger` and manager verify/replay methods in
+  `src/extensions/extension_manager_impl.rs`, with artifact hash/verify/replay
+  helpers in `src/extensions.rs`
 - JS hostcall capability derivation and canonical params hashing:
   `HostcallRequest::required_capability` and `HostcallRequest::params_hash` in `src/extensions_js.rs`
 - Extension compatibility scanner (forbidden/flagged APIs):
-  `CompatibilityScanner` in `src/extensions.rs`
+  public `CompatibilityScanner` type in `src/extensions.rs`, with its scanner
+  implementation in `src/extensions/compatibility.rs`
 - Environment variable blocklist for extension reads:
   `is_env_var_allowed` in `src/extensions_js.rs`
 - Persisted capability decisions and version-scoped grants:
@@ -224,7 +228,7 @@ Controls:
 - Static rules for forbidden builtins and suspicious dynamic APIs.
 
 Code:
-- `src/extensions.rs` (`CompatibilityScanner`, forbidden/flagged rules).
+- `src/extensions/compatibility.rs` (`CompatibilityScanner` implementation and forbidden/flagged rules).
 
 Residual risk:
 - Obfuscation/minification may evade simple lexical detectors; mitigated by runtime policy/risk layers.
@@ -273,7 +277,7 @@ Controls:
 - Quarantine behavior after repeated unsafe outcomes.
 
 Code:
-- `src/extensions.rs` (`evaluate_runtime_risk`, `record_runtime_risk_outcome`).
+- `src/extensions/extension_manager_impl.rs` (`evaluate_runtime_risk`, `record_runtime_risk_outcome`).
 
 Residual risk:
 - Controller sensitivity/specificity tuning is ongoing; requires WS6 calibration evidence.
@@ -337,7 +341,7 @@ Controls (current + planned):
 
 Code / Tracking:
 - Lock/provenance pipeline in `src/package_manager.rs` and docs in `docs/packages.md`.
-- Existing scanner in `src/extensions.rs`.
+- Existing scanner implementation in `src/extensions/compatibility.rs`.
 - Remaining follow-on tracked in `bd-21nj4`.
 
 Residual risk:
@@ -411,13 +415,13 @@ I7: Policy and risk decisions are observable through structured logs.
 
 | Threat | Deterministic test evidence (current) | Intent |
 |---|---|---|
-| T1 forbidden imports/APIs | `src/extensions.rs::compatibility_scanner_ignores_commented_patterns`; `src/extensions.rs::compatibility_scanner_still_reports_live_code_with_nearby_comments`; `src/extensions.rs::compatibility_scanner_keeps_late_requires_in_minified_lines` | Scanner catches live risky patterns and avoids comment false positives |
-| T2 capability mismatch | `src/extensions.rs::required_capability_for_host_call_maps_tools_and_fs_ops`; `tests/extensions_policy_negative.rs::hostcall_exec_maps_to_exec_capability`; `tests/extensions_policy_negative.rs::hostcall_unknown_method_returns_none` | Hostcall mapping is authoritative and rejects ambiguous methods |
+| T1 forbidden imports/APIs | `src/extensions/compatibility.rs::compatibility_scanner_ignores_commented_patterns`; `src/extensions/compatibility.rs::compatibility_scanner_still_reports_live_code_with_nearby_comments`; `src/extensions/compatibility.rs::compatibility_scanner_keeps_late_requires_in_minified_lines` | Scanner catches live risky patterns and avoids comment false positives |
+| T2 capability mismatch | `src/extensions/tests/core.rs::required_capability_for_host_call_maps_tools_and_fs_ops`; `tests/extensions_policy_negative.rs::hostcall_exec_maps_to_exec_capability`; `tests/extensions_policy_negative.rs::hostcall_unknown_method_returns_none` | Hostcall mapping is authoritative and rejects ambiguous methods |
 | T3 dangerous misconfig | `src/config.rs::extension_policy_metadata_unknown_profile_falls_back_to_safe`; `tests/config_edge_cases.rs::extension_policy_unknown_profile_falls_back_to_safe`; `tests/capability_policy_scoped.rs::default_config_resolves_to_permissive` | Unknown profiles fail closed to safe, and strict mode remains explicitly selectable when permissive compatibility defaults are too broad |
-| T4 runtime abuse post-load | `src/extensions.rs::shared_dispatch_runtime_risk_hardens_exec_calls`; `src/extensions.rs::shared_dispatch_runtime_risk_quarantines_repeated_unsafe_attempts` | Deterministic runtime risk actions escalate under hostile behavior |
-| T5 decision/evidence tampering | `src/extensions.rs::shared_dispatch_runtime_risk_ledger_is_tamper_evident`; `src/extensions.rs::shared_dispatch_runtime_risk_ledger_replay_reconstructs_decision_path`; `src/extensions.rs::shared_dispatch_runtime_risk_ledger_verifies_after_ring_buffer_truncation` | Hash chain detects tamper and replay is deterministic even with truncation |
-| T6 env secret exfiltration | `src/extensions_js.rs::pijs_env_get_honors_allowlist`; `src/extensions.rs::wasm_host_env_denied_by_policy_even_when_allowlisted`; `tests/extensions_policy_negative.rs::deny_caps_env_denied_in_all_modes` | Secret reads require allowlist and capability gate alignment |
-| T7 persistent over-grant | `src/extensions.rs::js_hostcall_prompt_mode_asks_once_per_capability`; `src/extensions.rs::js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params`; `src/permissions.rs::record_and_lookup` | Prompt decisions are cached per capability and persisted deterministically |
+| T4 runtime abuse post-load | `src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_hardens_exec_calls`; `src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_quarantines_repeated_unsafe_attempts` | Deterministic runtime risk actions escalate under hostile behavior |
+| T5 decision/evidence tampering | `src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_ledger_is_tamper_evident`; `src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_ledger_replay_reconstructs_decision_path`; `src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_ledger_verifies_after_ring_buffer_truncation` | Hash chain detects tamper and replay is deterministic even with truncation |
+| T6 env secret exfiltration | `src/extensions_js.rs::pijs_env_get_honors_allowlist`; `src/extensions/wasm_host.rs::wasm_host_env_denied_by_policy_even_when_allowlisted`; `tests/extensions_policy_negative.rs::deny_caps_env_denied_in_all_modes` | Secret reads require allowlist and capability gate alignment |
+| T7 persistent over-grant | `src/extensions/tests/core.rs::js_hostcall_prompt_mode_asks_once_per_capability`; `src/extensions/tests/core.rs::js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params`; `src/permissions.rs::record_and_lookup` | Prompt decisions are cached per capability and persisted deterministically |
 | T8 provenance/update drift | `tests/ext_provenance_verification.rs::provenance_verification_evidence_log`; `tests/ext_conformance_artifacts.rs` checksum/corpus validation suite | Artifact drift is detectable via deterministic provenance checks |
 
 ### 13.2 E2E Security Evidence Contract

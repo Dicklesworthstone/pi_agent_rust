@@ -33,6 +33,18 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   `pi::providers::static_registry_models` returns `Result<Vec<String>>` so
   malformed, unsafe, or resource-exceeding local catalog data cannot be
   mistaken for a valid empty fallback.
+- **Fetched-catalog persistence is provenance-bearing** — the public
+  `persist_provider_model_catalog` API now accepts a `ProviderModelCatalog`
+  rather than arbitrary provider/model rows, and that catalog's fields are
+  private with read-only accessors. The generated on-disk schema advances from
+  `pi.models.fetched.v1` to `pi.models.fetched.v2`. Pi preserves v1 bytes;
+  move `models.fetched.json` aside first, then run a verified live
+  `--fetch-models <provider> --refresh-models --persist-models` refresh to
+  create the v2 catalog.
+- **Runtime credentials now outrank `models.json` credentials** — explicit,
+  ambient, stored, or external-provider credentials are used before a
+  provider route's `apiKey`; the route value is now a fallback. Live catalog
+  discovery and inference therefore use the same credential precedence.
 
 ### Features
 
@@ -50,11 +62,20 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   the built-in catalog includes GPT-5.6 Sol, Terra, and Luna seeds.
 - **Live provider catalogs are usable outside the TUI** — `--fetch-models`
   prints model IDs and exits, `--refresh-models` requires a genuine live
-  response, and `--persist-models` atomically records only successful fetched
-  provider/model IDs in `models.fetched.json`. The generated catalog feeds
-  future `--list-models` and interactive model pickers without rewriting or
-  overriding hand-authored `models.json`. Fixes
+  response, and `--persist-models` atomically records only verified live or
+  same-process-cache results in `models.fetched.json`. Persisted provider/model
+  membership carries a fetch timestamp and non-secret endpoint/transport
+  fingerprint that excludes credential, URL-query, and header values; rows are
+  ignored with an actionable error if the current route shape no longer
+  matches, while credential rotation remains valid. Separate CLI invocations
+  start with an empty in-memory cache. The generated catalog feeds future
+  `--list-models` and interactive model pickers without rewriting or overriding
+  hand-authored `models.json`. Fixes
   [#150](https://github.com/Dicklesworthstone/pi_agent_rust/issues/150).
+- **Retired GitHub Models routing removed** — the `github-models` preset and
+  dead upstream autocomplete rows are no longer exposed after GitHub retired
+  the service on 2026-07-30. The distinct `github-copilot` native provider
+  remains supported.
 - **Injectable model credential resolution** — harnesses and SDK embedders can
   load the model registry without ambient process credentials affecting model
   availability, while production continues to use `AuthStorage`.
@@ -68,6 +89,11 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 - **File-lock ownership is identity-aware** — long-held locks refresh a
   heartbeat, stale reclaim checks ownership, and displaced owners cannot remove
   a replacement lock directory.
+- **Model-catalog filesystem policy is deterministic under root and ordinary
+  users** — reads enforce the effective Unix owner/group/other class on both
+  files and traversed directories. Generated-catalog persistence preflights
+  target and directory read/write/search access before creating directories,
+  locks, or temporary files, and rejects final symlinks without mutation.
 - **Concurrency-sensitive tests are deterministic** — RPC crash-recovery
   checkpoints, process-wide current-directory mutation, remote-worker fixtures,
   and extension memory/scanner cases now isolate their shared state.
@@ -133,6 +159,12 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Internal
 
+- Decomposed the extension monolith behind the stable `src/extensions.rs`
+  façade: manager orchestration, protocol/reactor, filesystem, exec mediation,
+  permission drift, event coalescing, native/Wasm runtime, and
+  characterization-test domains now live in focused `src/extensions/` modules
+  while public type definitions and import paths remain in the façade. Addresses
+  [#130](https://github.com/Dicklesworthstone/pi_agent_rust/issues/130).
 - Extracted the extension compatibility scanner into its own module while
   preserving the public compatibility contract and expanded the conformance,
   governance, provider, SDK, RPC, and swarm evidence suites.

@@ -14,8 +14,16 @@ being implemented, the relevant bead ID is listed for tracking.
 
 **Config precedence (most → least):**
 1. `--api-key`
-2. Provider-specific env var
-3. `auth.json` (OAuth or stored API key)
+2. Unexpired OAuth/bearer credential in `auth.json`
+3. Provider-specific environment variables, in the order declared by provider metadata
+4. Stored API key in `auth.json`
+5. Supported external coding-CLI credential (global auth storage only)
+6. Inline `models.json` provider `apiKey` fallback, when the selected model supplies one
+
+Provider-managed credentials are exceptions to the generic API-key chain:
+Bedrock resolves the AWS credential chain/SigV4 at request time, and SAP AI
+Core exchanges its client credentials for a bearer token rather than sending a
+client secret as an API token.
 
 ## Provider errors (401/429/5xx)
 

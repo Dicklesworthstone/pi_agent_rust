@@ -352,8 +352,10 @@ Run this review quarterly or after any release-process change:
    storage location are known.
 4. Trigger or inspect a non-publishing release rehearsal, preferably a
    pre-release tag or workflow dry run.
-5. Confirm the installer path verifies `SHA256SUMS` and does not require
-   `--no-verify` in published instructions.
+5. Confirm the installer path verifies `SHA256SUMS` and published install
+   commands never pass the installer's testing-only `--no-verify` flag. This is
+   distinct from the credential-scoped Cargo upload described in the release
+   runbook.
 6. File beads for any missing role, stale secret owner, failing workflow, or
    ambiguous branch-protection authority.
 

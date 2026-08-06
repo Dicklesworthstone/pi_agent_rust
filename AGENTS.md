@@ -217,7 +217,8 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 | `src/tools.rs` | 9 built-in tools (`subagent` is opt-in) |
 | `src/interactive.rs` | Interactive TUI application state and event loop |
 | `src/rpc.rs` | RPC/stdin server mode |
-| `src/extensions.rs` | Extension protocol, policy, and host integration |
+| `src/extensions.rs` | Stable extension facade, public contracts, manager state, and shared entry points |
+| `src/extensions/` | Focused manager, protocol, policy, connector, runtime, and behavior-domain test modules |
 | `src/extensions_js.rs` | QuickJS runtime bridge and hostcalls |
 | `src/resources.rs` | Skills/prompt/theme/extension resource loading |
 | `src/models.rs` | Built-in and `models.json` registry resolution |

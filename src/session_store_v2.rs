@@ -118,31 +118,162 @@ fn artifact_file_identity_matches(
 }
 
 #[cfg(windows)]
-fn reject_windows_reparse_components(path: &Path, allow_missing_tail: bool) -> Result<()> {
-    use std::os::windows::fs::MetadataExt as _;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+#[derive(Debug)]
+struct WindowsArtifactDirectoryGuard {
+    path: PathBuf,
+    identity: ArtifactFileIdentity,
+    handle: File,
+}
 
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        current.push(component.as_os_str());
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink()
-                    || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                {
-                    return Err(Error::session(format!(
-                        "session artifact path traverses a Windows reparse point: {}",
-                        current.display()
-                    )));
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && allow_missing_tail => {
-                break;
-            }
-            Err(error) => return Err(Error::Io(Box::new(error))),
+#[cfg(windows)]
+fn validate_windows_directory_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "session artifact path traverses a non-directory or Windows reparse point: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_artifact_directory_guards(
+    guards: &[WindowsArtifactDirectoryGuard],
+) -> std::io::Result<()> {
+    for guard in guards {
+        let handle_metadata = guard.handle.metadata()?;
+        let path_metadata = fs::symlink_metadata(&guard.path)?;
+        validate_windows_directory_metadata(&guard.path, &handle_metadata)?;
+        validate_windows_directory_metadata(&guard.path, &path_metadata)?;
+        if artifact_file_identity(&handle_metadata) != guard.identity
+            || artifact_file_identity(&path_metadata) != guard.identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "session artifact directory changed while it was pinned: {}",
+                    guard.path.display()
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn open_or_create_windows_artifact_directory_components(
+    path: &Path,
+    create: bool,
+) -> std::io::Result<(PathBuf, Vec<WindowsArtifactDirectoryGuard>)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::path::Component;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = PathBuf::new();
+    let mut guards = Vec::new();
+
+    for component in absolute_path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "secure session artifact paths must not contain parent components: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Component::Normal(name) => current.push(name),
+        }
+
+        let initial_metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                fs::symlink_metadata(&current)?
+            }
+            Err(error) => return Err(error),
+        };
+        validate_windows_directory_metadata(&current, &initial_metadata)?;
+        let initial_identity = artifact_file_identity(&initial_metadata);
+
+        // FILE_SHARE_DELETE is intentionally omitted. Retaining each handle pins
+        // every traversed component against rename/replacement until the caller's
+        // path-based operation has completed.
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&current)?;
+        let opened_metadata = handle.metadata()?;
+        validate_windows_directory_metadata(&current, &opened_metadata)?;
+        if artifact_file_identity(&opened_metadata) != initial_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "session artifact directory changed while it was being opened: {}",
+                    current.display()
+                ),
+            ));
+        }
+        guards.push(WindowsArtifactDirectoryGuard {
+            path: current.clone(),
+            identity: initial_identity,
+            handle,
+        });
+    }
+
+    validate_windows_artifact_directory_guards(&guards)?;
+    Ok((absolute_path, guards))
+}
+
+#[cfg(windows)]
+fn open_or_create_windows_artifact_parent(
+    path: &Path,
+    create: bool,
+) -> std::io::Result<(PathBuf, Vec<WindowsArtifactDirectoryGuard>)> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = absolute_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let (_, guards) = open_or_create_windows_artifact_directory_components(parent, create)?;
+    Ok((absolute_path, guards))
 }
 
 #[cfg(unix)]
@@ -245,7 +376,14 @@ fn open_nofollow(
 
 fn open_regular_file_for_read(path: &Path) -> Result<Option<File>> {
     #[cfg(windows)]
-    reject_windows_reparse_components(path, true)?;
+    let (operation_path, parent_guards) =
+        match open_or_create_windows_artifact_parent(path, false) {
+            Ok(context) => context,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(Error::Io(Box::new(error))),
+        };
+    #[cfg(windows)]
+    let path = operation_path.as_path();
     let initial_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -275,16 +413,19 @@ fn open_regular_file_for_read(path: &Path) -> Result<Option<File>> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
         use std::os::windows::fs::OpenOptionsExt as _;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         let file = fs::OpenOptions::new()
             .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let opened_metadata = file.metadata()?;
         reject_non_private_regular_file(path, &opened_metadata)?;
-        if initial_metadata.creation_time() != opened_metadata.creation_time() {
+        let opened_identity = artifact_file_identity(&opened_metadata);
+        if artifact_file_identity(&initial_metadata) != opened_identity {
             return Err(Error::session(format!(
                 "file changed while it was being opened: {}",
                 path.display()
@@ -292,12 +433,13 @@ fn open_regular_file_for_read(path: &Path) -> Result<Option<File>> {
         }
         let current_metadata = fs::symlink_metadata(path)?;
         reject_non_private_regular_file(path, &current_metadata)?;
-        if current_metadata.creation_time() != opened_metadata.creation_time() {
+        if artifact_file_identity(&current_metadata) != opened_identity {
             return Err(Error::session(format!(
                 "file path changed after descriptor open: {}",
                 path.display()
             )));
         }
+        validate_windows_artifact_directory_guards(&parent_guards)?;
         Ok(Some(file))
     }
 
@@ -351,9 +493,9 @@ fn validate_opened_regular_file_for_write(
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
+        let opened_identity = artifact_file_identity(&opened_metadata);
         if initial_metadata
-            .is_some_and(|metadata| metadata.creation_time() != opened_metadata.creation_time())
+            .is_some_and(|metadata| artifact_file_identity(metadata) != opened_identity)
         {
             return Err(Error::session(format!(
                 "artifact changed while it was being opened: {}",
@@ -363,7 +505,7 @@ fn validate_opened_regular_file_for_write(
         reject_non_private_regular_file(path, &opened_metadata)?;
         let current_metadata = fs::symlink_metadata(path)?;
         reject_non_private_regular_file(path, &current_metadata)?;
-        if current_metadata.creation_time() != opened_metadata.creation_time() {
+        if artifact_file_identity(&current_metadata) != opened_identity {
             return Err(Error::session(format!(
                 "artifact path changed after descriptor open: {}",
                 path.display()
@@ -380,7 +522,10 @@ fn open_regular_file_for_write(
     write_mode: ArtifactWriteMode,
 ) -> Result<File> {
     #[cfg(windows)]
-    reject_windows_reparse_components(path, create)?;
+    let (operation_path, parent_guards) =
+        open_or_create_windows_artifact_parent(path, create)?;
+    #[cfg(windows)]
+    let path = operation_path.as_path();
     let initial_metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -428,9 +573,13 @@ fn open_regular_file_for_write(
     let file = {
         use std::os::windows::fs::OpenOptionsExt as _;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         let mut options = fs::OpenOptions::new();
         options.write(true);
-        if matches!(write_mode, ArtifactWriteMode::CreateNew) {
+        if matches!(write_mode, ArtifactWriteMode::CreateNew)
+            || (create && initial_metadata.is_none())
+        {
             options.create_new(true);
         } else {
             options.create(create);
@@ -439,6 +588,7 @@ fn open_regular_file_for_write(
             options.append(true);
         }
         options
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?
     };
@@ -450,15 +600,22 @@ fn open_regular_file_for_write(
     )));
 
     validate_opened_regular_file_for_write(path, initial_metadata.as_ref(), &file)?;
+    #[cfg(windows)]
+    validate_windows_artifact_directory_guards(&parent_guards)?;
     if matches!(write_mode, ArtifactWriteMode::Replace) {
         file.set_len(0)?;
     }
     Ok(file)
 }
 
-fn open_directory_nofollow(path: &Path) -> Result<File> {
+fn open_directory_nofollow(path: &Path, create: bool) -> Result<File> {
     #[cfg(windows)]
-    reject_windows_reparse_components(path, false)?;
+    let (operation_path, component_guards) =
+        open_or_create_windows_artifact_directory_components(path, create)?;
+    #[cfg(windows)]
+    let path = operation_path.as_path();
+    #[cfg(not(windows))]
+    let _ = create;
     let initial_metadata = fs::symlink_metadata(path)?;
     if initial_metadata.file_type().is_symlink() || !initial_metadata.is_dir() {
         return Err(Error::session(format!(
@@ -476,13 +633,16 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
 
     #[cfg(windows)]
     let directory = {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?
+        component_guards
+            .last()
+            .ok_or_else(|| {
+                Error::session(format!(
+                    "session-store directory has no pinnable component: {}",
+                    path.display()
+                ))
+            })?
+            .handle
+            .try_clone()?
     };
 
     #[cfg(not(any(unix, windows)))]
@@ -509,16 +669,24 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if initial_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        {
+        validate_windows_directory_metadata(path, &initial_metadata)?;
+        validate_windows_directory_metadata(path, &opened_metadata)?;
+        let opened_identity = artifact_file_identity(&opened_metadata);
+        if artifact_file_identity(&initial_metadata) != opened_identity {
             return Err(Error::session(format!(
-                "session-store directory is a Windows reparse point: {}",
+                "session-store directory changed while opening: {}",
                 path.display()
             )));
         }
+        let current_metadata = fs::symlink_metadata(path)?;
+        validate_windows_directory_metadata(path, &current_metadata)?;
+        if artifact_file_identity(&current_metadata) != opened_identity {
+            return Err(Error::session(format!(
+                "session-store directory path changed after descriptor open: {}",
+                path.display()
+            )));
+        }
+        validate_windows_artifact_directory_guards(&component_guards)?;
     }
     Ok(directory)
 }
@@ -526,7 +694,7 @@ fn open_directory_nofollow(path: &Path) -> Result<File> {
 #[cfg(unix)]
 fn create_directory_tree_nofollow(path: &Path) -> Result<()> {
     if path_entry_exists(path)? {
-        drop(open_directory_nofollow(path)?);
+        drop(open_directory_nofollow(path, false)?);
         return Ok(());
     }
     let parent = path
@@ -537,7 +705,7 @@ fn create_directory_tree_nofollow(path: &Path) -> Result<()> {
         .file_name()
         .ok_or_else(|| Error::session(format!("directory has no filename: {}", path.display())))?;
     create_directory_tree_nofollow(parent)?;
-    let parent_directory = open_directory_nofollow(parent)?;
+    let parent_directory = open_directory_nofollow(parent, false)?;
     match rustix::fs::mkdirat(
         &parent_directory,
         name,
@@ -545,7 +713,7 @@ fn create_directory_tree_nofollow(path: &Path) -> Result<()> {
     ) {
         Ok(()) => Ok(()),
         Err(err) if std::io::Error::from(err).kind() == std::io::ErrorKind::AlreadyExists => {
-            drop(open_directory_nofollow(path)?);
+            drop(open_directory_nofollow(path, false)?);
             Ok(())
         }
         Err(err) => Err(Error::Io(Box::new(std::io::Error::from(err)))),
@@ -557,14 +725,7 @@ fn open_private_directory(path: &Path, create: bool) -> Result<File> {
     if create {
         create_directory_tree_nofollow(path)?;
     }
-    #[cfg(not(unix))]
-    if create {
-        #[cfg(windows)]
-        reject_windows_reparse_components(path, true)?;
-        fs::create_dir_all(path)?;
-    }
-
-    let directory = open_directory_nofollow(path)?;
+    let directory = open_directory_nofollow(path, create)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -581,30 +742,14 @@ fn open_private_directory(path: &Path, create: bool) -> Result<File> {
 }
 
 fn validate_private_directory_entry(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(Error::session(format!(
-            "expected a real session-store directory: {}",
-            path.display()
-        )));
-    }
+    let directory = open_directory_nofollow(path, false)?;
+    let metadata = directory.metadata()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(Error::session(format!(
                 "session-store directory has non-private permissions: {}",
-                path.display()
-            )));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(Error::session(format!(
-                "session-store directory is a Windows reparse point: {}",
                 path.display()
             )));
         }
@@ -626,6 +771,36 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
+#[cfg(all(unix, not(target_os = "redox")))]
+fn publish_regular_file_via_hard_link_no_replace(
+    source_directory: &File,
+    source_name: &std::ffi::OsStr,
+    target_directory: &File,
+    target_name: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    // linkat(2) creates the destination atomically and never replaces an
+    // existing name. Filesystems without hard-link support fail before the
+    // source is unlinked, which is the only safe fallback when renameat2-style
+    // no-replace publication is unavailable.
+    rustix::fs::linkat(
+        source_directory,
+        source_name,
+        target_directory,
+        target_name,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    target_directory.sync_all()?;
+    rustix::fs::unlinkat(
+        source_directory,
+        source_name,
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    source_directory.sync_all()?;
+    Ok(())
+}
+
 fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
     let source_file = open_regular_file_for_read(source)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", source.display())))?;
@@ -645,8 +820,17 @@ fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
     let target_name = target
         .file_name()
         .ok_or_else(|| Error::session("artifact target has no filename"))?;
+    #[cfg(unix)]
     let source_directory = open_private_directory(source_parent, false)?;
+    #[cfg(unix)]
     let target_directory = open_private_directory(target_parent, false)?;
+
+    #[cfg(windows)]
+    let (source_operation_path, source_parent_guards) =
+        open_or_create_windows_artifact_parent(source, false)?;
+    #[cfg(windows)]
+    let (target_operation_path, target_parent_guards) =
+        open_or_create_windows_artifact_parent(target, false)?;
 
     #[cfg(unix)]
     rustix::fs::renameat(
@@ -658,7 +842,13 @@ fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
     .map_err(std::io::Error::from)?;
 
     #[cfg(windows)]
-    fs::rename(source, target)?;
+    {
+        validate_windows_artifact_directory_guards(&source_parent_guards)?;
+        validate_windows_artifact_directory_guards(&target_parent_guards)?;
+        fs::rename(&source_operation_path, &target_operation_path)?;
+        validate_windows_artifact_directory_guards(&source_parent_guards)?;
+        validate_windows_artifact_directory_guards(&target_parent_guards)?;
+    }
 
     #[cfg(not(any(unix, windows)))]
     return Err(Error::session("secure artifact rename is unsupported"));
@@ -669,15 +859,20 @@ fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn rename_regular_file_no_replace(source: &Path, target: &Path) -> Result<()> {
+    rename_regular_file_no_replace_with(source, target, || Ok(()))
+}
+
+fn rename_regular_file_no_replace_with<F>(
+    source: &Path,
+    target: &Path,
+    before_publish: F,
+) -> Result<()>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
     let source_file = open_regular_file_for_read(source)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", source.display())))?;
     drop(source_file);
-    if path_entry_exists(target)? {
-        return Err(Error::session(format!(
-            "refusing to replace an existing immutable artifact: {}",
-            target.display()
-        )));
-    }
     let source_parent = source
         .parent()
         .ok_or_else(|| Error::session("artifact source has no parent directory"))?;
@@ -690,8 +885,19 @@ fn rename_regular_file_no_replace(source: &Path, target: &Path) -> Result<()> {
     let target_name = target
         .file_name()
         .ok_or_else(|| Error::session("artifact target has no filename"))?;
+    #[cfg(unix)]
     let source_directory = open_private_directory(source_parent, false)?;
+    #[cfg(unix)]
     let target_directory = open_private_directory(target_parent, false)?;
+
+    #[cfg(windows)]
+    let (source_operation_path, source_parent_guards) =
+        open_or_create_windows_artifact_parent(source, false)?;
+    #[cfg(windows)]
+    let (target_operation_path, target_parent_guards) =
+        open_or_create_windows_artifact_parent(target, false)?;
+
+    before_publish()?;
 
     #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))]
     rustix::fs::renameat_with(
@@ -707,21 +913,27 @@ fn rename_regular_file_no_replace(source: &Path, target: &Path) -> Result<()> {
         unix,
         not(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))
     ))]
-    rustix::fs::renameat(
+    publish_regular_file_via_hard_link_no_replace(
         &source_directory,
         source_name,
         &target_directory,
         target_name,
-    )
-    .map_err(std::io::Error::from)?;
+    )?;
 
     #[cfg(windows)]
-    fs::rename(source, target)?;
+    {
+        validate_windows_artifact_directory_guards(&source_parent_guards)?;
+        validate_windows_artifact_directory_guards(&target_parent_guards)?;
+        fs::hard_link(&source_operation_path, &target_operation_path)?;
+        fs::remove_file(&source_operation_path)?;
+        validate_windows_artifact_directory_guards(&source_parent_guards)?;
+        validate_windows_artifact_directory_guards(&target_parent_guards)?;
+    }
 
     #[cfg(not(any(unix, windows)))]
     return Err(Error::session("secure artifact rename is unsupported"));
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))]
     target_directory.sync_all()?;
     Ok(())
 }
@@ -736,14 +948,22 @@ fn remove_regular_file(path: &Path) -> Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| Error::session("artifact has no filename"))?;
+    #[cfg(unix)]
     let directory = open_private_directory(parent, false)?;
+
+    #[cfg(windows)]
+    let (operation_path, parent_guards) = open_or_create_windows_artifact_parent(path, false)?;
 
     #[cfg(unix)]
     rustix::fs::unlinkat(&directory, name, rustix::fs::AtFlags::empty())
         .map_err(std::io::Error::from)?;
 
     #[cfg(windows)]
-    fs::remove_file(path)?;
+    {
+        validate_windows_artifact_directory_guards(&parent_guards)?;
+        fs::remove_file(&operation_path)?;
+        validate_windows_artifact_directory_guards(&parent_guards)?;
+    }
 
     #[cfg(not(any(unix, windows)))]
     return Err(Error::session("secure artifact removal is unsupported"));

@@ -21,12 +21,12 @@ It is normative for:
 The authoritative flow is implemented in:
 
 - `Config::resolve_extension_policy_with_metadata` (`src/config.rs`)
-- `validate_host_call` (`src/extensions.rs`)
+- `validate_host_call` (`src/extensions/protocol.rs`)
 - `required_capability_for_host_call_static` (`src/extensions.rs`)
 - `ExtensionPolicy::evaluate_for` (`src/extensions.rs`)
 - `resolve_shared_policy_prompt` (`src/extensions.rs`)
 - `dispatch_host_call_shared` (`src/extensions.rs`)
-- `evaluate_runtime_risk` / `record_runtime_risk_outcome` (`src/extensions.rs`)
+- `evaluate_runtime_risk` / `record_runtime_risk_outcome` (`src/extensions/extension_manager_impl.rs`)
 
 ### 2.1 Stage A: Policy and Risk Settings Resolution
 
@@ -161,9 +161,9 @@ Embedded copy:
     {
       "id": "INV-001",
       "tests": [
-        "src/extensions.rs::required_capability_for_host_call_maps_tools_and_fs_ops",
+        "src/extensions/tests/core.rs::required_capability_for_host_call_maps_tools_and_fs_ops",
         "tests/extensions_policy_negative.rs::hostcall_exec_maps_to_exec_capability",
-        "src/extensions.rs::protocol_adapter_capability_mismatch_returns_invalid_request"
+        "src/extensions/tests/ui_protocol.rs::protocol_adapter_capability_mismatch_returns_invalid_request"
       ]
     },
     {
@@ -171,7 +171,7 @@ Embedded copy:
       "tests": [
         "tests/capability_policy_scoped.rs::empty_call_id_returns_invalid_request",
         "tests/capability_policy_scoped.rs::non_object_params_returns_invalid_request",
-        "src/extensions.rs::shared_dispatch_unsupported_method_returns_invalid_request"
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_unsupported_method_returns_invalid_request"
       ]
     },
     {
@@ -192,7 +192,7 @@ Embedded copy:
     {
       "id": "INV-005",
       "tests": [
-        "src/extensions.rs::shared_dispatch_per_extension_deny_does_not_affect_other_extensions",
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_per_extension_deny_does_not_affect_other_extensions",
         "tests/capability_policy_scoped.rs::multiple_extensions_independent_scoping"
       ]
     },
@@ -217,39 +217,39 @@ Embedded copy:
       "tests": [
         "tests/capability_policy_scoped.rs::dispatch_prompt_without_manager_falls_to_deny",
         "tests/capability_policy_scoped.rs::dispatch_prompt_with_manager_but_no_ui_sender",
-        "src/extensions.rs::shared_dispatch_ui_without_manager_returns_denied"
+        "src/extensions/tests/ui_protocol.rs::shared_dispatch_ui_without_manager_returns_denied"
       ]
     },
     {
       "id": "INV-009",
       "tests": [
-        "src/extensions.rs::shared_dispatch_runtime_risk_disabled_is_isomorphic",
-        "src/extensions.rs::shared_dispatch_runtime_risk_hardens_exec_calls",
-        "src/extensions.rs::shared_dispatch_runtime_risk_quarantines_repeated_unsafe_attempts"
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_disabled_is_isomorphic",
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_hardens_exec_calls",
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_quarantines_repeated_unsafe_attempts"
       ]
     },
     {
       "id": "INV-010",
       "tests": [
-        "src/extensions.rs::shared_dispatch_runtime_risk_ledger_is_tamper_evident",
-        "src/extensions.rs::shared_dispatch_runtime_risk_ledger_replay_reconstructs_decision_path",
-        "src/extensions.rs::shared_dispatch_runtime_risk_ledger_verifies_after_ring_buffer_truncation"
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_ledger_is_tamper_evident",
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_ledger_replay_reconstructs_decision_path",
+        "src/extensions/tests/shared_dispatch.rs::shared_dispatch_runtime_risk_ledger_verifies_after_ring_buffer_truncation"
       ]
     },
     {
       "id": "INV-011",
       "tests": [
         "src/extensions_js.rs::pijs_env_get_honors_allowlist",
-        "src/extensions.rs::wasm_host_env_requires_allowlist",
-        "src/extensions.rs::wasm_host_env_denied_by_policy_even_when_allowlisted"
+        "src/extensions/wasm_host.rs::wasm_host_env_requires_allowlist",
+        "src/extensions/wasm_host.rs::wasm_host_env_denied_by_policy_even_when_allowlisted"
       ]
     },
     {
       "id": "INV-012",
       "tests": [
-        "src/extensions.rs::hostcall_params_hash_is_stable_for_key_ordering",
-        "src/extensions.rs::hostcall_ledger_start_redacts_params_and_includes_hash",
-        "src/extensions.rs::js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params"
+        "src/extensions/tests/core.rs::hostcall_params_hash_is_stable_for_key_ordering",
+        "src/extensions/tests/core.rs::hostcall_ledger_start_redacts_params_and_includes_hash",
+        "src/extensions/tests/core.rs::js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params"
       ]
     }
   ]

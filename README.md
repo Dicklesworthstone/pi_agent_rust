@@ -301,8 +301,8 @@ For OpenAI-compatible providers, model discovery is a standalone command: it
 prints one model ID per stdout line and exits without starting the TUI.
 
 ```bash
-# Use a successful live response, the short-lived process cache, or (with a
-# warning on stderr) the static registry when live discovery is unavailable
+# Use a successful live response or (with a warning on stderr) the static
+# registry when live discovery is unavailable
 pi --fetch-models openrouter
 
 # Bypass the cache and require a genuinely live response; never fall back
@@ -313,11 +313,35 @@ pi --fetch-models openrouter --refresh-models
 pi --fetch-models openrouter --refresh-models --persist-models
 ```
 
-Persistence is opt-in and writes only provider/model IDs to
-`~/.pi/agent/models.fetched.json`. Pi never persists a static fallback or API
-credentials. The generated catalog is loaded first; your hand-written
-`~/.pi/agent/models.json` is loaded afterward and remains authoritative. Pi
-does not rewrite or merge that user-authored file.
+Each standalone CLI invocation starts a new process, so its in-memory cache is
+fresh. The five-minute cache only avoids repeat discovery calls made within one
+long-lived process by SDK/library users; `--refresh-models` bypasses that cache.
+
+Persistence is opt-in. The v2 `~/.pi/agent/models.fetched.json` schema stores
+provider/model IDs, the fetch timestamp, and a non-secret SHA-256 identity
+binding membership to the provider, API, query-free endpoint, auth-header
+mode, recognized credential-query ordered name/presence shape, and
+request-header name/presence shape that produced it. Pi never persists a static fallback, API
+credentials, URL query values, or request-header values—not even as
+offline-verifiable hashes. Credential-channel values are rotation-tolerant.
+Any non-empty query/header value outside a narrowly recognized credential
+channel may identify a tenant or deployment, so Pi refuses to persist that
+catalog (and ignores legacy persisted rows for such a current route) rather
+than reuse unverifiable membership. If a safely bound route shape no longer
+matches, Pi ignores those generated rows and reports how to refresh them.
+Credential rotation alone does not invalidate the catalog. The generated
+membership is likewise not account-bound: switching accounts on the same
+endpoint/transport shape can retain the prior account's saved model list until
+you rerun `--fetch-models <provider> --refresh-models --persist-models`.
+Inference still resolves and sends the current account's credential; only the
+opt-in model-membership list can be stale across that switch. The generated
+catalog is loaded first; your hand-written `~/.pi/agent/models.json` is loaded
+afterward and remains authoritative. Pi does not rewrite or merge that
+user-authored file.
+Legacy `pi.models.fetched.v1` files cannot be rebound safely because they lack
+this provenance, so Pi preserves them instead of overwriting them. Move the
+legacy file aside to `models.fetched.v1.backup.json`, then rerun the verified
+live refresh and persist command above to create a v2 catalog.
 
 ---
 
@@ -778,8 +802,8 @@ Interactive file references:
 | `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
 | `--list-providers` | List canonical provider IDs, aliases, and auth env keys |
 | `--fetch-models <PROVIDER>` | Print provider model IDs to stdout and exit; warns when using the static fallback |
-| `--refresh-models` | With `--fetch-models`, bypass cache and require a successful live response |
-| `--persist-models` | With `--fetch-models`, atomically save a successful live/cache catalog for future model pickers |
+| `--refresh-models` | With `--fetch-models`, bypass the same-process cache and require a successful live response |
+| `--persist-models` | With `--fetch-models`, atomically save a verified live/same-process-cache catalog for future model pickers |
 | `--export <PATH>` | Export session file to HTML |
 
 Additional high-leverage flags:
@@ -1732,9 +1756,13 @@ Pi also supports a v2 sidecar store next to JSONL sessions for faster resume and
 
 **How resume works:**
 
-1. If a v2 sidecar exists and is fresh, Pi opens from the sidecar index + segments.
-2. If sidecar data is stale relative to the source JSONL, Pi falls back to JSONL parsing.
-3. If index data is missing/corrupt but segments are valid, Pi rebuilds the index.
+1. A verified migration installs a durable `clean` source-state record, allowing the normal
+   v2 open to use the sidecar index + segments without rescanning the full JSONL file.
+2. Before any JSONL mutation, Pi durably marks the sidecar `dirty`; dirty, invalid, or
+   otherwise stale sidecars fall back to authoritative JSONL parsing. Filesystem mtimes remain
+   a secondary external-change check, and legacy sidecars are fully verified once before use.
+3. If index data needs repair, Pi marks the sidecar dirty first and adopts the repaired store
+   only after its entry IDs and hash chain match the source JSONL exactly.
 
 **Integrity strategy:**
 
@@ -2913,7 +2941,17 @@ src/
 ├── interactive.rs          # Interactive TUI app loop/state
 ├── interactive/            # Bubble Tea-style TUI submodules
 ├── rpc.rs                  # RPC/stdio mode
-├── extensions.rs           # Extension protocol + policy + security
+├── extensions.rs           # Stable extension facade + manager/lifecycle
+├── extensions/
+│   ├── protocol.rs         # Wire validation + hostcall reactor internals
+│   ├── fs_connector.rs     # Capability-scoped filesystem implementation
+│   ├── exec_mediation.rs   # Dangerous-command + secret policy logic
+│   ├── permission_drift.rs # Permission snapshot drift evidence
+│   ├── event_coalescer_impl.rs # Coalesced event dispatch
+│   ├── extension_manager_impl.rs # Manager lifecycle + event orchestration
+│   ├── native_runtime_duplicate_scaffold.rs # Active native descriptor runtime
+│   ├── wasm_host.rs        # Feature-gated Wasmtime component host
+│   └── tests/              # Behavior-domain characterization suites
 ├── extensions_js.rs        # QuickJS runtime bridge + hostcalls
 ├── extension_dispatcher.rs # Hostcall/tool dispatch plumbing
 ├── extension_preflight.rs  # Extension compatibility scanner
@@ -2939,7 +2977,7 @@ broader inventory.
 | Core runtime surfaces | [session](docs/session.md), [tree](docs/tree.md), [TUI](docs/tui.md), [RPC](docs/rpc.md), [SDK](docs/sdk.md), [skills](docs/skills.md), [prompt templates](docs/prompt-templates.md), [streaming hostcalls](docs/streaming-hostcalls.md), [context intelligence](docs/context-intelligence.md) |
 | Drop-in certification and migration | [certification contract](docs/contracts/dropin-certification-contract.json), [certification verdict](docs/evidence/dropin-certification-verdict.json), [parity gap ledger](docs/evidence/dropin-parity-gap-ledger.json), [differential evidence suite](docs/evidence/dropin-differential-evidence-suite.json), [feature inventory](docs/evidence/dropin-feature-inventory-matrix.json), [migration playbook](docs/integrator-migration-playbook.md), [parity snapshot](docs/parity-certification.json), [program governance](docs/program-governance.md) |
 | Extensions | [architecture](docs/extension-architecture.md), [compatibility guide](docs/ext-compat.md), [compatibility matrix](docs/extension-compatibility-matrix.md), [conformance plan](docs/extension-conformance-test-plan.json), [runtime threat model](docs/extension-runtime-threat-model.md), [troubleshooting](docs/extension-troubleshooting.md), [registry](docs/extension-registry.md), [WIT ABI](docs/wit/extension.wit) |
-| Providers | [provider guide](docs/providers.md), [auth troubleshooting checked crosswalk](docs/provider-auth-troubleshooting.md), [config examples](docs/provider-config-examples.md), [canonical ID policy](docs/provider-canonical-id-policy.md), [onboarding playbook](docs/provider-onboarding-playbook.md), [test obligations](docs/provider-test-obligations.md), [upstream catalog snapshot](docs/provider-upstream-catalog-snapshot.md), [support baseline audit](docs/provider-support-baseline-audit.md) |
+| Providers | [provider guide](docs/providers.md), [auth troubleshooting checked crosswalk](docs/provider-auth-troubleshooting.md), [config examples](docs/provider-config-examples.md), [canonical ID policy](docs/provider-canonical-id-policy.md), [onboarding playbook](docs/provider-onboarding-playbook.md), [test obligations](docs/provider-test-obligations.md), [upstream catalog snapshot](docs/provider-upstream-catalog-snapshot.md), [historical 2026-02-13 support baseline](docs/provider-support-baseline-audit.md) |
 | QA and evidence | [QA runbook](docs/qa-runbook.md), [testing policy](docs/testing-policy.md), [conformance playbook](docs/conformance-operator-playbook.md), [coverage matrix](docs/TEST_COVERAGE_MATRIX.md), [evidence schema](docs/evidence-contract-schema.json), [coverage baseline map](docs/coverage-baseline-map.json), [E2E scenario matrix](docs/e2e_scenario_matrix.json), [non-mock rubric](docs/non-mock-rubric.json) |
 | Security | [baseline audit](docs/security/baseline-audit.md), [threat model](docs/security/threat-model.md), [security invariants](docs/security/invariants.md), [operator handbook](docs/security/operator-handbook.md), [operator quick reference](docs/security/operator-quick-reference.md), [incident response](docs/security/incident-response-runbook.md), [runtime hostcall telemetry](docs/security/runtime-hostcall-telemetry.md), [security SLOs](docs/security/security-slos.md) |
 | Schemas and machine contracts | [extension manifest schema](docs/schema/extension_manifest.json), [extension protocol schema](docs/schema/extension_protocol.json), [session store v2 contract](docs/schema/session_store_v2_contract.json), [semantic workspace graph contract](docs/contracts/semantic-workspace-graph-contract.json), [semantic context graph contract](docs/contracts/semantic-context-graph-contract.json), [swarm replay trace contract](docs/contracts/swarm-replay-trace-contract.json), [swarm replay preview schema](docs/schema/swarm_replay_preview.json), [remote validation proof ledger contract](docs/contracts/remote-validation-proof-ledger-contract.json), [remote validation proof reuse gate contract](docs/contracts/remote-validation-proof-reuse-gate-contract.json), [validation proof-memory index contract](docs/contracts/validation-proof-memory-index-contract.json), [validation proof-memory index evidence](docs/evidence/validation-proof-memory-index.json), [operator work recommendation contract](docs/contracts/operator-work-recommendation-contract.json), [operator work recommendation evidence](docs/evidence/operator-work-recommendation.json), [operator smoothness SLO contract](docs/contracts/operator-smoothness-slo-contract.json), [operator smoothness SLO evidence](docs/evidence/operator-smoothness-slo.json), [extension resource firewall matrix contract](docs/contracts/extension-resource-firewall-matrix-contract.json), [validation broker contract](docs/contracts/validation-broker-contract.json), [validation broker closeout gate contract](docs/contracts/validation-broker-closeout-gate-contract.json), [validation broker closeout gate evidence](docs/evidence/validation-broker-closeout-gate.json), [context-intelligence closeout gate contract](docs/contracts/context-intelligence-closeout-gate-contract.json), [context-intelligence closeout gate evidence](docs/evidence/context-intelligence-closeout-gate.json), [progress SLO closeout gate contract](docs/contracts/swarm-progress-slo-closeout-gate-contract.json), [progress SLO closeout gate evidence](docs/evidence/swarm-progress-slo-closeout-gate.json), [runtime intelligence closeout gate contract](docs/contracts/runtime-intelligence-closeout-gate-contract.json), [runtime intelligence closeout gate evidence](docs/evidence/runtime-intelligence-closeout-gate.json), [sixth-wave validation hardening closeout gate contract](docs/contracts/sixth-wave-validation-hardening-closeout-gate-contract.json), [sixth-wave validation hardening closeout gate evidence](docs/evidence/sixth-wave-validation-hardening-closeout-gate.json), [seventh-wave runtime autonomy closeout gate contract](docs/contracts/seventh-wave-runtime-autonomy-closeout-gate-contract.json), [seventh-wave runtime autonomy closeout gate evidence](docs/evidence/seventh-wave-runtime-autonomy-closeout-gate.json), [predictive swarm telemetry ledger contract](docs/contracts/predictive-swarm-telemetry-ledger-contract.json), [predictive swarm telemetry ledger evidence](docs/evidence/predictive-swarm-telemetry-ledger.json), [test evidence logging contract](docs/schema/test_evidence_logging_contract.json), [runtime hostcall telemetry schema](docs/schema/runtime_hostcall_telemetry.json), [mock spec schema](docs/schema/mock_spec.json), [CLI surface diff schema](docs/schema/cli-surface-diff.json), [security traceability matrix](docs/sec_traceability_matrix.md) |

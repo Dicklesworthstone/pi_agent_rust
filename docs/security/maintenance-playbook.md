@@ -32,7 +32,9 @@ The compatibility scanner detects dangerous imports and code patterns at extensi
 **Steps:**
 
 1. Identify the pattern to add (e.g., `require('node:child_process')`)
-2. Add to the scanner's forbidden/flagged pattern list in `src/extensions.rs`
+2. Add the rule to the appropriate compatibility-scanner classifier in
+   `src/extensions/compatibility.rs` (`classify_import`,
+   `scan_flagged_apis_in_line`, or `scan_forbidden_patterns_in_line`)
 3. Add a regression test in `tests/install_time_security_scanner.rs`
 4. Verify:
    ```bash
