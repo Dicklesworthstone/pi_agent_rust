@@ -3988,13 +3988,17 @@ mod tests {
     // failure, and exposes local_compact() for the catastrophic-oversize path.
 
     use std::pin::Pin;
+    use async_trait::async_trait;
+    use asupersync::runtime::RuntimeBuilder;
     use futures::stream::{self, Stream};
+    use crate::provider::StreamOptions;
 
     /// Minimal Provider whose stream() immediately yields a single
     /// `StreamEvent::Error`, mirroring the provider HTTP 500 that triggers the
     /// bug in production (deepseek, oversized summarization prompt).
     struct FailingProvider;
 
+    #[async_trait]
     impl crate::provider::Provider for FailingProvider {
         fn name(&self) -> &str {
             "failing-test"
@@ -4008,7 +4012,7 @@ mod tests {
         async fn stream(
             &self,
             _context: &crate::provider::Context<'_>,
-            _options: &crate::model::StreamOptions,
+            _options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>,
         > {
@@ -4042,20 +4046,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn compact_falls_back_when_provider_errors() {
+    // NB: this crate has no tokio dependency; tests drive async via the project
+    // runtime `asupersync::runtime::RuntimeBuilder` (see `interactive/ext_session.rs`).
+
+    #[test]
+    fn compact_falls_back_when_provider_errors() {
         // Mimic the production failure: provider rejects the oversized summary
         // prompt with an error stream. compact() MUST return Ok with a usable
         // failsafe summary instead of propagating the error.
-        let prep = make_preparation("please summarize me", None);
-        let result = compact(
-            prep,
-            std::sync::Arc::new(FailingProvider),
-            "k",
-            None,
-        )
-        .await
-        .expect("compact() must succeed via failsafe, not propagate provider Err");
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime build");
+        let result = runtime
+            .block_on(async move {
+                let prep = make_preparation("please summarize me", None);
+                compact(
+                    prep,
+                    std::sync::Arc::new(FailingProvider),
+                    "k",
+                    None,
+                )
+                .await
+            })
+            .expect("compact() must succeed via failsafe, not propagate provider Err");
 
         assert!(
             result.summary.contains("failsafe local truncation"),
@@ -4067,17 +4080,23 @@ mod tests {
         assert_eq!(result.first_kept_entry_id, "kept");
     }
 
-    #[tokio::test]
-    async fn compact_failsafe_preserves_previous_summary() {
-        let prep = make_preparation("current content", Some("PREVIOUS SUMMARY TEXT"));
-        let result = compact(
-            prep,
-            std::sync::Arc::new(FailingProvider),
-            "k",
-            None,
-        )
-        .await
-        .expect("must succeed via failsafe");
+    #[test]
+    fn compact_failsafe_preserves_previous_summary() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("test runtime build");
+        let result = runtime
+            .block_on(async move {
+                let prep = make_preparation("current content", Some("PREVIOUS SUMMARY TEXT"));
+                compact(
+                    prep,
+                    std::sync::Arc::new(FailingProvider),
+                    "k",
+                    None,
+                )
+                .await
+            })
+            .expect("must succeed via failsafe");
         assert!(
             result.summary.contains("PREVIOUS SUMMARY TEXT"),
             "failsafe must round-trip previous compaction summary; got: {}",
