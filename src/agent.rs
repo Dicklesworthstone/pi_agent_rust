@@ -8741,11 +8741,12 @@ impl AgentSession {
                         ),
                     });
                     let result = compaction::local_compact(prep);
+                    let details = Some(compaction::compaction_details_to_value(&result.details)?);
                     let result_value = Some(Self::auto_compaction_result_payload(
                         result.summary.clone(),
                         result.first_kept_entry_id.clone(),
                         result.tokens_before,
-                        result.details.clone(),
+                        details.clone(),
                     ));
                     self.extensions_is_compacting
                         .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -8754,7 +8755,7 @@ impl AgentSession {
                             result.summary,
                             result.first_kept_entry_id,
                             result.tokens_before,
-                            Some(result.details),
+                            details,
                             true,
                         )
                         .await;

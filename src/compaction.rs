@@ -3987,9 +3987,7 @@ mod tests {
     // The failsafe makes compact() return Ok(local truncation) on any LLM
     // failure, and exposes local_compact() for the catastrophic-oversize path.
 
-    use super::compaction_settings_to_value as _; // keep unused-warn quiet if any
     use std::pin::Pin;
-    use std::future;
     use futures::stream::{self, Stream};
 
     /// Minimal Provider whose stream() immediately yields a single
@@ -4125,10 +4123,5 @@ mod tests {
         };
         let s = local_truncation_summary(&prep);
         assert!(s.contains("No prior messages"));
-        let _ = idle_unused_import(); // touch unused helper
-    }
-
-    fn idle_unused_import() -> future::Ready<()> {
-        future::ready(())
     }
 }
