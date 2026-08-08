@@ -1041,8 +1041,8 @@ mod tests {
             // tokens_before = 186_582 (proven peak of session 6667aec1).
             let prep = compaction::CompactionPreparation {
                 first_kept_entry_id: "kept".to_string(),
-                messages_to_summarize: vec![compaction::SessionMessage::User {
-                    content: compaction::UserContent::Text(
+                messages_to_summarize: vec![crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text(
                         "very long conversation body that broke pi".to_string(),
                     ),
                     timestamp: Some(0),
