@@ -827,6 +827,19 @@ fn should_compact(
     context_tokens >= window.saturating_sub(reserve)
 }
 
+/// Thin `pub(crate)` wrapper around the private `should_compact`, exposed so
+/// that cross-module tests (e.g. `compaction_worker::tests`) can assert the
+/// config-independence of the compaction trigger threshold. The threshold is a
+/// pure function of `(window, reserve)`; `keep_recent_tokens` does NOT affect
+/// it (validated by `config_matrix_compaction_threshold_invariants_hold`).
+pub(crate) fn prepare_compaction_threshold_check(
+    context_tokens: u64,
+    context_window: u32,
+    settings: &ResolvedCompactionSettings,
+) -> bool {
+    should_compact(context_tokens, context_window, settings)
+}
+
 fn estimate_tokens(message: &SessionMessage) -> u64 {
     let mut chars: usize = 0;
 

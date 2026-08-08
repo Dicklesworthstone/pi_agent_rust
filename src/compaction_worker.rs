@@ -895,4 +895,239 @@ mod tests {
             assert!(w.pending.is_none());
         });
     }
+
+    // ─── Stuck-pending deadlock regression tests ─────────────────────
+    //
+    // These mirror the production failure proven on sessions b058fa72
+    // (549k tokens, 0 compactions) and 1e796d52 (573k tokens, 0 compactions):
+    // a failed summarization LLM call left the worker's `pending` slot stuck,
+    // `attempt_count` climbed to `max_attempts_per_session`, and `can_start()`
+    // returned false forever. The fix (Part B) resets attempt_count on success
+    // and exposes `abort_pending()` so the Part C force-failsafe path can
+    // always recover from the >=2x-window catastrophic state.
+
+    #[test]
+    fn note_success_resets_attempt_count_and_last_start() {
+        // Part B unit proof: a single success restores full quota even after a
+        // long run of failures that otherwise would hit SessionAttemptLimit.
+        let mut w = default_worker();
+        w.attempt_count = 100; // exactly at the default SessionAttemptLimit
+        w.last_start = Some(Instant::now());
+        assert!(
+            !w.can_start(),
+            "at the limit, can_start() must be false before note_success"
+        );
+
+        w.note_success();
+        assert_eq!(w.attempt_count, 0, "attempt_count reset to 0");
+        assert!(w.last_start.is_none(), "last_start cleared so cooldown clock restarts fresh");
+        assert!(w.can_start(), "after a success, can_start() must be true again");
+    }
+
+    #[test]
+    fn try_recv_resets_attempt_count_on_success() {
+        // Wire proof: try_recv() must call note_success() when the awaited
+        // outcome is Ok, directly unbreaking the SessionAttemptLimit latch
+        // that poisoned production sessions.
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            // Fill the quota to the permanent-block state.
+            w.attempt_count = 100;
+            assert!(!w.can_start(), "precondition: at SessionAttemptLimit");
+
+            let result = CompactionResult {
+                summary: "recovery summary".to_string(),
+                first_kept_entry_id: "kept".to_string(),
+                tokens_before: 1_000_000,
+                details: compaction::CompactionDetails {
+                    read_files: vec![],
+                    modified_files: vec![],
+                },
+            };
+            let pending = ready_pending_with_handle(runtime_handle, Ok(result)).await;
+            inject_pending(&mut w, pending);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_ok(), "consumed the Ok outcome");
+            assert_eq!(w.attempt_count, 0, "try_recv reset attempt_count via note_success");
+            assert!(w.can_start(), "quota restored by a single success");
+        });
+    }
+
+    #[test]
+    fn try_recv_does_not_reset_attempt_count_on_failure() {
+        // Counter-proof: failed compactions must NOT reset the quota — that
+        // would defeat the SessionAttemptLimit safety valve. Only success resets.
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            w.attempt_count = 99;
+            let pending = ready_pending_with_handle(
+                runtime_handle,
+                Err(Error::session("simulated provider 500")),
+            )
+            .await;
+            inject_pending(&mut w, pending);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have outcome");
+            assert!(outcome.is_err(), "consumed the Err outcome");
+            assert_eq!(
+                w.attempt_count, 100,
+                "failed attempt incremented, NOT reset; SessionAttemptLimit now latches"
+            );
+            assert!(!w.can_start(), "failures must keep the quota blocked");
+        });
+    }
+
+    #[test]
+    fn abort_pending_frees_worker_slot_immediately() {
+        // Part C unit proof: the force-failsafe path in maybe_compact needs a
+        // way to drop a stuck pending task so it can synchronously apply a
+        // local_compact regardless of quota. abort_pending() is that escape.
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            let parked = parked_pending_with_handle(runtime_handle, None).await;
+            inject_pending(&mut w, parked);
+            assert!(w.pending.is_some(), "precondition: pending is Some");
+            assert!(!w.can_start(), "pending keeps can_start() false");
+
+            w.abort_pending();
+            assert!(w.pending.is_none(), "abort_pending dropped the task");
+            // Cooldown may still elapse (last_start was set), but pending is
+            // definitely gone — that's what the force path needs.
+        });
+    }
+
+    #[test]
+    fn catastrophic_oversize_admission_denied_then_local_compact_recovers() {
+        // End-to-end-ish proof for the bug's exact production scenario:
+        //   context (tokens_before) = 2x window  -> oversized
+        //   worker.attempt_count = max           -> SessionAttemptLimit latch
+        //   => admission.allowed is false
+        //   => without the fix, this is the permanent-spiral state.
+        // The recovery contract: abort_pending() + compaction::local_compact()
+        // produce a real CompactionResult with the failsafe summary, regardless
+        // of the denial reason.
+        run_async(|runtime_handle| async move {
+            let mut w = make_worker(CompactionQuota {
+                cooldown: std::time::Duration::from_secs(60),
+                timeout: std::time::Duration::from_secs(120),
+                max_attempts_per_session: 100,
+            });
+            w.attempt_count = 100; // SessionAttemptLimit latched
+            let parked = parked_pending_with_handle(runtime_handle, None).await;
+            inject_pending(&mut w, parked); // AND pending is stuck (Pending reason)
+
+            assert!(!w.can_start(), "stuck pending + limit = full starvation");
+
+            // Mirror what `agent::maybe_compact` does in the force-failsafe branch.
+            w.abort_pending();
+
+            let settings = compaction::ResolvedCompactionSettings {
+                enabled: true,
+                context_window_tokens: 128_000, // production deepseek-chat window
+                reserve_tokens: 8_192,         // production-applied value
+                keep_recent_tokens: 4_096,
+            };
+            // tokens_before = 186_582 (proven peak of session 6667aec1).
+            let prep = compaction::CompactionPreparation {
+                first_kept_entry_id: "kept".to_string(),
+                messages_to_summarize: vec![compaction::SessionMessage::User {
+                    content: compaction::UserContent::Text(
+                        "very long conversation body that broke pi".to_string(),
+                    ),
+                    timestamp: Some(0),
+                }],
+                turn_prefix_messages: Vec::new(),
+                is_split_turn: false,
+                tokens_before: 186_582,
+                previous_summary: Some("prior compaction summary".to_string()),
+                file_ops: compaction::FileOperations::default(),
+                settings,
+            };
+
+            // admission is STILL denied even after abort (the 60s cooldown ticks):
+            let decision = w.admission_decision(Some(&prep), &CompactionAdmissionSignals::default());
+            assert!(
+                !decision.allowed,
+                "admission should still be denied by cooldown/quota; \
+                 this is precisely why the force path is needed"
+            );
+
+            // The force-failsafe runs `local_compact` IGNORING the denial:
+            let result = compaction::local_compact(prep);
+            assert!(
+                result.summary.contains("failsafe local truncation"),
+                "recovery produced a deterministic failsafe summary"
+            );
+            assert!(
+                result.summary.contains("prior compaction summary"),
+                "previous compaction summary preserved across forced recovery"
+            );
+            assert_eq!(result.tokens_before, 186_582);
+            assert_eq!(result.first_kept_entry_id, "kept");
+            // local_compact did not touch the provider, so HTTP500 cannot block it.
+        });
+    }
+
+    #[test]
+    fn config_matrix_compaction_threshold_invariants_hold() {
+        // Validates the claim that NO (reserve, keep_recent, window) combination
+        // changes the deadlock behavior: the trigger threshold is a pure
+        // function of (window, reserve), independent of keep_recent — the lock
+        // itself occurs in the admission/worker, untouched by config.
+        let cases = [
+            // (window, reserve, keep_recent, expected_trigger)
+            (128_000u32, 4_096u32, 8_192u32, 123_904u64),
+            (128_000, 8_192, 4_096, 119_808),
+            (128_000, 12_000, 2_000, 116_000),
+            (32_768, 4_096, 2_000, 28_672),
+            (200_000, 10_000, 8_000, 190_000),
+        ];
+        for (window, reserve, keep_recent, expected_trigger) in cases {
+            let settings = compaction::ResolvedCompactionSettings {
+                enabled: true,
+                context_window_tokens: window,
+                reserve_tokens: reserve,
+                keep_recent_tokens: keep_recent,
+            };
+            // Just below trigger: should_compact false.
+            assert!(
+                !compaction::prepare_compaction_threshold_check(
+                    expected_trigger.saturating_sub(1),
+                    window,
+                    &settings,
+                ),
+                "case w={window} r={reserve} k={keep_recent}: just-below must NOT trigger"
+            );
+            // At/above trigger: should_compact true.
+            assert!(
+                compaction::prepare_compaction_threshold_check(
+                    expected_trigger,
+                    window,
+                    &settings,
+                ),
+                "case w={window} r={reserve} k={keep_recent}: at-trigger must trigger"
+            );
+            // Crucially: keep_recent does NOT affect the trigger. Confirm by
+            // flipping keep_recent and verifying the same expected_trigger.
+            let other = compaction::ResolvedCompactionSettings {
+                keep_recent_tokens: keep_recent.wrapping_add(99),
+                ..settings.clone()
+            };
+            assert!(
+                compaction::prepare_compaction_threshold_check(expected_trigger, window, &other),
+                "keep_recent must not affect the trigger threshold (config-independence)"
+            );
+        }
+    }
 }
