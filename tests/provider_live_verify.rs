@@ -35,7 +35,7 @@ mod common;
 use common::TestHarness;
 use futures::StreamExt;
 use pi::model::{Message, StopReason, StreamEvent, UserContent, UserMessage};
-use pi::provider::{Context, Provider, StreamOptions, ToolDef};
+use pi::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
 use pi::provider_metadata::{PROVIDER_METADATA, ProviderMetadata, provider_auth_env_keys};
 use pi::providers::anthropic::AnthropicProvider;
 use pi::providers::cohere::CohereProvider;
@@ -171,6 +171,7 @@ async fn collect_stream_events(
                 has_start: false,
                 has_done: false,
                 stop_reason: None,
+                usage: None,
                 stream_error: Some(e.to_string()),
                 elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             };
@@ -183,6 +184,7 @@ async fn collect_stream_events(
     let mut has_start = false;
     let mut has_done = false;
     let mut stop_reason = None;
+    let mut usage = None;
     let mut stream_error = None;
 
     while let Some(item) = stream.next().await {
@@ -198,6 +200,7 @@ async fn collect_stream_events(
                     StreamEvent::Done { reason, message } => {
                         has_done = true;
                         stop_reason = Some(*reason);
+                        usage = Some(message.usage.clone());
                         // Fall back to Done message text if no deltas were received.
                         if text.is_empty() {
                             for block in &message.content {
@@ -231,6 +234,7 @@ async fn collect_stream_events(
         has_start,
         has_done,
         stop_reason,
+        usage,
         stream_error,
         elapsed_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
     }
@@ -244,6 +248,9 @@ struct StreamResult {
     has_start: bool,
     has_done: bool,
     stop_reason: Option<StopReason>,
+    /// Token accounting from the terminal `Done` event. `None` when the stream
+    /// failed before completing.
+    usage: Option<pi::model::Usage>,
     stream_error: Option<String>,
     elapsed_ms: u64,
 }
@@ -572,6 +579,108 @@ mod anthropic {
                 text_preview: sr.text.chars().take(100).collect(),
                 tool_call_count: 0,
                 stop_reason: sr.stop_reason.map(|r| format!("{r:?}")),
+                error: None,
+            };
+            write_result_artifact(&vr);
+        });
+    }
+
+    /// Prompt-cache round trip through the real provider.
+    ///
+    /// The unit tests in `providers::anthropic` prove `build_request` emits the
+    /// JSON we intended; they cannot prove Anthropic accepts it or caches on
+    /// it. This drives the whole path — `build_request`, the `anthropic-beta`
+    /// header, serialization, the HTTP call, and usage parsing — and asserts
+    /// the API reported a cache read on the second identical request.
+    #[test]
+    fn live_prompt_cache_writes_then_reads() {
+        skip_unless_live!();
+        let (api_key, _) = skip_unless_secret!("anthropic");
+
+        common::run_async(async move {
+            // A cache entry only forms above the model's minimum cacheable
+            // prefix — 1024 tokens on Sonnet, and the prefix here is system +
+            // tools. Below that the API silently caches nothing, so the filler
+            // is sized for headroom over the floor rather than trimmed to it.
+            // The text must also be byte-identical across both calls, so the
+            // filler is deterministic.
+            let mut system_prompt =
+                String::from("You are a fixture used to verify Anthropic prompt caching. ");
+            for i in 0..110 {
+                system_prompt.push_str(&format!(
+                    "Stable prefix sentence {i}: the cache key is the exact byte prefix. "
+                ));
+            }
+
+            let provider = AnthropicProvider::new("claude-sonnet-4-5")
+                .with_base_url("https://api.anthropic.com/v1/messages");
+            let context = Context::owned(
+                Some(system_prompt),
+                vec![user_text("Reply with the single word: pong.")],
+                vec![echo_tool()],
+            );
+            let options = StreamOptions {
+                cache_retention: CacheRetention::Short,
+                ..simple_options(&api_key)
+            };
+
+            let first = collect_stream_events(&provider, &context, &options).await;
+            assert!(
+                first.stream_error.is_none(),
+                "anthropic cache write stream error: {}",
+                first.stream_error.as_deref().unwrap_or("")
+            );
+            let first_usage = first.usage.expect("anthropic: expected usage on first call");
+            // A prior run inside the 5-minute TTL leaves the entry warm, so a
+            // read here is also valid; only "neither" means caching is broken.
+            assert!(
+                first_usage.cache_write > 0 || first_usage.cache_read > 0,
+                "anthropic: first call neither wrote nor read cache \
+                 (write={}, read={}, input={})",
+                first_usage.cache_write,
+                first_usage.cache_read,
+                first_usage.input
+            );
+
+            let second = collect_stream_events(&provider, &context, &options).await;
+            assert!(
+                second.stream_error.is_none(),
+                "anthropic cache read stream error: {}",
+                second.stream_error.as_deref().unwrap_or("")
+            );
+            let second_usage = second
+                .usage
+                .expect("anthropic: expected usage on second call");
+            assert!(
+                second_usage.cache_read > 0,
+                "anthropic: second identical request did not read from cache \
+                 (write={}, read={}, input={}) — the prefix drifted or no \
+                 breakpoint reached the wire",
+                second_usage.cache_write,
+                second_usage.cache_read,
+                second_usage.input
+            );
+            // The cached prefix must not also be billed as uncached input.
+            assert!(
+                second_usage.input < second_usage.cache_read,
+                "anthropic: uncached input ({}) should be far below the cached \
+                 prefix ({})",
+                second_usage.input,
+                second_usage.cache_read
+            );
+
+            let vr = VerificationResult {
+                provider: "anthropic".into(),
+                scenario: "prompt_cache".into(),
+                passed: true,
+                elapsed_ms: first.elapsed_ms + second.elapsed_ms,
+                event_count: first.events.len() + second.events.len(),
+                text_preview: format!(
+                    "write={} read={} uncached={}",
+                    first_usage.cache_write, second_usage.cache_read, second_usage.input
+                ),
+                tool_call_count: 0,
+                stop_reason: second.stop_reason.map(|r| format!("{r:?}")),
                 error: None,
             };
             write_result_artifact(&vr);

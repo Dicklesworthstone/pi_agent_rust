@@ -36,6 +36,10 @@ const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20"
 /// Beta flag for Anthropic prompt caching.
 /// Override via `PI_ANTHROPIC_CACHE_BETA_FLAG`.
 const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
+/// Beta flag gating the 1-hour cache TTL. Sent only when a request actually
+/// carries `"ttl": "1h"`; the API rejects that field without the flag.
+/// Override via `PI_ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG`.
+const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
@@ -50,6 +54,37 @@ fn anthropic_cache_beta_flag() -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| ANTHROPIC_CACHE_BETA_FLAG.to_string())
+}
+
+fn anthropic_extended_cache_ttl_beta_flag() -> String {
+    std::env::var("PI_ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string())
+}
+
+/// Flags for the `anthropic-beta` request header. Empty means the header is
+/// omitted entirely.
+fn anthropic_beta_flags(
+    oauth_bearer_token: bool,
+    cache_retention: CacheRetention,
+    base_url: &str,
+) -> Vec<String> {
+    let mut flags = Vec::new();
+    if oauth_bearer_token {
+        flags.push(anthropic_oauth_beta_flags());
+    }
+    if cache_retention != CacheRetention::None {
+        flags.push(anthropic_cache_beta_flag());
+        // Derived from the same helper that builds the body, so the flag cannot
+        // drift out of sync with whether `ttl` is actually serialized.
+        if AnthropicCacheControl::for_retention(cache_retention, base_url)
+            .is_some_and(AnthropicCacheControl::needs_extended_ttl_beta)
+        {
+            flags.push(anthropic_extended_cache_ttl_beta_flag());
+        }
+    }
+    flags
 }
 
 #[inline]
@@ -421,16 +456,27 @@ impl AnthropicProvider {
             .map(convert_message_to_anthropic)
             .collect();
 
+        // Cache breakpoints go on the longest stable prefix: the system prompt
+        // and the tool definitions. Both are byte-identical across turns within
+        // a session, so marking them lets every turn after the first read the
+        // prefix from cache instead of re-billing it at full input rate.
+        let cache_control =
+            AnthropicCacheControl::for_retention(options.cache_retention, &self.base_url);
+
         let tools: Option<Vec<AnthropicTool<'_>>> = if context.tools.is_empty() {
             None
         } else {
-            Some(
-                context
-                    .tools
-                    .iter()
-                    .map(convert_tool_to_anthropic)
-                    .collect(),
-            )
+            let mut tools: Vec<AnthropicTool<'_>> = context
+                .tools
+                .iter()
+                .map(convert_tool_to_anthropic)
+                .collect();
+            // One marker on the final tool covers the whole array; Anthropic
+            // caches everything preceding the marked block.
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = cache_control;
+            }
+            Some(tools)
         };
 
         // Decide between the modern adaptive-thinking API and the legacy
@@ -510,7 +556,13 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            system: context.system_prompt.as_deref(),
+            system: context.system_prompt.as_deref().map(|text| {
+                vec![AnthropicSystemBlock {
+                    kind: "text",
+                    text,
+                    cache_control,
+                }]
+            }),
             max_tokens,
             temperature,
             tools,
@@ -615,13 +667,11 @@ impl Provider for AnthropicProvider {
             }
         }
 
-        let mut beta_flags: Vec<String> = Vec::new();
-        if anthropic_bearer_token {
-            beta_flags.push(anthropic_oauth_beta_flags());
-        }
-        if options.cache_retention != CacheRetention::None {
-            beta_flags.push(anthropic_cache_beta_flag());
-        }
+        let beta_flags = anthropic_beta_flags(
+            anthropic_bearer_token,
+            options.cache_retention,
+            &self.base_url,
+        );
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
         }
@@ -1080,7 +1130,7 @@ pub struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Vec<AnthropicSystemBlock<'a>>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -1168,6 +1218,51 @@ struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// A `system` prompt block. Anthropic accepts either a bare string or an array
+/// of typed blocks; only the array form can carry `cache_control`.
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Prompt-cache breakpoint marker. Everything *before* a marked block becomes
+/// the cache prefix; without at least one marker the API caches nothing, no
+/// matter which beta headers are sent.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
+}
+
+impl AnthropicCacheControl {
+    /// `None` retention yields no marker. `Long` maps to the 1-hour TTL, which
+    /// only first-party `api.anthropic.com` honours; relays reject the field.
+    fn for_retention(retention: CacheRetention, base_url: &str) -> Option<Self> {
+        match retention {
+            CacheRetention::None => None,
+            CacheRetention::Short => Some(Self { kind: "ephemeral", ttl: None }),
+            CacheRetention::Long => Some(Self {
+                kind: "ephemeral",
+                ttl: base_url.contains("api.anthropic.com").then_some("1h"),
+            }),
+        }
+    }
+
+    /// A marker carrying an explicit TTL requires the extended-cache-ttl beta
+    /// flag on the request; the default 5-minute cache does not.
+    fn needs_extended_ttl_beta(self) -> bool {
+        self.ttl.is_some()
+    }
 }
 
 // ============================================================================
@@ -1396,6 +1491,7 @@ fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
         name: &tool.name,
         description: &tool.description,
         input_schema: &tool.parameters,
+        cache_control: None,
     }
 }
 
@@ -1499,7 +1595,12 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, Some("System prompt"));
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].kind, "text");
+        assert_eq!(system[0].text, "System prompt");
+        // Default retention is None, so no breakpoint is emitted.
+        assert!(system[0].cache_control.is_none());
         assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
@@ -1543,7 +1644,7 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, None);
+        assert!(request.system.is_none());
         assert!(request.tools.is_none());
         assert!(request.thinking.is_none());
         assert!(request.output_config.is_none());
@@ -3394,6 +3495,166 @@ mod tests {
                     let _ = state.process_event(event);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_build_request_marks_cache_breakpoints_when_retention_short() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: vec![
+                ToolDef {
+                    name: "read".to_string(),
+                    description: "Read a file.".to_string(),
+                    parameters: json!({ "type": "object" }),
+                },
+                ToolDef {
+                    name: "write".to_string(),
+                    description: "Write a file.".to_string(),
+                    parameters: json!({ "type": "object" }),
+                },
+            ]
+            .into(),
+        };
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(
+            system[0].cache_control,
+            Some(AnthropicCacheControl {
+                kind: "ephemeral",
+                ttl: None
+            })
+        );
+
+        // Exactly one marker, on the final tool: it covers the whole array.
+        let tools = request.tools.as_ref().expect("tools");
+        assert!(tools[0].cache_control.is_none());
+        assert_eq!(
+            tools[1].cache_control,
+            Some(AnthropicCacheControl {
+                kind: "ephemeral",
+                ttl: None
+            })
+        );
+
+        // The marker must survive serialization; a struct field that never
+        // reaches the wire caches nothing.
+        let body = serde_json::to_string(&request).expect("serialize");
+        assert!(
+            body.contains(r#""cache_control":{"type":"ephemeral"}"#),
+            "cache_control missing from request body: {body}"
+        );
+    }
+
+    #[test]
+    fn test_build_request_emits_no_cache_control_when_retention_none() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            tools: vec![ToolDef {
+                name: "read".to_string(),
+                description: "Read a file.".to_string(),
+                parameters: json!({ "type": "object" }),
+            }]
+            .into(),
+            ..Default::default()
+        };
+        let options = StreamOptions::default();
+        assert_eq!(options.cache_retention, CacheRetention::None);
+
+        let request = provider.build_request(&context, &options);
+        let body = serde_json::to_string(&request).expect("serialize");
+        assert!(!body.contains("cache_control"), "unexpected marker: {body}");
+    }
+
+    #[test]
+    fn test_long_retention_sets_one_hour_ttl_only_on_first_party_base_url() {
+        let first_party = AnthropicCacheControl::for_retention(
+            CacheRetention::Long,
+            "https://api.anthropic.com/v1/messages",
+        );
+        assert_eq!(
+            first_party,
+            Some(AnthropicCacheControl {
+                kind: "ephemeral",
+                ttl: Some("1h")
+            })
+        );
+
+        // Relays reject the ttl field; degrade to the default 5-minute cache.
+        let relay = AnthropicCacheControl::for_retention(
+            CacheRetention::Long,
+            "https://openrouter.ai/api/v1/messages",
+        );
+        assert_eq!(
+            relay,
+            Some(AnthropicCacheControl {
+                kind: "ephemeral",
+                ttl: None
+            })
+        );
+    }
+
+    #[test]
+    fn test_extended_cache_ttl_beta_flag_tracks_emitted_ttl() {
+        // The flag and the `ttl` field must ship together: the flag without the
+        // field is noise, the field without the flag is a 400.
+        const FIRST_PARTY: &str = "https://api.anthropic.com/v1/messages";
+        const RELAY: &str = "https://openrouter.ai/api/v1/messages";
+
+        for (oauth, retention, base_url, expected) in [
+            (false, CacheRetention::None, FIRST_PARTY, vec![]),
+            (
+                false,
+                CacheRetention::Short,
+                FIRST_PARTY,
+                vec![ANTHROPIC_CACHE_BETA_FLAG],
+            ),
+            (
+                false,
+                CacheRetention::Long,
+                FIRST_PARTY,
+                vec![
+                    ANTHROPIC_CACHE_BETA_FLAG,
+                    ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG,
+                ],
+            ),
+            // Relays drop the `ttl` field, so the flag must stay off too.
+            (
+                false,
+                CacheRetention::Long,
+                RELAY,
+                vec![ANTHROPIC_CACHE_BETA_FLAG],
+            ),
+            (
+                true,
+                CacheRetention::Long,
+                FIRST_PARTY,
+                vec![
+                    ANTHROPIC_OAUTH_BETA_FLAGS,
+                    ANTHROPIC_CACHE_BETA_FLAG,
+                    ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG,
+                ],
+            ),
+        ] {
+            let expected: Vec<String> = expected.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                anthropic_beta_flags(oauth, retention, base_url),
+                expected,
+                "oauth={oauth} retention={retention:?} base_url={base_url}"
+            );
         }
     }
 }
