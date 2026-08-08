@@ -1693,6 +1693,27 @@ fn truncate_snippet(text: &str, max: usize) -> String {
     format!("{head}\n…[truncated {n} chars]…\n{tail}", n = chars.len() - max)
 }
 
+/// Deterministic, LLM-free compaction: the failsafe path. Builds a
+/// `CompactionResult` directly from `local_truncation_summary`, bypassing the
+/// provider entirely. Used by `Agent::maybe_compact` when context is already
+/// catastrophically oversized (>= 2× the window) and the normal admission/quota
+/// path could still deny recovery.
+pub fn local_compact(preparation: CompactionPreparation) -> CompactionResult {
+    let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+    let details = CompactionDetails {
+        read_files: read_files.clone(),
+        modified_files: modified_files.clone(),
+    };
+    let mut summary = local_truncation_summary(&preparation);
+    summary.push_str(&format_file_operations(&read_files, &modified_files));
+    CompactionResult {
+        summary,
+        first_kept_entry_id: preparation.first_kept_entry_id,
+        tokens_before: preparation.tokens_before,
+        details,
+    }
+}
+
 pub async fn compact(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
@@ -3955,5 +3976,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ─── Failsafe local-truncation compaction regression tests ──────
+    //
+    // See pi-usage/diagnosis/stuck-pending-deadlock-root-cause: a compaction
+    // summary LLM call fails (HTTP 500, oversized prompt) -> compact() used to
+    // return Err -> background task fails fast -> attempt_count climbs to 100
+    // -> SessionAttemptLimit -> permanent compaction block -> context spirals.
+    // The failsafe makes compact() return Ok(local truncation) on any LLM
+    // failure, and exposes local_compact() for the catastrophic-oversize path.
+
+    use super::compaction_settings_to_value as _; // keep unused-warn quiet if any
+    use std::pin::Pin;
+    use std::future;
+    use futures::stream::{self, Stream};
+
+    /// Minimal Provider whose stream() immediately yields a single
+    /// `StreamEvent::Error`, mirroring the provider HTTP 500 that triggers the
+    /// bug in production (deepseek, oversized summarization prompt).
+    struct FailingProvider;
+
+    impl crate::provider::Provider for FailingProvider {
+        fn name(&self) -> &str {
+            "failing-test"
+        }
+        fn api(&self) -> &str {
+            "failing"
+        }
+        fn model_id(&self) -> &str {
+            "failing-model"
+        }
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::model::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>,
+        > {
+            let err_stream = stream::iter(vec![Err(crate::error::Error::api(
+                "simulated provider 500: oversized summarization prompt",
+            ))]);
+            // Type-erase to Pin<Box<dyn Stream + Send>> like the real impls.
+            Ok(Box::pin(err_stream))
+        }
+    }
+
+    fn failsafe_settings() -> ResolvedCompactionSettings {
+        ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 100_000,
+            reserve_tokens: 5_000,
+            keep_recent_tokens: 5_000,
+        }
+    }
+
+    fn make_preparation(text: &str, previous: Option<&str>) -> CompactionPreparation {
+        CompactionPreparation {
+            first_kept_entry_id: "kept".to_string(),
+            messages_to_summarize: vec![make_user_text(text)],
+            turn_prefix_messages: Vec::new(),
+            is_split_turn: false,
+            tokens_before: 1_000_000,
+            previous_summary: previous.map(str::to_string),
+            file_ops: FileOperations::default(),
+            settings: failsafe_settings(),
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_falls_back_when_provider_errors() {
+        // Mimic the production failure: provider rejects the oversized summary
+        // prompt with an error stream. compact() MUST return Ok with a usable
+        // failsafe summary instead of propagating the error.
+        let prep = make_preparation("please summarize me", None);
+        let result = compact(
+            prep,
+            std::sync::Arc::new(FailingProvider),
+            "k",
+            None,
+        )
+        .await
+        .expect("compact() must succeed via failsafe, not propagate provider Err");
+
+        assert!(
+            result.summary.contains("failsafe local truncation"),
+            "summary should mark itself as failsafe; got: {}",
+            result.summary
+        );
+        assert!(result.summary.contains("please summarize me"));
+        assert_eq!(result.tokens_before, 1_000_000);
+        assert_eq!(result.first_kept_entry_id, "kept");
+    }
+
+    #[tokio::test]
+    async fn compact_failsafe_preserves_previous_summary() {
+        let prep = make_preparation("current content", Some("PREVIOUS SUMMARY TEXT"));
+        let result = compact(
+            prep,
+            std::sync::Arc::new(FailingProvider),
+            "k",
+            None,
+        )
+        .await
+        .expect("must succeed via failsafe");
+        assert!(
+            result.summary.contains("PREVIOUS SUMMARY TEXT"),
+            "failsafe must round-trip previous compaction summary; got: {}",
+            result.summary
+        );
+    }
+
+    #[test]
+    fn local_compact_is_deterministic_and_skips_llm() {
+        // local_compact never touches the provider; it must produce a
+        // deterministic summary from the preparation alone.
+        let big = "X".repeat(5000);
+        let prep = make_preparation(&big, Some("prior"));
+        let r1 = local_compact(prep.clone());
+        let r2 = local_compact(prep);
+        assert_eq!(r1.summary, r2.summary, "local_compact must be deterministic");
+        assert!(
+            r1.summary.contains("failsafe local truncation"),
+            "marker missing"
+        );
+        assert!(r1.summary.contains("prior"), "previous summary preserved");
+        // Long content is truncated (no full 5000-char body carried along).
+        assert!(
+            !r1.summary.contains(&"X".repeat(1000)),
+            "long content must be truncated, not copied verbatim"
+        );
+        assert!(r1.summary.contains("truncated"), "truncation marker present");
+        assert_eq!(r1.first_kept_entry_id, "kept");
+        assert_eq!(r1.tokens_before, 1_000_000);
+    }
+
+    #[test]
+    fn local_truncation_summary_handles_empty_messages() {
+        let prep = CompactionPreparation {
+            first_kept_entry_id: "k".to_string(),
+            messages_to_summarize: Vec::new(),
+            turn_prefix_messages: Vec::new(),
+            is_split_turn: false,
+            tokens_before: 0,
+            previous_summary: None,
+            file_ops: FileOperations::default(),
+            settings: failsafe_settings(),
+        };
+        let s = local_truncation_summary(&prep);
+        assert!(s.contains("No prior messages"));
+        let _ = idle_unused_import(); // touch unused helper
+    }
+
+    fn idle_unused_import() -> future::Ready<()> {
+        future::ready(())
     }
 }

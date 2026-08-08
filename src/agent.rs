@@ -8716,6 +8716,60 @@ impl AgentSession {
                 .compaction_worker
                 .admission_decision(Some(&prep), &CompactionAdmissionSignals::default());
             if !admission.allowed {
+                // Failsafe: if context is already >= 2x the window, we are in a
+                // catastrophic-oversize state (the symptom: every provider call
+                // returns HTTP 500 "Internal Server Error"). The normal
+                // admission gate (cooldown, SessionAttemptLimit, pending) would
+                // deny recovery here and the agent would spiral forever. Force a
+                // synchronous, deterministic, LLM-free local compaction so the
+                // agent can keep running regardless of quota/signals.
+                // See pi-usage/diagnosis/stuck-pending-deadlock-root-cause.
+                let window = self.compaction_settings.context_window_tokens;
+                if prep.tokens_before >= 2 * u64::from(window) {
+                    // Abort any stuck background task so the slot is free.
+                    self.compaction_worker.abort_pending();
+                    tracing::warn!(
+                        reason = admission.reason.as_str(),
+                        tokens_before = prep.tokens_before,
+                        window = window,
+                        "Admission denied but context >= 2x window; forcing local compaction",
+                    );
+                    on_event(AgentEvent::AutoCompactionStart {
+                        reason: format!(
+                            "force-local-2x-window;admission={}",
+                            admission.reason.as_str()
+                        ),
+                    });
+                    let result = compaction::local_compact(prep);
+                    let result_value = Some(Self::auto_compaction_result_payload(
+                        result.summary.clone(),
+                        result.first_kept_entry_id.clone(),
+                        result.tokens_before,
+                        result.details.clone(),
+                    ));
+                    self.extensions_is_compacting
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    let apply_result = self
+                        .apply_compaction_entry(
+                            result.summary,
+                            result.first_kept_entry_id,
+                            result.tokens_before,
+                            Some(result.details),
+                            true,
+                        )
+                        .await;
+                    self.extensions_is_compacting
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                    apply_result?;
+                    on_event(AgentEvent::AutoCompactionEnd {
+                        result: result_value,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: None,
+                    });
+                    return Ok(());
+                }
+
                 tracing::info!(
                     reason = admission.reason.as_str(),
                     tokens_before = admission.tokens_before,

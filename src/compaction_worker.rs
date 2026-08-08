@@ -302,7 +302,41 @@ impl CompactionWorkerState {
         }
 
         let pending = self.pending.take()?;
-        Some(pending.join.await)
+        let outcome = pending.join.await;
+
+        // Reset the per-session attempt counter on a SUCCESSFUL compaction so
+        // that a burst of transient failures (e.g. oversized-prompt rejections
+        // during the very endgame that the failsafe local-truncation summary
+        // covers) cannot permanently trip `SessionAttemptLimit`. Without this
+        // reset, the monotonic counter is the mechanism by which a long
+        // session ends up with `can_start() == false` forever — see
+        // `pi-usage/diagnosis/stuck-pending-deadlock-root-cause`.
+        if outcome.is_ok() {
+            self.note_success();
+        }
+
+        Some(outcome)
+    }
+
+    /// Mark the most recent compaction as successful and restore full quota.
+    ///
+    /// Called automatically by `try_recv` when the awaited outcome is `Ok`.
+    /// Resets `attempt_count` to zero (so `SessionAttemptLimit` cannot latch
+    /// permanently) and clears the last-start timestamp so the cooldown clock
+    /// starts fresh only from the next `start()`.
+    pub fn note_success(&mut self) {
+        self.attempt_count = 0;
+        self.last_start = None;
+    }
+
+    /// Abort and drop any in-flight background compaction, freeing the worker
+    /// slot immediately. Used by the catastrophic-oversize failsafe in
+    /// `Agent::maybe_compact` so a stuck `pending` task (which would otherwise
+    /// keep `can_start() == false`) cannot block forced synchronous recovery.
+    pub fn abort_pending(&mut self) {
+        if let Some(mut pending) = self.pending.take() {
+            pending.abort();
+        }
     }
 
     /// Spawn a background compaction on the provided runtime.
