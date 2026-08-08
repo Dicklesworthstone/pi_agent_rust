@@ -1600,54 +1600,135 @@ pub async fn summarize_entries(
     Ok(Some(summary))
 }
 
+/// Build a deterministic, non-LLM compaction summary from `messages_to_summarize`.
+///
+/// This is the failsafe used when the LLM-based `generate_summary` fails — most
+/// importantly when the conversation being summarized is *already* larger than
+/// the model's context window, which makes the summarization prompt itself
+/// get rejected with an HTTP 500 from the provider. Without this fallback,
+/// `compact()` would return `Err`, the background worker would record a failed
+/// attempt, and `maybe_compact` would either loop on a permanently-failing
+/// task or hit `SessionAttemptLimit` and block compaction forever — see
+/// `pi-usage/diagnosis/stuck-pending-deadlock-root-cause`.
+///
+/// The summary preserves, per message, the first/last `SNIPPET_CHARS` of text
+/// (so the agent keeps orientation about what was asked and concluded) plus the
+/// previous compaction summary if any. It is intentionally conservative: it
+/// never fabricates content the way a hallucinating model might.
+pub(crate) fn local_truncation_summary(preparation: &CompactionPreparation) -> String {
+    const SNIPPET_CHARS: usize = 1_000;
+
+    let mut out = String::new();
+    out.push_str(
+        "# Compacted session (failsafe local truncation)\n\n\
+         The prior conversation was too large to summarize via the model \
+         (provider rejected an oversized summarization prompt). It has been \
+         replaced with this deterministic truncation so the session can keep \
+         running.\n",
+    );
+
+    if let Some(prev) = &preparation.previous_summary {
+        out.push_str("\n## Previous compaction summary\n\n");
+        out.push_str(prev);
+        out.push('\n');
+    }
+
+    let msgs = &preparation.messages_to_summarize;
+    if !msgs.is_empty() {
+        out.push_str("\n## Prior turns (truncated)\n\n");
+        for (i, msg) in msgs.iter().enumerate() {
+            let role = session_message_role_label(msg);
+            let full = session_message_text(msg);
+            let snippet = truncate_snippet(&full, SNIPPET_CHARS);
+            if snippet.trim().is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "[{i}] [{role}]: {snippet}");
+        }
+    } else {
+        out.push_str("\n(No prior messages to summarize.)\n");
+    }
+
+    out
+}
+
+fn session_message_role_label(msg: &SessionMessage) -> &'static str {
+    match msg {
+        SessionMessage::User { .. } => "User",
+        SessionMessage::Assistant { .. } => "Assistant",
+        SessionMessage::ToolResult { .. } => "ToolResult",
+        SessionMessage::Custom { .. } => "Custom",
+        SessionMessage::BashExecution { .. } => "BashExecution",
+        SessionMessage::BranchSummary { .. } => "BranchSummary",
+        SessionMessage::CompactionSummary { .. } => "CompactionSummary",
+    }
+}
+
+/// Extract the most informative text from a `SessionMessage` for the failsafe
+/// summary. Falls back to empty string for purely-structural messages.
+fn session_message_text(msg: &SessionMessage) -> String {
+    match msg {
+        SessionMessage::User { content, .. } => match content {
+            UserContent::Text(t) => t.clone(),
+            UserContent::Blocks(blocks) => collect_text_blocks(blocks),
+        },
+        SessionMessage::Assistant { message } => collect_text_blocks(&message.content),
+        SessionMessage::ToolResult { content, .. } => collect_text_blocks(content),
+        SessionMessage::Custom { content, .. } => content.clone(),
+        SessionMessage::BashExecution { command, output, .. } => {
+            format!("$ {command}\n{output}")
+        }
+        SessionMessage::BranchSummary { summary, .. } => summary.clone(),
+        SessionMessage::CompactionSummary { summary, .. } => summary.clone(),
+    }
+}
+
+fn truncate_snippet(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max {
+        return text.to_string();
+    }
+    let head: String = chars.iter().take(max / 2).collect();
+    let tail: String = chars.iter().skip(chars.len() - max / 2).collect();
+    format!("{head}\n…[truncated {n} chars]…\n{tail}", n = chars.len() - max)
+}
+
 pub async fn compact(
     preparation: CompactionPreparation,
     provider: Arc<dyn Provider>,
     api_key: &str,
     custom_instructions: Option<&str>,
 ) -> Result<CompactionResult> {
-    let summary = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
-        let history_summary = if preparation.messages_to_summarize.is_empty() {
-            "No prior history.".to_string()
-        } else {
-            generate_summary(
-                &preparation.messages_to_summarize,
-                Arc::clone(&provider),
-                api_key,
-                &preparation.settings,
-                custom_instructions,
-                preparation.previous_summary.as_deref(),
-            )
-            .await?
-        };
-
-        let turn_prefix_summary = generate_turn_prefix_summary(
-            &preparation.turn_prefix_messages,
-            Arc::clone(&provider),
-            api_key,
-            &preparation.settings,
-        )
-        .await?;
-
-        format!(
-            "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
-        )
-    } else {
-        generate_summary(
-            &preparation.messages_to_summarize,
-            Arc::clone(&provider),
-            api_key,
-            &preparation.settings,
-            custom_instructions,
-            preparation.previous_summary.as_deref(),
-        )
-        .await?
-    };
-
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
     let details = CompactionDetails {
         read_files: read_files.clone(),
         modified_files: modified_files.clone(),
+    };
+
+    let summary = match compact_generate_summary(&preparation, &provider, api_key, custom_instructions)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            // Failsafe: a failed LLM summary used to deadlock the whole
+            // compaction pipeline (oversized prompt rejected by provider →
+            // endless retries → SessionAttemptLimit). Fall back to a
+            // deterministic truncation so the background task always *succeeds*,
+            // frees the worker slot, and lets the agent keep running.
+            tracing::warn!(
+                error = %e,
+                tokens_before = preparation.tokens_before,
+                "LLM summarization failed; using local truncation failsafe"
+            );
+            let mut s = local_truncation_summary(&preparation);
+            s.push_str(&format_file_operations(&read_files, &modified_files));
+            return Ok(CompactionResult {
+                summary: s,
+                first_kept_entry_id: preparation.first_kept_entry_id,
+                tokens_before: preparation.tokens_before,
+                details,
+            });
+        }
     };
 
     let mut summary = summary;
@@ -1659,6 +1740,53 @@ pub async fn compact(
         tokens_before: preparation.tokens_before,
         details,
     })
+}
+
+/// Shared summarization body for the split-turn and non-split-turn paths.
+/// Returns the assembled summary string, or the first error encountered.
+async fn compact_generate_summary(
+    preparation: &CompactionPreparation,
+    provider: &Arc<dyn Provider>,
+    api_key: &str,
+    custom_instructions: Option<&str>,
+) -> Result<String> {
+    if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+        let history_summary = if preparation.messages_to_summarize.is_empty() {
+            "No prior history.".to_string()
+        } else {
+            generate_summary(
+                &preparation.messages_to_summarize,
+                Arc::clone(provider),
+                api_key,
+                &preparation.settings,
+                custom_instructions,
+                preparation.previous_summary.as_deref(),
+            )
+            .await?
+        };
+
+        let turn_prefix_summary = generate_turn_prefix_summary(
+            &preparation.turn_prefix_messages,
+            Arc::clone(provider),
+            api_key,
+            &preparation.settings,
+        )
+        .await?;
+
+        Ok(format!(
+            "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
+        ))
+    } else {
+        generate_summary(
+            &preparation.messages_to_summarize,
+            Arc::clone(provider),
+            api_key,
+            &preparation.settings,
+            custom_instructions,
+            preparation.previous_summary.as_deref(),
+        )
+        .await
+    }
 }
 
 pub fn compaction_details_to_value(details: &CompactionDetails) -> Result<Value> {
