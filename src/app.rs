@@ -91,7 +91,10 @@ pub fn normalize_cli(cli: &mut cli::Cli) {
         cli.mode = Some("rpc".to_string());
     }
 
-    if cli.print {
+    if cli.print && cli.session_dir.is_none() && cli.session.is_none() {
+        // Print mode is ephemeral by default, but an explicit --session-dir or
+        // --session opts back into a persistent session (so live compaction/
+        // autosave can be observed from print mode).
         cli.no_session = true;
     }
 
@@ -2206,6 +2209,27 @@ mod tests {
                 prop_assert_eq!(cli.no_session, no_session_once);
                 prop_assert_eq!(cli.print, print_once);
             }
+        }
+
+        #[test]
+        fn normalize_cli_print_with_session_dir_keeps_session_enabled() {
+            let mut cli = cli::Cli::parse_from(["pi", "--session-dir", "/tmp/x", "-p", "hi"]);
+            assert!(cli.print);
+            assert!(cli.session_dir.is_some());
+            normalize_cli(&mut cli);
+            // An explicit --session-dir opts out of the print-mode ephemeral
+            // default, so the session must stay enabled (no_session=false).
+            assert!(!cli.no_session, "no_session should be false when --session-dir is set in print mode");
+
+            // Same for --session.
+            let mut cli2 = cli::Cli::parse_from(["pi", "--session", "abc", "-p", "hi"]);
+            normalize_cli(&mut cli2);
+            assert!(!cli2.no_session, "no_session should be false when --session is set in print mode");
+
+            // Without either, print mode stays ephemeral.
+            let mut cli3 = cli::Cli::parse_from(["pi", "-p", "hi"]);
+            normalize_cli(&mut cli3);
+            assert!(cli3.no_session, "no_session should be true for plain print mode");
         }
 
         // ====================================================================
