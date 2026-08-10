@@ -8736,8 +8736,11 @@ impl AgentSession {
                     );
                     on_event(AgentEvent::AutoCompactionStart {
                         reason: format!(
-                            "force-local-2x-window;admission={}",
-                            admission.reason.as_str()
+                            "force-local-2x-window;admission={};pressure={};tokens={};window={}",
+                            admission.reason.as_str(),
+                            Self::pressure_pct(prep.tokens_before, self.compaction_settings.context_window_tokens, self.compaction_settings.reserve_tokens),
+                            prep.tokens_before,
+                            self.compaction_settings.context_window_tokens,
                         ),
                     });
                     let result = compaction::local_compact(prep);
@@ -8780,7 +8783,13 @@ impl AgentSession {
             }
 
             on_event(AgentEvent::AutoCompactionStart {
-                reason: format!("threshold;admission={}", admission.reason.as_str()),
+                reason: format!(
+                    "threshold;admission={};pressure={};tokens={};window={}",
+                    admission.reason.as_str(),
+                    Self::pressure_pct(prep.tokens_before, self.compaction_settings.context_window_tokens, self.compaction_settings.reserve_tokens),
+                    prep.tokens_before,
+                    self.compaction_settings.context_window_tokens,
+                ),
             });
 
             let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
@@ -8866,6 +8875,20 @@ impl AgentSession {
         self.compaction_runtime = Some(runtime);
         self.runtime_handle = Some(runtime_handle.clone());
         Ok(runtime_handle)
+    }
+
+    /// Compute a 0-99 "context pressure" percentage for the compaction start
+    /// banner: 0 = exactly at the trigger threshold, 50 = halfway to the
+    /// window, capped at 99 at/over the window.
+    fn pressure_pct(tokens_before: u64, window: u32, reserve: u32) -> u32 {
+        let threshold = u64::from(window).saturating_sub(u64::from(reserve));
+        if threshold == 0 {
+            return 99;
+        }
+        let over = tokens_before.saturating_sub(threshold);
+        let span = u64::from(window).saturating_sub(threshold).max(1);
+        let pct = (over * 100) / span;
+        pct.min(99) as u32
     }
 
     fn auto_compaction_result_payload(

@@ -1483,7 +1483,7 @@ async fn run(
         }
     });
     let is_print_mode = mode.eq("text") || mode.eq("json");
-    if is_print_mode {
+    if is_print_mode && cli.session_dir.is_none() && cli.session.is_none() {
         cli.no_session = true;
     }
     if mode.eq("text") && initial.is_none() && messages.is_empty() {
@@ -6952,6 +6952,41 @@ async fn run_print_mode(
             .as_ref()
             .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
         move |event: AgentEvent| {
+            // Emit a terse colored progress line when a background compaction
+            // starts or finishes, so live pi sessions surface compaction to the
+            // user. Suppressed in JSON/text-stream modes (those emit their own
+            // structured event). The reason string carries pressure=N from
+            // `Agent::maybe_compact`, parsed here for the `[NN%]` meter.
+            if !emit_json_events && !stream_text_events {
+                match &event {
+                    AgentEvent::AutoCompactionStart { reason } => {
+                        let pct = reason
+                            .split("pressure=")
+                            .nth(1)
+                            .and_then(|s| s.split(';').next())
+                            .and_then(|s| s.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        eprintln!(
+                            "\x1b[36m[{pct:>2}%]\x1b[0m Compacting... \x1b[2m{reason}\x1b[0m"
+                        );
+                    }
+                    AgentEvent::AutoCompactionEnd {
+                        result, aborted, error_message, ..
+                    } => {
+                        let status = if *aborted {
+                            "aborted".to_string()
+                        } else if result.is_some() {
+                            "done ✓".to_string()
+                        } else if let Some(e) = error_message {
+                            format!("failed: {}", e)
+                        } else {
+                            "no result".to_string()
+                        };
+                        eprintln!("\x1b[36m[ ✓]\x1b[0m Compaction {}", status);
+                    }
+                    _ => {}
+                }
+            }
             if emit_json_events {
                 if let Ok(serialized) = serde_json::to_string(&event) {
                     println!("{serialized}");
