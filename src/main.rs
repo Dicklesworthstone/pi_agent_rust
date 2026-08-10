@@ -6952,12 +6952,15 @@ async fn run_print_mode(
             .as_ref()
             .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
         move |event: AgentEvent| {
-            // Emit a terse colored progress line when a background compaction
-            // starts or finishes, so live pi sessions surface compaction to the
-            // user. Suppressed in JSON/text-stream modes (those emit their own
-            // structured event). The reason string carries pressure=N from
-            // `Agent::maybe_compact`, parsed here for the `[NN%]` meter.
-            if !emit_json_events && !stream_text_events {
+            // Emit a terse colored progress line (to stderr) when a background
+            // compaction starts or finishes, so live pi sessions surface
+            // compaction to the user. Suppressed only in JSON mode (which emits
+            // its own structured event stream). Text mode streams assistant
+            // content to stdout via `stream_text_events`, but the compaction
+            // banner is a separate stderr lifecycle line — both can coexist.
+            // The reason string carries pressure=N from `Agent::maybe_compact`,
+            // parsed here for the `[NN%]` meter.
+            if !emit_json_events {
                 match &event {
                     AgentEvent::AutoCompactionStart { reason } => {
                         let pct = reason
