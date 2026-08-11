@@ -13,10 +13,14 @@
 profile-rustflags = true
 
 [profile.release]
-rustflags = ["-Cllvm-args=-enable-machine-outliner=always"]
+rustflags = ["-Z", "threads=4", "-Cllvm-args=-enable-machine-outliner=always"]
 
 [target.'cfg(target_os = "freebsd")']
 rustflags = ["-L", "/usr/local/lib"]
 
 [env]
 PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
+
+[build]
+# Parallel rustc front-end (nightly). Added by build-settings sweep.
+rustflags = ["-Z", "threads=4"]
