@@ -1725,8 +1725,9 @@ pub async fn summarize_entries(
 /// Generate the LLM-written compaction summary for `preparation`.
 ///
 /// Errors here (provider failures, oversized summarization prompts, empty
-/// responses) are recoverable: [`compact`] falls back to a deterministic
-/// local summary instead of propagating them.
+/// responses) are recoverable once the session is past the forced-local
+/// threshold: [`compact`] then falls back to a deterministic local summary
+/// instead of propagating them.
 async fn generate_llm_summary(
     preparation: &CompactionPreparation,
     provider: Arc<dyn Provider>,
@@ -1803,9 +1804,17 @@ pub async fn compact(
         Err(error) => {
             // An oversized session makes the summarization prompt itself
             // oversized, so the provider call fails for exactly the
-            // sessions that most need compaction. Failing compaction here
+            // sessions that most need compaction. Failing compaction there
             // would let the session grow without bound; degrade to a
-            // deterministic local summary instead.
+            // deterministic local summary instead. Below the forced-local
+            // threshold the failure is likely transient (rate limit, network
+            // blip) and retrying with the provider later beats permanently
+            // storing a degraded truncation summary, so propagate the error
+            // and let the worker's cooldown/attempt-limit machinery (and
+            // eventually the forced-local failsafe) govern.
+            if !requires_forced_local_compaction(preparation.tokens_before, &preparation.settings) {
+                return Err(error);
+            }
             tracing::warn!(
                 error = %error,
                 "LLM compaction summarization failed; using deterministic local fallback summary"
@@ -3957,7 +3966,9 @@ mod tests {
                 ],
                 turn_prefix_messages: Vec::new(),
                 is_split_turn: false,
-                tokens_before: 250_000,
+                // Past the forced-local threshold (2x the default 128K window)
+                // so provider failures degrade to the deterministic fallback.
+                tokens_before: 600_000,
                 previous_summary: Some("## Goal\nShip the scheduler fix".to_string()),
                 file_ops,
                 settings: ResolvedCompactionSettings::default(),
@@ -3973,7 +3984,7 @@ mod tests {
 
                 // Cut-point metadata preserved.
                 assert_eq!(result.first_kept_entry_id, "entry-9");
-                assert_eq!(result.tokens_before, 250_000);
+                assert_eq!(result.tokens_before, 600_000);
 
                 // Fallback marker and previous summary preserved.
                 assert!(result.summary.contains("deterministic fallback"));
@@ -4047,7 +4058,23 @@ mod tests {
             assert!(result.summary.contains("message number 0 "));
             assert!(result.summary.contains("message number 199 "));
             assert_eq!(result.first_kept_entry_id, "entry-9");
-            assert_eq!(result.tokens_before, 250_000);
+            assert_eq!(result.tokens_before, 600_000);
+        }
+
+        #[test]
+        fn provider_error_below_forced_threshold_propagates() {
+            run_async(async {
+                let mut prep = make_preparation();
+                // Over the compaction threshold but below 2x the window: the
+                // failure is likely transient, so the worker's retry machinery
+                // must see it instead of storing a degraded local summary.
+                prep.tokens_before = 200_000;
+
+                let error = compact(prep, Arc::new(FailingProvider), "key", None)
+                    .await
+                    .expect_err("provider errors below the forced threshold must propagate");
+                assert!(error.to_string().contains("exceeds context window"));
+            });
         }
 
         #[test]
