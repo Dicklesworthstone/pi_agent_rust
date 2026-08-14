@@ -321,18 +321,33 @@ impl OpenAIProvider {
         // into `high` itself, so we only emit the values it documents and let
         // `off` request the explicit non-thinking path. Both `xhigh` and `max`
         // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
-        // when the first-class `max` level was added; gh #139).
+        // when the first-class `max` level was added; gh #139). A catalog
+        // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
+        // enabled levels (gh #117/#165), matching the anthropic-messages and
+        // openai-responses transports; `off` never emits an effort.
         let (thinking, reasoning_effort) = match self.reasoning_style() {
-            Some(ReasoningStyle::DeepSeek) => match options.thinking_level.unwrap_or_default() {
-                ThinkingLevel::Off => (Some(OpenAIThinking { kind: "disabled" }), None),
-                ThinkingLevel::High => (Some(OpenAIThinking { kind: "enabled" }), Some("high")),
-                ThinkingLevel::XHigh | ThinkingLevel::Max => {
-                    (Some(OpenAIThinking { kind: "enabled" }), Some("max"))
+            Some(ReasoningStyle::DeepSeek) => {
+                let level = options.thinking_level.unwrap_or_default();
+                if level == ThinkingLevel::Off {
+                    (Some(OpenAIThinking { kind: "disabled" }), None)
+                } else {
+                    let mapped = self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.thinking_level_map.as_ref())
+                        .and_then(|map| map.get(level.to_string().as_str()))
+                        .map(String::as_str);
+                    let effort = mapped.or(match level {
+                        ThinkingLevel::High => Some("high"),
+                        ThinkingLevel::XHigh | ThinkingLevel::Max => Some("max"),
+                        ThinkingLevel::Off
+                        | ThinkingLevel::Minimal
+                        | ThinkingLevel::Low
+                        | ThinkingLevel::Medium => None,
+                    });
+                    (Some(OpenAIThinking { kind: "enabled" }), effort)
                 }
-                ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => {
-                    (Some(OpenAIThinking { kind: "enabled" }), None)
-                }
-            },
+            }
             None => (None, None),
         };
 
@@ -1295,9 +1310,11 @@ pub struct OpenAIRequest<'a> {
     thinking: Option<OpenAIThinking>,
     /// DeepSeek-only reasoning effort (`"high"` | `"max"`). DeepSeek maps
     /// `low`/`medium` to `high` and `xhigh` to `max` itself, so we only emit the
-    /// two values it documents.
+    /// two values it documents — unless a catalog `thinkingLevelMap` remaps the
+    /// level, in which case the mapped value (borrowed from the provider's
+    /// compat config) is sent verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning_effort: Option<&'static str>,
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1944,6 +1961,70 @@ mod tests {
         let quiet = body(&non_reasoning, crate::model::ThinkingLevel::High);
         assert!(quiet.get("thinking").is_none());
         assert!(quiet.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_thinking_level_map_overrides_deepseek_effort() {
+        // gh #165/#166 interaction: a catalog `thinkingLevelMap` is
+        // authoritative over the DeepSeek dialect's built-in effort
+        // vocabulary, matching the anthropic-messages and openai-responses
+        // transports. Unmapped levels keep the documented defaults, and `off`
+        // never emits an effort even if mapped.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_level_map: Some(HashMap::from([
+                    ("xhigh".to_string(), "high".to_string()),
+                    ("medium".to_string(), "medium".to_string()),
+                    ("off".to_string(), "none".to_string()),
+                ])),
+                ..Default::default()
+            }));
+        let body = |level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        let xhigh = body(crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "high", "map overrides max");
+
+        let medium = body(crate::model::ThinkingLevel::Medium);
+        assert_eq!(
+            medium["reasoning_effort"], "medium",
+            "map can emit an effort for a level with no default"
+        );
+
+        let max = body(crate::model::ThinkingLevel::Max);
+        assert_eq!(
+            max["reasoning_effort"], "max",
+            "unmapped level keeps default"
+        );
+
+        let high = body(crate::model::ThinkingLevel::High);
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let off = body(crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off never emits an effort, mapped or not"
+        );
     }
 
     #[test]

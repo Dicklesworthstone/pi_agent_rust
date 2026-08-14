@@ -161,6 +161,24 @@ impl ModelEntry {
         if !self.model.reasoning {
             return false;
         }
+        // gh #166: an explicit catalog `compat.thinkingFormat` declaration is
+        // authoritative, mirroring `OpenAIProvider::reasoning_style`.
+        // `"deepseek"` opts a custom provider into the dialect, so the
+        // registry must not clamp `XHigh`/`Max` away before `build_request`
+        // runs (otherwise the serializer's `reasoning_effort: "max"` arm is
+        // dead at runtime — the same rationale as the id/URL heuristic
+        // below). Any other declared format opts a DeepSeek-looking provider
+        // out, so its level list stays coherent with a transport that emits
+        // no DeepSeek thinking controls.
+        if let Some(format) = self
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_format.as_deref())
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+        {
+            return format.eq_ignore_ascii_case("deepseek");
+        }
         let provider_is_deepseek = canonical_provider_id(&self.model.provider)
             .is_some_and(|canonical| canonical == "deepseek")
             || self.model.provider.eq_ignore_ascii_case("deepseek");
@@ -7127,6 +7145,76 @@ mod tests {
         assert_eq!(
             bare.clamp_thinking_level(ThinkingLevel::XHigh),
             ThinkingLevel::High
+        );
+    }
+
+    /// gh #166: a declared `compat.thinkingFormat: "deepseek"` opts a custom
+    /// provider into the DeepSeek dialect, so the registry must not clamp
+    /// `XHigh`/`Max` away before the transport can serialize its
+    /// `reasoning_effort: "max"` arm.
+    #[test]
+    fn declared_deepseek_thinking_format_prevents_xhigh_and_max_clamping() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry_with_provider(
+            "deepseek-v4-flash",
+            true,
+            "opencode-go",
+            "https://opencode.ai/zen/go/v1",
+        );
+        entry.compat = Some(CompatConfig {
+            thinking_format: Some("deepseek".to_string()),
+            ..CompatConfig::default()
+        });
+        assert!(entry.supports_xhigh());
+        assert!(entry.supports_max());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Max
+        );
+
+        // Non-reasoning models stay clamped regardless of the declaration.
+        entry.model.reasoning = false;
+        assert!(!entry.supports_xhigh());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::Off
+        );
+    }
+
+    /// gh #166: an explicit non-deepseek `thinkingFormat` opts a
+    /// DeepSeek-looking provider out of the dialect, so the registry's level
+    /// list stays coherent with a transport that emits no DeepSeek controls.
+    /// An empty/whitespace declaration is treated as undeclared and keeps the
+    /// id/URL heuristic.
+    #[test]
+    fn declared_non_deepseek_thinking_format_opts_out_of_deepseek_levels() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry_with_provider(
+            "deepseek-v4-pro",
+            true,
+            "deepseek",
+            "https://api.deepseek.com/v1",
+        );
+        assert!(entry.supports_xhigh(), "heuristic baseline");
+
+        entry.compat = Some(CompatConfig {
+            thinking_format: Some("openai".to_string()),
+            ..CompatConfig::default()
+        });
+        assert!(!entry.supports_xhigh());
+        assert!(!entry.supports_max());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::High
+        );
+
+        entry.compat = Some(CompatConfig {
+            thinking_format: Some("   ".to_string()),
+            ..CompatConfig::default()
+        });
+        assert!(
+            entry.supports_xhigh(),
+            "blank declaration falls back to the heuristic"
         );
     }
 
