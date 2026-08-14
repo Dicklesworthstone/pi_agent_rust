@@ -46,6 +46,20 @@ impl ModelEntry {
                 | "gpt-5.3-codex-spark"
         ) || self.is_deepseek_reasoning_model()
             || self.is_anthropic_xhigh_effort_model()
+            || self.thinking_level_map_declares("xhigh")
+    }
+
+    /// Whether the catalog's per-model `thinkingLevelMap` declares a mapping
+    /// for the given lowercase thinking-level name. A declared entry is the
+    /// catalog author asserting the model accepts that tier (possibly under a
+    /// different provider vocabulary), so the registry must not clamp it away
+    /// for custom models that hard-coded model-id detection cannot know about
+    /// (gh #165).
+    fn thinking_level_map_declares(&self, level: &str) -> bool {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_level_map.as_ref())
+            .is_some_and(|map| map.contains_key(level))
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose modern
@@ -102,6 +116,7 @@ impl ModelEntry {
             "gpt-5.6" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna"
         ) || self.is_deepseek_reasoning_model()
             || self.is_anthropic_max_effort_model()
+            || self.thinking_level_map_declares("max")
     }
 
     /// Whether this is an Anthropic adaptive-thinking model whose
@@ -661,6 +676,12 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<CompatConfig>,
+    /// Model-level `thinkingLevelMap` (gh #165). Equivalent to — and
+    /// authoritative over — `compat.thinkingLevelMap` for this model: it is
+    /// folded into the entry's merged [`CompatConfig`] at registry build time.
+    /// Declaring a mapping for `xhigh`/`max` also marks the level as supported,
+    /// so the registry does not clamp it away for custom models.
+    pub thinking_level_map: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -2867,12 +2888,21 @@ fn apply_custom_models_with_provider_headers(
                 headers: HashMap::new(),
             };
 
+            let mut compat = merge_compat(provider_cfg.compat.as_ref(), model_cfg.compat.as_ref());
+            if let Some(map) = model_cfg.thinking_level_map.clone() {
+                // Model-level `thinkingLevelMap` is authoritative over any
+                // compat-carried map (gh #165).
+                compat
+                    .get_or_insert_with(CompatConfig::default)
+                    .thinking_level_map = Some(map);
+            }
+
             models.push(ModelEntry {
                 model,
                 api_key: provider_key.clone(),
                 headers: model_headers,
                 auth_header,
-                compat: merge_compat(provider_cfg.compat.as_ref(), model_cfg.compat.as_ref()),
+                compat,
                 oauth_config: None,
             });
         }
@@ -6958,6 +6988,122 @@ mod tests {
         assert_eq!(
             entry.clamp_thinking_level(ThinkingLevel::Off),
             ThinkingLevel::Off
+        );
+    }
+
+    /// gh #165: a catalog `thinkingLevelMap` declaring `xhigh`/`max` marks the
+    /// tier as supported, so custom models outside the hard-coded id lists are
+    /// not silently clamped down.
+    #[test]
+    fn thinking_level_map_prevents_xhigh_and_max_clamping() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("my-custom-reasoner", true);
+        entry.compat = Some(CompatConfig {
+            thinking_level_map: Some(HashMap::from([
+                ("xhigh".to_string(), "high".to_string()),
+                ("max".to_string(), "ultra".to_string()),
+            ])),
+            ..CompatConfig::default()
+        });
+
+        assert!(entry.supports_xhigh());
+        assert!(entry.supports_max());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::XHigh
+        );
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::Max
+        );
+        assert_eq!(
+            entry.available_thinking_levels(),
+            vec![
+                ThinkingLevel::Off,
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+                ThinkingLevel::XHigh,
+                ThinkingLevel::Max,
+            ]
+        );
+    }
+
+    /// gh #165: a map declaring only `xhigh` still downgrades `Max -> XHigh`,
+    /// and an absent map keeps the existing clamping behavior for unknown ids.
+    #[test]
+    fn thinking_level_map_partial_and_absent_clamping() {
+        use crate::model::ThinkingLevel;
+        let mut entry = make_model_entry("my-custom-reasoner", true);
+        entry.compat = Some(CompatConfig {
+            thinking_level_map: Some(HashMap::from([("xhigh".to_string(), "max".to_string())])),
+            ..CompatConfig::default()
+        });
+        assert!(entry.supports_xhigh());
+        assert!(!entry.supports_max());
+        assert_eq!(
+            entry.clamp_thinking_level(ThinkingLevel::Max),
+            ThinkingLevel::XHigh
+        );
+
+        let bare = make_model_entry("my-custom-reasoner", true);
+        assert!(!bare.supports_xhigh());
+        assert_eq!(
+            bare.clamp_thinking_level(ThinkingLevel::XHigh),
+            ThinkingLevel::High
+        );
+    }
+
+    /// gh #165: a model-level top-level `thinkingLevelMap` in models.json is
+    /// folded into the entry's merged compat and is authoritative over a
+    /// compat-carried map.
+    #[test]
+    fn apply_custom_models_folds_model_level_thinking_level_map_into_compat() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = Vec::new();
+        let config = ModelsConfig {
+            providers: HashMap::from([(
+                "my-gateway".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://gateway.example.com/v1".to_string()),
+                    api: Some("openai-responses".to_string()),
+                    models: Some(vec![ModelConfig {
+                        id: "custom-reasoner".to_string(),
+                        reasoning: Some(true),
+                        compat: Some(CompatConfig {
+                            thinking_level_map: Some(HashMap::from([(
+                                "xhigh".to_string(),
+                                "compat-loses".to_string(),
+                            )])),
+                            ..CompatConfig::default()
+                        }),
+                        thinking_level_map: Some(HashMap::from([(
+                            "xhigh".to_string(),
+                            "high".to_string(),
+                        )])),
+                        ..ModelConfig::default()
+                    }]),
+                    ..ProviderConfig::default()
+                },
+            )]),
+        };
+
+        apply_custom_models(&auth, &mut models, &config, None);
+
+        let entry = models
+            .iter()
+            .find(|entry| entry.model.id == "custom-reasoner")
+            .expect("custom model should be added");
+        let map = entry
+            .compat
+            .as_ref()
+            .and_then(|compat| compat.thinking_level_map.as_ref())
+            .expect("thinkingLevelMap should be carried on merged compat");
+        assert_eq!(map.get("xhigh").map(String::as_str), Some("high"));
+        assert!(
+            entry.supports_xhigh(),
+            "declared xhigh mapping must survive clamping"
         );
     }
 

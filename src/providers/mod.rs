@@ -969,6 +969,7 @@ pub fn create_provider(
                     .with_base_url(normalize_openai_responses_base(&entry.model.base_url))
                     .with_compat(entry.compat.clone())
                     .with_auth_header(entry.auth_header)
+                    .with_reasoning(entry.model.reasoning)
                     .with_client(client),
             ))
         }
@@ -981,6 +982,7 @@ pub fn create_provider(
                 .with_base_url(normalize_openai_codex_responses_base(&entry.model.base_url))
                 .with_compat(entry.compat.clone())
                 .with_auth_header(entry.auth_header)
+                .with_reasoning(entry.model.reasoning)
                 .with_client(client),
         )),
         ProviderRouteKind::NativeCursor => Ok(Arc::new(
