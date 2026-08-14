@@ -164,7 +164,7 @@ clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 clap_complete = "4.5.66"
 
 # Async runtime
-asupersync = { version = "0.3.9", default-features = false, features = ["tls-webpki-roots", "test-internals"] }
+asupersync = { version = "0.4.4", default-features = false, features = ["tls-webpki-roots", "test-internals"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -209,13 +209,13 @@ arboard = { version = "3.6.1", optional = true }
 # Filesystem
 dirs = "6"
 tempfile = "3.25.0"
-fs4 = "0.13"
+fs4 = "1.1"
 glob = "0.3"
 ignore = "0.4"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
-sqlmodel-sqlite = { version = "0.2.2" }
-sqlmodel-core = { version = "0.2.2" }
+sqlmodel-sqlite = { version = "0.3.3" }
+sqlmodel-core = { version = "0.3.2" }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -227,7 +227,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1.1.9"
 sha2 = "0.10"
 sha1 = "0.10"
@@ -276,7 +276,7 @@ arbitrary = { version = "1", features = ["derive"] }
 pretty_assertions = "1"
 insta = { version = "1", features = ["filters"] }
 tempfile = "3.25.0"
-asupersync = { version = "0.3.9", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.4.4", default-features = false, features = ["test-internals"] }
 criterion = { version = "0.8.2", features = ["html_reports"] }
 jsonschema = { version = "0.42.0", default-features = false }
 proptest = "1.10.0"
