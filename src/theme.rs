@@ -72,6 +72,58 @@ pub struct UiColors {
     pub cursor: String,
 }
 
+/// Terminal background classification used for theme auto-detection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalBackground {
+    Dark,
+    Light,
+}
+
+/// Classify a `COLORFGBG` value into a terminal background.
+///
+/// `COLORFGBG` is a passive environment hint set by some terminals
+/// (rxvt, konsole, and others) with the format `"<fg>;<bg>"` or
+/// `"<fg>;default;<bg>"`. The last segment is the background color
+/// index: values below 8 are dark colors, 8 and above are light.
+///
+/// Mirrors original Pi's `detectTerminalBackground()`: missing or
+/// unparseable values default to dark.
+#[must_use]
+pub fn classify_colorfgbg(value: Option<&str>) -> TerminalBackground {
+    let Some(value) = value else {
+        return TerminalBackground::Dark;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return TerminalBackground::Dark;
+    }
+    let mut parts = value.split(';');
+    let (Some(_fg), Some(second)) = (parts.next(), parts.next()) else {
+        return TerminalBackground::Dark;
+    };
+    // "fg;default;bg" form: the background index is the last segment.
+    let bg = parts.last().unwrap_or(second);
+    bg.trim()
+        .parse::<u32>()
+        .map_or(TerminalBackground::Dark, |index| {
+            if index < 8 {
+                TerminalBackground::Dark
+            } else {
+                TerminalBackground::Light
+            }
+        })
+}
+
+/// Detect the terminal background from the `COLORFGBG` environment variable.
+///
+/// This is intentionally passive (no OSC/tty queries, which can hang or
+/// raise SIGTTIN in background processes). Defaults to dark when the
+/// variable is missing or unparseable.
+#[must_use]
+pub fn detect_terminal_background() -> TerminalBackground {
+    classify_colorfgbg(std::env::var("COLORFGBG").ok().as_deref())
+}
+
 /// Explicit roots for theme discovery.
 #[derive(Debug, Clone)]
 pub struct ThemeRoots {
@@ -92,8 +144,11 @@ impl ThemeRoots {
 impl Theme {
     /// Resolve the active theme for the given config/cwd.
     ///
-    /// - If `config.theme` is unset/empty, defaults to [`Theme::dark`].
+    /// - If `config.theme` is unset/empty, auto-detects dark/light from the
+    ///   terminal background (`COLORFGBG`), defaulting to [`Theme::dark`]
+    ///   when detection is inconclusive — matching original Pi.
     /// - If set to `dark`, `light`, or `solarized`, uses built-in defaults.
+    /// - If set to `light/dark`, `auto`, or `system`, auto-detects as above.
     /// - Otherwise, attempts to resolve a theme spec:
     ///   - discovered theme name (from user/project theme dirs)
     ///   - theme JSON file path (absolute or cwd-relative, supports `~/...`)
@@ -102,11 +157,11 @@ impl Theme {
     #[must_use]
     pub fn resolve(config: &Config, cwd: &Path) -> Self {
         let Some(spec) = config.theme.as_deref() else {
-            return Self::dark();
+            return Self::detected();
         };
         let spec = spec.trim();
         if spec.is_empty() {
-            return Self::dark();
+            return Self::detected();
         }
 
         match Self::resolve_spec(spec, cwd) {
@@ -122,6 +177,7 @@ impl Theme {
     ///
     /// Supported specs:
     /// - Built-ins: `dark`, `light`, `solarized`
+    /// - Auto-detection: `light/dark`, `auto`, `system` (via `COLORFGBG`)
     /// - Theme name: resolves via [`Self::load_by_name`]
     /// - File path: resolves via [`Self::load`] (absolute or cwd-relative, supports `~/...`)
     pub fn resolve_spec(spec: &str, cwd: &Path) -> Result<Self> {
@@ -137,6 +193,12 @@ impl Theme {
         }
         if spec.eq_ignore_ascii_case("solarized") {
             return Ok(Self::solarized());
+        }
+        if spec.eq_ignore_ascii_case("light/dark")
+            || spec.eq_ignore_ascii_case("auto")
+            || spec.eq_ignore_ascii_case("system")
+        {
+            return Ok(Self::detected());
         }
 
         if looks_like_theme_path(spec) {
@@ -326,6 +388,22 @@ impl Theme {
         }
 
         Ok(None)
+    }
+
+    /// Built-in theme matching a detected terminal background.
+    #[must_use]
+    pub fn from_background(background: TerminalBackground) -> Self {
+        match background {
+            TerminalBackground::Dark => Self::dark(),
+            TerminalBackground::Light => Self::light(),
+        }
+    }
+
+    /// Built-in theme auto-detected from the terminal background
+    /// (`COLORFGBG`; dark when inconclusive).
+    #[must_use]
+    pub fn detected() -> Self {
+        Self::from_background(detect_terminal_background())
     }
 
     /// Default dark theme.
@@ -787,38 +865,120 @@ mod tests {
     }
 
     // ── resolve with empty/None config ───────────────────────────────
+    //
+    // With no theme configured, `resolve` auto-detects from COLORFGBG
+    // (matching original Pi). In environments without COLORFGBG this is
+    // dark; assert against `Theme::detected()` so the tests hold either way.
 
     #[test]
-    fn resolve_defaults_to_dark_when_no_theme_set() {
+    fn resolve_auto_detects_when_no_theme_set() {
         let cfg = Config {
             theme: None,
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
-        assert_eq!(resolved.name, "dark");
+        assert_eq!(resolved.name, Theme::detected().name);
     }
 
     #[test]
-    fn resolve_defaults_to_dark_when_theme_is_empty() {
+    fn resolve_auto_detects_when_theme_is_empty() {
         let cfg = Config {
             theme: Some(String::new()),
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
-        assert_eq!(resolved.name, "dark");
+        assert_eq!(resolved.name, Theme::detected().name);
     }
 
     #[test]
-    fn resolve_defaults_to_dark_when_theme_is_whitespace() {
+    fn resolve_auto_detects_when_theme_is_whitespace() {
         let cfg = Config {
             theme: Some("   ".to_string()),
             ..Default::default()
         };
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
-        assert_eq!(resolved.name, "dark");
+        assert_eq!(resolved.name, Theme::detected().name);
+    }
+
+    // ── terminal background detection (COLORFGBG) ────────────────────
+
+    #[test]
+    fn classify_colorfgbg_missing_defaults_to_dark() {
+        assert_eq!(classify_colorfgbg(None), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("   ")), TerminalBackground::Dark);
+    }
+
+    #[test]
+    fn classify_colorfgbg_two_part_form() {
+        assert_eq!(classify_colorfgbg(Some("0;15")), TerminalBackground::Light);
+        assert_eq!(classify_colorfgbg(Some("15;0")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("15;7")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("0;8")), TerminalBackground::Light);
+    }
+
+    #[test]
+    fn classify_colorfgbg_three_part_form_uses_last_segment() {
+        assert_eq!(
+            classify_colorfgbg(Some("0;default;15")),
+            TerminalBackground::Light
+        );
+        assert_eq!(
+            classify_colorfgbg(Some("15;default;0")),
+            TerminalBackground::Dark
+        );
+    }
+
+    #[test]
+    fn classify_colorfgbg_unparseable_defaults_to_dark() {
+        assert_eq!(
+            classify_colorfgbg(Some("default;default")),
+            TerminalBackground::Dark
+        );
+        assert_eq!(
+            classify_colorfgbg(Some("garbage")),
+            TerminalBackground::Dark
+        );
+        assert_eq!(classify_colorfgbg(Some("0;abc")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some(";;")), TerminalBackground::Dark);
+        assert_eq!(classify_colorfgbg(Some("0;-1")), TerminalBackground::Dark);
+    }
+
+    #[test]
+    fn from_background_maps_to_builtin_themes() {
+        assert_eq!(
+            Theme::from_background(TerminalBackground::Dark).name,
+            "dark"
+        );
+        assert_eq!(
+            Theme::from_background(TerminalBackground::Light).name,
+            "light"
+        );
+    }
+
+    #[test]
+    fn resolve_spec_auto_detection_specs() {
+        let cwd = Path::new(".");
+        let expected = Theme::detected().name;
+        for spec in [
+            "light/dark",
+            "LIGHT/DARK",
+            "auto",
+            "Auto",
+            "system",
+            "SYSTEM",
+        ] {
+            let resolved = Theme::resolve_spec(spec, cwd).expect("resolve auto spec");
+            assert_eq!(resolved.name, expected, "spec {spec:?}");
+            assert!(
+                resolved.name == "dark" || resolved.name == "light",
+                "auto specs resolve to a built-in, got {}",
+                resolved.name
+            );
+        }
     }
 
     // ── resolve_spec case insensitivity ──────────────────────────────

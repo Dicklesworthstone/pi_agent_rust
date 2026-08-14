@@ -58,7 +58,11 @@ Resulting behavior:
 
 ### Appearance
 
-- `theme` (string): Theme name to apply. Defaults to `dark` if unset.
+- `theme` (string): Theme to apply. Built-ins: `dark`, `light`, `solarized`; also
+  accepts a discovered theme name or a path to a theme JSON file. `light/dark`,
+  `auto`, or `system` auto-detect dark/light from the terminal background via the
+  `COLORFGBG` environment variable (dark when unavailable). If unset, auto-detects
+  the same way.
 - `hide_thinking_block` (bool): Hide thinking blocks in interactive output. Default `false`.
 - `show_hardware_cursor` (bool): Show terminal hardware cursor. Default `false` unless
   `PI_HARDWARE_CURSOR=1`.
