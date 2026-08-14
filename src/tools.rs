@@ -4108,10 +4108,6 @@ fn ensure_atomic_source_unchanged(
     Ok(())
 }
 
-// Keep the descriptor-pinned validation, write, rename, durability, and
-// identity-checked cleanup sequence together: splitting this security-critical
-// transaction across helpers would make its ordering invariants harder to audit.
-#[allow(clippy::too_many_lines)]
 /// Normalize a raw `rustix` stat identity to platform-independent widths.
 ///
 /// The libc stat field types differ per target (`st_dev` is `i32` and
@@ -4125,7 +4121,7 @@ fn ensure_atomic_source_unchanged(
     clippy::cast_sign_loss,
     clippy::unnecessary_cast
 )]
-fn stat_replacement_identity(metadata: &rustix::fs::Stat) -> (u64, u64, u32) {
+const fn stat_replacement_identity(metadata: &rustix::fs::Stat) -> (u64, u64, u32) {
     (
         metadata.st_dev as u64,
         metadata.st_ino as u64,
@@ -4133,6 +4129,10 @@ fn stat_replacement_identity(metadata: &rustix::fs::Stat) -> (u64, u64, u32) {
     )
 }
 
+// Keep the descriptor-pinned validation, write, rename, durability, and
+// identity-checked cleanup sequence together: splitting this security-critical
+// transaction across helpers would make its ordering invariants harder to audit.
+#[allow(clippy::too_many_lines)]
 fn atomic_replace_file_with<F>(
     target: &Path,
     cwd: &Path,
