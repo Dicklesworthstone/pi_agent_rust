@@ -2361,7 +2361,7 @@ fn read_open_file_capped_at(file: &std::fs::File, max_bytes: u64) -> std::io::Re
         .unwrap_or(0)
         .min(read_limit);
     let mut contents = Vec::with_capacity(initial_capacity);
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     let mut offset = 0_u64;
 
     while contents.len() < read_limit {
@@ -2369,7 +2369,7 @@ fn read_open_file_capped_at(file: &std::fs::File, max_bytes: u64) -> std::io::Re
         let chunk_len = remaining.min(buffer.len());
         let read = loop {
             match positioned_file_read(file, &mut buffer[..chunk_len], offset) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 result => break result?,
             }
         };
@@ -2790,11 +2790,15 @@ impl ScopedScanRoot {
         self.logical_path.clone()
     }
 
+    // `&self` kept (despite being unused on this cfg) so both platform variants
+    // share one method signature at every call site.
+    #[allow(clippy::unused_self)]
     #[cfg(unix)]
     fn child_operand(&self) -> PathBuf {
         PathBuf::from(".")
     }
 
+    #[allow(clippy::unused_self)]
     #[cfg(windows)]
     fn child_operand(&self) -> PathBuf {
         PathBuf::from(".")
@@ -2803,6 +2807,9 @@ impl ScopedScanRoot {
     /// Path by which a child can access this root after its handle is installed
     /// as stdin. Scanner children run with their pinned scan root as cwd, so
     /// stdin remains available for the independently pinned workspace root.
+    // `&self` kept (despite being unused on this cfg) so both platform variants
+    // share one method signature at every call site.
+    #[allow(clippy::unused_self)]
     #[cfg(unix)]
     fn inherited_child_operand(&self) -> PathBuf {
         #[cfg(any(target_os = "linux", target_os = "android"))]
