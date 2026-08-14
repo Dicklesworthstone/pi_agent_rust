@@ -407,6 +407,31 @@ fn anthropic_effort_for_level(
     }
 }
 
+/// Mark the last content block of the last user-role message with a
+/// prompt-cache breakpoint so each turn re-reads the previous turn's cached
+/// conversation history instead of paying full input price for it (parity
+/// with pi-mono's `convertMessages`). Trailing assistant messages and block
+/// kinds that cannot carry `cache_control` are left untouched.
+fn mark_last_user_block_for_caching(
+    messages: &mut [AnthropicMessage<'_>],
+    cache_control: Option<AnthropicCacheControl>,
+) {
+    if let Some(cc) = cache_control
+        && let Some(last_message) = messages.last_mut()
+        && last_message.role == "user"
+        && let Some(last_block) = last_message.content.last_mut()
+    {
+        match last_block {
+            AnthropicContent::Text { cache_control, .. }
+            | AnthropicContent::Image { cache_control, .. }
+            | AnthropicContent::ToolResult { cache_control, .. } => {
+                *cache_control = Some(cc);
+            }
+            AnthropicContent::Thinking { .. } | AnthropicContent::ToolUse { .. } => {}
+        }
+    }
+}
+
 impl AnthropicProvider {
     /// Create a new Anthropic provider.
     pub fn new(model: impl Into<String>) -> Self {
@@ -456,18 +481,21 @@ impl AnthropicProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> AnthropicRequest<'a> {
-        let messages = context
+        let mut messages: Vec<AnthropicMessage<'_>> = context
             .messages
             .iter()
             .map(convert_message_to_anthropic)
             .collect();
 
-        // Prompt-cache breakpoints. One marker on the system block and one on
-        // the last tool cover the entire tools + system prefix (Anthropic
-        // caches everything before a marked block). `CacheRetention::None`
-        // emits no markers anywhere — cache writes bill at 1.25x, so caching
-        // must be strictly opt-in.
+        // Prompt-cache breakpoints. One marker on the system block, one on the
+        // last tool, and one on the last user message's final content block
+        // (incremental conversation-history caching — parity with pi-mono's
+        // `convertMessages`). Anthropic caches everything before a marked
+        // block. `CacheRetention::None` emits no markers anywhere — cache
+        // writes bill at 1.25x, so caching must be strictly opt-in.
         let cache_control = anthropic_cache_control_for(options.cache_retention, &self.base_url);
+
+        mark_last_user_block_for_caching(&mut messages, cache_control);
 
         let tools: Option<Vec<AnthropicTool<'_>>> = if context.tools.is_empty() {
             None
@@ -560,13 +588,21 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            system: context.system_prompt.as_deref().map(|text| {
-                vec![AnthropicSystemBlock {
-                    r#type: "text",
-                    text,
-                    cache_control,
-                }]
-            }),
+            // An empty system prompt must be omitted entirely: as a bare
+            // string it was tolerated, but a `{"type":"text","text":""}`
+            // block is rejected by the API (min length 1). pi-mono's falsy
+            // check (`context.systemPrompt &&`) skips it the same way.
+            system: context
+                .system_prompt
+                .as_deref()
+                .filter(|text| !text.is_empty())
+                .map(|text| {
+                    vec![AnthropicSystemBlock {
+                        r#type: "text",
+                        text,
+                        cache_control,
+                    }]
+                }),
             max_tokens,
             temperature,
             tools,
@@ -676,9 +712,11 @@ impl Provider for AnthropicProvider {
             beta_flags.push(anthropic_oauth_beta_flags());
         }
         // Derived from the same helper that emits the body's cache_control
-        // markers, so headers and body cannot drift: the caching beta is sent
-        // iff markers are emitted, and the extended-TTL beta iff a marker
-        // actually carries `ttl: "1h"`.
+        // markers, so headers and body cannot drift: whenever the body carries
+        // markers the right flags are present, and the extended-TTL beta is
+        // sent iff a marker would carry `ttl: "1h"`. (A degenerate request
+        // with no system prompt, no tools, and no markable trailing user
+        // block sends the flags without any marker — a harmless no-op.)
         if let Some(cache_control) =
             anthropic_cache_control_for(options.cache_retention, &self.base_url)
         {
@@ -1193,6 +1231,10 @@ struct AnthropicMessage<'a> {
 enum AnthropicContent<'a> {
     Text {
         text: &'a str,
+        /// Prompt-cache breakpoint for incremental conversation caching.
+        /// Set only on the final block of the last user-role message.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     Thinking {
         thinking: &'a str,
@@ -1200,6 +1242,8 @@ enum AnthropicContent<'a> {
     },
     Image {
         source: AnthropicImageSource<'a>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
     ToolUse {
         id: &'a str,
@@ -1211,6 +1255,8 @@ enum AnthropicContent<'a> {
         content: Vec<AnthropicToolResultContent<'a>>,
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
 }
 
@@ -1397,6 +1443,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
             role: "user",
             content: vec![AnthropicContent::Text {
                 text: &custom.content,
+                cache_control: None,
             }],
         },
         Message::Assistant(assistant) => AnthropicMessage {
@@ -1429,6 +1476,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
                     })
                     .collect(),
                 is_error: if result.is_error { Some(true) } else { None },
+                cache_control: None,
             }],
         },
     }
@@ -1436,17 +1484,24 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
 
 fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     match content {
-        UserContent::Text(text) => vec![AnthropicContent::Text { text }],
+        UserContent::Text(text) => vec![AnthropicContent::Text {
+            text,
+            cache_control: None,
+        }],
         UserContent::Blocks(blocks) => blocks
             .iter()
             .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+                ContentBlock::Text(t) => Some(AnthropicContent::Text {
+                    text: &t.text,
+                    cache_control: None,
+                }),
                 ContentBlock::Image(img) => Some(AnthropicContent::Image {
                     source: AnthropicImageSource {
                         r#type: "base64",
                         media_type: &img.mime_type,
                         data: &img.data,
                     },
+                    cache_control: None,
                 }),
                 _ => None,
             })
@@ -1456,7 +1511,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
 
 fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
     match block {
-        ContentBlock::Text(t) => Some(AnthropicContent::Text { text: &t.text }),
+        ContentBlock::Text(t) => Some(AnthropicContent::Text {
+            text: &t.text,
+            cache_control: None,
+        }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
             id: &tc.id,
             name: &tc.name,
@@ -1610,7 +1668,7 @@ mod tests {
         assert_eq!(request.messages[0].role, "user");
         assert_eq!(request.messages[0].content.len(), 1);
         match &request.messages[0].content[0] {
-            AnthropicContent::Text { text } => assert_eq!(*text, "Ping"),
+            AnthropicContent::Text { text, .. } => assert_eq!(*text, "Ping"),
             other => panic!(),
         }
 
@@ -1667,8 +1725,9 @@ mod tests {
     }
 
     /// Short retention: one `{"type":"ephemeral"}` breakpoint on the system
-    /// block and one on the LAST tool only, and both survive serde
-    /// serialization to the wire body.
+    /// block, one on the LAST tool only, and one on the last user message's
+    /// final content block (incremental conversation caching — pi-mono
+    /// parity), and all survive serde serialization to the wire body.
     #[test]
     fn test_build_request_short_retention_marks_system_and_last_tool_only() {
         let provider = AnthropicProvider::new("claude-test");
@@ -1705,12 +1764,75 @@ mod tests {
             body["tools"][0].get("cache_control").is_none(),
             "non-final tools must not carry cache_control"
         );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" }),
+            "last user message's final block carries the history breakpoint"
+        );
         let wire = body.to_string();
         assert_eq!(
             wire.matches("cache_control").count(),
-            2,
-            "exactly two breakpoints: system + last tool"
+            3,
+            "exactly three breakpoints: system + last tool + last user block"
         );
+    }
+
+    /// The conversation-history breakpoint goes only on user-role trailing
+    /// messages; a trailing assistant message must stay unmarked (pi-mono
+    /// guards on `lastMessage.role === "user"`).
+    #[test]
+    fn test_build_request_short_retention_skips_marker_on_trailing_assistant() {
+        let provider = AnthropicProvider::new("claude-test");
+        let mut context = cache_test_context();
+        let mut messages = context.messages.to_vec();
+        messages.push(Message::Assistant(
+            AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent {
+                    text: "Pong".to_string(),
+                    text_signature: None,
+                })],
+                ..Default::default()
+            }
+            .into(),
+        ));
+        context.messages = messages.into();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            body["messages"][1]["content"][0]
+                .get("cache_control")
+                .is_none(),
+            "trailing assistant content must not carry a cache breakpoint"
+        );
+        // System + last tool markers still present.
+        assert_eq!(body.to_string().matches("cache_control").count(), 2);
+    }
+
+    /// An empty system prompt must be omitted entirely: the API rejects
+    /// `{"type":"text","text":""}` blocks (min length 1), and pi-mono's
+    /// falsy check skips it the same way.
+    #[test]
+    fn test_build_request_empty_system_prompt_is_omitted() {
+        let provider = AnthropicProvider::new("claude-test");
+        let mut context = cache_test_context();
+        context.system_prompt = Some(String::new().into());
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        assert!(
+            request.system.is_none(),
+            "Some(\"\") must serialize as no system field, not an empty block"
+        );
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert!(body.get("system").is_none());
     }
 
     /// None retention (the default) must emit zero `cache_control` markers —
