@@ -852,7 +852,8 @@ fn release_publication_never_builds_with_the_registry_token() {
             );
         }
     }
-    let provider_sha256 = pi::package_manager::hex_encode(&Sha256::digest(provider_source.as_bytes()));
+    let provider_sha256 =
+        pi::package_manager::hex_encode(&Sha256::digest(provider_source.as_bytes()));
     assert!(
         runbook.contains(&provider_sha256),
         "manual release provider pin must match the exact extracted provider bytes"
@@ -2954,7 +2955,9 @@ fn perf_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
         .map_err(|err| format!("failed to serialize canonical budget inventory: {err}"))?;
     }
     canonical.push(']');
-    Ok(pi::package_manager::hex_encode(&Sha256::digest(canonical.as_bytes())))
+    Ok(pi::package_manager::hex_encode(&Sha256::digest(
+        canonical.as_bytes(),
+    )))
 }
 
 fn validate_performance_budget_summary(

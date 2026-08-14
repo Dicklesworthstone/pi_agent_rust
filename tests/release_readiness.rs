@@ -1096,7 +1096,8 @@ fn validate_certified_must_pass_against_contents(
         return (Signal::Fail, err);
     }
 
-    let events_sha256 = pi::package_manager::hex_encode(&Sha256::digest(events_contents.as_bytes()));
+    let events_sha256 =
+        pi::package_manager::hex_encode(&Sha256::digest(events_contents.as_bytes()));
     (
         Signal::Pass,
         format!(
@@ -1353,7 +1354,9 @@ fn canonical_git_tree_sha256(root: &Path, commit: &str) -> Result<String, String
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(pi::package_manager::hex_encode(&Sha256::digest(&output.stdout)))
+    Ok(pi::package_manager::hex_encode(&Sha256::digest(
+        &output.stdout,
+    )))
 }
 
 fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
@@ -3303,7 +3306,9 @@ fn performance_budget_inventory_sha256(budgets: &[V]) -> Result<String, String> 
         .map_err(|error| format!("failed to serialize canonical budget inventory: {error}"))?;
     }
     canonical.push(']');
-    Ok(pi::package_manager::hex_encode(&Sha256::digest(canonical.as_bytes())))
+    Ok(pi::package_manager::hex_encode(&Sha256::digest(
+        canonical.as_bytes(),
+    )))
 }
 
 #[allow(clippy::too_many_lines)]

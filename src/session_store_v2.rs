@@ -4733,7 +4733,9 @@ fn chain_hash_step(prev_chain: &str, payload_sha256: &str) -> String {
 
 fn manifest_hash_hex(manifest: &Manifest) -> Result<String> {
     let encoded = serde_json::to_vec(manifest)?;
-    Ok(crate::package_manager::hex_encode(&Sha256::digest(&encoded)))
+    Ok(crate::package_manager::hex_encode(&Sha256::digest(
+        &encoded,
+    )))
 }
 
 /// Derive the V2 sidecar store root from a JSONL session file path.

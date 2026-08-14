@@ -36,8 +36,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rquickjs::function::{Func, Opt};
 use rquickjs::loader::{
-    ImportAttributes as JsImportAttributes, Loader as JsModuleLoader,
-    Resolver as JsModuleResolver,
+    ImportAttributes as JsImportAttributes, Loader as JsModuleLoader, Resolver as JsModuleResolver,
 };
 use rquickjs::module::Declared as JsModuleDeclared;
 use rquickjs::{
