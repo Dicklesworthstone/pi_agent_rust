@@ -163,6 +163,24 @@ Accessor defaults:
 }
 ```
 
+### Subagents
+
+- `subagent_structured_results` (bool): Default `false`. Alias: `subagentStructuredResults`.
+  When `true`, the `subagent` tool appends a machine-readable
+  `<subagent-structured-result>` block to its result text: a compact JSON array
+  with one entry per child (`agent`, `step`, `status`, `exitCode`, `output`,
+  `error` — the same field names as the `pi.subagent.result.v1` details
+  schema). `output`/`error` are truncated to 2 KiB each and the whole block is
+  capped at 16 KiB; when entries must be dropped, the final array element is
+  `{"truncated": true, "omittedResults": N}`. Default `false` keeps the tool
+  output byte-identical to previous releases.
+
+```json
+{
+  "subagent_structured_results": true
+}
+```
+
 ### Images
 
 - `images.auto_resize` (bool): Default `true`.

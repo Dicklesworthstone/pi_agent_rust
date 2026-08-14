@@ -102,7 +102,7 @@ pub fn classify_colorfgbg(value: Option<&str>) -> TerminalBackground {
         return TerminalBackground::Dark;
     };
     // "fg;default;bg" form: the background index is the last segment.
-    let bg = parts.last().unwrap_or(second);
+    let bg = parts.next_back().unwrap_or(second);
     bg.trim()
         .parse::<u32>()
         .map_or(TerminalBackground::Dark, |index| {
