@@ -112,7 +112,7 @@ fn compute_noise_score(governor: &str, turbo: &str, thp: &str, aslr: &str) -> u8
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    pi::package_manager::hex_encode(&hasher.finalize())
 }
 
 /// Collect the full environment fingerprint.
