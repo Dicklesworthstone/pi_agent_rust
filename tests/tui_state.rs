@@ -2812,6 +2812,26 @@ fn tui_state_slash_theme_lists_and_switches() {
 }
 
 #[test]
+fn tui_state_slash_theme_auto_detects_and_persists_the_auto_spec() {
+    let harness = TestHarness::new("tui_state_slash_theme_auto_detects_and_persists_the_auto_spec");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/theme auto");
+    let step = press_enter(&harness, &mut app);
+    // Detection result depends on COLORFGBG in the environment; the status
+    // line always names the auto spec plus the detected built-in.
+    assert_after_contains(&harness, &step, "Switched to theme: auto (detected: ");
+
+    let settings_path = harness.temp_path(".pi/settings.json");
+    let settings = fs::read_to_string(settings_path).expect("read settings.json");
+    assert!(
+        settings.contains("\"theme\": \"auto\""),
+        "expected the auto spec (not the detected theme) persisted to settings.json: {settings}"
+    );
+}
+
+#[test]
 fn tui_state_slash_hotkeys_shows_dynamic_keybindings() {
     let harness = TestHarness::new("tui_state_slash_hotkeys_shows_dynamic_keybindings");
     let mut app = build_app(&harness, Vec::new());

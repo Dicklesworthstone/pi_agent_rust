@@ -97,7 +97,7 @@ impl SlashCommand {
   /export [path]     - Export conversation to HTML
   /session, /info    - Show session info (path, tokens, cost)
   /settings          - Open settings selector
-  /theme [name]      - List or switch themes (dark/light/custom)
+  /theme [name]      - List or switch themes (dark/light/auto/custom)
   /resume, /r        - Pick and resume a previous session
   /new               - Start a new session
   /copy, /cp         - Copy last assistant message to clipboard
@@ -1558,7 +1558,9 @@ impl PiApp {
             };
             let _ = writeln!(output, "{marker}{name}");
         }
-        output.push_str("\nUse /theme <name> to switch");
+        output.push_str(
+            "\nUse /theme <name> to switch, or /theme auto to match the terminal background",
+        );
         output
     }
 
@@ -1797,12 +1799,17 @@ impl PiApp {
                     return None;
                 }
 
+                let is_auto_spec = name.eq_ignore_ascii_case("light/dark")
+                    || name.eq_ignore_ascii_case("auto")
+                    || name.eq_ignore_ascii_case("system");
                 let theme = if name.eq_ignore_ascii_case("dark") {
                     Theme::dark()
                 } else if name.eq_ignore_ascii_case("light") {
                     Theme::light()
                 } else if name.eq_ignore_ascii_case("solarized") {
                     Theme::solarized()
+                } else if is_auto_spec {
+                    Theme::detected()
                 } else {
                     match Theme::load_by_name(name, &self.cwd) {
                         Ok(theme) => theme,
@@ -1815,15 +1822,27 @@ impl PiApp {
 
                 let theme_name = theme.name.clone();
                 self.apply_theme(theme);
-                self.config.theme = Some(theme_name.clone());
+                // Persist auto specs as typed so future sessions keep
+                // re-detecting instead of pinning today's detected theme.
+                let persisted_spec = if is_auto_spec {
+                    name.to_ascii_lowercase()
+                } else {
+                    theme_name.clone()
+                };
+                self.config.theme = Some(persisted_spec.clone());
+                let display_name = if is_auto_spec {
+                    format!("{persisted_spec} (detected: {theme_name})")
+                } else {
+                    theme_name
+                };
 
-                if let Err(err) = self.persist_project_theme(&theme_name) {
+                if let Err(err) = self.persist_project_theme(&persisted_spec) {
                     tracing::warn!("Failed to persist theme preference: {err}");
                     self.status_message = Some(format!(
-                        "Switched to theme: {theme_name} (not saved: {err})"
+                        "Switched to theme: {display_name} (not saved: {err})"
                     ));
                 } else {
-                    self.status_message = Some(format!("Switched to theme: {theme_name}"));
+                    self.status_message = Some(format!("Switched to theme: {display_name}"));
                 }
 
                 None
