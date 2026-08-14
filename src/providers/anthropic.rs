@@ -1795,8 +1795,8 @@ mod tests {
                 anthropic_cache_control_for(CacheRetention::None, base_url).is_none(),
                 "None emits no marker for {base_url}"
             );
-            let short = anthropic_cache_control_for(CacheRetention::Short, base_url)
-                .expect("short marker");
+            let short =
+                anthropic_cache_control_for(CacheRetention::Short, base_url).expect("short marker");
             assert!(short.ttl.is_none(), "Short never sets ttl for {base_url}");
         }
         let long_first_party = anthropic_cache_control_for(

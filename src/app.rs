@@ -19,7 +19,7 @@ use crate::models::{
     ModelEntry, ModelRegistry, default_models_path, model_entry_is_ready,
     model_requires_configured_credential, normalize_api_key_opt,
 };
-use crate::provider::{StreamOptions, ThinkingBudgets};
+use crate::provider::{CacheRetention, StreamOptions, ThinkingBudgets};
 use crate::provider_metadata::{
     canonical_provider_id, provider_ids_match, split_provider_model_spec,
 };
@@ -920,6 +920,22 @@ pub fn resolve_api_key(
     Ok(key)
 }
 
+/// Resolve the prompt-cache retention preference for agent requests.
+///
+/// Parity with pi-mono (`packages/ai/src/providers/anthropic.ts`,
+/// `resolveCacheRetention`): caching defaults to short-lived retention
+/// ("ephemeral", ~5 minutes on Anthropic) and the `PI_CACHE_RETENTION`
+/// environment variable can override it (`"long"` for ~1 hour TTL, `"none"`
+/// to disable). Providers that do not support prompt caching ignore the
+/// option entirely, so applying the default globally is safe.
+pub fn cache_retention_from_env(value: Option<&str>) -> CacheRetention {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("long") => CacheRetention::Long,
+        Some(v) if v.eq_ignore_ascii_case("none") => CacheRetention::None,
+        _ => CacheRetention::Short,
+    }
+}
+
 pub fn build_stream_options(
     config: &Config,
     api_key: Option<String>,
@@ -930,6 +946,12 @@ pub fn build_stream_options(
         api_key,
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
+        // Enable prompt caching by default (matches pi-mono's "short"
+        // default). Without this, Anthropic requests never set cache_control
+        // and users pay full input-token price on every turn.
+        cache_retention: cache_retention_from_env(
+            std::env::var("PI_CACHE_RETENTION").ok().as_deref(),
+        ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so the value users configure in `models.json` actually takes effect.
         // Without this every provider falls back to its hardcoded per-request
@@ -1758,6 +1780,59 @@ mod tests {
                 .expect("active branch thinking level should restore");
 
         assert_eq!(selection.thinking_level, model::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn cache_retention_from_env_defaults_to_short() {
+        assert_eq!(cache_retention_from_env(None), CacheRetention::Short);
+        assert_eq!(cache_retention_from_env(Some("")), CacheRetention::Short);
+        assert_eq!(
+            cache_retention_from_env(Some("short")),
+            CacheRetention::Short
+        );
+        // Unrecognized values fall back to the default rather than disabling
+        // caching (mirrors pi-mono, which only honors "long" via env).
+        assert_eq!(
+            cache_retention_from_env(Some("weekly")),
+            CacheRetention::Short
+        );
+    }
+
+    #[test]
+    fn cache_retention_from_env_honors_overrides() {
+        assert_eq!(cache_retention_from_env(Some("long")), CacheRetention::Long);
+        assert_eq!(cache_retention_from_env(Some("none")), CacheRetention::None);
+        assert_eq!(
+            cache_retention_from_env(Some(" LONG ")),
+            CacheRetention::Long
+        );
+        assert_eq!(cache_retention_from_env(Some("None")), CacheRetention::None);
+    }
+
+    #[test]
+    fn build_stream_options_enables_prompt_caching_by_default() {
+        let config = Config::default();
+        let session = Session::in_memory();
+        let selection = ModelSelection {
+            model_entry: test_model_entry("gpt-5.4", "openai-codex", true),
+            thinking_level: model::ThinkingLevel::High,
+            scoped_models: Vec::new(),
+            fallback_message: None,
+        };
+
+        let options =
+            build_stream_options(&config, Some("test-key".to_string()), &selection, &session);
+
+        // The default must track PI_CACHE_RETENTION exactly as the pure
+        // resolver does; when the variable is unset (the normal case, and the
+        // CI case) that means Short — matching pi-mono's default so Anthropic
+        // requests carry cache_control breakpoints out of the box.
+        let expected =
+            cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref());
+        assert_eq!(options.cache_retention, expected);
+        if std::env::var_os("PI_CACHE_RETENTION").is_none() {
+            assert_eq!(options.cache_retention, CacheRetention::Short);
+        }
     }
 
     #[test]
