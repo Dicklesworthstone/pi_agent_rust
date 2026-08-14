@@ -16,7 +16,7 @@
 mod common;
 
 use common::tmux::TuiSession;
-use fs4::fs_std::FileExt as _;
+use fs4::FileExt as _;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::time::Duration;
@@ -59,14 +59,14 @@ impl TmuxE2eLock {
             .truncate(false)
             .open(&path)
             .expect("open tmux e2e lock file");
-        file.lock_exclusive().expect("lock tmux e2e lock file");
+        fs4::FileExt::lock(&file).expect("lock tmux e2e lock file");
         Self(file)
     }
 }
 
 impl Drop for TmuxE2eLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = fs4::FileExt::unlock(&self.0);
     }
 }
 

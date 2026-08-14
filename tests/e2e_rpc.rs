@@ -1257,13 +1257,13 @@ fn assert_lock_released(lock_path: &Path) {
         .truncate(false)
         .open(lock_path)
         .expect("open lock file");
-    if let Err(err) = fs4::fs_std::FileExt::try_lock_exclusive(&file) {
+    if let Err(err) = fs4::FileExt::try_lock(&file) {
         exit_crash_interrupt_worker(format!(
             "lock should be released after interrupted worker: {} ({err})",
             lock_path.display()
         ));
     }
-    fs4::fs_std::FileExt::unlock(&file).expect("unlock test lock probe");
+    fs4::FileExt::unlock(&file).expect("unlock test lock probe");
 }
 
 #[cfg(unix)]

@@ -18,7 +18,7 @@ mod common;
 use clap::Parser as _;
 use common::run_async;
 use common::tmux::TuiSession;
-use fs4::fs_std::FileExt as _;
+use fs4::FileExt as _;
 use pi::app::build_system_prompt;
 use pi::cli;
 use pi::model::ContentBlock;
@@ -97,7 +97,7 @@ impl TmuxE2eLock {
             .truncate(false)
             .open(&path)
             .expect("open tmux e2e lock file");
-        file.lock_exclusive().expect("lock tmux e2e lock file");
+        fs4::FileExt::lock(&file).expect("lock tmux e2e lock file");
         Self {
             _thread_guard: thread_guard,
             file,
@@ -108,7 +108,7 @@ impl TmuxE2eLock {
 impl Drop for TmuxE2eLock {
     fn drop(&mut self) {
         // Call the fs4 trait explicitly so we don't depend on std's newer `File::unlock()`.
-        let _ = fs4::fs_std::FileExt::unlock(&self.file);
+        let _ = fs4::FileExt::unlock(&self.file);
     }
 }
 
