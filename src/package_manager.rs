@@ -2510,9 +2510,11 @@ fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
     dir
 }
 
-/// Lowercase hex encoding of `bytes` (matches the old `{:x}` formatting of
-/// digest outputs byte-for-byte). Shared by every module that renders a
-/// digest as hex, since digest 0.11 output arrays no longer impl `LowerHex`.
+/// Lowercase hex encoding of `bytes`.
+///
+/// Matches the old `{:x}` formatting of digest outputs byte-for-byte. Shared
+/// by every module that renders a digest as hex, since digest 0.11 output
+/// arrays no longer impl `LowerHex`.
 pub fn hex_encode(bytes: &[u8]) -> String {
     const LUT: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len().saturating_mul(2));
