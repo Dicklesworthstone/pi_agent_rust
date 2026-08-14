@@ -193,7 +193,7 @@ fn profile_from_target_path(path: &Path) -> Option<String> {
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
-    format!("{:x}", hasher.finalize())
+    pi::package_manager::hex_encode(&hasher.finalize())
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────────────

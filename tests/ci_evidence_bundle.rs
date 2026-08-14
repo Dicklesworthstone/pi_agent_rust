@@ -954,7 +954,7 @@ fn source_tree_sha256(records: &[(String, String, String)]) -> String {
         hasher.update(blob.as_bytes());
         hasher.update([0]);
     }
-    format!("{:x}", hasher.finalize())
+    pi::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
@@ -964,13 +964,13 @@ fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
             let mut hasher = Sha1::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         64 => {
             let mut hasher = Sha256::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         length => Err(format!("unsupported Git object ID length: {length}")),
     }
@@ -1068,8 +1068,8 @@ fn current_must_pass_source_bindings(root: &Path) -> Result<MustPassSourceBindin
     Ok(MustPassSourceBindings {
         git_commit,
         source_tree_sha256: source_tree_sha256(&records),
-        inclusion_sha256: format!("{:x}", Sha256::digest(&inclusion_contents)),
-        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_contents)),
+        inclusion_sha256: pi::package_manager::hex_encode(&Sha256::digest(&inclusion_contents)),
+        manifest_sha256: pi::package_manager::hex_encode(&Sha256::digest(&manifest_contents)),
         inclusion_contents,
         manifest_contents,
         tracked_paths: records.into_iter().map(|record| record.0).collect(),
@@ -2815,8 +2815,8 @@ fn must_pass_validation_fixture() -> MustPassValidationFixture {
         git_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
         source_tree_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
             .to_string(),
-        inclusion_sha256: format!("{:x}", Sha256::digest(&inclusion_contents)),
-        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_contents)),
+        inclusion_sha256: pi::package_manager::hex_encode(&Sha256::digest(&inclusion_contents)),
+        manifest_sha256: pi::package_manager::hex_encode(&Sha256::digest(&manifest_contents)),
         inclusion_contents,
         manifest_contents,
         tracked_paths: entries
@@ -2887,7 +2887,7 @@ fn update_fixture_inclusion_binding(fixture: &mut MustPassValidationFixture, val
     fixture.bindings.inclusion_contents =
         serde_json::to_vec(value).expect("serialize mutated inclusion fixture");
     fixture.bindings.inclusion_sha256 =
-        format!("{:x}", Sha256::digest(&fixture.bindings.inclusion_contents));
+        pi::package_manager::hex_encode(&Sha256::digest(&fixture.bindings.inclusion_contents));
     fixture.payload["inclusion_sha256"] = Value::String(fixture.bindings.inclusion_sha256.clone());
     for event in &mut fixture.events {
         event["inclusion_sha256"] = Value::String(fixture.bindings.inclusion_sha256.clone());
@@ -2899,7 +2899,7 @@ fn update_fixture_manifest_binding(fixture: &mut MustPassValidationFixture, valu
     fixture.bindings.manifest_contents =
         serde_json::to_vec(value).expect("serialize mutated manifest fixture");
     fixture.bindings.manifest_sha256 =
-        format!("{:x}", Sha256::digest(&fixture.bindings.manifest_contents));
+        pi::package_manager::hex_encode(&Sha256::digest(&fixture.bindings.manifest_contents));
     fixture.payload["manifest_sha256"] = Value::String(fixture.bindings.manifest_sha256.clone());
     for event in &mut fixture.events {
         event["manifest_sha256"] = Value::String(fixture.bindings.manifest_sha256.clone());

@@ -817,7 +817,7 @@ fn release_publication_never_builds_with_the_registry_token() {
             && !publisher_setup.contains("env -u CARGO_REGISTRY_TOKEN"),
         "publisher dry-run and configuration proofs must not inherit operator home or credentials"
     );
-    let workflow_sha256 = format!("{:x}", Sha256::digest(workflow.as_bytes()));
+    let workflow_sha256 = pi::package_manager::hex_encode(&Sha256::digest(workflow.as_bytes()));
     assert!(
         runbook.contains(&workflow_sha256),
         "manual release workflow pin must match the exact reviewed workflow bytes"
@@ -852,7 +852,7 @@ fn release_publication_never_builds_with_the_registry_token() {
             );
         }
     }
-    let provider_sha256 = format!("{:x}", Sha256::digest(provider_source.as_bytes()));
+    let provider_sha256 = pi::package_manager::hex_encode(&Sha256::digest(provider_source.as_bytes()));
     assert!(
         runbook.contains(&provider_sha256),
         "manual release provider pin must match the exact extracted provider bytes"
@@ -2954,7 +2954,7 @@ fn perf_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
         .map_err(|err| format!("failed to serialize canonical budget inventory: {err}"))?;
     }
     canonical.push(']');
-    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    Ok(pi::package_manager::hex_encode(&Sha256::digest(canonical.as_bytes())))
 }
 
 fn validate_performance_budget_summary(
@@ -4190,7 +4190,10 @@ fn e2e_source_snapshot_from_clean_checkout(root: &Path, source_commit: &str) -> 
         update_framed(&mut digest, mode);
         update_framed(&mut digest, &blob);
     }
-    format!("sha256:{:x}", digest.finalize())
+    format!(
+        "sha256:{}",
+        pi::package_manager::hex_encode(&digest.finalize())
+    )
 }
 
 fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
@@ -4303,7 +4306,7 @@ fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
             let bytes = std::fs::read(&path).expect("read E2E fixture diagnostic");
             json!({
                 "path": path,
-                "sha256": format!("sha256:{:x}", Sha256::digest(&bytes)),
+                "sha256": format!("sha256:{}", pi::package_manager::hex_encode(&Sha256::digest(&bytes))),
                 "size_bytes": bytes.len()
             })
         };
@@ -4339,7 +4342,7 @@ fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
             "schema": "pi.e2e.diagnostic_artifacts.v1",
             "output_log": {
                 "path": lib_dir.join("output.log"),
-                "sha256": format!("sha256:{:x}", Sha256::digest(&lib_output)),
+                "sha256": format!("sha256:{}", pi::package_manager::hex_encode(&Sha256::digest(&lib_output))),
                 "size_bytes": lib_output.len()
             },
             "test_log_jsonl": null,
@@ -4835,7 +4838,7 @@ fn retained_conformance_evidence_fixture() -> (PathBuf, PathBuf, String) {
         &["ls-tree", "-r", "-z", "--full-tree", &source_commit],
     )
     .expect("capture conformance fixture source tree");
-    let source_tree_sha256 = format!("{:x}", Sha256::digest(source_tree));
+    let source_tree_sha256 = pi::package_manager::hex_encode(&Sha256::digest(source_tree));
     let generated = Utc::now();
     let generated_seconds = generated.to_rfc3339_opts(SecondsFormat::Secs, true);
     let generated_millis = generated.to_rfc3339_opts(SecondsFormat::Millis, true);

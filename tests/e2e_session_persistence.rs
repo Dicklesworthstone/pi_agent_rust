@@ -358,7 +358,7 @@ fn session_divergence_report_path(
 
 fn file_sha256(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
-    Some(format!("{:x}", Sha256::digest(&bytes)))
+    Some(pi::package_manager::hex_encode(&Sha256::digest(&bytes)))
 }
 
 fn file_size_bytes(path: &Path) -> Option<u64> {

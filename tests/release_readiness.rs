@@ -1096,7 +1096,7 @@ fn validate_certified_must_pass_against_contents(
         return (Signal::Fail, err);
     }
 
-    let events_sha256 = format!("{:x}", Sha256::digest(events_contents.as_bytes()));
+    let events_sha256 = pi::package_manager::hex_encode(&Sha256::digest(events_contents.as_bytes()));
     (
         Signal::Pass,
         format!(
@@ -1337,7 +1337,7 @@ fn source_tree_sha256(records: &[(String, String, String)]) -> String {
         hasher.update(blob.as_bytes());
         hasher.update([0]);
     }
-    format!("{:x}", hasher.finalize())
+    pi::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn canonical_git_tree_sha256(root: &Path, commit: &str) -> Result<String, String> {
@@ -1353,7 +1353,7 @@ fn canonical_git_tree_sha256(root: &Path, commit: &str) -> Result<String, String
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(format!("{:x}", Sha256::digest(&output.stdout)))
+    Ok(pi::package_manager::hex_encode(&Sha256::digest(&output.stdout)))
 }
 
 fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
@@ -1363,13 +1363,13 @@ fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
             let mut hasher = Sha1::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         64 => {
             let mut hasher = Sha256::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         length => Err(format!("unsupported Git object ID length: {length}")),
     }
@@ -1592,8 +1592,8 @@ fn capture_must_pass_source_snapshot(root: &Path) -> Result<MustPassSourceSnapsh
     Ok(MustPassSourceSnapshot {
         git_commit,
         source_tree_sha256: source_tree_sha256(&records),
-        inclusion_sha256: format!("{:x}", Sha256::digest(&inclusion_contents)),
-        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_contents)),
+        inclusion_sha256: pi::package_manager::hex_encode(&Sha256::digest(&inclusion_contents)),
+        manifest_sha256: pi::package_manager::hex_encode(&Sha256::digest(&manifest_contents)),
         inclusion_contents,
         manifest_contents,
         tracked_paths,
@@ -2193,7 +2193,7 @@ fn evaluate_committed_conformance_summary(root: &Path) -> (Signal, String, Optio
             None,
         );
     }
-    let sha256 = format!("{:x}", Sha256::digest(&artifact_before.contents));
+    let sha256 = pi::package_manager::hex_encode(&Sha256::digest(&artifact_before.contents));
     (signal, detail, Some(sha256))
 }
 
@@ -3303,7 +3303,7 @@ fn performance_budget_inventory_sha256(budgets: &[V]) -> Result<String, String> 
         .map_err(|error| format!("failed to serialize canonical budget inventory: {error}"))?;
     }
     canonical.push(']');
-    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    Ok(pi::package_manager::hex_encode(&Sha256::digest(canonical.as_bytes())))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5831,7 +5831,7 @@ fn build_phase5_go_no_go_snapshot(
 
 fn sha256_file(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
-    Some(format!("{:x}", Sha256::digest(data)))
+    Some(pi::package_manager::hex_encode(&Sha256::digest(data)))
 }
 
 fn check_cert_gate(
@@ -5851,7 +5851,7 @@ fn check_cert_gate(
             ),
             Ok(value) => {
                 let (signal, detail) = check(&value);
-                let sha = format!("{:x}", Sha256::digest(&artifact.contents));
+                let sha = pi::package_manager::hex_encode(&Sha256::digest(&artifact.contents));
                 (signal, detail, Some(sha))
             }
         },

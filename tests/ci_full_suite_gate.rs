@@ -1729,7 +1729,7 @@ fn must_pass_source_tree_sha256(records: &[(String, String, String)]) -> String 
         hasher.update(blob.as_bytes());
         hasher.update([0]);
     }
-    format!("{:x}", hasher.finalize())
+    pi::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
@@ -1739,13 +1739,13 @@ fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
             let mut hasher = Sha1::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         64 => {
             let mut hasher = Sha256::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         length => Err(format!("unsupported Git object ID length: {length}")),
     }
@@ -1841,8 +1841,8 @@ fn capture_must_pass_source_snapshot(root: &Path) -> Result<MustPassSourceSnapsh
     Ok(MustPassSourceSnapshot {
         git_commit,
         source_tree_sha256: must_pass_source_tree_sha256(&records),
-        inclusion_sha256: format!("{:x}", Sha256::digest(&inclusion_contents)),
-        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_contents)),
+        inclusion_sha256: pi::package_manager::hex_encode(&Sha256::digest(&inclusion_contents)),
+        manifest_sha256: pi::package_manager::hex_encode(&Sha256::digest(&manifest_contents)),
         inclusion_contents,
         manifest_contents,
         tracked_paths,

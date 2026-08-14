@@ -1128,7 +1128,7 @@ fn evidence_ingestion_rejects_invalid_utf8_without_lossy_replacement() -> TestRe
         &full_path,
         b"{\"schema\":\"fixture.invalid_utf8.v1\",\"value\":\"\xff\"}",
     )?;
-    let expected_sha256 = format!("{:x}", Sha256::digest(fs::read(&full_path)?));
+    let expected_sha256 = pi::package_manager::hex_encode(&Sha256::digest(fs::read(&full_path)?));
 
     let graph = build_fixture_graph(temp.path())?;
     let node = node_with_source(&graph, SemanticNodeType::EvidenceArtifact, path)?;
@@ -3417,7 +3417,7 @@ fn large_workspace_context_planner_budget_artifact_is_deterministic_under_random
     let artifact_dir = target_dir.join("perf");
     fs::create_dir_all(&artifact_dir)?;
     let summary_bytes = serde_json::to_vec(&bundle_summary)?;
-    let summary_sha256 = format!("{:x}", Sha256::digest(&summary_bytes));
+    let summary_sha256 = pi::package_manager::hex_encode(&Sha256::digest(&summary_bytes));
     let artifact = json!({
         "schema": "pi.semantic_context.performance_budget.v1",
         "generated_at": "2026-05-13T00:00:00Z",

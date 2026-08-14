@@ -1458,7 +1458,7 @@ fn compaction_pipeline_save_and_open_round_trip_rehydrates_compaction_context() 
 
     let mut hasher = Sha256::new();
     hasher.update(result.summary.as_bytes());
-    let summary_hash = format!("{:x}", hasher.finalize());
+    let summary_hash = pi::package_manager::hex_encode(&hasher.finalize());
     harness.log().info_ctx("compaction", "summary_hash", |ctx| {
         ctx.push(("sha256".into(), summary_hash));
     });
