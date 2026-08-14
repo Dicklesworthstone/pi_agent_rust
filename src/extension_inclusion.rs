@@ -312,7 +312,7 @@ pub fn normalized_manifest_hash_from_value(
     let bytes = serde_json::to_vec(&normalized)?;
     let mut hasher = sha2::Sha256::new();
     hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::package_manager::hex_encode(&hasher.finalize()))
 }
 
 // ────────────────────────────────────────────────────────────────────────────

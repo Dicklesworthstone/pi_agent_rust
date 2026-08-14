@@ -434,7 +434,7 @@ fn hash_path(path: &Path) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(path.to_string_lossy().as_bytes());
     let digest = hasher.finalize();
-    format!("{digest:x}")
+    crate::package_manager::hex_encode(&digest)
 }
 
 fn fs_op_read(params: &Value, path: &Path) -> std::result::Result<Value, HostCallError> {

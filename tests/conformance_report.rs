@@ -61,13 +61,13 @@ fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
             let mut hasher = sha1::Sha1::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         64 => {
             let mut hasher = Sha256::new();
             hasher.update(header.as_bytes());
             hasher.update(contents);
-            Ok(format!("{:x}", hasher.finalize()))
+            Ok(pi::package_manager::hex_encode(&hasher.finalize()))
         }
         length => Err(format!("unsupported Git object ID length: {length}")),
     }
@@ -223,7 +223,7 @@ fn release_source_provenance(
             String::from_utf8_lossy(&tree.stderr).trim()
         ));
     }
-    let source_tree_sha256 = format!("{:x}", Sha256::digest(&tree.stdout));
+    let source_tree_sha256 = pi::package_manager::hex_encode(&Sha256::digest(&tree.stdout));
 
     let index = git_output(root, &["ls-files", "--stage", "-z"])?;
     if !index.status.success() {

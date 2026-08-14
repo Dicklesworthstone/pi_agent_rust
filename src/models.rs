@@ -640,7 +640,10 @@ pub(crate) fn model_catalog_route_fingerprint(
         );
     }
 
-    format!("sha256:{:x}", hasher.finalize())
+    format!(
+        "sha256:{}",
+        crate::package_manager::hex_encode(&hasher.finalize())
+    )
 }
 
 fn is_valid_model_catalog_route_fingerprint(value: &str) -> bool {

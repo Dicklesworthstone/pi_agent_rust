@@ -5790,7 +5790,7 @@ fn list_models_cache_path(models_path: &Path) -> Option<PathBuf> {
         hasher.update([0x00]);
     }
 
-    let key = format!("{:x}", hasher.finalize());
+    let key = pi::package_manager::hex_encode(&hasher.finalize());
     dirs::cache_dir().map(|dir| {
         dir.join("pi")
             .join("list-models-cache")
@@ -7843,7 +7843,7 @@ mod tests {
         let digest = |path: &Path| {
             let mut hasher = Sha256::new();
             assert!(append_file_fingerprint(&mut hasher, path));
-            format!("{:x}", hasher.finalize())
+            pi::package_manager::hex_encode(&hasher.finalize())
         };
         let first = digest(&path);
 

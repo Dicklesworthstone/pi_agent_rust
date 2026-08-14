@@ -267,9 +267,9 @@ fn cache_key(provider: &str, api_key: &str, route: &ModelCatalogProviderConfig) 
         }
     }
     format!(
-        "{}:{:x}",
+        "{}:{}",
         canonical_provider_key(provider),
-        hasher.finalize()
+        crate::package_manager::hex_encode(&hasher.finalize())
     )
 }
 

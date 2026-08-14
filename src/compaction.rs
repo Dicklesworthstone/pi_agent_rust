@@ -357,7 +357,7 @@ fn marker_digest(marker: &SemanticCompactionMarker) -> String {
     digest.update(marker.id.as_bytes());
     digest.update([0]);
     digest.update(marker.marker.as_bytes());
-    format!("{:x}", digest.finalize())
+    crate::package_manager::hex_encode(&digest.finalize())
 }
 
 fn record_loss(
@@ -2039,7 +2039,7 @@ pub mod semantic_marker_scan_quality {
     fn short_content_fingerprint(content: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = crate::package_manager::hex_encode(&hasher.finalize());
         digest.chars().take(16).collect()
     }
 
@@ -2055,7 +2055,7 @@ pub mod semantic_marker_scan_quality {
             hasher.update(short_content_fingerprint(&turn.content).as_bytes());
             hasher.update(b"\0");
         }
-        let digest = format!("{:x}", hasher.finalize());
+        let digest = crate::package_manager::hex_encode(&hasher.finalize());
         digest.chars().take(16).collect()
     }
 

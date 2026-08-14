@@ -281,7 +281,7 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::package_manager::hex_encode(&hasher.finalize()))
 }
 
 /// Hashes asserted build/source/binary provenance as compact canonical JSON.
@@ -311,7 +311,7 @@ pub fn benchmark_provenance_config_hash(provenance: &BenchmarkProvenance<'_>) ->
         .expect("benchmark provenance contains only JSON-serializable primitives");
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 /// Attempts to derive the Cargo profile from an executable artifact layout.

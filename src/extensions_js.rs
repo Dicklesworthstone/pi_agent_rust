@@ -3209,7 +3209,7 @@ pub type ArtifactChecksum = String;
 pub fn compute_artifact_checksum(content: &[u8]) -> ArtifactChecksum {
     use sha2::{Digest, Sha256};
     let hash = Sha256::digest(content);
-    format!("{hash:x}")
+    hex_lower(&hash)
 }
 
 /// A single artifact entry in a golden checksum manifest.
@@ -5646,7 +5646,7 @@ export default __pijs_builtin_default;
 fn builtin_overlay_module_key(base: &str, canonical: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(base.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = hex_lower(&hasher.finalize());
     let short = &digest[..16];
     format!("pijs-compat://builtin/{canonical}/{short}")
 }
@@ -5704,7 +5704,13 @@ fn maybe_register_builtin_compat_overlay(
 
 impl JsModuleResolver for PiJsResolver {
     #[allow(clippy::too_many_lines)]
-    fn resolve(&mut self, ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
+    fn resolve<'js>(
+        &mut self,
+        ctx: &Ctx<'js>,
+        base: &str,
+        name: &str,
+        _attributes: Option<JsImportAttributes<'js>>,
+    ) -> rquickjs::Result<String> {
         let spec = name.trim();
         if spec.is_empty() {
             return Err(rquickjs::Error::new_resolving(base, name));
@@ -6027,7 +6033,7 @@ fn compile_module_source(
 /// The source file metadata can remain unchanged across a Pi upgrade while the
 /// transformed output changes. Versioning the key prevents a newer binary from
 /// reusing stale compiled JavaScript emitted by an older compiler pipeline.
-const COMPILED_MODULE_CACHE_VERSION: u8 = 3;
+const COMPILED_MODULE_CACHE_VERSION: u8 = 4;
 
 fn module_cache_key(
     static_virtual_modules: &HashMap<String, String>,
@@ -6044,8 +6050,8 @@ fn module_cache_key(
         hasher.update(b"\0");
         hasher.update(source.as_bytes());
         return Some(format!(
-            "v{COMPILED_MODULE_CACHE_VERSION}:v:{:x}",
-            hasher.finalize()
+            "v{COMPILED_MODULE_CACHE_VERSION}:v:{}",
+            hex_lower(&hasher.finalize())
         ));
     }
 
@@ -6078,7 +6084,7 @@ fn module_cache_key(
 fn disk_cache_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
     let mut hasher = Sha256::new();
     hasher.update(cache_key.as_bytes());
-    let hex = format!("{:x}", hasher.finalize());
+    let hex = hex_lower(&hasher.finalize());
     let prefix = &hex[..2];
     cache_dir.join(prefix).join(format!("{hex}.js"))
 }
@@ -24349,7 +24355,7 @@ mod tests {
     use serde_json::json;
 
     fn sha256_hex(bytes: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(bytes))
+        hex_lower(&Sha256::digest(bytes))
     }
 
     #[test]

@@ -95,7 +95,7 @@ fn rewrite_single_segment_frames_and_index(
 fn write_rehashed_manifest(path: &Path, mut manifest: Manifest) -> PiResult<()> {
     manifest.integrity.manifest_hash.clear();
     manifest.integrity.manifest_hash =
-        format!("{:x}", Sha256::digest(serde_json::to_vec(&manifest)?));
+        pi::package_manager::hex_encode(&Sha256::digest(serde_json::to_vec(&manifest)?));
     fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
     Ok(())
 }

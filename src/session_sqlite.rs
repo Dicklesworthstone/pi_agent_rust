@@ -121,9 +121,9 @@ fn row_get_string(row: &SqliteRow, column: &str) -> Result<String> {
 }
 
 fn malformed_json_error(kind: &str, json: &str, error: &serde_json::Error) -> Error {
-    let digest = Sha256::digest(json.as_bytes());
+    let digest = crate::package_manager::hex_encode(&Sha256::digest(json.as_bytes()));
     Error::session(format!(
-        "Failed to parse SQLite {kind}: line={} column={} bytes={} sha256={digest:x}",
+        "Failed to parse SQLite {kind}: line={} column={} bytes={} sha256={digest}",
         error.line(),
         error.column(),
         json.len()
@@ -145,9 +145,9 @@ fn validate_sqlite_json_for_write(kind: &str, json: &str) -> Result<()> {
 
 fn parse_sqlite_json<T: serde::de::DeserializeOwned>(kind: &str, json: &str) -> Result<T> {
     if json.len() > MAX_SQLITE_JSON_BYTES {
-        let digest = Sha256::digest(json.as_bytes());
+        let digest = crate::package_manager::hex_encode(&Sha256::digest(json.as_bytes()));
         return Err(Error::session(format!(
-            "SQLite {kind} exceeds JSON limit: bytes={} limit={MAX_SQLITE_JSON_BYTES} sha256={digest:x}",
+            "SQLite {kind} exceeds JSON limit: bytes={} limit={MAX_SQLITE_JSON_BYTES} sha256={digest}",
             json.len()
         )));
     }

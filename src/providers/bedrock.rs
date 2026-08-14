@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use futures::stream;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};

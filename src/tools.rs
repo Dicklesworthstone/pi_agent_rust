@@ -1344,7 +1344,7 @@ fn write_text_tool_output_artifact_at_root(
     }
     let redacted = redact_tool_output_artifact_bytes(bytes)?;
     let bytes = redacted.bytes.as_slice();
-    let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+    let sha256 = crate::package_manager::hex_encode(&sha2::Sha256::digest(bytes));
     let (scope_dir, session_id) = tool_output_artifact_scope_dir(root, tool_call_id);
     std::fs::create_dir_all(&scope_dir)?;
 
@@ -1412,7 +1412,7 @@ fn copy_text_tool_output_artifact_from_path_at_root(
     let redacted = redact_tool_output_artifact_bytes(&source_bytes)?;
     let bytes = redacted.bytes.as_slice();
 
-    let sha256 = format!("{:x}", sha2::Sha256::digest(bytes));
+    let sha256 = crate::package_manager::hex_encode(&sha2::Sha256::digest(bytes));
     let (scope_dir, session_id) = tool_output_artifact_scope_dir(root, tool_call_id);
     std::fs::create_dir_all(&scope_dir)?;
     let id = format!("tool-artifact-{}", &sha256[..16]);

@@ -17,7 +17,7 @@ fn cassette_root() -> PathBuf {
 fn sha256_hex(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
+    pi::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn read_json(path: &Path) -> Value {

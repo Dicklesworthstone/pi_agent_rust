@@ -541,7 +541,7 @@ fn policy_snapshot_version(policy: &ExtensionPolicy) -> String {
         Ok(value) => hash_canonical_json(&value, &mut hasher),
         Err(err) => hasher.update(err.to_string().as_bytes()),
     }
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn policy_lookup_path(capability: &str) -> &'static str {
@@ -907,7 +907,7 @@ struct DualExecOutcomeDiff {
 fn hostcall_value_fingerprint(value: &Value) -> String {
     let mut hasher = sha2::Sha256::new();
     hash_canonical_json(value, &mut hasher);
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn hostcall_outcome_fingerprint(outcome: &HostcallOutcome) -> String {

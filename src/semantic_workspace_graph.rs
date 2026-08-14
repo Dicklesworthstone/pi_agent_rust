@@ -2524,7 +2524,9 @@ fn performance_budget_inventory_sha256(budgets: &[Value]) -> Result<String, Stri
         .map_err(|error| format!("failed to serialize canonical budget inventory: {error}"))?;
     }
     canonical.push(']');
-    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    Ok(crate::package_manager::hex_encode(&Sha256::digest(
+        canonical.as_bytes(),
+    )))
 }
 
 fn validate_performance_budget_contract(
@@ -3274,13 +3276,13 @@ fn git_blob_oid(object_format: &str, bytes: &[u8]) -> Option<String> {
             let mut hasher = Sha1::new();
             hasher.update(header.as_bytes());
             hasher.update(bytes);
-            Some(format!("{:x}", hasher.finalize()))
+            Some(crate::package_manager::hex_encode(&hasher.finalize()))
         }
         "sha256" => {
             let mut hasher = Sha256::new();
             hasher.update(header.as_bytes());
             hasher.update(bytes);
-            Some(format!("{:x}", hasher.finalize()))
+            Some(crate::package_manager::hex_encode(&hasher.finalize()))
         }
         _ => None,
     }
@@ -5895,7 +5897,7 @@ fn graph_input_fingerprint_digest(graph: &SemanticWorkspaceGraph) -> String {
             hasher.update(mtime_unix_ns.to_string().as_bytes());
         }
     }
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn build_redaction_summary(
@@ -6392,7 +6394,7 @@ fn datetime_unix_ns(timestamp: DateTime<Utc>) -> Option<u64> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::package_manager::hex_encode(&Sha256::digest(bytes))
 }
 
 fn cache_key_sha256(
@@ -6410,7 +6412,7 @@ fn cache_key_sha256(
     hasher.update(normalized_source_path.as_bytes());
     hasher.update(b"\0");
     hasher.update(content_sha256.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 fn stable_id(kind: &str, parts: &[&str]) -> String {
@@ -6420,7 +6422,7 @@ fn stable_id(kind: &str, parts: &[&str]) -> String {
         hasher.update(b"\0");
         hasher.update(part.as_bytes());
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = crate::package_manager::hex_encode(&hasher.finalize());
     format!("swg:{kind}:{}", &digest[..16])
 }
 

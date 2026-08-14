@@ -880,7 +880,7 @@ fn fingerprint_open_session_source(mut file: std::fs::File) -> Result<V2SourceFi
 
     Ok(V2SourceFingerprint {
         byte_length,
-        sha256: format!("{:x}", hasher.finalize()),
+        sha256: crate::package_manager::hex_encode(&hasher.finalize()),
         #[cfg(unix)]
         file_identity: Some(identity_before),
         #[cfg(not(unix))]
@@ -2936,7 +2936,8 @@ fn elapsed_us_since(start: Instant) -> u64 {
 }
 
 fn cold_start_hash_path(path: &Path) -> String {
-    let mut digest = format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()));
+    let mut digest =
+        crate::package_manager::hex_encode(&Sha256::digest(path.to_string_lossy().as_bytes()));
     digest.truncate(16);
     digest
 }
@@ -7543,7 +7544,7 @@ fn v2_payload_chain_hash_step(previous: &str, payload_sha256: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(previous.as_bytes());
     hasher.update(payload_sha256.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 const fn v2_verification_is_complete(
@@ -7652,11 +7653,12 @@ fn is_v2_sidecar_stale_read_only(jsonl_path: &Path, v2_root: &Path) -> Result<bo
 
 fn session_entry_chain_hash_step(prev_chain: &str, entry: &SessionEntry) -> Result<String> {
     let (_, _, _, payload) = session_store_v2::session_entry_to_frame_args(entry)?;
-    let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
+    let payload_sha256 =
+        crate::package_manager::hex_encode(&Sha256::digest(serde_json::to_vec(&payload)?));
     let mut hasher = Sha256::new();
     hasher.update(prev_chain.as_bytes());
     hasher.update(payload_sha256.as_bytes());
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::package_manager::hex_encode(&hasher.finalize()))
 }
 
 /// Remove a V2 sidecar, reverting to JSONL-only storage.
@@ -8028,7 +8030,7 @@ fn generate_loaded_entry_id(entry: &SessionEntry, existing: &HashSet<String>) ->
         hasher.update(b"pi.session.legacy-entry-id.v1\0");
         hasher.update(&encoded);
         hasher.update(collision_index.to_be_bytes());
-        let candidate = format!("{:x}", hasher.finalize())[..8].to_string();
+        let candidate = crate::package_manager::hex_encode(&hasher.finalize())[..8].to_string();
         if !existing.contains(&candidate) {
             return candidate;
         }
@@ -8042,7 +8044,7 @@ fn generate_loaded_entry_id(entry: &SessionEntry, existing: &HashSet<String>) ->
     hasher.update(b"pi.session.legacy-entry-id.v1\0");
     hasher.update(&encoded);
     hasher.update(100u32.to_be_bytes());
-    let prefix = format!("{:x}", hasher.finalize())[..8].to_string();
+    let prefix = crate::package_manager::hex_encode(&hasher.finalize())[..8].to_string();
     for suffix in 0..=existing.len() {
         let candidate = format!("{prefix}-{suffix:x}");
         if !existing.contains(&candidate) {

@@ -4080,7 +4080,7 @@ fn stable_id(raw: &str) -> String {
 
 fn sha256_prefixed(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    format!("sha256:{digest:x}")
+    format!("sha256:{}", crate::package_manager::hex_encode(&digest))
 }
 
 #[allow(dead_code)]

@@ -314,7 +314,7 @@ fn budget_inventory_canonical_json() -> String {
 
 fn budget_inventory_sha256() -> String {
     let digest = Sha256::digest(budget_inventory_canonical_json().as_bytes());
-    format!("{digest:x}")
+    pi::package_manager::hex_encode(&digest)
 }
 
 const DEFAULT_MAX_ARTIFACT_AGE_HOURS: f64 = 24.0;

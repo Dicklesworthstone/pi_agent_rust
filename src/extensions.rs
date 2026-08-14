@@ -1115,7 +1115,7 @@ pub fn sha256_hex_standalone(input: &str) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
-    format!("{digest:x}")
+    crate::package_manager::hex_encode(&digest)
 }
 use permission_drift::{
     PermissionDriftFlags, capability_expansion_missing_provenance, capability_set_has_dangerous,
@@ -6942,7 +6942,7 @@ fn runtime_risk_compute_ledger_hash(
     }
     let payload = serde_json::to_string(&canonical).unwrap_or_default();
     hasher.update(payload.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 pub fn runtime_risk_compute_ledger_hash_artifact(
@@ -6959,7 +6959,7 @@ pub fn runtime_risk_ledger_data_hash(entries: &[RuntimeRiskLedgerArtifactEntry])
         hasher.update(entry.ledger_hash.as_bytes());
         hasher.update(b"\n");
     }
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 pub fn verify_runtime_risk_ledger_artifact(
@@ -7271,7 +7271,7 @@ pub fn compute_incident_bundle_hash(bundle: &IncidentEvidenceBundle) -> String {
             .unwrap_or_default()
             .as_bytes(),
     );
-    format!("{:x}", hasher.finalize())
+    crate::package_manager::hex_encode(&hasher.finalize())
 }
 
 /// Build an incident evidence bundle from raw artifacts with filtering and
