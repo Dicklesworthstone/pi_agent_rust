@@ -13102,6 +13102,17 @@ fn discover_workspace_bundle_entries(package_dir: &Path) -> Result<Vec<PathBuf>>
     Ok(out)
 }
 
+/// True when `dir` follows the independent-extensions auto-discovery
+/// convention: a directory literally named `extensions` (for example
+/// `~/.pi/agent/extensions/` or `.pi/extensions/`). Entries that live
+/// directly inside such a directory are independent extensions by
+/// convention, never fragments of a single package or workspace bundle.
+fn is_independent_extensions_root(dir: &Path) -> bool {
+    dir.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
+}
+
 fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
     let canonical_primary = safe_canonicalize(primary);
     if primary
@@ -13123,11 +13134,7 @@ fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
     // Subdirectories there are independent extensions, not packages of a
     // single workspace bundle. Mirrors the equivalent guard in
     // `discover_sibling_extension_entries`.
-    if cluster_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
-    {
+    if is_independent_extensions_root(cluster_root) {
         return Vec::new();
     }
 
@@ -13174,11 +13181,7 @@ fn discover_sibling_extension_entries(primary: &Path) -> Vec<PathBuf> {
     // Skip sibling discovery when the parent is a known auto-discovery root
     // (e.g., ~/.pi/agent/extensions/ or .pi/extensions/). Files in these
     // directories are independent extensions, not siblings of a single package.
-    if parent_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
-    {
+    if is_independent_extensions_root(parent_dir) {
         return Vec::new();
     }
 
@@ -13358,13 +13361,23 @@ fn collect_js_extension_roots(
                     continue;
                 };
                 let canonical_parent = safe_canonicalize(parent);
+                // Inside an independent-extensions root (e.g. `.pi/extensions/`)
+                // sibling entry files are separate extensions by convention, so
+                // ownership is tracked per entry file. Everywhere else the leaf
+                // directory is the exclusive ownership unit, keeping distinct
+                // ids that resolve into one arbitrary directory failing closed.
+                let ownership_key = if is_independent_extensions_root(&canonical_parent) {
+                    safe_canonicalize(entry_path)
+                } else {
+                    canonical_parent
+                };
                 if let Some(previous_owner) =
-                    leaf_root_owner.insert(canonical_parent.clone(), extension_id.clone())
+                    leaf_root_owner.insert(ownership_key.clone(), extension_id.clone())
                     && previous_owner != *extension_id
                 {
                     return Err(Error::extension(format!(
                         "Ambiguous JS extension ownership: {previous_owner} and {extension_id} both resolve entries under {}",
-                        canonical_parent.display()
+                        ownership_key.display()
                     )));
                 }
             }

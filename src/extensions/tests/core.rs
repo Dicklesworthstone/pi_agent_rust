@@ -2367,6 +2367,82 @@ fn isolated_runtime_rejects_distinct_owners_for_the_same_leaf_directory() {
 }
 
 #[test]
+fn isolated_runtime_allows_sibling_files_under_extensions_discovery_root() {
+    let manager = ExtensionManager::new();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+
+    runtime.block_on(async move {
+        let dir = tempdir().expect("tempdir");
+        // Mirrors the e2e shape: two single-file extensions passed explicitly
+        // that share a parent directory following the independent-extensions
+        // auto-discovery convention (a directory named `extensions`). They
+        // must load as separate extensions without tripping the ambiguous
+        // leaf-ownership guard.
+        let extensions_dir = dir.path().join("extensions");
+        std::fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+        let entry_a = extensions_dir.join("ext_a.mjs");
+        let entry_b = extensions_dir.join("ext_b.mjs");
+        std::fs::write(
+            &entry_a,
+            r#"
+                export default function init(pi) {
+                  pi.registerCommand("from-sibling-a", {
+                    description: "Command from sibling extension A",
+                    handler: async () => ({}),
+                  });
+                }
+            "#,
+        )
+        .expect("write first extension");
+        std::fs::write(
+            &entry_b,
+            r#"
+                export default function init(pi) {
+                  pi.registerCommand("from-sibling-b", {
+                    description: "Command from sibling extension B",
+                    handler: async () => ({}),
+                  });
+                }
+            "#,
+        )
+        .expect("write second extension");
+
+        let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+        let js_runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: dir.path().display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await
+        .expect("start js runtime");
+        manager.set_js_runtime(js_runtime);
+
+        let spec_a = JsExtensionLoadSpec::from_entry_path(&entry_a).expect("first spec");
+        let spec_b = JsExtensionLoadSpec::from_entry_path(&entry_b).expect("second spec");
+        manager
+            .load_js_extensions(vec![spec_a, spec_b])
+            .await
+            .expect("sibling extensions under an extensions/ root must load");
+
+        assert!(
+            manager.has_command("from-sibling-a"),
+            "from-sibling-a should exist"
+        );
+        assert!(
+            manager.has_command("from-sibling-b"),
+            "from-sibling-b should exist"
+        );
+
+        assert!(manager.shutdown(Duration::from_secs(3)).await);
+    });
+}
+
+#[test]
 #[cfg(feature = "ext-conformance")]
 fn explicit_compat_scan_disable_prevents_static_registration_fallback() {
     let manager = ExtensionManager::new();
