@@ -13118,6 +13118,19 @@ fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
 
+    // Skip sibling-index clustering when the cluster root is a known
+    // auto-discovery root (e.g., ~/.pi/agent/extensions/ or .pi/extensions/).
+    // Subdirectories there are independent extensions, not packages of a
+    // single workspace bundle. Mirrors the equivalent guard in
+    // `discover_sibling_extension_entries`.
+    if cluster_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
+    {
+        return Vec::new();
+    }
+
     let mut candidate_dirs = Vec::new();
     if let Ok(entries) = fs::read_dir(cluster_root) {
         for entry in entries.flatten() {

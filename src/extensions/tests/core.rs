@@ -442,6 +442,24 @@ fn discover_sibling_index_entries_keeps_primary_even_when_not_sorted_first() {
 }
 
 #[test]
+fn discover_sibling_index_entries_skips_auto_discovery_extensions_root() {
+    let temp = tempdir().expect("tempdir");
+    let extensions_root = temp.path().join("extensions");
+    for id in ["alpha", "beta", "gamma"] {
+        let dir = extensions_root.join(id);
+        std::fs::create_dir_all(&dir).expect("mkdir extension dir");
+        std::fs::write(dir.join("index.ts"), "export default {};\n").expect("write index");
+    }
+
+    let primary = extensions_root.join("beta").join("index.ts");
+    let discovered = discover_sibling_index_entries(&primary);
+    assert!(
+        discovered.is_empty(),
+        "independent extensions under an auto-discovery extensions root must not be clustered as a bundle: {discovered:?}"
+    );
+}
+
+#[test]
 fn discover_sibling_index_entries_ignores_huge_parent_clusters() {
     let temp = tempdir().expect("tempdir");
     let cluster = temp.path().join("bundle");
