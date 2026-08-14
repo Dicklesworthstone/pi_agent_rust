@@ -278,7 +278,7 @@ fn sha256_short(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     let result = hasher.finalize();
-    format!("{result:x}")[..16].to_string()
+    pi::package_manager::hex_encode(&result)[..16].to_string()
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────────────

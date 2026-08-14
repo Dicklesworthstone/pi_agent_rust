@@ -396,9 +396,10 @@ impl HostState {
         }
 
         let prompt_extension_id = self.extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
-        let allow = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
+        let (allow, persist) =
+            prompt_capability_once(&manager, prompt_extension_id, &capability).await;
         if let Some(extension_id) = self.extension_id.as_deref() {
-            manager.cache_policy_prompt_decision(extension_id, &capability, allow);
+            manager.cache_policy_prompt_decision_scoped(extension_id, &capability, allow, persist);
         }
         let decision = if allow {
             PolicyDecision::Allow
@@ -636,7 +637,7 @@ impl HostState {
         let mut hasher = sha2::Sha256::new();
         hasher.update(input.as_bytes());
         let digest = hasher.finalize();
-        format!("{digest:x}")
+        crate::package_manager::hex_encode(&digest)
     }
 
     fn canonicalize_json(value: &Value) -> Value {
