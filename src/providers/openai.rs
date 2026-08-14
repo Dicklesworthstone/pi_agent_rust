@@ -223,15 +223,35 @@ impl OpenAIProvider {
 
     /// Detect a provider-specific reasoning dialect for this transport.
     ///
-    /// DeepSeek is identified the same way `ModelEntry::is_deepseek_reasoning_model`
-    /// does it — by the canonical provider id (so the `deep-seek` alias also
-    /// matches) or a `deepseek.com` base URL — AND only for reasoning models, so a
-    /// non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
+    /// An explicit catalog `compat.thinkingFormat` declaration wins (gh #166):
+    /// `"deepseek"` opts any custom OpenAI-compatible provider into the
+    /// DeepSeek dialect regardless of provider id or base URL, while any other
+    /// declared format (the legacy catalog also carries `"openai"`, `"zai"`,
+    /// `"qwen"`) explicitly opts out of it — this transport only models the
+    /// DeepSeek dialect today, so those serialize with no
+    /// `thinking`/`reasoning_effort`, exactly like providers with no dialect.
+    ///
+    /// When no `thinkingFormat` is declared, DeepSeek is identified the same
+    /// way `ModelEntry::is_deepseek_reasoning_model` does it — by the
+    /// canonical provider id (so the `deep-seek` alias also matches) or a
+    /// `deepseek.com` base URL. Either path applies only to reasoning models,
+    /// so a non-reasoning DeepSeek model (e.g. `deepseek-chat`) emits no
     /// `thinking`/`reasoning_effort` (byte-for-byte as before #113, gh #114).
     /// Every other OpenAI-compatible provider is left untouched.
     fn reasoning_style(&self) -> Option<ReasoningStyle> {
         if !self.reasoning {
             return None;
+        }
+        if let Some(format) = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.thinking_format.as_deref())
+            .map(str::trim)
+            .filter(|format| !format.is_empty())
+        {
+            return format
+                .eq_ignore_ascii_case("deepseek")
+                .then_some(ReasoningStyle::DeepSeek);
         }
         let provider_is_deepseek = canonical_provider_id(&self.provider)
             .is_some_and(|canonical| canonical == "deepseek")
@@ -1858,6 +1878,133 @@ mod tests {
         let high_url = body(&ds_by_url, crate::model::ThinkingLevel::High);
         assert_eq!(high_url["thinking"]["type"], "enabled");
         assert_eq!(high_url["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_deepseek_custom_provider() {
+        // gh #166: a custom openai-completions provider (non-deepseek id, non
+        // deepseek.com URL) that declares `compat.thinkingFormat: "deepseek"`
+        // must get the full DeepSeek mapping — identical to native detection.
+        let body = |provider: &OpenAIProvider, level: crate::model::ThinkingLevel| {
+            let context = Context {
+                system_prompt: None,
+                messages: vec![Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 0,
+                })]
+                .into(),
+                tools: Vec::<ToolDef>::new().into(),
+            };
+            let options = StreamOptions {
+                thinking_level: Some(level),
+                ..Default::default()
+            };
+            serde_json::to_value(provider.build_request(&context, &options))
+                .expect("serialize request")
+        };
+
+        let custom = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+
+        let off = body(&custom, crate::model::ThinkingLevel::Off);
+        assert_eq!(off["thinking"]["type"], "disabled");
+        assert!(
+            off.get("reasoning_effort").is_none(),
+            "off must not send reasoning_effort"
+        );
+
+        let high = body(&custom, crate::model::ThinkingLevel::High);
+        assert_eq!(high["thinking"]["type"], "enabled");
+        assert_eq!(high["reasoning_effort"], "high");
+
+        let xhigh = body(&custom, crate::model::ThinkingLevel::XHigh);
+        assert_eq!(xhigh["thinking"]["type"], "enabled");
+        assert_eq!(xhigh["reasoning_effort"], "max");
+
+        let max = body(&custom, crate::model::ThinkingLevel::Max);
+        assert_eq!(max["thinking"]["type"], "enabled");
+        assert_eq!(max["reasoning_effort"], "max");
+
+        // The reasoning gate still applies: a non-reasoning model with the
+        // same declaration emits neither field.
+        let non_reasoning = OpenAIProvider::new("deepseek-v4-flash")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(false)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("deepseek".to_string()),
+                ..Default::default()
+            }));
+        let quiet = body(&non_reasoning, crate::model::ThinkingLevel::High);
+        assert!(quiet.get("thinking").is_none());
+        assert!(quiet.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_compat_thinking_format_explicit_declaration_wins() {
+        // gh #166: an explicit non-deepseek `thinkingFormat` opts a provider
+        // out of the DeepSeek dialect even when the id/URL heuristic would
+        // have enabled it — the explicit catalog declaration is authoritative.
+        let provider = OpenAIProvider::new("deepseek-v4-pro")
+            .with_provider_name("deepseek")
+            .with_base_url("https://api.deepseek.com/v1/chat/completions".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig {
+                thinking_format: Some("openai".to_string()),
+                ..Default::default()
+            }));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn test_build_request_compat_without_thinking_format_keeps_custom_provider_unchanged() {
+        // gh #166: a custom provider whose compat config carries no
+        // `thinkingFormat` serializes exactly as before — the heuristic still
+        // finds no DeepSeek identity, so no reasoning controls are emitted.
+        let provider = OpenAIProvider::new("some-model")
+            .with_provider_name("opencode-go")
+            .with_base_url("https://opencode.ai/zen/go/v1".to_string())
+            .with_reasoning(true)
+            .with_compat(Some(CompatConfig::default()));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::<ToolDef>::new().into(),
+        };
+        let options = StreamOptions {
+            thinking_level: Some(crate::model::ThinkingLevel::High),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(value.get("thinking").is_none());
+        assert!(value.get("reasoning_effort").is_none());
     }
 
     #[test]
