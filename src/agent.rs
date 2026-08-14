@@ -8817,7 +8817,7 @@ impl AgentSession {
     /// `before_compact` dispatch: this path exists to guarantee forward
     /// progress, so nothing may cancel it.
     async fn force_local_compaction_if_oversized(
-        &mut self,
+        &self,
         on_event: AgentEventHandler,
     ) -> Result<()> {
         let decision = self
