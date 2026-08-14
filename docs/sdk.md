@@ -179,6 +179,74 @@ fn main() -> pi::sdk::Result<()> {
 }
 ```
 
+## Recipe 5b: Handle Extension UI Prompts and Permission Scope
+
+Without a UI handler, SDK sessions fail closed: extension UI requests error and
+capability prompts resolve to deny. Attach a handler to answer them in-process.
+
+```rust
+use futures::executor::block_on;
+use pi::sdk::{
+    ExtensionUiHandler, ExtensionUiRequest, ExtensionUiResponse, SessionOptions,
+    create_agent_session,
+};
+use serde_json::json;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+struct AllowOnce;
+
+#[async_trait::async_trait]
+impl ExtensionUiHandler for AllowOnce {
+    async fn request_ui(
+        &self,
+        request: ExtensionUiRequest,
+    ) -> pi::sdk::Result<Option<ExtensionUiResponse>> {
+        Ok(Some(ExtensionUiResponse {
+            id: request.id,
+            // Plain `Value::Bool(allow)` keeps default persistence; an object
+            // controls it per decision ("persist": false = this session only).
+            value: Some(json!({ "allow": true, "persist": false })),
+            cancelled: false,
+        }))
+    }
+}
+
+fn main() -> pi::sdk::Result<()> {
+    let _session = block_on(create_agent_session(SessionOptions {
+        extension_paths: vec![PathBuf::from("extensions/my_extension.js")],
+        extension_ui_handler: Some(Arc::new(AllowOnce)),
+        // `false` scopes all prompt decisions to this session's memory instead
+        // of `~/.pi/extension-permissions.json` (default `true` = CLI behavior).
+        persist_extension_permissions: false,
+        ..SessionOptions::default()
+    }))?;
+    Ok(())
+}
+```
+
+## Recipe 5c: Override Compaction Settings Per Session
+
+```rust
+use futures::executor::block_on;
+use pi::sdk::{ResolvedCompactionSettings, SessionOptions, create_agent_session};
+
+fn main() -> pi::sdk::Result<()> {
+    let session = block_on(create_agent_session(SessionOptions {
+        // Used verbatim; `None` keeps the config/model-derived defaults.
+        compaction_settings: Some(ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 200_000,
+            reserve_tokens: 32_768,
+            keep_recent_tokens: 40_000,
+        }),
+        ..SessionOptions::default()
+    }))?;
+    eprintln!("resolved: {:?}", session.compaction_settings());
+    Ok(())
+}
+```
+
 ## Recipe 6: Use RPC Transport Client
 
 ```rust
@@ -221,6 +289,9 @@ fn main() -> pi::sdk::Result<()> {
 - In-process `AgentSessionHandle` currently exposes prompt/state/model/thinking/compaction flows; queue controls like `steer`/`follow_up` are on `RpcTransportClient`.
 - `SessionTransport::prompt` returns `SessionPromptResult`, which is `InProcess(Box<AssistantMessage>)` or `RpcEvents(Vec<Value>)` depending on backend.
 - Extension loading is opt-in via `extension_paths`, with `extension_policy`/`repair_policy` controls.
+- Extension UI/capability prompts are answered via `SessionOptions::extension_ui_handler`; without one they fail closed (deny).
+- Prompt decisions persist to disk by default (CLI parity); `persist_extension_permissions: false` or a per-response `"persist": false` scopes them to the session.
+- `SessionOptions::compaction_settings` overrides the config/model-derived compaction settings verbatim when `Some`.
 
 ## Verified Reference Surfaces
 
