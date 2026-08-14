@@ -19069,6 +19069,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                             #[cfg(not(target_os = "linux"))]
                             {
+                                use std::io::Read;
+
                                 let checked_path = crate::extensions::safe_canonicalize(&requested_abs);
 
                                 // Allow reads from workspace root or any registered
@@ -19094,7 +19096,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     ));
                                 }
 
-                                use std::io::Read;
                                 let file = match std::fs::File::open(&checked_path) {
                                     Ok(file) => file,
                                     Err(err) => {
@@ -19120,7 +19121,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 if buffer.len() as u64 > MAX_SYNC_READ_SIZE {
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
-                                        format!("host read failed: file exceeds {} bytes", MAX_SYNC_READ_SIZE),
+                                        format!("host read failed: file exceeds {MAX_SYNC_READ_SIZE} bytes"),
                                     ));
                                 }
 

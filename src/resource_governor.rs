@@ -176,6 +176,10 @@ pub struct HostResourceSample {
 
 impl HostResourceSample {
     /// Sample the current process/host state.
+    // Const-eligible only where the probe functions are cfg'd to const stubs
+    // (non-Linux); on Linux they do real /proc IO, so `const fn` cannot apply
+    // uniformly.
+    #[allow(clippy::missing_const_for_fn)]
     #[must_use]
     pub fn current() -> Self {
         Self {
