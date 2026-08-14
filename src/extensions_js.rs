@@ -35,7 +35,10 @@ use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, Scheduler, Wall
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rquickjs::function::{Func, Opt};
-use rquickjs::loader::{Loader as JsModuleLoader, Resolver as JsModuleResolver};
+use rquickjs::loader::{
+    ImportAttributes as JsImportAttributes, Loader as JsModuleLoader,
+    Resolver as JsModuleResolver,
+};
 use rquickjs::module::Declared as JsModuleDeclared;
 use rquickjs::{
     AsyncContext, AsyncRuntime, Coerced, Ctx, Exception, FromJs, Function, IntoJs, Module, Object,
@@ -5934,6 +5937,7 @@ impl JsModuleLoader for PiJsLoader {
         &mut self,
         ctx: &Ctx<'js>,
         name: &str,
+        _attributes: Option<JsImportAttributes<'js>>,
     ) -> rquickjs::Result<Module<'js, JsModuleDeclared>> {
         let source = {
             let mut state = self.state.borrow_mut();

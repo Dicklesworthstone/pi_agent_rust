@@ -229,12 +229,12 @@ uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
 base64 = "0.23"
 flate2 = "1.1.9"
-sha2 = "0.10"
-sha1 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
-pbkdf2 = { version = "0.12.2", features = ["hmac"] }
-scrypt = { version = "0.11.0", default-features = false }
+sha2 = "0.11"
+sha1 = "0.11"
+md-5 = "0.11"
+hmac = "0.13"
+pbkdf2 = { version = "0.13.0", features = ["hmac"] }
+scrypt = { version = "0.12.0", default-features = false }
 getrandom = "0.4.1"
 regex = "1.12.3"
 ring = "0.17.14"
@@ -252,14 +252,14 @@ unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 sysinfo = "0.39.6"
-rquickjs = { version = "0.11", features = ["futures", "loader"] }
-swc_common = "18.0.1"
-swc_ecma_codegen = "23.0.0"
-swc_ecma_ast = "20.0.1"
-swc_ecma_parser = "34.0.0"
-swc_ecma_transforms_base = "37.0.0"
-swc_ecma_transforms_typescript = "41.0.0"
-swc_ecma_visit = "20.0.0"
+rquickjs = { version = "0.12.2", features = ["futures", "loader"] }
+swc_common = "26.0.0"
+swc_ecma_codegen = "32.0.0"
+swc_ecma_ast = "29.0.0"
+swc_ecma_parser = "45.0.0"
+swc_ecma_transforms_base = "49.0.0"
+swc_ecma_transforms_typescript = "55.0.0"
+swc_ecma_visit = "29.0.0"
 wasmtime = { version = "47.0.3", features = ["component-model"], optional = true }
 filetime = "0.2.27"
 
@@ -323,7 +323,7 @@ tikv-jemallocator = { version = "0.6", optional = true }
 # ship pre-generated bindings for this target, so regenerate at build time
 # via the `bindgen` feature (uses /usr/bin/clang from the base system).
 [target.'cfg(target_os = "freebsd")'.dependencies]
-rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
+rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 
 # Android (including Termux on-device): rquickjs-sys 0.11 ships pre-generated
 # bindings for aarch64-linux-android only for some Cargo versions and not
@@ -332,7 +332,7 @@ rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 # upstream crate. Termux ships clang under $PREFIX/bin which bindgen picks
 # up automatically.
 [target.'cfg(target_os = "android")'.dependencies]
-rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
+rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 
 [features]
 default = ["sqlite-sessions", "tui"]
