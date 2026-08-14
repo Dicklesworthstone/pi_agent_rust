@@ -3122,12 +3122,15 @@ where
             .filter(|v| !v.is_empty());
     }
 
-    // pi parity (issue #64): values that look like an env var name and end with
-    // `_API_KEY` (e.g. `DASHSCOPE_API_KEY`) are treated as a reference to that
-    // env var, matching the original `pi` convention. Real provider API keys do
-    // not end with the literal suffix `_API_KEY`, so this is a safe signal that
-    // the user wants indirection rather than a literal credential.
-    if looks_like_api_key_env_var(value) {
+    // pi parity (issues #64, #152): values that look like an env var name
+    // (e.g. `DASHSCOPE_API_KEY`, `HF_TOKEN`, `MY_TOKEN`, `CUSTOM_KEY`) are
+    // treated as a reference to that env var, matching the original `pi`
+    // behavior of trying `process.env[value]` first for any bare string and
+    // falling back to the literal. Real provider API keys never match an
+    // uppercase-identifier-with-underscore pattern (they contain lowercase
+    // letters, dashes, colons, etc.), so this is a safe signal that the user
+    // wants indirection rather than a literal credential.
+    if looks_like_env_var_reference(value) {
         match env_lookup(value) {
             Some(env_value) => {
                 let trimmed = env_value.trim();
@@ -3161,28 +3164,41 @@ where
 }
 
 /// Whether `value` should be treated as the *name* of an environment variable
-/// holding the real API key (matching the original `pi` convention).
+/// holding the real credential (matching the original `pi` convention, where
+/// `resolveConfigValue` tries `process.env[value]` first for any bare string).
 ///
-/// Conservative check: uppercase ASCII letters/digits/underscores, starting
-/// with a letter, ending with the literal suffix `_API_KEY`, and at least one
-/// character before that suffix (so `_API_KEY` itself is rejected).
-fn looks_like_api_key_env_var(value: &str) -> bool {
-    const SUFFIX: &str = "_API_KEY";
-    if !value.ends_with(SUFFIX) {
-        return false;
-    }
-    let prefix = &value[..value.len() - SUFFIX.len()];
-    if prefix.is_empty() {
-        return false;
-    }
-    let mut chars = prefix.chars();
+/// Accepted pattern: an uppercase ASCII identifier — first char `A-Z`, rest
+/// `A-Z`/`0-9`/`_` (i.e. `^[A-Z][A-Z0-9_]*$`) — containing at least one
+/// underscore. This covers conventional credential names (`OPENAI_API_KEY`,
+/// `HF_TOKEN`, `MY_SECRET`, `CUSTOM_KEY`, ...) since every common credential
+/// suffix (`_API_KEY`, `_TOKEN`, `_SECRET`, `_KEY`) itself contains an
+/// underscore. Realistic literal API keys (`sk-ant-...`, `AIza...`, anything
+/// with lowercase, dashes, or colons) can never match.
+///
+/// Deliberate divergence from original `pi`: a single uppercase word with no
+/// underscore (e.g. `PROBE`) is NOT treated as an env-var reference, even
+/// though original `pi` would attempt an env lookup on it. Requiring one
+/// underscore avoids false positives on plain uppercase words used as literal
+/// values; since unset env vars fall back to the literal in both
+/// implementations, this only diverges when such a bare word happens to also
+/// be a set env var — an acceptable trade-off for safety.
+fn looks_like_env_var_reference(value: &str) -> bool {
+    let mut chars = value.chars();
     let Some(first) = chars.next() else {
         return false;
     };
     if !first.is_ascii_uppercase() {
         return false;
     }
-    chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    let mut has_underscore = false;
+    for c in chars {
+        match c {
+            '_' => has_underscore = true,
+            'A'..='Z' | '0'..='9' => {}
+            _ => return false,
+        }
+    }
+    has_underscore
 }
 
 fn resolve_shell(cmd: &str) -> Option<String> {
@@ -5437,34 +5453,50 @@ mod tests {
         assert!(resolve_value("file:/definitely/missing/path").is_none());
     }
 
-    // ─── pi parity: bare *_API_KEY env-var indirection (issue #64) ───────────
+    // ─── pi parity: bare env-var indirection (issues #64, #152) ──────────────
 
     #[test]
-    fn looks_like_api_key_env_var_accepts_typical_names() {
-        assert!(looks_like_api_key_env_var("DASHSCOPE_API_KEY"));
-        assert!(looks_like_api_key_env_var("OPENAI_API_KEY"));
-        assert!(looks_like_api_key_env_var("ANTHROPIC_API_KEY"));
-        assert!(looks_like_api_key_env_var("MY_CUSTOM_API_KEY"));
+    fn looks_like_env_var_reference_accepts_typical_names() {
+        assert!(looks_like_env_var_reference("DASHSCOPE_API_KEY"));
+        assert!(looks_like_env_var_reference("OPENAI_API_KEY"));
+        assert!(looks_like_env_var_reference("ANTHROPIC_API_KEY"));
+        assert!(looks_like_env_var_reference("MY_CUSTOM_API_KEY"));
         // Digits in the prefix are fine, as long as it starts with a letter.
-        assert!(looks_like_api_key_env_var("PROVIDER42_API_KEY"));
+        assert!(looks_like_env_var_reference("PROVIDER42_API_KEY"));
+        // issue #152: any uppercase identifier with an underscore, not just
+        // the `_API_KEY` suffix.
+        assert!(looks_like_env_var_reference("HF_TOKEN"));
+        assert!(looks_like_env_var_reference("MY_TOKEN"));
+        assert!(looks_like_env_var_reference("CUSTOM_KEY"));
+        assert!(looks_like_env_var_reference("MY_SECRET"));
+        assert!(looks_like_env_var_reference("DASHSCOPE_API"));
+        // Trailing underscore is still a valid env-var-shaped name.
+        assert!(looks_like_env_var_reference("A_"));
     }
 
     #[test]
-    fn looks_like_api_key_env_var_rejects_non_matches() {
-        // Wrong suffix.
-        assert!(!looks_like_api_key_env_var("DASHSCOPE_API"));
-        assert!(!looks_like_api_key_env_var("DASHSCOPE_TOKEN"));
+    fn looks_like_env_var_reference_rejects_non_matches() {
         // Lowercase letters anywhere → looks like a literal key.
-        assert!(!looks_like_api_key_env_var("dashscope_api_key"));
-        assert!(!looks_like_api_key_env_var("My_API_KEY"));
-        // Real-shaped keys.
-        assert!(!looks_like_api_key_env_var("sk-ant-api03-AAAA_API_KEY"));
-        assert!(!looks_like_api_key_env_var("sk-1234567890"));
-        // Bare suffix only.
-        assert!(!looks_like_api_key_env_var("_API_KEY"));
-        assert!(!looks_like_api_key_env_var(""));
-        // Must start with a letter.
-        assert!(!looks_like_api_key_env_var("0DASH_API_KEY"));
+        assert!(!looks_like_env_var_reference("dashscope_api_key"));
+        assert!(!looks_like_env_var_reference("My_API_KEY"));
+        assert!(!looks_like_env_var_reference("lowercase_key"));
+        // Real-shaped keys (lowercase, dashes, colons).
+        assert!(!looks_like_env_var_reference("sk-ant-api03-AAAA_API_KEY"));
+        assert!(!looks_like_env_var_reference("sk-1234567890"));
+        assert!(!looks_like_env_var_reference("AIzaSyExample123"));
+        assert!(!looks_like_env_var_reference("XX:YY_ZZ"));
+        // `$`-prefixed values (issue #152's proposed syntax) stay literal;
+        // original pi has no `$` handling either.
+        assert!(!looks_like_env_var_reference("$CUSTOM_API_KEY"));
+        // Bare suffix only / empty / leading underscore or digit.
+        assert!(!looks_like_env_var_reference("_API_KEY"));
+        assert!(!looks_like_env_var_reference(""));
+        assert!(!looks_like_env_var_reference("0DASH_API_KEY"));
+        assert!(!looks_like_env_var_reference("_TOKEN"));
+        // Deliberate divergence from original pi: single uppercase word with
+        // no underscore is treated as a literal.
+        assert!(!looks_like_env_var_reference("PROBE"));
+        assert!(!looks_like_env_var_reference("TOKEN"));
     }
 
     #[test]
@@ -5508,6 +5540,46 @@ mod tests {
             panic!("env_lookup should not be invoked for literal-shaped values");
         });
         assert_eq!(resolved.as_deref(), Some("sk-ant-api03-abcdef123"));
+    }
+
+    #[test]
+    fn resolve_value_resolves_non_api_key_env_var_names_when_set() {
+        // issue #152: original pi env-resolves any bare string; we now cover
+        // uppercase identifiers with an underscore regardless of suffix.
+        for name in ["HF_TOKEN", "MY_TOKEN", "CUSTOM_KEY"] {
+            let resolved = resolve_value_with_resolvers(name, None, |var| {
+                assert_eq!(var, name);
+                Some("hf_real_secret".to_string())
+            });
+            assert_eq!(resolved.as_deref(), Some("hf_real_secret"), "{name}");
+        }
+    }
+
+    #[test]
+    fn resolve_value_falls_back_to_literal_when_non_api_key_env_var_unset() {
+        for name in ["HF_TOKEN", "MY_TOKEN", "CUSTOM_KEY"] {
+            let resolved = resolve_value_with_resolvers(name, None, |_| None);
+            assert_eq!(resolved.as_deref(), Some(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn resolve_value_keeps_dollar_prefixed_value_literal() {
+        // issue #152 proposed `$CUSTOM_API_KEY`; neither original pi nor Rust
+        // pi treats `$` specially, so the value passes through verbatim
+        // without an env lookup.
+        let resolved = resolve_value_with_resolvers("$CUSTOM_API_KEY", None, |_| {
+            panic!("env_lookup should not be invoked for $-prefixed values");
+        });
+        assert_eq!(resolved.as_deref(), Some("$CUSTOM_API_KEY"));
+    }
+
+    #[test]
+    fn resolve_value_never_env_resolves_lowercase_values() {
+        let resolved = resolve_value_with_resolvers("lowercase_key", None, |_| {
+            panic!("env_lookup should not be invoked for lowercase values");
+        });
+        assert_eq!(resolved.as_deref(), Some("lowercase_key"));
     }
 
     #[test]
