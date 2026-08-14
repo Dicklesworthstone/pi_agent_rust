@@ -16,7 +16,6 @@
 mod common;
 
 use common::tmux::TuiSession;
-use fs4::FileExt as _;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::time::Duration;

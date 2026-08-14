@@ -1909,7 +1909,7 @@ mod find_tool {
                 .to_string_lossy();
 
             harness.create_dir("prefix\n..");
-            harness.create_file(&format!("prefix\n../{outside_name}"), b"inside entry");
+            harness.create_file(format!("prefix\n../{outside_name}"), b"inside entry");
 
             let tool = pi::tools::FindTool::new(harness.temp_dir());
             let result = tool
@@ -1981,7 +1981,7 @@ mod find_tool {
     fn test_find_permission_preflight_reads_only_consumed_ignore_controls() {
         asupersync::test_utils::run_test(|| async {
             for control in [".gitignore", ".ignore", ".fdignore"] {
-                let harness = TestHarness::new(&format!(
+                let harness = TestHarness::new(format!(
                     "find_owner_denied_{}",
                     control.trim_start_matches('.')
                 ));

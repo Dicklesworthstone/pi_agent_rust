@@ -1433,7 +1433,12 @@ fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
             .args(["--noprofile", "--norc", "-p", "-c", script])
             .env_clear();
         if raw_function {
-            command.env("BASH_FUNC_git%%", format!("() {{  :\n}}"));
+            // The value is a literal bash exported-function body; the braces
+            // are shell syntax, not Rust formatting placeholders.
+            #[allow(clippy::literal_string_with_formatting_args)]
+            {
+                command.env("BASH_FUNC_git%%", "() {  :\n}");
+            }
         }
         command.output().expect("execute controller preamble")
     };

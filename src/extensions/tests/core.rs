@@ -3953,14 +3953,15 @@ fn session_scoped_prompt_decision_skips_permission_store() {
     let path = dir.path().join("extension-permissions.json");
 
     let manager = extension_manager_no_persisted_permissions();
-    {
+    let has_permission_store = {
         let mut guard = manager
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ExtensionManager::load_persisted_permissions_from(&mut guard, &path);
-        assert!(guard.permission_store.is_some());
-    }
+        guard.permission_store.is_some()
+    };
+    assert!(has_permission_store);
 
     // Session-scoped decision: cached in memory, never written to disk.
     manager.cache_policy_prompt_decision_scoped("ext.session", "exec", true, Some(false));

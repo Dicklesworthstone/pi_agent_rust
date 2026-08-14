@@ -18,7 +18,6 @@ mod common;
 use clap::Parser as _;
 use common::run_async;
 use common::tmux::TuiSession;
-use fs4::FileExt as _;
 use pi::app::build_system_prompt;
 use pi::cli;
 use pi::model::ContentBlock;

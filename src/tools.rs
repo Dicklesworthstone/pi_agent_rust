@@ -12052,6 +12052,7 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_lines)]
     async fn assert_scoped_scan_roots_survive_after_open_replacement(tmp: &Path) {
         use std::os::unix::fs::symlink;
 

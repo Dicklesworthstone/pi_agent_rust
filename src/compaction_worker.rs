@@ -877,6 +877,9 @@ mod tests {
         });
     }
 
+    // Deliberately returns the full outcome type the worker consumes, not a
+    // bare `CompactionResult`.
+    #[allow(clippy::unnecessary_wraps)]
     fn ok_compaction_outcome() -> CompactionOutcome {
         Ok(CompactionResult {
             summary: "summary".to_string(),
