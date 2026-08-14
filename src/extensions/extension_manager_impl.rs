@@ -4103,9 +4103,28 @@ impl ExtensionManager {
         };
 
         // Direct handler bridge (SDK embedders) takes precedence over the
-        // channel-based TUI/RPC surface.
+        // channel-based TUI/RPC surface. Preserve the channel path's
+        // semantics: honor the request's effective timeout (fail with the
+        // same timeout error instead of hanging on a stalled handler) and
+        // never surface a response for notification-style requests.
         if let Some(handler) = ui_handler {
-            return handler.request_ui(request).await;
+            let timeout_ms = request.effective_timeout_ms();
+            let response = if let Some(timeout_ms) = timeout_ms {
+                timeout(
+                    wall_now(),
+                    Duration::from_millis(timeout_ms),
+                    handler.request_ui(request),
+                )
+                .await
+                .unwrap_or_else(|_| Err(Error::extension("Extension UI request timed out")))
+            } else {
+                handler.request_ui(request).await
+            };
+            return if expects_response {
+                response
+            } else {
+                response.map(|_| None)
+            };
         }
 
         let Some(ui_sender) = ui_sender else {

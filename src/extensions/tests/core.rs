@@ -4070,6 +4070,70 @@ fn ui_handler_bridges_request_ui_and_records_prompt() {
     assert_eq!(prompts[0].method, "confirm");
 }
 
+struct PendingUiHandler;
+
+#[async_trait]
+impl crate::extension_dispatcher::ExtensionUiHandler for PendingUiHandler {
+    async fn request_ui(
+        &self,
+        _request: ExtensionUiRequest,
+    ) -> Result<Option<ExtensionUiResponse>> {
+        std::future::pending().await
+    }
+}
+
+#[test]
+fn ui_handler_honors_request_timeout() {
+    let manager = extension_manager_no_persisted_permissions();
+    manager.set_ui_handler(Arc::new(PendingUiHandler));
+
+    let err = run_async(async {
+        manager
+            .request_ui(ExtensionUiRequest::new(
+                "",
+                "confirm",
+                json!({ "title": "Allow?", "message": "m", "timeout": 50 }),
+            ))
+            .await
+    })
+    .expect_err("stalled handler must hit the request timeout");
+    assert!(err.to_string().contains("timed out"), "unexpected: {err}");
+}
+
+#[test]
+fn ui_handler_notification_response_is_suppressed() {
+    let manager = extension_manager_no_persisted_permissions();
+    let handler = Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: Value::Bool(true),
+    });
+    manager.set_ui_handler(handler.clone());
+
+    // "notify" does not expect a response; the channel path returns
+    // `Ok(None)`, so the handler path must as well even when the handler
+    // returns a value.
+    let response = run_async(async {
+        manager
+            .request_ui(ExtensionUiRequest::new(
+                "",
+                "notify",
+                json!({ "message": "hi" }),
+            ))
+            .await
+    })
+    .expect("request_ui");
+    assert!(
+        response.is_none(),
+        "notification must not surface a response"
+    );
+
+    let prompts = handler
+        .prompts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(prompts.len(), 1, "handler still observes the notification");
+}
+
 #[test]
 fn prompt_capability_once_parses_scoped_object_response() {
     let manager = extension_manager_no_persisted_permissions();
