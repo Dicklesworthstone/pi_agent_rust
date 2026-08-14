@@ -36,6 +36,10 @@ const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20"
 /// Beta flag for Anthropic prompt caching.
 /// Override via `PI_ANTHROPIC_CACHE_BETA_FLAG`.
 const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
+/// Beta flag for the extended (1h) prompt-cache TTL. Only sent when the request
+/// actually carries a `ttl: "1h"` cache breakpoint (first-party API + `Long`
+/// retention); relays commonly reject both the flag and the `ttl` field.
+const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
 const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
@@ -50,6 +54,43 @@ fn anthropic_cache_beta_flag() -> String {
         .ok()
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| ANTHROPIC_CACHE_BETA_FLAG.to_string())
+}
+
+/// True when `base_url` targets Anthropic's first-party API host.
+///
+/// Relays and proxies (custom `base_url`s) generally accept the plain
+/// `{"type":"ephemeral"}` marker but reject the extended `ttl` field, so the
+/// 1h TTL is only emitted for the first-party endpoint.
+fn is_first_party_anthropic_base_url(base_url: &str) -> bool {
+    base_url
+        .strip_prefix("https://api.anthropic.com")
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
+/// Derive the prompt-cache breakpoint marker for a request, if any.
+///
+/// This is the single source of truth for both the request body
+/// (`cache_control` on the system block and the last tool) and the header
+/// assembly (the extended-TTL beta flag is sent iff the returned marker
+/// carries a `ttl`), so the two can never drift apart.
+fn anthropic_cache_control_for(
+    retention: CacheRetention,
+    base_url: &str,
+) -> Option<AnthropicCacheControl> {
+    match retention {
+        CacheRetention::None => None,
+        CacheRetention::Short => Some(AnthropicCacheControl {
+            r#type: "ephemeral",
+            ttl: None,
+        }),
+        CacheRetention::Long => Some(AnthropicCacheControl {
+            r#type: "ephemeral",
+            // The 1h TTL requires the extended-cache-ttl beta and is only
+            // supported on the first-party API; degrade to the default 5m
+            // TTL elsewhere instead of risking a 400 from a relay.
+            ttl: is_first_party_anthropic_base_url(base_url).then_some("1h"),
+        }),
+    }
 }
 
 #[inline]
@@ -421,16 +462,25 @@ impl AnthropicProvider {
             .map(convert_message_to_anthropic)
             .collect();
 
+        // Prompt-cache breakpoints. One marker on the system block and one on
+        // the last tool cover the entire tools + system prefix (Anthropic
+        // caches everything before a marked block). `CacheRetention::None`
+        // emits no markers anywhere — cache writes bill at 1.25x, so caching
+        // must be strictly opt-in.
+        let cache_control = anthropic_cache_control_for(options.cache_retention, &self.base_url);
+
         let tools: Option<Vec<AnthropicTool<'_>>> = if context.tools.is_empty() {
             None
         } else {
-            Some(
-                context
-                    .tools
-                    .iter()
-                    .map(convert_tool_to_anthropic)
-                    .collect(),
-            )
+            let mut tools: Vec<AnthropicTool<'_>> = context
+                .tools
+                .iter()
+                .map(convert_tool_to_anthropic)
+                .collect();
+            if let Some(last) = tools.last_mut() {
+                last.cache_control = cache_control;
+            }
+            Some(tools)
         };
 
         // Decide between the modern adaptive-thinking API and the legacy
@@ -510,7 +560,13 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            system: context.system_prompt.as_deref(),
+            system: context.system_prompt.as_deref().map(|text| {
+                vec![AnthropicSystemBlock {
+                    r#type: "text",
+                    text,
+                    cache_control,
+                }]
+            }),
             max_tokens,
             temperature,
             tools,
@@ -619,8 +675,17 @@ impl Provider for AnthropicProvider {
         if anthropic_bearer_token {
             beta_flags.push(anthropic_oauth_beta_flags());
         }
-        if options.cache_retention != CacheRetention::None {
+        // Derived from the same helper that emits the body's cache_control
+        // markers, so headers and body cannot drift: the caching beta is sent
+        // iff markers are emitted, and the extended-TTL beta iff a marker
+        // actually carries `ttl: "1h"`.
+        if let Some(cache_control) =
+            anthropic_cache_control_for(options.cache_retention, &self.base_url)
+        {
             beta_flags.push(anthropic_cache_beta_flag());
+            if cache_control.ttl.is_some() {
+                beta_flags.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string());
+            }
         }
         if !beta_flags.is_empty() {
             request = request.header("anthropic-beta", beta_flags.join(","));
@@ -1080,7 +1145,7 @@ pub struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Vec<AnthropicSystemBlock<'a>>>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
@@ -1168,6 +1233,30 @@ struct AnthropicTool<'a> {
     name: &'a str,
     description: &'a str,
     input_schema: &'a serde_json::Value,
+    /// Prompt-cache breakpoint. Set on the LAST tool only: Anthropic caches
+    /// everything up to and including a marked block, so one marker covers
+    /// the whole tools array.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Typed system-prompt block. The `system` field must be an array of blocks
+/// (rather than a bare string) for a block to carry `cache_control`.
+#[derive(Debug, Serialize)]
+struct AnthropicSystemBlock<'a> {
+    r#type: &'static str,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+/// Prompt-cache breakpoint marker (`{"type":"ephemeral"}`, optionally with
+/// `"ttl":"1h"`). See [`anthropic_cache_control_for`].
+#[derive(Debug, Clone, Copy, Serialize)]
+struct AnthropicCacheControl {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
 }
 
 // ============================================================================
@@ -1396,6 +1485,7 @@ fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
         name: &tool.name,
         description: &tool.description,
         input_schema: &tool.parameters,
+        cache_control: None,
     }
 }
 
@@ -1499,7 +1589,12 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, Some("System prompt"));
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].r#type, "text");
+        assert_eq!(system[0].text, "System prompt");
+        // Default retention is None: no cache breakpoint on the system block.
+        assert!(system[0].cache_control.is_none());
         assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
@@ -1543,12 +1638,186 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        assert_eq!(request.system, None);
+        assert!(request.system.is_none());
         assert!(request.tools.is_none());
         assert!(request.thinking.is_none());
         assert!(request.output_config.is_none());
         assert_eq!(request.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(request.stream);
+    }
+
+    fn cache_test_tool(name: &str) -> ToolDef {
+        ToolDef {
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: json!({ "type": "object" }),
+        }
+    }
+
+    fn cache_test_context() -> Context<'static> {
+        Context {
+            system_prompt: Some("System prompt".to_string().into()),
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: vec![cache_test_tool("alpha"), cache_test_tool("beta")].into(),
+        }
+    }
+
+    /// Short retention: one `{"type":"ephemeral"}` breakpoint on the system
+    /// block and one on the LAST tool only, and both survive serde
+    /// serialization to the wire body.
+    #[test]
+    fn test_build_request_short_retention_marks_system_and_last_tool_only() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Short,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        assert_eq!(system.len(), 1);
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert_eq!(system_cc.r#type, "ephemeral");
+        assert!(system_cc.ttl.is_none(), "Short retention must not set ttl");
+        let tools = request.tools.as_ref().expect("tools");
+        assert_eq!(tools.len(), 2);
+        assert!(
+            tools[0].cache_control.is_none(),
+            "only the last tool carries the marker"
+        );
+        assert!(tools[1].cache_control.is_some());
+
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "non-final tools must not carry cache_control"
+        );
+        let wire = body.to_string();
+        assert_eq!(
+            wire.matches("cache_control").count(),
+            2,
+            "exactly two breakpoints: system + last tool"
+        );
+    }
+
+    /// None retention (the default) must emit zero `cache_control` markers —
+    /// cache writes bill at 1.25x, so caching is strictly opt-in.
+    #[test]
+    fn test_build_request_none_retention_emits_no_cache_control() {
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions::default();
+
+        let body = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "CacheRetention::None must not emit any cache_control marker"
+        );
+    }
+
+    /// Long retention against the first-party API gets `ttl: "1h"` (which the
+    /// header assembly pairs with the extended-cache-ttl beta flag).
+    #[test]
+    fn test_build_request_long_retention_first_party_uses_1h_ttl() {
+        // Default base_url is the first-party endpoint.
+        let provider = AnthropicProvider::new("claude-test");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert_eq!(system_cc.ttl, Some("1h"));
+
+        let body = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            body["system"][0]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+    }
+
+    /// Long retention through a relay (non-first-party base_url) degrades to
+    /// the default 5m TTL: markers are emitted, but no `ttl` field.
+    #[test]
+    fn test_build_request_long_retention_relay_degrades_to_default_ttl() {
+        let provider = AnthropicProvider::new("claude-test")
+            .with_base_url("https://relay.example.com/v1/messages");
+        let context = cache_test_context();
+        let options = StreamOptions {
+            cache_retention: CacheRetention::Long,
+            ..Default::default()
+        };
+
+        let request = provider.build_request(&context, &options);
+        let system = request.system.as_ref().expect("system blocks");
+        let system_cc = system[0].cache_control.as_ref().expect("system marker");
+        assert!(system_cc.ttl.is_none(), "relays must not receive ttl");
+        assert!(
+            !serde_json::to_value(&request)
+                .expect("serialize request")
+                .to_string()
+                .contains("ttl"),
+            "no ttl anywhere in the relay body"
+        );
+    }
+
+    /// The ttl decision (and therefore the extended-TTL beta flag, which is
+    /// derived from `ttl.is_some()` in `stream()`) hinges on the base URL.
+    #[test]
+    fn test_anthropic_cache_control_for_matrix() {
+        for base_url in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com",
+            "https://relay.example.com/v1/messages",
+        ] {
+            assert!(
+                anthropic_cache_control_for(CacheRetention::None, base_url).is_none(),
+                "None emits no marker for {base_url}"
+            );
+            let short = anthropic_cache_control_for(CacheRetention::Short, base_url)
+                .expect("short marker");
+            assert!(short.ttl.is_none(), "Short never sets ttl for {base_url}");
+        }
+        let long_first_party = anthropic_cache_control_for(
+            CacheRetention::Long,
+            "https://api.anthropic.com/v1/messages",
+        )
+        .expect("long marker");
+        assert_eq!(long_first_party.ttl, Some("1h"));
+        let long_relay = anthropic_cache_control_for(
+            CacheRetention::Long,
+            "https://relay.example.com/v1/messages",
+        )
+        .expect("long marker");
+        assert!(long_relay.ttl.is_none());
+        // Prefix-alike hosts are NOT first-party.
+        assert!(!is_first_party_anthropic_base_url(
+            "https://api.anthropic.com.evil.example/v1/messages"
+        ));
+        assert!(!is_first_party_anthropic_base_url(
+            "http://api.anthropic.com/v1/messages"
+        ));
     }
 
     /// gh #116: an adaptive-thinking Anthropic model must emit the modern
@@ -2255,6 +2524,24 @@ mod tests {
             captured.headers.get("anthropic-beta").map(String::as_str),
             Some("prompt-caching-2024-07-31")
         );
+        // Short retention: breakpoint marker present, no ttl anywhere.
+        assert!(captured.body.contains("\"cache_control\""));
+        assert!(!captured.body.contains("\"ttl\""));
+    }
+
+    /// Long retention through a relay base URL (the test server is not
+    /// api.anthropic.com): the caching beta is sent, but the extended-TTL
+    /// beta flag and the `ttl` field are both withheld together.
+    #[test]
+    fn test_stream_long_retention_via_relay_omits_extended_ttl_flag() {
+        let captured = run_stream_and_capture_headers(CacheRetention::Long)
+            .expect("captured request for long retention via relay");
+        assert_eq!(
+            captured.headers.get("anthropic-beta").map(String::as_str),
+            Some("prompt-caching-2024-07-31")
+        );
+        assert!(captured.body.contains("\"cache_control\""));
+        assert!(!captured.body.contains("\"ttl\""));
     }
 
     #[test]
