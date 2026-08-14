@@ -1,0 +1,1902 @@
+{
+  "bead": "bd-cv653.7.3",
+  "generated_by": "throwaway analysis script (STEP 0); sources pinned below",
+  "sources": {
+    "omp_registry": "/tmp/oh-my-pi-study/packages/ai/src/registry",
+    "omp_catalog_descriptors": "/tmp/oh-my-pi-study/packages/catalog/src/provider-models/descriptors.ts",
+    "omp_models_json": "/tmp/oh-my-pi-study/packages/catalog/src/models.json",
+    "pi_provider_metadata": "/Users/jemanuel/projects/pi_agent_rust/src/provider_metadata.rs"
+  },
+  "counts": {
+    "ours": 94,
+    "theirs": 77,
+    "in_both": 48,
+    "only_omp": 29,
+    "only_ours": 52,
+    "added": 1,
+    "deferred": 28
+  },
+  "theirs": {
+    "aiand": {
+      "registry": {
+        "file": "aiand.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "AIAND_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.aiand.com/v1"
+      ],
+      "models": 9,
+      "max_context_window": 1048576,
+      "max_max_tokens": 393216
+    },
+    "aimlapi": {
+      "registry": {
+        "file": "aimlapi.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "AIMLAPI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.aimlapi.com/v1"
+      ],
+      "models": 349,
+      "max_context_window": 2000000,
+      "max_max_tokens": 1020000
+    },
+    "alibaba-coding-plan": {
+      "registry": {
+        "file": "alibaba-coding-plan.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "ALIBABA_CODING_PLAN_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://coding-intl.dashscope.aliyuncs.com/v1"
+      ],
+      "models": 12,
+      "max_context_window": 1000000,
+      "max_max_tokens": 65536
+    },
+    "alibaba-token-plan": {
+      "registry": {
+        "file": "alibaba-token-plan.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "ALIBABA_TOKEN_PLAN_API_KEY",
+        "BAILIAN_TOKEN_PLAN_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+      ],
+      "models": 7,
+      "max_context_window": 1000000,
+      "max_max_tokens": 384000
+    },
+    "amazon-bedrock": {
+      "registry": {
+        "file": "amazon-bedrock.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [],
+      "api_kinds": [
+        "bedrock-converse-stream"
+      ],
+      "base_urls": [
+        "https://bedrock-runtime.us-east-1.amazonaws.com"
+      ],
+      "models": 141,
+      "max_context_window": 3500000,
+      "max_max_tokens": 262000
+    },
+    "anthropic": {
+      "registry": {
+        "file": "anthropic.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "ANTHROPIC_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://api.anthropic.com",
+        "https://api.anthropic.com/v1"
+      ],
+      "models": 26,
+      "max_context_window": 1000000,
+      "max_max_tokens": 128000
+    },
+    "azure": {
+      "registry": {
+        "file": "azure.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "AZURE_OPENAI_API_KEY"
+      ],
+      "api_kinds": [
+        "azure-openai-responses"
+      ],
+      "base_urls": [],
+      "models": 39,
+      "max_context_window": 1050000,
+      "max_max_tokens": 272000
+    },
+    "baseten": {
+      "registry": {
+        "file": "baseten.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "BASETEN_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://inference.baseten.co/v1"
+      ],
+      "models": 12,
+      "max_context_window": 1048576,
+      "max_max_tokens": 1048576
+    },
+    "bedrock-mantle": {
+      "registry": {
+        "file": "bedrock-mantle.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "AWS_BEARER_TOKEN_BEDROCK"
+      ],
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://bedrock-mantle.{region}.api.aws/openai/v1"
+      ],
+      "models": 5,
+      "max_context_window": 272000,
+      "max_max_tokens": 128000
+    },
+    "cerebras": {
+      "registry": {
+        "file": "cerebras.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "CEREBRAS_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.cerebras.ai/v1"
+      ],
+      "models": 7,
+      "max_context_window": 131072,
+      "max_max_tokens": 40960
+    },
+    "cloudflare-ai-gateway": {
+      "registry": {
+        "file": "cloudflare-ai-gateway.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "CLOUDFLARE_AI_GATEWAY_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic"
+      ],
+      "models": 45,
+      "max_context_window": 1050000,
+      "max_max_tokens": 262144
+    },
+    "coreweave": {
+      "registry": {
+        "file": "coreweave.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "COREWEAVE_API_KEY",
+        "WANDB_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.inference.wandb.ai/v1"
+      ],
+      "models": 35,
+      "max_context_window": 1048576,
+      "max_max_tokens": 1048576
+    },
+    "cursor": {
+      "registry": {
+        "file": "cursor.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "CURSOR_ACCESS_TOKEN"
+      ],
+      "api_kinds": [
+        "cursor-agent"
+      ],
+      "base_urls": [
+        "https://api2.cursor.sh"
+      ],
+      "models": 179,
+      "max_context_window": 1048576,
+      "max_max_tokens": 128000
+    },
+    "deepseek": {
+      "registry": {
+        "file": "deepseek.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "DEEPSEEK_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.deepseek.com"
+      ],
+      "models": 2,
+      "max_context_window": 1000000,
+      "max_max_tokens": 384000
+    },
+    "devin": {
+      "registry": {
+        "file": "devin.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "DEVIN_API_KEY"
+      ],
+      "api_kinds": [
+        "devin-agent"
+      ],
+      "base_urls": [
+        "https://server.codeium.com"
+      ],
+      "models": 1,
+      "max_context_window": 200000,
+      "max_max_tokens": 64000
+    },
+    "exa": {
+      "registry": {
+        "file": "exa.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "firepass": {
+      "registry": {
+        "file": "firepass.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "FIREPASS_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.fireworks.ai/inference/v1"
+      ],
+      "models": 1,
+      "max_context_window": 262144,
+      "max_max_tokens": 32768
+    },
+    "fireworks": {
+      "registry": {
+        "file": "fireworks.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "FIREWORKS_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.fireworks.ai/inference/v1"
+      ],
+      "models": 29,
+      "max_context_window": 1048576,
+      "max_max_tokens": 1048576
+    },
+    "github-copilot": {
+      "registry": {
+        "file": "github-copilot.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "COPILOT_GITHUB_TOKEN"
+      ],
+      "api_kinds": [
+        "anthropic-messages",
+        "openai-completions",
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://api.githubcopilot.com"
+      ],
+      "models": 42,
+      "max_context_window": 1050000,
+      "max_max_tokens": 131072
+    },
+    "gitlab-duo": {
+      "registry": {
+        "file": "gitlab-duo.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "GITLAB_TOKEN"
+      ],
+      "api_kinds": [
+        "anthropic-messages",
+        "openai-completions",
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://cloud.gitlab.com/ai/v1/proxy/anthropic/",
+        "https://cloud.gitlab.com/ai/v1/proxy/openai/v1"
+      ],
+      "models": 16,
+      "max_context_window": 272000,
+      "max_max_tokens": 128000
+    },
+    "gitlab-duo-agent": {
+      "registry": {
+        "file": "gitlab-duo-workflow.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "GITLAB_TOKEN"
+      ],
+      "api_kinds": [
+        "gitlab-duo-agent"
+      ],
+      "base_urls": [
+        "https://gitlab.com"
+      ],
+      "models": 1,
+      "max_context_window": 1000000,
+      "max_max_tokens": null
+    },
+    "gmi-cloud": {
+      "registry": {
+        "file": "gmi-cloud.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "GMI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.gmi-serving.com/v1"
+      ],
+      "models": 1,
+      "max_context_window": 1048576,
+      "max_max_tokens": 384000
+    },
+    "google": {
+      "registry": {
+        "file": "google.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "GEMINI_API_KEY"
+      ],
+      "api_kinds": [
+        "google-generative-ai"
+      ],
+      "base_urls": [
+        "https://generativelanguage.googleapis.com/v1beta"
+      ],
+      "models": 43,
+      "max_context_window": 1048576,
+      "max_max_tokens": 65536
+    },
+    "google-antigravity": {
+      "registry": {
+        "file": "google-antigravity.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [],
+      "api_kinds": [
+        "google-gemini-cli"
+      ],
+      "base_urls": [
+        "https://daily-cloudcode-pa.googleapis.com"
+      ],
+      "models": 18,
+      "max_context_window": 1048576,
+      "max_max_tokens": 65536
+    },
+    "google-gemini-cli": {
+      "registry": {
+        "file": "google-gemini-cli.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [],
+      "api_kinds": [
+        "google-gemini-cli"
+      ],
+      "base_urls": [
+        "https://cloudcode-pa.googleapis.com"
+      ],
+      "models": 7,
+      "max_context_window": 1048576,
+      "max_max_tokens": 65536
+    },
+    "google-vertex": {
+      "registry": {
+        "file": "google-vertex.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [],
+      "api_kinds": [
+        "anthropic-messages",
+        "google-vertex",
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://{location}-aiplatform.googleapis.com",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/endpoints/openapi",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-haiku-4-5@20251001:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-opus-4-5@20251101:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-opus-4-6@default:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-opus-4-7@default:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-opus-4-8@default:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-opus-5@default:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-sonnet-4-6@default:streamRawPredict",
+        "https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-sonnet-5@default:streamRawPredict"
+      ],
+      "models": 24,
+      "max_context_window": 1048576,
+      "max_max_tokens": 128000
+    },
+    "groq": {
+      "registry": {
+        "file": "groq.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "GROQ_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.groq.com/openai/v1"
+      ],
+      "models": 19,
+      "max_context_window": 262144,
+      "max_max_tokens": 131072
+    },
+    "huggingface": {
+      "registry": {
+        "file": "huggingface.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "HUGGINGFACE_HUB_TOKEN",
+        "HF_TOKEN"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://router.huggingface.co/v1"
+      ],
+      "models": 59,
+      "max_context_window": 1048576,
+      "max_max_tokens": 1048576
+    },
+    "kagi": {
+      "registry": {
+        "file": "kagi.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "kilo": {
+      "registry": {
+        "file": "kilo.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "KILO_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.kilo.ai/api/gateway"
+      ],
+      "models": 515,
+      "max_context_window": 2000000,
+      "max_max_tokens": 2000000
+    },
+    "kimi-code": {
+      "registry": {
+        "file": "kimi-code.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "KIMI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.kimi.com/coding/v1"
+      ],
+      "models": 7,
+      "max_context_window": 1048576,
+      "max_max_tokens": 262144
+    },
+    "litellm": {
+      "registry": {
+        "file": "litellm.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "LITELLM_API_KEY"
+      ],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "lm-studio": {
+      "registry": {
+        "file": "lm-studio.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "LM_STUDIO_API_KEY"
+      ],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "meta": {
+      "registry": {
+        "file": "meta.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "MODEL_API_KEY",
+        "META_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://api.meta.ai/v1"
+      ],
+      "models": 3,
+      "max_context_window": 1048576,
+      "max_max_tokens": 131072
+    },
+    "minimax": {
+      "registry": {
+        "file": "minimax.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "MINIMAX_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://api.minimax.io/anthropic"
+      ],
+      "models": 8,
+      "max_context_window": 1000000,
+      "max_max_tokens": 131072
+    },
+    "minimax-cn": {
+      "registry": null,
+      "env_vars": [],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://api.minimaxi.com/anthropic"
+      ],
+      "models": 8,
+      "max_context_window": 1000000,
+      "max_max_tokens": 131072
+    },
+    "minimax-code": {
+      "registry": {
+        "file": "minimax-code.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "MINIMAX_CODE_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.minimax.io/v1"
+      ],
+      "models": 9,
+      "max_context_window": 1000000,
+      "max_max_tokens": 131072
+    },
+    "minimax-code-cn": {
+      "registry": {
+        "file": "minimax-code-cn.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "MINIMAX_CODE_CN_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.minimaxi.com/v1"
+      ],
+      "models": 9,
+      "max_context_window": 1000000,
+      "max_max_tokens": 131072
+    },
+    "mistral": {
+      "registry": {
+        "file": "mistral.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "MISTRAL_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.mistral.ai/v1"
+      ],
+      "models": 30,
+      "max_context_window": 262144,
+      "max_max_tokens": 262144
+    },
+    "moonshot": {
+      "registry": {
+        "file": "moonshot.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "MOONSHOT_API_KEY",
+        "KIMI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.moonshot.ai/v1"
+      ],
+      "models": 17,
+      "max_context_window": 1048576,
+      "max_max_tokens": 262144
+    },
+    "nanogpt": {
+      "registry": {
+        "file": "nanogpt.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "NANO_GPT_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://nano-gpt.com/api/v1"
+      ],
+      "models": 850,
+      "max_context_window": 10000000,
+      "max_max_tokens": 2000000
+    },
+    "novita": {
+      "registry": {
+        "file": "novita.ts",
+        "oauth": false,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "NOVITA_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.novita.ai/openai/v1"
+      ],
+      "models": 112,
+      "max_context_window": 1048576,
+      "max_max_tokens": 1048576
+    },
+    "nvidia": {
+      "registry": {
+        "file": "nvidia.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "NVIDIA_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://integrate.api.nvidia.com/v1"
+      ],
+      "models": 164,
+      "max_context_window": 1048576,
+      "max_max_tokens": 393216
+    },
+    "ollama": {
+      "registry": {
+        "file": "ollama.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "OLLAMA_API_KEY"
+      ],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "ollama-cloud": {
+      "registry": {
+        "file": "ollama-cloud.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "OLLAMA_CLOUD_API_KEY"
+      ],
+      "api_kinds": [
+        "ollama-chat"
+      ],
+      "base_urls": [
+        "https://ollama.com"
+      ],
+      "models": 47,
+      "max_context_window": 1048576,
+      "max_max_tokens": 262144
+    },
+    "openai": {
+      "registry": {
+        "file": "openai.ts",
+        "oauth": false,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "OPENAI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://api.openai.com/v1"
+      ],
+      "models": 54,
+      "max_context_window": 1050000,
+      "max_max_tokens": 272000
+    },
+    "openai-codex": {
+      "registry": {
+        "file": "openai-codex.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "OPENAI_CODEX_OAUTH_TOKEN"
+      ],
+      "api_kinds": [
+        "openai-codex-responses"
+      ],
+      "base_urls": [
+        "https://chatgpt.com/backend-api"
+      ],
+      "models": 8,
+      "max_context_window": 372000,
+      "max_max_tokens": 128000
+    },
+    "openai-codex-device": {
+      "registry": {
+        "file": "openai-codex-device.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "opencode": {
+      "registry": null,
+      "env_vars": [],
+      "api_kinds": [
+        "openai-completions",
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://opencode.ai/zen/v1"
+      ],
+      "models": 5,
+      "max_context_window": 1050000,
+      "max_max_tokens": 262144
+    },
+    "opencode-go": {
+      "registry": {
+        "file": "opencode-go.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "OPENCODE_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages",
+        "openai-completions",
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://opencode.ai/zen/go",
+        "https://opencode.ai/zen/go/v1"
+      ],
+      "models": 24,
+      "max_context_window": 1050000,
+      "max_max_tokens": 500000
+    },
+    "opencode-zen": {
+      "registry": {
+        "file": "opencode-zen.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "OPENCODE_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages",
+        "google-generative-ai",
+        "openai-completions",
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://opencode.ai/zen",
+        "https://opencode.ai/zen/v1"
+      ],
+      "models": 83,
+      "max_context_window": 1050000,
+      "max_max_tokens": 500000
+    },
+    "openrouter": {
+      "registry": {
+        "file": "openrouter.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "OPENROUTER_API_KEY"
+      ],
+      "api_kinds": [
+        "openrouter"
+      ],
+      "base_urls": [
+        "https://openrouter.ai/api/v1"
+      ],
+      "models": 460,
+      "max_context_window": 2000000,
+      "max_max_tokens": 2000000
+    },
+    "parallel": {
+      "registry": {
+        "file": "parallel.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "perplexity": {
+      "registry": {
+        "file": "perplexity.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "qianfan": {
+      "registry": {
+        "file": "qianfan.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "QIANFAN_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://qianfan.baidubce.com/v2"
+      ],
+      "models": 1,
+      "max_context_window": 98304,
+      "max_max_tokens": 32768
+    },
+    "qwen-portal": {
+      "registry": {
+        "file": "qwen-portal.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "QWEN_OAUTH_TOKEN",
+        "QWEN_PORTAL_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://portal.qwen.ai/v1"
+      ],
+      "models": 2,
+      "max_context_window": 128000,
+      "max_max_tokens": 8192
+    },
+    "sakana": {
+      "registry": {
+        "file": "sakana.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "SAKANA_API_KEY",
+        "FUGU_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://api.sakana.ai/v1"
+      ],
+      "models": 3,
+      "max_context_window": 1000000,
+      "max_max_tokens": null
+    },
+    "siliconflow": {
+      "registry": {
+        "file": "siliconflow.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "SILICONFLOW_API_KEY"
+      ],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "siliconflow-cn": {
+      "registry": {
+        "file": "siliconflow-cn.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "SILICONFLOW_CN_API_KEY"
+      ],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "synthetic": {
+      "registry": {
+        "file": "synthetic.ts",
+        "oauth": false,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "SYNTHETIC_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.synthetic.new/openai/v1"
+      ],
+      "models": 10,
+      "max_context_window": 524288,
+      "max_max_tokens": 65536
+    },
+    "tavily": {
+      "registry": {
+        "file": "tavily.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "together": {
+      "registry": {
+        "file": "together.ts",
+        "oauth": false,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "TOGETHER_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.together.xyz/v1"
+      ],
+      "models": 35,
+      "max_context_window": 20000000,
+      "max_max_tokens": 512300
+    },
+    "umans": {
+      "registry": {
+        "file": "umans.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "UMANS_AI_CODING_PLAN_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://api.code.umans.ai"
+      ],
+      "models": 7,
+      "max_context_window": 1048576,
+      "max_max_tokens": 393215
+    },
+    "venice": {
+      "registry": {
+        "file": "venice.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "VENICE_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.venice.ai/api/v1"
+      ],
+      "models": 138,
+      "max_context_window": 2000000,
+      "max_max_tokens": 1048576
+    },
+    "vercel-ai-gateway": {
+      "registry": {
+        "file": "vercel-ai-gateway.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "AI_GATEWAY_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://ai-gateway.vercel.sh"
+      ],
+      "models": 245,
+      "max_context_window": 2000000,
+      "max_max_tokens": 2000000
+    },
+    "vllm": {
+      "registry": {
+        "file": "vllm.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "VLLM_API_KEY"
+      ],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "wafer-serverless": {
+      "registry": {
+        "file": "wafer-serverless.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "WAFER_SERVERLESS_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://pass.wafer.ai/v1"
+      ],
+      "models": 16,
+      "max_context_window": 1048576,
+      "max_max_tokens": 65536
+    },
+    "xai": {
+      "registry": {
+        "file": "xai.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "XAI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.x.ai/v1"
+      ],
+      "models": 31,
+      "max_context_window": 2000000,
+      "max_max_tokens": 500000
+    },
+    "xai-oauth": {
+      "registry": {
+        "file": "xai-oauth.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "XAI_OAUTH_TOKEN",
+        "XAI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "base_urls": [
+        "https://api.x.ai/v1"
+      ],
+      "models": 9,
+      "max_context_window": 2000000,
+      "max_max_tokens": 2000000
+    },
+    "xiaomi": {
+      "registry": {
+        "file": "xiaomi.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "XIAOMI_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://api.xiaomimimo.com/v1"
+      ],
+      "models": 6,
+      "max_context_window": 1048576,
+      "max_max_tokens": 131072
+    },
+    "xiaomi-token-plan-ams": {
+      "registry": {
+        "file": "xiaomi-token-plan-ams.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "XIAOMI_TOKEN_PLAN_AMS_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://token-plan-ams.xiaomimimo.com/v1"
+      ],
+      "models": 4,
+      "max_context_window": 1048576,
+      "max_max_tokens": 131072
+    },
+    "xiaomi-token-plan-cn": {
+      "registry": {
+        "file": "xiaomi-token-plan-cn.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "XIAOMI_TOKEN_PLAN_CN_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://token-plan-cn.xiaomimimo.com/v1"
+      ],
+      "models": 4,
+      "max_context_window": 1048576,
+      "max_max_tokens": 131072
+    },
+    "xiaomi-token-plan-sgp": {
+      "registry": {
+        "file": "xiaomi-token-plan-sgp.ts",
+        "oauth": true,
+        "api_key_login": false
+      },
+      "env_vars": [
+        "XIAOMI_TOKEN_PLAN_SGP_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://token-plan-sgp.xiaomimimo.com/v1"
+      ],
+      "models": 4,
+      "max_context_window": 1048576,
+      "max_max_tokens": 131072
+    },
+    "zai": {
+      "registry": {
+        "file": "zai.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "ZAI_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "base_urls": [
+        "https://api.z.ai/api/anthropic"
+      ],
+      "models": 14,
+      "max_context_window": 1000000,
+      "max_max_tokens": 131072
+    },
+    "zai-coding-plan": {
+      "registry": {
+        "file": "zai.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [],
+      "api_kinds": [],
+      "base_urls": [],
+      "models": 0
+    },
+    "zenmux": {
+      "registry": {
+        "file": "zenmux.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "ZENMUX_API_KEY"
+      ],
+      "api_kinds": [
+        "anthropic-messages",
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://zenmux.ai/api/anthropic",
+        "https://zenmux.ai/api/v1"
+      ],
+      "models": 214,
+      "max_context_window": 2000000,
+      "max_max_tokens": 1048576
+    },
+    "zhipu-coding-plan": {
+      "registry": {
+        "file": "zhipu-coding-plan.ts",
+        "oauth": true,
+        "api_key_login": true
+      },
+      "env_vars": [
+        "ZHIPU_API_KEY"
+      ],
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "base_urls": [
+        "https://open.bigmodel.cn/api/coding/paas/v4"
+      ],
+      "models": 12,
+      "max_context_window": 1000000,
+      "max_max_tokens": 131072
+    }
+  },
+  "in_both": [
+    {
+      "omp_id": "amazon-bedrock",
+      "pi_id": "amazon-bedrock"
+    },
+    {
+      "omp_id": "anthropic",
+      "pi_id": "anthropic"
+    },
+    {
+      "omp_id": "azure",
+      "pi_id": "azure-openai"
+    },
+    {
+      "omp_id": "baseten",
+      "pi_id": "baseten"
+    },
+    {
+      "omp_id": "cerebras",
+      "pi_id": "cerebras"
+    },
+    {
+      "omp_id": "cloudflare-ai-gateway",
+      "pi_id": "cloudflare-ai-gateway"
+    },
+    {
+      "omp_id": "cursor",
+      "pi_id": "cursor"
+    },
+    {
+      "omp_id": "deepseek",
+      "pi_id": "deepseek"
+    },
+    {
+      "omp_id": "fireworks",
+      "pi_id": "fireworks"
+    },
+    {
+      "omp_id": "github-copilot",
+      "pi_id": "github-copilot"
+    },
+    {
+      "omp_id": "gitlab-duo",
+      "pi_id": "gitlab"
+    },
+    {
+      "omp_id": "google",
+      "pi_id": "google"
+    },
+    {
+      "omp_id": "google-antigravity",
+      "pi_id": "google-antigravity"
+    },
+    {
+      "omp_id": "google-gemini-cli",
+      "pi_id": "google-gemini-cli"
+    },
+    {
+      "omp_id": "google-vertex",
+      "pi_id": "google-vertex"
+    },
+    {
+      "omp_id": "groq",
+      "pi_id": "groq"
+    },
+    {
+      "omp_id": "huggingface",
+      "pi_id": "huggingface"
+    },
+    {
+      "omp_id": "kimi-code",
+      "pi_id": "kimi-for-coding"
+    },
+    {
+      "omp_id": "lm-studio",
+      "pi_id": "lmstudio"
+    },
+    {
+      "omp_id": "minimax",
+      "pi_id": "minimax"
+    },
+    {
+      "omp_id": "minimax-cn",
+      "pi_id": "minimax-cn"
+    },
+    {
+      "omp_id": "minimax-code",
+      "pi_id": "minimax-coding-plan"
+    },
+    {
+      "omp_id": "minimax-code-cn",
+      "pi_id": "minimax-cn-coding-plan"
+    },
+    {
+      "omp_id": "mistral",
+      "pi_id": "mistral"
+    },
+    {
+      "omp_id": "moonshot",
+      "pi_id": "moonshotai"
+    },
+    {
+      "omp_id": "nanogpt",
+      "pi_id": "nano-gpt"
+    },
+    {
+      "omp_id": "novita",
+      "pi_id": "novita-ai"
+    },
+    {
+      "omp_id": "nvidia",
+      "pi_id": "nvidia"
+    },
+    {
+      "omp_id": "ollama",
+      "pi_id": "ollama"
+    },
+    {
+      "omp_id": "ollama-cloud",
+      "pi_id": "ollama-cloud"
+    },
+    {
+      "omp_id": "openai",
+      "pi_id": "openai"
+    },
+    {
+      "omp_id": "openai-codex",
+      "pi_id": "openai-codex"
+    },
+    {
+      "omp_id": "opencode",
+      "pi_id": "opencode"
+    },
+    {
+      "omp_id": "opencode-zen",
+      "pi_id": "opencode"
+    },
+    {
+      "omp_id": "openrouter",
+      "pi_id": "openrouter"
+    },
+    {
+      "omp_id": "perplexity",
+      "pi_id": "perplexity"
+    },
+    {
+      "omp_id": "siliconflow",
+      "pi_id": "siliconflow"
+    },
+    {
+      "omp_id": "siliconflow-cn",
+      "pi_id": "siliconflow-cn"
+    },
+    {
+      "omp_id": "synthetic",
+      "pi_id": "synthetic"
+    },
+    {
+      "omp_id": "together",
+      "pi_id": "togetherai"
+    },
+    {
+      "omp_id": "venice",
+      "pi_id": "venice"
+    },
+    {
+      "omp_id": "vercel-ai-gateway",
+      "pi_id": "vercel"
+    },
+    {
+      "omp_id": "xai",
+      "pi_id": "xai"
+    },
+    {
+      "omp_id": "xai-oauth",
+      "pi_id": "xai"
+    },
+    {
+      "omp_id": "xiaomi",
+      "pi_id": "xiaomi"
+    },
+    {
+      "omp_id": "zai",
+      "pi_id": "zai"
+    },
+    {
+      "omp_id": "zai-coding-plan",
+      "pi_id": "zai-coding-plan"
+    },
+    {
+      "omp_id": "zenmux",
+      "pi_id": "zenmux"
+    }
+  ],
+  "only_omp": [
+    "aiand",
+    "aimlapi",
+    "alibaba-coding-plan",
+    "alibaba-token-plan",
+    "bedrock-mantle",
+    "coreweave",
+    "devin",
+    "exa",
+    "firepass",
+    "gitlab-duo-agent",
+    "gmi-cloud",
+    "kagi",
+    "kilo",
+    "litellm",
+    "meta",
+    "openai-codex-device",
+    "opencode-go",
+    "parallel",
+    "qianfan",
+    "qwen-portal",
+    "sakana",
+    "tavily",
+    "umans",
+    "vllm",
+    "wafer-serverless",
+    "xiaomi-token-plan-ams",
+    "xiaomi-token-plan-cn",
+    "xiaomi-token-plan-sgp",
+    "zhipu-coding-plan"
+  ],
+  "only_ours": [
+    "302ai",
+    "abacus",
+    "aihubmix",
+    "alibaba",
+    "alibaba-cn",
+    "alibaba-us",
+    "atlascloud",
+    "bailing",
+    "berget",
+    "chutes",
+    "cloudflare-workers-ai",
+    "cohere",
+    "cortecs",
+    "deepinfra",
+    "fastrouter",
+    "firmware",
+    "friendli",
+    "gitlab",
+    "helicone",
+    "iflowcn",
+    "inception",
+    "inference",
+    "io-net",
+    "jiekou",
+    "kimi-for-coding",
+    "llama",
+    "llamacpp",
+    "lmstudio",
+    "lucidquery",
+    "mistralrs",
+    "moark",
+    "modelscope",
+    "moonshotai",
+    "moonshotai-cn",
+    "morph",
+    "nebius",
+    "nova",
+    "ovhcloud",
+    "poe",
+    "privatemode-ai",
+    "requesty",
+    "sap-ai-core",
+    "scaleway",
+    "stackit",
+    "submodel",
+    "togetherai",
+    "upstage",
+    "v0",
+    "vivgrid",
+    "vultr",
+    "wandb",
+    "zhipuai-coding-plan"
+  ],
+  "added_candidates": [
+    "aimlapi"
+  ],
+  "deferred": [
+    {
+      "id": "aiand",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "alibaba-coding-plan",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "alibaba-token-plan",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "bedrock-mantle",
+      "reason": "non-openai-completions api",
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "oauth": false
+    },
+    {
+      "id": "coreweave",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "devin",
+      "reason": "needs native module",
+      "api_kinds": [
+        "devin-agent"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "exa",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "firepass",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "gitlab-duo-agent",
+      "reason": "needs native module",
+      "api_kinds": [
+        "gitlab-duo-agent"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "gmi-cloud",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "kagi",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "kilo",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "litellm",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "meta",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "openai-codex-device",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "opencode-go",
+      "reason": "needs native module",
+      "api_kinds": [
+        "anthropic-messages",
+        "openai-completions",
+        "openai-responses"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "parallel",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "qianfan",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "qwen-portal",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "sakana",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-responses"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "tavily",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "umans",
+      "reason": "needs native module",
+      "api_kinds": [
+        "anthropic-messages"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "vllm",
+      "reason": "needs native module",
+      "api_kinds": [],
+      "oauth": true
+    },
+    {
+      "id": "wafer-serverless",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "xiaomi-token-plan-ams",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "xiaomi-token-plan-cn",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "xiaomi-token-plan-sgp",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    },
+    {
+      "id": "zhipu-coding-plan",
+      "reason": "needs native module",
+      "api_kinds": [
+        "openai-completions"
+      ],
+      "oauth": true
+    }
+  ]
+}
