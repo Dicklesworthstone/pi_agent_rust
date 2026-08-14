@@ -3872,6 +3872,180 @@ fn invalid_permissions_file_still_allows_future_decisions_to_persist() {
 }
 
 #[test]
+fn session_scoped_prompt_decision_skips_permission_store() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("extension-permissions.json");
+
+    let manager = extension_manager_no_persisted_permissions();
+    {
+        let mut guard = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ExtensionManager::load_persisted_permissions_from(&mut guard, &path);
+        assert!(guard.permission_store.is_some());
+    }
+
+    // Session-scoped decision: cached in memory, never written to disk.
+    manager.cache_policy_prompt_decision_scoped("ext.session", "exec", true, Some(false));
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.session", "exec"),
+        Some(true),
+        "session-scoped decision must hit the in-memory cache"
+    );
+    let store = PermissionStore::open(&path).expect("reload permissions file");
+    assert_eq!(
+        store.lookup("ext.session", "exec"),
+        None,
+        "session-scoped decision must not be persisted"
+    );
+
+    // Explicit persist and default (None) decisions still reach the store.
+    manager.cache_policy_prompt_decision_scoped("ext.session", "http", false, Some(true));
+    manager.cache_policy_prompt_decision_scoped("ext.session", "read", true, None);
+    let store = PermissionStore::open(&path).expect("reload permissions file");
+    assert_eq!(store.lookup("ext.session", "http"), Some(false));
+    assert_eq!(store.lookup("ext.session", "read"), Some(true));
+}
+
+#[test]
+fn manager_session_scope_disables_default_persistence() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("extension-permissions.json");
+
+    let manager = extension_manager_no_persisted_permissions();
+    {
+        let mut guard = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ExtensionManager::load_persisted_permissions_from(&mut guard, &path);
+    }
+
+    assert!(manager.policy_prompt_persistence(), "persistent by default");
+    manager.set_policy_prompt_persistence(false);
+    assert!(!manager.policy_prompt_persistence());
+
+    // Legacy entry point now defers to the manager-level scope.
+    manager.cache_policy_prompt_decision("ext.mgr", "exec", true);
+    assert_eq!(
+        manager.cached_policy_prompt_decision("ext.mgr", "exec"),
+        Some(true)
+    );
+    let store = PermissionStore::open(&path).expect("reload permissions file");
+    assert_eq!(store.lookup("ext.mgr", "exec"), None);
+
+    // A per-decision override still wins over the manager default.
+    manager.cache_policy_prompt_decision_scoped("ext.mgr", "http", true, Some(true));
+    let store = PermissionStore::open(&path).expect("reload permissions file");
+    assert_eq!(store.lookup("ext.mgr", "http"), Some(true));
+}
+
+struct RecordingUiHandler {
+    prompts: std::sync::Mutex<Vec<ExtensionUiRequest>>,
+    value: Value,
+}
+
+#[async_trait]
+impl crate::extension_dispatcher::ExtensionUiHandler for RecordingUiHandler {
+    async fn request_ui(&self, request: ExtensionUiRequest) -> Result<Option<ExtensionUiResponse>> {
+        let id = request.id.clone();
+        self.prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request);
+        Ok(Some(ExtensionUiResponse {
+            id,
+            value: Some(self.value.clone()),
+            cancelled: false,
+        }))
+    }
+}
+
+#[test]
+fn ui_handler_bridges_request_ui_and_records_prompt() {
+    let manager = extension_manager_no_persisted_permissions();
+    let handler = Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: Value::Bool(true),
+    });
+    manager.set_ui_handler(handler.clone());
+
+    let response = run_async(async {
+        manager
+            .request_ui(ExtensionUiRequest::new(
+                "",
+                "confirm",
+                json!({ "title": "Allow?", "message": "capability prompt" }),
+            ))
+            .await
+    })
+    .expect("request_ui")
+    .expect("handler response");
+    assert_eq!(response.value, Some(Value::Bool(true)));
+    assert!(!response.cancelled);
+
+    let prompts = handler
+        .prompts
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(prompts.len(), 1);
+    assert!(!prompts[0].id.is_empty(), "request id must be assigned");
+    assert_eq!(prompts[0].method, "confirm");
+}
+
+#[test]
+fn prompt_capability_once_parses_scoped_object_response() {
+    let manager = extension_manager_no_persisted_permissions();
+    let handler = Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: json!({ "allow": true, "persist": false }),
+    });
+    manager.set_ui_handler(handler);
+
+    let (allow, persist) =
+        run_async(async { super::prompt_capability_once(&manager, "ext.scoped", "exec").await });
+    assert!(allow);
+    assert_eq!(persist, Some(false));
+}
+
+#[test]
+fn prompt_capability_once_bool_response_keeps_default_persistence() {
+    let manager = extension_manager_no_persisted_permissions();
+    let handler = Arc::new(RecordingUiHandler {
+        prompts: std::sync::Mutex::new(Vec::new()),
+        value: Value::Bool(true),
+    });
+    manager.set_ui_handler(handler);
+
+    let (allow, persist) =
+        run_async(async { super::prompt_capability_once(&manager, "ext.bool", "exec").await });
+    assert!(allow);
+    assert_eq!(persist, None);
+}
+
+#[test]
+fn prompt_capability_once_without_ui_surface_fails_closed() {
+    let manager = extension_manager_no_persisted_permissions();
+
+    let err = run_async(async {
+        manager
+            .request_ui(ExtensionUiRequest::new("", "confirm", json!({})))
+            .await
+    })
+    .expect_err("no UI surface configured");
+    assert!(
+        err.to_string()
+            .contains("Extension UI sender not configured")
+    );
+
+    let (allow, persist) =
+        run_async(async { super::prompt_capability_once(&manager, "ext.closed", "exec").await });
+    assert!(!allow, "missing UI surface must deny");
+    assert_eq!(persist, None);
+}
+
+#[test]
 fn cached_policy_prompt_decision_rejects_out_of_range_version() {
     let manager = extension_manager_no_persisted_permissions();
     {

@@ -144,7 +144,7 @@ impl ExtensionManager {
             all_event_hooks,
             all_tool_defs,
             command_names,
-            has_ui: inner.ui_sender.is_some(),
+            has_ui: inner.ui_sender.is_some() || inner.ui_handler.is_some(),
         }
     }
 
@@ -2777,6 +2777,57 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Install a direct UI handler bridge (SDK embedders).
+    ///
+    /// The handler is consulted by [`Self::request_ui`] before any channel
+    /// sender installed via [`Self::set_ui_sender`]. When neither is
+    /// configured, `request_ui` keeps its fail-closed error behavior.
+    pub fn set_ui_handler(
+        &self,
+        handler: Arc<dyn crate::extension_dispatcher::ExtensionUiHandler>,
+    ) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.ui_handler = Some(handler);
+        self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    /// Remove any direct UI handler bridge.
+    pub fn clear_ui_handler(&self) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.ui_handler = None;
+        self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    /// Control whether policy prompt decisions are persisted to disk.
+    ///
+    /// `true` (the default) keeps the existing behavior: decisions are
+    /// written to the permission store and survive across sessions. `false`
+    /// scopes decisions to this session's in-memory cache only. A
+    /// per-decision `persist` override supplied through
+    /// [`Self::cache_policy_prompt_decision_scoped`] takes precedence.
+    pub fn set_policy_prompt_persistence(&self, persist: bool) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.session_scoped_prompt_decisions = !persist;
+    }
+
+    /// Whether policy prompt decisions currently default to disk persistence.
+    pub fn policy_prompt_persistence(&self) -> bool {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !guard.session_scoped_prompt_decisions
+    }
+
     pub fn set_runtime(&self, runtime: ExtensionRuntimeHandle) {
         let mut guard = self
             .inner
@@ -2890,6 +2941,24 @@ impl ExtensionManager {
     }
 
     pub fn cache_policy_prompt_decision(&self, extension_id: &str, capability: &str, allow: bool) {
+        self.cache_policy_prompt_decision_scoped(extension_id, capability, allow, None);
+    }
+
+    /// Cache a policy prompt decision with explicit persistence scope.
+    ///
+    /// The decision is always cached in memory for the current session.
+    /// `persist` controls whether it is also written to the permission store:
+    /// `None` defers to the manager-level default (see
+    /// [`Self::set_policy_prompt_persistence`], persistent unless changed),
+    /// `Some(true)` forces a durable record, and `Some(false)` keeps the
+    /// decision session-scoped.
+    pub fn cache_policy_prompt_decision_scoped(
+        &self,
+        extension_id: &str,
+        capability: &str,
+        allow: bool,
+        persist: Option<bool>,
+    ) {
         let mut guard = self
             .inner
             .lock()
@@ -2914,7 +2983,12 @@ impl ExtensionManager {
             .or_default()
             .insert(capability.to_string(), decision);
 
-        // Persist to disk so the decision survives across sessions.
+        // Persist to disk so the decision survives across sessions, unless
+        // the decision (or the manager) is scoped to this session only.
+        let persist_effective = persist.unwrap_or(!guard.session_scoped_prompt_decisions);
+        if !persist_effective {
+            return;
+        }
         if let Some(ref mut store) = guard.permission_store {
             let res = if let Some(range) = version_range {
                 store.record_with_version(extension_id, capability, allow, &range)
@@ -4016,13 +4090,23 @@ impl ExtensionManager {
             request.id = Uuid::new_v4().to_string();
         }
 
-        let (ui_sender, expects_response) = {
+        let (ui_sender, ui_handler, expects_response) = {
             let guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (guard.ui_sender.clone(), request.expects_response())
+            (
+                guard.ui_sender.clone(),
+                guard.ui_handler.clone(),
+                request.expects_response(),
+            )
         };
+
+        // Direct handler bridge (SDK embedders) takes precedence over the
+        // channel-based TUI/RPC surface.
+        if let Some(handler) = ui_handler {
+            return handler.request_ui(request).await;
+        }
 
         let Some(ui_sender) = ui_sender else {
             return Err(Error::extension("Extension UI sender not configured"));

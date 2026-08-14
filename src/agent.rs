@@ -8322,6 +8322,11 @@ impl AgentSession {
         self.compaction_settings.context_window_tokens = context_window_tokens;
     }
 
+    /// The resolved compaction settings this session was constructed with.
+    pub const fn compaction_settings(&self) -> &ResolvedCompactionSettings {
+        &self.compaction_settings
+    }
+
     pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
         let already_active = {
             let provider = self.agent.provider();

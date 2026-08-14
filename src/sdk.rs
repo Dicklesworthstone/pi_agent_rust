@@ -22,7 +22,6 @@
 use crate::app;
 use crate::auth::AuthStorage;
 use crate::cli::Cli;
-use crate::compaction::ResolvedCompactionSettings;
 use crate::models::default_models_path;
 use crate::provider::ThinkingBudgets;
 use crate::providers;
@@ -39,9 +38,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
+pub use crate::compaction::ResolvedCompactionSettings;
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
-pub use crate::extensions::{ExtensionManager, ExtensionPolicy, ExtensionRegion};
+pub use crate::extension_dispatcher::ExtensionUiHandler;
+pub use crate::extensions::{
+    ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionUiRequest, ExtensionUiResponse,
+};
 pub use crate::model::ThinkingLevel;
 pub use crate::model::{
     AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopDetails,
@@ -333,6 +336,38 @@ pub struct SessionOptions {
 
     /// Callback for raw provider [`StreamEvent`]s.
     pub on_stream_event: Option<OnStreamEvent>,
+
+    /// Optional UI handler bridging extension UI requests (including
+    /// capability prompts) to the host application.
+    ///
+    /// In interactive mode the TUI answers these prompts; without a handler,
+    /// SDK sessions keep the historical fail-closed behavior: extension UI
+    /// requests error out and capability prompts resolve to deny.
+    ///
+    /// Only consulted when [`SessionOptions::extension_paths`] loads at least
+    /// one extension. A capability prompt arrives as a `"confirm"` request;
+    /// respond with `value: Value::Bool(allow)` for the default persistence
+    /// behavior, or `value: json!({"allow": bool, "persist": bool})` to
+    /// control whether the decision is persisted across sessions
+    /// (`persist: false` keeps it scoped to this session).
+    pub extension_ui_handler: Option<Arc<dyn ExtensionUiHandler>>,
+
+    /// Whether extension capability prompt decisions are persisted to the
+    /// on-disk permission store (`~/.pi/extension-permissions.json`).
+    ///
+    /// `true` (the default) matches the CLI/TUI behavior. `false` scopes all
+    /// prompt decisions for this session to the in-memory cache, unless an
+    /// individual handler response overrides with `persist: true`.
+    pub persist_extension_permissions: bool,
+
+    /// Optional per-session compaction settings override.
+    ///
+    /// When `Some`, the settings are used verbatim for this session. When
+    /// `None` (the default), settings derive from the global config and the
+    /// selected model's context window exactly as before. Note that switching
+    /// models later still updates `context_window_tokens` to the new model's
+    /// window.
+    pub compaction_settings: Option<ResolvedCompactionSettings>,
 }
 
 impl Default for SessionOptions {
@@ -359,6 +394,9 @@ impl Default for SessionOptions {
             on_tool_start: None,
             on_tool_end: None,
             on_stream_event: None,
+            extension_ui_handler: None,
+            persist_extension_permissions: true,
+            compaction_settings: None,
         }
     }
 }
@@ -1327,6 +1365,14 @@ impl AgentSessionHandle {
         self.session.extensions.as_ref()
     }
 
+    /// The compaction settings this session resolved at creation time.
+    ///
+    /// Reflects [`SessionOptions::compaction_settings`] when an override was
+    /// supplied, or the config/model-derived defaults otherwise.
+    pub const fn compaction_settings(&self) -> &ResolvedCompactionSettings {
+        self.session.compaction_settings()
+    }
+
     // -----------------------------------------------------------------
     // Provider & Model
     // -----------------------------------------------------------------
@@ -1769,17 +1815,19 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     );
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
-    let context_window_tokens = if selection.model_entry.model.context_window == 0 {
-        ResolvedCompactionSettings::default().context_window_tokens
-    } else {
-        selection.model_entry.model.context_window
-    };
-    let compaction_settings = ResolvedCompactionSettings {
-        enabled: config.compaction_enabled(),
-        reserve_tokens: config.compaction_reserve_tokens(),
-        keep_recent_tokens: config.compaction_keep_recent_tokens(),
-        context_window_tokens,
-    };
+    let compaction_settings = options.compaction_settings.clone().unwrap_or_else(|| {
+        let context_window_tokens = if selection.model_entry.model.context_window == 0 {
+            ResolvedCompactionSettings::default().context_window_tokens
+        } else {
+            selection.model_entry.model.context_window
+        };
+        ResolvedCompactionSettings {
+            enabled: config.compaction_enabled(),
+            reserve_tokens: config.compaction_reserve_tokens(),
+            keep_recent_tokens: config.compaction_keep_recent_tokens(),
+            context_window_tokens,
+        }
+    });
 
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
@@ -1811,6 +1859,23 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
                 None,
             )
             .await?;
+
+        // Bridge extension UI requests (capability prompts, pi.ui()) to the
+        // host application and apply the requested permission-persistence
+        // scope. Without a handler, extension UI requests keep failing
+        // closed exactly as before.
+        if let Some(manager) = agent_session
+            .extensions
+            .as_ref()
+            .map(ExtensionRegion::manager)
+        {
+            if let Some(handler) = options.extension_ui_handler.clone() {
+                manager.set_ui_handler(handler);
+            }
+            if !options.persist_extension_permissions {
+                manager.set_policy_prompt_persistence(false);
+            }
+        }
     }
 
     agent_session.set_model_registry(model_registry.clone());
@@ -2593,6 +2658,116 @@ mod tests {
         );
         assert!(handle.extension_manager().is_none());
         assert!(handle.extension_region().is_none());
+    }
+
+    #[test]
+    fn session_options_new_fields_default_to_current_behavior() {
+        let options = SessionOptions::default();
+        assert!(options.extension_ui_handler.is_none());
+        assert!(options.persist_extension_permissions);
+        assert!(options.compaction_settings.is_none());
+    }
+
+    #[test]
+    fn create_agent_session_uses_compaction_override_verbatim() {
+        let tmp = tempdir().expect("tempdir");
+        let custom = ResolvedCompactionSettings {
+            enabled: false,
+            context_window_tokens: 55_555,
+            reserve_tokens: 1_234,
+            keep_recent_tokens: 4_321,
+        };
+        let options = SessionOptions {
+            compaction_settings: Some(custom.clone()),
+            ..hermetic_session_options(tmp.path())
+        };
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        let resolved = handle.compaction_settings();
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.context_window_tokens, custom.context_window_tokens);
+        assert_eq!(resolved.reserve_tokens, custom.reserve_tokens);
+        assert_eq!(resolved.keep_recent_tokens, custom.keep_recent_tokens);
+    }
+
+    #[test]
+    fn create_agent_session_derives_compaction_without_override() {
+        let tmp = tempdir().expect("tempdir");
+        let options = hermetic_session_options(tmp.path());
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        let resolved = handle.compaction_settings();
+        assert!(
+            resolved.context_window_tokens > 0,
+            "derived settings must resolve a context window"
+        );
+    }
+
+    struct SdkRecordingUiHandler {
+        prompts: Mutex<Vec<ExtensionUiRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ExtensionUiHandler for SdkRecordingUiHandler {
+        async fn request_ui(
+            &self,
+            request: ExtensionUiRequest,
+        ) -> Result<Option<ExtensionUiResponse>> {
+            let id = request.id.clone();
+            self.prompts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(request);
+            Ok(Some(ExtensionUiResponse {
+                id,
+                value: Some(Value::Bool(true)),
+                cancelled: false,
+            }))
+        }
+    }
+
+    #[test]
+    fn create_agent_session_wires_extension_ui_handler_and_permission_scope() {
+        let tmp = tempdir().expect("tempdir");
+        let ext_path = tmp.path().join("noop_ext.js");
+        std::fs::write(&ext_path, "export default function init() {}\n").expect("write extension");
+
+        let handler = Arc::new(SdkRecordingUiHandler {
+            prompts: Mutex::new(Vec::new()),
+        });
+        let options = SessionOptions {
+            extension_paths: vec![ext_path],
+            extension_ui_handler: Some(handler.clone()),
+            persist_extension_permissions: false,
+            ..hermetic_session_options(tmp.path())
+        };
+
+        let handle = run_async(create_agent_session(options)).expect("create session");
+        let manager = handle.extension_manager().expect("extensions loaded");
+        assert!(
+            !manager.policy_prompt_persistence(),
+            "persist_extension_permissions: false must scope decisions to the session"
+        );
+
+        let response = run_async(async {
+            manager
+                .request_ui(ExtensionUiRequest::new(
+                    "",
+                    "confirm",
+                    serde_json::json!({ "title": "Allow?", "message": "capability" }),
+                ))
+                .await
+        })
+        .expect("request_ui")
+        .expect("handler response");
+        assert_eq!(response.value, Some(Value::Bool(true)));
+
+        let prompts = handler
+            .prompts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(prompts.len(), 1, "handler must receive the UI request");
+        assert_eq!(prompts[0].method, "confirm");
     }
 
     // =====================================================================

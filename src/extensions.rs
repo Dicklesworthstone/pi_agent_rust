@@ -15166,11 +15166,19 @@ fn js_hostcall_timeout_ms(request: &HostcallRequest) -> Option<u64> {
     }
 }
 
+/// Prompt the UI surface once for a capability decision.
+///
+/// Returns `(allow, persist_override)`. The response `value` may be either a
+/// plain boolean (the TUI flow; `persist_override` stays `None`, keeping the
+/// caller's default persistence behavior) or an object of the form
+/// `{"allow": bool, "persist": bool}` so embedder-provided UI handlers can
+/// scope a decision to the current session (`persist: false`) or persist it
+/// (`persist: true`). Missing responses and errors fail closed to deny.
 async fn prompt_capability_once(
     manager: &ExtensionManager,
     extension_id: &str,
     capability: &str,
-) -> bool {
+) -> (bool, Option<bool>) {
     let title = format!("Allow extension capability: {capability}");
     let message = format!("Extension {extension_id} requests capability '{capability}'. Allow?");
     let payload = json!({
@@ -15183,14 +15191,20 @@ async fn prompt_capability_once(
 
     match manager.request_ui(request).await {
         Ok(Some(response)) => {
-            response
-                .value
-                .as_ref()
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && !response.cancelled
+            if response.cancelled {
+                return (false, None);
+            }
+            match response.value.as_ref() {
+                Some(Value::Bool(allow)) => (*allow, None),
+                Some(Value::Object(map)) => {
+                    let allow = map.get("allow").and_then(Value::as_bool).unwrap_or(false);
+                    let persist = map.get("persist").and_then(Value::as_bool);
+                    (allow, persist)
+                }
+                _ => (false, None),
+            }
         }
-        Ok(None) | Err(_) => false,
+        Ok(None) | Err(_) => (false, None),
     }
 }
 
@@ -15234,9 +15248,9 @@ async fn resolve_js_hostcall_policy_decision(
     let Some(manager) = host.manager() else {
         return (PolicyDecision::Deny, "shutdown".to_string(), capability);
     };
-    let allow = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
+    let (allow, persist) = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
     if let Some(extension_id) = extension_id {
-        manager.cache_policy_prompt_decision(extension_id, &capability, allow);
+        manager.cache_policy_prompt_decision_scoped(extension_id, &capability, allow, persist);
     }
     decision = if allow {
         PolicyDecision::Allow
@@ -16302,10 +16316,10 @@ async fn resolve_shared_policy_prompt(
     };
 
     let prompt_ext_id = ctx.extension_id.unwrap_or("<unknown>");
-    let allow = prompt_capability_once(manager, prompt_ext_id, capability).await;
+    let (allow, persist) = prompt_capability_once(manager, prompt_ext_id, capability).await;
 
     if let Some(ext_id) = ctx.extension_id {
-        manager.cache_policy_prompt_decision(ext_id, capability, allow);
+        manager.cache_policy_prompt_decision_scoped(ext_id, capability, allow, persist);
     }
 
     let decision = if allow {
@@ -19344,6 +19358,13 @@ struct ExtensionManagerInner {
     #[cfg(feature = "wasm-host")]
     wasm_extensions: Vec<WasmExtensionHandle>,
     ui_sender: Option<mpsc::Sender<ExtensionUiRequest>>,
+    /// Direct UI handler bridge for embedders (SDK mode). Checked before
+    /// `ui_sender`; when neither is configured, `request_ui` fails closed.
+    ui_handler: Option<Arc<dyn crate::extension_dispatcher::ExtensionUiHandler>>,
+    /// When `true`, policy prompt decisions are cached in memory for this
+    /// session only and never written to the persistent permission store
+    /// (unless a per-decision override requests persistence).
+    session_scoped_prompt_decisions: bool,
     pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
