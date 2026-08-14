@@ -17,3 +17,7 @@ last-touched
 # Preserved pre-repair DB/WAL copies and timestamped recovery snapshots.
 *.bad_*
 recovery_*/
+
+# Merge artifacts (temporary files from 3-way merge)
+beads.base.jsonl
+beads.base.meta.json
