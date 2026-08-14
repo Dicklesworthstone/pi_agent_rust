@@ -8816,10 +8816,7 @@ impl AgentSession {
     /// while a background compaction is still pending, and skips extension
     /// `before_compact` dispatch: this path exists to guarantee forward
     /// progress, so nothing may cancel it.
-    async fn force_local_compaction_if_oversized(
-        &self,
-        on_event: AgentEventHandler,
-    ) -> Result<()> {
+    async fn force_local_compaction_if_oversized(&self, on_event: AgentEventHandler) -> Result<()> {
         let decision = self
             .compaction_worker
             .admission_decision(None, &CompactionAdmissionSignals::default());
@@ -13003,35 +13000,34 @@ mod tests {
                 .await
                 .expect("maybe_compact");
 
-            let captured = events.lock().expect("lock captured events");
-            let start_reason = captured
-                .iter()
-                .find_map(|event| match event {
+            let (start_reason, end_payload) = {
+                let captured = events.lock().expect("lock captured events");
+                let start_reason = captured.iter().find_map(|event| match event {
                     AgentEvent::AutoCompactionStart { reason } => Some(reason.clone()),
                     _ => None,
-                })
-                .expect("forced local compaction should start");
-            assert!(
-                start_reason.starts_with("forced_local"),
-                "unexpected start reason: {start_reason}"
-            );
-            let end_payload = captured
-                .iter()
-                .find_map(|event| match event {
+                });
+                let end_payload = captured.iter().find_map(|event| match event {
                     AgentEvent::AutoCompactionEnd {
                         result: Some(result),
                         ..
                     } => Some(result.clone()),
                     _ => None,
-                })
-                .expect("forced local compaction should complete");
+                });
+                drop(captured);
+                (start_reason, end_payload)
+            };
+            let start_reason = start_reason.expect("forced local compaction should start");
+            assert!(
+                start_reason.starts_with("forced_local"),
+                "unexpected start reason: {start_reason}"
+            );
+            let end_payload = end_payload.expect("forced local compaction should complete");
             assert!(
                 end_payload["summary"]
                     .as_str()
                     .expect("summary string")
                     .contains("deterministic fallback")
             );
-            drop(captured);
 
             // The session must now contain a compaction entry.
             let cx = crate::agent_cx::AgentCx::for_request();
