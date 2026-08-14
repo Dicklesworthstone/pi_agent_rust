@@ -302,7 +302,16 @@ impl CompactionWorkerState {
         }
 
         let pending = self.pending.take()?;
-        Some(pending.join.await)
+        let outcome = pending.join.await;
+        if outcome.is_ok() {
+            // A successful compaction ends any failure streak. The per-session
+            // attempt quota exists to stop futile retry loops, not to cap how
+            // many times a long-lived session may successfully compact; without
+            // this reset the counter is monotonic and compaction is permanently
+            // blocked once it crosses `max_attempts_per_session`.
+            self.attempt_count = 0;
+        }
+        Some(outcome)
     }
 
     /// Spawn a background compaction on the provided runtime.
@@ -339,6 +348,12 @@ impl CompactionWorkerState {
         });
         self.last_start = Some(now);
         self.attempt_count = self.attempt_count.saturating_add(1);
+    }
+
+    /// Test-only: force the session attempt counter to simulate quota state.
+    #[cfg(test)]
+    pub(crate) const fn set_attempt_count_for_test(&mut self, attempt_count: u32) {
+        self.attempt_count = attempt_count;
     }
 }
 
@@ -859,6 +874,115 @@ mod tests {
             let result = outcome.expect("should be Ok");
             assert_eq!(result.summary, "test summary");
             assert!(w.pending.is_none());
+        });
+    }
+
+    fn ok_compaction_outcome() -> CompactionOutcome {
+        Ok(CompactionResult {
+            summary: "summary".to_string(),
+            first_kept_entry_id: "entry-1".to_string(),
+            tokens_before: 1000,
+            details: compaction::CompactionDetails {
+                read_files: vec![],
+                modified_files: vec![],
+            },
+        })
+    }
+
+    #[test]
+    fn successful_result_resets_attempt_count() {
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            w.attempt_count = 41;
+            let pending = ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            inject_pending(&mut w, pending);
+            assert_eq!(w.attempt_count, 42);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_ok());
+            assert_eq!(
+                w.attempt_count, 0,
+                "successful compaction must reset the session attempt counter"
+            );
+        });
+    }
+
+    #[test]
+    fn failed_result_does_not_reset_attempt_count() {
+        run_async(|runtime_handle| async move {
+            let mut w = default_worker();
+            w.attempt_count = 4;
+            let pending = ready_pending_with_handle(
+                runtime_handle,
+                Err(Error::session("provider returned HTTP 500".to_string())),
+            )
+            .await;
+            inject_pending(&mut w, pending);
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_err());
+            assert_eq!(
+                w.attempt_count, 5,
+                "failed compaction must keep counting toward the attempt quota"
+            );
+        });
+    }
+
+    #[test]
+    fn timeout_does_not_reset_attempt_count() {
+        run_async(|runtime_handle| async move {
+            let mut w = make_worker(CompactionQuota {
+                timeout: Duration::from_millis(0),
+                ..CompactionQuota::default()
+            });
+            w.attempt_count = 6;
+            let mut pending = parked_pending_with_handle(runtime_handle, None).await;
+            pending.started_at = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+            inject_pending(&mut w, pending);
+
+            let outcome = w.try_recv().await.expect("should return timeout error");
+            assert!(outcome.is_err());
+            assert_eq!(w.attempt_count, 7);
+        });
+    }
+
+    #[test]
+    fn attempt_limit_recovers_after_success() {
+        run_async(|runtime_handle| async move {
+            let mut w = make_worker(CompactionQuota {
+                max_attempts_per_session: 3,
+                cooldown: Duration::from_millis(0),
+                ..CompactionQuota::default()
+            });
+            w.attempt_count = 2;
+            let pending = ready_pending_with_handle(runtime_handle, ok_compaction_outcome()).await;
+            inject_pending(&mut w, pending);
+            // At the limit and pending: blocked.
+            assert!(!w.can_start());
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+
+            let outcome = w.try_recv().await.expect("should have result");
+            assert!(outcome.is_ok());
+            assert!(
+                w.can_start(),
+                "reaching the attempt limit via successes must not permanently block compaction"
+            );
         });
     }
 }

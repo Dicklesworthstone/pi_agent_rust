@@ -1429,6 +1429,128 @@ async fn generate_turn_prefix_summary(
 }
 
 // =============================================================================
+// Deterministic fallback summarization (no LLM)
+// =============================================================================
+
+/// Maximum visible characters retained per message excerpt in a deterministic
+/// fallback summary.
+const FALLBACK_SNIPPET_MAX_CHARS: usize = 400;
+
+/// Multiplier over the configured context window at which a quota-blocked
+/// background compaction escalates to a synchronous, provider-free local
+/// compaction so the session cannot grow without bound.
+pub const FORCED_LOCAL_COMPACTION_WINDOW_FACTOR: u64 = 2;
+
+/// Whether the session is so far past its context window that compaction must
+/// proceed even when the background worker is quota-blocked.
+#[must_use]
+pub fn requires_forced_local_compaction(
+    tokens_before: u64,
+    settings: &ResolvedCompactionSettings,
+) -> bool {
+    settings.enabled
+        && tokens_before
+            >= u64::from(settings.context_window_tokens)
+                .saturating_mul(FORCED_LOCAL_COMPACTION_WINDOW_FACTOR)
+}
+
+/// Keep the head and tail of `text`, eliding the middle so the result stays
+/// within roughly `max_chars` visible characters plus a short elision marker.
+///
+/// Operates on `char` boundaries so multi-byte text is never split.
+fn truncate_middle(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+
+    let head = (max_chars * 2 / 3).max(1);
+    let tail = max_chars.saturating_sub(head);
+    let elided = total - head - tail;
+
+    let head_text: String = text.chars().take(head).collect();
+    let tail_text: String = text.chars().skip(total - tail).collect();
+    format!("{head_text}\n… [{elided} chars elided] …\n{tail_text}")
+}
+
+/// Render one session message as a truncated excerpt using the same
+/// serialization the LLM summarization prompt uses (`[User]:`, `[Assistant]:`,
+/// tool call/result labels).
+fn fallback_message_snippet(message: &SessionMessage) -> Option<String> {
+    let model_message = session_message_to_model(message)?;
+    let serialized = serialize_conversation(std::slice::from_ref(&model_message));
+    if serialized.trim().is_empty() {
+        return None;
+    }
+    Some(truncate_middle(&serialized, FALLBACK_SNIPPET_MAX_CHARS))
+}
+
+/// Build a deterministic, provider-free replacement for the LLM compaction
+/// summary: the previous summary (if any) followed by head/tail excerpts of
+/// each discarded message, bounded so the result fits comfortably inside the
+/// configured reserve budget.
+fn build_fallback_summary(preparation: &CompactionPreparation) -> String {
+    let budget_chars = usize::try_from(preparation.settings.reserve_tokens)
+        .unwrap_or(usize::MAX)
+        .saturating_mul(CHARS_PER_TOKEN_ESTIMATE)
+        / 2;
+    let max_snippets = (budget_chars / FALLBACK_SNIPPET_MAX_CHARS).max(2);
+
+    let mut out = String::from(
+        "## Context Checkpoint (deterministic fallback)\n\n\
+         LLM summarization was unavailable, so this checkpoint preserves truncated \
+         excerpts of the compacted history instead of a model-written summary. \
+         Excerpts may be incomplete; prefer the retained recent messages for \
+         precise details.",
+    );
+
+    if let Some(previous) = preparation
+        .previous_summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        out.push_str("\n\n## Previous Summary\n\n");
+        out.push_str(&truncate_middle(previous, budget_chars.max(1)));
+    }
+
+    let snippets = preparation
+        .messages_to_summarize
+        .iter()
+        .chain(preparation.turn_prefix_messages.iter())
+        .filter_map(fallback_message_snippet)
+        .collect::<Vec<_>>();
+
+    if snippets.is_empty() {
+        return out;
+    }
+
+    out.push_str("\n\n## History Excerpts (truncated)");
+    if snippets.len() <= max_snippets {
+        for snippet in &snippets {
+            out.push_str("\n\n");
+            out.push_str(snippet);
+        }
+    } else {
+        // Keep the oldest and newest excerpts; elide the middle. Early
+        // messages carry the original goal, late messages carry current state.
+        let head = max_snippets.div_ceil(2);
+        let tail = max_snippets - head;
+        let elided = snippets.len() - max_snippets;
+        for snippet in &snippets[..head] {
+            out.push_str("\n\n");
+            out.push_str(snippet);
+        }
+        let _ = write!(out, "\n\n[... {elided} older messages elided ...]");
+        for snippet in &snippets[snippets.len() - tail..] {
+            out.push_str("\n\n");
+            out.push_str(snippet);
+        }
+    }
+
+    out
+}
+
+// =============================================================================
 // Public API
 // =============================================================================
 
@@ -1600,13 +1722,18 @@ pub async fn summarize_entries(
     Ok(Some(summary))
 }
 
-pub async fn compact(
-    preparation: CompactionPreparation,
+/// Generate the LLM-written compaction summary for `preparation`.
+///
+/// Errors here (provider failures, oversized summarization prompts, empty
+/// responses) are recoverable: [`compact`] falls back to a deterministic
+/// local summary instead of propagating them.
+async fn generate_llm_summary(
+    preparation: &CompactionPreparation,
     provider: Arc<dyn Provider>,
     api_key: &str,
     custom_instructions: Option<&str>,
-) -> Result<CompactionResult> {
-    let summary = if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+) -> Result<String> {
+    if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
         let history_summary = if preparation.messages_to_summarize.is_empty() {
             "No prior history.".to_string()
         } else {
@@ -1629,9 +1756,9 @@ pub async fn compact(
         )
         .await?;
 
-        format!(
+        Ok(format!(
             "{history_summary}\n\n---\n\n**Turn Context (split turn):**\n\n{turn_prefix_summary}"
-        )
+        ))
     } else {
         generate_summary(
             &preparation.messages_to_summarize,
@@ -1641,24 +1768,64 @@ pub async fn compact(
             custom_instructions,
             preparation.previous_summary.as_deref(),
         )
-        .await?
-    };
+        .await
+    }
+}
 
+/// Attach file-operation lists and cut-point metadata to a finished summary.
+fn finish_compaction(preparation: CompactionPreparation, mut summary: String) -> CompactionResult {
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
     let details = CompactionDetails {
         read_files: read_files.clone(),
         modified_files: modified_files.clone(),
     };
 
-    let mut summary = summary;
     summary.push_str(&format_file_operations(&read_files, &modified_files));
 
-    Ok(CompactionResult {
+    CompactionResult {
         summary,
         first_kept_entry_id: preparation.first_kept_entry_id,
         tokens_before: preparation.tokens_before,
         details,
-    })
+    }
+}
+
+pub async fn compact(
+    preparation: CompactionPreparation,
+    provider: Arc<dyn Provider>,
+    api_key: &str,
+    custom_instructions: Option<&str>,
+) -> Result<CompactionResult> {
+    let summary = match generate_llm_summary(&preparation, provider, api_key, custom_instructions)
+        .await
+    {
+        Ok(summary) => summary,
+        Err(error) => {
+            // An oversized session makes the summarization prompt itself
+            // oversized, so the provider call fails for exactly the
+            // sessions that most need compaction. Failing compaction here
+            // would let the session grow without bound; degrade to a
+            // deterministic local summary instead.
+            tracing::warn!(
+                error = %error,
+                "LLM compaction summarization failed; using deterministic local fallback summary"
+            );
+            build_fallback_summary(&preparation)
+        }
+    };
+
+    Ok(finish_compaction(preparation, summary))
+}
+
+/// Provider-free compaction: summarize `preparation` with the deterministic
+/// truncation-based fallback, never contacting the LLM.
+///
+/// Used as a failsafe when background LLM compaction is quota-blocked but the
+/// session has grown far beyond the context window.
+#[must_use]
+pub fn compact_local(preparation: CompactionPreparation) -> CompactionResult {
+    let summary = build_fallback_summary(&preparation);
+    finish_compaction(preparation, summary)
 }
 
 pub fn compaction_details_to_value(details: &CompactionDetails) -> Result<Value> {
@@ -3689,6 +3856,232 @@ mod tests {
             prep.messages_to_summarize.is_empty(),
             "Nothing before the turn to summarize"
         );
+    }
+
+    // ── deterministic fallback summarization ─────────────────────────
+
+    mod fallback {
+        use super::*;
+        use async_trait::async_trait;
+        use futures::Stream;
+        use std::pin::Pin;
+
+        struct FailingProvider;
+
+        #[async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl Provider for FailingProvider {
+            fn name(&self) -> &str {
+                "test-failing"
+            }
+
+            fn api(&self) -> &str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>,
+            > {
+                Err(Error::api("HTTP 500: request exceeds context window"))
+            }
+        }
+
+        struct FixedSummaryProvider;
+
+        #[async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl Provider for FixedSummaryProvider {
+            fn name(&self) -> &str {
+                "test-fixed"
+            }
+
+            fn api(&self) -> &str {
+                "test-api"
+            }
+
+            fn model_id(&self) -> &str {
+                "test-model"
+            }
+
+            async fn stream(
+                &self,
+                _context: &Context<'_>,
+                _options: &StreamOptions,
+            ) -> crate::error::Result<
+                Pin<Box<dyn Stream<Item = crate::error::Result<crate::model::StreamEvent>> + Send>>,
+            > {
+                let message = AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("LLM SUMMARY"))],
+                    api: String::new(),
+                    provider: String::new(),
+                    model: String::new(),
+                    stop_reason: StopReason::Stop,
+                    stop_details: None,
+                    error_message: None,
+                    timestamp: 0,
+                    usage: Usage::default(),
+                };
+                Ok(Box::pin(futures::stream::iter(vec![Ok(
+                    crate::model::StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message,
+                    },
+                )])))
+            }
+        }
+
+        fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build test runtime");
+            runtime.block_on(future)
+        }
+
+        fn make_preparation() -> CompactionPreparation {
+            let mut file_ops = FileOperations::default();
+            file_ops.read.insert("src/lib.rs".to_string());
+            file_ops.edited.insert("src/agent.rs".to_string());
+            CompactionPreparation {
+                first_kept_entry_id: "entry-9".to_string(),
+                messages_to_summarize: vec![
+                    make_user_text("investigate the flaky scheduler test"),
+                    make_assistant_text("Root cause is a race in the scheduler", 10, 5),
+                ],
+                turn_prefix_messages: Vec::new(),
+                is_split_turn: false,
+                tokens_before: 250_000,
+                previous_summary: Some("## Goal\nShip the scheduler fix".to_string()),
+                file_ops,
+                settings: ResolvedCompactionSettings::default(),
+            }
+        }
+
+        #[test]
+        fn provider_error_falls_back_to_deterministic_summary() {
+            run_async(async {
+                let result = compact(make_preparation(), Arc::new(FailingProvider), "key", None)
+                    .await
+                    .expect("compact must not fail when the provider errors");
+
+                // Cut-point metadata preserved.
+                assert_eq!(result.first_kept_entry_id, "entry-9");
+                assert_eq!(result.tokens_before, 250_000);
+
+                // Fallback marker and previous summary preserved.
+                assert!(result.summary.contains("deterministic fallback"));
+                assert!(result.summary.contains("Ship the scheduler fix"));
+
+                // Message excerpts preserved with the standard labels.
+                assert!(
+                    result
+                        .summary
+                        .contains("[User]: investigate the flaky scheduler test")
+                );
+                assert!(result.summary.contains("race in the scheduler"));
+
+                // File-operation lists preserved in both summary and details.
+                assert!(result.summary.contains("<read-files>"));
+                assert!(result.summary.contains("src/lib.rs"));
+                assert!(result.summary.contains("<modified-files>"));
+                assert!(result.summary.contains("src/agent.rs"));
+                assert_eq!(result.details.read_files, vec!["src/lib.rs".to_string()]);
+                assert_eq!(
+                    result.details.modified_files,
+                    vec!["src/agent.rs".to_string()]
+                );
+            });
+        }
+
+        #[test]
+        fn provider_error_falls_back_on_split_turn() {
+            run_async(async {
+                let mut prep = make_preparation();
+                prep.is_split_turn = true;
+                prep.turn_prefix_messages = vec![make_user_text("split turn prefix request")];
+
+                let result = compact(prep, Arc::new(FailingProvider), "key", None)
+                    .await
+                    .expect("split-turn compact must not fail when the provider errors");
+                assert!(result.summary.contains("deterministic fallback"));
+                assert!(result.summary.contains("split turn prefix request"));
+            });
+        }
+
+        #[test]
+        fn successful_provider_still_produces_llm_summary() {
+            run_async(async {
+                let result = compact(
+                    make_preparation(),
+                    Arc::new(FixedSummaryProvider),
+                    "key",
+                    None,
+                )
+                .await
+                .expect("compact with healthy provider");
+                assert!(result.summary.starts_with("LLM SUMMARY"));
+                assert!(!result.summary.contains("deterministic fallback"));
+            });
+        }
+
+        #[test]
+        fn compact_local_never_contacts_provider_and_elides_middle_messages() {
+            let mut prep = make_preparation();
+            prep.messages_to_summarize = (0..200)
+                .map(|i| make_user_text(&format!("message number {i} with some padding text")))
+                .collect();
+            // Small reserve => small excerpt budget => elision must kick in.
+            prep.settings.reserve_tokens = 1_024;
+
+            let result = compact_local(prep);
+            assert!(result.summary.contains("deterministic fallback"));
+            assert!(result.summary.contains("older messages elided"));
+            // Oldest and newest excerpts are retained.
+            assert!(result.summary.contains("message number 0 "));
+            assert!(result.summary.contains("message number 199 "));
+            assert_eq!(result.first_kept_entry_id, "entry-9");
+            assert_eq!(result.tokens_before, 250_000);
+        }
+
+        #[test]
+        fn truncate_middle_keeps_short_text_verbatim() {
+            assert_eq!(truncate_middle("short text", 400), "short text");
+        }
+
+        #[test]
+        fn truncate_middle_elides_long_text_on_char_boundaries() {
+            let text = "é".repeat(1_000);
+            let truncated = truncate_middle(&text, 100);
+            assert!(truncated.contains("[900 chars elided]"));
+            assert!(truncated.starts_with('é'));
+            assert!(truncated.ends_with('é'));
+            assert!(truncated.chars().count() < 150);
+        }
+
+        #[test]
+        fn forced_local_compaction_threshold() {
+            let settings = ResolvedCompactionSettings {
+                enabled: true,
+                context_window_tokens: 100_000,
+                ..Default::default()
+            };
+            assert!(!requires_forced_local_compaction(199_999, &settings));
+            assert!(requires_forced_local_compaction(200_000, &settings));
+            assert!(requires_forced_local_compaction(1_000_000, &settings));
+
+            let disabled = ResolvedCompactionSettings {
+                enabled: false,
+                ..settings
+            };
+            assert!(!requires_forced_local_compaction(1_000_000, &disabled));
+        }
     }
 
     mod proptest_compaction {

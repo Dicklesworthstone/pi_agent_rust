@@ -15,7 +15,7 @@
 use crate::auth::AuthStorage;
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{
-    CompactionAdmissionSignals, CompactionQuota, CompactionWorkerState,
+    CompactionAdmissionReason, CompactionAdmissionSignals, CompactionQuota, CompactionWorkerState,
 };
 use crate::error::{Error, Result};
 use crate::extension_events::{
@@ -8691,7 +8691,9 @@ impl AgentSession {
 
         // Phase 2: start new background compaction if quotas allow.
         if !self.compaction_worker.can_start() {
-            return Ok(());
+            // Failsafe: a quota-blocked worker must not let a catastrophically
+            // oversized session grow without bound.
+            return self.force_local_compaction_if_oversized(on_event).await;
         }
 
         let (entries, preparation) = {
@@ -8797,6 +8799,73 @@ impl AgentSession {
         }
 
         Ok(())
+    }
+
+    /// Failsafe for quota-blocked compaction.
+    ///
+    /// When the background worker cannot start (attempt limit exhausted or
+    /// still cooling down) but the session has grown to at least
+    /// [`compaction::FORCED_LOCAL_COMPACTION_WINDOW_FACTOR`] times the context
+    /// window, apply a synchronous, provider-free compaction so every future
+    /// provider call is not doomed to fail on an oversized context. Never runs
+    /// while a background compaction is still pending, and skips extension
+    /// `before_compact` dispatch: this path exists to guarantee forward
+    /// progress, so nothing may cancel it.
+    async fn force_local_compaction_if_oversized(
+        &mut self,
+        on_event: AgentEventHandler,
+    ) -> Result<()> {
+        let decision = self
+            .compaction_worker
+            .admission_decision(None, &CompactionAdmissionSignals::default());
+        if decision.reason == CompactionAdmissionReason::Pending {
+            // An in-flight background compaction will resolve on its own;
+            // never compact underneath it.
+            return Ok(());
+        }
+
+        let preparation = {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            session.ensure_entry_ids();
+            let entries = session
+                .entries_for_current_path()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+        };
+
+        let Some(prep) = preparation else {
+            return Ok(());
+        };
+        if !compaction::requires_forced_local_compaction(prep.tokens_before, &prep.settings) {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            blocked_reason = decision.reason.as_str(),
+            tokens_before = prep.tokens_before,
+            context_window_tokens = prep.settings.context_window_tokens,
+            "Background compaction quota-blocked while context is far over the window; applying deterministic local compaction"
+        );
+        on_event(AgentEvent::AutoCompactionStart {
+            reason: format!("forced_local;blocked={}", decision.reason.as_str()),
+        });
+
+        let result = compaction::compact_local(prep);
+        self.extensions_is_compacting
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let apply_result = self
+            .apply_compaction_result(result, Arc::clone(&on_event))
+            .await;
+        self.extensions_is_compacting
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        apply_result
     }
 
     fn compaction_runtime_handle(&mut self) -> Result<RuntimeHandle> {
@@ -12871,6 +12940,177 @@ mod tests {
             assert_eq!(payload["tokensBefore"], 12_000);
             assert_eq!(payload["details"]["readFiles"], json!(["src/main.rs"]));
             assert_eq!(payload["details"]["modifiedFiles"], json!(["src/agent.rs"]));
+        });
+    }
+
+    #[test]
+    fn maybe_compact_forces_local_compaction_when_quota_blocked_and_oversized() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = Arc::new(SilentProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+
+            // Small window so a handful of messages is "catastrophically"
+            // oversized (>= 2x window) by heuristic estimation (chars / 3).
+            let settings = ResolvedCompactionSettings {
+                enabled: true,
+                context_window_tokens: 100,
+                reserve_tokens: 10,
+                keep_recent_tokens: 30,
+            };
+
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                for i in 0..6 {
+                    guard.append_message(crate::session::SessionMessage::User {
+                        content: UserContent::Text(format!(
+                            "oversized turn {i}: {}",
+                            "x".repeat(300)
+                        )),
+                        timestamp: Some(0),
+                    });
+                }
+            }
+
+            let mut agent_session = AgentSession::new(agent, session, false, settings);
+            // Exhaust the per-session attempt quota so the background worker is
+            // permanently blocked (the deadlock reported for oversized sessions).
+            agent_session
+                .compaction_worker
+                .set_attempt_count_for_test(u32::MAX);
+            assert!(!agent_session.compaction_worker.can_start());
+
+            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&events);
+            let on_event: AgentEventHandler = Arc::new(move |event| {
+                sink.lock().expect("lock compaction events").push(event);
+            });
+
+            agent_session
+                .maybe_compact(on_event)
+                .await
+                .expect("maybe_compact");
+
+            let captured = events.lock().expect("lock captured events");
+            let start_reason = captured
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::AutoCompactionStart { reason } => Some(reason.clone()),
+                    _ => None,
+                })
+                .expect("forced local compaction should start");
+            assert!(
+                start_reason.starts_with("forced_local"),
+                "unexpected start reason: {start_reason}"
+            );
+            let end_payload = captured
+                .iter()
+                .find_map(|event| match event {
+                    AgentEvent::AutoCompactionEnd {
+                        result: Some(result),
+                        ..
+                    } => Some(result.clone()),
+                    _ => None,
+                })
+                .expect("forced local compaction should complete");
+            assert!(
+                end_payload["summary"]
+                    .as_str()
+                    .expect("summary string")
+                    .contains("deterministic fallback")
+            );
+            drop(captured);
+
+            // The session must now contain a compaction entry.
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert!(
+                guard
+                    .entries_for_current_path()
+                    .iter()
+                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
+                "forced local compaction should append a compaction entry"
+            );
+        });
+    }
+
+    #[test]
+    fn maybe_compact_quota_blocked_is_noop_below_forced_threshold() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = Arc::new(SilentProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+
+            // Over the compaction threshold (window - reserve) but below the
+            // forced-local threshold (2x window): ~600 chars => ~200 tokens.
+            let settings = ResolvedCompactionSettings {
+                enabled: true,
+                context_window_tokens: 150,
+                reserve_tokens: 10,
+                keep_recent_tokens: 30,
+            };
+
+            {
+                let cx = crate::agent_cx::AgentCx::for_request();
+                let mut guard = session.lock(cx.cx()).await.expect("session lock");
+                for i in 0..2 {
+                    guard.append_message(crate::session::SessionMessage::User {
+                        content: UserContent::Text(format!("turn {i}: {}", "x".repeat(300))),
+                        timestamp: Some(0),
+                    });
+                }
+            }
+
+            let mut agent_session = AgentSession::new(agent, session, false, settings);
+            agent_session
+                .compaction_worker
+                .set_attempt_count_for_test(u32::MAX);
+
+            let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+                Arc::new(std::sync::Mutex::new(Vec::new()));
+            let sink = Arc::clone(&events);
+            let on_event: AgentEventHandler = Arc::new(move |event| {
+                sink.lock().expect("lock compaction events").push(event);
+            });
+
+            agent_session
+                .maybe_compact(on_event)
+                .await
+                .expect("maybe_compact");
+
+            assert!(
+                events.lock().expect("lock captured events").is_empty(),
+                "quota-blocked compaction below the forced threshold must stay a no-op"
+            );
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = agent_session
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("session lock");
+            assert!(
+                !guard
+                    .entries_for_current_path()
+                    .iter()
+                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
+            );
         });
     }
 
