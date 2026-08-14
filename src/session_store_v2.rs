@@ -70,9 +70,28 @@ enum ArtifactFileIdentity {
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
     Windows {
-        volume_serial_number: Option<u32>,
-        file_index: Option<u64>,
+        // Stable-toolchain fingerprint. The true kernel file identity
+        // (`volume_serial_number()` + `file_index()`) is still unstable on
+        // `std::os::windows::fs::MetadataExt` (`windows_by_handle`,
+        // rust-lang/rust#63010), and this crate must build on stable Windows
+        // (`rust-version` in Cargo.toml promises stable support), so those
+        // accessors cannot be used here.
+        //
+        // Instead the identity is the creation time (FILETIME, 100ns
+        // resolution) plus the structural attribute bits (directory /
+        // reparse point). Replacing the pinned file or directory with a
+        // newly created object yields a different creation time, and a swap
+        // to a reparse point or between file/directory flips the structural
+        // bits, so directory-swap revalidation still trips in practice.
+        //
+        // Tradeoff: unlike a kernel file ID this cannot distinguish two
+        // objects whose creation time was forged to match (SetFileTime) or a
+        // same-timestamp cross-volume remap. Forging either already requires
+        // write access to the artifact tree, at which point the artifacts
+        // themselves are writable directly, so the residual risk is accepted
+        // in exchange for compiling on stable.
         creation_time: u64,
+        structural_attributes: u32,
     },
     #[cfg(not(any(unix, windows)))]
     Unsupported,
@@ -90,10 +109,15 @@ fn artifact_file_identity(metadata: &fs::Metadata) -> ArtifactFileIdentity {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
         ArtifactFileIdentity::Windows {
-            volume_serial_number: metadata.volume_serial_number(),
-            file_index: metadata.file_index(),
             creation_time: metadata.creation_time(),
+            // Mask to structural bits only: volatile attributes (e.g. the
+            // archive bit, which Windows sets on every write) must not make
+            // the same object look like a different one.
+            structural_attributes: metadata.file_attributes()
+                & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT),
         }
     }
     #[cfg(not(any(unix, windows)))]
