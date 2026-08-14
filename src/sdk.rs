@@ -364,9 +364,11 @@ pub struct SessionOptions {
     ///
     /// When `Some`, the settings are used verbatim for this session. When
     /// `None` (the default), settings derive from the global config and the
-    /// selected model's context window exactly as before. Note that switching
-    /// models later still updates `context_window_tokens` to the new model's
-    /// window.
+    /// selected model's context window exactly as before. Either way the
+    /// settings are fixed at session creation: a later
+    /// [`AgentSessionHandle::set_model`] does not re-derive them (in
+    /// particular, `context_window_tokens` is not updated to the new model's
+    /// window).
     pub compaction_settings: Option<ResolvedCompactionSettings>,
 }
 
