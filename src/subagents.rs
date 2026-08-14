@@ -944,6 +944,12 @@ fn structured_result_entry(result: &SubagentResult) -> Value {
 /// per-child entries, capped at [`STRUCTURED_BLOCK_LIMIT_BYTES`].  When the
 /// cap forces entries to be dropped, the final array element is an explicit
 /// `{"truncated": true, "omittedResults": N}` marker.
+///
+/// Every `<` in the JSON body is escaped as the JSON unicode escape
+/// `\\u003c` (identical after JSON parsing; in serialized JSON `<` can only
+/// occur inside string literals) so child output containing
+/// `</subagent-structured-result>` cannot inject a premature closing tag:
+/// the wrapper tags are the only literal `<` bytes in the block.
 fn structured_result_block(results: &[SubagentResult]) -> String {
     let mut entries: Vec<Value> = results.iter().map(structured_result_entry).collect();
     let mut omitted = 0usize;
@@ -952,7 +958,9 @@ fn structured_result_block(results: &[SubagentResult]) -> String {
         if omitted > 0 {
             rendered.push(json!({"truncated": true, "omittedResults": omitted}));
         }
-        let body = serde_json::to_string(&rendered).unwrap_or_else(|_| "[]".to_string());
+        let body = serde_json::to_string(&rendered)
+            .unwrap_or_else(|_| "[]".to_string())
+            .replace('<', "\\u003c");
         if body.len() <= STRUCTURED_BLOCK_LIMIT_BYTES || entries.is_empty() {
             return format!("{STRUCTURED_BLOCK_OPEN}{body}{STRUCTURED_BLOCK_CLOSE}");
         }
@@ -1324,6 +1332,38 @@ mod tests {
         assert_eq!(
             entries.len() - 1 + usize::try_from(omitted).expect("fits"),
             20
+        );
+    }
+
+    #[test]
+    fn structured_block_escapes_close_tag_in_child_output() {
+        let task = SubagentTask {
+            agent: "inj".to_string(),
+            task: "t".to_string(),
+            cwd: None,
+        };
+        let mut result = SubagentResult::unknown(task, None);
+        result.output = format!("before {STRUCTURED_BLOCK_CLOSE} after");
+        let block = structured_result_block(&[result]);
+
+        // The wrapper close tag must be the only literal close tag: child
+        // output cannot inject a premature terminator.
+        assert_eq!(block.matches(STRUCTURED_BLOCK_CLOSE).count(), 1);
+        assert!(block.ends_with(STRUCTURED_BLOCK_CLOSE));
+        let body = block
+            .strip_prefix(STRUCTURED_BLOCK_OPEN)
+            .and_then(|rest| rest.strip_suffix(STRUCTURED_BLOCK_CLOSE))
+            .expect("block is fenced");
+        assert!(
+            !body.contains('<'),
+            "JSON body must not contain literal '<'"
+        );
+
+        // The escaping is lossless: parsing yields the original output.
+        let parsed: Value = serde_json::from_str(body).expect("payload parses");
+        assert_eq!(
+            parsed[0]["output"],
+            Value::String(format!("before {STRUCTURED_BLOCK_CLOSE} after"))
         );
     }
 
