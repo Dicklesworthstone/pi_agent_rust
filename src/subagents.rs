@@ -31,6 +31,13 @@ const MAX_SUBAGENT_DEPTH: usize = 3;
 const MAX_CHILD_OUTPUT_BYTES: usize = 256 * 1024;
 const SUBAGENT_RESULT_SCHEMA: &str = "pi.subagent.result.v1";
 const SUBAGENT_PROGRESS_SCHEMA: &str = "pi.subagent.progress.v1";
+/// Per-field byte budget for `output`/`error` in the opt-in structured block.
+const STRUCTURED_FIELD_LIMIT_BYTES: usize = 2 * 1024;
+/// Byte budget for the JSON payload of the opt-in structured block.
+const STRUCTURED_BLOCK_LIMIT_BYTES: usize = 16 * 1024;
+const STRUCTURED_BLOCK_OPEN: &str = "<subagent-structured-result>";
+const STRUCTURED_BLOCK_CLOSE: &str = "</subagent-structured-result>";
+const STRUCTURED_TRUNCATION_MARKER: &str = "…[truncated]";
 const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit";
 
 type UpdateCallback = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
@@ -40,6 +47,7 @@ pub struct SubagentTool {
     cwd: PathBuf,
     global_dir: PathBuf,
     child_binary: PathBuf,
+    structured_results: bool,
 }
 
 impl SubagentTool {
@@ -54,7 +62,19 @@ impl SubagentTool {
             cwd: cwd.to_path_buf(),
             global_dir: Config::global_dir(),
             child_binary,
+            structured_results: false,
         }
+    }
+
+    /// Opt in to appending the machine-readable
+    /// `<subagent-structured-result>` JSON block to the tool result text.
+    ///
+    /// Off by default; when disabled the tool output is byte-identical to
+    /// previous releases. See pi_agent_rust#163.
+    #[must_use]
+    pub const fn with_structured_results(mut self, enabled: bool) -> Self {
+        self.structured_results = enabled;
+        self
     }
 
     #[cfg(test)]
@@ -63,6 +83,7 @@ impl SubagentTool {
             cwd,
             global_dir,
             child_binary,
+            structured_results: false,
         }
     }
 
@@ -206,7 +227,11 @@ impl Tool for SubagentTool {
         let mode = request.mode_name()?;
         let results = self.run_request(request, update).await?;
         let is_error = results.iter().any(|result| result.is_error);
-        let content = render_results(&results);
+        let mut content = render_results(&results);
+        if self.structured_results {
+            content.push_str("\n\n");
+            content.push_str(&structured_result_block(&results));
+        }
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(content))],
             details: Some(json!({
@@ -884,6 +909,58 @@ fn render_results(results: &[SubagentResult]) -> String {
         .join("\n\n")
 }
 
+/// Truncate `value` to at most `limit` bytes (on a char boundary), appending
+/// an explicit marker when anything was cut.
+fn truncated_field(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_string();
+    }
+    let mut cut = limit;
+    while !value.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{STRUCTURED_TRUNCATION_MARKER}", &value[..cut])
+}
+
+/// Compact per-child entry for the opt-in structured block.
+///
+/// Field names deliberately match the `pi.subagent.result.v1` details schema
+/// (`agent`, `step`, `status`, `exitCode`, `output`, `error`).
+fn structured_result_entry(result: &SubagentResult) -> Value {
+    json!({
+        "agent": result.agent,
+        "step": result.step,
+        "status": result.status,
+        "exitCode": result.exit_code,
+        "output": truncated_field(&result.output, STRUCTURED_FIELD_LIMIT_BYTES),
+        "error": result
+            .error
+            .as_deref()
+            .map(|error| truncated_field(error, STRUCTURED_FIELD_LIMIT_BYTES)),
+    })
+}
+
+/// Render the opt-in `<subagent-structured-result>` block: a JSON array of
+/// per-child entries, capped at [`STRUCTURED_BLOCK_LIMIT_BYTES`].  When the
+/// cap forces entries to be dropped, the final array element is an explicit
+/// `{"truncated": true, "omittedResults": N}` marker.
+fn structured_result_block(results: &[SubagentResult]) -> String {
+    let mut entries: Vec<Value> = results.iter().map(structured_result_entry).collect();
+    let mut omitted = 0usize;
+    loop {
+        let mut rendered = entries.clone();
+        if omitted > 0 {
+            rendered.push(json!({"truncated": true, "omittedResults": omitted}));
+        }
+        let body = serde_json::to_string(&rendered).unwrap_or_else(|_| "[]".to_string());
+        if body.len() <= STRUCTURED_BLOCK_LIMIT_BYTES || entries.is_empty() {
+            return format!("{STRUCTURED_BLOCK_OPEN}{body}{STRUCTURED_BLOCK_CLOSE}");
+        }
+        entries.pop();
+        omitted += 1;
+    }
+}
+
 fn emit_progress(update: Option<&UpdateCallback>, result: &SubagentResult) {
     let Some(update) = update else {
         return;
@@ -1146,6 +1223,108 @@ mod tests {
         assert!(schema["properties"].get("agent").is_some());
         assert!(schema["properties"].get("tasks").is_some());
         assert!(schema["properties"].get("chain").is_some());
+    }
+
+    fn execute_unknown_agent(structured: bool) -> ToolOutput {
+        let temp = TempDir::new().expect("tempdir");
+        let tool = SubagentTool::with_paths(
+            temp.path().to_path_buf(),
+            temp.path().join("global"),
+            PathBuf::from("pi"),
+        )
+        .with_structured_results(structured);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime
+            .block_on(tool.execute(
+                "subagent-structured",
+                json!({"agent": "scout", "task": "inspect"}),
+                None,
+            ))
+            .expect("execute returns tool output")
+    }
+
+    fn output_text(output: &ToolOutput) -> String {
+        let ContentBlock::Text(text) = &output.content[0] else {
+            panic!("expected text output");
+        };
+        text.text.clone()
+    }
+
+    #[test]
+    fn structured_block_disabled_by_default_keeps_output_byte_identical() {
+        let output = execute_unknown_agent(false);
+        let text = output_text(&output);
+        assert_eq!(text, "## scout\nUnknown agent: scout");
+        assert!(!text.contains(STRUCTURED_BLOCK_OPEN));
+        assert!(output.is_error);
+    }
+
+    #[test]
+    fn structured_block_appends_parseable_json_matching_details() {
+        let output = execute_unknown_agent(true);
+        let text = output_text(&output);
+        let prefix = "## scout\nUnknown agent: scout\n\n";
+        assert!(text.starts_with(prefix), "unexpected text: {text}");
+        let block = &text[prefix.len()..];
+        let body = block
+            .strip_prefix(STRUCTURED_BLOCK_OPEN)
+            .and_then(|rest| rest.strip_suffix(STRUCTURED_BLOCK_CLOSE))
+            .expect("structured block is fenced");
+        let parsed: Value = serde_json::from_str(body).expect("block payload parses as JSON");
+        let entries = parsed.as_array().expect("payload is an array");
+        assert_eq!(entries.len(), 1);
+        let details = output.details.as_ref().expect("details present");
+        assert_eq!(entries[0]["agent"], details["results"][0]["agent"]);
+        assert_eq!(entries[0]["status"], details["results"][0]["status"]);
+        assert_eq!(entries[0]["error"], details["results"][0]["error"]);
+        assert_eq!(entries[0]["status"], "failed");
+        assert_eq!(entries[0]["exitCode"], Value::Null);
+    }
+
+    #[test]
+    fn structured_block_truncates_fields_and_caps_block() {
+        let task = |name: &str| SubagentTask {
+            agent: name.to_string(),
+            task: "t".to_string(),
+            cwd: None,
+        };
+        let mut long = SubagentResult::unknown(task("long"), None);
+        long.output = "x".repeat(10 * 1024);
+        let entry = structured_result_entry(&long);
+        let rendered_output = entry["output"].as_str().expect("output is a string");
+        assert!(rendered_output.ends_with(STRUCTURED_TRUNCATION_MARKER));
+        assert!(
+            rendered_output.len()
+                <= STRUCTURED_FIELD_LIMIT_BYTES + STRUCTURED_TRUNCATION_MARKER.len()
+        );
+
+        let results: Vec<SubagentResult> = (0..20)
+            .map(|index| {
+                let mut result = SubagentResult::unknown(task(&format!("agent-{index}")), None);
+                result.output = "y".repeat(4 * 1024);
+                result
+            })
+            .collect();
+        let block = structured_result_block(&results);
+        let body = block
+            .strip_prefix(STRUCTURED_BLOCK_OPEN)
+            .and_then(|rest| rest.strip_suffix(STRUCTURED_BLOCK_CLOSE))
+            .expect("capped block is fenced");
+        assert!(body.len() <= STRUCTURED_BLOCK_LIMIT_BYTES);
+        let parsed: Value = serde_json::from_str(body).expect("capped payload parses");
+        let entries = parsed.as_array().expect("capped payload is an array");
+        let marker = entries.last().expect("array is non-empty");
+        assert_eq!(marker["truncated"], Value::Bool(true));
+        let omitted = marker["omittedResults"]
+            .as_u64()
+            .expect("omittedResults present");
+        assert!(omitted > 0);
+        assert_eq!(
+            entries.len() - 1 + usize::try_from(omitted).expect("fits"),
+            20
+        );
     }
 
     #[test]

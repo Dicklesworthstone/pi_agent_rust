@@ -112,6 +112,23 @@ pub struct Config {
     #[serde(alias = "ghPath")]
     pub gh_path: Option<String>,
 
+    // Subagent tool
+    /// Append a machine-readable `<subagent-structured-result>` JSON block to
+    /// the `subagent` tool's result text. See pi_agent_rust#163.
+    ///
+    /// Providers only serialize a tool result's text content, so the
+    /// structured `details` payload (`pi.subagent.result.v1`) never reaches
+    /// the parent model. When `true`, the subagent tool appends a compact
+    /// JSON array (field names match the `pi.subagent.result.v1` schema)
+    /// wrapped in `<subagent-structured-result>...</subagent-structured-result>`
+    /// so parents can parse per-child results. `output`/`error` fields are
+    /// truncated to 2 KiB each and the whole block is capped at 16 KiB.
+    ///
+    /// Default `false` keeps subagent tool output byte-identical to previous
+    /// releases.
+    #[serde(alias = "subagentStructuredResults")]
+    pub subagent_structured_results: Option<bool>,
+
     // Images
     pub images: Option<ImageSettings>,
 
@@ -543,6 +560,11 @@ impl Config {
             shell_path: other.shell_path.or(base.shell_path),
             shell_command_prefix: other.shell_command_prefix.or(base.shell_command_prefix),
             gh_path: other.gh_path.or(base.gh_path),
+
+            // Subagent tool
+            subagent_structured_results: other
+                .subagent_structured_results
+                .or(base.subagent_structured_results),
 
             // Images
             images: merge_images(base.images, other.images),

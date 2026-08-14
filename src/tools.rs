@@ -4112,6 +4112,27 @@ fn ensure_atomic_source_unchanged(
 // identity-checked cleanup sequence together: splitting this security-critical
 // transaction across helpers would make its ordering invariants harder to audit.
 #[allow(clippy::too_many_lines)]
+/// Normalize a raw `rustix` stat identity to platform-independent widths.
+///
+/// The libc stat field types differ per target (`st_dev` is `i32` and
+/// `st_mode` is `u16` on macOS, `u64`/`u32` on Linux), while the comparisons
+/// below mix them with `std::os::unix::fs::MetadataExt` values (`u64`) and
+/// `Permissions::from_mode` (`u32`). Widening every field once here keeps the
+/// identity checks compiling identically on every unix target.
+#[cfg(all(unix, not(any(target_os = "espidf", target_os = "redox"))))]
+#[allow(
+    clippy::cast_lossless,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast
+)]
+fn stat_replacement_identity(metadata: &rustix::fs::Stat) -> (u64, u64, u32) {
+    (
+        metadata.st_dev as u64,
+        metadata.st_ino as u64,
+        metadata.st_mode as u32,
+    )
+}
+
 fn atomic_replace_file_with<F>(
     target: &Path,
     cwd: &Path,
@@ -4196,7 +4217,7 @@ where
                 if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
                     == rustix::fs::FileType::RegularFile =>
             {
-                Some((metadata.st_dev, metadata.st_ino, metadata.st_mode))
+                Some(stat_replacement_identity(&metadata))
             }
             Ok(_) => {
                 return Err(std::io::Error::new(
@@ -4270,7 +4291,7 @@ where
                     if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
                         == rustix::fs::FileType::RegularFile =>
                 {
-                    Some((metadata.st_dev, metadata.st_ino, metadata.st_mode))
+                    Some(stat_replacement_identity(&metadata))
                 }
                 Ok(_) => {
                     return Err(std::io::Error::new(
@@ -4330,13 +4351,10 @@ where
                     target_name,
                     rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
                 )?;
-                if after_digest.st_dev != expected_dev
-                    || after_digest.st_ino != expected_ino
-                    || Some((
-                        after_digest.st_dev,
-                        after_digest.st_ino,
-                        after_digest.st_mode,
-                    )) != expected_target_identity
+                let after_identity = stat_replacement_identity(&after_digest);
+                if after_identity.0 != expected_dev
+                    || after_identity.1 != expected_ino
+                    || Some(after_identity) != expected_target_identity
                 {
                     return Err(std::io::Error::other(
                         "file changed since it was read; re-read it and retry the edit",
@@ -4977,7 +4995,15 @@ impl ToolRegistry {
                 "find" => tools.push(Box::new(FindTool::new(cwd))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
-                "subagent" => tools.push(Box::new(crate::subagents::SubagentTool::new(cwd))),
+                "subagent" => {
+                    let structured_results = config
+                        .and_then(|c| c.subagent_structured_results)
+                        .unwrap_or(false);
+                    tools.push(Box::new(
+                        crate::subagents::SubagentTool::new(cwd)
+                            .with_structured_results(structured_results),
+                    ));
+                }
                 _ => {}
             }
         }
