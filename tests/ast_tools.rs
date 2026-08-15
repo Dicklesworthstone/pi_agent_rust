@@ -132,18 +132,23 @@ fn ast_edit_staging_lifecycle_resolve_applies_atomically() {
             .to_string();
         assert_eq!(staged_json["staged"], json!(true));
         assert_eq!(staged_json["replacements"], json!(3));
-        let staged_text = first_text(&staged);
+        // Assert on the PARSED diff payload (not the pretty-printed text):
+        // the text form JSON-escapes quotes, so substring needles with raw
+        // quotes can never match it. (Round-8 audit fix.)
+        let alpha_diff = staged_json["files"][0]["diff"]
+            .as_str()
+            .expect("alpha diff string");
         assert!(
-            staged_text.contains("--- a/src/alpha.rs"),
-            "diff preview must name alpha.rs:\n{staged_text}"
+            alpha_diff.contains("--- a/src/alpha.rs"),
+            "diff preview must name alpha.rs:\n{alpha_diff}"
         );
         assert!(
-            staged_text.contains("-    compute().unwrap()"),
-            "diff preview must show removed line:\n{staged_text}"
+            alpha_diff.contains("-    compute().unwrap()"),
+            "diff preview must show removed line:\n{alpha_diff}"
         );
         assert!(
-            staged_text.contains("+    compute().expect(\"boom\")"),
-            "diff preview must show added line:\n{staged_text}"
+            alpha_diff.contains("+    compute().expect(\"boom\")"),
+            "diff preview must show added line:\n{alpha_diff}"
         );
         // Staging must not write.
         assert!(read_file(&harness, "src/alpha.rs").contains("compute().unwrap()"));
