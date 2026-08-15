@@ -606,12 +606,14 @@ fn rpc_compaction_result_serde() {
         "summary": "Compacted 10 messages into 2",
         "firstKeptEntryId": "entry-5",
         "tokensBefore": 12000,
+        "tokensAfter": 3200,
         "details": {"removed": 8}
     });
     let result: RpcCompactionResult = serde_json::from_value(value.clone()).expect("deserialize");
     assert_eq!(result.summary, "Compacted 10 messages into 2");
     assert_eq!(result.first_kept_entry_id, "entry-5");
     assert_eq!(result.tokens_before, 12000);
+    assert_eq!(result.tokens_after, 3200);
 
     let reencoded = serde_json::to_value(&result).expect("serialize");
     assert_eq!(reencoded, value);
@@ -623,6 +625,7 @@ fn rpc_compaction_result_serde() {
                 "tokens_before".to_string(),
                 result.tokens_before.to_string(),
             ));
+            ctx.push(("tokens_after".to_string(), result.tokens_after.to_string()));
         });
 }
 

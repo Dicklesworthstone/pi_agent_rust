@@ -814,6 +814,27 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
     }
 }
 
+/// Estimate a complete model-message list without trusting provider usage
+/// attached to retained assistant messages. After compaction those usage totals
+/// still describe the pre-compaction request, so they would overstate the new
+/// active context.
+#[must_use]
+pub(crate) fn estimate_model_messages_tokens_heuristic(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .cloned()
+        .map(SessionMessage::from)
+        .map(|message| estimate_tokens(&message))
+        .fold(0_u64, u64::saturating_add)
+}
+
+/// Estimate plain text or serialized schema overhead using the same heuristic
+/// as session message estimation.
+#[must_use]
+pub(crate) fn estimate_text_tokens(text_bytes: usize) -> u64 {
+    u64::try_from(text_bytes.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
+}
+
 fn should_compact(
     context_tokens: u64,
     context_window: u32,
@@ -2755,6 +2776,18 @@ mod tests {
         // "hi" => 1, "hello" => 2, "bye" => 1.
         assert_eq!(estimate.tokens, 4);
         assert!(estimate.last_usage_index.is_none());
+    }
+
+    #[test]
+    fn post_compaction_estimate_ignores_stale_provider_usage() {
+        let messages = vec![
+            session_message_to_model(&make_user_text("hi")).expect("user message"),
+            session_message_to_model(&make_assistant_text("hello", 50_000, 10_000))
+                .expect("assistant message"),
+            session_message_to_model(&make_user_text("bye")).expect("user message"),
+        ];
+
+        assert_eq!(estimate_model_messages_tokens_heuristic(&messages), 4);
     }
 
     // ── extract_file_ops_from_message ────────────────────────────────

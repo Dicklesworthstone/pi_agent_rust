@@ -606,6 +606,7 @@ pub struct RpcCompactionResult {
     pub summary: String,
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
+    pub tokens_after: u64,
     #[serde(default)]
     pub details: Value,
 }

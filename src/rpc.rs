@@ -1757,6 +1757,7 @@ pub async fn run(
                         );
                         inner_session.to_messages_for_current_path()
                     };
+                    let tokens_after = guard.agent.estimate_post_compaction_tokens(&messages);
                     guard.persist_session().await?;
                     guard.agent.replace_messages(messages);
 
@@ -1764,6 +1765,7 @@ pub async fn run(
                         "summary": result_data.summary,
                         "firstKeptEntryId": result_data.first_kept_entry_id,
                         "tokensBefore": result_data.tokens_before,
+                        "tokensAfter": tokens_after,
                         "details": details_value,
                     }))
                 }
@@ -4174,6 +4176,7 @@ async fn maybe_auto_compact(
                 );
                 inner_session.to_messages_for_current_path()
             };
+            let tokens_after = guard.agent.estimate_post_compaction_tokens(&messages);
             let _ = guard.persist_session().await;
             guard.agent.replace_messages(messages);
             drop(guard);
@@ -4183,6 +4186,7 @@ async fn maybe_auto_compact(
                     "summary": result.summary,
                     "firstKeptEntryId": result.first_kept_entry_id,
                     "tokensBefore": result.tokens_before,
+                    "tokensAfter": tokens_after,
                     "details": details_value,
                 })),
                 aborted: false,
