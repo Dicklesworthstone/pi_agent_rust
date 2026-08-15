@@ -11176,6 +11176,50 @@ mod tests {
         }
     }
 
+    /// bd-cv653.3.1: legacy (role-less) ModelChange JSON must deserialize with
+    /// `role: None`, and role-tagged entries must round-trip the role.
+    #[test]
+    fn test_model_change_role_field_backward_compat() {
+        // Legacy serialization: no `role` key at all.
+        let legacy_json = r#"{"id":"mc1","parentId":null,"timestamp":1706918401000,"provider":"openai","modelId":"gpt-4"}"#;
+        let entry: SessionEntry = serde_json::from_str(legacy_json)
+            .expect("legacy role-less ModelChange must still parse");
+        if let SessionEntry::ModelChange(mc) = &entry {
+            assert_eq!(mc.provider, "openai");
+            assert_eq!(mc.role, None, "missing role must default to None");
+        } else {
+            test_fail!("Expected ModelChange, got {:?}", entry);
+        }
+        // Re-serialization of a role-less entry must NOT grow a role key:
+        // byte-shape parity with what older versions wrote.
+        let reserialized = serde_json::to_string(&entry).expect("serialize");
+        assert!(
+            !reserialized.contains("\"role\""),
+            "role-less entries must not serialize a role key: {reserialized}"
+        );
+
+        // Role-tagged round-trip (bd-cv653.3.1): in-memory append with a role,
+        // then JSON round-trip preserves provider/model/role exactly.
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Hello"));
+        let change_id = session.append_model_change_with_role(
+            "openai".to_string(),
+            "gpt-5.1".to_string(),
+            Some("advisor".to_string()),
+        );
+        let entry = session.get_entry(&change_id).expect("entry").clone();
+        let json = serde_json::to_string(&entry).expect("serialize role-tagged entry");
+        assert!(json.contains("\"role\":\"advisor\""), "role must serialize: {json}");
+        let parsed: SessionEntry = serde_json::from_str(&json).expect("reparse");
+        if let SessionEntry::ModelChange(mc) = parsed {
+            assert_eq!(mc.provider, "openai");
+            assert_eq!(mc.model_id, "gpt-5.1");
+            assert_eq!(mc.role.as_deref(), Some("advisor"));
+        } else {
+            test_fail!("Expected ModelChange after round-trip");
+        }
+    }
+
     #[test]
     fn test_thinking_level_change_updates_leaf() {
         let mut session = Session::in_memory();
