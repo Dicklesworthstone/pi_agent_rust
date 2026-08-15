@@ -1915,6 +1915,84 @@ fn js_runtime_pump_once_advances_timers_and_hostcalls() {
     });
 }
 
+/// gh #167: registering a hook for an event this host never fires must stay
+/// fail-open (the handler is kept for forward-compat) but emit a loud tracing
+/// warning naming the extension and the unknown event. Known events must not
+/// warn.
+#[test]
+fn register_hook_unknown_event_warns_and_still_registers() {
+    let (probe, events) = capture_tracing_events(|| {
+        run_async(async {
+            let runtime = crate::extensions_js::PiJsRuntime::new()
+                .await
+                .expect("create runtime");
+            let secret =
+                serde_json::to_string(runtime.bridge_secret()).expect("serialize bridge secret");
+            let script = format!(
+                r#"(() => {{
+                    const __secret = {secret};
+                    __pi_begin_extension(__secret, "ext.unknown-event", {{ name: "ext.unknown-event" }});
+                    globalThis.unknownEventProbe = {{}};
+                    try {{
+                        const off = pi.on("totally_unknown_event", async () => {{}});
+                        globalThis.unknownEventProbe.registered = typeof off === 'function';
+                    }} catch (error) {{
+                        globalThis.unknownEventProbe.error = String(error);
+                    }}
+                    pi.on("agent_start", async () => {{}});
+                    __pi_end_extension(__secret);
+                }})();"#
+            );
+            runtime.eval(&script).await.expect("eval registration");
+            runtime
+                .get_global_json("unknownEventProbe")
+                .await
+                .expect("read unknown-event probe")
+        })
+    });
+
+    assert_eq!(
+        probe["registered"],
+        serde_json::json!(true),
+        "unknown-event registration must stay fail-open: {probe}"
+    );
+    assert_eq!(
+        probe["error"],
+        serde_json::Value::Null,
+        "unknown-event registration must not throw: {probe}"
+    );
+
+    let warning = events
+        .iter()
+        .find(|event| {
+            event
+                .fields
+                .get("event")
+                .is_some_and(|value| value.contains("totally_unknown_event"))
+        })
+        .expect("expected a tracing warning for the unknown event");
+    assert_eq!(warning.level, tracing::Level::WARN);
+    assert!(
+        warning
+            .fields
+            .get("extension")
+            .is_some_and(|value| value.contains("ext.unknown-event")),
+        "warning must name the extension: {:?}",
+        warning.fields
+    );
+
+    assert!(
+        !events.iter().any(|event| {
+            event.level == tracing::Level::WARN
+                && event
+                    .fields
+                    .get("event")
+                    .is_some_and(|value| value.contains("agent_start"))
+        }),
+        "known events must not produce unknown-event warnings"
+    );
+}
+
 #[test]
 fn isolated_runtime_reset_drops_registry_routes_and_requires_cold_reload() {
     let manager = ExtensionManager::new();
