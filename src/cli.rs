@@ -307,6 +307,19 @@ pub struct Cli {
     #[arg(long)]
     pub models: Option<String>,
 
+    /// Model spec for the `smol` role (cheap/fast work, e.g. subagent fan-out).
+    /// Format: provider/model with optional :thinking suffix (bd-cv653.3.1).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub smol: Option<String>,
+
+    /// Model spec for the `slow` role (deep reasoning).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub slow: Option<String>,
+
+    /// Model spec for the `plan` role (plan mode).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub plan: Option<String>,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each

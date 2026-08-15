@@ -16,7 +16,7 @@ use crate::cli;
 use crate::config::Config;
 use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
 use crate::models::{
-    ModelEntry, ModelRegistry, default_models_path, model_entry_is_ready,
+    ModelEntry, ModelRegistry, ModelRole, default_models_path, model_entry_is_ready,
     model_requires_configured_credential, normalize_api_key_opt,
 };
 use crate::provider::{CacheRetention, StreamOptions, ThinkingBudgets};
@@ -519,6 +519,22 @@ pub fn select_model_and_thinking(
     }
 
     if selected_model.is_none()
+        && let Some(resolution) = resolve_role_model(ModelRole::Default, cli, config, registry)
+    {
+        // `modelRoles.default` outranks defaultProvider/defaultModel (bd-cv653.3.1).
+        if let Some(warning) = resolution.warning {
+            if fallback_message.is_none() {
+                fallback_message = Some(warning);
+            }
+        } else {
+            if cli.thinking.is_none() {
+                scoped_thinking = resolution.thinking_level.or(scoped_thinking);
+            }
+            selected_model = Some(resolution.model_entry);
+        }
+    }
+
+    if selected_model.is_none()
         && let (Some(default_provider), Some(default_model)) = (
             config.default_provider.as_deref(),
             config.default_model.as_deref(),
@@ -651,6 +667,159 @@ fn parse_thinking_level(value: &str) -> Result<model::ThinkingLevel> {
 
 fn parse_thinking_level_opt(value: &str) -> Option<model::ThinkingLevel> {
     value.parse().ok()
+}
+
+// === Model roles (bd-cv653.3.1) ===
+
+/// Result of resolving a model role to a concrete model entry.
+#[derive(Debug, Clone)]
+pub struct RoleModelResolution {
+    pub model_entry: ModelEntry,
+    pub thinking_level: Option<model::ThinkingLevel>,
+    /// Where the winning spec came from: `cli`, `settings`, or `default-role`.
+    pub source: &'static str,
+    /// Non-fatal resolution warning (unresolvable specs fall through loudly
+    /// here instead of failing the session).
+    pub warning: Option<String>,
+}
+
+/// Parse a role model spec of the form `provider/model[:thinking]` (or a bare
+/// model id) into a registry entry, tolerating ad-hoc provider/model pairs.
+fn resolve_role_spec(
+    spec: &str,
+    registry: &ModelRegistry,
+) -> Option<(ModelEntry, Option<model::ThinkingLevel>)> {
+    let (model_part, thinking) = match spec.rsplit_once(':') {
+        Some((prefix, suffix)) if parse_thinking_level_opt(suffix).is_some() => {
+            (prefix, parse_thinking_level_opt(suffix))
+        }
+        _ => (spec, None),
+    };
+    let model_part = model_part.trim();
+    if model_part.is_empty() {
+        return None;
+    }
+    let entry = if let Some((provider, model_id)) = split_provider_model_spec(model_part) {
+        registry
+            .find(provider, model_id)
+            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+    } else {
+        registry.find_by_id(model_part)
+    };
+    entry.map(|entry| (entry, thinking))
+}
+
+/// The spec string configured for a role in merged settings, if any.
+pub fn role_spec_from_settings<'a>(
+    roles: &'a crate::config::ModelRoleSettings,
+    role: ModelRole,
+) -> Option<&'a str> {
+    let spec = match role {
+        ModelRole::Default => roles.default.as_deref(),
+        ModelRole::Smol => roles.smol.as_deref(),
+        ModelRole::Slow => roles.slow.as_deref(),
+        ModelRole::Plan => roles.plan.as_deref(),
+        ModelRole::Commit => roles.commit.as_deref(),
+        ModelRole::Vision => roles.vision.as_deref(),
+        ModelRole::Designer => roles.designer.as_deref(),
+        ModelRole::Task => roles.task.as_deref(),
+        ModelRole::Advisor => roles.advisor.as_deref(),
+        ModelRole::Tiny => roles.tiny.as_deref(),
+    };
+    spec.filter(|s| !s.trim().is_empty())
+}
+
+/// The spec string configured for a role via CLI flag (`--smol`/`--slow`/
+/// `--plan`; other roles have no CLI flags), if any.
+fn role_spec_from_cli<'a>(cli: &'a cli::Cli, role: ModelRole) -> Option<&'a str> {
+    let spec = match role {
+        ModelRole::Smol => cli.smol.as_deref(),
+        ModelRole::Slow => cli.slow.as_deref(),
+        ModelRole::Plan => cli.plan.as_deref(),
+        _ => None,
+    };
+    spec.filter(|s| !s.trim().is_empty())
+}
+
+/// Resolve a model role to a concrete model entry.
+///
+/// Precedence: CLI role flag > settings `modelRoles.<role>` > (non-default
+/// roles) the `default` role's own resolution. Returns `None` when nothing
+/// configures the role and `role == ModelRole::Default` (the caller then runs
+/// the legacy default-provider/default-model/auto-select flow). Unresolvable
+/// specs never fail the session: they fall through with a warning.
+pub fn resolve_role_model(
+    role: ModelRole,
+    cli: &cli::Cli,
+    config: &Config,
+    registry: &ModelRegistry,
+) -> Option<RoleModelResolution> {
+    if let Some(spec) = role_spec_from_cli(cli, role) {
+        match resolve_role_spec(spec, registry) {
+            Some((model_entry, thinking_level)) => {
+                return Some(RoleModelResolution {
+                    model_entry,
+                    thinking_level,
+                    source: "cli",
+                    warning: None,
+                });
+            }
+            None => {
+                return Some(RoleModelResolution {
+                    model_entry: registry.models().first()?.clone(),
+                    thinking_level: None,
+                    source: "cli",
+                    warning: Some(format!(
+                        "CLI --{role} spec \"{spec}\" did not resolve to a known model; falling back."
+                    )),
+                });
+            }
+        }
+    }
+    if let Some(roles) = config.model_roles.as_ref()
+        && let Some(spec) = role_spec_from_settings(roles, role)
+    {
+        match resolve_role_spec(spec, registry) {
+            Some((model_entry, thinking_level)) => {
+                return Some(RoleModelResolution {
+                    model_entry,
+                    thinking_level,
+                    source: "settings",
+                    warning: None,
+                });
+            }
+            None => {
+                return Some(RoleModelResolution {
+                    model_entry: registry.models().first()?.clone(),
+                    thinking_level: None,
+                    source: "settings",
+                    warning: Some(format!(
+                        "modelRoles.{role} spec \"{spec}\" did not resolve to a known model; falling back."
+                    )),
+                });
+            }
+        }
+    }
+    if role != ModelRole::Default {
+        return resolve_role_model(ModelRole::Default, cli, config, registry).map(
+            |mut resolution| {
+                resolution.source = "default-role";
+                resolution
+            },
+        );
+    }
+    None
+}
+
+/// The model spec a subagent child should run with when its agent definition
+/// does not pin `model:` — the `task` role, else `smol`, else `None` (child
+/// inherits the parent ambient environment). Returns the raw spec string; the
+/// child process resolves it through its own startup registry.
+pub fn subagent_role_spec(config: &Config) -> Option<String> {
+    let roles = config.model_roles.as_ref()?;
+    role_spec_from_settings(roles, ModelRole::Task)
+        .or_else(|| role_spec_from_settings(roles, ModelRole::Smol))
+        .map(str::to_string)
 }
 
 fn last_model_from_session(session: &Session) -> Option<(String, String)> {
