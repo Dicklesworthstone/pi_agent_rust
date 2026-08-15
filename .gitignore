@@ -126,6 +126,14 @@ tests/edit_repro.rs
 # Build artifacts (concurrent agent output)
 artifacts/
 release_artifacts/
+# The unanchored `artifacts/` rule above also swallows the vendored extension
+# conformance corpus; re-include only the vendored pi-better-compaction tree
+# (bd-8ma6q) without exposing ignored junk elsewhere under the corpus.
+!tests/ext_conformance/artifacts/
+tests/ext_conformance/artifacts/*
+!tests/ext_conformance/artifacts/third-party/
+tests/ext_conformance/artifacts/third-party/*
+!tests/ext_conformance/artifacts/third-party/lll9p-pi-better-compaction/
 
 # Python bytecode caches
 __pycache__/

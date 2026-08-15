@@ -1,0 +1,60 @@
+{
+  "name": "@lll9p/pi-better-compaction",
+  "version": "0.2.1",
+  "type": "module",
+  "description": "Better compaction for pi: native /responses/compact replay for OpenAI Responses APIs, plus a configurable compaction model driving pi's native summarization everywhere else.",
+  "author": "Lilin Lao",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lll9p/pi-better-compaction.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lll9p/pi-better-compaction/issues"
+  },
+  "homepage": "https://github.com/lll9p/pi-better-compaction#readme",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "openai",
+    "compaction",
+    "codex",
+    "responses"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "files": [
+    "index.ts",
+    "src/compact-client.ts",
+    "src/config.ts",
+    "src/debug.ts",
+    "src/details-store.ts",
+    "src/extension-runtime.ts",
+    "src/native-fallback.ts",
+    "src/payload-rewrite.ts",
+    "src/request-context-cache.ts",
+    "src/runtime.ts",
+    "src/serializer.ts",
+    "src/supported-environment.ts",
+    "src/types.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "test:coverage": "bun test --coverage --coverage-reporter=text --coverage-reporter=lcov && node ./scripts/check-lcov.mjs ./coverage/lcov.info",
+    "test:pi": "bun test ./test/pi-smoke.test.ts"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=0.80.0"
+  }
+}

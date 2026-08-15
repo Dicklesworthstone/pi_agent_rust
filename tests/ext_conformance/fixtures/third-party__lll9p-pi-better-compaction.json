@@ -1,0 +1,72 @@
+{
+  "extension": {
+    "id": "third-party/lll9p-pi-better-compaction",
+    "source": { "path": "third-party/lll9p-pi-better-compaction/index.ts" }
+  },
+  "scenarios": [
+    {
+      "id": "scn-pi-better-compaction-reg-001",
+      "kind": "registration",
+      "summary": "Registers session_start, session_before_compact, and before_provider_request handlers; before_provider_request is unknown on this host (bd-1q31s) but stays registered fail-open with a warning",
+      "expect": {
+        "event_hooks_contains": [
+          "before_provider_request",
+          "session_before_compact",
+          "session_start"
+        ]
+      }
+    },
+    {
+      "id": "scn-pi-better-compaction-evt-session-start-001",
+      "kind": "event",
+      "summary": "session_start loads extension config via node:fs/node:os shims without UI and returns undefined",
+      "event_name": "session_start",
+      "input": {
+        "event": {}
+      },
+      "expect": {
+        "no_error": true
+      }
+    },
+    {
+      "id": "scn-pi-better-compaction-evt-compact-001",
+      "kind": "event",
+      "summary": "session_before_compact with a full upstream preparation payload fails open: no ctx.model resolves to missing-model, no configured fallback model resolves to no-model-configured, handler returns undefined so pi's native compaction proceeds",
+      "event_name": "session_before_compact",
+      "input": {
+        "event": {
+          "customInstructions": "focus on the open work items",
+          "preparation": {
+            "tokensBefore": 120000,
+            "firstKeptEntryId": "entry-keep-1",
+            "previousSummary": null,
+            "messagesToSummarize": [],
+            "turnPrefixMessages": []
+          }
+        }
+      },
+      "expect": {
+        "no_error": true
+      }
+    },
+    {
+      "id": "scn-pi-better-compaction-evt-provider-request-001",
+      "kind": "event",
+      "summary": "before_provider_request handler is dispatchable (registered fail-open); with no ctx.model it resolves missing-model and returns undefined, leaving the payload untouched; the host does not fire this event in production yet (bd-1q31s)",
+      "event_name": "before_provider_request",
+      "input": {
+        "event": {
+          "payload": {
+            "model": "gpt-5.2-codex",
+            "input": [
+              { "type": "message", "role": "user", "content": "hello" }
+            ]
+          }
+        }
+      },
+      "expect": {
+        "no_error": true
+      }
+    }
+  ]
+}

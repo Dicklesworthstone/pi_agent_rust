@@ -1463,7 +1463,7 @@ fn validate_named_registration_contract(
 ) -> Result<(), String> {
     if capability != !actual.is_empty() {
         return Err(format!(
-            "Extension '{entry_id}': manifest {kind} capability={capability}, but runtime registered {} {kind}",
+            "Extension '{entry_id}': manifest {kind} capability={capability}, but runtime registered {} {kind}: {actual:?}",
             actual.len()
         ));
     }
@@ -6475,6 +6475,10 @@ conformance_test!(
 conformance_test!(
     ext_third_party_limouren_agent_things,
     "third-party/limouren-agent-things"
+);
+conformance_test!(
+    ext_third_party_lll9p_pi_better_compaction,
+    "third-party/lll9p-pi-better-compaction"
 );
 conformance_test!(
     ext_third_party_marckrenn_pi_sub,

@@ -3752,6 +3752,39 @@ fn scenario_pi_ai_helpers_fail_closed() {
     );
 }
 
+/// Focused test: vendored pi-better-compaction (gh #167, bd-8ma6q) registers
+/// all three upstream hooks and fails open across the current host API
+/// surface.
+///
+/// `before_provider_request` is not an event this host fires yet (bd-1q31s);
+/// registration keeps it fail-open with a logged warning, and dispatching it
+/// through the harness must still resolve to the plugin's `missing-model`
+/// skip path rather than an error.
+#[test]
+fn scenario_pi_better_compaction_registers_and_fails_open() {
+    let (ext, mut items) = load_scenario_fixture("third-party__lll9p-pi-better-compaction");
+    // The vendored artifact lives in the third-party corpus tier, not in
+    // `base_fixtures`, so opt out of the focused base-fixture isolation that
+    // `source_tier == "fixture"` would trigger.
+    for item in &mut items {
+        item.source_tier = "third-party-github".to_string();
+    }
+
+    assert_eq!(
+        ext.scenarios.len(),
+        4,
+        "fixture should carry registration + three fail-open event scenarios"
+    );
+    for scenario in &ext.scenarios {
+        let result = run_scenario(&ext, scenario, &items);
+        assert_eq!(
+            result.status, "pass",
+            "pi-better-compaction scenario '{}' failed: diffs={:?} error={:?} skip={:?}",
+            scenario.id, result.diffs, result.error, result.skip_reason
+        );
+    }
+}
+
 struct PiAiProviderBridgeHostActions {
     completions: Mutex<Vec<ExtensionAiCompletionRequest>>,
 }
