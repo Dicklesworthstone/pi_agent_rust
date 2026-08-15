@@ -1,0 +1,126 @@
+{
+  "version": "1.0",
+  "tool": "ast_edit",
+  "description": "Conformance tests for the ast_edit staged structural rewrite tool (bd-cv653.1.3). Only single-call (stage/error) paths are exercised here; resolve/reject lifecycle is covered by unit and e2e tests.",
+  "cases": [
+    {
+      "name": "ast_edit_stage_preview_diff",
+      "description": "Stage returns a proposal id, replacement count, and exact per-file diff preview without writing",
+      "requirement_ids": ["AST-5"],
+      "setup": [
+        {"type": "create_dir", "path": "src"},
+        {"type": "create_file", "path": "src/main.rs", "content": "fn f() -> i32 {\n    compute().unwrap()\n}\n"}
+      ],
+      "input": {"ops": [{"pat": "$EXPR.unwrap()", "out": "$EXPR.expect(\"boom\")"}], "path": "src"},
+      "expected": {
+        "content_contains": [
+          "\"staged\": true",
+          "\"proposalId\": \"ast-",
+          "\"replacements\": 1",
+          "--- a/src/main.rs",
+          "+++ b/src/main.rs",
+          "-    compute().unwrap()",
+          "+    compute().expect(\"boom\")",
+          "NOTHING was written"
+        ]
+      }
+    },
+    {
+      "name": "ast_edit_metavar_identity_rewrite",
+      "description": "Rewrite with a repeated metavariable only rewrites identical-code matches",
+      "requirement_ids": ["AST-2", "AST-5"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn main() {\n    let _ = value == value;\n    let _ = left == right;\n}\n"}
+      ],
+      "input": {"ops": [{"pat": "$A == $A", "out": "$A.eq(&$A)"}], "path": "."},
+      "expected": {
+        "content_contains": ["\"replacements\": 1", "-    let _ = value == value;", "+    let _ = value.eq(&value);"],
+        "content_not_contains": ["left.eq(&right)"]
+      }
+    },
+    {
+      "name": "ast_edit_empty_out_deletes_node",
+      "description": "Empty out deletes the matched node (preview)",
+      "requirement_ids": ["AST-5"],
+      "setup": [
+        {"type": "create_file", "path": "app.js", "content": "function main() {\n  console.log(\"debug\");\n  run();\n}\n"}
+      ],
+      "input": {"ops": [{"pat": "console.log($$$ARGS)", "out": ""}], "path": "."},
+      "expected": {
+        "content_contains": ["\"replacements\": 1", "-  console.log(\"debug\");"]
+      }
+    },
+    {
+      "name": "ast_edit_comment_only_match_stages_nothing",
+      "description": "Planted negative for rewrite: unwrap() appearing only in a comment stages no proposal",
+      "requirement_ids": ["AST-1", "AST-5"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() {\n    // pretend compute().unwrap() happens here\n}\n"}
+      ],
+      "input": {"ops": [{"pat": "$EXPR.unwrap()", "out": "$EXPR.expect(\"boom\")"}], "path": "."},
+      "expected": {
+        "content_contains": ["\"staged\": false", "\"replacements\": 0", "nothing staged"]
+      }
+    },
+    {
+      "name": "ast_edit_malformed_pattern_named_error",
+      "description": "Non-single-node pattern returns a named AST_PATTERN_PARSE error, never a partial apply",
+      "requirement_ids": ["AST-4"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() -> i32 {\n    compute().unwrap()\n}\n"}
+      ],
+      "input": {"ops": [{"pat": "fn a() {} fn b() {}", "out": "fn c() {}"}], "path": "."},
+      "expect_error": true,
+      "error_contains": "AST_PATTERN_PARSE"
+    },
+    {
+      "name": "ast_edit_malformed_replacement_named_error",
+      "description": "Non-single-node replacement (two statements) returns a named AST_PATTERN_PARSE error",
+      "requirement_ids": ["AST-4"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() -> i32 {\n    compute().unwrap()\n}\n"}
+      ],
+      "input": {"ops": [{"pat": "$EXPR.unwrap()", "out": "foo(); bar();"}], "path": "."},
+      "expect_error": true,
+      "error_contains": "AST_PATTERN_PARSE"
+    },
+    {
+      "name": "ast_edit_unparseable_pattern_named_error",
+      "description": "Syntactically broken pattern returns a named AST_PATTERN_PARSE error",
+      "requirement_ids": ["AST-4"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() {}\n"}
+      ],
+      "input": {"ops": [{"pat": "fn broken(", "out": "fn fixed() {}"}], "path": ".", "lang": "rust"},
+      "expect_error": true,
+      "error_contains": "AST_PATTERN_PARSE"
+    },
+    {
+      "name": "ast_edit_unknown_lang_rejected",
+      "description": "Unknown lang override is a validation error",
+      "requirement_ids": ["AST-5"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() {}\n"}
+      ],
+      "input": {"ops": [{"pat": "$A", "out": "$A"}], "path": ".", "lang": "cobol"},
+      "expect_error": true,
+      "error_contains": "unknown lang"
+    },
+    {
+      "name": "ast_edit_unknown_proposal_resolve",
+      "description": "Resolving an unknown proposal id fails with AST_PROPOSAL_UNKNOWN",
+      "requirement_ids": ["AST-6"],
+      "input": {"action": "resolve", "proposalId": "ast-does-not-exist", "reason": "never staged"},
+      "expect_error": true,
+      "error_contains": "AST_PROPOSAL_UNKNOWN"
+    },
+    {
+      "name": "ast_edit_resolve_requires_reason",
+      "description": "Resolve without a one-line reason fails with AST_REASON_REQUIRED",
+      "requirement_ids": ["AST-6"],
+      "input": {"action": "resolve", "proposalId": "ast-x"},
+      "expect_error": true,
+      "error_contains": "AST_REASON_REQUIRED"
+    }
+  ]
+}

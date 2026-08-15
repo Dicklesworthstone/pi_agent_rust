@@ -81,6 +81,8 @@ pub mod agent_cx;
 #[doc(hidden)]
 pub mod app;
 #[doc(hidden)]
+pub mod ast_tools;
+#[doc(hidden)]
 pub mod auth;
 #[doc(hidden)]
 pub mod autocomplete;

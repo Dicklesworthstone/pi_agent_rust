@@ -56,6 +56,8 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "find" => Box::new(pi::tools::FindTool::new(temp_dir.path())),
         "ls" => Box::new(pi::tools::LsTool::new(temp_dir.path())),
         "hashline_edit" => Box::new(pi::tools::HashlineEditTool::new(temp_dir.path())),
+        "ast_grep" => Box::new(pi::ast_tools::AstGrepTool::new(temp_dir.path())),
+        "ast_edit" => Box::new(pi::ast_tools::AstEditTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
         }

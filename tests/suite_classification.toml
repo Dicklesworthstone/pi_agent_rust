@@ -15,6 +15,7 @@
 files = [
     "agent_tools_coverage",
     "algorithms",
+    "ast_tools",
     "bench_schema",
     "branch_edge_failure_coverage",
     "ci_artifact_retention",
@@ -285,6 +286,7 @@ files = [
 [suite.e2e]
 files = [
     "e2e_agent_loop",
+    "e2e_ast_tools",
     "e2e_auto_repair",
     "e2e_cli",
     "e2e_cross_provider_parity",

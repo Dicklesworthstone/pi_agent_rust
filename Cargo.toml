@@ -247,6 +247,8 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
     "tree-sitter-javascript",
     "tree-sitter-typescript",
     "tree-sitter-ruby",
+    "tree-sitter-rust",
+    "tree-sitter-go",
 ] }
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }

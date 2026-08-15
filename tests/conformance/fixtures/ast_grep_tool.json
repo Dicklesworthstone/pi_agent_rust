@@ -1,0 +1,156 @@
+{
+  "version": "1.0",
+  "tool": "ast_grep",
+  "description": "Conformance tests for the ast_grep structural search tool (bd-cv653.1.3)",
+  "cases": [
+    {
+      "name": "ast_grep_rust_unwrap_match",
+      "description": "Structural unwrap() match in rust with line info",
+      "requirement_ids": ["AST-1"],
+      "setup": [
+        {"type": "create_dir", "path": "src"},
+        {"type": "create_file", "path": "src/main.rs", "content": "fn f() -> i32 {\n    compute().unwrap()\n}\n"}
+      ],
+      "input": {"pattern": "$EXPR.unwrap()", "path": "src"},
+      "expected": {
+        "content_contains": ["compute().unwrap()", "src/main.rs", "\"matchCount\": 1", "\"startLine\": 2"]
+      }
+    },
+    {
+      "name": "ast_grep_comment_exclusion_planted_negative",
+      "description": "Planted negative: $EXPR.unwrap() must NOT match a comment or string containing unwrap()",
+      "requirement_ids": ["AST-1"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() -> i32 {\n    let r = compute().unwrap();\n    // this comment mentions data.unwrap() but must never match\n    let _s = \"string: thing.unwrap()\";\n    r\n}\n"}
+      ],
+      "input": {"pattern": "$EXPR.unwrap()", "path": "."},
+      "expected": {
+        "content_contains": ["compute().unwrap()", "\"matchCount\": 1"],
+        "content_not_contains": ["data.unwrap()", "thing.unwrap()"]
+      }
+    },
+    {
+      "name": "ast_grep_metavar_identity",
+      "description": "Same metavariable twice matches identical code only",
+      "requirement_ids": ["AST-2"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn main() {\n    let _ = value == value;\n    let _ = left == right;\n}\n"}
+      ],
+      "input": {"pattern": "$A == $A", "path": "."},
+      "expected": {
+        "content_contains": ["value == value", "\"matchCount\": 1"],
+        "content_not_contains": ["left == right"]
+      }
+    },
+    {
+      "name": "ast_grep_python_call_match",
+      "description": "Structural call match in python",
+      "requirement_ids": ["AST-3"],
+      "setup": [
+        {"type": "create_file", "path": "app.py", "content": "import os\nos.remove(\"/tmp/x\")\nprint(\"done\")\n"}
+      ],
+      "input": {"pattern": "os.remove($$$ARGS)", "path": "."},
+      "expected": {
+        "content_contains": ["os.remove(\"/tmp/x\")", "\"language\": \"python\"", "\"matchCount\": 1"]
+      }
+    },
+    {
+      "name": "ast_grep_javascript_match",
+      "description": "Structural call match in javascript",
+      "requirement_ids": ["AST-3"],
+      "setup": [
+        {"type": "create_file", "path": "app.js", "content": "function main() {\n  console.log(\"hello\", 42);\n}\n"}
+      ],
+      "input": {"pattern": "console.log($$$ARGS)", "path": "."},
+      "expected": {
+        "content_contains": ["console.log(\"hello\", 42)", "\"language\": \"javascript\""]
+      }
+    },
+    {
+      "name": "ast_grep_typescript_match",
+      "description": "Structural call match in typescript",
+      "requirement_ids": ["AST-3"],
+      "setup": [
+        {"type": "create_file", "path": "app.ts", "content": "function main(): void {\n  console.log(\"typed\");\n}\n"}
+      ],
+      "input": {"pattern": "console.log($$$ARGS)", "path": "."},
+      "expected": {
+        "content_contains": ["console.log(\"typed\")", "\"language\": \"typescript\""]
+      }
+    },
+    {
+      "name": "ast_grep_bash_command_match",
+      "description": "Structural command match in bash",
+      "requirement_ids": ["AST-3"],
+      "setup": [
+        {"type": "create_file", "path": "run.sh", "content": "#!/usr/bin/env bash\nset -e\nrm -rf /tmp/scratch\n"}
+      ],
+      "input": {"pattern": "rm -rf $$$", "path": "."},
+      "expected": {
+        "content_contains": ["rm -rf /tmp/scratch", "\"language\": \"bash\"", "\"matchCount\": 1"]
+      }
+    },
+    {
+      "name": "ast_grep_glob_scoping",
+      "description": "Glob restricts the scan to matching files",
+      "requirement_ids": ["AST-1"],
+      "setup": [
+        {"type": "create_file", "path": "a.rs", "content": "fn a() {\n    helper(1);\n}\n"},
+        {"type": "create_file", "path": "b.py", "content": "def b():\n    helper(2)\n"}
+      ],
+      "input": {"pattern": "helper($$$ARGS)", "path": ".", "glob": "**/*.rs"},
+      "expected": {
+        "content_contains": ["a.rs", "\"matchCount\": 1"],
+        "content_not_contains": ["b.py"]
+      }
+    },
+    {
+      "name": "ast_grep_multi_language_scan",
+      "description": "One scan parses each file in its own language",
+      "requirement_ids": ["AST-3"],
+      "setup": [
+        {"type": "create_file", "path": "a.rs", "content": "fn a() {\n    helper(1);\n}\n"},
+        {"type": "create_file", "path": "b.py", "content": "def b():\n    helper(2)\n"},
+        {"type": "create_file", "path": "c.js", "content": "function c() {\n  helper(3);\n}\n"}
+      ],
+      "input": {"pattern": "helper($$$ARGS)", "path": "."},
+      "expected": {
+        "content_contains": ["a.rs", "b.py", "c.js", "\"matchCount\": 3"]
+      }
+    },
+    {
+      "name": "ast_grep_no_matches",
+      "description": "Pattern with no structural matches returns an empty match list",
+      "requirement_ids": ["AST-1"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() {}\n"}
+      ],
+      "input": {"pattern": "$EXPR.unwrap()", "path": "."},
+      "expected": {
+        "content_contains": ["\"matchCount\": 0", "\"matches\": []"]
+      }
+    },
+    {
+      "name": "ast_grep_invalid_pattern_named_error",
+      "description": "Unparseable pattern returns a named AST_PATTERN_PARSE error",
+      "requirement_ids": ["AST-4"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() {}\n"}
+      ],
+      "input": {"pattern": "fn broken(", "path": ".", "lang": "rust"},
+      "expect_error": true,
+      "error_contains": "AST_PATTERN_PARSE"
+    },
+    {
+      "name": "ast_grep_limit_zero_rejected",
+      "description": "limit=0 is a validation error",
+      "requirement_ids": ["AST-1"],
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": "fn f() {}\n"}
+      ],
+      "input": {"pattern": "fn $NAME($$$ARGS) { $$$BODY }", "path": ".", "limit": 0},
+      "expect_error": true,
+      "error_contains": "limit"
+    }
+  ]
+}
