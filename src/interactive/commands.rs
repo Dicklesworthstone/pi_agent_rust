@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
+use crate::models::{ModelEntry, ModelRole, model_requires_configured_credential, normalize_api_key_opt};
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
     split_provider_model_spec,
@@ -2568,6 +2568,43 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_model(&mut self, args: &str) -> Option<Cmd> {
+        // Role targeting (bd-cv653.3.1): `/model <role>` shows the role's
+        // assignment; `/model <role> <pattern>` assigns a model to the role
+        // for this session. Non-role first tokens fall through to the classic
+        // selector flow below.
+        {
+            let trimmed = args.trim();
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let first = parts.next().unwrap_or("");
+            let rest = parts.next().unwrap_or("").trim();
+            if !first.is_empty()
+                && let Some(role) = ModelRole::from_name(first)
+            {
+                if rest.is_empty() {
+                    let current = self
+                        .role_model_overrides
+                        .get(&role)
+                        .map(|(p, m)| format!("{p}/{m}"))
+                        .or_else(|| {
+                            self.config
+                                .model_roles
+                                .as_ref()
+                                .and_then(|roles| crate::app::role_spec_from_settings(roles, role))
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| "(inherits default)".to_string());
+                    self.status_message = Some(format!("Role {role}: {current}"));
+                    return None;
+                }
+                if self.agent_state != AgentState::Idle {
+                    self.status_message =
+                        Some("Cannot switch models while processing".to_string());
+                    return None;
+                }
+                return self.assign_model_to_role(role, rest);
+            }
+        }
+
         if args.trim().is_empty() {
             self.open_model_selector_configured_only();
             return None;
@@ -2695,6 +2732,51 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         self.status_message = Some(format!("Switched model: {}", self.model));
+        None
+    }
+
+    /// Assign a model to a role for this session (`/model <role> <pattern>`,
+    /// bd-cv653.3.1). Records the override in app state and appends a
+    /// role-tagged `ModelChange` entry so the assignment replays.
+    fn assign_model_to_role(&mut self, role: ModelRole, pattern: &str) -> Option<Cmd> {
+        let mut found: Option<ModelEntry> = None;
+        for entry in &self.available_models {
+            let full = format!("{}/{}", entry.model.provider, entry.model.id);
+            if full.eq_ignore_ascii_case(pattern)
+                || entry.model.id.eq_ignore_ascii_case(pattern)
+                || split_provider_model_spec(pattern).is_some_and(|(provider, model_id)| {
+                    provider_ids_match(&entry.model.provider, provider)
+                        && entry.model.id.eq_ignore_ascii_case(model_id)
+                })
+            {
+                found = Some(entry.clone());
+                break;
+            }
+        }
+        if found.is_none()
+            && let Some((provider, model_id)) = split_provider_model_spec(pattern)
+        {
+            let provider = normalize_auth_provider_input(provider);
+            if !provider.is_empty() && !model_id.trim().is_empty() {
+                found = crate::models::ad_hoc_model_entry(&provider, model_id.trim());
+            }
+        }
+        let Some(entry) = found else {
+            self.status_message = Some(format!("Model not found: {pattern}"));
+            return None;
+        };
+        let provider = entry.model.provider.clone();
+        let model_id = entry.model.id.clone();
+        self.role_model_overrides
+            .insert(role, (provider.clone(), model_id.clone()));
+        if let Ok(mut session_guard) = self.session.try_lock() {
+            session_guard.append_model_change_with_role(
+                provider.clone(),
+                model_id.clone(),
+                Some(role.as_str().to_string()),
+            );
+        }
+        self.status_message = Some(format!("Role {role} set to {provider}/{model_id}"));
         None
     }
 

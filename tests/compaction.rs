@@ -144,6 +144,7 @@ fn model_change_entry(
         base: base(Some(id), parent_id),
         provider: provider.to_string(),
         model_id: model_id.to_string(),
+        role: None,
     })
 }
 

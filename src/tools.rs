@@ -5002,13 +5002,17 @@ impl ToolRegistry {
                 "find" => tools.push(Box::new(FindTool::new(cwd))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
+                "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
                 "subagent" => {
                     let structured_results = config
                         .and_then(|c| c.subagent_structured_results)
                         .unwrap_or(false);
+                    let role_model_spec = config.and_then(crate::app::subagent_role_spec);
                     tools.push(Box::new(
                         crate::subagents::SubagentTool::new(cwd)
-                            .with_structured_results(structured_results),
+                            .with_structured_results(structured_results)
+                            .with_role_model_spec(role_model_spec),
                     ));
                 }
                 _ => {}

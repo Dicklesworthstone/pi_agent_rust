@@ -1651,6 +1651,7 @@ pub async fn run_interactive(
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
+    title_model_entry: Option<ModelEntry>,
     pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
     resources: ResourceLoader,
@@ -1749,6 +1750,7 @@ pub async fn run_interactive(
             model_entry,
             model_scope,
             available_models,
+            title_model_entry,
             pending_inputs,
             event_tx,
             runtime_handle,
@@ -1826,6 +1828,9 @@ pub enum PiMsg {
         stop_reason: StopReason,
         error_message: Option<String>,
     },
+    /// Auto-titling result: a tiny/smol-role model suggested a session name
+    /// (bd-cv653.3.1). Applied only if the session is still unnamed.
+    SessionTitleSuggestion { title: String },
     /// Agent error.
     AgentError(String),
     /// Credentials changed for a provider; refresh in-memory provider auth state.
@@ -2354,6 +2359,17 @@ pub struct PiApp {
     // Keybindings for action dispatch
     keybindings: crate::keybindings::KeyBindings,
 
+    /// Session-scoped per-role model overrides set via `/model <role> <spec>`
+    /// (bd-cv653.3.1). Values are `(provider, model_id)`. Consumed by
+    /// role-aware features (advisor, plan mode, titling) as they land.
+    role_model_overrides: std::collections::HashMap<crate::models::ModelRole, (String, String)>,
+
+    /// Model used for automatic session titling (tiny/smol role), or None
+    /// when titling is disabled/unresolvable (bd-cv653.3.1).
+    title_model_entry: Option<ModelEntry>,
+    /// Guard so titling fires at most once per session.
+    title_requested: bool,
+
     // Track last Ctrl+C time for double-tap quit detection
     last_ctrlc_time: Option<std::time::Instant>,
     // Track last Escape time for double-tap tree/fork
@@ -2464,6 +2480,7 @@ impl PiApp {
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
+        title_model_entry: Option<ModelEntry>,
         pending_inputs: Vec<PendingInput>,
         event_tx: mpsc::Sender<PiMsg>,
         runtime_handle: RuntimeHandle,
@@ -2660,6 +2677,9 @@ impl PiApp {
             pending_oauth: None,
             extensions,
             keybindings,
+            role_model_overrides: std::collections::HashMap::new(),
+            title_model_entry,
+            title_requested: false,
             last_ctrlc_time: None,
             last_escape_time: None,
             autocomplete,

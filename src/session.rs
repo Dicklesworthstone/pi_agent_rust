@@ -4654,12 +4654,25 @@ impl Session {
     }
 
     pub fn append_model_change(&mut self, provider: String, model_id: String) -> String {
+        self.append_model_change_with_role(provider, model_id, None)
+    }
+
+    /// Append a model change tagged with the role it applies to
+    /// (bd-cv653.3.1). `role: None` means the default role and serializes
+    /// identically to legacy entries.
+    pub fn append_model_change_with_role(
+        &mut self,
+        provider: String,
+        model_id: String,
+        role: Option<String>,
+    ) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
         let entry = SessionEntry::ModelChange(ModelChangeEntry {
             base,
             provider,
             model_id,
+            role,
         });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
@@ -6164,6 +6177,11 @@ pub struct ModelChangeEntry {
     pub base: EntryBase,
     pub provider: String,
     pub model_id: String,
+    /// The model role this change applies to (bd-cv653.3.1). Absent/None means
+    /// the `default` role — older session files and older readers never carry
+    /// or require the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 /// Thinking level change entry.

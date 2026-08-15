@@ -48,6 +48,9 @@ pub struct SubagentTool {
     global_dir: PathBuf,
     child_binary: PathBuf,
     structured_results: bool,
+    /// Model spec children run with when their agent definition does not pin
+    /// `model:` — the `task` role spec, else `smol` (bd-cv653.3.1).
+    role_model_spec: Option<String>,
 }
 
 impl SubagentTool {
@@ -63,7 +66,16 @@ impl SubagentTool {
             global_dir: Config::global_dir(),
             child_binary,
             structured_results: false,
+            role_model_spec: None,
         }
+    }
+
+    /// Set the role model spec children fall back to when their agent
+    /// definition has no `model:` pin (task role, else smol).
+    #[must_use]
+    pub fn with_role_model_spec(mut self, spec: Option<String>) -> Self {
+        self.role_model_spec = spec.filter(|s| !s.trim().is_empty());
+        self
     }
 
     /// Opt in to appending the machine-readable
@@ -587,7 +599,7 @@ impl ChildRunner {
                 format!("Working directory does not exist: {}", cwd.display()),
             );
         }
-        let args = child_args(agent, &task.task);
+        let args = child_args(agent, &task.task, self.role_model_spec.as_deref());
         let mut result =
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args);
         let update = on_update.as_ref();
@@ -735,7 +747,7 @@ impl Drop for ChildProcessGuard {
     }
 }
 
-fn child_args(agent: &AgentDefinition, task: &str) -> Vec<OsString> {
+fn child_args(agent: &AgentDefinition, task: &str, role_model_spec: Option<&str>) -> Vec<OsString> {
     let mut args = vec![
         "--mode".into(),
         "json".into(),
@@ -748,8 +760,12 @@ fn child_args(agent: &AgentDefinition, task: &str) -> Vec<OsString> {
             .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","))
             .into(),
     ];
+    // Model precedence (bd-cv653.3.1): agent-def `model:` pin > task/smol role
+    // spec from settings > nothing (child inherits the parent's ambient model).
     if let Some(model) = &agent.model {
         args.extend(["--model".into(), model.clone().into()]);
+    } else if let Some(spec) = role_model_spec {
+        args.extend(["--model".into(), spec.into()]);
     }
     if let Some(reasoning) = &agent.reasoning {
         args.extend(["--thinking".into(), reasoning.clone().into()]);
@@ -1181,7 +1197,7 @@ mod tests {
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider")
+        let args = child_args(&agent, "inspect provider", None)
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();

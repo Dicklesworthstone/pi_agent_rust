@@ -729,6 +729,7 @@ mod tests {
                 base: dummy_base(),
                 provider: "anthropic".to_string(),
                 model_id: "claude-sonnet-4-5".to_string(),
+                role: None,
             }),
             message_entry(),
         ];
@@ -799,6 +800,7 @@ mod tests {
                 base: dummy_base(),
                 provider: "openai".to_string(),
                 model_id: "gpt-4".to_string(),
+                role: None,
             }),
             session_info_entry(Some("Named".to_string())),
             SessionEntry::Label(LabelEntry {

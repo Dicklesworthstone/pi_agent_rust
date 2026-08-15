@@ -822,6 +822,38 @@ pub fn subagent_role_spec(config: &Config) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Resolve the model entry used for automatic session titling
+/// (bd-cv653.3.1 round-4): the explicitly configured `tiny` role, else
+/// `smol`, else `None`. Deliberately does NOT fall back to the default role —
+/// titling must stay cheap; when no cheap role resolves, it disables silently.
+/// Honors CLI `--smol` (tiny has no CLI flag).
+pub fn titling_model_entry(
+    cli: &cli::Cli,
+    config: &Config,
+    registry: &ModelRegistry,
+) -> Option<ModelEntry> {
+    if !config.auto_title_enabled() {
+        return None;
+    }
+    for role in [ModelRole::Tiny, ModelRole::Smol] {
+        let spec = role_spec_from_cli(cli, role)
+            .map(str::to_string)
+            .or_else(|| {
+                config
+                    .model_roles
+                    .as_ref()
+                    .and_then(|roles| role_spec_from_settings(roles, role))
+                    .map(str::to_string)
+            });
+        if let Some(spec) = spec
+            && let Some((entry, _thinking)) = resolve_role_spec(&spec, registry)
+        {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 fn last_model_from_session(session: &Session) -> Option<(String, String)> {
     session.effective_model_for_current_path()
 }

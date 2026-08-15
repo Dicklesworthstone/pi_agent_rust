@@ -1875,6 +1875,8 @@ async fn run(
             .map(|sm| sm.model.clone())
             .collect::<Vec<_>>();
         let available_models = model_registry.get_available();
+        let title_model_entry =
+            pi::app::titling_model_entry(cli, &config, &model_registry);
 
         run_interactive_mode(
             agent_session,
@@ -1884,6 +1886,7 @@ async fn run(
             selection.model_entry.clone(),
             model_scope,
             available_models,
+            title_model_entry,
             !cli.no_session,
             resources,
             resource_cli,
@@ -7385,6 +7388,7 @@ async fn run_interactive_mode(
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
+    title_model_entry: Option<ModelEntry>,
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
@@ -7417,6 +7421,7 @@ async fn run_interactive_mode(
         model_entry,
         model_scope,
         available_models,
+        title_model_entry,
         pending,
         save_enabled,
         resources,

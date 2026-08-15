@@ -1159,6 +1159,7 @@ mod tests {
                 current,
                 Vec::new(),
                 available,
+                None,
                 Vec::new(),
                 event_tx,
                 runtime_handle(),

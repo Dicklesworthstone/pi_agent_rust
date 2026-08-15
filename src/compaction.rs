@@ -3281,6 +3281,7 @@ mod tests {
             base: test_base("1"),
             provider: "test".to_string(),
             model_id: "model-1".to_string(),
+            role: None,
         });
         assert!(!entry_is_message_like(&entry));
     }
@@ -3380,6 +3381,7 @@ mod tests {
             base: test_base("1"),
             provider: "test".to_string(),
             model_id: "model".to_string(),
+            role: None,
         });
         assert!(message_from_entry(&entry).is_none());
     }
@@ -3647,6 +3649,7 @@ mod tests {
             base: test_base("1"),
             provider: "test".to_string(),
             model_id: "model".to_string(),
+            role: None,
         })];
         assert!(prepare_compaction(&entries, ResolvedCompactionSettings::default()).is_none());
     }

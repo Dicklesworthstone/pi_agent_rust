@@ -49,6 +49,8 @@ pub struct Config {
     /// Per-role model assignments (see [`ModelRoleSettings`], bd-cv653.3.1).
     #[serde(alias = "modelRoles")]
     pub model_roles: Option<ModelRoleSettings>,
+    /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
+    pub titling: Option<TitlingSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -327,6 +329,20 @@ pub struct ModelRoleSettings {
     pub tiny: Option<String>,
 }
 
+/// Automatic session titling (bd-cv653.3.1 round-4 scope).
+///
+/// After the first exchange of a new session, a tiny/smol-role model call
+/// summarizes the task into a short session name (the `SessionInfo` entry),
+/// making `--resume` pickers and status lines readable. Never blocks the turn
+/// and silently no-ops when no cheap role resolves or credentials are missing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TitlingSettings {
+    /// Master switch for automatic session titling (default: true).
+    #[serde(alias = "autoTitle", alias = "auto")]
+    pub auto_title: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -551,6 +567,7 @@ impl Config {
             default_thinking_level: other.default_thinking_level.or(base.default_thinking_level),
             enabled_models: other.enabled_models.or(base.enabled_models),
             model_roles: merge_model_roles(base.model_roles, other.model_roles),
+            titling: merge_titling(base.titling, other.titling),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -630,6 +647,15 @@ impl Config {
         self.compaction
             .as_ref()
             .and_then(|c| c.enabled)
+            .unwrap_or(true)
+    }
+
+    /// Whether automatic session titling is enabled (bd-cv653.3.1).
+    /// Default: true — it degrades to a silent no-op without a tiny/smol role.
+    pub fn auto_title_enabled(&self) -> bool {
+        self.titling
+            .as_ref()
+            .and_then(|t| t.auto_title)
             .unwrap_or(true)
     }
 
@@ -1212,6 +1238,18 @@ fn merge_model_roles(
             task: other.task.or(base.task),
             advisor: other.advisor.or(base.advisor),
             tiny: other.tiny.or(base.tiny),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge titling settings (other wins).
+fn merge_titling(base: Option<TitlingSettings>, other: Option<TitlingSettings>) -> Option<TitlingSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(TitlingSettings {
+            auto_title: other.auto_title.or(base.auto_title),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
