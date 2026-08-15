@@ -1459,7 +1459,8 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
     ProviderMetadata {
         canonical_id: "opencode",
         display_name: Some("OpenCode"),
-        aliases: &[],
+        // opencode-zen is the omp registry id for the Zen tier (bd-cv653.7.3).
+        aliases: &["opencode-zen"],
         auth_env_keys: &["OPENCODE_API_KEY"],
         onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
         routing_defaults: Some(ProviderRoutingDefaults {
@@ -1504,6 +1505,156 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
             input: &INPUT_TEXT,
             context_window: 200_000,
             max_tokens: 8192,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    // ── omp-catalog delta presets (bd-cv653.7.3) ─────────────────────────
+    // Machine diff vs omp:packages/ai/src/registry + pi-catalog recorded in
+    // docs/evidence/provider-catalog-diff-omp.json. Every entry below is a
+    // plain API-key preset; omp OAuth/device login flows (kilo, wafer,
+    // opencode-go) remain out of preset scope and are NOT claimed here.
+    ProviderMetadata {
+        canonical_id: "gmi",
+        display_name: Some("GMI Cloud"),
+        aliases: &["gmi-cloud", "gmi-serving"],
+        auth_env_keys: &["GMI_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.gmi-serving.com/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // CoreWeave Serverless Inference (wandb-hosted). NOTE: omp also
+        // sends an OpenAI-Project header derived from COREWEAVE_PROJECT for
+        // model discovery; that header is not expressible in static metadata,
+        // so bare bearer-key request shaping is all this preset guarantees.
+        canonical_id: "coreweave",
+        display_name: Some("CoreWeave Serverless Inference"),
+        aliases: &["coreweave-serverless"],
+        auth_env_keys: &["COREWEAVE_API_KEY", "WANDB_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.inference.wandb.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // omp descriptor marks Sakana's /v1 surface as openai-responses.
+        canonical_id: "sakana",
+        display_name: Some("Sakana AI"),
+        aliases: &["sakana-ai"],
+        auth_env_keys: &["SAKANA_API_KEY", "FUGU_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-responses",
+            base_url: "https://api.sakana.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "wafer",
+        display_name: Some("Wafer Serverless"),
+        aliases: &["wafer-serverless"],
+        auth_env_keys: &["WAFER_SERVERLESS_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://pass.wafer.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "qianfan",
+        display_name: Some("Qianfan (Baidu)"),
+        aliases: &["baidu-qianfan"],
+        auth_env_keys: &["QIANFAN_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://qianfan.baidubce.com/v2",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // omp descriptor routes Umans through anthropic-messages, not
+        // openai-completions; API-key auth (no OAuth flow required).
+        canonical_id: "umans",
+        display_name: Some("Umans AI Coding Plan"),
+        aliases: &["umans-ai"],
+        auth_env_keys: &["UMANS_AI_CODING_PLAN_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.code.umans.ai/v1/messages",
+            auth_header: false,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 200_000,
+            max_tokens: 8192,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        canonical_id: "kilo",
+        display_name: Some("Kilo Gateway"),
+        aliases: &["kilo-gateway", "kilo-ai"],
+        auth_env_keys: &["KILO_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.kilo.ai/api/gateway",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
+        // OpenCode Go tier; omp exposes openai-completions at /zen/go/v1
+        // (alongside anthropic-messages/openai-responses dialects).
+        canonical_id: "opencode-go",
+        display_name: Some("OpenCode Go"),
+        aliases: &[],
+        auth_env_keys: &["OPENCODE_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://opencode.ai/zen/go/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
         }),
         test_obligations: TEST_REQUIRED,
     },
