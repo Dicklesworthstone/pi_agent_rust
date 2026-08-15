@@ -1667,6 +1667,13 @@ fn build_stream_options_with_optional_key(
         headers: selection.model_entry.headers.clone(),
         session_id: Some(session.header.id.clone()),
         thinking_level: Some(selection.thinking_level),
+        // Match the CLI path (`app::build_stream_options`): prompt caching
+        // defaults to short retention, so SDK embedders get the same
+        // Anthropic cache breakpoints instead of silently paying full input
+        // price. `PI_CACHE_RETENTION` overrides ("long"/"none").
+        cache_retention: app::cache_retention_from_env(
+            std::env::var("PI_CACHE_RETENTION").ok().as_deref(),
+        ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so embedders inherit the configured limit by default; they can still
         // override it via `set_max_tokens`.
@@ -2249,6 +2256,57 @@ mod tests {
                 .count()
         });
         assert_eq!(thinking_changes, 1);
+    }
+
+    #[test]
+    fn sdk_stream_options_enable_prompt_caching_by_default() {
+        let config = crate::config::Config::default();
+        let session = crate::session::Session::in_memory();
+        let selection = app::ModelSelection {
+            model_entry: ModelEntry {
+                model: Model {
+                    id: "plain-model".to_string(),
+                    name: "Plain Model".to_string(),
+                    api: "anthropic-messages".to_string(),
+                    provider: "anthropic".to_string(),
+                    base_url: "https://api.anthropic.com/v1/messages".to_string(),
+                    reasoning: false,
+                    input: vec![InputType::Text],
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    context_window: 128_000,
+                    max_tokens: 8_192,
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: false,
+                compat: None,
+                oauth_config: None,
+            },
+            thinking_level: crate::model::ThinkingLevel::Off,
+            scoped_models: Vec::new(),
+            fallback_message: None,
+        };
+
+        let options =
+            build_stream_options_with_optional_key(&config, None, &selection, &session);
+
+        // SDK embedders must get the same prompt-caching default as the CLI
+        // path (`app::build_stream_options`); the assertion tracks the pure
+        // env resolver so it stays correct if PI_CACHE_RETENTION is set in
+        // the environment running the tests.
+        assert_eq!(
+            options.cache_retention,
+            app::cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref())
+        );
+        if std::env::var("PI_CACHE_RETENTION").is_err() {
+            assert_eq!(options.cache_retention, crate::provider::CacheRetention::Short);
+        }
     }
 
     #[test]
