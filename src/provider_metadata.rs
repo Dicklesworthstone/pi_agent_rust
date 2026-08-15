@@ -3398,10 +3398,12 @@ mod tests {
             };
             let base_url = defaults.base_url;
             if base_url.is_empty() {
-                // amazon-bedrock computes endpoints per-region at runtime.
-                assert_eq!(
-                    meta.canonical_id, "amazon-bedrock",
-                    "only amazon-bedrock may carry an empty base_url"
+                // Runtime-computed endpoints: bedrock derives endpoints
+                // per-region and vertex per project/location at request time.
+                assert!(
+                    matches!(meta.canonical_id, "amazon-bedrock" | "google-vertex"),
+                    "only runtime-computed providers (bedrock, vertex) may carry an empty base_url, got '{}'",
+                    meta.canonical_id
                 );
                 continue;
             }
@@ -3477,8 +3479,15 @@ mod tests {
                     }
                 }
                 ProviderOnboardingMode::NativeAdapterRequired => {
+                    // Native adapters (bedrock, sap-ai-core, …) legitimately
+                    // carry routing defaults to declare their api family; they
+                    // may NOT carry a routable preset base_url (that would be
+                    // masquerading as a zero-config preset).
+                    let masquerades = meta
+                        .routing_defaults
+                        .is_some_and(|defaults| !defaults.base_url.is_empty());
                     assert!(
-                        meta.routing_defaults.is_none(),
+                        !masquerades,
                         "native-adapter provider '{}' must not masquerade as a routable preset",
                         meta.canonical_id
                     );

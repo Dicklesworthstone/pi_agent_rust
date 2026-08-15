@@ -1272,7 +1272,9 @@
       }
     },
     {
-      "aliases": [],
+      "aliases": [
+        "opencode-zen"
+      ],
       "auth_env_keys": [
         "OPENCODE_API_KEY"
       ],
@@ -1316,6 +1318,144 @@
         "base_url": "https://zenmux.ai/api/anthropic/v1/messages",
         "context_window": 200000,
         "max_tokens": 8192
+      }
+    },
+    {
+      "aliases": [
+        "gmi-cloud",
+        "gmi-serving"
+      ],
+      "auth_env_keys": [
+        "GMI_API_KEY"
+      ],
+      "canonical_id": "gmi",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://api.gmi-serving.com/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
+        "coreweave-serverless"
+      ],
+      "auth_env_keys": [
+        "COREWEAVE_API_KEY",
+        "WANDB_API_KEY"
+      ],
+      "canonical_id": "coreweave",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://api.inference.wandb.ai/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
+        "sakana-ai"
+      ],
+      "auth_env_keys": [
+        "SAKANA_API_KEY",
+        "FUGU_API_KEY"
+      ],
+      "canonical_id": "sakana",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-responses",
+        "auth_header": true,
+        "base_url": "https://api.sakana.ai/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
+        "wafer-serverless"
+      ],
+      "auth_env_keys": [
+        "WAFER_SERVERLESS_API_KEY"
+      ],
+      "canonical_id": "wafer",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://pass.wafer.ai/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
+        "baidu-qianfan"
+      ],
+      "auth_env_keys": [
+        "QIANFAN_API_KEY"
+      ],
+      "canonical_id": "qianfan",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://qianfan.baidubce.com/v2",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
+        "umans-ai"
+      ],
+      "auth_env_keys": [
+        "UMANS_AI_CODING_PLAN_API_KEY"
+      ],
+      "canonical_id": "umans",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "anthropic-messages",
+        "auth_header": false,
+        "base_url": "https://api.code.umans.ai/v1/messages",
+        "context_window": 200000,
+        "max_tokens": 8192
+      }
+    },
+    {
+      "aliases": [
+        "kilo-gateway",
+        "kilo-ai"
+      ],
+      "auth_env_keys": [
+        "KILO_API_KEY"
+      ],
+      "canonical_id": "kilo",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://api.kilo.ai/api/gateway",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [],
+      "auth_env_keys": [
+        "OPENCODE_API_KEY"
+      ],
+      "canonical_id": "opencode-go",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://opencode.ai/zen/go/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
       }
     },
     {
@@ -1449,6 +1589,6 @@
     }
   ],
   "schema_version": "1.0",
-  "total_aliases": 51,
-  "total_providers": 94
+  "total_aliases": 61,
+  "total_providers": 102
 }

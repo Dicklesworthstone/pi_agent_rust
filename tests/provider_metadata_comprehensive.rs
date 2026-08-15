@@ -252,7 +252,7 @@ fn provider_auth_reference_artifacts_match_runtime_metadata() {
         serde_json::from_str(include_str!("../docs/provider-canonical-id-policy.json"))
             .expect("provider canonical ID policy must be valid JSON");
 
-    assert_eq!(PROVIDER_METADATA.len(), 94);
+    assert_eq!(PROVIDER_METADATA.len(), 102);
     assert_eq!(crosswalk["schema"], "pi.docs.provider_auth_crosswalk.v2");
     assert!(crosswalk.get("api_key_resolution_precedence").is_none());
     assert!(crosswalk.get("auth_method_patterns").is_none());
@@ -264,12 +264,12 @@ fn provider_auth_reference_artifacts_match_runtime_metadata() {
         crosswalk["schema_migration_from_v1"]["renamed_sections"]["auth_method_patterns"],
         "request_auth_methods"
     );
-    assert_eq!(crosswalk["providers"].as_array().map(Vec::len), Some(94));
+    assert_eq!(crosswalk["providers"].as_array().map(Vec::len), Some(102));
     assert_eq!(
         policy["canonical_id_map"]["entries"]
             .as_array()
             .map(Vec::len),
-        Some(94)
+        Some(102)
     );
     assert_eq!(
         provider_reference_strings(&crosswalk, "/providers", "aliases"),
@@ -623,6 +623,10 @@ fn all_oai_compatible_base_urls_are_unique() {
         // Local OpenAI-compatible servers that both default to 127.0.0.1:1234.
         ("lmstudio", "mistralrs"),
         ("mistralrs", "lmstudio"),
+        // CoreWeave powers W&B Inference; omp's coreweave descriptor is a
+        // second name for the wandb.ai endpoint (same base_url by design).
+        ("wandb", "coreweave"),
+        ("coreweave", "wandb"),
     ]);
     for meta in PROVIDER_METADATA {
         if let Some(defaults) = &meta.routing_defaults {
@@ -1002,115 +1006,113 @@ fn generate_canonical_id_alias_table_json() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn canonical_id_snapshot_detects_additions_and_removals() {
-    // ── Snapshot: 94 canonical IDs (sorted) ─────────────────────────────
+    // ── Snapshot: 102 canonical IDs (sorted) ─────────────────────────────
     // To update: run the failing test, copy the "actual" list printed
     // below, and replace this array.
     const EXPECTED: &[&str] = &[
-
-    "302ai",
-    "abacus",
-    "aihubmix",
-    "alibaba",
-    "alibaba-cn",
-    "alibaba-us",
-    "amazon-bedrock",
-    "anthropic",
-    "atlascloud",
-    "azure-openai",
-    "bailing",
-    "baseten",
-    "berget",
-    "cerebras",
-    "chutes",
-    "cloudflare-ai-gateway",
-    "cloudflare-workers-ai",
-    "cohere",
-    "coreweave",
-    "cortecs",
-    "cursor",
-    "deepinfra",
-    "deepseek",
-    "fastrouter",
-    "fireworks",
-    "firmware",
-    "friendli",
-    "github-copilot",
-    "gitlab",
-    "gmi",
-    "google",
-    "google-antigravity",
-    "google-gemini-cli",
-    "google-vertex",
-    "groq",
-    "helicone",
-    "huggingface",
-    "iflowcn",
-    "inception",
-    "inference",
-    "io-net",
-    "jiekou",
-    "kilo",
-    "kimi-for-coding",
-    "llama",
-    "llamacpp",
-    "lmstudio",
-    "lucidquery",
-    "minimax",
-    "minimax-cn",
-    "minimax-cn-coding-plan",
-    "minimax-coding-plan",
-    "mistral",
-    "mistralrs",
-    "moark",
-    "modelscope",
-    "moonshotai",
-    "moonshotai-cn",
-    "morph",
-    "nano-gpt",
-    "nebius",
-    "nova",
-    "novita-ai",
-    "nvidia",
-    "ollama",
-    "ollama-cloud",
-    "openai",
-    "openai-codex",
-    "opencode",
-    "opencode-go",
-    "openrouter",
-    "ovhcloud",
-    "perplexity",
-    "poe",
-    "privatemode-ai",
-    "qianfan",
-    "requesty",
-    "sakana",
-    "sap-ai-core",
-    "scaleway",
-    "siliconflow",
-    "siliconflow-cn",
-    "stackit",
-    "submodel",
-    "synthetic",
-    "togetherai",
-    "umans",
-    "upstage",
-    "v0",
-    "venice",
-    "vercel",
-    "vivgrid",
-    "vultr",
-    "wafer",
-    "wandb",
-    "xai",
-    "xiaomi",
-    "zai",
-    "zai-coding-plan",
-    "zenmux",
-    "zhipuai",
-    "zhipuai-coding-plan",
-
-        ];
+        "302ai",
+        "abacus",
+        "aihubmix",
+        "alibaba",
+        "alibaba-cn",
+        "alibaba-us",
+        "amazon-bedrock",
+        "anthropic",
+        "atlascloud",
+        "azure-openai",
+        "bailing",
+        "baseten",
+        "berget",
+        "cerebras",
+        "chutes",
+        "cloudflare-ai-gateway",
+        "cloudflare-workers-ai",
+        "cohere",
+        "coreweave",
+        "cortecs",
+        "cursor",
+        "deepinfra",
+        "deepseek",
+        "fastrouter",
+        "fireworks",
+        "firmware",
+        "friendli",
+        "github-copilot",
+        "gitlab",
+        "gmi",
+        "google",
+        "google-antigravity",
+        "google-gemini-cli",
+        "google-vertex",
+        "groq",
+        "helicone",
+        "huggingface",
+        "iflowcn",
+        "inception",
+        "inference",
+        "io-net",
+        "jiekou",
+        "kilo",
+        "kimi-for-coding",
+        "llama",
+        "llamacpp",
+        "lmstudio",
+        "lucidquery",
+        "minimax",
+        "minimax-cn",
+        "minimax-cn-coding-plan",
+        "minimax-coding-plan",
+        "mistral",
+        "mistralrs",
+        "moark",
+        "modelscope",
+        "moonshotai",
+        "moonshotai-cn",
+        "morph",
+        "nano-gpt",
+        "nebius",
+        "nova",
+        "novita-ai",
+        "nvidia",
+        "ollama",
+        "ollama-cloud",
+        "openai",
+        "openai-codex",
+        "opencode",
+        "opencode-go",
+        "openrouter",
+        "ovhcloud",
+        "perplexity",
+        "poe",
+        "privatemode-ai",
+        "qianfan",
+        "requesty",
+        "sakana",
+        "sap-ai-core",
+        "scaleway",
+        "siliconflow",
+        "siliconflow-cn",
+        "stackit",
+        "submodel",
+        "synthetic",
+        "togetherai",
+        "umans",
+        "upstage",
+        "v0",
+        "venice",
+        "vercel",
+        "vivgrid",
+        "vultr",
+        "wafer",
+        "wandb",
+        "xai",
+        "xiaomi",
+        "zai",
+        "zai-coding-plan",
+        "zenmux",
+        "zhipuai",
+        "zhipuai-coding-plan",
+    ];
 
     let mut actual: Vec<&str> = PROVIDER_METADATA.iter().map(|m| m.canonical_id).collect();
     actual.sort_unstable();
@@ -1136,253 +1138,68 @@ fn canonical_id_snapshot_detects_additions_and_removals() {
 fn alias_mapping_snapshot_is_current() {
     // ── Snapshot: alias → canonical_id (sorted by alias) ────────────────
     const EXPECTED_ALIASES: &[(&str, &str)] = &[
-
-    (
-        "antigravity",
-        "google-antigravity",
-    ),
-    (
-        "atlas",
-        "atlascloud",
-    ),
-    (
-        "atlas-cloud",
-        "atlascloud",
-    ),
-    (
-        "azure",
-        "azure-openai",
-    ),
-    (
-        "azure-cognitive-services",
-        "azure-openai",
-    ),
-    (
-        "azure-openai-responses",
-        "azure-openai",
-    ),
-    (
-        "azure_openai",
-        "azure-openai",
-    ),
-    (
-        "baidu-qianfan",
-        "qianfan",
-    ),
-    (
-        "bedrock",
-        "amazon-bedrock",
-    ),
-    (
-        "chatgpt-codex",
-        "openai-codex",
-    ),
-    (
-        "codex",
-        "openai-codex",
-    ),
-    (
-        "copilot",
-        "github-copilot",
-    ),
-    (
-        "coreweave-serverless",
-        "coreweave",
-    ),
-    (
-        "cursor-agent",
-        "cursor",
-    ),
-    (
-        "dashscope",
-        "alibaba",
-    ),
-    (
-        "deep-infra",
-        "deepinfra",
-    ),
-    (
-        "deep-seek",
-        "deepseek",
-    ),
-    (
-        "fireworks-ai",
-        "fireworks",
-    ),
-    (
-        "gemini",
-        "google",
-    ),
-    (
-        "gemini-cli",
-        "google-gemini-cli",
-    ),
-    (
-        "github-copilot-enterprise",
-        "github-copilot",
-    ),
-    (
-        "gitlab-duo",
-        "gitlab",
-    ),
-    (
-        "glm",
-        "zhipuai",
-    ),
-    (
-        "gmi-cloud",
-        "gmi",
-    ),
-    (
-        "gmi-serving",
-        "gmi",
-    ),
-    (
-        "google-vertex-anthropic",
-        "google-vertex",
-    ),
-    (
-        "grok",
-        "xai",
-    ),
-    (
-        "hf",
-        "huggingface",
-    ),
-    (
-        "hugging-face",
-        "huggingface",
-    ),
-    (
-        "kilo-ai",
-        "kilo",
-    ),
-    (
-        "kilo-gateway",
-        "kilo",
-    ),
-    (
-        "kimi",
-        "moonshotai",
-    ),
-    (
-        "kimi-code",
-        "kimi-for-coding",
-    ),
-    (
-        "kimi-coding",
-        "kimi-for-coding",
-    ),
-    (
-        "llama-cpp",
-        "llamacpp",
-    ),
-    (
-        "llama-server",
-        "llamacpp",
-    ),
-    (
-        "llama.cpp",
-        "llamacpp",
-    ),
-    (
-        "lm-studio",
-        "lmstudio",
-    ),
-    (
-        "mistral-rs",
-        "mistralrs",
-    ),
-    (
-        "mistral.rs",
-        "mistralrs",
-    ),
-    (
-        "mistralai",
-        "mistral",
-    ),
-    (
-        "moonshot",
-        "moonshotai",
-    ),
-    (
-        "nanogpt",
-        "nano-gpt",
-    ),
-    (
-        "nim",
-        "nvidia",
-    ),
-    (
-        "novita",
-        "novita-ai",
-    ),
-    (
-        "nvidia-nim",
-        "nvidia",
-    ),
-    (
-        "open-router",
-        "openrouter",
-    ),
-    (
-        "opencode-zen",
-        "opencode",
-    ),
-    (
-        "pplx",
-        "perplexity",
-    ),
-    (
-        "qwen",
-        "alibaba",
-    ),
-    (
-        "sakana-ai",
-        "sakana",
-    ),
-    (
-        "sap",
-        "sap-ai-core",
-    ),
-    (
-        "silicon-flow",
-        "siliconflow",
-    ),
-    (
-        "together",
-        "togetherai",
-    ),
-    (
-        "together-ai",
-        "togetherai",
-    ),
-    (
-        "umans-ai",
-        "umans",
-    ),
-    (
-        "vercel-ai-gateway",
-        "vercel",
-    ),
-    (
-        "vertexai",
-        "google-vertex",
-    ),
-    (
-        "wafer-serverless",
-        "wafer",
-    ),
-    (
-        "x-ai",
-        "xai",
-    ),
-    (
-        "zhipu",
-        "zhipuai",
-    ),
-
-        ];
+        ("antigravity", "google-antigravity"),
+        ("atlas", "atlascloud"),
+        ("atlas-cloud", "atlascloud"),
+        ("azure", "azure-openai"),
+        ("azure-cognitive-services", "azure-openai"),
+        ("azure-openai-responses", "azure-openai"),
+        ("azure_openai", "azure-openai"),
+        ("baidu-qianfan", "qianfan"),
+        ("bedrock", "amazon-bedrock"),
+        ("chatgpt-codex", "openai-codex"),
+        ("codex", "openai-codex"),
+        ("copilot", "github-copilot"),
+        ("coreweave-serverless", "coreweave"),
+        ("cursor-agent", "cursor"),
+        ("dashscope", "alibaba"),
+        ("deep-infra", "deepinfra"),
+        ("deep-seek", "deepseek"),
+        ("fireworks-ai", "fireworks"),
+        ("gemini", "google"),
+        ("gemini-cli", "google-gemini-cli"),
+        ("github-copilot-enterprise", "github-copilot"),
+        ("gitlab-duo", "gitlab"),
+        ("glm", "zhipuai"),
+        ("gmi-cloud", "gmi"),
+        ("gmi-serving", "gmi"),
+        ("google-vertex-anthropic", "google-vertex"),
+        ("grok", "xai"),
+        ("hf", "huggingface"),
+        ("hugging-face", "huggingface"),
+        ("kilo-ai", "kilo"),
+        ("kilo-gateway", "kilo"),
+        ("kimi", "moonshotai"),
+        ("kimi-code", "kimi-for-coding"),
+        ("kimi-coding", "kimi-for-coding"),
+        ("llama-cpp", "llamacpp"),
+        ("llama-server", "llamacpp"),
+        ("llama.cpp", "llamacpp"),
+        ("lm-studio", "lmstudio"),
+        ("mistral-rs", "mistralrs"),
+        ("mistral.rs", "mistralrs"),
+        ("mistralai", "mistral"),
+        ("moonshot", "moonshotai"),
+        ("nanogpt", "nano-gpt"),
+        ("nim", "nvidia"),
+        ("novita", "novita-ai"),
+        ("nvidia-nim", "nvidia"),
+        ("open-router", "openrouter"),
+        ("opencode-zen", "opencode"),
+        ("pplx", "perplexity"),
+        ("qwen", "alibaba"),
+        ("sakana-ai", "sakana"),
+        ("sap", "sap-ai-core"),
+        ("silicon-flow", "siliconflow"),
+        ("together", "togetherai"),
+        ("together-ai", "togetherai"),
+        ("umans-ai", "umans"),
+        ("vercel-ai-gateway", "vercel"),
+        ("vertexai", "google-vertex"),
+        ("wafer-serverless", "wafer"),
+        ("x-ai", "xai"),
+        ("zhipu", "zhipuai"),
+    ];
 
     let mut actual: Vec<(&str, &str)> = Vec::new();
     for meta in PROVIDER_METADATA {
@@ -1565,6 +1382,9 @@ fn no_accidental_duplicate_routing_defaults() {
         "zai-coding-plan",
         "zhipuai-coding-plan",
         "mistralrs",
+        // CoreWeave powers W&B Inference: omp models it as a second name for
+        // the wandb.ai endpoint, so coreweave shares wandb's base_url.
+        "coreweave",
     ]
     .iter()
     .copied()
