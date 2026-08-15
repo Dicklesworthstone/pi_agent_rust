@@ -7332,7 +7332,7 @@
     },
     {
       "id": "third-party/lll9p-pi-better-compaction",
-      "entry_path": "third-party/lll9p-pi-better-compaction/index.ts",
+      "entry_path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
         "registers_tools": false,

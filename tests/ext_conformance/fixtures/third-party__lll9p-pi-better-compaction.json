@@ -1,7 +1,7 @@
 {
   "extension": {
     "id": "third-party/lll9p-pi-better-compaction",
-    "source": { "path": "third-party/lll9p-pi-better-compaction/index.ts" }
+    "source": { "path": "third-party/lll9p-pi-better-compaction/pi-better-compaction/index.ts" }
   },
   "scenarios": [
     {
