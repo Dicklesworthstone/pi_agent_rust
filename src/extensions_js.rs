@@ -24513,10 +24513,10 @@ mod tests {
                 sha256_hex(source.as_bytes())
             );
         }
-        assert_eq!(bridge.len(), 193_144);
+        assert_eq!(bridge.len(), 196_849);
         assert_eq!(
             sha256_hex(bridge.as_bytes()),
-            "c3047ae81da821cf2eee265a6adc4a15a1d951268e40daaad8b2e2fa6540a5e8"
+            "c1a25d825f82daf35adf11bfacdbc066ba5534e56961ae4a9fd8c91bb0130f7a"
         );
 
         for (name, expected_len, expected_sha256) in [
@@ -24542,8 +24542,8 @@ mod tests {
             ),
             (
                 "@mariozechner/pi-coding-agent",
-                14_966,
-                "96be2fcee80995ef133943c300289b842e469adb7b5f0c58ce778b7eae09ad4d",
+                16_032,
+                "c3d9fc22b4255d7687fca7e97417357043b87f360e5cc2f8154ecc08b78754f4",
             ),
             (
                 "@mariozechner/pi-tui",
