@@ -1852,9 +1852,24 @@ fn resolved_provider_transport(
             },
         )
     });
-    let auth_header = config
-        .auth_header
-        .unwrap_or_else(|| defaults.is_some_and(|value| value.auth_header));
+    let auth_header = config.auth_header.unwrap_or_else(|| {
+        defaults.is_some_and(|value| value.auth_header)
+            // Pre-c2173764 behavior, restored: a custom models.json provider on
+            // an OpenAI-family transport with a configured apiKey attached
+            // `Bearer <key>`. Without this, unknown custom providers silently
+            // sent no Authorization header at all (tests/provider_factory.rs
+            // schema_compat_* encode the correct contract). Keyless local
+            // servers are unaffected (no key → no header either way).
+            || (defaults.is_none()
+                && matches!(
+                    api.as_str(),
+                    "openai-completions" | "openai-responses" | "openai-codex-responses"
+                )
+                && config
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty()))
+    });
     (defaults, api, base_url, auth_header)
 }
 

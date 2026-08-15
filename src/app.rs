@@ -1862,7 +1862,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn select_model_and_thinking_provider_only_prefers_ready_model() {
         let cli = cli::Cli::parse_from(["pi", "--provider", "acme"]);

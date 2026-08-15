@@ -603,7 +603,8 @@ fn slash_model_role_assignment_and_query() {
     let result = app.handle_slash_model("advisor openai/gpt-5.2");
     assert!(result.is_none(), "role assignment is a status-only action");
     assert_eq!(
-        app.role_model_overrides.get(&crate::models::ModelRole::Advisor),
+        app.role_model_overrides
+            .get(&crate::models::ModelRole::Advisor),
         Some(&("openai".to_string(), "gpt-5.2".to_string())),
         "override recorded for the advisor role"
     );

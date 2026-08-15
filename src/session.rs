@@ -11209,7 +11209,10 @@ mod tests {
         );
         let entry = session.get_entry(&change_id).expect("entry").clone();
         let json = serde_json::to_string(&entry).expect("serialize role-tagged entry");
-        assert!(json.contains("\"role\":\"advisor\""), "role must serialize: {json}");
+        assert!(
+            json.contains("\"role\":\"advisor\""),
+            "role must serialize: {json}"
+        );
         let parsed: SessionEntry = serde_json::from_str(&json).expect("reparse");
         if let SessionEntry::ModelChange(mc) = parsed {
             assert_eq!(mc.provider, "openai");

@@ -45,7 +45,12 @@ fn make_model_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntr
         },
         api_key: None,
         headers: HashMap::new(),
-        auth_header: false,
+        // Faithful to real registry entries: PROVIDER_METADATA routing defaults
+        // give OpenAI-compatible presets auth_header: true (models.rs:557), and
+        // since c2173764 the openai-family providers gate Bearer attachment on
+        // it. Tests asserting x-api-key transports are unaffected (the
+        // anthropic provider does not read this flag).
+        auth_header: true,
         compat: None,
         oauth_config: None,
     }
