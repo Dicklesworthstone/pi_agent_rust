@@ -9744,6 +9744,46 @@ impl std::fmt::Display for ExtensionEventName {
 }
 
 impl ExtensionEventName {
+    /// Every known extension event, in declaration order.
+    ///
+    /// This is the canonical Rust source of truth for the event-name set.
+    /// The QuickJS bootstrap receives the [`std::fmt::Display`] rendering of
+    /// this list (as `__pi_known_event_names`) so `pi.on(...)` can emit a
+    /// loud diagnostic when an extension registers a handler for an event
+    /// this host will never fire (gh #167). Registration itself stays
+    /// fail-open: unknown events remain registrable for forward-compat.
+    pub const ALL: [Self; 29] = [
+        Self::Startup,
+        Self::Input,
+        Self::BeforeAgentStart,
+        Self::Context,
+        Self::AgentStart,
+        Self::AgentEnd,
+        Self::TurnStart,
+        Self::TurnEnd,
+        Self::MessageStart,
+        Self::MessageUpdate,
+        Self::MessageEnd,
+        Self::ToolExecutionStart,
+        Self::ToolExecutionUpdate,
+        Self::ToolExecutionEnd,
+        Self::ToolCall,
+        Self::ToolResult,
+        Self::SessionStart,
+        Self::SessionBeforeSwitch,
+        Self::SessionSwitch,
+        Self::SessionBeforeFork,
+        Self::SessionFork,
+        Self::SessionBeforeCompact,
+        Self::SessionCompact,
+        Self::ResourcesDiscover,
+        Self::ModelSelect,
+        Self::UserBash,
+        Self::SessionBeforeTree,
+        Self::SessionTree,
+        Self::SessionShutdown,
+    ];
+
     /// Returns `true` for fire-and-forget lifecycle/telemetry events where
     /// the dispatcher doesn't consume the handler's response to block,
     /// cancel, or transform anything.

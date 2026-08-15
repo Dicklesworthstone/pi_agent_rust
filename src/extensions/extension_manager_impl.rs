@@ -4203,6 +4203,8 @@ impl ExtensionManager {
         session: Option<Arc<dyn ExtensionSession>>,
         cwd_override: Option<String>,
         model_registry_values: &HashMap<String, String>,
+        current_provider: Option<&str>,
+        current_model_id: Option<&str>,
     ) -> Value {
         let mut ctx = serde_json::Map::new();
         ctx.insert("hasUI".into(), Value::Bool(has_ui));
@@ -4231,6 +4233,28 @@ impl ExtensionManager {
             ctx.insert("sessionEntries".into(), Value::Array(entries));
             ctx.insert("sessionBranch".into(), Value::Array(branch));
             ctx.insert("sessionLeafEntry".into(), leaf_entry);
+        }
+
+        // ctx.model parity with upstream pi-mono's ExtensionContext (gh #167):
+        // prefer the session's serialized model entry (the interactive bridge
+        // supplies the full upstream `Model` shape — id/provider/api/name/
+        // baseUrl/reasoning/contextWindow/maxTokens), falling back to the
+        // manager's current provider/model pair when no session is attached.
+        let mut model = ctx
+            .get("sessionState")
+            .and_then(|state| state.get("model"))
+            .filter(|value| !value.is_null())
+            .cloned();
+        if model.is_none()
+            && let (Some(provider), Some(model_id)) = (current_provider, current_model_id)
+        {
+            model = Some(serde_json::json!({
+                "provider": provider,
+                "id": model_id,
+            }));
+        }
+        if let Some(model) = model {
+            ctx.insert("model".into(), model);
         }
 
         Value::Object(ctx)
@@ -4270,7 +4294,15 @@ impl ExtensionManager {
         // Rebuild directly from the snapshot to avoid cloning the full
         // model-registry map on cache misses.
         let payload = Arc::new(
-            Self::build_ctx_payload(has_ui, session, cwd, &snap.model_registry_values).await,
+            Self::build_ctx_payload(
+                has_ui,
+                session,
+                cwd,
+                &snap.model_registry_values,
+                snap.current_provider.as_deref(),
+                snap.current_model_id.as_deref(),
+            )
+            .await,
         );
         drop(snap);
 

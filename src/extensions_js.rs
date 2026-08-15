@@ -9425,15 +9425,11 @@ export function rawKeyHint(key, description = "") {
   return keyLabel && label ? `${keyLabel} ${label}` : keyLabel || label;
 }
 
-// Stub: compact performs conversation compaction via LLM
+// compact performs conversation compaction via LLM. Refuse placeholder data:
+// an extension feeding a fake summary into session_before_compact would
+// replace real history with garbage.
 export async function compact(_preparation, _model, _apiKey, _customInstructions, _signal) {
-  // Return a minimal compaction result
-  return {
-    summary: "Conversation summary placeholder",
-    firstKeptEntryId: null,
-    tokensBefore: 0,
-    tokensAfter: 0,
-  };
+  throw new Error("compact() is not yet bridged to the native compaction engine in pi_agent_rust; see gh #167");
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -9484,12 +9480,35 @@ export class ModelSelectorComponent {
   }
 }
 
+// SessionManager shim mirroring upstream's read-only identity getters. A
+// default-constructed instance reflects the host session via the bridge's
+// __pi_session_identity mirror (real id/file/dir for persisted sessions;
+// null file/dir for unsaved ones). inMemory() has no host-backed session
+// behind it, so all identity getters return null.
 export class SessionManager {
-  constructor() {}
-  static inMemory() { return new SessionManager(); }
-  getSessionFile() { return ""; }
-  getSessionDir() { return ""; }
-  getSessionId() { return ""; }
+  constructor() { this._inMemory = false; }
+  static inMemory() {
+    const manager = new SessionManager();
+    manager._inMemory = true;
+    return manager;
+  }
+  _identity() {
+    if (this._inMemory) return null;
+    const identity = globalThis.__pi_session_identity;
+    return identity && typeof identity === "object" ? identity : null;
+  }
+  getSessionFile() {
+    const identity = this._identity();
+    return identity && typeof identity.file === "string" && identity.file ? identity.file : null;
+  }
+  getSessionDir() {
+    const identity = this._identity();
+    return identity && typeof identity.dir === "string" && identity.dir ? identity.dir : null;
+  }
+  getSessionId() {
+    const identity = this._identity();
+    return identity && typeof identity.id === "string" && identity.id ? identity.id : null;
+  }
   buildSessionContext() { return buildSessionContext([]); }
 }
 
@@ -19415,6 +19434,39 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // gh #167: canonical event-name list for unknown-event
+                // warnings in __pi_register_hook. Data-only global; the
+                // bridge freezes it (with every other __pi_* global) on eval.
+                let known_event_names: Vec<String> =
+                    crate::extensions::ExtensionEventName::ALL
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect();
+                global.set("__pi_known_event_names", known_event_names)?;
+
+                // __pi_warn_unknown_event_native(extension_id, event_name) —
+                // loud diagnostic for hooks that will never fire (gh #167).
+                // Fail-open: registration still succeeds; this only emits a
+                // tracing warning.
+                global.set(
+                    "__pi_warn_unknown_event_native",
+                    Func::from(
+                        |_ctx: Ctx<'_>,
+                         extension_id: String,
+                         event_name: String|
+                         -> rquickjs::Result<()> {
+                            tracing::warn!(
+                                extension = %extension_id,
+                                event = %event_name,
+                                "extension registered a handler for an unknown event; \
+                                 it will never fire on this host (kept registered for \
+                                 forward-compatibility)"
+                            );
+                            Ok(())
+                        },
+                    ),
+                )?;
+
                 // Register crypto hostcalls for node:crypto module
                 crate::crypto_shim::register_crypto_hostcalls(&global)?;
 
@@ -19788,6 +19840,21 @@ const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, descrip
 const __pi_message_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
 const __pi_mcp_server_index = new Map(); // server_name -> { extensionId, spec }
 
+// gh #167 extension-API parity: host session identity mirror + current system
+// prompt. `__pi_session_identity` is published on globalThis (frozen property,
+// mutable fields) so the @mariozechner/pi-coding-agent SessionManager shim can
+// surface real values; `__pi_current_system_prompt` backs ctx.getSystemPrompt()
+// and is captured from before_agent_start payloads (and, when present, from
+// a `systemPrompt` field on the host ctx payload).
+const __pi_session_identity = { id: null, file: null, dir: null };
+Object.defineProperty(globalThis, '__pi_session_identity', {
+    value: __pi_session_identity,
+    writable: false,
+    configurable: false,
+    enumerable: false,
+});
+let __pi_current_system_prompt = null;
+
 // Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
 // task_id -> { status: 'pending'|'resolved'|'rejected', value?, error? }
 const __pi_tasks = new Map();
@@ -19954,6 +20021,10 @@ function __pi_reset_extension_runtime_state(bridge_secret) {
     __pi_map_clear_primordial(__pi_timer_callbacks);
     __pi_map_clear_primordial(__pi_event_listeners);
     __pi_map_clear_primordial(__pi_event_batch_contexts);
+    __pi_session_identity.id = null;
+    __pi_session_identity.file = null;
+    __pi_session_identity.dir = null;
+    __pi_current_system_prompt = null;
 
     const after = __pi_runtime_registry_snapshot();
     const clean =
@@ -20583,6 +20654,21 @@ function __pi_register_message_renderer(customType, renderer) {
 	    if (typeof handler !== 'function') {
 	        throw new Error('on: handler must be a function');
 	    }
+
+	    // gh #167: warn (fail-open) when the event name is not one this host
+	    // ever fires — a typo here means the handler silently never runs.
+	    // Unknown events stay registrable for forward-compatibility.
+	    try {
+	        const known = globalThis.__pi_known_event_names;
+	        if (
+	            Array.isArray(known) &&
+	            known.length > 0 &&
+	            known.indexOf(eventName) === -1 &&
+	            typeof globalThis.__pi_warn_unknown_event_native === 'function'
+	        ) {
+	            globalThis.__pi_warn_unknown_event_native(String(ext.id), eventName);
+	        }
+	    } catch (_e) {}
 
 	    if (!ext.hooks.has(eventName)) {
 	        ext.hooks.set(eventName, []);
@@ -21242,10 +21328,49 @@ function __pi_make_extension_ctx(ctx_payload) {
         (ctx_payload && (ctx_payload.modelRegistry || ctx_payload.model_registry || ctx_payload.model_registry_values)) ||
         {};
 
+    // gh #167 parity: session identity + current model from the host payload.
+    const sessionStateRaw =
+        (ctx_payload && (ctx_payload.sessionState || ctx_payload.session_state)) || null;
+    const sessionState =
+        sessionStateRaw && typeof sessionStateRaw === 'object' && !Array.isArray(sessionStateRaw)
+            ? sessionStateRaw
+            : null;
+    const sessionId =
+        sessionState && typeof sessionState.sessionId === 'string' && sessionState.sessionId
+            ? sessionState.sessionId
+            : null;
+    const sessionFile =
+        sessionState && typeof sessionState.sessionFile === 'string' && sessionState.sessionFile
+            ? sessionState.sessionFile
+            : null;
+    let sessionDir = null;
+    if (sessionFile) {
+        const cut = Math.max(sessionFile.lastIndexOf('/'), sessionFile.lastIndexOf('\\'));
+        if (cut > 0) sessionDir = sessionFile.slice(0, cut);
+    }
+    __pi_session_identity.id = sessionId;
+    __pi_session_identity.file = sessionFile;
+    __pi_session_identity.dir = sessionDir;
+
+    let model =
+        ctx_payload && ctx_payload.model !== undefined && ctx_payload.model !== null
+            ? ctx_payload.model
+            : undefined;
+    if (model === undefined && sessionState && sessionState.model !== undefined && sessionState.model !== null) {
+        model = sessionState.model;
+    }
+
+    if (ctx_payload && typeof ctx_payload.systemPrompt === 'string') {
+        __pi_current_system_prompt = ctx_payload.systemPrompt;
+    }
+
     const sessionManager = {
         getEntries: () => entries,
         getBranch: () => branch,
         getLeafEntry: () => leafEntry,
+        getSessionId: () => sessionId,
+        getSessionFile: () => sessionFile,
+        getSessionDir: () => sessionDir,
     };
 
     return {
@@ -21253,6 +21378,8 @@ function __pi_make_extension_ctx(ctx_payload) {
         cwd: cwd,
         ui: __pi_make_extension_ui(hasUI),
         sessionManager: sessionManager,
+        model: model,
+        getSystemPrompt: () => __pi_current_system_prompt,
         modelRegistry: {
             getApiKeyForProvider: async (provider) => {
                 const key = String(provider || '').trim();
@@ -21266,6 +21393,16 @@ function __pi_make_extension_ctx(ctx_payload) {
 }
 
 	async function __pi_dispatch_event_inner(eventName, event_payload, ctx, handlerPhase = 'all') {
+	    // gh #167: remember the host-provided system prompt (even with zero
+	    // handlers) so ctx.getSystemPrompt() works on later events too.
+	    if (
+	        eventName === 'before_agent_start' &&
+	        event_payload &&
+	        typeof event_payload === 'object' &&
+	        typeof event_payload.systemPrompt === 'string'
+	    ) {
+	        __pi_current_system_prompt = event_payload.systemPrompt;
+	    }
 	    const directHandlers = __pi_hook_index.get(eventName) || [];
 	    const eventBusHandlers = __pi_event_bus_index.get(eventName) || [];
 	    const handlers = handlerPhase === 'direct'
@@ -21351,6 +21488,7 @@ function __pi_make_extension_ctx(ctx_payload) {
 	                if (result.systemPrompt !== undefined) {
 	                    currentSystemPrompt = String(result.systemPrompt);
 	                    modified = true;
+	                    __pi_current_system_prompt = currentSystemPrompt;
                 }
             }
         }
@@ -24550,6 +24688,273 @@ mod tests {
             );
             clock.set(next_deadline);
         }
+    }
+
+    // ── gh #167 extension-API parity: ctx.model / getSystemPrompt /
+    //    sessionManager identity / compact() refusal ─────────────────────
+
+    const CTX_PARITY_EXTENSION_REGISTRATION: &str = r#"
+        __pi_begin_extension(__pi_test_secret, "ext.ctx-parity", { name: "ext.ctx-parity" });
+        globalThis.ctxParity = { captures: [] };
+        pi.on("agent_start", async (_ev, ctx) => {
+            globalThis.ctxParity.captures.push({
+                model: ctx.model === undefined ? "undefined" : ctx.model,
+                systemPrompt: ctx.getSystemPrompt(),
+                sessionId: ctx.sessionManager.getSessionId(),
+                sessionFile: ctx.sessionManager.getSessionFile(),
+                sessionDir: ctx.sessionManager.getSessionDir(),
+            });
+        });
+        pi.on("before_agent_start", async (ev, ctx) => {
+            globalThis.ctxParity.promptDuringHandler = ctx.getSystemPrompt();
+            return { systemPrompt: ev.systemPrompt + " [amended]" };
+        });
+        __pi_end_extension(__pi_test_secret);
+    "#;
+
+    const CTX_PARITY_DISPATCH_SEQUENCE: &str = r#"
+        const persistedPayload = {
+            hasUI: false,
+            cwd: '/workspace',
+            sessionState: {
+                model: {
+                    provider: 'anthropic',
+                    id: 'claude-4',
+                    name: 'Claude 4',
+                    api: 'anthropic-messages',
+                    reasoning: true,
+                    contextWindow: 200000,
+                    maxTokens: 64000,
+                },
+                sessionId: 'sess-persisted',
+                sessionFile: '/tmp/pi/sessions/2026_sess-persisted.jsonl',
+            },
+        };
+        const inMemoryPayload = {
+            hasUI: false,
+            cwd: '/workspace',
+            sessionState: {
+                model: { provider: 'openai', id: 'gpt-5' },
+                sessionId: 'sess-memory',
+                sessionFile: null,
+            },
+        };
+        globalThis.ctxParity.done = false;
+        __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, persistedPayload)
+            .then(() => __pi_dispatch_extension_event(
+                __pi_test_secret,
+                'before_agent_start',
+                { prompt: 'hello', systemPrompt: 'You are Pi.' },
+                persistedPayload,
+            ))
+            .then((outcome) => { globalThis.ctxParity.beforeAgentStartOutcome = outcome; })
+            .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, inMemoryPayload))
+            .then(() => import('@mariozechner/pi-coding-agent'))
+            .then((mod) => {
+                const live = new mod.SessionManager();
+                globalThis.ctxParity.shimAfterInMemory = {
+                    id: live.getSessionId(),
+                    file: live.getSessionFile(),
+                    dir: live.getSessionDir(),
+                };
+                const detached = mod.SessionManager.inMemory();
+                globalThis.ctxParity.shimDetached = {
+                    id: detached.getSessionId(),
+                    file: detached.getSessionFile(),
+                    dir: detached.getSessionDir(),
+                };
+            })
+            .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, persistedPayload))
+            .then(() => import('@mariozechner/pi-coding-agent'))
+            .then((mod) => {
+                const live = new mod.SessionManager();
+                globalThis.ctxParity.shimAfterPersisted = {
+                    id: live.getSessionId(),
+                    file: live.getSessionFile(),
+                    dir: live.getSessionDir(),
+                };
+            })
+            .catch((error) => { globalThis.ctxParity.error = String((error && error.stack) || error); })
+            .finally(() => { globalThis.ctxParity.done = true; });
+    "#;
+
+    #[test]
+    fn extension_ctx_exposes_model_system_prompt_and_session_identity() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    CTX_PARITY_EXTENSION_REGISTRATION,
+                ))
+                .await
+                .expect("register ctx parity extension");
+            runtime
+                .eval(&privileged_test_script(&runtime, CTX_PARITY_DISPATCH_SEQUENCE))
+                .await
+                .expect("dispatch ctx parity events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "ctxParity").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // First agent_start: no system prompt is known yet; model comes
+            // from sessionState; sessionManager mirrors the persisted session.
+            let first = &probe["captures"][0];
+            assert_eq!(first["model"]["id"], json!("claude-4"));
+            assert_eq!(first["model"]["provider"], json!("anthropic"));
+            assert_eq!(first["model"]["api"], json!("anthropic-messages"));
+            assert_eq!(first["model"]["name"], json!("Claude 4"));
+            assert_eq!(first["model"]["contextWindow"], json!(200_000));
+            assert_eq!(first["model"]["maxTokens"], json!(64_000));
+            assert_eq!(first["model"]["reasoning"], json!(true));
+            assert_eq!(first["systemPrompt"], serde_json::Value::Null);
+            assert_eq!(first["sessionId"], json!("sess-persisted"));
+            assert_eq!(
+                first["sessionFile"],
+                json!("/tmp/pi/sessions/2026_sess-persisted.jsonl")
+            );
+            assert_eq!(first["sessionDir"], json!("/tmp/pi/sessions"));
+
+            // Inside the before_agent_start handler the host-provided prompt
+            // is already visible via ctx.getSystemPrompt().
+            assert_eq!(probe["promptDuringHandler"], json!("You are Pi."));
+            assert_eq!(
+                probe["beforeAgentStartOutcome"]["systemPrompt"],
+                json!("You are Pi. [amended]")
+            );
+
+            // Second agent_start (in-memory session): the amended prompt is
+            // remembered; file/dir are null while the id stays real.
+            let second = &probe["captures"][1];
+            assert_eq!(second["model"]["id"], json!("gpt-5"));
+            assert_eq!(second["systemPrompt"], json!("You are Pi. [amended]"));
+            assert_eq!(second["sessionId"], json!("sess-memory"));
+            assert_eq!(second["sessionFile"], serde_json::Value::Null);
+            assert_eq!(second["sessionDir"], serde_json::Value::Null);
+
+            // SessionManager shim reflects the most recent host session
+            // identity; inMemory() instances always report null.
+            assert_eq!(probe["shimAfterInMemory"]["id"], json!("sess-memory"));
+            assert_eq!(
+                probe["shimAfterInMemory"]["file"],
+                serde_json::Value::Null
+            );
+            assert_eq!(probe["shimAfterInMemory"]["dir"], serde_json::Value::Null);
+            assert_eq!(probe["shimDetached"]["id"], serde_json::Value::Null);
+            assert_eq!(probe["shimDetached"]["file"], serde_json::Value::Null);
+            assert_eq!(probe["shimDetached"]["dir"], serde_json::Value::Null);
+            assert_eq!(probe["shimAfterPersisted"]["id"], json!("sess-persisted"));
+            assert_eq!(
+                probe["shimAfterPersisted"]["file"],
+                json!("/tmp/pi/sessions/2026_sess-persisted.jsonl")
+            );
+            assert_eq!(
+                probe["shimAfterPersisted"]["dir"],
+                json!("/tmp/pi/sessions")
+            );
+        });
+    }
+
+    #[test]
+    fn extension_ctx_prefers_top_level_model_over_session_state() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.model-pref", { name: "ext.model-pref" });
+                    globalThis.modelPref = { done: false };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        globalThis.modelPref.model = ctx.model === undefined ? "undefined" : ctx.model;
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register model preference extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
+                        hasUI: false,
+                        cwd: '/workspace',
+                        model: { provider: 'anthropic', id: 'from-payload' },
+                        sessionState: { model: { provider: 'anthropic', id: 'from-state' } },
+                    })
+                        .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
+                            hasUI: false,
+                            cwd: '/workspace',
+                        }))
+                        .then(() => { globalThis.modelPref.modelAbsent = globalThis.modelPref.model; })
+                        .catch((error) => { globalThis.modelPref.error = String(error); })
+                        .finally(() => { globalThis.modelPref.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch model preference events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "modelPref").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            // The explicit host payload model wins over sessionState.model;
+            // with neither present, ctx.model is undefined (upstream parity).
+            assert_eq!(probe["modelAbsent"], json!("undefined"));
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_compact_rejects_instead_of_placeholder() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.compactProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => mod.compact({}, {}, 'api-key', undefined, undefined))
+                        .then((value) => { globalThis.compactProbe.value = value; })
+                        .catch((error) => {
+                            globalThis.compactProbe.error = String((error && error.message) || error);
+                        })
+                        .finally(() => { globalThis.compactProbe.done = true; });
+                    ",
+                )
+                .await
+                .expect("invoke compact stub");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "compactProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(
+                probe.get("value"),
+                None,
+                "compact() must not resolve with placeholder data: {probe}"
+            );
+            let error = probe["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains(
+                    "compact() is not yet bridged to the native compaction engine in pi_agent_rust"
+                ) && error.contains("gh #167"),
+                "unexpected compact() rejection: {error}"
+            );
+        });
     }
 
     #[allow(clippy::future_not_send)]
