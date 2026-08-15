@@ -2567,8 +2567,18 @@ const WAVE_C2_PRESET_CASES: [(&str, &str, &str, bool); 8] = [
         "https://api.inference.wandb.ai/v1",
         true,
     ),
-    ("sakana", "openai-responses", "https://api.sakana.ai/v1", true),
-    ("wafer", "openai-completions", "https://pass.wafer.ai/v1", true),
+    (
+        "sakana",
+        "openai-responses",
+        "https://api.sakana.ai/v1",
+        true,
+    ),
+    (
+        "wafer",
+        "openai-completions",
+        "https://pass.wafer.ai/v1",
+        true,
+    ),
     (
         "qianfan",
         "openai-completions",

@@ -1246,7 +1246,10 @@ fn merge_model_roles(
 }
 
 /// Merge titling settings (other wins).
-fn merge_titling(base: Option<TitlingSettings>, other: Option<TitlingSettings>) -> Option<TitlingSettings> {
+fn merge_titling(
+    base: Option<TitlingSettings>,
+    other: Option<TitlingSettings>,
+) -> Option<TitlingSettings> {
     match (base, other) {
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),

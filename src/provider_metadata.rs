@@ -3207,7 +3207,15 @@ mod tests {
         // every other new preset uses bearer auth.
         let umans = provider_routing_defaults("umans").expect("umans defaults");
         assert!(!umans.auth_header);
-        for id in ["gmi", "coreweave", "sakana", "wafer", "qianfan", "kilo", "opencode-go"] {
+        for id in [
+            "gmi",
+            "coreweave",
+            "sakana",
+            "wafer",
+            "qianfan",
+            "kilo",
+            "opencode-go",
+        ] {
             let defaults = provider_routing_defaults(id)
                 .unwrap_or_else(|| unreachable!("expected routing defaults for '{id}'"));
             assert!(defaults.auth_header, "{id} must use bearer auth header");
@@ -3317,8 +3325,8 @@ mod tests {
         // alias claimed by two different providers.
         let planted: Vec<(&str, &[&str])> = vec![
             ("gmi", &["gmi-cloud"][..]),
-            ("qianfan", &["GMI"][..]),     // shadows canonical 'gmi' (case-insensitive)
-            ("kilo", &["gmi-cloud"][..]),  // duplicate alias across providers
+            ("qianfan", &["GMI"][..]), // shadows canonical 'gmi' (case-insensitive)
+            ("kilo", &["gmi-cloud"][..]), // duplicate alias across providers
         ];
         let violations = alias_collision_violations(&planted);
         assert!(
@@ -3401,10 +3409,7 @@ mod tests {
             match meta.onboarding {
                 ProviderOnboardingMode::OpenAICompatiblePreset => {
                     let defaults = meta.routing_defaults.unwrap_or_else(|| {
-                        panic!(
-                            "preset '{}' must carry routing defaults",
-                            meta.canonical_id
-                        )
+                        panic!("preset '{}' must carry routing defaults", meta.canonical_id)
                     });
                     assert!(
                         PRESET_APIS.contains(&defaults.api),

@@ -2293,8 +2293,7 @@ mod tests {
             fallback_message: None,
         };
 
-        let options =
-            build_stream_options_with_optional_key(&config, None, &selection, &session);
+        let options = build_stream_options_with_optional_key(&config, None, &selection, &session);
 
         // SDK embedders must get the same prompt-caching default as the CLI
         // path (`app::build_stream_options`); the assertion tracks the pure
@@ -2305,7 +2304,10 @@ mod tests {
             app::cache_retention_from_env(std::env::var("PI_CACHE_RETENTION").ok().as_deref())
         );
         if std::env::var("PI_CACHE_RETENTION").is_err() {
-            assert_eq!(options.cache_retention, crate::provider::CacheRetention::Short);
+            assert_eq!(
+                options.cache_retention,
+                crate::provider::CacheRetention::Short
+            );
         }
     }
 

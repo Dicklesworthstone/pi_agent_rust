@@ -81,7 +81,10 @@ fn e2e_ast_edit_codemod_fixture_crate_still_compiles() {
         let log = harness.log();
 
         if !cargo_available() {
-            log.warn("skip", "cargo not available on this host; skipping e2e codemod proof");
+            log.warn(
+                "skip",
+                "cargo not available on this host; skipping e2e codemod proof",
+            );
             let path = harness.temp_path("e2e_ast_tools.jsonl");
             harness.write_jsonl_logs(&path).expect("write JSONL logs");
             harness.record_artifact("e2e_ast_tools.jsonl", &path);
@@ -119,9 +122,11 @@ fn e2e_ast_edit_codemod_fixture_crate_still_compiles() {
         );
         let proposal_id = staged_json["proposalId"].as_str().unwrap().to_string();
         // Staging writes nothing.
-        assert!(std::fs::read_to_string(crate_root.join("src/lib.rs"))
-            .expect("read lib")
-            .contains("old_parse(\"1\")"));
+        assert!(
+            std::fs::read_to_string(crate_root.join("src/lib.rs"))
+                .expect("read lib")
+                .contains("old_parse(\"1\")")
+        );
 
         // Resolve with a one-line reason.
         let resolve_input = json!({
@@ -163,7 +168,10 @@ fn e2e_ast_edit_codemod_fixture_crate_still_compiles() {
             .await
             .expect("ast_grep must succeed");
         assert_eq!(output_json(&old)["matchCount"], json!(0));
-        log.info("verify", "codemod applied structurally (3 new_parse, 0 old_parse calls)");
+        log.info(
+            "verify",
+            "codemod applied structurally (3 new_parse, 0 old_parse calls)",
+        );
 
         // Proof: the rewritten crate still compiles.
         let target_dir = harness.temp_path("cargo_target");
@@ -196,7 +204,9 @@ fn e2e_ast_edit_codemod_fixture_crate_still_compiles() {
 
         // Close out: JSONL logs validated and recorded.
         let log_path = harness.temp_path("e2e_ast_tools.jsonl");
-        harness.write_jsonl_logs(&log_path).expect("write JSONL logs");
+        harness
+            .write_jsonl_logs(&log_path)
+            .expect("write JSONL logs");
         let payload = std::fs::read_to_string(&log_path).expect("read JSONL logs");
         let errors = validate_jsonl_v2_only(&payload);
         assert!(errors.is_empty(), "JSONL schema violations: {errors:?}");

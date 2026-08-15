@@ -109,7 +109,9 @@ fn ast_edit_staging_lifecycle_resolve_applies_atomically() {
             "src/beta.rs",
             "pub fn b() -> i32 {\n    compute().unwrap() + compute().unwrap()\n}\n",
         );
-        harness.log().info("setup", "created two rust fixture files");
+        harness
+            .log()
+            .info("setup", "created two rust fixture files");
 
         let registry = ToolRegistry::new(&["ast_grep", "ast_edit"], harness.temp_dir(), None);
         let edit = registry.get("ast_edit").expect("ast_edit registered");
@@ -145,9 +147,11 @@ fn ast_edit_staging_lifecycle_resolve_applies_atomically() {
         );
         // Staging must not write.
         assert!(read_file(&harness, "src/alpha.rs").contains("compute().unwrap()"));
-        harness.log().info_ctx("verify", "stage preview verified", |ctx| {
-            ctx.push(("proposalId".into(), proposal_id.clone()));
-        });
+        harness
+            .log()
+            .info_ctx("verify", "stage preview verified", |ctx| {
+                ctx.push(("proposalId".into(), proposal_id.clone()));
+            });
 
         let resolved = resolve_raw(
             edit,
@@ -190,8 +194,13 @@ fn ast_edit_staging_lifecycle_resolve_applies_atomically() {
             err.to_string().contains("[AST_PROPOSAL_UNKNOWN]"),
             "expected AST_PROPOSAL_UNKNOWN, got: {err}"
         );
-        harness.log().info("verify", "proposal consumption enforced");
-        finish_case(&harness, "ast_edit_staging_lifecycle_resolve_applies_atomically");
+        harness
+            .log()
+            .info("verify", "proposal consumption enforced");
+        finish_case(
+            &harness,
+            "ast_edit_staging_lifecycle_resolve_applies_atomically",
+        );
     });
 }
 
@@ -264,11 +273,16 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
         let harness = TestHarness::new("ast_edit_atomic_rollback_on_mid_apply_failure");
         // Sorted scan order: a_first.rs, locked/b_second.rs, z_third.rs.
         write_file(&harness, "a_first.rs", "fn a() {\n    marker(1);\n}\n");
-        write_file(&harness, "locked/b_second.rs", "fn b() {\n    marker(2);\n}\n");
+        write_file(
+            &harness,
+            "locked/b_second.rs",
+            "fn b() {\n    marker(2);\n}\n",
+        );
         write_file(&harness, "z_third.rs", "fn c() {\n    marker(3);\n}\n");
-        harness
-            .log()
-            .info("setup", "created three rust files; middle one in a lockable dir");
+        harness.log().info(
+            "setup",
+            "created three rust files; middle one in a lockable dir",
+        );
 
         let registry = ToolRegistry::new(&["ast_edit"], harness.temp_dir(), None);
         let edit = registry.get("ast_edit").expect("ast_edit registered");
@@ -303,10 +317,12 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
         if writable_anyway {
             let _ = std::fs::remove_file(&probe);
         }
-        harness.log().info_ctx("setup", "write failure injected via read-only dir", |ctx| {
-            ctx.push(("dir".into(), locked_dir.display().to_string()));
-            ctx.push(("effective".into(), (!writable_anyway).to_string()));
-        });
+        harness
+            .log()
+            .info_ctx("setup", "write failure injected via read-only dir", |ctx| {
+                ctx.push(("dir".into(), locked_dir.display().to_string()));
+                ctx.push(("effective".into(), (!writable_anyway).to_string()));
+            });
 
         let result = resolve_raw(
             edit,
@@ -322,9 +338,10 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
         std::fs::set_permissions(&locked_dir, original_perms).expect("restore locked dir perms");
 
         if writable_anyway {
-            harness
-                .log()
-                .warn("skip", "running with elevated privileges; permission injection ineffective");
+            harness.log().warn(
+                "skip",
+                "running with elevated privileges; permission injection ineffective",
+            );
             finish_case(&harness, "ast_edit_atomic_rollback_on_mid_apply_failure");
             return;
         }
@@ -343,9 +360,11 @@ fn ast_edit_atomic_rollback_on_mid_apply_failure() {
             message.contains("rolled back 1 previously-written file(s)"),
             "error must report rollback, got: {message}"
         );
-        harness.log().info_ctx("verify", "apply failed as injected", |ctx| {
-            ctx.push(("error".into(), message));
-        });
+        harness
+            .log()
+            .info_ctx("verify", "apply failed as injected", |ctx| {
+                ctx.push(("error".into(), message));
+            });
 
         // Atomicity: file 1 rolled back, file 2 untouched, file 3 never written.
         assert_eq!(
@@ -395,7 +414,11 @@ fn ast_edit_stale_file_rejects_whole_proposal_naming_file() {
             .to_string();
 
         // Modify a staged file between stage and apply.
-        write_file(&harness, "two.rs", "fn b() {\n    marker(2); // edited externally\n}\n");
+        write_file(
+            &harness,
+            "two.rs",
+            "fn b() {\n    marker(2); // edited externally\n}\n",
+        );
         harness
             .log()
             .info("action", "modified two.rs between stage and resolve");
@@ -421,8 +444,14 @@ fn ast_edit_stale_file_rejects_whole_proposal_naming_file() {
         );
 
         // Whole-proposal rejection: the untouched file must not be written.
-        assert_eq!(read_file(&harness, "one.rs"), "fn a() {\n    marker(1);\n}\n");
-        finish_case(&harness, "ast_edit_stale_file_rejects_whole_proposal_naming_file");
+        assert_eq!(
+            read_file(&harness, "one.rs"),
+            "fn a() {\n    marker(1);\n}\n"
+        );
+        finish_case(
+            &harness,
+            "ast_edit_stale_file_rejects_whole_proposal_naming_file",
+        );
     });
 }
 
@@ -462,7 +491,10 @@ fn ast_grep_same_metavariable_twice_requires_identical_code() {
             "$A == $A must not match left == right"
         );
         harness.log().info("verify", "identity rule held");
-        finish_case(&harness, "ast_grep_same_metavariable_twice_requires_identical_code");
+        finish_case(
+            &harness,
+            "ast_grep_same_metavariable_twice_requires_identical_code",
+        );
     });
 }
 
@@ -494,7 +526,11 @@ fn ast_grep_unwrap_pattern_ignores_comments_and_strings() {
         let registry = ToolRegistry::new(&["ast_grep"], harness.temp_dir(), None);
         let grep = registry.get("ast_grep").expect("ast_grep registered");
         let output = grep
-            .execute("test-id", json!({"pattern": "$EXPR.unwrap()", "path": "."}), None)
+            .execute(
+                "test-id",
+                json!({"pattern": "$EXPR.unwrap()", "path": "."}),
+                None,
+            )
             .await
             .expect("ast_grep must succeed");
         let payload = output_json(&output);
@@ -518,7 +554,10 @@ fn ast_grep_unwrap_pattern_ignores_comments_and_strings() {
         harness
             .log()
             .info("verify", "planted negative passed: comment/string excluded");
-        finish_case(&harness, "ast_grep_unwrap_pattern_ignores_comments_and_strings");
+        finish_case(
+            &harness,
+            "ast_grep_unwrap_pattern_ignores_comments_and_strings",
+        );
     });
 }
 
@@ -585,9 +624,11 @@ fn ast_edit_malformed_patterns_return_named_parse_error() {
             err.to_string().contains("[AST_PATTERN_PARSE]"),
             "expected named parse error, got: {err}"
         );
-        harness.log().info_ctx("verify", "multi-node pat rejected", |ctx| {
-            ctx.push(("error".into(), err.to_string()));
-        });
+        harness
+            .log()
+            .info_ctx("verify", "multi-node pat rejected", |ctx| {
+                ctx.push(("error".into(), err.to_string()));
+            });
 
         // Non-single-node replacement (two statements).
         let bad_out = edit
@@ -612,7 +653,10 @@ fn ast_edit_malformed_patterns_return_named_parse_error() {
 
         // Never a partial apply: the file is untouched and no proposal exists.
         assert_eq!(read_file(&harness, "src/alpha.rs"), original);
-        finish_case(&harness, "ast_edit_malformed_patterns_return_named_parse_error");
+        finish_case(
+            &harness,
+            "ast_edit_malformed_patterns_return_named_parse_error",
+        );
     });
 }
 
@@ -677,14 +721,26 @@ fn ast_grep_scans_each_file_in_its_own_language() {
         write_file(&harness, "code/a.rs", "fn a() {\n    helper(1);\n}\n");
         write_file(&harness, "code/b.py", "def b():\n    helper(2)\n");
         write_file(&harness, "code/c.js", "function c() {\n  helper(3);\n}\n");
-        write_file(&harness, "code/d.ts", "function d(): void {\n  helper(4);\n}\n");
+        write_file(
+            &harness,
+            "code/d.ts",
+            "function d(): void {\n  helper(4);\n}\n",
+        );
         write_file(&harness, "code/e.sh", "#!/usr/bin/env bash\nhelper 5\n");
-        write_file(&harness, "code/f.go", "package main\n\nfunc f() {\n\thelper(6)\n}\n");
+        write_file(
+            &harness,
+            "code/f.go",
+            "package main\n\nfunc f() {\n\thelper(6)\n}\n",
+        );
 
         let registry = ToolRegistry::new(&["ast_grep"], harness.temp_dir(), None);
         let grep = registry.get("ast_grep").expect("ast_grep registered");
         let output = grep
-            .execute("test-id", json!({"pattern": "helper($$$ARGS)", "path": "code"}), None)
+            .execute(
+                "test-id",
+                json!({"pattern": "helper($$$ARGS)", "path": "code"}),
+                None,
+            )
             .await
             .expect("ast_grep must succeed");
         let payload = output_json(&output);
@@ -694,9 +750,11 @@ fn ast_grep_scans_each_file_in_its_own_language() {
             .iter()
             .map(|m| m["file"].as_str().unwrap())
             .collect();
-        harness.log().info_ctx("verify", "multi-language matches", |ctx| {
-            ctx.push(("files".into(), files.join(", ")));
-        });
+        harness
+            .log()
+            .info_ctx("verify", "multi-language matches", |ctx| {
+                ctx.push(("files".into(), files.join(", ")));
+            });
         for expected in [
             "code/a.rs",
             "code/b.py",

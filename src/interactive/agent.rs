@@ -1505,7 +1505,9 @@ After approving access in the browser, press Enter in Pi to complete login."
             .iter()
             .filter(|m| m.role == MessageRole::User)
             .map(|m| m.content.clone());
-        let Some(user_text) = user_texts.next() else { return };
+        let Some(user_text) = user_texts.next() else {
+            return;
+        };
         if user_texts.next().is_some() {
             // Only title on the first exchange — later arrivals suggest the
             // session already has an established topic.
@@ -1525,7 +1527,8 @@ After approving access in the browser, press Enter in Pi to complete login."
         let event_tx = self.event_tx.clone();
         self.runtime_handle.spawn(async move {
             let cx = Cx::for_request();
-            if let Some(title) = generate_session_title(&entry, &user_text, &assistant_excerpt).await
+            if let Some(title) =
+                generate_session_title(&entry, &user_text, &assistant_excerpt).await
             {
                 crate::interactive::enqueue_pi_event(
                     &event_tx,

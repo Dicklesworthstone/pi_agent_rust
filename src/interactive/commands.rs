@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::models::{ModelEntry, ModelRole, model_requires_configured_credential, normalize_api_key_opt};
+use crate::models::{
+    ModelEntry, ModelRole, model_requires_configured_credential, normalize_api_key_opt,
+};
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
     split_provider_model_spec,
@@ -2597,8 +2599,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     return None;
                 }
                 if self.agent_state != AgentState::Idle {
-                    self.status_message =
-                        Some("Cannot switch models while processing".to_string());
+                    self.status_message = Some("Cannot switch models while processing".to_string());
                     return None;
                 }
                 return self.assign_model_to_role(role, rest);

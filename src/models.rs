@@ -70,7 +70,9 @@ impl ModelRole {
     /// Parse a role name (case-insensitive). Returns `None` for unknown names.
     pub fn from_name(name: &str) -> Option<Self> {
         let lowered = name.trim().to_ascii_lowercase();
-        ModelRole::ALL.into_iter().find(|role| role.as_str() == lowered)
+        ModelRole::ALL
+            .into_iter()
+            .find(|role| role.as_str() == lowered)
     }
 
     /// The role a subagent child should use when its agent definition does not
