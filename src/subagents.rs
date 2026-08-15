@@ -96,6 +96,7 @@ impl SubagentTool {
             global_dir,
             child_binary,
             structured_results: false,
+            role_model_spec: None,
         }
     }
 
@@ -122,6 +123,7 @@ impl SubagentTool {
                 let cwd = self.cwd.clone();
                 let global_dir = self.global_dir.clone();
                 let binary = self.child_binary.clone();
+                let role_spec = self.role_model_spec.clone();
                 let update = on_update.clone();
                 let results = stream::iter(tasks.into_iter().enumerate())
                     .map(move |(index, task)| {
@@ -129,9 +131,10 @@ impl SubagentTool {
                         let cwd = cwd.clone();
                         let global_dir = global_dir.clone();
                         let binary = binary.clone();
+                        let role_spec = role_spec.clone();
                         let update = update.clone();
                         async move {
-                            let runner = ChildRunner::new(cwd, global_dir, binary);
+                            let runner = ChildRunner::new(cwd, global_dir, binary, role_spec);
                             (index, runner.run_one(&agents, task, None, update).await)
                         }
                     })
@@ -173,6 +176,7 @@ impl SubagentTool {
             self.cwd.clone(),
             self.global_dir.clone(),
             self.child_binary.clone(),
+            self.role_model_spec.clone(),
         )
         .run_one(agents, task, step, on_update)
         .await
@@ -569,14 +573,21 @@ struct ChildRunner {
     cwd: PathBuf,
     global_dir: PathBuf,
     child_binary: PathBuf,
+    role_model_spec: Option<String>,
 }
 
 impl ChildRunner {
-    const fn new(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
+    const fn new(
+        cwd: PathBuf,
+        global_dir: PathBuf,
+        child_binary: PathBuf,
+        role_model_spec: Option<String>,
+    ) -> Self {
         Self {
             cwd,
             global_dir,
             child_binary,
+            role_model_spec,
         }
     }
 

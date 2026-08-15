@@ -182,8 +182,10 @@ fn resolve_tool_path(path: &str, cwd: &Path) -> PathBuf {
 
 /// Display path relative to the working directory when possible.
 fn display_path(path: &Path, cwd: &Path) -> String {
-    path.strip_prefix(cwd)
-        .map_or_else(|_| path.display().to_string(), |rel| rel.display().to_string())
+    path.strip_prefix(cwd).map_or_else(
+        |_| path.display().to_string(),
+        |rel| rel.display().to_string(),
+    )
 }
 
 /// SHA-256 hex digest of file content (stale-anchor hash).
@@ -218,7 +220,11 @@ fn build_glob_override(
 }
 
 /// Whether a path passes the glob override (matched relative to `cwd`).
-fn glob_allows(path: &Path, cwd: &Path, glob_override: Option<&ignore::overrides::Override>) -> bool {
+fn glob_allows(
+    path: &Path,
+    cwd: &Path,
+    glob_override: Option<&ignore::overrides::Override>,
+) -> bool {
     let Some(glob_override) = glob_override else {
         return true;
     };
@@ -323,7 +329,7 @@ fn unified_diff_preview(display: &str, old: &str, new: &str) -> String {
     let mut text = diff
         .unified_diff()
         .context_radius(3)
-        .header(format!("a/{display}"), format!("b/{display}"))
+        .header(&format!("a/{display}"), &format!("b/{display}"))
         .to_string();
     if text.len() > DIFF_PREVIEW_MAX_BYTES {
         let mut end = DIFF_PREVIEW_MAX_BYTES;
@@ -439,7 +445,13 @@ impl AstGrepTool {
                 input.path.as_deref().unwrap_or(".")
             )));
         }
-        let scan = collect_files(&root, &self.cwd, input.glob.as_deref(), lang_override, "ast_grep")?;
+        let scan = collect_files(
+            &root,
+            &self.cwd,
+            input.glob.as_deref(),
+            lang_override,
+            "ast_grep",
+        )?;
 
         // Compile the pattern once per in-scope language.
         let mut compiled: HashMap<AstLanguage, std::result::Result<Pattern, String>> =
@@ -713,13 +725,14 @@ impl AstEditTool {
             if op.pat.trim().is_empty() {
                 return Err(format!("op {index}: `pat` must not be empty"));
             }
-            let pattern = Pattern::try_new(op.pat.as_str(), lang.support_lang()).map_err(|error| {
-                format!(
-                    "op {index}: pattern `{}` failed to parse as {}: {error}",
-                    op.pat,
-                    lang.name()
-                )
-            })?;
+            let pattern =
+                Pattern::try_new(op.pat.as_str(), lang.support_lang()).map_err(|error| {
+                    format!(
+                        "op {index}: pattern `{}` failed to parse as {}: {error}",
+                        op.pat,
+                        lang.name()
+                    )
+                })?;
             if !op.out.is_empty() {
                 Pattern::try_new(op.out.as_str(), lang.support_lang()).map_err(|error| {
                     format!(
@@ -756,9 +769,8 @@ impl AstEditTool {
                 let grep = AstGrep::new(current.as_str(), lang.support_lang());
                 for node in grep.root().find_all(&op.pattern) {
                     let edit = node.make_edit(&op.pattern, &op.out.as_str());
-                    let inserted_text = String::from_utf8(edit.inserted_text).map_err(|error| {
-                        format!("replacement produced invalid UTF-8: {error}")
-                    })?;
+                    let inserted_text = String::from_utf8(edit.inserted_text)
+                        .map_err(|error| format!("replacement produced invalid UTF-8: {error}"))?;
                     edits.push(TextEdit {
                         position: edit.position,
                         deleted_length: edit.deleted_length,
@@ -797,9 +809,10 @@ impl AstEditTool {
     }
 
     fn stage(&self, input: &AstEditInput) -> Result<ToolOutput> {
-        let ops = input.ops.as_deref().ok_or_else(|| {
-            Error::validation("`ops` is required for action=stage")
-        })?;
+        let ops = input
+            .ops
+            .as_deref()
+            .ok_or_else(|| Error::validation("`ops` is required for action=stage"))?;
         if ops.is_empty() {
             return Err(Error::validation("`ops` must contain at least one op"));
         }
@@ -828,7 +841,13 @@ impl AstEditTool {
                 input.path.as_deref().unwrap_or(".")
             )));
         }
-        let scan = collect_files(&root, &self.cwd, input.glob.as_deref(), lang_override, "ast_edit")?;
+        let scan = collect_files(
+            &root,
+            &self.cwd,
+            input.glob.as_deref(),
+            lang_override,
+            "ast_edit",
+        )?;
 
         // Compile ops per in-scope language; any parse failure is a hard,
         // named error — never a partial apply.
@@ -935,9 +954,10 @@ impl AstEditTool {
     }
 
     fn resolve(&self, input: &AstEditInput) -> Result<ToolOutput> {
-        let proposal_id = input.proposal_id.as_deref().ok_or_else(|| {
-            Error::validation("`proposalId` is required for action=resolve")
-        })?;
+        let proposal_id = input
+            .proposal_id
+            .as_deref()
+            .ok_or_else(|| Error::validation("`proposalId` is required for action=resolve"))?;
         let reason = input.reason.as_deref().map(str::trim).ok_or_else(|| {
             Error::validation("[AST_REASON_REQUIRED] `reason` is required for action=resolve")
         })?;
@@ -989,8 +1009,7 @@ impl AstEditTool {
                     if let Err(rollback_error) =
                         write_file_atomic(&previous.path, &previous.original_content)
                     {
-                        rollback_errors
-                            .push(format!("{}: {rollback_error}", previous.display));
+                        rollback_errors.push(format!("{}: {rollback_error}", previous.display));
                     }
                 }
                 let mut message = format!(
@@ -1035,9 +1054,10 @@ impl AstEditTool {
     }
 
     fn reject(&self, input: &AstEditInput) -> Result<ToolOutput> {
-        let proposal_id = input.proposal_id.as_deref().ok_or_else(|| {
-            Error::validation("`proposalId` is required for action=reject")
-        })?;
+        let proposal_id = input
+            .proposal_id
+            .as_deref()
+            .ok_or_else(|| Error::validation("`proposalId` is required for action=reject"))?;
         let removed = self
             .proposals
             .lock()
