@@ -822,9 +822,7 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
 pub(crate) fn estimate_model_messages_tokens_heuristic(messages: &[Message]) -> u64 {
     messages
         .iter()
-        .cloned()
-        .map(SessionMessage::from)
-        .map(|message| estimate_tokens(&message))
+        .map(estimate_tokens)
         .fold(0_u64, u64::saturating_add)
 }
 
@@ -848,85 +846,66 @@ fn should_compact(
     context_tokens >= window.saturating_sub(reserve)
 }
 
-fn estimate_tokens(message: &SessionMessage) -> u64 {
-    let mut chars: usize = 0;
+trait TokenEstimable {
+    fn estimated_chars(&self) -> usize;
+}
 
-    match message {
-        SessionMessage::User { content, .. } => match content {
-            UserContent::Text(text) => chars = text.len(),
-            UserContent::Blocks(blocks) => {
-                for block in blocks {
-                    match block {
-                        ContentBlock::Text(text) => {
-                            chars = chars.saturating_add(text.text.len());
-                        }
-                        ContentBlock::Image(_) => {
-                            chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
-                        }
-                        ContentBlock::Thinking(thinking) => {
-                            chars = chars.saturating_add(thinking.thinking.len());
-                        }
-                        ContentBlock::ToolCall(call) => {
-                            chars = chars.saturating_add(call.name.len());
-                            chars = chars.saturating_add(json_byte_len(&call.arguments));
-                        }
-                        // Opaque marker — the data field is never replayed to a model
-                        // (see `convert_content_block_to_anthropic`), so it contributes
-                        // zero context tokens.
-                        ContentBlock::RedactedThinking(_) => {}
-                    }
-                }
-            }
-        },
-        SessionMessage::Assistant { message } => {
-            for block in &message.content {
-                match block {
-                    ContentBlock::Text(text) => {
-                        chars = chars.saturating_add(text.text.len());
-                    }
-                    ContentBlock::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len());
-                    }
-                    ContentBlock::Image(_) => {
-                        chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
-                    }
-                    ContentBlock::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len());
-                        chars = chars.saturating_add(json_byte_len(&call.arguments));
-                    }
-                    ContentBlock::RedactedThinking(_) => {}
-                }
-            }
+fn estimate_tokens(message: &impl TokenEstimable) -> u64 {
+    u64::try_from(message.estimated_chars().div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
+}
+
+fn estimate_content_blocks_chars(blocks: &[ContentBlock]) -> usize {
+    blocks.iter().fold(0_usize, |chars, block| {
+        let block_chars = match block {
+            ContentBlock::Text(text) => text.text.len(),
+            ContentBlock::Thinking(thinking) => thinking.thinking.len(),
+            ContentBlock::Image(_) => IMAGE_CHAR_ESTIMATE,
+            ContentBlock::ToolCall(call) => call
+                .name
+                .len()
+                .saturating_add(json_byte_len(&call.arguments)),
+            // Opaque marker — the data field is never replayed to a model
+            // (see `convert_content_block_to_anthropic`), so it contributes
+            // zero context tokens.
+            ContentBlock::RedactedThinking(_) => 0,
+        };
+        chars.saturating_add(block_chars)
+    })
+}
+
+impl TokenEstimable for Message {
+    fn estimated_chars(&self) -> usize {
+        match self {
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => text.len(),
+                UserContent::Blocks(blocks) => estimate_content_blocks_chars(blocks),
+            },
+            Message::Assistant(message) => estimate_content_blocks_chars(&message.content),
+            Message::ToolResult(message) => estimate_content_blocks_chars(&message.content),
+            Message::Custom(message) => message.content.len(),
         }
-        SessionMessage::ToolResult { content, .. } => {
-            for block in content {
-                match block {
-                    ContentBlock::Text(text) => {
-                        chars = chars.saturating_add(text.text.len());
-                    }
-                    ContentBlock::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len());
-                    }
-                    ContentBlock::Image(_) => {
-                        chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
-                    }
-                    ContentBlock::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len());
-                        chars = chars.saturating_add(json_byte_len(&call.arguments));
-                    }
-                    ContentBlock::RedactedThinking(_) => {}
-                }
-            }
-        }
-        SessionMessage::Custom { content, .. } => chars = content.len(),
-        SessionMessage::BashExecution {
-            command, output, ..
-        } => chars = command.len().saturating_add(output.len()),
-        SessionMessage::BranchSummary { summary, .. }
-        | SessionMessage::CompactionSummary { summary, .. } => chars = summary.len(),
     }
+}
 
-    u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
+impl TokenEstimable for SessionMessage {
+    fn estimated_chars(&self) -> usize {
+        match self {
+            SessionMessage::User { content, .. } => match content {
+                UserContent::Text(text) => text.len(),
+                UserContent::Blocks(blocks) => estimate_content_blocks_chars(blocks),
+            },
+            SessionMessage::Assistant { message } => {
+                estimate_content_blocks_chars(&message.content)
+            }
+            SessionMessage::ToolResult { content, .. } => estimate_content_blocks_chars(content),
+            SessionMessage::Custom { content, .. } => content.len(),
+            SessionMessage::BashExecution {
+                command, output, ..
+            } => command.len().saturating_add(output.len()),
+            SessionMessage::BranchSummary { summary, .. }
+            | SessionMessage::CompactionSummary { summary, .. } => summary.len(),
+        }
+    }
 }
 
 // =============================================================================
