@@ -3,7 +3,7 @@
   "bead_id": "bd-3uqg.9.3.2",
   "generated_at_utc": "2026-08-06T09:40:00Z",
   "generated_by": "manual source reconciliation against src/provider_metadata.rs and auth runtime tests",
-  "description": "Canonical/alias/env-key auth crosswalk covering all 94 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
+  "description": "Canonical/alias/env-key auth crosswalk covering all 102 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
 
   "provider_row_contract": {
     "auth_method": "Primary request-wire authentication method ID from request_auth_methods.",
@@ -39,13 +39,13 @@
   "request_auth_methods": {
     "bearer_token": {
       "header": "Authorization: Bearer {API_KEY}",
-      "providers_count": 84,
+      "providers_count": 91,
       "description": "Bearer value on the inference request. How the value was acquired (direct key, OAuth, device flow, external CLI, Bedrock override, or SAP exchange) is modeled separately."
     },
     "x_api_key": {
       "header": "X-API-Key: {API_KEY}",
-      "providers_count": 7,
-      "providers": ["anthropic", "kimi-for-coding", "minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan", "zenmux"],
+      "providers_count": 8,
+      "providers": ["anthropic", "kimi-for-coding", "minimax", "minimax-cn", "minimax-coding-plan", "minimax-cn-coding-plan", "zenmux", "umans"],
       "description": "Anthropic API-key request lane. Anthropic OAuth and Kimi device/external tokens instead use bearer_token."
     },
     "api_key_header": {
@@ -93,7 +93,7 @@
     },
     "methods": {
       "direct_api_key": {
-        "providers_count": 86,
+        "providers_count": 94,
         "description": "Complete API key supplied explicitly, through a provider API-key environment variable, or from stored ApiKey auth."
       },
       "oauth_login": {
@@ -316,13 +316,21 @@
     {"canonical_id": "zai", "aliases": [], "env_keys": ["ZHIPU_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.z.ai/api/paas/v4", "tier": "oai_compat"},
     {"canonical_id": "zai-coding-plan", "aliases": [], "env_keys": ["ZHIPU_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.z.ai/api/coding/paas/v4", "tier": "oai_compat"},
     {"canonical_id": "zhipuai", "aliases": ["zhipu", "glm"], "env_keys": ["ZHIPU_API_KEY"], "auth_method": "bearer_token", "base_url": "https://open.bigmodel.cn/api/paas/v4", "tier": "oai_compat"},
-    {"canonical_id": "zhipuai-coding-plan", "aliases": [], "env_keys": ["ZHIPU_API_KEY"], "auth_method": "bearer_token", "base_url": "https://open.bigmodel.cn/api/coding/paas/v4", "tier": "oai_compat"}
+    {"canonical_id": "zhipuai-coding-plan", "aliases": [], "env_keys": ["ZHIPU_API_KEY"], "auth_method": "bearer_token", "base_url": "https://open.bigmodel.cn/api/coding/paas/v4", "tier": "oai_compat"},
+    {"canonical_id": "gmi", "aliases": ["gmi-cloud", "gmi-serving"], "env_keys": ["GMI_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.gmi-serving.com/v1", "tier": "oai_compat"},
+    {"canonical_id": "coreweave", "aliases": ["coreweave-serverless"], "env_keys": ["COREWEAVE_API_KEY", "WANDB_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.inference.wandb.ai/v1", "tier": "oai_compat", "notes": "omp also sends an OpenAI-Project header (COREWEAVE_PROJECT) for model discovery; not expressible in static preset metadata"},
+    {"canonical_id": "sakana", "aliases": ["sakana-ai"], "env_keys": ["SAKANA_API_KEY", "FUGU_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.sakana.ai/v1", "tier": "oai_compat", "notes": "omp descriptor routes Sakana via openai-responses"},
+    {"canonical_id": "wafer", "aliases": ["wafer-serverless"], "env_keys": ["WAFER_SERVERLESS_API_KEY"], "auth_method": "bearer_token", "base_url": "https://pass.wafer.ai/v1", "tier": "oai_compat"},
+    {"canonical_id": "qianfan", "aliases": ["baidu-qianfan"], "env_keys": ["QIANFAN_API_KEY"], "auth_method": "bearer_token", "base_url": "https://qianfan.baidubce.com/v2", "tier": "oai_compat"},
+    {"canonical_id": "umans", "aliases": ["umans-ai"], "env_keys": ["UMANS_AI_CODING_PLAN_API_KEY"], "auth_method": "x_api_key", "base_url": "https://api.code.umans.ai/v1/messages", "tier": "oai_compat", "notes": "omp descriptor routes Umans via anthropic-messages"},
+    {"canonical_id": "kilo", "aliases": ["kilo-gateway", "kilo-ai"], "env_keys": ["KILO_API_KEY"], "auth_method": "bearer_token", "base_url": "https://api.kilo.ai/api/gateway", "tier": "oai_compat"},
+    {"canonical_id": "opencode-go", "aliases": [], "env_keys": ["OPENCODE_API_KEY"], "auth_method": "bearer_token", "base_url": "https://opencode.ai/zen/go/v1", "tier": "oai_compat"}
   ],
 
   "acceptance_criteria_compliance": {
     "criterion_1": {
       "requirement": "Crosswalk covers canonical IDs, common aliases, env key precedence, and base URL defaults/overrides",
-      "status": "PASS — all 94 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
+      "status": "PASS — all 102 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
     },
     "criterion_2": {
       "requirement": "Includes high-confusion mappings (azure, azure-cognitive-services, fireworks-ai, qwen, kimi, google-vertex-anthropic)",

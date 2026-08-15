@@ -3129,6 +3129,332 @@ mod tests {
         }
     }
 
+    // ── Batch C2 tests (bd-cv653.7.3 omp-catalog delta) ─────────────────
+
+    const BATCH_C2_IDS: [&str; 8] = [
+        "gmi",
+        "coreweave",
+        "sakana",
+        "wafer",
+        "qianfan",
+        "umans",
+        "kilo",
+        "opencode-go",
+    ];
+
+    #[test]
+    fn batch_c2_metadata_resolves_all_eight_providers() {
+        for id in BATCH_C2_IDS {
+            let meta = provider_metadata(id)
+                .unwrap_or_else(|| unreachable!("expected metadata for '{id}'"));
+            assert_eq!(meta.canonical_id, id);
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::OpenAICompatiblePreset,
+                "{id} onboarding mode mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn batch_c2_env_keys_match_omp_catalog_descriptors() {
+        assert_eq!(provider_auth_env_keys("gmi"), &["GMI_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("coreweave"),
+            &["COREWEAVE_API_KEY", "WANDB_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("sakana"),
+            &["SAKANA_API_KEY", "FUGU_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("wafer"),
+            &["WAFER_SERVERLESS_API_KEY"]
+        );
+        assert_eq!(provider_auth_env_keys("qianfan"), &["QIANFAN_API_KEY"]);
+        assert_eq!(
+            provider_auth_env_keys("umans"),
+            &["UMANS_AI_CODING_PLAN_API_KEY"]
+        );
+        assert_eq!(provider_auth_env_keys("kilo"), &["KILO_API_KEY"]);
+        assert_eq!(provider_auth_env_keys("opencode-go"), &["OPENCODE_API_KEY"]);
+    }
+
+    #[test]
+    fn batch_c2_routing_defaults_match_omp_descriptor_api_kinds() {
+        // api kind + host come from the omp catalog descriptor for each id.
+        let ids = [
+            ("gmi", "openai-completions", "api.gmi-serving.com"),
+            ("coreweave", "openai-completions", "api.inference.wandb.ai"),
+            ("sakana", "openai-responses", "api.sakana.ai"),
+            ("wafer", "openai-completions", "pass.wafer.ai"),
+            ("qianfan", "openai-completions", "qianfan.baidubce.com"),
+            ("umans", "anthropic-messages", "api.code.umans.ai"),
+            ("kilo", "openai-completions", "api.kilo.ai"),
+            ("opencode-go", "openai-completions", "opencode.ai/zen/go"),
+        ];
+        for (id, expected_api, expected_host) in &ids {
+            let defaults = provider_routing_defaults(id)
+                .unwrap_or_else(|| unreachable!("expected routing defaults for '{id}'"));
+            assert_eq!(defaults.api, *expected_api, "{id} api mismatch");
+            assert!(
+                defaults.base_url.contains(expected_host),
+                "{id} base_url '{}' should contain '{expected_host}'",
+                defaults.base_url
+            );
+        }
+        // umans rides the anthropic-messages transport (x-api-key style),
+        // every other new preset uses bearer auth.
+        let umans = provider_routing_defaults("umans").expect("umans defaults");
+        assert!(!umans.auth_header);
+        for id in ["gmi", "coreweave", "sakana", "wafer", "qianfan", "kilo", "opencode-go"] {
+            let defaults = provider_routing_defaults(id)
+                .unwrap_or_else(|| unreachable!("expected routing defaults for '{id}'"));
+            assert!(defaults.auth_header, "{id} must use bearer auth header");
+        }
+    }
+
+    #[test]
+    fn batch_c2_aliases_resolve_and_opencode_zen_maps_to_opencode() {
+        let cases: &[(&str, &str)] = &[
+            ("gmi-cloud", "gmi"),
+            ("gmi-serving", "gmi"),
+            ("coreweave-serverless", "coreweave"),
+            ("sakana-ai", "sakana"),
+            ("wafer-serverless", "wafer"),
+            ("baidu-qianfan", "qianfan"),
+            ("umans-ai", "umans"),
+            ("kilo-gateway", "kilo"),
+            ("kilo-ai", "kilo"),
+            ("opencode-zen", "opencode"),
+        ];
+        for &(alias, expected_canonical) in cases {
+            let meta = provider_metadata(alias)
+                .unwrap_or_else(|| unreachable!("expected metadata for alias '{alias}'"));
+            assert_eq!(
+                meta.canonical_id, expected_canonical,
+                "alias '{alias}' should resolve to '{expected_canonical}', got '{}'",
+                meta.canonical_id
+            );
+        }
+    }
+
+    #[test]
+    fn batch_c2_opencode_go_and_zen_tiers_stay_distinct() {
+        let zen = provider_routing_defaults("opencode").expect("opencode defaults");
+        let go = provider_routing_defaults("opencode-go").expect("opencode-go defaults");
+        assert_eq!(canonical_provider_id("opencode-zen"), Some("opencode"));
+        assert_ne!(zen.base_url, go.base_url);
+        assert_eq!(zen.api, "openai-completions");
+        assert_eq!(go.api, "openai-completions");
+        assert_eq!(
+            provider_auth_env_keys("opencode"),
+            provider_auth_env_keys("opencode-go")
+        );
+    }
+
+    // ── Whole-table audits (bd-cv653.7.3) ────────────────────────────────
+
+    /// Audit an arbitrary `(canonical_id, aliases)` table for collisions:
+    /// duplicate canonical ids, duplicate aliases, or an alias that shadows
+    /// another entry's canonical id. Returns one violation string per hit.
+    /// Kept as a free function over table data so the planted-negative test
+    /// can feed it a deliberately broken table.
+    fn alias_collision_violations(table: &[(&str, &[&str])]) -> Vec<String> {
+        let mut violations = Vec::new();
+        let mut canonicals: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        for &(canonical, _) in table {
+            let key = canonical.to_ascii_lowercase();
+            if let Some(previous) = canonicals.insert(key.clone(), canonical) {
+                violations.push(format!(
+                    "duplicate canonical id '{canonical}' collides with '{previous}'"
+                ));
+            }
+        }
+        let mut alias_owner: std::collections::HashMap<String, &str> =
+            std::collections::HashMap::new();
+        for &(canonical, aliases) in table {
+            for &alias in aliases {
+                let key = alias.to_ascii_lowercase();
+                if let Some(&owner) = canonicals.get(&key)
+                    && owner != canonical
+                {
+                    violations.push(format!(
+                        "alias '{alias}' of '{canonical}' shadows canonical id '{owner}'"
+                    ));
+                }
+                if let Some(previous) = alias_owner.insert(key.clone(), canonical)
+                    && previous != canonical
+                {
+                    violations.push(format!(
+                        "alias '{alias}' claimed by both '{previous}' and '{canonical}'"
+                    ));
+                }
+            }
+        }
+        violations
+    }
+
+    #[test]
+    fn provider_alias_collision_audit_passes_for_whole_table() {
+        let table: Vec<(&str, &[&str])> = PROVIDER_METADATA
+            .iter()
+            .map(|meta| (meta.canonical_id, meta.aliases))
+            .collect();
+        let violations = alias_collision_violations(&table);
+        assert!(
+            violations.is_empty(),
+            "alias/canonical collisions detected:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn provider_alias_collision_audit_catches_planted_collisions() {
+        // Planted negative: an alias that WOULD collide with an existing
+        // canonical id (case-insensitively) must be reported, and so must an
+        // alias claimed by two different providers.
+        let planted: Vec<(&str, &[&str])> = vec![
+            ("gmi", &["gmi-cloud"][..]),
+            ("qianfan", &["GMI"][..]),     // shadows canonical 'gmi' (case-insensitive)
+            ("kilo", &["gmi-cloud"][..]),  // duplicate alias across providers
+        ];
+        let violations = alias_collision_violations(&planted);
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("shadows canonical id 'gmi'")),
+            "planted canonical-shadowing alias must be caught, got: {violations:?}"
+        );
+        assert!(
+            violations
+                .iter()
+                .any(|v| v.contains("claimed by both 'gmi' and 'kilo'")),
+            "planted duplicate alias must be caught, got: {violations:?}"
+        );
+        // A collision-free table yields no violations.
+        let clean: Vec<(&str, &[&str])> = vec![("gmi", &["gmi-cloud"][..]), ("kilo", &[])];
+        assert!(alias_collision_violations(&clean).is_empty());
+    }
+
+    #[test]
+    fn provider_base_urls_parse_as_absolute_http_urls() {
+        for meta in PROVIDER_METADATA {
+            let Some(defaults) = meta.routing_defaults else {
+                continue;
+            };
+            let base_url = defaults.base_url;
+            if base_url.is_empty() {
+                // amazon-bedrock computes endpoints per-region at runtime.
+                assert_eq!(
+                    meta.canonical_id, "amazon-bedrock",
+                    "only amazon-bedrock may carry an empty base_url"
+                );
+                continue;
+            }
+            // Template placeholders (cloudflare account/gateway ids) are
+            // filled at runtime; substitute a concrete segment for parsing.
+            let concrete = base_url
+                .replace("{account_id}", "account")
+                .replace("{gateway_id}", "gateway");
+            let parsed = url::Url::parse(&concrete).unwrap_or_else(|err| {
+                panic!(
+                    "provider '{}' base_url '{base_url}' must parse as a URL: {err}",
+                    meta.canonical_id
+                )
+            });
+            assert!(
+                matches!(parsed.scheme(), "https" | "http"),
+                "provider '{}' base_url must be http(s): '{base_url}'",
+                meta.canonical_id
+            );
+            assert!(
+                parsed.host_str().is_some(),
+                "provider '{}' base_url must carry a host: '{base_url}'",
+                meta.canonical_id
+            );
+            if parsed.scheme() == "http" {
+                let host = parsed.host_str().unwrap_or_default();
+                assert!(
+                    host == "127.0.0.1" || host == "localhost",
+                    "provider '{}' plain-http base_url must be loopback: '{base_url}'",
+                    meta.canonical_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_preset_claims_auth_it_cannot_perform() {
+        // Static audit: OpenAI-compatible presets authenticate with a plain
+        // API key from the environment (or are keyless local servers). A
+        // preset MUST NOT exist without an env-key path — that would be an
+        // implicit promise of OAuth/plan routing, which requires a native
+        // module (ProviderOnboardingMode::NativeAdapterRequired).
+        const PRESET_APIS: [&str; 3] = [
+            "openai-completions",
+            "openai-responses",
+            "anthropic-messages",
+        ];
+        for meta in PROVIDER_METADATA {
+            match meta.onboarding {
+                ProviderOnboardingMode::OpenAICompatiblePreset => {
+                    let defaults = meta.routing_defaults.unwrap_or_else(|| {
+                        panic!(
+                            "preset '{}' must carry routing defaults",
+                            meta.canonical_id
+                        )
+                    });
+                    assert!(
+                        PRESET_APIS.contains(&defaults.api),
+                        "preset '{}' claims api '{}' which no preset transport serves",
+                        meta.canonical_id,
+                        defaults.api
+                    );
+                    if meta.auth_env_keys.is_empty() {
+                        // Keyless is only honest for loopback servers that
+                        // also skip the auth header (ollama/llamacpp/mistralrs).
+                        assert!(
+                            !defaults.auth_header,
+                            "preset '{}' has no auth env keys but requires an auth header",
+                            meta.canonical_id
+                        );
+                        assert!(
+                            crate::provider_metadata::provider_is_keyless_local(meta.canonical_id),
+                            "preset '{}' must satisfy the keyless-local predicate",
+                            meta.canonical_id
+                        );
+                    }
+                }
+                ProviderOnboardingMode::NativeAdapterRequired => {
+                    assert!(
+                        meta.routing_defaults.is_none(),
+                        "native-adapter provider '{}' must not masquerade as a routable preset",
+                        meta.canonical_id
+                    );
+                }
+                ProviderOnboardingMode::BuiltInNative => {}
+            }
+        }
+        // The known OAuth/plan providers stay behind native adapters.
+        for id in [
+            "openai-codex",
+            "github-copilot",
+            "gitlab",
+            "google-gemini-cli",
+            "google-antigravity",
+        ] {
+            let meta = provider_metadata(id)
+                .unwrap_or_else(|| unreachable!("expected metadata for '{id}'"));
+            assert_eq!(
+                meta.onboarding,
+                ProviderOnboardingMode::NativeAdapterRequired,
+                "OAuth/plan provider '{id}' must not be a plain preset"
+            );
+        }
+    }
+
     mod proptest_provider_metadata {
         use super::*;
         use proptest::prelude::*;

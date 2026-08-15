@@ -26,7 +26,7 @@ Reconciled against the live registry and auth runtime: 2026-08-06
 
 This crosswalk maps every user-visible provider name (including upstream aliases from opencode and models.dev) to the Pi canonical ID, accepted aliases, auth env vars, and default endpoint. Use this when a user reports "missing provider" or confusion about which name to use.
 
-**Total**: 94 registered canonical provider IDs and 51 aliases. Registration
+**Total**: 102 registered canonical provider IDs and 61 aliases. Registration
 coverage is not a claim that every ID has an executable native route; use
 `pi --list-providers` and the implementation-mode evidence for runtime status.
 
@@ -101,6 +101,7 @@ coverage is not a claim that every ID has an executable native route; use
 | `minimax-coding-plan` | — | `MINIMAX_API_KEY` | `https://api.minimax.io/anthropic/v1/messages` |
 | `minimax-cn-coding-plan` | — | `MINIMAX_CN_API_KEY` | `https://api.minimaxi.com/anthropic/v1/messages` |
 | `zenmux` | — | `ZENMUX_API_KEY` | `https://zenmux.ai/api/anthropic/v1/messages` |
+| `umans` | `umans-ai` | `UMANS_AI_CODING_PLAN_API_KEY` | `https://api.code.umans.ai/v1/messages` |
 
 `kimi-for-coding` has two intentional request-auth lanes. A `sk-*` direct API
 key, including one supplied through `KIMI_API_KEY`, is sent as `x-api-key`.
@@ -122,16 +123,19 @@ active.
 | `chutes` | — | `CHUTES_API_KEY` | `https://llm.chutes.ai/v1` |
 | `cloudflare-ai-gateway` | — | `CLOUDFLARE_API_TOKEN` | `https://gateway.ai.cloudflare.com/v1/...` |
 | `cloudflare-workers-ai` | — | `CLOUDFLARE_API_TOKEN` | `https://api.cloudflare.com/client/v4/accounts/.../ai/v1` |
+| `coreweave` | `coreweave-serverless` | `COREWEAVE_API_KEY`, `WANDB_API_KEY` | `https://api.inference.wandb.ai/v1` |
 | `cortecs` | — | `CORTECS_API_KEY` | `https://api.cortecs.ai/v1` |
 | `fastrouter` | — | `FASTROUTER_API_KEY` | `https://go.fastrouter.ai/api/v1` |
 | `firmware` | — | `FIRMWARE_API_KEY` | `https://app.firmware.ai/api/v1` |
 | `friendli` | — | `FRIENDLI_TOKEN` | `https://api.friendli.ai/serverless/v1` |
+| `gmi` | `gmi-cloud`, `gmi-serving` | `GMI_API_KEY` | `https://api.gmi-serving.com/v1` |
 | `helicone` | — | `HELICONE_API_KEY` | `https://ai-gateway.helicone.ai/v1` |
 | `iflowcn` | — | `IFLOW_API_KEY` | `https://apis.iflow.cn/v1` |
 | `inception` | — | `INCEPTION_API_KEY` | `https://api.inceptionlabs.ai/v1` |
 | `inference` | — | `INFERENCE_API_KEY` | `https://inference.net/v1` |
 | `io-net` | — | `IOINTELLIGENCE_API_KEY` | `https://api.intelligence.io.solutions/api/v1` |
 | `jiekou` | — | `JIEKOU_API_KEY` | `https://api.jiekou.ai/openai` |
+| `kilo` | `kilo-gateway`, `kilo-ai` | `KILO_API_KEY` | `https://api.kilo.ai/api/gateway` |
 | `llama` | — | `LLAMA_API_KEY` | `https://api.llama.com/compat/v1` |
 | `llamacpp` | `llama-cpp`, `llama.cpp`, `llama-server` | _(none; local llama-server)_ | `http://127.0.0.1:8080/v1` |
 | `lmstudio` | `lm-studio` | `LMSTUDIO_API_KEY` | `http://127.0.0.1:1234/v1` |
@@ -144,15 +148,19 @@ active.
 | `novita-ai` | `novita` | `NOVITA_API_KEY` | `https://api.novita.ai/openai` |
 | `ollama` | — | _(none)_ | `http://127.0.0.1:11434/v1` |
 | `ollama-cloud` | — | `OLLAMA_API_KEY` | `https://ollama.com/v1` |
-| `opencode` | — | `OPENCODE_API_KEY` | `https://opencode.ai/zen/v1` |
+| `opencode` | `opencode-zen` | `OPENCODE_API_KEY` | `https://opencode.ai/zen/v1` |
+| `opencode-go` | — | `OPENCODE_API_KEY` | `https://opencode.ai/zen/go/v1` |
 | `poe` | — | `POE_API_KEY` | `https://api.poe.com/v1` |
 | `privatemode-ai` | — | `PRIVATEMODE_API_KEY` | `http://localhost:8080/v1` |
+| `qianfan` | `baidu-qianfan` | `QIANFAN_API_KEY` | `https://qianfan.baidubce.com/v2` |
 | `requesty` | — | `REQUESTY_API_KEY` | `https://router.requesty.ai/v1` |
+| `sakana` | `sakana-ai` | `SAKANA_API_KEY`, `FUGU_API_KEY` | `https://api.sakana.ai/v1` (openai-responses) |
 | `submodel` | — | `SUBMODEL_INSTAGEN_ACCESS_KEY` | `https://llm.submodel.ai/v1` |
 | `synthetic` | — | `SYNTHETIC_API_KEY` | `https://api.synthetic.new/v1` |
 | `vercel` | `vercel-ai-gateway` | `AI_GATEWAY_API_KEY` | `https://ai-gateway.vercel.sh/v1` |
 | `vivgrid` | — | `VIVGRID_API_KEY` | `https://api.vivgrid.com/v1` |
 | `vultr` | — | `VULTR_API_KEY` | `https://api.vultrinference.com/v1` |
+| `wafer` | `wafer-serverless` | `WAFER_SERVERLESS_API_KEY` | `https://pass.wafer.ai/v1` |
 | `wandb` | — | `WANDB_API_KEY` | `https://api.inference.wandb.ai/v1` |
 | `xiaomi` | — | `XIAOMI_API_KEY` | `https://api.xiaomimimo.com/v1` |
 
@@ -195,6 +203,14 @@ If a user types any of these aliases (left), Pi resolves to the canonical ID (ri
 | `cursor-agent` | `cursor` |
 | `llama-cpp`, `llama.cpp`, `llama-server` | `llamacpp` |
 | `mistral-rs`, `mistral.rs` | `mistralrs` |
+| `gmi-cloud`, `gmi-serving` | `gmi` |
+| `coreweave-serverless` | `coreweave` |
+| `sakana-ai` | `sakana` |
+| `wafer-serverless` | `wafer` |
+| `baidu-qianfan` | `qianfan` |
+| `umans-ai` | `umans` |
+| `kilo-gateway`, `kilo-ai` | `kilo` |
+| `opencode-zen` | `opencode` |
 
 ### Shared env-key families
 
@@ -208,6 +224,8 @@ Some distinct canonical IDs share environment variables (intentional for provide
 | `MINIMAX_API_KEY` | `minimax`, `minimax-coding-plan` |
 | `MINIMAX_CN_API_KEY` | `minimax-cn`, `minimax-cn-coding-plan` |
 | `CLOUDFLARE_API_TOKEN` | `cloudflare-ai-gateway`, `cloudflare-workers-ai` |
+| `WANDB_API_KEY` | `wandb`, `coreweave` |
+| `OPENCODE_API_KEY` | `opencode`, `opencode-go` |
 
 **Validation**: `cargo test --test provider_metadata_comprehensive provider_auth_reference_artifacts_match_runtime_metadata -- --exact`
 

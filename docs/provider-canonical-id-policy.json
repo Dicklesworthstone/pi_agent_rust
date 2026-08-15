@@ -3,8 +3,10 @@
   "bead_id": "bd-3uqg.1.3",
   "generated_at_utc": "2026-02-10T04:38:00Z",
   "last_reviewed_at_utc": "2026-08-06T00:00:00Z",
-  "depends_on": ["bd-3uqg.1.1", "bd-3uqg.1.2"],
-
+  "depends_on": [
+    "bd-3uqg.1.1",
+    "bd-3uqg.1.2"
+  ],
   "normalization_algorithm": {
     "description": "Steps applied to user-supplied provider ID before lookup",
     "steps": [
@@ -15,7 +17,6 @@
     ],
     "rationale": "src/provider_metadata.rs is the runtime authority. Underscore spellings are accepted only when explicitly registered as aliases (for example, azure_openai); there is no generic underscore-to-hyphen rewrite."
   },
-
   "conflict_resolution_rules": [
     "1. PROVIDER_METADATA is authoritative for active Pi canonical IDs and aliases",
     "2. Upstream IDs that differ from Pi's active canonical ID may be registered as aliases after routing and auth behavior are verified",
@@ -24,112 +25,635 @@
     "5. Coding-plan variants (e.g., 'minimax-coding-plan') are distinct canonical IDs",
     "6. Extension-registered providers own their declared-ID semantics outside the built-in metadata lookup"
   ],
-
   "deprecation_posture": {
     "policy": "Only explicitly documented aliases are accepted; removals are recorded separately from aliases",
     "current_deprecations": []
   },
-
   "canonical_id_map": {
     "_comment": "Active Pi runtime mapping mirrored from PROVIDER_METADATA. canonical_id is authoritative; historical upstream-only IDs are excluded.",
     "entries": [
-      {"canonical_id": "302ai", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "abacus", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "aihubmix", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "alibaba", "aliases": ["dashscope", "qwen"], "source": "models.dev", "notes": "DashScope is Alibaba Cloud's API platform; Qwen is the model family"},
-      {"canonical_id": "alibaba-cn", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "alibaba-us", "aliases": [], "source": "Pi runtime"},
-      {"canonical_id": "amazon-bedrock", "aliases": ["bedrock"], "source": "models.dev+opencode", "notes": "opencode uses 'bedrock'"},
-      {"canonical_id": "anthropic", "aliases": [], "source": "all"},
-      {"canonical_id": "atlascloud", "aliases": ["atlas-cloud", "atlas"], "source": "Pi runtime"},
-      {"canonical_id": "azure-openai", "aliases": ["azure", "azure_openai", "azure-cognitive-services", "azure-openai-responses"], "source": "Pi runtime"},
-      {"canonical_id": "bailing", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "baseten", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "berget", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "cerebras", "aliases": [], "source": "models.dev+opencode"},
-      {"canonical_id": "chutes", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "cloudflare-ai-gateway", "aliases": [], "source": "models.dev+opencode"},
-      {"canonical_id": "cloudflare-workers-ai", "aliases": [], "source": "models.dev+opencode"},
-      {"canonical_id": "cohere", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "cortecs", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "cursor", "aliases": ["cursor-agent"], "source": "Pi runtime"},
-      {"canonical_id": "deepinfra", "aliases": ["deep-infra"], "source": "models.dev"},
-      {"canonical_id": "deepseek", "aliases": ["deep-seek"], "source": "models.dev"},
-      {"canonical_id": "fastrouter", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "fireworks", "aliases": ["fireworks-ai"], "source": "Pi runtime"},
-      {"canonical_id": "firmware", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "friendli", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "github-copilot", "aliases": ["copilot", "github-copilot-enterprise"], "source": "models.dev+opencode", "notes": "GitHub Copilot remains a supported native provider"},
-      {"canonical_id": "gitlab", "aliases": ["gitlab-duo"], "source": "models.dev+opencode"},
-      {"canonical_id": "google", "aliases": ["gemini"], "source": "models.dev+opencode", "notes": "opencode uses 'gemini'; models.dev canonical is 'google'"},
-      {"canonical_id": "google-antigravity", "aliases": ["antigravity"], "source": "Pi runtime"},
-      {"canonical_id": "google-gemini-cli", "aliases": ["gemini-cli"], "source": "Pi runtime"},
-      {"canonical_id": "google-vertex", "aliases": ["vertexai", "google-vertex-anthropic"], "source": "models.dev+opencode", "notes": "opencode uses 'vertexai'"},
-      {"canonical_id": "groq", "aliases": [], "source": "models.dev+opencode"},
-      {"canonical_id": "helicone", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "huggingface", "aliases": ["hf", "hugging-face"], "source": "models.dev"},
-      {"canonical_id": "iflowcn", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "inception", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "inference", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "io-net", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "jiekou", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "kimi-for-coding", "aliases": ["kimi-coding", "kimi-code"], "source": "models.dev", "notes": "Distinct from moonshotai/kimi alias; this is a coding-specific variant"},
-      {"canonical_id": "llama", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "llamacpp", "aliases": ["llama-cpp", "llama.cpp", "llama-server"], "source": "Pi runtime"},
-      {"canonical_id": "lmstudio", "aliases": ["lm-studio"], "source": "models.dev+codex"},
-      {"canonical_id": "lucidquery", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "minimax", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "minimax-cn", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "minimax-cn-coding-plan", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "minimax-coding-plan", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "mistral", "aliases": ["mistralai"], "source": "models.dev"},
-      {"canonical_id": "mistralrs", "aliases": ["mistral.rs", "mistral-rs"], "source": "Pi runtime"},
-      {"canonical_id": "moark", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "modelscope", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "moonshotai", "aliases": ["moonshot", "kimi"], "source": "models.dev", "notes": "MoonshotAI is the company; Kimi is the product name"},
-      {"canonical_id": "moonshotai-cn", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "morph", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "nano-gpt", "aliases": ["nanogpt"], "source": "models.dev"},
-      {"canonical_id": "nebius", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "nova", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "novita-ai", "aliases": ["novita"], "source": "models.dev"},
-      {"canonical_id": "nvidia", "aliases": ["nim", "nvidia-nim"], "source": "models.dev"},
-      {"canonical_id": "ollama", "aliases": [], "source": "codex"},
-      {"canonical_id": "ollama-cloud", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "openai", "aliases": [], "source": "all"},
-      {"canonical_id": "openai-codex", "aliases": ["codex", "chatgpt-codex"], "source": "Pi runtime"},
-      {"canonical_id": "opencode", "aliases": [], "source": "models.dev+opencode", "notes": "Meta-routing provider in opencode; models.dev has as provider"},
-      {"canonical_id": "openrouter", "aliases": ["open-router"], "source": "models.dev+opencode"},
-      {"canonical_id": "ovhcloud", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "perplexity", "aliases": ["pplx"], "source": "models.dev"},
-      {"canonical_id": "poe", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "privatemode-ai", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "requesty", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "sap-ai-core", "aliases": ["sap"], "source": "models.dev+opencode"},
-      {"canonical_id": "scaleway", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "siliconflow", "aliases": ["silicon-flow"], "source": "models.dev"},
-      {"canonical_id": "siliconflow-cn", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "stackit", "aliases": [], "source": "Pi runtime"},
-      {"canonical_id": "submodel", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "synthetic", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "togetherai", "aliases": ["together", "together-ai"], "source": "models.dev"},
-      {"canonical_id": "upstage", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "v0", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "venice", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "vercel", "aliases": ["vercel-ai-gateway"], "source": "models.dev+opencode"},
-      {"canonical_id": "vivgrid", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "vultr", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "wandb", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "xai", "aliases": ["grok", "x-ai"], "source": "models.dev+opencode"},
-      {"canonical_id": "xiaomi", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "zai", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "zai-coding-plan", "aliases": [], "source": "models.dev"},
-      {"canonical_id": "zenmux", "aliases": [], "source": "models.dev+opencode"},
-      {"canonical_id": "zhipuai", "aliases": ["zhipu", "glm"], "source": "models.dev"},
-      {"canonical_id": "zhipuai-coding-plan", "aliases": [], "source": "models.dev"}
+      {
+        "canonical_id": "302ai",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "abacus",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "aihubmix",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "alibaba",
+        "aliases": [
+          "dashscope",
+          "qwen"
+        ],
+        "source": "models.dev",
+        "notes": "DashScope is Alibaba Cloud's API platform; Qwen is the model family"
+      },
+      {
+        "canonical_id": "alibaba-cn",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "alibaba-us",
+        "aliases": [],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "amazon-bedrock",
+        "aliases": [
+          "bedrock"
+        ],
+        "source": "models.dev+opencode",
+        "notes": "opencode uses 'bedrock'"
+      },
+      {
+        "canonical_id": "anthropic",
+        "aliases": [],
+        "source": "all"
+      },
+      {
+        "canonical_id": "atlascloud",
+        "aliases": [
+          "atlas-cloud",
+          "atlas"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "azure-openai",
+        "aliases": [
+          "azure",
+          "azure_openai",
+          "azure-cognitive-services",
+          "azure-openai-responses"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "bailing",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "baseten",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "berget",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "cerebras",
+        "aliases": [],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "chutes",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "cloudflare-ai-gateway",
+        "aliases": [],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "cloudflare-workers-ai",
+        "aliases": [],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "cohere",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "cortecs",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "cursor",
+        "aliases": [
+          "cursor-agent"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "deepinfra",
+        "aliases": [
+          "deep-infra"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "deepseek",
+        "aliases": [
+          "deep-seek"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "fastrouter",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "fireworks",
+        "aliases": [
+          "fireworks-ai"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "firmware",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "friendli",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "github-copilot",
+        "aliases": [
+          "copilot",
+          "github-copilot-enterprise"
+        ],
+        "source": "models.dev+opencode",
+        "notes": "GitHub Copilot remains a supported native provider"
+      },
+      {
+        "canonical_id": "gitlab",
+        "aliases": [
+          "gitlab-duo"
+        ],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "google",
+        "aliases": [
+          "gemini"
+        ],
+        "source": "models.dev+opencode",
+        "notes": "opencode uses 'gemini'; models.dev canonical is 'google'"
+      },
+      {
+        "canonical_id": "google-antigravity",
+        "aliases": [
+          "antigravity"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "google-gemini-cli",
+        "aliases": [
+          "gemini-cli"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "google-vertex",
+        "aliases": [
+          "vertexai",
+          "google-vertex-anthropic"
+        ],
+        "source": "models.dev+opencode",
+        "notes": "opencode uses 'vertexai'"
+      },
+      {
+        "canonical_id": "groq",
+        "aliases": [],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "helicone",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "huggingface",
+        "aliases": [
+          "hf",
+          "hugging-face"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "iflowcn",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "inception",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "inference",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "io-net",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "jiekou",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "kimi-for-coding",
+        "aliases": [
+          "kimi-coding",
+          "kimi-code"
+        ],
+        "source": "models.dev",
+        "notes": "Distinct from moonshotai/kimi alias; this is a coding-specific variant"
+      },
+      {
+        "canonical_id": "llama",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "llamacpp",
+        "aliases": [
+          "llama-cpp",
+          "llama.cpp",
+          "llama-server"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "lmstudio",
+        "aliases": [
+          "lm-studio"
+        ],
+        "source": "models.dev+codex"
+      },
+      {
+        "canonical_id": "lucidquery",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "minimax",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "minimax-cn",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "minimax-cn-coding-plan",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "minimax-coding-plan",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "mistral",
+        "aliases": [
+          "mistralai"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "mistralrs",
+        "aliases": [
+          "mistral.rs",
+          "mistral-rs"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "moark",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "modelscope",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "moonshotai",
+        "aliases": [
+          "moonshot",
+          "kimi"
+        ],
+        "source": "models.dev",
+        "notes": "MoonshotAI is the company; Kimi is the product name"
+      },
+      {
+        "canonical_id": "moonshotai-cn",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "morph",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "nano-gpt",
+        "aliases": [
+          "nanogpt"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "nebius",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "nova",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "novita-ai",
+        "aliases": [
+          "novita"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "nvidia",
+        "aliases": [
+          "nim",
+          "nvidia-nim"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "ollama",
+        "aliases": [],
+        "source": "codex"
+      },
+      {
+        "canonical_id": "ollama-cloud",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "openai",
+        "aliases": [],
+        "source": "all"
+      },
+      {
+        "canonical_id": "openai-codex",
+        "aliases": [
+          "codex",
+          "chatgpt-codex"
+        ],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "opencode",
+        "aliases": [
+          "opencode-zen"
+        ],
+        "source": "models.dev+opencode",
+        "notes": "Meta-routing provider in opencode; models.dev has as provider"
+      },
+      {
+        "canonical_id": "openrouter",
+        "aliases": [
+          "open-router"
+        ],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "ovhcloud",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "perplexity",
+        "aliases": [
+          "pplx"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "poe",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "privatemode-ai",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "requesty",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "sap-ai-core",
+        "aliases": [
+          "sap"
+        ],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "scaleway",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "siliconflow",
+        "aliases": [
+          "silicon-flow"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "siliconflow-cn",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "stackit",
+        "aliases": [],
+        "source": "Pi runtime"
+      },
+      {
+        "canonical_id": "submodel",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "synthetic",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "togetherai",
+        "aliases": [
+          "together",
+          "together-ai"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "upstage",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "v0",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "venice",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "vercel",
+        "aliases": [
+          "vercel-ai-gateway"
+        ],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "vivgrid",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "vultr",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "wandb",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "xai",
+        "aliases": [
+          "grok",
+          "x-ai"
+        ],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "xiaomi",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "zai",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "zai-coding-plan",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "zenmux",
+        "aliases": [],
+        "source": "models.dev+opencode"
+      },
+      {
+        "canonical_id": "zhipuai",
+        "aliases": [
+          "zhipu",
+          "glm"
+        ],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "zhipuai-coding-plan",
+        "aliases": [],
+        "source": "models.dev"
+      },
+      {
+        "canonical_id": "gmi",
+        "aliases": [
+          "gmi-cloud",
+          "gmi-serving"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "coreweave",
+        "aliases": [
+          "coreweave-serverless"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "sakana",
+        "aliases": [
+          "sakana-ai"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "wafer",
+        "aliases": [
+          "wafer-serverless"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "qianfan",
+        "aliases": [
+          "baidu-qianfan"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "umans",
+        "aliases": [
+          "umans-ai"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "kilo",
+        "aliases": [
+          "kilo-gateway",
+          "kilo-ai"
+        ],
+        "source": "omp-registry"
+      },
+      {
+        "canonical_id": "opencode-go",
+        "aliases": [],
+        "source": "omp-registry"
+      }
     ]
   },
-
   "alias_lookup_table": {
     "_comment": "Flat alias->canonical lookup for implementation. Includes all aliases from canonical_id_map.",
     "antigravity": "google-antigravity",
@@ -182,9 +706,18 @@
     "vercel-ai-gateway": "vercel",
     "vertexai": "google-vertex",
     "x-ai": "xai",
-    "zhipu": "zhipuai"
+    "zhipu": "zhipuai",
+    "gmi-cloud": "gmi",
+    "gmi-serving": "gmi",
+    "coreweave-serverless": "coreweave",
+    "sakana-ai": "sakana",
+    "wafer-serverless": "wafer",
+    "baidu-qianfan": "qianfan",
+    "umans-ai": "umans",
+    "kilo-gateway": "kilo",
+    "kilo-ai": "kilo",
+    "opencode-zen": "opencode"
   },
-
   "credential_resolution_precedence": {
     "scope": "src/auth.rs AuthStorage::resolve_api_key",
     "steps": [
@@ -196,7 +729,6 @@
     ],
     "alias_behavior": "Canonical IDs and aliases share stored and external credential lookup; alias resolution is not a separate precedence tier."
   },
-
   "retired_provider_ids": [
     {
       "provider_id": "github-models",
@@ -205,10 +737,9 @@
       "replacement_policy": "No transparent replacement. github-copilot is a separate supported native provider."
     }
   ],
-
   "summary": {
-    "total_canonical_ids": 94,
-    "total_aliases": 51,
+    "total_canonical_ids": 102,
+    "total_aliases": 61,
     "retired_provider_ids": 1,
     "normalization": "trim + case-insensitive registered canonical-or-alias match"
   }

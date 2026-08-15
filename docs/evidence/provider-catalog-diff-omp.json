@@ -1984,5 +1984,37 @@
       "models": 12,
       "max_context_window": 1000000
     }
+  },
+  "post_implementation": {
+    "ours_after": 102,
+    "added_canonical_ids": [
+      "coreweave",
+      "gmi",
+      "kilo",
+      "opencode-go",
+      "qianfan",
+      "sakana",
+      "umans",
+      "wafer"
+    ],
+    "added_aliases": [
+      "gmi-cloud",
+      "gmi-serving",
+      "coreweave-serverless",
+      "sakana-ai",
+      "wafer-serverless",
+      "baidu-qianfan",
+      "umans-ai",
+      "kilo-gateway",
+      "kilo-ai",
+      "opencode-zen"
+    ],
+    "notes": [
+      "coreweave: omp also sends OpenAI-Project header (COREWEAVE_PROJECT) for model discovery; static preset guarantees bearer-key request shaping only",
+      "kilo/wafer/opencode-go: omp registry login is OAuth/device flow; presets here are env-key only and claim no OAuth",
+      "umans: omp descriptor routes via anthropic-messages (x-api-key), not openai-completions",
+      "sakana: omp descriptor routes via openai-responses",
+      "zhipu: no omp descriptor with that exact id; pi zhipuai/zhipuai-coding-plan cover the GLM surface"
+    ]
   }
 }

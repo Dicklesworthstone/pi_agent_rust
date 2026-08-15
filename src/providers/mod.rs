@@ -2107,6 +2107,32 @@ export default function init(pi) {
     }
 
     #[test]
+    fn suggest_similar_providers_covers_omp_delta_presets() {
+        // bd-cv653.7.3: typo/near-miss inputs must keep resolving to the new
+        // presets after their aliases joined the table.
+        let cases: [(&str, &str); 5] = [
+            ("qianfa", "qianfan"),
+            ("coreweav", "coreweave"),
+            ("opencode-zn", "opencode"),
+            ("opencode-g", "opencode-go"),
+            ("umans-ai", "umans"),
+        ];
+        for (input, expected) in cases {
+            let suggestions = suggest_similar_providers(input);
+            assert!(
+                suggestions.contains(&expected.to_string()),
+                "expected '{expected}' in suggestions for '{input}': {suggestions:?}"
+            );
+        }
+        // Newly added aliases must not hijack suggestions for unrelated ids.
+        let opencode = suggest_similar_providers("opencode");
+        assert!(
+            opencode.contains(&"opencode".to_string()),
+            "exact id must remain the top suggestion: {opencode:?}"
+        );
+    }
+
+    #[test]
     fn edit_distance_basic_cases() {
         assert_eq!(edit_distance(b"", b""), 0);
         assert_eq!(edit_distance(b"abc", b"abc"), 0);

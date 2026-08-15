@@ -2547,3 +2547,356 @@ fn input_type_rejects_unknown_values() {
         });
     assert!(err.to_string().contains("unknown variant"));
 }
+
+// ── Wave C2: omp-catalog delta presets (bd-cv653.7.3) ───────────────────
+//
+// Each case was machine-verified against omp's registry/catalog descriptors
+// (docs/evidence/provider-catalog-diff-omp.json): api kind, base_url host,
+// and auth env keys all come from the omp descriptor for the provider.
+
+const WAVE_C2_PRESET_CASES: [(&str, &str, &str, bool); 8] = [
+    (
+        "gmi",
+        "openai-completions",
+        "https://api.gmi-serving.com/v1",
+        true,
+    ),
+    (
+        "coreweave",
+        "openai-completions",
+        "https://api.inference.wandb.ai/v1",
+        true,
+    ),
+    ("sakana", "openai-responses", "https://api.sakana.ai/v1", true),
+    ("wafer", "openai-completions", "https://pass.wafer.ai/v1", true),
+    (
+        "qianfan",
+        "openai-completions",
+        "https://qianfan.baidubce.com/v2",
+        true,
+    ),
+    (
+        "umans",
+        "anthropic-messages",
+        "https://api.code.umans.ai/v1/messages",
+        false,
+    ),
+    (
+        "kilo",
+        "openai-completions",
+        "https://api.kilo.ai/api/gateway",
+        true,
+    ),
+    (
+        "opencode-go",
+        "openai-completions",
+        "https://opencode.ai/zen/go/v1",
+        true,
+    ),
+];
+
+#[test]
+fn wave_c2_presets_resolve_metadata_defaults_and_factory_route() {
+    let harness = TestHarness::new("wave_c2_presets_resolve_metadata_defaults_and_factory_route");
+    for (provider_id, expected_api, expected_base_url, expected_auth_header) in WAVE_C2_PRESET_CASES
+    {
+        let defaults = provider_routing_defaults(provider_id)
+            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+        harness
+            .log()
+            .info_ctx("wave_c2.defaults", "metadata defaults", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("api".to_string(), defaults.api.to_string()));
+                ctx.push(("base_url".to_string(), defaults.base_url.to_string()));
+                ctx.push(("auth_header".to_string(), defaults.auth_header.to_string()));
+            });
+        assert_eq!(defaults.api, expected_api);
+        assert_eq!(defaults.base_url, expected_base_url);
+        assert_eq!(defaults.auth_header, expected_auth_header);
+        assert_eq!(canonical_provider_id(provider_id), Some(provider_id));
+
+        let mut entry = make_model_entry(provider_id, "wave-c2-default-model", expected_base_url);
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should route {provider_id}: {e}"));
+        harness
+            .log()
+            .info_ctx("wave_c2.factory", "factory route", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("name".to_string(), provider.name().to_string()));
+                ctx.push(("api".to_string(), provider.api().to_string()));
+            });
+        assert_eq!(provider.name(), provider_id);
+        assert_eq!(provider.api(), expected_api);
+        assert_eq!(provider.model_id(), "wave-c2-default-model");
+    }
+}
+
+#[test]
+fn wave_c2_env_keys_match_omp_descriptors() {
+    let harness = TestHarness::new("wave_c2_env_keys_match_omp_descriptors");
+    let cases: [(&str, &[&str]); 8] = [
+        ("gmi", &["GMI_API_KEY"]),
+        ("coreweave", &["COREWEAVE_API_KEY", "WANDB_API_KEY"]),
+        ("sakana", &["SAKANA_API_KEY", "FUGU_API_KEY"]),
+        ("wafer", &["WAFER_SERVERLESS_API_KEY"]),
+        ("qianfan", &["QIANFAN_API_KEY"]),
+        ("umans", &["UMANS_AI_CODING_PLAN_API_KEY"]),
+        ("kilo", &["KILO_API_KEY"]),
+        ("opencode-go", &["OPENCODE_API_KEY"]),
+    ];
+    for (provider_id, expected_keys) in cases {
+        let keys = provider_auth_env_keys(provider_id);
+        harness
+            .log()
+            .info_ctx("wave_c2.env", "auth env keys", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("env_keys".to_string(), keys.join(",")));
+            });
+        assert_eq!(keys, expected_keys, "{provider_id} env keys drifted");
+    }
+}
+
+fn wave_c2_ping_context() -> (Context<'static>, StreamOptions, String) {
+    let context = Context {
+        system_prompt: Some("Be concise.".to_string().into()),
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text("Ping".to_string()),
+            timestamp: 0,
+        })]
+        .into(),
+        tools: Vec::new().into(),
+    };
+    let options = StreamOptions {
+        max_tokens: Some(64),
+        ..Default::default()
+    };
+    (context, options, "Ping".to_string())
+}
+
+#[test]
+fn wave_c2_openai_completions_streams_use_chat_completions_path_and_bearer_auth() {
+    let harness = TestHarness::new(
+        "wave_c2_openai_completions_streams_use_chat_completions_path_and_bearer_auth",
+    );
+    let completions_cases: [(&str, &str); 6] = [
+        ("gmi", "wave-c2-gmi-token"),
+        ("coreweave", "wave-c2-coreweave-token"),
+        ("wafer", "wave-c2-wafer-token"),
+        ("qianfan", "wave-c2-qianfan-token"),
+        ("kilo", "wave-c2-kilo-token"),
+        ("opencode-go", "wave-c2-opencode-go-token"),
+    ];
+    for (index, (provider_id, api_key)) in completions_cases.into_iter().enumerate() {
+        let defaults = provider_routing_defaults(provider_id)
+            .unwrap_or_else(|| panic!("missing metadata defaults for {provider_id}"));
+        assert_eq!(defaults.api, "openai-completions");
+        assert!(defaults.auth_header);
+
+        let server = harness.start_mock_http_server();
+        let path_prefix = format!("/wave-c2/{index}/{}", provider_id.replace('-', "_"));
+        let expected_path = format!("{path_prefix}/chat/completions");
+        server.add_route(
+            "POST",
+            &expected_path,
+            text_event_stream_response(openai_chat_sse_body()),
+        );
+
+        // Route through the metadata-declared api kind, overriding only the
+        // host with the fixture server (base_url path shape is preserved).
+        let mut entry = make_model_entry(
+            provider_id,
+            "wave-c2-stream-model",
+            &format!("{}{}", server.base_url(), path_prefix),
+        );
+        entry.model.api.clear();
+        let provider = create_provider(&entry, None)
+            .unwrap_or_else(|e| panic!("create_provider should stream-route {provider_id}: {e}"));
+        assert_eq!(provider.api(), "openai-completions");
+
+        let (context, base_options, _) = wave_c2_ping_context();
+        let options = StreamOptions {
+            api_key: Some(api_key.to_string()),
+            ..base_options
+        };
+        drive_provider_stream_to_done(provider, context, options);
+
+        let requests = server.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "expected exactly one request for {provider_id}"
+        );
+        let request = &requests[0];
+        harness
+            .log()
+            .info_ctx("wave_c2.stream", "request lock", |ctx| {
+                ctx.push(("provider".to_string(), provider_id.to_string()));
+                ctx.push(("path".to_string(), request.path.clone()));
+                ctx.push((
+                    "authorization".to_string(),
+                    request_header(&request.headers, "authorization").unwrap_or_default(),
+                ));
+            });
+        assert_eq!(request.path, expected_path);
+        let expected_auth = format!("Bearer {api_key}");
+        assert_eq!(
+            request_header(&request.headers, "authorization").as_deref(),
+            Some(expected_auth.as_str())
+        );
+        assert_eq!(
+            request_header(&request.headers, "content-type").as_deref(),
+            Some("application/json")
+        );
+    }
+}
+
+#[test]
+fn wave_c2_sakana_streams_via_openai_responses_path_with_bearer_auth() {
+    let harness =
+        TestHarness::new("wave_c2_sakana_streams_via_openai_responses_path_with_bearer_auth");
+    let defaults = provider_routing_defaults("sakana").expect("sakana defaults");
+    assert_eq!(defaults.api, "openai-responses");
+    assert!(defaults.auth_header);
+
+    let server = harness.start_mock_http_server();
+    let expected_path = "/wave-c2/sakana/responses";
+    server.add_route(
+        "POST",
+        expected_path,
+        text_event_stream_response(openai_responses_sse_body()),
+    );
+
+    let mut entry = make_model_entry(
+        "sakana",
+        "wave-c2-sakana-model",
+        &format!("{}/wave-c2/sakana", server.base_url()),
+    );
+    entry.model.api.clear();
+    let provider =
+        create_provider(&entry, None).expect("create_provider should stream-route sakana");
+    assert_eq!(provider.api(), "openai-responses");
+
+    let (context, base_options, _) = wave_c2_ping_context();
+    let options = StreamOptions {
+        api_key: Some("wave-c2-sakana-token".to_string()),
+        ..base_options
+    };
+    drive_provider_stream_to_done(provider, context, options);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one request for sakana");
+    let request = &requests[0];
+    harness
+        .log()
+        .info_ctx("wave_c2.stream", "sakana request lock", |ctx| {
+            ctx.push(("path".to_string(), request.path.clone()));
+            ctx.push((
+                "authorization".to_string(),
+                request_header(&request.headers, "authorization").unwrap_or_default(),
+            ));
+        });
+    assert_eq!(request.path, expected_path);
+    assert_eq!(
+        request_header(&request.headers, "authorization").as_deref(),
+        Some("Bearer wave-c2-sakana-token")
+    );
+    assert_eq!(
+        request_header(&request.headers, "content-type").as_deref(),
+        Some("application/json")
+    );
+}
+
+#[test]
+fn wave_c2_umans_streams_via_anthropic_messages_path_with_x_api_key() {
+    let harness =
+        TestHarness::new("wave_c2_umans_streams_via_anthropic_messages_path_with_x_api_key");
+    let defaults = provider_routing_defaults("umans").expect("umans defaults");
+    assert_eq!(defaults.api, "anthropic-messages");
+    assert!(!defaults.auth_header);
+
+    let server = harness.start_mock_http_server();
+    let expected_path = "/wave-c2/umans/v1/messages";
+    server.add_route(
+        "POST",
+        expected_path,
+        text_event_stream_response(anthropic_messages_sse_body()),
+    );
+
+    let mut entry = make_model_entry(
+        "umans",
+        "wave-c2-umans-model",
+        &format!("{}/wave-c2/umans", server.base_url()),
+    );
+    entry.model.api.clear();
+    let provider =
+        create_provider(&entry, None).expect("create_provider should stream-route umans");
+    assert_eq!(provider.api(), "anthropic-messages");
+
+    let api_key = "wave-c2-umans-token";
+    let (context, base_options, _) = wave_c2_ping_context();
+    let options = StreamOptions {
+        api_key: Some(api_key.to_string()),
+        ..base_options
+    };
+    drive_provider_stream_to_done(provider, context, options);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "expected exactly one request for umans");
+    let request = &requests[0];
+    harness
+        .log()
+        .info_ctx("wave_c2.stream", "umans request lock", |ctx| {
+            ctx.push(("path".to_string(), request.path.clone()));
+            ctx.push((
+                "x-api-key".to_string(),
+                request_header(&request.headers, "x-api-key").unwrap_or_default(),
+            ));
+        });
+    assert_eq!(request.path, expected_path);
+    assert_eq!(
+        request_header(&request.headers, "x-api-key").as_deref(),
+        Some(api_key)
+    );
+    assert!(request_header(&request.headers, "authorization").is_none());
+    assert_eq!(
+        request_header(&request.headers, "anthropic-version").as_deref(),
+        Some("2023-06-01")
+    );
+}
+
+#[test]
+fn wave_c2_aliases_resolve_and_do_not_collide() {
+    let harness = TestHarness::new("wave_c2_aliases_resolve_and_do_not_collide");
+    let cases: [(&str, &str); 10] = [
+        ("gmi-cloud", "gmi"),
+        ("gmi-serving", "gmi"),
+        ("coreweave-serverless", "coreweave"),
+        ("sakana-ai", "sakana"),
+        ("wafer-serverless", "wafer"),
+        ("baidu-qianfan", "qianfan"),
+        ("umans-ai", "umans"),
+        ("kilo-gateway", "kilo"),
+        ("kilo-ai", "kilo"),
+        ("opencode-zen", "opencode"),
+    ];
+    for (alias, expected_canonical) in cases {
+        let resolved = canonical_provider_id(alias)
+            .unwrap_or_else(|| panic!("alias '{alias}' should resolve"));
+        harness.log().info_ctx("wave_c2.alias", "alias", |ctx| {
+            ctx.push(("alias".to_string(), alias.to_string()));
+            ctx.push(("canonical".to_string(), resolved.to_string()));
+        });
+        assert_eq!(resolved, expected_canonical);
+        // Case-insensitive resolution must not produce a different provider.
+        let upper = canonical_provider_id(&alias.to_uppercase())
+            .unwrap_or_else(|| panic!("uppercase alias '{alias}' should resolve"));
+        assert_eq!(upper, expected_canonical);
+    }
+    // The OpenCode tiers stay distinct after the opencode-zen alias was added.
+    assert_eq!(canonical_provider_id("opencode"), Some("opencode"));
+    assert_eq!(canonical_provider_id("opencode-go"), Some("opencode-go"));
+    let zen = provider_routing_defaults("opencode").expect("zen defaults");
+    let go = provider_routing_defaults("opencode-go").expect("go defaults");
+    assert_ne!(zen.base_url, go.base_url);
+}
