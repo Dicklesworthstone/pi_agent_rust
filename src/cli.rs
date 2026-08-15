@@ -676,6 +676,36 @@ mod tests {
         assert_eq!(cli.model.as_deref(), Some("claude-opus-4"));
     }
 
+    /// bd-cv653.3.1: role model flags parse independently and together.
+    #[test]
+    fn parse_role_model_flags() {
+        let cli = Cli::parse_from(["pi", "--smol", "openai/gpt-5-mini"]);
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+        assert!(cli.slow.is_none());
+        assert!(cli.plan.is_none());
+
+        let cli = Cli::parse_from([
+            "pi",
+            "--smol",
+            "openai/gpt-5-mini",
+            "--slow",
+            "anthropic/claude-opus-4-7:max",
+            "--plan",
+            "google/gemini-3-pro",
+        ]);
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+        assert_eq!(cli.slow.as_deref(), Some("anthropic/claude-opus-4-7:max"));
+        assert_eq!(cli.plan.as_deref(), Some("google/gemini-3-pro"));
+    }
+
+    /// bd-cv653.3.1: role flags compose with the classic model flags.
+    #[test]
+    fn parse_role_flags_compose_with_model_flag() {
+        let cli = Cli::parse_from(["pi", "--model", "gpt-5.5", "--smol", "openai/gpt-5-mini"]);
+        assert_eq!(cli.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(cli.smol.as_deref(), Some("openai/gpt-5-mini"));
+    }
+
     #[test]
     fn parse_provider_flag() {
         let cli = Cli::parse_from(["pi", "--provider", "openai"]);

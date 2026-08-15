@@ -1195,6 +1195,63 @@ mod tests {
         assert!(matches!(scout.source, AgentSource::Project));
     }
 
+    /// bd-cv653.3.1: agent-def `model:` pin beats the role spec; the role
+    /// spec is used only when the definition has no pin; no spec at all keeps
+    /// the ambient-inheritance behavior (no --model passed).
+    #[test]
+    fn child_args_role_model_precedence() {
+        let base = AgentDefinition {
+            name: "scout".to_string(),
+            description: "inspect".to_string(),
+            model: None,
+            reasoning: None,
+            tools: None,
+            skills: Vec::new(),
+            system_prompt: String::new(),
+            source: AgentSource::User,
+            file_path: PathBuf::from("/tmp/scout.md"),
+        };
+        let args_of = |agent: &AgentDefinition, spec: Option<&str>| {
+            child_args(agent, "inspect provider", spec)
+                .iter()
+                .map(|arg| arg.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        };
+        let model_value = |args: &[String]| {
+            args.windows(2)
+                .find(|pair| pair[0] == "--model")
+                .map(|pair| pair[1].clone())
+        };
+
+        // No pin + role spec → role spec is used (task/smol resolution
+        // happens at the registry; here we only prove the wire shape).
+        let args = args_of(&base, Some("openai/gpt-5-mini:low"));
+        assert_eq!(
+            model_value(&args).as_deref(),
+            Some("openai/gpt-5-mini:low"),
+            "role spec must be passed as --model when the agent def has no pin"
+        );
+
+        // Pin present → pin wins over the role spec.
+        let pinned = AgentDefinition {
+            model: Some("ai-router/gpt-5.6-sol".to_string()),
+            ..base.clone()
+        };
+        let args = args_of(&pinned, Some("openai/gpt-5-mini:low"));
+        assert_eq!(
+            model_value(&args).as_deref(),
+            Some("ai-router/gpt-5.6-sol"),
+            "agent-def model pin must beat the role spec"
+        );
+
+        // No pin and no spec → no --model flag at all (ambient inheritance).
+        let args = args_of(&base, None);
+        assert!(
+            model_value(&args).is_none(),
+            "no role spec and no pin must not inject --model"
+        );
+    }
+
     #[test]
     fn child_args_keep_model_effort_tools_skills_and_prompt() {
         let agent = AgentDefinition {

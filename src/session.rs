@@ -11181,7 +11181,7 @@ mod tests {
     #[test]
     fn test_model_change_role_field_backward_compat() {
         // Legacy serialization: no `role` key at all.
-        let legacy_json = r#"{"id":"mc1","parentId":null,"timestamp":1706918401000,"provider":"openai","modelId":"gpt-4"}"#;
+        let legacy_json = r#"{"type":"model_change","id":"mc1","parentId":null,"timestamp":"2026-02-03T00:00:01.000Z","provider":"openai","modelId":"gpt-4"}"#;
         let entry: SessionEntry = serde_json::from_str(legacy_json)
             .expect("legacy role-less ModelChange must still parse");
         if let SessionEntry::ModelChange(mc) = &entry {

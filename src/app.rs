@@ -1686,6 +1686,183 @@ mod tests {
         assert!(!selection.model_entry.model.id.is_empty());
     }
 
+    // === Model roles (bd-cv653.3.1) ===
+
+    fn role_test_registry() -> ModelRegistry {
+        registry_with_entries(vec![
+            test_model_entry("gpt-5.5", "openai", true),
+            test_model_entry("gpt-5-mini", "openai", true),
+            test_model_entry("claude-haiku-4-5", "anthropic", true),
+        ])
+    }
+
+    fn config_with_roles(roles: crate::config::ModelRoleSettings) -> Config {
+        Config {
+            model_roles: Some(roles),
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn resolve_role_model_cli_flag_beats_settings() {
+        let cli = cli::Cli::parse_from(["pi", "--smol", "openai/gpt-5.5"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            smol: Some("anthropic/claude-haiku-4-5".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Smol, &cli, &config, &registry)
+            .expect("smol should resolve");
+        assert_eq!(resolution.model_entry.model.id, "gpt-5.5");
+        assert_eq!(resolution.source, "cli");
+        assert!(resolution.warning.is_none());
+    }
+
+    #[test]
+    fn resolve_role_model_uses_settings_spec_with_thinking_suffix() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            slow: Some("openai/gpt-5.5:max".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Slow, &cli, &config, &registry)
+            .expect("slow should resolve");
+        assert_eq!(resolution.model_entry.model.id, "gpt-5.5");
+        assert_eq!(resolution.source, "settings");
+        assert_eq!(
+            resolution.thinking_level,
+            Some(model::ThinkingLevel::Max),
+            "spec :thinking suffix must be honored"
+        );
+    }
+
+    #[test]
+    fn resolve_role_model_nondefault_falls_back_to_default_role() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("anthropic/claude-haiku-4-5".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Advisor, &cli, &config, &registry)
+            .expect("advisor falls back to default role");
+        assert_eq!(resolution.model_entry.model.id, "claude-haiku-4-5");
+        assert_eq!(resolution.source, "default-role");
+    }
+
+    #[test]
+    fn resolve_role_model_unresolvable_spec_warns_never_aborts() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            commit: Some("nosuch/ghost-model".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        let resolution = resolve_role_model(ModelRole::Commit, &cli, &config, &registry)
+            .expect("falls through to a registry entry");
+        assert!(
+            resolution.warning.is_some(),
+            "unresolvable spec must carry a warning"
+        );
+    }
+
+    #[test]
+    fn resolve_role_model_default_role_unconfigured_returns_none() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let config = Config::default();
+        let registry = role_test_registry();
+        assert!(
+            resolve_role_model(ModelRole::Default, &cli, &config, &registry).is_none(),
+            "unconfigured default role defers to the legacy default flow"
+        );
+    }
+
+    #[test]
+    fn subagent_role_spec_prefers_task_then_smol() {
+        let both = config_with_roles(crate::config::ModelRoleSettings {
+            task: Some("openai/gpt-5.5".to_string()),
+            smol: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            subagent_role_spec(&both).as_deref(),
+            Some("openai/gpt-5.5"),
+            "task role wins when both are set"
+        );
+        let smol_only = config_with_roles(crate::config::ModelRoleSettings {
+            smol: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(
+            subagent_role_spec(&smol_only).as_deref(),
+            Some("openai/gpt-5-mini"),
+            "smol is the task fallback"
+        );
+        assert!(
+            subagent_role_spec(&Config::default()).is_none(),
+            "no roles configured → None (ambient inheritance)"
+        );
+    }
+
+    #[test]
+    fn titling_model_entry_never_falls_back_to_default_role() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        // Default role configured but tiny/smol unset: titling stays off.
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("openai/gpt-5.5".to_string()),
+            ..Default::default()
+        });
+        let registry = role_test_registry();
+        assert!(
+            titling_model_entry(&cli, &config, &registry).is_none(),
+            "titling must not burn the (possibly expensive) default model"
+        );
+
+        let config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("openai/gpt-5.5".to_string()),
+            smol: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        let entry = titling_model_entry(&cli, &config, &registry).expect("smol resolves");
+        assert_eq!(entry.model.id, "gpt-5-mini");
+    }
+
+    #[test]
+    fn titling_model_entry_disabled_by_setting() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let mut config = config_with_roles(crate::config::ModelRoleSettings {
+            tiny: Some("openai/gpt-5-mini".to_string()),
+            ..Default::default()
+        });
+        config.titling = Some(crate::config::TitlingSettings {
+            auto_title: Some(false),
+        });
+        let registry = role_test_registry();
+        assert!(titling_model_entry(&cli, &config, &registry).is_none());
+    }
+
+    #[test]
+    fn select_model_and_thinking_model_roles_default_outranks_legacy_defaults() {
+        let cli = cli::Cli::parse_from(["pi"]);
+        let mut config = config_with_roles(crate::config::ModelRoleSettings {
+            default: Some("anthropic/claude-haiku-4-5".to_string()),
+            ..Default::default()
+        });
+        config.default_provider = Some("openai".to_string());
+        config.default_model = Some("gpt-5.5".to_string());
+        let session = Session::in_memory();
+        let registry = role_test_registry();
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("selection");
+        assert_eq!(
+            selection.model_entry.model.id, "claude-haiku-4-5",
+            "modelRoles.default must outrank defaultProvider/defaultModel"
+        );
+    }
+
+
     #[test]
     fn select_model_and_thinking_provider_only_prefers_ready_model() {
         let cli = cli::Cli::parse_from(["pi", "--provider", "acme"]);

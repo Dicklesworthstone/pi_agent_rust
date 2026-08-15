@@ -590,3 +590,61 @@ fn tui_degradation_drill_preserves_input_and_semantics_under_pressure() {
     finish_agent_and_preserve_input(&mut app, &mut trace);
     assert_tui_degradation_evidence(&app, &mut trace);
 }
+
+/// bd-cv653.3.1: `/model <role> <spec>` assigns a session-scoped role
+/// override and records a role-tagged ModelChange entry; `/model <role>`
+/// alone reports the assignment; unknown role-like tokens never assign.
+#[test]
+fn slash_model_role_assignment_and_query() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+
+    // Assign: exact provider/model match against available_models.
+    let result = app.handle_slash_model("advisor openai/gpt-5.2");
+    assert!(result.is_none(), "role assignment is a status-only action");
+    assert_eq!(
+        app.role_model_overrides.get(&crate::models::ModelRole::Advisor),
+        Some(&("openai".to_string(), "gpt-5.2".to_string())),
+        "override recorded for the advisor role"
+    );
+
+    // Session carries a role-tagged ModelChange entry.
+    let guard = app.session.try_lock().expect("session lock");
+    let role_entries: Vec<_> = guard
+        .entries_for_current_path()
+        .iter()
+        .filter_map(|e| match e {
+            crate::session::SessionEntry::ModelChange(mc) => Some(mc),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        role_entries
+            .iter()
+            .any(|mc| mc.role.as_deref() == Some("advisor")
+                && mc.provider == "openai"
+                && mc.model_id == "gpt-5.2"),
+        "role-tagged ModelChange entry present"
+    );
+    drop(guard);
+
+    // Query: `/model advisor` reports the assignment without changing state.
+    app.status_message = None;
+    let result = app.handle_slash_model("advisor");
+    assert!(result.is_none());
+    let status = app.status_message.clone().unwrap_or_default();
+    assert!(
+        status.contains("advisor") && status.contains("openai/gpt-5.2"),
+        "query reports assignment, got: {status}"
+    );
+
+    // Planted negative: a two-token pattern whose first token is NOT a role
+    // must not create any override.
+    let before = app.role_model_overrides.len();
+    let _ = app.handle_slash_model("notarole openai/gpt-5.2");
+    assert_eq!(
+        app.role_model_overrides.len(),
+        before,
+        "non-role first token must not assign"
+    );
+}
