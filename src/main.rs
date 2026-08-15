@@ -1875,8 +1875,7 @@ async fn run(
             .map(|sm| sm.model.clone())
             .collect::<Vec<_>>();
         let available_models = model_registry.get_available();
-        let title_model_entry =
-            pi::app::titling_model_entry(cli, &config, &model_registry);
+        let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
 
         run_interactive_mode(
             agent_session,
