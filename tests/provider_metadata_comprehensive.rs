@@ -1394,3 +1394,45 @@ fn no_accidental_duplicate_routing_defaults() {
         violations.join("\n")
     );
 }
+
+/// bd-cv653.7.3: docs/models.md carries a GENERATED provider table between
+/// `<!-- PROVIDER_TABLE:BEGIN -->` / `:END -->` markers. The checked-in section
+/// must match `render_provider_docs_table()` exactly; regenerate with
+/// `PI_BLESS_MODELS_DOC=1 cargo test --test provider_metadata_comprehensive`.
+#[test]
+fn docs_models_provider_table_matches_registry() {
+    const BEGIN: &str = "<!-- PROVIDER_TABLE:BEGIN -->";
+    const END: &str = "<!-- PROVIDER_TABLE:END -->";
+    let doc_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/models.md");
+    let doc = std::fs::read_to_string(&doc_path).expect("read docs/models.md");
+    let begin = doc
+        .find(BEGIN)
+        .unwrap_or_else(|| panic!("docs/models.md is missing {BEGIN}"));
+    let end = doc
+        .find(END)
+        .unwrap_or_else(|| panic!("docs/models.md is missing {END}"));
+    assert!(begin < end, "table markers out of order in docs/models.md");
+    let section = doc[begin + BEGIN.len()..end].trim().to_string();
+    let expected = pi::provider_metadata::render_provider_docs_table()
+        .trim()
+        .to_string();
+
+    if std::env::var_os("PI_BLESS_MODELS_DOC").is_some() {
+        // Bless path: regenerate the marked section in place.
+        let mut updated = String::with_capacity(doc.len() + expected.len());
+        updated.push_str(&doc[..begin + BEGIN.len()]);
+        updated.push_str("\n\n");
+        updated.push_str(&expected);
+        updated.push_str("\n\n");
+        updated.push_str(&doc[end..]);
+        std::fs::write(&doc_path, updated).expect("bless docs/models.md");
+        return;
+    }
+
+    assert_eq!(
+        section, expected,
+        "docs/models.md provider table is stale; regenerate with \
+         PI_BLESS_MODELS_DOC=1 cargo test --test provider_metadata_comprehensive \
+         docs_models_provider_table_matches_registry"
+    );
+}

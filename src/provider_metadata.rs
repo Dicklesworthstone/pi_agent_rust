@@ -1874,6 +1874,50 @@ pub fn split_provider_model_spec(model_spec: &str) -> Option<(&str, &str)> {
     Some((provider, model_id))
 }
 
+/// Render the bundled-provider table for `docs/models.md` (bd-cv653.7.3).
+///
+/// The docs table is GENERATED from this registry so prose never drifts from
+/// code; `tests/provider_metadata_comprehensive.rs` asserts the checked-in
+/// docs section matches this exact output (regenerate with
+/// `PI_BLESS_MODELS_DOC=1 cargo test ...docs_provider_table...`).
+#[must_use]
+pub fn render_provider_docs_table() -> String {
+    let mut out = String::from(
+        "| Provider ID | Name | Aliases | Auth env keys | Onboarding |\n\
+         |---|---|---|---|---|\n",
+    );
+    for meta in PROVIDER_METADATA {
+        let name = meta.display_name.unwrap_or("-");
+        let aliases = if meta.aliases.is_empty() {
+            "-".to_string()
+        } else {
+            meta.aliases.join(", ")
+        };
+        let env_keys = if meta.auth_env_keys.is_empty() {
+            "-".to_string()
+        } else {
+            meta.auth_env_keys
+                .iter()
+                .map(|k| format!("`{k}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let onboarding = match meta.onboarding {
+            ProviderOnboardingMode::BuiltInNative => "native",
+            ProviderOnboardingMode::OpenAICompatiblePreset => "openai-compatible preset",
+            ProviderOnboardingMode::NativeAdapterRequired => "native adapter",
+        };
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "| `{}` | {} | {} | {} | {} |\n",
+                meta.canonical_id, name, aliases, env_keys, onboarding
+            ),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
