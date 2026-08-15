@@ -46,6 +46,9 @@ pub struct Config {
     pub default_thinking_level: Option<String>,
     #[serde(alias = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
+    /// Per-role model assignments (see [`ModelRoleSettings`], bd-cv653.3.1).
+    #[serde(alias = "modelRoles")]
+    pub model_roles: Option<ModelRoleSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -302,6 +305,28 @@ pub struct RetrySettings {
     pub max_delay_ms: Option<u32>,
 }
 
+/// Per-role model assignments (bd-cv653.3.1).
+///
+/// Each value is a model spec string: `"provider/model"` (optionally with a
+/// `:thinking-level` suffix, e.g. `"openai/gpt-5:high"`). All roles are
+/// optional; unset roles fall back to the `default` role, which itself falls
+/// back to `defaultProvider`/`defaultModel` and then the built-in auto-select.
+/// CLI role flags (`--smol`/`--slow`/`--plan`) override these values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelRoleSettings {
+    pub default: Option<String>,
+    pub smol: Option<String>,
+    pub slow: Option<String>,
+    pub plan: Option<String>,
+    pub commit: Option<String>,
+    pub vision: Option<String>,
+    pub designer: Option<String>,
+    pub task: Option<String>,
+    pub advisor: Option<String>,
+    pub tiny: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -525,6 +550,7 @@ impl Config {
             default_model: other.default_model.or(base.default_model),
             default_thinking_level: other.default_thinking_level.or(base.default_thinking_level),
             enabled_models: other.enabled_models.or(base.enabled_models),
+            model_roles: merge_model_roles(base.model_roles, other.model_roles),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -1162,6 +1188,30 @@ fn merge_markdown(
     match (base, other) {
         (Some(base), Some(other)) => Some(MarkdownSettings {
             code_block_indent: other.code_block_indent.or(base.code_block_indent),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge per-role model assignments field-wise (other wins per role).
+fn merge_model_roles(
+    base: Option<ModelRoleSettings>,
+    other: Option<ModelRoleSettings>,
+) -> Option<ModelRoleSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ModelRoleSettings {
+            default: other.default.or(base.default),
+            smol: other.smol.or(base.smol),
+            slow: other.slow.or(base.slow),
+            plan: other.plan.or(base.plan),
+            commit: other.commit.or(base.commit),
+            vision: other.vision.or(base.vision),
+            designer: other.designer.or(base.designer),
+            task: other.task.or(base.task),
+            advisor: other.advisor.or(base.advisor),
+            tiny: other.tiny.or(base.tiny),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

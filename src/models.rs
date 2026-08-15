@@ -17,6 +17,75 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// Routable model roles (bd-cv653.3.1, port of omp's model-roles concept).
+///
+/// Roles let work be routed by intent: the main conversation runs on
+/// `Default`, cheap fan-out on `Smol`, deep reasoning on `Slow`, plan mode on
+/// `Plan`, and so on. Every role falls back to `Default` when unconfigured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ModelRole {
+    Default,
+    Smol,
+    Slow,
+    Plan,
+    Commit,
+    Vision,
+    Designer,
+    Task,
+    Advisor,
+    Tiny,
+}
+
+impl ModelRole {
+    /// All roles in stable declaration order.
+    pub const ALL: [ModelRole; 10] = [
+        ModelRole::Default,
+        ModelRole::Smol,
+        ModelRole::Slow,
+        ModelRole::Plan,
+        ModelRole::Commit,
+        ModelRole::Vision,
+        ModelRole::Designer,
+        ModelRole::Task,
+        ModelRole::Advisor,
+        ModelRole::Tiny,
+    ];
+
+    /// Canonical lowercase name (as used in settings.json and /model).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ModelRole::Default => "default",
+            ModelRole::Smol => "smol",
+            ModelRole::Slow => "slow",
+            ModelRole::Plan => "plan",
+            ModelRole::Commit => "commit",
+            ModelRole::Vision => "vision",
+            ModelRole::Designer => "designer",
+            ModelRole::Task => "task",
+            ModelRole::Advisor => "advisor",
+            ModelRole::Tiny => "tiny",
+        }
+    }
+
+    /// Parse a role name (case-insensitive). Returns `None` for unknown names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let lowered = name.trim().to_ascii_lowercase();
+        ModelRole::ALL.into_iter().find(|role| role.as_str() == lowered)
+    }
+
+    /// The role a subagent child should use when its agent definition does not
+    /// pin a model: `task` when configured, else `smol`, else `default`.
+    pub const fn subagent_fallback() -> Self {
+        ModelRole::Task
+    }
+}
+
+impl std::fmt::Display for ModelRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelEntry {
     pub model: Model,
