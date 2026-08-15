@@ -1020,7 +1020,10 @@ where
                         id: call_id.clone(),
                         name: name.clone(),
                         arguments: serde_json::Value::Null,
-                        thought_signature: None,
+                        // Preserve the original `fc_...` output-item id so
+                        // subsequent requests can replay it (OpenAI validates
+                        // reasoning/function-call pairing by item id).
+                        thought_signature: Some(id.clone()),
                     }));
 
                     self.pending_events.push_back(StreamEvent::ToolCallStart {
@@ -1063,15 +1066,39 @@ where
                 }
             }
             OpenAIResponsesChunk::OutputItemDone { item } => {
-                if let OpenAIResponsesOutputItemDone::FunctionCall {
-                    id,
-                    call_id,
-                    name,
-                    arguments,
-                } = item
-                {
-                    self.ensure_started();
-                    self.end_tool_call(&id, &call_id, &name, &arguments);
+                let typed: OpenAIResponsesOutputItemDone = serde_json::from_value(item.clone())
+                    .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+                match typed {
+                    OpenAIResponsesOutputItemDone::FunctionCall {
+                        id,
+                        call_id,
+                        name,
+                        arguments,
+                    } => {
+                        self.ensure_started();
+                        self.end_tool_call(&id, &call_id, &name, &arguments);
+                    }
+                    OpenAIResponsesOutputItemDone::Reasoning {
+                        id,
+                        summary,
+                        encrypted_content,
+                    } => {
+                        let summary_text = summary
+                            .iter()
+                            .map(|part| part.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        self.capture_reasoning_item(
+                            &id,
+                            encrypted_content.as_deref(),
+                            &summary_text,
+                            &item,
+                        );
+                    }
+                    OpenAIResponsesOutputItemDone::Message { id } => {
+                        self.capture_message_item_id(&id);
+                    }
+                    OpenAIResponsesOutputItemDone::Unknown => {}
                 }
             }
             OpenAIResponsesChunk::ResponseCompleted { response }
@@ -1117,6 +1144,73 @@ where
         Ok(())
     }
 
+    /// Preserve a completed `reasoning` output item (TS parity: the raw item
+    /// JSON — id, summary, `encrypted_content`, status — is stored in the
+    /// thinking block's `thinking_signature` so subsequent requests can replay
+    /// it verbatim).
+    ///
+    /// The signature lands on the first thinking block streamed for the item.
+    /// A reasoning item that produced no summary/text deltas gets a fresh
+    /// (possibly empty) thinking block, but only when it carries
+    /// `encrypted_content` — otherwise there is nothing replayable and the
+    /// legacy behavior (ignore) is preserved.
+    fn capture_reasoning_item(
+        &mut self,
+        item_id: &str,
+        encrypted_content: Option<&str>,
+        summary_text: &str,
+        raw_item: &serde_json::Value,
+    ) {
+        let existing_idx = self
+            .reasoning_blocks
+            .iter()
+            .filter(|(key, _)| key.item_id == item_id)
+            .map(|(_, idx)| *idx)
+            .min();
+
+        let idx = match existing_idx {
+            Some(idx) => idx,
+            None => {
+                if encrypted_content.is_none() {
+                    return;
+                }
+                self.ensure_started();
+                let idx =
+                    self.reasoning_block_for(ReasoningKind::Summary, item_id.to_string(), 0);
+                if !summary_text.is_empty() {
+                    self.apply_reasoning_snapshot(
+                        ReasoningKind::Summary,
+                        item_id.to_string(),
+                        0,
+                        summary_text.to_string(),
+                    );
+                }
+                idx
+            }
+        };
+
+        if let Some(ContentBlock::Thinking(block)) = self.partial.content.get_mut(idx) {
+            block.thinking_signature = serde_json::to_string(raw_item).ok();
+        }
+    }
+
+    /// Record the original `msg_...` item id on the text blocks streamed for a
+    /// completed `message` output item (TS parity: `textSignature = item.id`),
+    /// enabling faithful replay of the item id on subsequent requests.
+    fn capture_message_item_id(&mut self, item_id: &str) {
+        let indexes: Vec<usize> = self
+            .text_blocks
+            .iter()
+            .filter(|(key, _)| key.item_id == item_id)
+            .map(|(_, idx)| *idx)
+            .collect();
+        for idx in indexes {
+            if let Some(ContentBlock::Text(block)) = self.partial.content.get_mut(idx) {
+                block.text_signature = Some(item_id.to_string());
+            }
+        }
+    }
+
     fn partial_has_tool_call(&self) -> bool {
         self.partial
             .content
@@ -1134,7 +1228,7 @@ where
                     id: call_id.to_string(),
                     name: name.to_string(),
                     arguments: serde_json::Value::Null,
-                    thought_signature: None,
+                    thought_signature: Some(item_id.to_string()),
                 }));
                 (
                     ToolCallState {
@@ -1189,7 +1283,7 @@ where
                 id: tc.call_id.clone(),
                 name: tc.name.clone(),
                 arguments: parsed_args.clone(),
-                thought_signature: None,
+                thought_signature: Some(item_id.to_string()),
             },
         });
 
@@ -1198,6 +1292,7 @@ where
             block.id = tc.call_id;
             block.name = tc.name;
             block.arguments = parsed_args;
+            block.thought_signature = Some(item_id.to_string());
         }
     }
 
@@ -1387,9 +1482,27 @@ enum OpenAIResponsesInputItem {
         role: &'static str,
         content: Vec<OpenAIResponsesAssistantContentPart>,
     },
+    /// Assistant `message` output item replayed with its original item id and
+    /// `status`, mirroring the TS reference (`ResponseOutputMessage`). Only
+    /// emitted when the source text block carries a `text_signature` captured
+    /// from a previous Responses stream; signature-less text keeps the legacy
+    /// role/content shape above.
+    AssistantMessageItem {
+        #[serde(rename = "type")]
+        r#type: &'static str,
+        role: &'static str,
+        id: String,
+        status: &'static str,
+        content: Vec<OpenAIResponsesAssistantContentPart>,
+    },
     FunctionCall {
         #[serde(rename = "type")]
         r#type: &'static str,
+        /// Original Responses output-item id (`fc_...`). Replayed so OpenAI's
+        /// reasoning/function-call pairing validation recognizes the item.
+        /// Absent for legacy sessions with no captured metadata.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         call_id: String,
         name: String,
         arguments: String,
@@ -1400,6 +1513,10 @@ enum OpenAIResponsesInputItem {
         call_id: String,
         output: String,
     },
+    /// Raw provider item replayed verbatim (currently: `reasoning` items with
+    /// their `encrypted_content`, captured on parse into
+    /// `ThinkingContent::thinking_signature`).
+    RawItem(serde_json::Value),
 }
 
 #[derive(Debug, Serialize)]
@@ -1415,7 +1532,14 @@ enum OpenAIResponsesUserContentPart {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OpenAIResponsesAssistantContentPart {
     #[serde(rename = "output_text")]
-    OutputText { text: String },
+    OutputText {
+        text: String,
+        /// Present (as `[]`) only on replayed `message` items, matching the TS
+        /// reference; omitted on legacy role/content assistant items so their
+        /// serialization stays byte-identical.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        annotations: Option<Vec<serde_json::Value>>,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1460,24 +1584,60 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
             Message::Assistant(assistant) => {
                 // Preserve ordering between text and tool calls.
                 let mut pending_text = String::new();
+                let flush_pending =
+                    |pending: &mut String, input: &mut Vec<OpenAIResponsesInputItem>| {
+                        if !pending.is_empty() {
+                            input.push(OpenAIResponsesInputItem::Assistant {
+                                role: "assistant",
+                                content: vec![OpenAIResponsesAssistantContentPart::OutputText {
+                                    text: std::mem::take(pending),
+                                    annotations: None,
+                                }],
+                            });
+                        }
+                    };
 
                 for block in &assistant.content {
                     match block {
-                        ContentBlock::Text(t) => pending_text.push_str(&t.text),
-                        ContentBlock::ToolCall(tc) => {
-                            if !pending_text.is_empty() {
-                                input.push(OpenAIResponsesInputItem::Assistant {
+                        ContentBlock::Text(t) => {
+                            if let Some(item_id) = replayable_message_item_id(t) {
+                                // Replay the original `message` output item with
+                                // its id + status so OpenAI's reasoning pairing
+                                // validation recognizes it (TS parity).
+                                flush_pending(&mut pending_text, &mut input);
+                                input.push(OpenAIResponsesInputItem::AssistantMessageItem {
+                                    r#type: "message",
                                     role: "assistant",
+                                    id: item_id,
+                                    status: "completed",
                                     content: vec![
                                         OpenAIResponsesAssistantContentPart::OutputText {
-                                            text: std::mem::take(&mut pending_text),
+                                            text: t.text.clone(),
+                                            annotations: Some(Vec::new()),
                                         },
                                     ],
                                 });
+                            } else {
+                                pending_text.push_str(&t.text);
                             }
+                        }
+                        ContentBlock::Thinking(thinking) => {
+                            // Replay raw reasoning items (with encrypted_content)
+                            // captured from a previous Responses stream. Thinking
+                            // blocks without a captured raw item keep the legacy
+                            // behavior of being dropped without flushing text.
+                            if let Some(raw_item) = replayable_reasoning_item(thinking) {
+                                flush_pending(&mut pending_text, &mut input);
+                                input.push(OpenAIResponsesInputItem::RawItem(raw_item));
+                            }
+                        }
+                        ContentBlock::ToolCall(tc) => {
+                            flush_pending(&mut pending_text, &mut input);
+                            let (call_id, embedded_item_id) = split_responses_tool_call_id(&tc.id);
                             input.push(OpenAIResponsesInputItem::FunctionCall {
                                 r#type: "function_call",
-                                call_id: tc.id.clone(),
+                                id: replayable_function_call_item_id(tc, embedded_item_id),
+                                call_id: call_id.to_string(),
                                 name: tc.name.clone(),
                                 arguments: tc.arguments.to_string(),
                             });
@@ -1486,14 +1646,7 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                     }
                 }
 
-                if !pending_text.is_empty() {
-                    input.push(OpenAIResponsesInputItem::Assistant {
-                        role: "assistant",
-                        content: vec![OpenAIResponsesAssistantContentPart::OutputText {
-                            text: pending_text,
-                        }],
-                    });
-                }
+                flush_pending(&mut pending_text, &mut input);
             }
             Message::ToolResult(result) => {
                 let mut out = String::new();
@@ -1505,9 +1658,10 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                         out.push_str(&t.text);
                     }
                 }
+                let (call_id, _) = split_responses_tool_call_id(&result.tool_call_id);
                 input.push(OpenAIResponsesInputItem::FunctionCallOutput {
                     r#type: "function_call_output",
-                    call_id: result.tool_call_id.clone(),
+                    call_id: call_id.to_string(),
                     output: out,
                 });
             }
@@ -1515,6 +1669,67 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
     }
 
     input
+}
+
+/// Maximum item-id length OpenAI accepts on replayed input items.
+const MAX_RESPONSES_ITEM_ID_LEN: usize = 64;
+
+/// Split a pi tool-call id into `(call_id, embedded_item_id)`.
+///
+/// Legacy pi-rust sessions store the bare `call_...` id (no `|`), so the split
+/// is the identity and requests stay byte-identical. Sessions written by TS
+/// pi-mono store `"<call_id>|<item_id>"`; the suffix is the original `fc_...`
+/// output-item id.
+fn split_responses_tool_call_id(id: &str) -> (&str, Option<&str>) {
+    id.split_once('|')
+        .map_or((id, None), |(call_id, item_id)| (call_id, Some(item_id)))
+}
+
+/// Original `fc_...` output-item id to replay on a `function_call` input item.
+///
+/// Prefers the id captured on parse (stored in `thought_signature`), falling
+/// back to a TS-session embedded id. Only ids that look like Responses
+/// function-call item ids (`fc` prefix, within OpenAI's 64-char limit) are
+/// replayed; anything else (e.g. a Gemini thought signature) is ignored so the
+/// request keeps the legacy shape.
+fn replayable_function_call_item_id(
+    tool_call: &ToolCall,
+    embedded_item_id: Option<&str>,
+) -> Option<String> {
+    tool_call
+        .thought_signature
+        .as_deref()
+        .or(embedded_item_id)
+        .filter(|id| id.starts_with("fc") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
+        .map(ToString::to_string)
+}
+
+/// Original `msg_...` output-item id to replay on an assistant `message` item.
+///
+/// Present only when the text block carries a `text_signature` captured from a
+/// previous Responses stream. Foreign or oversized signatures fall back to the
+/// legacy signature-less shape.
+fn replayable_message_item_id(text: &TextContent) -> Option<String> {
+    text.text_signature
+        .as_deref()
+        .filter(|id| id.starts_with("msg") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
+        .map(ToString::to_string)
+}
+
+/// Raw `reasoning` output item to replay verbatim, parsed from the
+/// `thinking_signature` captured on stream parse.
+///
+/// The signature must be a JSON object with `"type": "reasoning"`; opaque
+/// signatures from other providers (Anthropic base64 blobs, etc.) fail the
+/// parse or the tag check and are skipped, preserving legacy behavior.
+fn replayable_reasoning_item(thinking: &ThinkingContent) -> Option<serde_json::Value> {
+    let signature = thinking.thinking_signature.as_deref()?;
+    let value: serde_json::Value = serde_json::from_str(signature).ok()?;
+    if value.get("type").and_then(serde_json::Value::as_str) == Some("reasoning") {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 fn convert_user_message_to_responses(content: &UserContent) -> OpenAIResponsesInputItem {
@@ -1573,8 +1788,11 @@ enum OpenAIResponsesChunk {
     },
     #[serde(rename = "response.output_item.added")]
     OutputItemAdded { item: OpenAIResponsesOutputItem },
+    /// Raw item payload kept as JSON so `reasoning` items (encrypted content,
+    /// ids, status) can be preserved verbatim; typed interpretation happens in
+    /// `process_event` via [`OpenAIResponsesOutputItemDone`].
     #[serde(rename = "response.output_item.done")]
-    OutputItemDone { item: OpenAIResponsesOutputItemDone },
+    OutputItemDone { item: serde_json::Value },
     #[serde(rename = "response.function_call_arguments.delta")]
     FunctionCallArgumentsDelta { item_id: String, delta: String },
     #[serde(rename = "response.content_part.done")]
@@ -1681,8 +1899,24 @@ enum OpenAIResponsesOutputItemDone {
         #[serde(default)]
         arguments: String,
     },
+    #[serde(rename = "reasoning")]
+    Reasoning {
+        id: String,
+        #[serde(default)]
+        summary: Vec<OpenAIResponsesReasoningSummaryPart>,
+        #[serde(default)]
+        encrypted_content: Option<String>,
+    },
+    #[serde(rename = "message")]
+    Message { id: String },
     #[serde(other)]
     Unknown,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIResponsesReasoningSummaryPart {
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
