@@ -2774,7 +2774,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         };
         let provider = entry.model.provider.clone();
-        let model_id = entry.model.id.clone();
+        let model_id = entry.model.id;
         self.role_model_overrides
             .insert(role, (provider.clone(), model_id.clone()));
         if let Ok(mut session_guard) = self.session.try_lock() {

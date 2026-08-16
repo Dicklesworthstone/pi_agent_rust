@@ -153,6 +153,7 @@ fn create_bench_app() -> PiApp {
         model_entry,
         model_scope,
         available_models,
+        None,
         Vec::new(),
         event_tx,
         bench_runtime_handle(),

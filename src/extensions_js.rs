@@ -25029,7 +25029,7 @@ mod tests {
         __pi_end_extension(__pi_test_secret);
     "#;
 
-    const CTX_PARITY_DISPATCH_SEQUENCE: &str = r#"
+    const CTX_PARITY_DISPATCH_SEQUENCE: &str = r"
         const persistedPayload = {
             hasUI: false,
             cwd: '/workspace',
@@ -25093,7 +25093,7 @@ mod tests {
             })
             .catch((error) => { globalThis.ctxParity.error = String((error && error.stack) || error); })
             .finally(() => { globalThis.ctxParity.done = true; });
-    "#;
+    ";
 
     #[test]
     fn extension_ctx_exposes_model_system_prompt_and_session_identity() {
@@ -25203,7 +25203,7 @@ mod tests {
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
                         hasUI: false,
                         cwd: '/workspace',
@@ -25217,7 +25217,7 @@ mod tests {
                         .then(() => { globalThis.modelPref.modelAbsent = globalThis.modelPref.model; })
                         .catch((error) => { globalThis.modelPref.error = String(error); })
                         .finally(() => { globalThis.modelPref.done = true; });
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("dispatch model preference events");
@@ -25409,7 +25409,7 @@ mod tests {
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     const sessionPayload = {
                         hasUI: false,
                         cwd: '/workspace',
@@ -25435,7 +25435,7 @@ mod tests {
                         })
                         .catch((error) => { globalThis.identityKeep.error = String(error); })
                         .finally(() => { globalThis.identityKeep.done = true; });
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("dispatch identity events");
@@ -25501,7 +25501,7 @@ mod tests {
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
                         hasUI: false,
                         cwd: '/workspace',
@@ -25526,7 +25526,7 @@ mod tests {
                     })
                         .catch((error) => { globalThis.modelFind.error = String(error); })
                         .finally(() => { globalThis.modelFind.done = true; });
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("dispatch model-find event");
@@ -25583,7 +25583,7 @@ mod tests {
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
+                    r"
                     // Host payloads carry the boot-time prompt (gh #167).
                     const payload = { hasUI: false, cwd: '/workspace', systemPrompt: 'Base prompt.' };
                     globalThis.promptSeed.done = false;
@@ -25597,7 +25597,7 @@ mod tests {
                         .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, payload))
                         .catch((error) => { globalThis.promptSeed.error = String(error); })
                         .finally(() => { globalThis.promptSeed.done = true; });
-                    "#,
+                    ",
                 ))
                 .await
                 .expect("dispatch prompt-seed events");

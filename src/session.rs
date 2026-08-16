@@ -13103,11 +13103,12 @@ mod tests {
         .expect("rewrite session");
 
         let resumed = run_async(async {
-            Session::resume_with_picker(
+            // Boxed: the picker future tops clippy::large_futures' threshold.
+            Box::pin(Session::resume_with_picker(
                 Some(temp.path()),
                 &Config::default(),
                 Some("1".to_string()),
-            )
+            ))
             .await
         })
         .expect("resume with picker");

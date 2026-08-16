@@ -18,7 +18,6 @@ use common::logging::validate_jsonl_v2_only;
 use pi::model::ContentBlock;
 use pi::tools::{Tool, ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
-use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,6 +95,7 @@ async fn resolve_raw(tool: &dyn Tool, input: Value) -> pi::error::Result<ToolOut
 // ---------------------------------------------------------------------------
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn ast_edit_staging_lifecycle_resolve_applies_atomically() {
     asupersync::test_utils::run_test(|| async {
         let harness = TestHarness::new("ast_edit_staging_lifecycle_resolve_applies_atomically");

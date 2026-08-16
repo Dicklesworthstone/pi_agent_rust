@@ -38,47 +38,45 @@ pub enum ModelRole {
 
 impl ModelRole {
     /// All roles in stable declaration order.
-    pub const ALL: [ModelRole; 10] = [
-        ModelRole::Default,
-        ModelRole::Smol,
-        ModelRole::Slow,
-        ModelRole::Plan,
-        ModelRole::Commit,
-        ModelRole::Vision,
-        ModelRole::Designer,
-        ModelRole::Task,
-        ModelRole::Advisor,
-        ModelRole::Tiny,
+    pub const ALL: [Self; 10] = [
+        Self::Default,
+        Self::Smol,
+        Self::Slow,
+        Self::Plan,
+        Self::Commit,
+        Self::Vision,
+        Self::Designer,
+        Self::Task,
+        Self::Advisor,
+        Self::Tiny,
     ];
 
     /// Canonical lowercase name (as used in settings.json and /model).
     pub const fn as_str(self) -> &'static str {
         match self {
-            ModelRole::Default => "default",
-            ModelRole::Smol => "smol",
-            ModelRole::Slow => "slow",
-            ModelRole::Plan => "plan",
-            ModelRole::Commit => "commit",
-            ModelRole::Vision => "vision",
-            ModelRole::Designer => "designer",
-            ModelRole::Task => "task",
-            ModelRole::Advisor => "advisor",
-            ModelRole::Tiny => "tiny",
+            Self::Default => "default",
+            Self::Smol => "smol",
+            Self::Slow => "slow",
+            Self::Plan => "plan",
+            Self::Commit => "commit",
+            Self::Vision => "vision",
+            Self::Designer => "designer",
+            Self::Task => "task",
+            Self::Advisor => "advisor",
+            Self::Tiny => "tiny",
         }
     }
 
     /// Parse a role name (case-insensitive). Returns `None` for unknown names.
     pub fn from_name(name: &str) -> Option<Self> {
         let lowered = name.trim().to_ascii_lowercase();
-        ModelRole::ALL
-            .into_iter()
-            .find(|role| role.as_str() == lowered)
+        Self::ALL.into_iter().find(|role| role.as_str() == lowered)
     }
 
     /// The role a subagent child should use when its agent definition does not
     /// pin a model: `task` when configured, else `smol`, else `default`.
     pub const fn subagent_fallback() -> Self {
-        ModelRole::Task
+        Self::Task
     }
 }
 

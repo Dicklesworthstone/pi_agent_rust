@@ -710,10 +710,10 @@ fn resolve_role_spec(
 }
 
 /// The spec string configured for a role in merged settings, if any.
-pub fn role_spec_from_settings<'a>(
-    roles: &'a crate::config::ModelRoleSettings,
+pub fn role_spec_from_settings(
+    roles: &crate::config::ModelRoleSettings,
     role: ModelRole,
-) -> Option<&'a str> {
+) -> Option<&str> {
     let spec = match role {
         ModelRole::Default => roles.default.as_deref(),
         ModelRole::Smol => roles.smol.as_deref(),
@@ -731,7 +731,7 @@ pub fn role_spec_from_settings<'a>(
 
 /// The spec string configured for a role via CLI flag (`--smol`/`--slow`/
 /// `--plan`; other roles have no CLI flags), if any.
-fn role_spec_from_cli<'a>(cli: &'a cli::Cli, role: ModelRole) -> Option<&'a str> {
+fn role_spec_from_cli(cli: &cli::Cli, role: ModelRole) -> Option<&str> {
     let spec = match role {
         ModelRole::Smol => cli.smol.as_deref(),
         ModelRole::Slow => cli.slow.as_deref(),
@@ -812,7 +812,9 @@ pub fn resolve_role_model(
 }
 
 /// The model spec a subagent child should run with when its agent definition
-/// does not pin `model:` — the `task` role, else `smol`, else `None` (child
+/// does not pin `model:`.
+///
+/// Resolution order: the `task` role, else `smol`, else `None` (child
 /// inherits the parent ambient environment). Returns the raw spec string; the
 /// child process resolves it through its own startup registry.
 pub fn subagent_role_spec(config: &Config) -> Option<String> {
@@ -822,7 +824,8 @@ pub fn subagent_role_spec(config: &Config) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve the model entry used for automatic session titling
+/// Resolve the model entry used for automatic session titling.
+///
 /// (bd-cv653.3.1 round-4): the explicitly configured `tiny` role, else
 /// `smol`, else `None`. Deliberately does NOT fall back to the default role —
 /// titling must stay cheap; when no cheap role resolves, it disables silently.

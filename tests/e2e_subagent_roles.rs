@@ -20,7 +20,7 @@ use common::logging::validate_jsonl_v2_only;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// OpenAI chat-completions SSE: assistant message that calls the subagent tool.
+/// `OpenAI` `chat-completions` SSE: assistant message that calls the `subagent` tool.
 fn tool_call_sse_body() -> String {
     [
         r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"subagent","arguments":"{\"agent\":\"scout\",\"task\":\"reply briefly\"}"}}]}}]}"#,
@@ -33,7 +33,7 @@ fn tool_call_sse_body() -> String {
     .join("\n")
 }
 
-/// OpenAI chat-completions SSE: plain final text.
+/// `OpenAI` `chat-completions` SSE: plain final text.
 fn text_sse_body(text: &str) -> String {
     [
         format!(r#"data: {{"choices":[{{"index":0,"delta":{{"content":"{text}"}}}}]}}"#).as_str(),
@@ -55,6 +55,7 @@ fn sse_response(body: String) -> MockHttpResponse {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_subagent_child_uses_task_role_model() {
     let harness = TestHarness::new("e2e_subagent_child_uses_task_role_model");
     harness

@@ -75,6 +75,7 @@ fn write_fixture_crate(root: &Path) {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_ast_edit_codemod_fixture_crate_still_compiles() {
     asupersync::test_utils::run_test(|| async {
         let harness = TestHarness::new("e2e_ast_edit_codemod_fixture_crate_still_compiles");
