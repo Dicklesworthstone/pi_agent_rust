@@ -5210,6 +5210,86 @@ mod tests {
     }
 
     #[test]
+    fn test_package_pi_manifest_without_extensions_skips_convention_directory() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let package_root = temp_dir.path().join("pkg");
+            let entry_path = package_root.join("extensions").join("index.ts");
+            fs::create_dir_all(entry_path.parent().expect("entry parent")).expect("create dir");
+            fs::write(&entry_path, "export default {}").expect("write index.ts");
+            fs::write(
+                package_root.join("package.json"),
+                serde_json::to_string_pretty(&json!({
+                    "name": "pkg",
+                    "version": "1.0.0",
+                    "pi": {
+                        "skills": []
+                    }
+                }))
+                .expect("serialize manifest"),
+            )
+            .expect("write manifest");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let sources = vec![package_root.to_string_lossy().to_string()];
+            let resolved = manager
+                .resolve_extension_sources(
+                    &sources,
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect("resolve extension sources");
+
+            assert!(
+                resolved.extensions.is_empty(),
+                "a package with a pi manifest must only load explicitly declared resource fields"
+            );
+        });
+    }
+
+    #[test]
+    fn test_package_without_pi_manifest_uses_convention_directory() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let package_root = temp_dir.path().join("pkg");
+            let entry_path = package_root.join("extensions").join("index.ts");
+            fs::create_dir_all(entry_path.parent().expect("entry parent")).expect("create dir");
+            fs::write(&entry_path, "export default {}").expect("write index.ts");
+            fs::write(
+                package_root.join("package.json"),
+                serde_json::to_string_pretty(&json!({
+                    "name": "pkg",
+                    "version": "1.0.0"
+                }))
+                .expect("serialize manifest"),
+            )
+            .expect("write manifest");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let sources = vec![package_root.to_string_lossy().to_string()];
+            let resolved = manager
+                .resolve_extension_sources(
+                    &sources,
+                    ResolveExtensionSourcesOptions {
+                        local: false,
+                        temporary: true,
+                    },
+                )
+                .await
+                .expect("resolve extension sources");
+
+            assert_eq!(resolved.extensions.len(), 1);
+            let entry = &resolved.extensions[0];
+            assert_eq!(entry.path, entry_path);
+            assert!(entry.enabled);
+            assert_eq!(entry.metadata.source, sources[0]);
+        });
+    }
+
+    #[test]
     fn test_resolve_extension_sources_errors_on_malformed_package_manifest() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");
