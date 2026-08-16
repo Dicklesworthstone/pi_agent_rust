@@ -1078,6 +1078,124 @@ fn discover_sibling_index_entries_skips_cluster_root_with_package_json() {
     );
 }
 
+/// Writes a two-package workspace layout (`primary-ext`, `sibling-ext`,
+/// each with `pi.extensions = ["./index.ts"]`) under `workspace_root` and
+/// returns the primary and sibling entry paths.
+fn write_two_package_workspace(workspace_root: &Path) -> (PathBuf, PathBuf) {
+    let package_dir = workspace_root.join("primary-ext");
+    let sibling_dir = workspace_root.join("sibling-ext");
+    std::fs::create_dir_all(&package_dir).expect("mkdir primary");
+    std::fs::create_dir_all(&sibling_dir).expect("mkdir sibling");
+
+    let primary = package_dir.join("index.ts");
+    std::fs::write(&primary, "export default {};\n").expect("write primary");
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+    )
+    .expect("write primary package.json");
+
+    let sibling = sibling_dir.join("index.ts");
+    std::fs::write(&sibling, "export default {};\n").expect("write sibling");
+    std::fs::write(
+        sibling_dir.join("package.json"),
+        r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+    )
+    .expect("write sibling package.json");
+
+    (primary, sibling)
+}
+
+#[test]
+fn workspace_bundle_accepts_pnpm_workspace_marker() {
+    let temp = tempdir().expect("tempdir");
+    let workspace_root = temp.path().join("pnpm-monorepo");
+    std::fs::create_dir_all(&workspace_root).expect("mkdir root");
+    let (primary, sibling) = write_two_package_workspace(&workspace_root);
+    std::fs::write(
+        workspace_root.join("pnpm-workspace.yaml"),
+        "packages:\n  - \"*\"\n",
+    )
+    .expect("write pnpm-workspace.yaml");
+
+    assert!(is_declared_workspace_root(&workspace_root));
+    let discovered = discover_related_extension_entries(&primary).expect("discover related");
+    assert!(
+        discovered.contains(&safe_canonicalize(&sibling)),
+        "a pnpm-workspace.yaml marker must allow sibling bundling: {discovered:?}"
+    );
+}
+
+#[test]
+fn workspace_bundle_accepts_object_form_workspaces_packages() {
+    let temp = tempdir().expect("tempdir");
+    let workspace_root = temp.path().join("object-monorepo");
+    std::fs::create_dir_all(&workspace_root).expect("mkdir root");
+    let (primary, sibling) = write_two_package_workspace(&workspace_root);
+    std::fs::write(
+        workspace_root.join("package.json"),
+        r#"{ "name": "monorepo", "workspaces": { "packages": ["primary-ext", "sibling-ext"] } }"#,
+    )
+    .expect("write workspace package.json");
+
+    assert!(is_declared_workspace_root(&workspace_root));
+    let discovered = discover_related_extension_entries(&primary).expect("discover related");
+    assert!(
+        discovered.contains(&safe_canonicalize(&sibling)),
+        "the yarn/npm object `workspaces.packages` form must allow bundling: {discovered:?}"
+    );
+}
+
+#[test]
+fn workspace_bundle_rejects_memberless_or_malformed_workspace_declarations() {
+    let cases: [(&str, &str); 3] = [
+        ("empty-array", r#"{ "workspaces": [] }"#),
+        (
+            "object-without-packages",
+            r#"{ "workspaces": { "nohoist": ["**/react-native"] } }"#,
+        ),
+        (
+            "object-empty-packages",
+            r#"{ "workspaces": { "packages": [] } }"#,
+        ),
+    ];
+
+    for (label, root_manifest) in cases {
+        let temp = tempdir().expect("tempdir");
+        let workspace_root = temp.path().join(label);
+        std::fs::create_dir_all(&workspace_root).expect("mkdir root");
+        let (primary, _sibling) = write_two_package_workspace(&workspace_root);
+        std::fs::write(workspace_root.join("package.json"), root_manifest)
+            .expect("write workspace package.json");
+
+        assert!(
+            !is_declared_workspace_root(&workspace_root),
+            "case {label}: a member-less workspaces declaration must not opt in"
+        );
+        let discovered = discover_related_extension_entries(&primary)
+            .unwrap_or_else(|err| panic!("case {label}: discovery must fail open, got: {err}"));
+        assert_eq!(
+            discovered,
+            vec![safe_canonicalize(&primary)],
+            "case {label}: without workspace members only the primary entry may load"
+        );
+    }
+
+    // A malformed root manifest must fail open at the workspace-marker
+    // check itself (never treat unreadable JSON as an opt-in). Full
+    // discovery separately fails closed on malformed ancestor manifests,
+    // covered by `discover_related_extension_entries_errors_on_malformed_package_manifest`.
+    let temp = tempdir().expect("tempdir");
+    let workspace_root = temp.path().join("malformed-json");
+    std::fs::create_dir_all(&workspace_root).expect("mkdir root");
+    std::fs::write(workspace_root.join("package.json"), r#"{ "workspaces": ["#)
+        .expect("write malformed package.json");
+    assert!(
+        !is_declared_workspace_root(&workspace_root),
+        "malformed package.json must not be treated as a workspace opt-in"
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn sample_protocol_messages() -> Vec<(&'static str, ExtensionMessage)> {
     vec![

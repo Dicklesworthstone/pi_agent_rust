@@ -4227,20 +4227,20 @@ impl ExtensionManager {
         tx.is_some_and(|sender| sender.send(&cx, response).is_ok())
     }
 
-    /// Build the context payload from the current inner state.
+    /// Build the context payload from an RCU registry snapshot.
     ///
     /// This is extracted so that it can be called once and the result cached
     /// across multiple rapid-fire event dispatches.
-    async fn build_ctx_payload(
-        has_ui: bool,
-        session: Option<Arc<dyn ExtensionSession>>,
-        cwd_override: Option<String>,
-        model_registry_values: &HashMap<String, String>,
-        current_provider: Option<&str>,
-        current_model_id: Option<&str>,
-        extension_models: &[Value],
-        current_system_prompt: Option<&str>,
-    ) -> Value {
+    async fn build_ctx_payload(snap: &RegistrySnapshot) -> Value {
+        let has_ui = snap.has_ui;
+        let session = snap.session.clone();
+        let cwd_override = snap.cwd.clone();
+        let model_registry_values = &snap.model_registry_values;
+        let current_provider = snap.current_provider.as_deref();
+        let current_model_id = snap.current_model_id.as_deref();
+        let extension_models: &[Value] = &snap.extension_models;
+        let current_system_prompt = snap.current_system_prompt.as_deref();
+
         let mut ctx = serde_json::Map::new();
         ctx.insert("hasUI".into(), Value::Bool(has_ui));
         if let Some(cwd) = cwd_override.or_else(|| {
@@ -4296,10 +4296,7 @@ impl ExtensionManager {
         // ctx.modelRegistry.find() shim. Entries are already projected
         // through the credential-free `pi_ai_model_entry_value` shape.
         if !extension_models.is_empty() {
-            ctx.insert(
-                "models".into(),
-                Value::Array(extension_models.to_owned()),
-            );
+            ctx.insert("models".into(), Value::Array(extension_models.to_owned()));
         }
 
         // gh #167: current system prompt (seeded at boot; refreshed per
@@ -4338,25 +4335,10 @@ impl ExtensionManager {
         }
 
         // Cache miss: read state from the RCU snapshot (no mutex needed).
-        let snap = self.read_snapshot();
-        let has_ui = snap.has_ui;
-        let session = snap.session.clone();
-        let cwd = snap.cwd.clone();
         // Rebuild directly from the snapshot to avoid cloning the full
         // model-registry map on cache misses.
-        let payload = Arc::new(
-            Self::build_ctx_payload(
-                has_ui,
-                session,
-                cwd,
-                &snap.model_registry_values,
-                snap.current_provider.as_deref(),
-                snap.current_model_id.as_deref(),
-                &snap.extension_models,
-                snap.current_system_prompt.as_deref(),
-            )
-            .await,
-        );
+        let snap = self.read_snapshot();
+        let payload = Arc::new(Self::build_ctx_payload(&snap).await);
         drop(snap);
 
         // Store in cache (best-effort; if another thread updated generation

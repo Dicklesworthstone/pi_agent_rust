@@ -24794,7 +24794,12 @@ mod tests {
             bridge.len(),
             sha256_hex(bridge.as_bytes())
         );
-        for name in ["node:fs", "@mariozechner/pi-ai", "node:child_process"] {
+        for name in [
+            "node:fs",
+            "@mariozechner/pi-ai",
+            "node:child_process",
+            "@mariozechner/pi-coding-agent",
+        ] {
             let source = modules.get(name).expect("receipt module must exist");
             eprintln!(
                 "PiJS source receipt: {name} len={} sha256={}",
@@ -24802,10 +24807,10 @@ mod tests {
                 sha256_hex(source.as_bytes())
             );
         }
-        assert_eq!(bridge.len(), 196_849);
+        assert_eq!(bridge.len(), 199_560);
         assert_eq!(
             sha256_hex(bridge.as_bytes()),
-            "c1a25d825f82daf35adf11bfacdbc066ba5534e56961ae4a9fd8c91bb0130f7a"
+            "23c94348e553376db60dd44b7e1a481c26863f490cb8fe1d36ae76dc191aaf36"
         );
 
         for (name, expected_len, expected_sha256) in [
@@ -24831,8 +24836,8 @@ mod tests {
             ),
             (
                 "@mariozechner/pi-coding-agent",
-                16_032,
-                "c3d9fc22b4255d7687fca7e97417357043b87f360e5cc2f8154ecc08b78754f4",
+                23_756,
+                "b0c34939de7e6b4c1de2a593c0d33bd09bf1d111b539f37a461cfb6fed4cea2c",
             ),
             (
                 "@mariozechner/pi-tui",
@@ -25534,19 +25539,27 @@ mod tests {
             // Exact upstream constants (byte parity with session.rs).
             assert_eq!(
                 probe["prefixes"]["compactionPrefix"],
-                json!("The conversation history before this point was compacted into the following summary:\n\n<summary>\n")
+                json!(
+                    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n"
+                )
             );
             assert_eq!(probe["prefixes"]["compactionSuffix"], json!("\n</summary>"));
             assert_eq!(
                 probe["prefixes"]["branchPrefix"],
-                json!("The following is a summary of a branch that this conversation came back from:\n\n<summary>\n")
+                json!(
+                    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n"
+                )
             );
             assert_eq!(probe["prefixes"]["branchSuffix"], json!("</summary>"));
 
             let result = probe["result"].as_array().expect("array result");
             // 10 inputs, minus the excluded bashExecution and the unknown
             // role, gives 8 messages.
-            assert_eq!(result.len(), 8, "unexpected convertToLlm output: {result:?}");
+            assert_eq!(
+                result.len(),
+                8,
+                "unexpected convertToLlm output: {result:?}"
+            );
 
             // Passthrough roles survive unchanged.
             assert_eq!(result[0]["role"], json!("user"));
@@ -25569,11 +25582,15 @@ mod tests {
             // branch/compaction summaries get the exact prefix/suffix bytes.
             assert_eq!(
                 result[6]["content"][0]["text"],
-                json!("The following is a summary of a branch that this conversation came back from:\n\n<summary>\nbranch things</summary>")
+                json!(
+                    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\nbranch things</summary>"
+                )
             );
             assert_eq!(
                 result[7]["content"][0]["text"],
-                json!("The conversation history before this point was compacted into the following summary:\n\n<summary>\nold history\n</summary>")
+                json!(
+                    "The conversation history before this point was compacted into the following summary:\n\n<summary>\nold history\n</summary>"
+                )
             );
         });
     }

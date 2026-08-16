@@ -13089,6 +13089,13 @@ fn resolve_package_declared_entries(
 /// mirror — must never cause its unrelated siblings to be absorbed into
 /// one bundle. Only a root that opts in with an explicit workspace marker
 /// may donate sibling packages.
+///
+/// Both npm/yarn `workspaces` shapes are recognized: the shorthand array of
+/// globs and the object form, whose member list lives under `packages`
+/// (yarn additionally allows `nohoist`, which declares no members on its
+/// own). A declared-but-empty member list is not a workspace root: there
+/// are no members to donate, so clustering stays off. Malformed JSON fails
+/// open toward "not a workspace" rather than erroring discovery.
 fn is_declared_workspace_root(dir: &Path) -> bool {
     if dir.join("pnpm-workspace.yaml").is_file() {
         return true;
@@ -13105,7 +13112,10 @@ fn is_declared_workspace_root(dir: &Path) -> bool {
     };
     match json.get("workspaces") {
         Some(Value::Array(entries)) => !entries.is_empty(),
-        Some(Value::Object(map)) => !map.is_empty(),
+        Some(Value::Object(map)) => map
+            .get("packages")
+            .and_then(Value::as_array)
+            .is_some_and(|packages| !packages.is_empty()),
         _ => false,
     }
 }
@@ -13118,6 +13128,13 @@ fn discover_workspace_bundle_entries(package_dir: &Path) -> Result<Vec<PathBuf>>
     // Never infer a workspace from a lone self-contained child package:
     // the parent must explicitly declare itself a workspace root.
     if !is_declared_workspace_root(workspace_root) {
+        tracing::debug!(
+            event = "ext.discovery.bundle.skipped",
+            package_dir = %package_dir.display(),
+            workspace_root = %workspace_root.display(),
+            reason = "parent lacks workspace marker (package.json workspaces / pnpm-workspace.yaml)",
+            "Not clustering sibling packages: parent did not opt in as a workspace root"
+        );
         return Ok(Vec::new());
     }
 
@@ -13224,6 +13241,13 @@ fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
     // fragments of one bundle — clustering there would absorb foreign
     // extensions wholesale. Fail closed and load only the primary.
     if cluster_root.join("package.json").is_file() {
+        tracing::debug!(
+            event = "ext.discovery.sibling_index.skipped",
+            primary = %primary.display(),
+            cluster_root = %cluster_root.display(),
+            reason = "cluster root carries its own package.json",
+            "Not clustering bare sibling index entries: loading only the primary entry"
+        );
         return Vec::new();
     }
 
@@ -13233,6 +13257,14 @@ fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 if path.join("package.json").is_file() {
+                    tracing::debug!(
+                        event = "ext.discovery.sibling_index.skipped",
+                        primary = %primary.display(),
+                        cluster_root = %cluster_root.display(),
+                        packaged_sibling = %path.display(),
+                        reason = "cluster contains a self-contained packaged sibling",
+                        "Not clustering bare sibling index entries: loading only the primary entry"
+                    );
                     return Vec::new();
                 }
                 candidate_dirs.push(path);

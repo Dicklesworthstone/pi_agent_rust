@@ -1526,6 +1526,15 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         ContentBlock::Thinking(t) => {
             t.thinking_signature
                 .as_ref()
+                // Only echo a signature that is actually an Anthropic one.
+                // A session recorded on the openai-responses route stores its
+                // raw reasoning item (a JSON object) in `thinking_signature`;
+                // on a mid-session switch to an Anthropic model that JSON would
+                // be sent as an Anthropic `signature` and rejected with a 400.
+                // Anthropic signatures are opaque base64 tokens, so they never
+                // begin with `{` — foreign JSON payloads are dropped, matching
+                // the TS reference's cross-model signature stripping.
+                .filter(|sig| !is_foreign_reasoning_signature(sig))
                 .map(|sig| AnthropicContent::Thinking {
                     thinking: &t.thinking,
                     signature: sig,
@@ -1536,6 +1545,14 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         // subsequent turns, so we do the same.
         ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
     }
+}
+
+/// True when a `thinking_signature` is a foreign (non-Anthropic) reasoning
+/// payload rather than a native Anthropic base64 signature. The openai-responses
+/// route stores its raw reasoning item — a JSON object — in this field; a native
+/// Anthropic signature is opaque base64 and can never begin with `{`.
+fn is_foreign_reasoning_signature(signature: &str) -> bool {
+    signature.trim_start().starts_with('{')
 }
 
 fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
@@ -1565,6 +1582,37 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn thinking_block_drops_foreign_reasoning_signature() {
+        // A native Anthropic signature (opaque base64) is echoed back.
+        let native = ContentBlock::Thinking(ThinkingContent {
+            thinking: "step".to_string(),
+            thinking_signature: Some("Cg8KDXNvbWViYXNlNjQ=".to_string()),
+        });
+        match convert_content_block_to_anthropic(&native) {
+            Some(AnthropicContent::Thinking { signature, .. }) => {
+                assert_eq!(signature, "Cg8KDXNvbWViYXNlNjQ=");
+            }
+            other => panic!("expected thinking block with signature, got {other:?}"),
+        }
+
+        // A foreign openai-responses raw reasoning item (JSON) is dropped so it
+        // is never sent to Anthropic as a signature (would 400).
+        let foreign = ContentBlock::Thinking(ThinkingContent {
+            thinking: "step".to_string(),
+            thinking_signature: Some(
+                r#"{"type":"reasoning","id":"rs_1","encrypted_content":"x"}"#.to_string(),
+            ),
+        });
+        assert!(
+            convert_content_block_to_anthropic(&foreign).is_none(),
+            "foreign JSON reasoning signature must be dropped, not echoed to Anthropic"
+        );
+
+        assert!(is_foreign_reasoning_signature("  {\"type\":\"reasoning\"}"));
+        assert!(!is_foreign_reasoning_signature("Cg8KDXNvbWViYXNlNjQ="));
+    }
 
     #[test]
     fn home_dir_lookup_falls_back_to_userprofile() {

@@ -481,6 +481,9 @@ fn read_auth_file_bounded(path: &Path) -> std::io::Result<Option<String>> {
 }
 
 #[cfg(unix)]
+use crate::platform::read_trusted_symlink_component;
+
+#[cfg(unix)]
 fn open_auth_directory_nofollow(path: &Path, create: bool) -> std::io::Result<File> {
     use std::path::Component;
 
@@ -495,10 +498,11 @@ fn open_auth_directory_nofollow(path: &Path, create: bool) -> std::io::Result<Fi
     .map_err(std::io::Error::from)?;
     let mut directory = File::from(descriptor);
 
+    let mut pending = std::collections::VecDeque::new();
     for component in path.components() {
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => pending.push_back(name.to_os_string()),
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -508,25 +512,52 @@ fn open_auth_directory_nofollow(path: &Path, create: bool) -> std::io::Result<Fi
                     ),
                 ));
             }
-        };
+        }
+    }
 
+    // Bounded trusted-symlink expansion, in the spirit of SYMLOOP_MAX.
+    let mut symlink_budget: u8 = 8;
+    while let Some(name) = pending.pop_front() {
         let flags = rustix::fs::OFlags::RDONLY
             | rustix::fs::OFlags::DIRECTORY
             | rustix::fs::OFlags::NOFOLLOW
             | rustix::fs::OFlags::CLOEXEC;
-        let child = match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
+        let child = match rustix::fs::openat(&directory, &name, flags, rustix::fs::Mode::empty()) {
             Ok(child) => child,
             Err(rustix::io::Errno::NOENT) if create => {
                 match rustix::fs::mkdirat(
                     &directory,
-                    name,
+                    &name,
                     rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR | rustix::fs::Mode::XUSR,
                 ) {
                     Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                     Err(error) => return Err(std::io::Error::from(error)),
                 }
-                rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                rustix::fs::openat(&directory, &name, flags, rustix::fs::Mode::empty())
                     .map_err(std::io::Error::from)?
+            }
+            // O_NOFOLLOW on a symlink surfaces as ELOOP (POSIX) or ENOTDIR
+            // (macOS with O_DIRECTORY). Expand trusted system symlinks such
+            // as macOS `/var -> private/var`; everything else stays closed.
+            Err(errno @ (rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR)) => {
+                let Some((components, absolute)) =
+                    read_trusted_symlink_component(&directory, &name)
+                else {
+                    return Err(std::io::Error::from(errno));
+                };
+                symlink_budget = symlink_budget
+                    .checked_sub(1)
+                    .ok_or_else(|| std::io::Error::from(rustix::io::Errno::LOOP))?;
+                for part in components.into_iter().rev() {
+                    pending.push_front(part);
+                }
+                if absolute {
+                    directory = File::from(
+                        rustix::fs::open("/", flags, rustix::fs::Mode::empty())
+                            .map_err(std::io::Error::from)?,
+                    );
+                }
+                continue;
             }
             Err(error) => return Err(std::io::Error::from(error)),
         };

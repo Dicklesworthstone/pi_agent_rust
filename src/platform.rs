@@ -123,6 +123,54 @@ impl EffectiveModeAccessContext {
     }
 }
 
+/// Expand one trusted symlink component during a secure `O_NOFOLLOW` walk.
+///
+/// Component-wise `O_NOFOLLOW` walks fail closed on every symlink, which is
+/// correct against symlink planting but also rejects benign system symlinks in
+/// the ancestor chain — macOS ships `/var -> private/var`, so the default
+/// `TMPDIR` and several standard locations live behind a root-owned symlink.
+///
+/// A symlink component is trusted only when it is owned by root while this
+/// process is not running as root: an attacker cannot fabricate a root-owned
+/// symlink, and a root process must keep the strict fail-closed behavior
+/// because under euid 0 every self-created symlink is root-owned. The link
+/// target is read once and re-walked component-by-component with `O_NOFOLLOW`
+/// (no kernel-side following), so swapping the symlink after this check
+/// cannot redirect the walk.
+///
+/// Returns the target components to walk (front of the caller's queue) plus
+/// whether the target is absolute, or `None` when the entry is not a trusted
+/// symlink (the caller must then surface its original open error).
+#[cfg(unix)]
+pub(crate) fn read_trusted_symlink_component(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> Option<(Vec<std::ffi::OsString>, bool)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::path::Component;
+
+    let stat = rustix::fs::statat(directory, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).ok()?;
+    let is_symlink =
+        rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Symlink;
+    if !is_symlink || stat.st_uid != 0 || rustix::process::geteuid().is_root() {
+        return None;
+    }
+    let target = rustix::fs::readlinkat(directory, name, Vec::new()).ok()?;
+    let target = Path::new(std::ffi::OsStr::from_bytes(target.as_bytes()));
+    let absolute = target.is_absolute();
+    let mut components = Vec::new();
+    for component in target.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => components.push(part.to_os_string()),
+            // A trusted symlink that climbs upward is outside this narrow
+            // allowance; keep the strict fail-closed behavior for it.
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some((components, absolute))
+}
+
 /// Enforce the Unix permission class selected for the effective process identity.
 ///
 /// Unix selects exactly one class in owner, group, other order; permissions from

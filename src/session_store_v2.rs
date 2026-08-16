@@ -330,11 +330,11 @@ fn open_nofollow_componentwise(
 ) -> std::io::Result<File> {
     use std::path::Component;
 
-    let mut names = Vec::new();
+    let mut pending = std::collections::VecDeque::new();
     for component in path.components() {
         match component {
             Component::RootDir | Component::CurDir => {}
-            Component::Normal(name) => names.push(name),
+            Component::Normal(name) => pending.push_back(name.to_os_string()),
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -347,39 +347,60 @@ fn open_nofollow_componentwise(
         }
     }
 
+    let root_flags = rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC;
     let base = if path.is_absolute() { "/" } else { "." };
-    let descriptor = rustix::fs::open(
-        base,
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
+    let descriptor = rustix::fs::open(base, root_flags, rustix::fs::Mode::empty())
+        .map_err(std::io::Error::from)?;
     let mut directory = File::from(descriptor);
 
-    for (index, name) in names.iter().enumerate() {
-        let is_last = index + 1 == names.len();
+    // Bounded trusted-symlink expansion, in the spirit of SYMLOOP_MAX.
+    let mut symlink_budget: u8 = 8;
+    while let Some(name) = pending.pop_front() {
+        let is_last = pending.is_empty();
         let flags = if is_last {
             oflags | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC
         } else {
-            rustix::fs::OFlags::RDONLY
-                | rustix::fs::OFlags::DIRECTORY
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC
+            root_flags
         };
-        let child = rustix::fs::openat(
+        let child = match rustix::fs::openat(
             &directory,
-            *name,
+            &name,
             flags,
             if is_last {
                 mode
             } else {
                 rustix::fs::Mode::empty()
             },
-        )
-        .map_err(std::io::Error::from)?;
+        ) {
+            Ok(child) => child,
+            // O_NOFOLLOW on a symlink surfaces as ELOOP (POSIX) or ENOTDIR
+            // (macOS with O_DIRECTORY). Expand trusted system symlinks such
+            // as macOS `/var -> private/var`; everything else stays closed.
+            Err(errno @ (rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR)) => {
+                let Some((components, absolute)) =
+                    crate::platform::read_trusted_symlink_component(&directory, &name)
+                else {
+                    return Err(std::io::Error::from(errno));
+                };
+                symlink_budget = symlink_budget
+                    .checked_sub(1)
+                    .ok_or_else(|| std::io::Error::from(rustix::io::Errno::LOOP))?;
+                for part in components.into_iter().rev() {
+                    pending.push_front(part);
+                }
+                if absolute {
+                    directory = File::from(
+                        rustix::fs::open("/", root_flags, rustix::fs::Mode::empty())
+                            .map_err(std::io::Error::from)?,
+                    );
+                }
+                continue;
+            }
+            Err(error) => return Err(std::io::Error::from(error)),
+        };
         if is_last {
             return Ok(File::from(child));
         }
@@ -897,18 +918,35 @@ fn publish_regular_file_via_hard_link_no_replace(
     // existing name. Filesystems without hard-link support fail before the
     // source is unlinked, which is the only safe fallback when renameat2-style
     // no-replace publication is unavailable.
-    use std::os::fd::AsRawFd as _;
-
+    //
+    // Where procfs exists, link the exact open descriptor via
+    // /proc/self/fd so a source-name swap cannot publish a different file.
+    // Elsewhere (macOS test builds, BSDs) devfs refuses hard links through
+    // /dev/fd (EPERM regardless of target state), so link by
+    // directory-relative name; the identity re-check below still refuses to
+    // unlink a swapped source, and an occupied target keeps surfacing as
+    // EEXIST/AlreadyExists.
     #[cfg(any(target_os = "android", target_os = "linux"))]
-    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", source_file.as_raw_fd()));
+    {
+        use std::os::fd::AsRawFd as _;
+
+        let descriptor_path = PathBuf::from(format!("/proc/self/fd/{}", source_file.as_raw_fd()));
+        rustix::fs::linkat(
+            rustix::fs::CWD,
+            &descriptor_path,
+            target_directory,
+            target_name,
+            rustix::fs::AtFlags::SYMLINK_FOLLOW,
+        )
+        .map_err(std::io::Error::from)?;
+    }
     #[cfg(not(any(target_os = "android", target_os = "linux")))]
-    let descriptor_path = PathBuf::from(format!("/dev/fd/{}", source_file.as_raw_fd()));
     rustix::fs::linkat(
-        rustix::fs::CWD,
-        &descriptor_path,
+        source_directory,
+        source_name,
         target_directory,
         target_name,
-        rustix::fs::AtFlags::SYMLINK_FOLLOW,
+        rustix::fs::AtFlags::empty(),
     )
     .map_err(std::io::Error::from)?;
     target_directory.sync_all()?;

@@ -14,8 +14,8 @@
     },
     {
       "category": "multi_capability",
-      "failed": 15,
-      "passed": 27,
+      "failed": 11,
+      "passed": 31,
       "skipped": 0
     },
     {
@@ -26,12 +26,12 @@
     },
     {
       "category": "tool_provider",
-      "failed": 2,
-      "passed": 11,
+      "failed": 1,
+      "passed": 12,
       "skipped": 0
     }
   ],
-  "failed": 20,
+  "failed": 15,
   "failures": [
     {
       "category": "tool_provider",
@@ -72,14 +72,6 @@
       "failure_step": "load_extension",
       "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_community_tmustier_tab_status --nocapture --exact",
       "tier": 1
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "event-bus",
-      "failure_reason": "Extension 'event-bus': event-handler identities differ from the manifest; expected={\"my:notification\", \"session_start\"}, actual={\"session_start\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_event_bus --nocapture --exact",
-      "tier": 2
     },
     {
       "category": "passive",
@@ -139,30 +131,6 @@
     },
     {
       "category": "multi_capability",
-      "extension_id": "third-party/graffioh-pi-screenshots-picker",
-      "failure_reason": "Extension 'third-party/graffioh-pi-screenshots-picker': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\"], expected={\"ss\", \"ss-clear\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_graffioh_pi_screenshots_picker --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "third-party/graffioh-pi-super-curl",
-      "failure_reason": "Extension 'third-party/graffioh-pi-super-curl': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"], expected={\"scurl\", \"scurl-history\", \"scurl-log\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_graffioh_pi_super_curl --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "third-party/jyaunches-pi-canvas",
-      "failure_reason": "Extension 'third-party/jyaunches-pi-canvas': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"ad-name\", \"ask\", \"askwith\", \"assistant\", \"branch\", \"code\", \"codemap\", \"command-center\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"dumb-zone-status\", \"end-review\", \"ephemeral\", \"extensions:update\", \"files\", \"followup\", \"handoff\", \"md\", \"model-sysprompt-appendix\", \"notify\", \"oracle\", \"plan\", \"plan:list\", \"plan:save\", \"preset\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"review\", \"rp-tools-lock\", \"rpbind\", \"sandbox\", \"scurl\", \"scurl-history\", \"scurl-log\", \"session-ask\", \"session:copy-id\", \"session:copy-path\", \"sketch\", \"skill\", \"speedread\", \"ss\", \"ss-clear\", \"steer\", \"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\", \"subagent\", \"system-prompt\", \"theme\", \"todos\", \"tools\", \"ultrathink\", \"usage\", \"vog\", \"ws\"], expected={\"calendar\"}, actual={\"ad-name\", \"ask\", \"askwith\", \"assistant\", \"branch\", \"calendar\", \"code\", \"codemap\", \"command-center\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"dumb-zone-status\", \"end-review\", \"ephemeral\", \"extensions:update\", \"files\", \"followup\", \"handoff\", \"md\", \"model-sysprompt-appendix\", \"notify\", \"oracle\", \"plan\", \"plan:list\", \"plan:save\", \"preset\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"review\", \"rp-tools-lock\", \"rpbind\", \"sandbox\", \"scurl\", \"scurl-history\", \"scurl-log\", \"session-ask\", \"session:copy-id\", \"session:copy-path\", \"sketch\", \"skill\", \"speedread\", \"ss\", \"ss-clear\", \"steer\", \"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\", \"subagent\", \"system-prompt\", \"theme\", \"todos\", \"tools\", \"ultrathink\", \"usage\", \"vog\", \"ws\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_jyaunches_pi_canvas --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
       "extension_id": "third-party/lsj5031-pi-notification-extension",
       "failure_reason": "Extension 'third-party/lsj5031-pi-notification-extension': event-handler identities differ from the manifest; expected={\"agent_end\", \"data\", \"end\", \"error\", \"session_start\", \"timeout\"}, actual={\"agent_end\", \"session_start\"}",
       "failure_step": "load_extension",
@@ -172,7 +140,7 @@
     {
       "category": "multi_capability",
       "extension_id": "third-party/ogulcancelik-pi-sketch",
-      "failure_reason": "Extension 'third-party/ogulcancelik-pi-sketch': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"slow-mode\", \"ss\", \"ss-clear\"], expected={\"sketch\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}",
+      "failure_reason": "Extension 'third-party/ogulcancelik-pi-sketch': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}",
       "failure_step": "load_extension",
       "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_ogulcancelik_pi_sketch --nocapture --exact",
       "tier": 2
@@ -180,24 +148,16 @@
     {
       "category": "event_subscriber",
       "extension_id": "third-party/rytswd-direnv",
-      "failure_reason": "Extension 'third-party/rytswd-direnv': manifest commands capability=false, but runtime registered 15 commands",
+      "failure_reason": "Extension 'third-party/rytswd-direnv': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_start\", \"tool_result\"}, actual={\"session_start\", \"tool_result\"}",
       "failure_step": "load_extension",
       "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_rytswd_direnv --nocapture --exact",
       "tier": 2
-    },
-    {
-      "category": "tool_provider",
-      "extension_id": "third-party/rytswd-questionnaire",
-      "failure_reason": "Extension 'third-party/rytswd-questionnaire': manifest commands capability=false, but runtime registered 15 commands",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_rytswd_questionnaire --nocapture --exact",
-      "tier": 1
     }
   ],
-  "generated_at": "2026-08-04T22:36:17.306Z",
+  "generated_at": "2026-08-16T01:55:24.854Z",
   "must_pass_count": 125,
-  "pass_rate_pct": 84.0,
-  "passed": 105,
+  "pass_rate_pct": 88.0,
+  "passed": 110,
   "schema": "pi.ext.journey_report.v1",
   "skipped": 0,
   "tested": 125

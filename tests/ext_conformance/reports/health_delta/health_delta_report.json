@@ -1,16 +1,16 @@
 {
   "schema": "pi.ext.health_delta.v1",
-  "generated_at": "2026-08-04T22:36:25.130Z",
-  "baseline_path": "/data/projects/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
+  "generated_at": "2026-08-16T01:55:39.983Z",
+  "baseline_path": "/Users/jemanuel/projects/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
   "baseline_date": "2026-08-04T03:26:54Z",
   "current_summary": {
     "excluded": 1,
-    "failed": 80,
-    "manifest_count": 226,
-    "pass_rate_pct": 64.44444444444444,
-    "passed": 145,
+    "failed": 73,
+    "manifest_count": 227,
+    "pass_rate_pct": 67.69911504424779,
+    "passed": 153,
     "skipped": 1,
-    "tested": 225
+    "tested": 226
   },
   "baseline_summary": {
     "failed": 0,
@@ -19,10 +19,10 @@
     "tested": 223
   },
   "aggregate_delta": {
-    "fail_delta": 80,
+    "fail_delta": 73,
     "net_change": 0,
-    "pass_delta": -78,
-    "rate_delta_pct": -35.55555555555556
+    "pass_delta": -70,
+    "rate_delta_pct": -32.30088495575221
   },
   "regressions": [],
   "fixes": [],
@@ -497,9 +497,8 @@
     {
       "id": "event-bus",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'event-bus': event-handler identities differ from the manifest; expected={\"my:notification\", \"session_start\"}, actual={\"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "file-trigger",
@@ -590,14 +589,14 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/agentsbox': manifest commands capability=false, but runtime registered 3 commands"
+      "failure_reason": "Extension 'npm/agentsbox': manifest commands capability=false, but runtime registered 3 commands: {\"agentsbox-help\", \"agentsbox-search\", \"agentsbox-status\"}"
     },
     {
       "id": "npm/aliou-pi-extension-dev",
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/aliou-pi-extension-dev': manifest tools capability=false, but runtime registered 4 tools"
+      "failure_reason": "Extension 'npm/aliou-pi-extension-dev': manifest tools capability=false, but runtime registered 4 tools: {\"detect_package_manager\", \"pi_changelog\", \"pi_docs\", \"pi_version\"}"
     },
     {
       "id": "npm/aliou-pi-guardrails",
@@ -617,7 +616,7 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/aliou-pi-processes': manifest tools capability=false, but runtime registered 1 tools"
+      "failure_reason": "Extension 'npm/aliou-pi-processes': manifest tools capability=false, but runtime registered 1 tools: {\"processes\"}"
     },
     {
       "id": "npm/aliou-pi-synthetic",
@@ -669,21 +668,21 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/juanibiapina-pi-extension-settings': manifest commands capability=false, but runtime registered 1 commands"
+      "failure_reason": "Extension 'npm/juanibiapina-pi-extension-settings': manifest commands capability=false, but runtime registered 1 commands: {\"extension-settings\"}"
     },
     {
       "id": "npm/juanibiapina-pi-files",
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/juanibiapina-pi-files': manifest commands capability=false, but runtime registered 1 commands"
+      "failure_reason": "Extension 'npm/juanibiapina-pi-files': manifest commands capability=false, but runtime registered 1 commands: {\"files\"}"
     },
     {
       "id": "npm/juanibiapina-pi-gob",
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/juanibiapina-pi-gob': manifest commands capability=false, but runtime registered 1 commands"
+      "failure_reason": "Extension 'npm/juanibiapina-pi-gob': manifest commands capability=false, but runtime registered 1 commands: {\"gob\"}"
     },
     {
       "id": "npm/lsp-pi",
@@ -704,7 +703,7 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/marckrenn-pi-sub-core': manifest tools capability=true, but runtime registered 0 tools"
+      "failure_reason": "Extension 'npm/marckrenn-pi-sub-core': manifest tools capability=true, but runtime registered 0 tools: {}"
     },
     {
       "id": "npm/mitsupi",
@@ -986,7 +985,7 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'npm/qualisero-pi-agent-scip': manifest tools capability=false, but runtime registered 6 tools"
+      "failure_reason": "Extension 'npm/qualisero-pi-agent-scip': manifest tools capability=false, but runtime registered 6 tools: {\"scip_find_definition\", \"scip_find_references\", \"scip_list_symbols\", \"scip_project_tree\", \"scip_reindex\", \"scip_search_symbols\"}"
     },
     {
       "id": "npm/ralph-loop-pi",
@@ -1250,14 +1249,14 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/aliou-pi-extensions': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"ask_user\", \"bash\", \"detect_package_manager\", \"find_sessions\", \"get_current_time\", \"jester\", \"lookout\", \"mac_app_action\", \"mac_app_click\", \"mac_app_focus\", \"mac_app_query\", \"mac_app_scroll_to\", \"mac_app_type\", \"oracle\", \"pi_changelog\", \"pi_docs\", \"pi_version\", \"processes\", \"read\", \"read_session\", \"reviewer\", \"scout\", \"web_fetch\", \"worker\"], expected={\"nvim_context\"}, actual={\"ask_user\", \"bash\", \"detect_package_manager\", \"find_sessions\", \"get_current_time\", \"jester\", \"lookout\", \"mac_app_action\", \"mac_app_click\", \"mac_app_focus\", \"mac_app_query\", \"mac_app_scroll_to\", \"mac_app_type\", \"nvim_context\", \"oracle\", \"pi_changelog\", \"pi_docs\", \"pi_version\", \"processes\", \"read\", \"read_session\", \"reviewer\", \"scout\", \"web_fetch\", \"worker\"}"
+      "failure_reason": "Extension 'third-party/aliou-pi-extensions': runtime commands identities differ from the manifest; missing declared identities=[\"dumb-zone-status\", \"extensions:update\", \"plan:list\", \"plan:save\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"session:copy-id\", \"session:copy-path\"], unexpected runtime identities=[], expected={\"ad-name\", \"dumb-zone-status\", \"extensions:update\", \"plan:list\", \"plan:save\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"session:copy-id\", \"session:copy-path\", \"system-prompt\", \"theme\"}, actual={\"ad-name\", \"system-prompt\", \"theme\"}"
     },
     {
       "id": "third-party/ben-vargas-pi-packages",
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/ben-vargas-pi-packages': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"--exa-mcp-api-key\", \"--exa-mcp-config\", \"--exa-mcp-max-bytes\", \"--exa-mcp-max-lines\", \"--exa-mcp-protocol\", \"--exa-mcp-timeout-ms\", \"--exa-mcp-tools\", \"--exa-mcp-url\", \"--firecrawl-mcp-api-key\", \"--firecrawl-mcp-config\", \"--firecrawl-mcp-max-bytes\", \"--firecrawl-mcp-max-lines\", \"--firecrawl-mcp-protocol\", \"--firecrawl-mcp-timeout-ms\", \"--firecrawl-mcp-tools\", \"--firecrawl-mcp-url\"], expected={}, actual={\"--exa-mcp-api-key\", \"--exa-mcp-config\", \"--exa-mcp-max-bytes\", \"--exa-mcp-max-lines\", \"--exa-mcp-protocol\", \"--exa-mcp-timeout-ms\", \"--exa-mcp-tools\", \"--exa-mcp-url\", \"--firecrawl-mcp-api-key\", \"--firecrawl-mcp-config\", \"--firecrawl-mcp-max-bytes\", \"--firecrawl-mcp-max-lines\", \"--firecrawl-mcp-protocol\", \"--firecrawl-mcp-timeout-ms\", \"--firecrawl-mcp-tools\", \"--firecrawl-mcp-url\"}"
+      "failure_reason": "Extension 'third-party/ben-vargas-pi-packages': manifest commands capability=true, but runtime registered 0 commands: {}"
     },
     {
       "id": "third-party/charles-cooper-pi-extensions",
@@ -1276,30 +1275,27 @@
     {
       "id": "third-party/graffioh-pi-screenshots-picker",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/graffioh-pi-screenshots-picker': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\"], expected={\"ss\", \"ss-clear\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/graffioh-pi-super-curl",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/graffioh-pi-super-curl': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"], expected={\"scurl\", \"scurl-history\", \"scurl-log\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/jyaunches-pi-canvas",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/jyaunches-pi-canvas': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"ad-name\", \"ask\", \"askwith\", \"assistant\", \"branch\", \"code\", \"codemap\", \"command-center\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"dumb-zone-status\", \"end-review\", \"ephemeral\", \"extensions:update\", \"files\", \"followup\", \"handoff\", \"md\", \"model-sysprompt-appendix\", \"notify\", \"oracle\", \"plan\", \"plan:list\", \"plan:save\", \"preset\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"review\", \"rp-tools-lock\", \"rpbind\", \"sandbox\", \"scurl\", \"scurl-history\", \"scurl-log\", \"session-ask\", \"session:copy-id\", \"session:copy-path\", \"sketch\", \"skill\", \"speedread\", \"ss\", \"ss-clear\", \"steer\", \"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\", \"subagent\", \"system-prompt\", \"theme\", \"todos\", \"tools\", \"ultrathink\", \"usage\", \"vog\", \"ws\"], expected={\"calendar\"}, actual={\"ad-name\", \"ask\", \"askwith\", \"assistant\", \"branch\", \"calendar\", \"code\", \"codemap\", \"command-center\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"dumb-zone-status\", \"end-review\", \"ephemeral\", \"extensions:update\", \"files\", \"followup\", \"handoff\", \"md\", \"model-sysprompt-appendix\", \"notify\", \"oracle\", \"plan\", \"plan:list\", \"plan:save\", \"preset\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"review\", \"rp-tools-lock\", \"rpbind\", \"sandbox\", \"scurl\", \"scurl-history\", \"scurl-log\", \"session-ask\", \"session:copy-id\", \"session:copy-path\", \"sketch\", \"skill\", \"speedread\", \"ss\", \"ss-clear\", \"steer\", \"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\", \"subagent\", \"system-prompt\", \"theme\", \"todos\", \"tools\", \"ultrathink\", \"usage\", \"vog\", \"ws\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/kcosr-pi-extensions",
       "tier": 5,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/kcosr-pi-extensions': event-handler identities differ from the manifest; expected={\"SIGINT\", \"SIGTERM\", \"before_agent_start\", \"close\", \"connection\", \"data\", \"end\", \"error\", \"session_start\", \"tool_call\", \"tool_result\"}, actual={\"before_agent_start\", \"session_start\"}"
+      "failure_reason": "Extension 'third-party/kcosr-pi-extensions': manifest commands capability=true, but runtime registered 0 commands: {}"
     },
     {
       "id": "third-party/limouren-agent-things",
@@ -1307,6 +1303,12 @@
       "delta_type": "new_failure",
       "current_status": "fail",
       "failure_reason": "Extension 'third-party/limouren-agent-things': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"sandbox\"], expected={}, actual={\"sandbox\"}"
+    },
+    {
+      "id": "third-party/lll9p-pi-better-compaction",
+      "tier": 3,
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/lsj5031-pi-notification-extension",
@@ -1320,7 +1322,7 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/marckrenn-pi-sub': manifest tools capability=true, but runtime registered 0 tools"
+      "failure_reason": "Extension 'third-party/marckrenn-pi-sub': manifest tools capability=true, but runtime registered 0 tools: {}"
     },
     {
       "id": "third-party/michalvavra-agents",
@@ -1333,7 +1335,7 @@
       "tier": 2,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/ogulcancelik-pi-sketch': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"slow-mode\", \"ss\", \"ss-clear\"], expected={\"sketch\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}"
+      "failure_reason": "Extension 'third-party/ogulcancelik-pi-sketch': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}"
     },
     {
       "id": "third-party/openclaw-openclaw",
@@ -1353,7 +1355,7 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/qualisero-pi-agent-scip': manifest commands capability=false, but runtime registered 15 commands"
+      "failure_reason": "Extension 'third-party/qualisero-pi-agent-scip': event-handler identities differ from the manifest; expected={\"before_agent_start\", \"close\", \"data\", \"error\", \"session_start\"}, actual={\"before_agent_start\", \"session_start\"}"
     },
     {
       "id": "third-party/raunovillberg-pi-stuffed",
@@ -1366,21 +1368,19 @@
       "tier": 2,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/rytswd-direnv': manifest commands capability=false, but runtime registered 15 commands"
+      "failure_reason": "Extension 'third-party/rytswd-direnv': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_start\", \"tool_result\"}, actual={\"session_start\", \"tool_result\"}"
     },
     {
       "id": "third-party/rytswd-questionnaire",
       "tier": 1,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/rytswd-questionnaire': manifest commands capability=false, but runtime registered 15 commands"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/rytswd-slow-mode",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/rytswd-slow-mode': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"ss\", \"ss-clear\"], expected={\"slow-mode\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/vtemian-pi-config",
@@ -1394,14 +1394,13 @@
       "tier": 3,
       "delta_type": "new_failure",
       "current_status": "fail",
-      "failure_reason": "Extension 'third-party/w-winter-dot314': runtime commands identities differ from the manifest; missing declared identities=[\"skill\", \"ws\"], unexpected runtime identities=[], expected={\"ask\", \"askwith\", \"branch\", \"code\", \"command-center\", \"end-review\", \"ephemeral\", \"files\", \"followup\", \"md\", \"model-sysprompt-appendix\", \"notify\", \"oracle\", \"plan\", \"preset\", \"review\", \"rp\", \"rp-tools-lock\", \"rpbind\", \"sandbox\", \"session-ask\", \"skill\", \"speedread\", \"steer\", \"todos\", \"tools\", \"ultrathink\", \"usage\", \"vog\", \"ws\"}, actual={\"ask\", \"askwith\", \"branch\", \"code\", \"command-center\", \"end-review\", \"ephemeral\", \"files\", \"followup\", \"md\", \"model-sysprompt-appendix\", \"notify\", \"oracle\", \"plan\", \"preset\", \"review\", \"rp\", \"rp-tools-lock\", \"rpbind\", \"sandbox\", \"session-ask\", \"speedread\", \"steer\", \"todos\", \"tools\", \"ultrathink\", \"usage\", \"vog\"}"
+      "failure_reason": "Extension 'third-party/w-winter-dot314': manifest commands capability=true, but runtime registered 0 commands: {}"
     },
     {
       "id": "third-party/zenobi-us-pi-dcp",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/zenobi-us-pi-dcp': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"calendar\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"], expected={\"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\"}, actual={\"calendar\", \"dcp-debug\", \"dcp-init\", \"dcp-logs\", \"dcp-recent\", \"dcp-stats\", \"dcp-toggle\", \"dcp-tools\", \"scurl\", \"scurl-history\", \"scurl-log\", \"sketch\", \"slow-mode\", \"ss\", \"ss-clear\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "timed-confirm",

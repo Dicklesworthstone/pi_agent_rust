@@ -813,6 +813,51 @@ fn ctx_generation_increments_on_thinking_level_change() {
 }
 
 #[test]
+fn set_extension_models_bumps_generation_and_snapshot() {
+    let mgr = ExtensionManager::new();
+    let gen_before = mgr
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ctx_generation;
+    mgr.set_extension_models(vec![serde_json::json!({
+        "id": "claude-4",
+        "provider": "anthropic",
+    })]);
+    let gen_after = mgr
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ctx_generation;
+    assert_eq!(gen_after, gen_before + 1);
+    let snap = mgr.read_snapshot();
+    assert_eq!(snap.extension_models.len(), 1);
+    assert_eq!(
+        snap.extension_models[0]["id"],
+        serde_json::json!("claude-4")
+    );
+}
+
+#[test]
+fn set_system_prompt_bumps_generation_and_snapshot() {
+    let mgr = ExtensionManager::new();
+    let gen_before = mgr
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ctx_generation;
+    mgr.set_system_prompt(Some("You are Pi.".to_string()));
+    let gen_after = mgr
+        .inner
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .ctx_generation;
+    assert_eq!(gen_after, gen_before + 1);
+    let snap = mgr.read_snapshot();
+    assert_eq!(snap.current_system_prompt.as_deref(), Some("You are Pi."));
+}
+
+#[test]
 fn invalidate_ctx_cache_bumps_generation() {
     let mgr = ExtensionManager::new();
     let gen_before = mgr

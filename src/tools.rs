@@ -2212,7 +2212,9 @@ fn cache_dependencies_for_scoped_scan(
 ) -> Option<Vec<ToolCacheDependency>> {
     let io_path = root.io_path();
     let fingerprint = match mode {
-        ToolCacheFingerprintMode::FileContent => fingerprint_file_content(&io_path)?,
+        // File roots are read via the bare descriptor path; `io_path()` is
+        // only traversable for directory roots.
+        ToolCacheFingerprintMode::FileContent => fingerprint_file_content(&root.file_read_path())?,
         ToolCacheFingerprintMode::DirectoryImmediate => fingerprint_directory_immediate(&io_path)?,
         ToolCacheFingerprintMode::DirectoryRecursive => fingerprint_directory_recursive(&io_path)?,
     };
@@ -2773,16 +2775,24 @@ impl ScopedScanRoot {
         &self.logical_path
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn io_path(&self) -> PathBuf {
         use std::os::fd::AsRawFd as _;
 
         let descriptor = self.handle.as_raw_fd();
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let prefix = "/proc/self/fd";
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let prefix = "/dev/fd";
-        PathBuf::from(prefix).join(descriptor.to_string()).join(".")
+        PathBuf::from("/proc/self/fd")
+            .join(descriptor.to_string())
+            .join(".")
+    }
+
+    // macOS/BSD `/dev/fd/N` entries support only re-open (dup) semantics:
+    // traversing through them as directories fails (`/dev/fd/N/.` -> ENOENT,
+    // readdir -> ENOTDIR), so fd-relative path IO is procfs-only. Fall back
+    // to the canonicalized logical path, as Windows does; the pinned handle
+    // still guards identity and liveness of the scan root.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn io_path(&self) -> PathBuf {
+        self.logical_path.clone()
     }
 
     #[cfg(windows)]
@@ -2804,19 +2814,64 @@ impl ScopedScanRoot {
         PathBuf::from(".")
     }
 
+    /// Whether the pinned root is a regular file rather than a directory.
+    fn is_file_root(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.handle.metadata().is_ok_and(|m| m.is_file())
+        }
+        #[cfg(windows)]
+        {
+            std::fs::metadata(&self.logical_path).is_ok_and(|m| m.is_file())
+        }
+    }
+
+    /// Path for reading the pinned root's bytes when it is a regular file.
+    /// `io_path()` appends `/.` for directory traversal, which never resolves
+    /// for a file descriptor, so file reads need the bare descriptor path.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn file_read_path(&self) -> PathBuf {
+        use std::os::fd::AsRawFd as _;
+
+        PathBuf::from("/proc/self/fd").join(self.handle.as_raw_fd().to_string())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn file_read_path(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
+    /// Scanner operand for a pinned regular-file root. Children cannot chdir
+    /// into a file, so Unix children read the pinned descriptor from stdin
+    /// (`-`), while Windows children receive the logical path.
+    #[allow(clippy::unused_self)]
+    #[cfg(unix)]
+    fn file_child_operand(&self) -> PathBuf {
+        PathBuf::from("-")
+    }
+
+    #[cfg(windows)]
+    fn file_child_operand(&self) -> PathBuf {
+        self.logical_path.clone()
+    }
+
     /// Path by which a child can access this root after its handle is installed
     /// as stdin. Scanner children run with their pinned scan root as cwd, so
     /// stdin remains available for the independently pinned workspace root.
     // `&self` kept (despite being unused on this cfg) so both platform variants
     // share one method signature at every call site.
     #[allow(clippy::unused_self)]
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn inherited_child_operand(&self) -> PathBuf {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let path = "/proc/self/fd/0";
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let path = "/dev/fd/0";
-        PathBuf::from(path).join(".")
+        PathBuf::from("/proc/self/fd/0").join(".")
+    }
+
+    // See io_path(): /dev/fd nodes cannot be traversed on macOS/BSD, so a
+    // child reaches the independently pinned workspace root by its logical
+    // path while the inherited stdin descriptor keeps the root alive.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    fn inherited_child_operand(&self) -> PathBuf {
+        self.logical_path.clone()
     }
 
     #[cfg(windows)]
@@ -2835,6 +2890,17 @@ impl ScopedScanRoot {
     }
 
     fn map_child_output(&self, child_path: &Path) -> std::io::Result<ScopedScanOutputPath> {
+        // A regular-file root has exactly one possible result: the root
+        // itself. Unix scanners read it from stdin (reporting `<stdin>`),
+        // so their reported path never resolves against the root anyway.
+        if self.is_file_root() {
+            return Ok(ScopedScanOutputPath {
+                read_path: self.file_read_path(),
+                logical_path: self.logical_path.clone(),
+                relative: PathBuf::new(),
+            });
+        }
+
         #[cfg(unix)]
         let relative = if child_path.is_absolute() {
             child_path
@@ -7871,7 +7937,11 @@ impl Tool for GrepTool {
 
         args.push(OsString::from("--"));
         args.push(OsString::from(&input.pattern));
-        args.push(scoped_root.child_operand().into_os_string());
+        args.push(if is_directory {
+            scoped_root.child_operand().into_os_string()
+        } else {
+            scoped_root.file_child_operand().into_os_string()
+        });
 
         let rg_cmd = find_rg_binary().ok_or_else(|| {
             Error::tool(
@@ -7880,7 +7950,20 @@ impl Tool for GrepTool {
             )
         })?;
 
-        let mut child = command_with_default_sigpipe_in_dir(rg_cmd, &scan_io_path)
+        // A child cannot chdir into a regular file, so single-file scans run
+        // from the pinned workspace root and read the pinned file descriptor
+        // via stdin (`-` operand) instead.
+        let child_cwd = if is_directory {
+            scan_io_path.clone()
+        } else {
+            operation_cwd.clone()
+        };
+        let child_stdin = if is_directory {
+            cwd_scope.child_stdin()
+        } else {
+            scoped_root.child_stdin()
+        };
+        let mut child = command_with_default_sigpipe_in_dir(rg_cmd, &child_cwd)
             .map_err(|e| {
                 Error::tool(
                     "grep",
@@ -7888,8 +7971,8 @@ impl Tool for GrepTool {
                 )
             })?
             .args(args)
-            .current_dir(&scan_io_path)
-            .stdin(cwd_scope.child_stdin().map_err(|error| {
+            .current_dir(&child_cwd)
+            .stdin(child_stdin.map_err(|error| {
                 Error::tool(
                     "grep",
                     format!(
@@ -12055,7 +12138,7 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[allow(clippy::too_many_lines)]
     async fn assert_scoped_scan_roots_survive_after_open_replacement(tmp: &Path) {
         use std::os::unix::fs::symlink;
@@ -12682,7 +12765,10 @@ mod tests {
             assert_read_cache_hit_and_stale(tmp.path()).await;
             #[cfg(unix)]
             assert_read_cache_does_not_bind_opened_inode_to_replacement_path(tmp.path()).await;
-            #[cfg(unix)]
+            // Root-swap survival needs fd-path traversal (procfs); macOS/BSD
+            // /dev/fd nodes are dup-only, so those platforms scan by logical
+            // path (Windows posture) and cannot hold this guarantee.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             assert_scoped_scan_roots_survive_after_open_replacement(tmp.path()).await;
             assert_find_selects_globally_newest_match(tmp.path()).await;
             assert_ls_cache_hit_and_stale(tmp.path()).await;

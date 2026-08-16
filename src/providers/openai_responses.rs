@@ -130,8 +130,7 @@ impl OpenAIResponsesProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> OpenAIResponsesRequest {
-        let input =
-            build_openai_responses_input(context, &self.model, &self.provider, &self.api);
+        let input = build_openai_responses_input(context, &self.model, &self.provider, &self.api);
         let tools: Option<Vec<OpenAIResponsesTool>> = if context.tools.is_empty() {
             None
         } else {
@@ -1074,19 +1073,20 @@ where
                 // hard error for malformed function calls, and keep the new
                 // capture paths opportunistic so a partial item never aborts
                 // the stream.
-                let typed = match serde_json::from_value::<OpenAIResponsesOutputItemDone>(
-                    item.clone(),
-                ) {
-                    Ok(typed) => typed,
-                    Err(e) => {
-                        if item.get("type").and_then(serde_json::Value::as_str)
-                            == Some("function_call")
-                        {
-                            return Err(Error::api(format!("JSON parse error: {e}\nData: {data}")));
+                let typed =
+                    match serde_json::from_value::<OpenAIResponsesOutputItemDone>(item.clone()) {
+                        Ok(typed) => typed,
+                        Err(e) => {
+                            if item.get("type").and_then(serde_json::Value::as_str)
+                                == Some("function_call")
+                            {
+                                return Err(Error::api(format!(
+                                    "JSON parse error: {e}\nData: {data}"
+                                )));
+                            }
+                            OpenAIResponsesOutputItemDone::Unknown
                         }
-                        OpenAIResponsesOutputItemDone::Unknown
-                    }
-                };
+                    };
                 match typed {
                     OpenAIResponsesOutputItemDone::FunctionCall {
                         id,
@@ -1582,6 +1582,7 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_openai_responses_input(
     context: &Context<'_>,
     model: &str,
@@ -1605,10 +1606,16 @@ fn build_openai_responses_input(
             }),
             Message::Assistant(assistant) => {
                 // TS parity (`convertResponsesMessages`): when this assistant
-                // turn was produced by a *different model* on the same
-                // provider/api, the original `fc_...` item ids must not be
-                // replayed — OpenAI validates reasoning/function-call pairing
-                // per model and 400s on ids minted by another model.
+                // turn was produced by a *different model*, none of its
+                // captured raw-item metadata may be replayed: OpenAI validates
+                // reasoning/function-call pairing per model, and another
+                // model's `encrypted_content` cannot be decrypted. The TS
+                // reference gets this via `transformMessages` (which strips
+                // thinking/text/thought signatures for non-same-model turns)
+                // plus the `isDifferentModel` fc-id gate in
+                // `convertResponsesMessages`; pi-rust has no transform layer
+                // yet, so the gate lives here. Same-provider/api comparison
+                // keeps foreign-api turns on the existing prefix/JSON gates.
                 let is_different_model = assistant.model != model
                     && assistant.provider == provider
                     && assistant.api == api;
@@ -1630,7 +1637,12 @@ fn build_openai_responses_input(
                 for block in &assistant.content {
                     match block {
                         ContentBlock::Text(t) => {
-                            if let Some(item_id) = replayable_message_item_id(t) {
+                            let replay_id = if is_different_model {
+                                None
+                            } else {
+                                replayable_message_item_id(t)
+                            };
+                            if let Some(item_id) = replay_id {
                                 // Replay the original `message` output item with
                                 // its id + status so OpenAI's reasoning pairing
                                 // validation recognizes it (TS parity).
@@ -1667,10 +1679,15 @@ fn build_openai_responses_input(
                         }
                         ContentBlock::Thinking(thinking) => {
                             // Replay raw reasoning items (with encrypted_content)
-                            // captured from a previous Responses stream. Thinking
-                            // blocks without a captured raw item keep the legacy
-                            // behavior of being dropped without flushing text.
-                            if let Some(raw_item) = replayable_reasoning_item(thinking) {
+                            // captured from a previous Responses stream — but
+                            // never across models: OpenAI cannot decrypt
+                            // another model's encrypted_content. Thinking
+                            // blocks without a replayable raw item keep the
+                            // legacy behavior of being dropped without
+                            // flushing text.
+                            if !is_different_model
+                                && let Some(raw_item) = replayable_reasoning_item(thinking)
+                            {
                                 flush_pending(&mut pending_text, &mut input);
                                 input.push(OpenAIResponsesInputItem::RawItem(raw_item));
                             }
@@ -2790,19 +2807,24 @@ mod tests {
         );
     }
 
-    /// TS parity (`isDifferentModel` in `convertResponsesMessages`): an
-    /// assistant turn produced by a different model on the same provider/api
-    /// must not replay its `fc_...` item id — OpenAI validates
-    /// reasoning/function-call pairing per model. The raw reasoning item and
-    /// message id keep replaying (the TS reference only gates the fc id).
+    /// TS-net parity: an assistant turn produced by a different model on the
+    /// same provider/api must not replay any captured raw-item metadata —
+    /// OpenAI validates reasoning/function-call pairing per model and cannot
+    /// decrypt another model's `encrypted_content` (in TS, `transformMessages`
+    /// strips the signatures and `isDifferentModel` gates the fc id). The
+    /// request falls back to the legacy shape.
     #[test]
-    fn test_build_request_omits_fc_item_id_for_different_model_same_api() {
+    fn test_build_request_omits_raw_item_replay_for_different_model_same_api() {
         let provider = OpenAIResponsesProvider::new("gpt-test");
         let other_model = Message::Assistant(std::sync::Arc::new(AssistantMessage {
             content: vec![
                 ContentBlock::Thinking(ThinkingContent {
                     thinking: "Plan the echo.".to_string(),
                     thinking_signature: Some(raw_reasoning_item().to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "Calling echo.".to_string(),
+                    text_signature: Some("msg_1".to_string()),
                 }),
                 ContentBlock::ToolCall(ToolCall {
                     id: "call_1".to_string(),
@@ -2831,7 +2853,10 @@ mod tests {
         assert_eq!(
             value["input"],
             json!([
-                raw_reasoning_item(),
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Calling echo." }]
+                },
                 {
                     "type": "function_call",
                     "call_id": "call_1",
