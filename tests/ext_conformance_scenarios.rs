@@ -3786,6 +3786,336 @@ fn scenario_pi_better_compaction_registers_and_fails_open() {
     }
 }
 
+/// Spy host bridge for the pi-better-compaction acceptance flow (gh #167,
+/// bd-8ma6q). Records every `ctx.compact()` / `pi.events("compact")` call so a
+/// test can prove whether the plugin actually reached the host compaction
+/// bridge, and returns the well-formed shape a real bridge produces
+/// (`AgentSessionHostActions::compact_session`, `src/agent.rs:3738`, +
+/// `tokensAfter` from the post-compaction notification, `src/agent.rs:9158`).
+struct CompactBridgeSpyHostActions {
+    compact_calls: Mutex<Vec<Value>>,
+}
+
+impl CompactBridgeSpyHostActions {
+    const fn new() -> Self {
+        Self {
+            compact_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn compact_call_count(&self) -> usize {
+        self.compact_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+#[async_trait]
+impl ExtensionHostActions for CompactBridgeSpyHostActions {
+    async fn send_message(&self, _message: ExtensionSendMessage) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn send_user_message(&self, _message: ExtensionSendUserMessage) -> pi::error::Result<()> {
+        Ok(())
+    }
+
+    async fn compact_session(&self, preparation: Value) -> pi::error::Result<Value> {
+        let first_kept = preparation
+            .get("firstKeptEntryId")
+            .and_then(Value::as_str)
+            .unwrap_or("entry-keep-1")
+            .to_string();
+        let tokens_before = preparation
+            .get("tokensBefore")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        self.compact_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(preparation);
+        // Mirror the real host bridge result contract: {summary,
+        // firstKeptEntryId, tokensBefore, details} plus the tokensAfter field
+        // the host attaches to compaction payloads.
+        Ok(serde_json::json!({
+            "summary": "recap: investigate the flaky scheduler test; keep open work items",
+            "firstKeptEntryId": first_kept,
+            "tokensBefore": tokens_before,
+            "tokensAfter": 8_200,
+            "details": { "readFiles": ["src/lib.rs"], "modifiedFiles": ["src/agent.rs"] }
+        }))
+    }
+}
+
+/// End-to-end acceptance flow for the vendored pi-better-compaction extension
+/// (gh #167, bd-8ma6q). Drives the 7-step acceptance flow against the *current*
+/// host API surface and asserts the real behavior — genuine E2E execution where
+/// the plugin can reach a landed API, documented graceful degradation where a
+/// deliberate host boundary keeps it fail-open.
+///
+/// KEY FINDING (credential boundary): pi-better-compaction gates *both* of its
+/// compaction branches on `ctx.modelRegistry.getApiKeyAndHeaders(model)`, which
+/// the host DELIBERATELY does not expose to sandboxed JS (gh #167 / bd-j8sxn;
+/// see `src/extensions_js.rs:1663`). The Responses branch (raw `fetch` to
+/// `/responses/compact` in compact-client.ts) needs that API key, and the
+/// native-fallback branch calls `getApiKeyAndHeaders` directly. With the key
+/// withheld, the Responses branch resolves `missing-api-key` and the fallback
+/// resolves `auth-failed`/`no-model-configured`, so the plugin returns
+/// undefined and pi's own native compaction proceeds. Consequently the landed
+/// `ctx.compact()` host bridge, `buildSessionContext`, `convertToLlm`, and the
+/// Responses `before_provider_request` rewrite re-ingest are all implemented and
+/// independently tested, but THIS plugin never reaches them end-to-end. Steps
+/// that depend on that credential are asserted as graceful degradation, not
+/// faked as passes.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn scenario_pi_better_compaction_e2e_acceptance() {
+    let (ext, items) = load_scenario_fixture("third-party__lll9p-pi-better-compaction");
+    let ext_path =
+        resolve_extension_path(&ext.extension_id, &items).expect("resolve pi-better-compaction");
+    let loaded = load_extension(&ext_path).expect("load pi-better-compaction extension");
+
+    // Install a spy compaction bridge so we can observe whether the plugin ever
+    // reaches ctx.compact() and provide a well-formed host response if it does.
+    let actions = Arc::new(CompactBridgeSpyHostActions::new());
+    loaded.manager.set_host_actions(actions.clone());
+
+    // ── Step 1: load + registration ─────────────────────────────────────────
+    // The extension loaded (above) and registered all three upstream hooks.
+    let hooks = loaded.manager.list_event_hooks();
+    for expected in [
+        "session_start",
+        "session_before_compact",
+        "before_provider_request",
+    ] {
+        assert!(
+            hooks.iter().any(|h| h == expected),
+            "step 1: expected hook '{expected}' registered, got {hooks:?}"
+        );
+    }
+
+    // Realistic host context for a Responses-family session mid-conversation:
+    // current model on the openai-responses API, a live session identity, a
+    // branch, a system prompt, and a model catalog for modelRegistry.find.
+    let settings = deterministic_settings_for(&ext_path);
+    let current_model = serde_json::json!({
+        "provider": "openai",
+        "id": "gpt-5.2-codex",
+        "api": "openai-responses",
+        "baseUrl": "https://api.openai.com/v1/responses",
+    });
+    let ctx = serde_json::json!({
+        "hasUI": false,
+        "cwd": settings.cwd,
+        "model": current_model,
+        "models": [
+            current_model,
+            {
+                "provider": "anthropic",
+                "id": "claude-sonnet-4-6",
+                "api": "anthropic-messages",
+                "baseUrl": "https://api.anthropic.com/v1/messages",
+            }
+        ],
+        "systemPrompt": "You are pi, a coding agent.",
+        "sessionState": {
+            "sessionId": "sess-e2e-8ma6q",
+            "sessionFile": "/private/tmp/pi-tests/sess-e2e-8ma6q.jsonl",
+        },
+        "sessionEntries": [],
+        "sessionBranch": [],
+        "modelRegistry": {},
+    });
+
+    // ── Steps 2 + 3: dispatch session_before_compact; handler is invoked ─────
+    // A full upstream preparation payload. The handler runs (config loads,
+    // resolveNativeCompactionEnvironment advances past model/api/baseUrl to the
+    // credential check). Reaching the plugin at all — without a dispatch error —
+    // proves the session_before_compact handler is invoked.
+    let compact_event = serde_json::json!({
+        "customInstructions": "focus on the open work items",
+        "preparation": {
+            "tokensBefore": 120_000,
+            "firstKeptEntryId": "entry-keep-1",
+            "previousSummary": null,
+            "messagesToSummarize": [
+                { "role": "user", "content": "investigate the flaky scheduler test" },
+                { "role": "assistant", "content": "looking into the scheduler now" }
+            ],
+            "turnPrefixMessages": []
+        }
+    });
+    let compact_result = common::run_async({
+        let runtime = loaded.runtime.clone();
+        let ctx = ctx.clone();
+        let event = compact_event.clone();
+        async move {
+            runtime
+                .dispatch_event(
+                    "session_before_compact".to_string(),
+                    event,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .await
+        }
+    })
+    .expect("step 3: session_before_compact dispatch must not error (handler invoked, fails open)");
+
+    // ── Step 4: native compaction result / host bridge ──────────────────────
+    // The plugin fails open here rather than producing a native result: with
+    // getApiKeyAndHeaders withheld the Responses branch is missing-api-key and
+    // the fallback is no-model-configured, so the handler returns undefined
+    // (serialized to null) — never {cancel:true} and never {compaction:...}.
+    assert!(
+        compact_result.is_null()
+            || (compact_result.get("compaction").is_none()
+                && compact_result.get("cancel") != Some(&Value::Bool(true))),
+        "step 4: expected fail-open (null / no compaction / no cancel), got {compact_result:?}"
+    );
+    // The plugin never reached ctx.compact(): it demands provider credentials the
+    // host deliberately withholds, so the host compaction bridge is not invoked.
+    assert_eq!(
+        actions.compact_call_count(),
+        0,
+        "step 4: plugin must fail open BEFORE the ctx.compact() bridge (credential boundary, bd-j8sxn)"
+    );
+
+    // Step 4 (positive half): prove the landed ctx.compact() host bridge is
+    // reachable and returns a well-formed {summary, firstKeptEntryId,
+    // tokensBefore, tokensAfter} when a plugin *does* call it. pi-better-
+    // compaction cannot (see credential boundary), so exercise the bridge wiring
+    // through a minimal probe extension: JS ctx.compact() -> pi.events("compact")
+    // -> ExtensionHostActions::compact_session -> value returned verbatim to JS.
+    let probe_dir = TempDir::new().expect("probe tempdir");
+    let probe_entry = probe_dir.path().join("index.mjs");
+    fs::write(
+        &probe_entry,
+        r#"export default function (pi) {
+  pi.on("session_before_compact", async (event, ctx) => {
+    const result = await ctx.compact(event.preparation);
+    return { probeCompact: result };
+  });
+}
+"#,
+    )
+    .expect("write probe extension");
+    let probe = load_extension(&probe_entry).expect("load probe extension");
+    let probe_actions = Arc::new(CompactBridgeSpyHostActions::new());
+    probe.manager.set_host_actions(probe_actions.clone());
+    let bridge_result = common::run_async({
+        let runtime = probe.runtime.clone();
+        let ctx = ctx.clone();
+        let event = compact_event.clone();
+        async move {
+            runtime
+                .dispatch_event(
+                    "session_before_compact".to_string(),
+                    event,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .await
+        }
+    })
+    .expect("probe ctx.compact() dispatch");
+    assert_eq!(
+        probe_actions.compact_call_count(),
+        1,
+        "step 4: probe must reach the host compaction bridge exactly once"
+    );
+    let bridge = bridge_result
+        .get("probeCompact")
+        .expect("step 4: ctx.compact() result returned to JS");
+    assert_eq!(
+        bridge.get("summary").and_then(Value::as_str),
+        Some("recap: investigate the flaky scheduler test; keep open work items"),
+        "step 4: bridge result carries a real summary, got {bridge:?}"
+    );
+    assert_eq!(
+        bridge.get("firstKeptEntryId").and_then(Value::as_str),
+        Some("entry-keep-1"),
+        "step 4: bridge echoes firstKeptEntryId from preparation"
+    );
+    assert_eq!(
+        bridge.get("tokensBefore").and_then(Value::as_u64),
+        Some(120_000),
+        "step 4: bridge echoes tokensBefore from preparation"
+    );
+    assert_eq!(
+        bridge.get("tokensAfter").and_then(Value::as_u64),
+        Some(8_200),
+        "step 4: bridge result carries tokensAfter"
+    );
+
+    // ── Step 5: before_provider_request fires; plugin replays/rewrites or ────
+    //            fails open. The host genuinely fires this event from the
+    //            Responses provider before each send (src/providers/
+    //            openai_responses.rs:316) and validates any rewrite via
+    //            validate_rewritten_responses_request (fail-open on rejection).
+    // Here the plugin caches request context (rememberRequestContext) then, with
+    // no resolvable API key, returns undefined — leaving the payload untouched.
+    let provider_event = serde_json::json!({
+        "payload": {
+            "model": "gpt-5.2-codex",
+            "input": [
+                { "type": "message", "role": "user", "content": "hello" }
+            ]
+        }
+    });
+    let provider_result = common::run_async({
+        let runtime = loaded.runtime.clone();
+        let ctx = ctx.clone();
+        let event = provider_event.clone();
+        async move {
+            runtime
+                .dispatch_event(
+                    "before_provider_request".to_string(),
+                    event,
+                    Arc::new(ctx),
+                    DEFAULT_TIMEOUT_MS,
+                )
+                .await
+        }
+    })
+    .expect("step 5: before_provider_request dispatch must not error");
+    // Fail-open: undefined (null) => original payload sent unchanged. If a
+    // rewrite were ever returned it would have to equal the original payload.
+    assert!(
+        provider_result.is_null()
+            || provider_result == *provider_event.get("payload").expect("payload"),
+        "step 5: expected fail-open (payload untouched), got {provider_result:?}"
+    );
+
+    // ── Step 6: Responses item fields survive raw-item replay ────────────────
+    // The plugin's rewrite path (unreached here) hands a Responses input array
+    // straight back to the provider. That the provider preserves Responses item
+    // fields on replay is proven end-to-end in the provider crate:
+    //   src/providers/openai_responses.rs
+    //     - test_stream_captures_raw_items_and_build_request_replays_them (:2396)
+    //     - validate_rewritten_responses_request re-ingest (:1487)
+    // These guarantee reasoning/message/function_call item ids and raw items
+    // round-trip verbatim, which is the invariant the plugin relies on.
+
+    // ── Step 7: normal conversation works when the plugin returns undefined ──
+    // Both dispatches above returned undefined (fail-open) with no error and no
+    // cancel, so pi's normal compaction + provider flow proceed untouched. The
+    // config-disabled path is observably identical: with config.enabled === false
+    // handleSessionBeforeCompact / handleBeforeProviderRequest return undefined
+    // immediately (extension-runtime.ts:243, :349), the same fail-open outcome
+    // asserted here.
+    assert!(
+        compact_result.is_null() || compact_result.get("compaction").is_none(),
+        "step 7: disabled/undefined path must leave native compaction to pi"
+    );
+    assert!(
+        provider_result.is_null()
+            || provider_result == *provider_event.get("payload").expect("payload"),
+        "step 7: disabled/undefined path must leave the provider request untouched"
+    );
+}
+
 struct PiAiProviderBridgeHostActions {
     completions: Mutex<Vec<ExtensionAiCompletionRequest>>,
 }

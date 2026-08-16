@@ -3186,6 +3186,36 @@ fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
     ensure_ancestors_searchable_with_context_sync(path, &access_context)
 }
 
+/// Backend for the `grep`/`find` tools (bd-cv653.1.5).
+///
+/// `Inproc` (default) searches with the same engines ripgrep is built from
+/// (`ignore` walker + `grep-searcher`/`globset`), linked into the process so
+/// no `rg`/`fd` binaries are required. `External` shells out to `rg`/`fd`
+/// exactly as before — kept as a debugging escape hatch via the
+/// `search_backend` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SearchBackend {
+    #[default]
+    Inproc,
+    External,
+}
+
+pub(crate) fn search_backend_from_config(config: Option<&Config>) -> SearchBackend {
+    match config
+        .and_then(|config| config.search_backend.as_deref())
+        .map(str::trim)
+    {
+        Some("external") => SearchBackend::External,
+        Some("inproc") | Some("") | None => SearchBackend::Inproc,
+        Some(other) => {
+            tracing::warn!(
+                "unknown search_backend setting '{other}' (expected 'inproc' or 'external'); using inproc"
+            );
+            SearchBackend::Inproc
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecursiveScanAccess {
     DirectoriesOnly,
@@ -3665,6 +3695,113 @@ fn recursive_scan_walk_builder(
         })?);
     }
     Ok(builder)
+}
+
+/// Resolve the git global ignore file for an in-process scan, mirroring how
+/// the external scanners (and the cache-dependency tracker) consume it.
+fn resolved_global_git_ignore_for_scan(cwd: &Path) -> std::io::Result<Option<PathBuf>> {
+    let access_context = EffectiveModeAccessContext::current()?;
+    let controls = resolve_git_global_ignore_controls(
+        &GitGlobalConfigLocations::current(),
+        &access_context,
+        "in-process scan global-git-config reading",
+    )?;
+    Ok(controls
+        .ignore_path
+        .map(|path| ignore_control_path_from_command_cwd(path, cwd)))
+}
+
+/// In-process `find` backend (bd-cv653.1.5): walk the pinned scan root with
+/// the same ignore surface the external `fd` invocation consumed and collect
+/// scan-root-relative matches for the shared result pipeline.
+///
+/// Filename-shaped patterns (no `/`) match the entry name, path-shaped
+/// patterns match the scan-root-relative path — the same split the external
+/// backend implements via `--full-path` plus the host-side Override filter.
+fn find_inproc_scan_sync(
+    scan_root: &Path,
+    operation_cwd: &Path,
+    pattern: &str,
+    path_shaped: bool,
+    scan_limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Vec<PathBuf>> {
+    let filename_matcher = if path_shaped {
+        None
+    } else {
+        Some(
+            globset::Glob::new(pattern)
+                .map_err(|err| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+                })?
+                .compile_matcher(),
+        )
+    };
+    let path_matcher = if path_shaped {
+        let mut builder = ignore::overrides::OverrideBuilder::new(scan_root);
+        builder.add(pattern).map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?;
+        Some(builder.build().map_err(|err| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+        })?)
+    } else {
+        None
+    };
+
+    let global_git_ignore = resolved_global_git_ignore_for_scan(operation_cwd)?;
+    let builder = recursive_scan_walk_builder(
+        scan_root,
+        operation_cwd,
+        RecursiveScanAccess::DirectoriesOnly,
+        None,
+        global_git_ignore.as_deref(),
+    )?;
+
+    let mut results = Vec::new();
+    for entry in builder.build() {
+        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "scan cancelled",
+            ));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            // fd reports unreadable entries on stderr and keeps walking;
+            // the permission preflight already failed closed on anything
+            // the effective mode model forbids.
+            Err(err) => {
+                tracing::debug!("in-process find skipped an unreadable entry: {err}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == scan_root {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(scan_root) else {
+            continue;
+        };
+        let is_dir = entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir());
+        let matched = if let Some(matcher) = &filename_matcher {
+            path.file_name()
+                .is_some_and(|name| matcher.is_match(Path::new(name)))
+        } else if let Some(matcher) = &path_matcher {
+            matcher.matched(path, is_dir).is_whitelist()
+        } else {
+            false
+        };
+        if matched {
+            results.push(relative.to_path_buf());
+            if results.len() >= scan_limit {
+                break;
+            }
+        }
+    }
+    Ok(results)
 }
 
 /// Validate every visible filesystem object a recursive search could visit.
@@ -5061,8 +5198,14 @@ impl ToolRegistry {
                 ))),
                 "edit" => tools.push(Box::new(EditTool::new(cwd))),
                 "write" => tools.push(Box::new(WriteTool::new(cwd))),
-                "grep" => tools.push(Box::new(GrepTool::new(cwd))),
-                "find" => tools.push(Box::new(FindTool::new(cwd))),
+                "grep" => tools.push(Box::new(GrepTool::with_backend(
+                    cwd,
+                    search_backend_from_config(config),
+                ))),
+                "find" => tools.push(Box::new(FindTool::with_backend(
+                    cwd,
+                    search_backend_from_config(config),
+                ))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
                 "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
@@ -7386,15 +7529,21 @@ struct GrepInput {
 pub struct GrepTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    backend: SearchBackend,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl GrepTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_backend(cwd, SearchBackend::default())
+    }
+
+    pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            backend,
             #[cfg(test)]
             after_scope_hook: None,
         }
@@ -7405,6 +7554,7 @@ impl GrepTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
+            backend: SearchBackend::default(),
             after_scope_hook: None,
         }
     }
@@ -7417,6 +7567,7 @@ impl GrepTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            backend: SearchBackend::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -7660,6 +7811,187 @@ fn build_workspace_ignore_matcher(
     builder.build().ok()
 }
 
+/// Result of an in-process grep scan, handing the pinned roots and filters
+/// back to the async caller alongside the collected matches.
+struct InprocGrepScan {
+    scoped_root: ScopedScanRoot,
+    glob_override: Option<ignore::overrides::Override>,
+    workspace_ignore: Option<ignore::gitignore::Gitignore>,
+    matches: Vec<(PathBuf, usize)>,
+    match_count: usize,
+    limit_reached: bool,
+}
+
+/// In-process `grep` backend (bd-cv653.1.5): search with the engines ripgrep
+/// is built from (`grep-regex` matcher + `grep-searcher`), walking the pinned
+/// scan root with the same ignore surface the external `rg` invocation
+/// consumed. Result-path filters (glob + workspace gitignore) are applied per
+/// candidate file before its contents are searched — both are path-level, so
+/// this yields exactly the per-match filtering of the external drain path.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn grep_inproc_scan_sync(
+    scoped_root: ScopedScanRoot,
+    glob_override: Option<ignore::overrides::Override>,
+    workspace_ignore: Option<ignore::gitignore::Gitignore>,
+    operation_cwd: &Path,
+    is_directory: bool,
+    pattern: &str,
+    ignore_case: bool,
+    literal: bool,
+    scan_limit: usize,
+    cancelled: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<InprocGrepScan> {
+    use grep_searcher::{BinaryDetection, SearcherBuilder, sinks};
+
+    let pattern_for_matcher = if literal {
+        regex::escape(pattern)
+    } else {
+        pattern.to_string()
+    };
+    let matcher = grep_regex::RegexMatcherBuilder::new()
+        .case_insensitive(ignore_case)
+        .build(&pattern_for_matcher)
+        .map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("regex parse error: {err}"),
+            )
+        })?;
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        // rg's default binary handling: stop searching a file at the first
+        // NUL byte.
+        .binary_detection(BinaryDetection::quit(0))
+        .build();
+
+    let mut matches: Vec<(PathBuf, usize)> = Vec::new();
+    let mut match_count: usize = 0;
+    let mut limit_reached = false;
+
+    if is_directory {
+        let scan_root = scoped_root.io_path();
+        let global_git_ignore = resolved_global_git_ignore_for_scan(operation_cwd)?;
+        let builder = recursive_scan_walk_builder(
+            &scan_root,
+            operation_cwd,
+            RecursiveScanAccess::ReadableFiles,
+            None,
+            global_git_ignore.as_deref(),
+        )?;
+        'walk: for entry in builder.build() {
+            if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "scan cancelled",
+                ));
+            }
+            let entry = match entry {
+                Ok(entry) => entry,
+                // rg reports unreadable entries on stderr and keeps
+                // searching; the permission preflight already failed closed
+                // on anything the effective mode model forbids.
+                Err(err) => {
+                    tracing::debug!("in-process grep skipped an unreadable entry: {err}");
+                    continue;
+                }
+            };
+            if !entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
+            {
+                continue;
+            }
+            let path = entry.path();
+            let Ok(relative) = path.strip_prefix(&scan_root) else {
+                continue;
+            };
+            let relative = relative.to_path_buf();
+            if glob_override.is_some() || workspace_ignore.is_some() {
+                let Ok(mapped) = scoped_root.map_child_output(&relative) else {
+                    continue;
+                };
+                if let Some(glob_override) = glob_override.as_ref()
+                    && glob_override
+                        .matched(&mapped.logical_path, false)
+                        .is_ignore()
+                {
+                    continue;
+                }
+                if let Some(workspace_ignore) = workspace_ignore.as_ref()
+                    && workspace_ignore
+                        .matched_path_or_any_parents(&mapped.logical_path, false)
+                        .is_ignore()
+                {
+                    continue;
+                }
+            }
+            let mut file_hit_limit = false;
+            let search = searcher.search_path(
+                &matcher,
+                path,
+                sinks::Lossy(|line_number, _line| {
+                    matches.push((
+                        relative.clone(),
+                        usize::try_from(line_number).unwrap_or(usize::MAX),
+                    ));
+                    match_count += 1;
+                    if match_count >= scan_limit {
+                        file_hit_limit = true;
+                        Ok(false)
+                    } else {
+                        Ok(true)
+                    }
+                }),
+            );
+            if let Err(err) = search {
+                tracing::debug!(
+                    "in-process grep skipped an unreadable file {}: {err}",
+                    path_for_line_output(path)
+                );
+            }
+            if file_hit_limit {
+                limit_reached = true;
+                break 'walk;
+            }
+        }
+    } else {
+        // Pinned regular file: search the held descriptor itself (dup'd, so
+        // the parent's handle keeps an untouched offset) — a post-pin
+        // rename/symlink swap cannot redirect the search.
+        let sink = sinks::Lossy(|line_number, _line| {
+            matches.push((
+                PathBuf::new(),
+                usize::try_from(line_number).unwrap_or(usize::MAX),
+            ));
+            match_count += 1;
+            if match_count >= scan_limit {
+                limit_reached = true;
+                Ok(false)
+            } else {
+                Ok(true)
+            }
+        });
+        #[cfg(unix)]
+        {
+            let handle = scoped_root.handle.try_clone()?;
+            searcher.search_reader(&matcher, handle, sink)?;
+        }
+        // Windows pins parent components rather than the file itself; the
+        // logical-path read matches the platform's established posture.
+        #[cfg(not(unix))]
+        searcher.search_path(&matcher, scoped_root.logical_path(), sink)?;
+    }
+
+    Ok(InprocGrepScan {
+        scoped_root,
+        glob_override,
+        workspace_ignore,
+        matches,
+        match_count,
+        limit_reached,
+    })
+}
+
 fn build_grep_glob_override(
     cwd: &Path,
     glob: Option<&str>,
@@ -7789,7 +8121,7 @@ impl Tool for GrepTool {
             ));
         }
 
-        if !rg_available() {
+        if self.backend == SearchBackend::External && !rg_available() {
             return Err(Error::tool(
                 "grep",
                 "ripgrep (rg) is not available (please install ripgrep)".to_string(),
@@ -7922,153 +8254,224 @@ impl Tool for GrepTool {
             return Ok(output);
         }
 
-        let mut args: Vec<OsString> = vec![
-            OsString::from("--json"),
-            OsString::from("--line-number"),
-            OsString::from("--color=never"),
-            OsString::from("--hidden"),
-            OsString::from("--no-config"),
-            OsString::from("--no-follow"),
-            OsString::from("--no-ignore-parent"),
-            OsString::from("--no-require-git"),
-            // Prevent massive JSON lines from minified files causing OOM
-            OsString::from("--max-columns=10000"),
-        ];
-
-        if input.ignore_case.unwrap_or(false) {
-            args.push(OsString::from("--ignore-case"));
-        }
-        if input.literal.unwrap_or(false) {
-            args.push(OsString::from("--fixed-strings"));
-        }
         // The scanner runs from the pinned search root, while grep globs are
         // defined relative to the command cwd. Apply that glob to mapped
-        // logical result paths below so a descriptor path cannot change its
+        // logical result paths so a descriptor path cannot change its
         // slash-containing semantics.
         let glob_override =
             build_grep_glob_override(cwd_scope.logical_path(), input.glob.as_deref())?;
 
-        // Mirror find-tool behavior: rg discovers .gitignore files natively
-        // during traversal, while workspace-root rules above the scan root are
-        // applied as a post-filter on mapped result paths (see
-        // build_workspace_ignore_matcher for why --ignore-file cannot express
-        // them). Explicit file operands bypass ignore filtering entirely, so
-        // neither applies to single-file scans.
+        // Mirror find-tool behavior: the walk discovers .gitignore files
+        // natively, while workspace-root rules above the scan root are
+        // applied as a result-path filter (see build_workspace_ignore_matcher
+        // for why --ignore-file cannot express them). Explicit file operands
+        // bypass ignore filtering entirely, so neither applies to
+        // single-file scans.
         let workspace_ignore = if is_directory {
             build_workspace_ignore_matcher(&cwd_scope)
         } else {
             None
         };
-        if is_directory {
-            let root_gitignore = scoped_root.child_operand().join(".gitignore");
-            if scoped_root.logical_path() != cwd_scope.logical_path()
-                && scan_io_path.join(".gitignore").exists()
-            {
-                args.push(OsString::from("--ignore-file"));
-                args.push(root_gitignore.as_os_str().to_owned());
-            }
-        }
-
-        args.push(OsString::from("--"));
-        args.push(OsString::from(&input.pattern));
-        args.push(if is_directory {
-            scoped_root.child_operand().into_os_string()
-        } else {
-            scoped_root.file_child_operand().into_os_string()
-        });
-
-        let rg_cmd = find_rg_binary().ok_or_else(|| {
-            Error::tool(
-                "grep",
-                "rg is not available (please install ripgrep or rg)".to_string(),
-            )
-        })?;
-
-        // A child cannot chdir into a regular file, so single-file scans run
-        // from the pinned workspace root and read the pinned file descriptor
-        // via stdin (`-` operand) instead.
-        let child_cwd = if is_directory {
-            scan_io_path.clone()
-        } else {
-            operation_cwd.clone()
-        };
-        let child_stdin = if is_directory {
-            cwd_scope.child_stdin()
-        } else {
-            scoped_root.child_stdin()
-        };
-        let mut child = command_with_default_sigpipe_in_dir(rg_cmd, &child_cwd)
-            .map_err(|e| {
-                Error::tool(
-                    "grep",
-                    format!("Failed to prepare ripgrep: {}", error_for_line_output(&e)),
-                )
-            })?
-            .args(args)
-            .current_dir(&child_cwd)
-            .stdin(child_stdin.map_err(|error| {
-                Error::tool(
-                    "grep",
-                    format!(
-                        "Failed to pin ripgrep workspace: {}",
-                        error_for_line_output(&error)
-                    ),
-                )
-            })?)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                Error::tool(
-                    "grep",
-                    format!("Failed to run ripgrep: {}", error_for_line_output(&e)),
-                )
-            })?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::tool("grep", "Missing stdout".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
-
-        let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
-
-        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1024);
-        let (stderr_tx, stderr_rx) =
-            std::sync::mpsc::sync_channel::<std::result::Result<Vec<u8>, String>>(1024);
-
-        let stdout_thread = std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stdout);
-            for line in reader.lines() {
-                if stdout_tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let stderr_thread = std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stderr);
-            let _ = stderr_tx.send(read_to_end_capped_and_drain(reader, READ_TOOL_MAX_BYTES));
-        });
 
         let mut matches: Vec<(PathBuf, usize)> = Vec::new();
         let mut match_count: usize = 0;
         let mut match_scan_limit_reached = false;
-        let mut stderr_bytes = Vec::new();
 
-        let tick = Duration::from_millis(10);
-        let mut cx_cancelled = false;
+        let scoped_root = if self.backend == SearchBackend::Inproc {
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_for_scan = Arc::clone(&cancelled);
+            let operation_cwd_owned = operation_cwd.clone();
+            let pattern = input.pattern.clone();
+            let ignore_case = input.ignore_case.unwrap_or(false);
+            let literal = input.literal.unwrap_or(false);
+            let mut scan = Box::pin(asupersync::runtime::spawn_blocking_io(move || {
+                grep_inproc_scan_sync(
+                    scoped_root,
+                    glob_override,
+                    workspace_ignore,
+                    &operation_cwd_owned,
+                    is_directory,
+                    &pattern,
+                    ignore_case,
+                    literal,
+                    scan_limit,
+                    &cancel_for_scan,
+                )
+            }));
+            let tick = Duration::from_millis(10);
+            let outcome = loop {
+                let agent_cx = AgentCx::for_current_or_request();
+                let cx = agent_cx.cx();
+                if cx.checkpoint().is_err() {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(Error::tool("grep", "Command cancelled"));
+                }
+                let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                let sleeper = Box::pin(sleep(now, tick));
+                match futures::future::select(scan, sleeper).await {
+                    futures::future::Either::Left((result, _)) => break result,
+                    futures::future::Either::Right(((), pending)) => scan = pending,
+                }
+            };
+            let outcome =
+                outcome.map_err(|err| Error::tool("grep", error_for_line_output(&err)))?;
+            matches = outcome.matches;
+            match_count = outcome.match_count;
+            match_scan_limit_reached = outcome.limit_reached;
+            outcome.scoped_root
+        } else {
+            let mut args: Vec<OsString> = vec![
+                OsString::from("--json"),
+                OsString::from("--line-number"),
+                OsString::from("--color=never"),
+                OsString::from("--hidden"),
+                OsString::from("--no-config"),
+                OsString::from("--no-follow"),
+                OsString::from("--no-ignore-parent"),
+                OsString::from("--no-require-git"),
+                // Prevent massive JSON lines from minified files causing OOM
+                OsString::from("--max-columns=10000"),
+            ];
 
-        let exit_status = loop {
-            let agent_cx = AgentCx::for_current_or_request();
-            let cx = agent_cx.cx();
-            if cx.checkpoint().is_err() {
-                cx_cancelled = true;
-                break None;
+            if input.ignore_case.unwrap_or(false) {
+                args.push(OsString::from("--ignore-case"));
             }
+            if input.literal.unwrap_or(false) {
+                args.push(OsString::from("--fixed-strings"));
+            }
+            if is_directory {
+                let root_gitignore = scoped_root.child_operand().join(".gitignore");
+                if scoped_root.logical_path() != cwd_scope.logical_path()
+                    && scan_io_path.join(".gitignore").exists()
+                {
+                    args.push(OsString::from("--ignore-file"));
+                    args.push(root_gitignore.as_os_str().to_owned());
+                }
+            }
+
+            args.push(OsString::from("--"));
+            args.push(OsString::from(&input.pattern));
+            args.push(if is_directory {
+                scoped_root.child_operand().into_os_string()
+            } else {
+                scoped_root.file_child_operand().into_os_string()
+            });
+
+            let rg_cmd = find_rg_binary().ok_or_else(|| {
+                Error::tool(
+                    "grep",
+                    "rg is not available (please install ripgrep or rg)".to_string(),
+                )
+            })?;
+
+            // A child cannot chdir into a regular file, so single-file scans run
+            // from the pinned workspace root and read the pinned file descriptor
+            // via stdin (`-` operand) instead.
+            let child_cwd = if is_directory {
+                scan_io_path.clone()
+            } else {
+                operation_cwd.clone()
+            };
+            let child_stdin = if is_directory {
+                cwd_scope.child_stdin()
+            } else {
+                scoped_root.child_stdin()
+            };
+            let mut child = command_with_default_sigpipe_in_dir(rg_cmd, &child_cwd)
+                .map_err(|e| {
+                    Error::tool(
+                        "grep",
+                        format!("Failed to prepare ripgrep: {}", error_for_line_output(&e)),
+                    )
+                })?
+                .args(args)
+                .current_dir(&child_cwd)
+                .stdin(child_stdin.map_err(|error| {
+                    Error::tool(
+                        "grep",
+                        format!(
+                            "Failed to pin ripgrep workspace: {}",
+                            error_for_line_output(&error)
+                        ),
+                    )
+                })?)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| {
+                    Error::tool(
+                        "grep",
+                        format!("Failed to run ripgrep: {}", error_for_line_output(&e)),
+                    )
+                })?;
+
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::tool("grep", "Missing stdout".to_string()))?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
+
+            let mut guard = ProcessGuard::new(child, ProcessCleanupMode::ChildOnly);
+
+            let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1024);
+            let (stderr_tx, stderr_rx) =
+                std::sync::mpsc::sync_channel::<std::result::Result<Vec<u8>, String>>(1024);
+
+            let stdout_thread = std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stdout);
+                for line in reader.lines() {
+                    if stdout_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let stderr_thread = std::thread::spawn(move || {
+                let reader = std::io::BufReader::new(stderr);
+                let _ = stderr_tx.send(read_to_end_capped_and_drain(reader, READ_TOOL_MAX_BYTES));
+            });
+
+            let mut stderr_bytes = Vec::new();
+
+            let tick = Duration::from_millis(10);
+            let mut cx_cancelled = false;
+
+            let exit_status = loop {
+                let agent_cx = AgentCx::for_current_or_request();
+                let cx = agent_cx.cx();
+                if cx.checkpoint().is_err() {
+                    cx_cancelled = true;
+                    break None;
+                }
+
+                drain_rg_stdout(
+                    &stdout_rx,
+                    &scoped_root,
+                    glob_override.as_ref(),
+                    workspace_ignore.as_ref(),
+                    &mut matches,
+                    &mut match_count,
+                    &mut match_scan_limit_reached,
+                    scan_limit,
+                )?;
+                drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
+
+                if match_scan_limit_reached {
+                    break None;
+                }
+
+                match guard.try_wait_child() {
+                    Ok(Some(status)) => break Some(status),
+                    Ok(None) => {
+                        let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                        sleep(now, tick).await;
+                    }
+                    Err(e) => return Err(Error::tool("grep", error_for_line_output(&e))),
+                }
+            };
 
             drain_rg_stdout(
                 &stdout_rx,
@@ -8080,51 +8483,59 @@ impl Tool for GrepTool {
                 &mut match_scan_limit_reached,
                 scan_limit,
             )?;
-            drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
 
-            if match_scan_limit_reached {
-                break None;
-            }
+            let completed_status = if match_scan_limit_reached || cx_cancelled {
+                // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
+                // `kill()` terminates the process, and we reap it in a background thread
+                // so the stdout reader threads can exit promptly without blocking this task.
+                let _ = guard.kill();
+                // Drop any buffered stdout/stderr lines that were queued before termination.
+                while stdout_rx.try_recv().is_ok() {}
+                while stderr_rx.try_recv().is_ok() {}
+                None
+            } else {
+                Some(exit_status.expect("rg exit status"))
+            };
 
-            match guard.try_wait_child() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {
-                    let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
-                    sleep(now, tick).await;
+            // Keep draining while waiting for reader threads to finish; otherwise a
+            // bounded channel can fill and block the sender thread, causing join()
+            // to hang after ripgrep has already exited.
+            while !stdout_thread.is_finished() || !stderr_thread.is_finished() {
+                if match_scan_limit_reached || cx_cancelled {
+                    while stdout_rx.try_recv().is_ok() {}
+                } else {
+                    drain_rg_stdout(
+                        &stdout_rx,
+                        &scoped_root,
+                        glob_override.as_ref(),
+                        workspace_ignore.as_ref(),
+                        &mut matches,
+                        &mut match_count,
+                        &mut match_scan_limit_reached,
+                        scan_limit,
+                    )?;
                 }
-                Err(e) => return Err(Error::tool("grep", error_for_line_output(&e))),
+                drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
+                sleep(wall_now(), Duration::from_millis(1)).await;
             }
-        };
 
-        drain_rg_stdout(
-            &stdout_rx,
-            &scoped_root,
-            glob_override.as_ref(),
-            workspace_ignore.as_ref(),
-            &mut matches,
-            &mut match_count,
-            &mut match_scan_limit_reached,
-            scan_limit,
-        )?;
+            if cx_cancelled {
+                return Err(Error::tool("grep", "Command cancelled"));
+            }
 
-        let completed_status = if match_scan_limit_reached || cx_cancelled {
-            // Avoid buffering unbounded stdout/stderr once we've hit the match limit.
-            // `kill()` terminates the process, and we reap it in a background thread
-            // so the stdout reader threads can exit promptly without blocking this task.
-            let _ = guard.kill();
-            // Drop any buffered stdout/stderr lines that were queued before termination.
-            while stdout_rx.try_recv().is_ok() {}
-            while stderr_rx.try_recv().is_ok() {}
-            None
-        } else {
-            Some(exit_status.expect("rg exit status"))
-        };
+            // Ensure stdout/stderr reader threads have fully drained the pipes before
+            // we decide whether matches were found. Without this, fast ripgrep runs can
+            // exit before the reader thread has delivered JSON match lines, causing
+            // false "No matches found" results.
+            stdout_thread
+                .join()
+                .map_err(|_| Error::tool("grep", "ripgrep stdout reader thread panicked"))?;
+            stderr_thread
+                .join()
+                .map_err(|_| Error::tool("grep", "ripgrep stderr reader thread panicked"))?;
 
-        // Keep draining while waiting for reader threads to finish; otherwise a
-        // bounded channel can fill and block the sender thread, causing join()
-        // to hang after ripgrep has already exited.
-        while !stdout_thread.is_finished() || !stderr_thread.is_finished() {
-            if match_scan_limit_reached || cx_cancelled {
+            // Drain any remaining stdout/stderr produced after the last poll.
+            if match_scan_limit_reached {
                 while stdout_rx.try_recv().is_ok() {}
             } else {
                 drain_rg_stdout(
@@ -8139,51 +8550,19 @@ impl Tool for GrepTool {
                 )?;
             }
             drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
-            sleep(wall_now(), Duration::from_millis(1)).await;
-        }
 
-        if cx_cancelled {
-            return Err(Error::tool("grep", "Command cancelled"));
-        }
-
-        // Ensure stdout/stderr reader threads have fully drained the pipes before
-        // we decide whether matches were found. Without this, fast ripgrep runs can
-        // exit before the reader thread has delivered JSON match lines, causing
-        // false "No matches found" results.
-        stdout_thread
-            .join()
-            .map_err(|_| Error::tool("grep", "ripgrep stdout reader thread panicked"))?;
-        stderr_thread
-            .join()
-            .map_err(|_| Error::tool("grep", "ripgrep stderr reader thread panicked"))?;
-
-        // Drain any remaining stdout/stderr produced after the last poll.
-        if match_scan_limit_reached {
-            while stdout_rx.try_recv().is_ok() {}
-        } else {
-            drain_rg_stdout(
-                &stdout_rx,
-                &scoped_root,
-                glob_override.as_ref(),
-                workspace_ignore.as_ref(),
-                &mut matches,
-                &mut match_count,
-                &mut match_scan_limit_reached,
-                scan_limit,
-            )?;
-        }
-        drain_rg_stderr(&stderr_rx, &mut stderr_bytes)?;
-
-        let stderr_text = diagnostic_for_line_output(
-            &stderr_bytes,
-            stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES,
-        );
-        if !match_scan_limit_reached
-            && let Some(message) =
-                completed_status.and_then(|status| rg_exit_failure(status, &stderr_text))
-        {
-            return Err(Error::tool("grep", message));
-        }
+            let stderr_text = diagnostic_for_line_output(
+                &stderr_bytes,
+                stderr_bytes.len() as u64 > READ_TOOL_MAX_BYTES,
+            );
+            if !match_scan_limit_reached
+                && let Some(message) =
+                    completed_status.and_then(|status| rg_exit_failure(status, &stderr_text))
+            {
+                return Err(Error::tool("grep", message));
+            }
+            scoped_root
+        };
 
         let match_limit_reached = match_count > effective_limit;
         if match_limit_reached {
@@ -8421,15 +8800,21 @@ struct FindEntry {
 pub struct FindTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    backend: SearchBackend,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl FindTool {
     pub fn new(cwd: &Path) -> Self {
+        Self::with_backend(cwd, SearchBackend::default())
+    }
+
+    pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            backend,
             #[cfg(test)]
             after_scope_hook: None,
         }
@@ -8443,6 +8828,7 @@ impl FindTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            backend: SearchBackend::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -8632,6 +9018,188 @@ impl Tool for FindTool {
             return Ok(output);
         }
 
+        // NOTE: Both backends rely on native .gitignore discovery during the
+        // walk. Workspace-root rules above the scan root are applied as a
+        // post-filter on mapped result paths (see
+        // build_workspace_ignore_matcher for why --ignore-file cannot express
+        // them).
+        let workspace_ignore = build_workspace_ignore_matcher(&cwd_scope);
+        // fd matches plain `--glob` patterns against the FILENAME only, so a
+        // path-shaped pattern like `src/**/*.txt` silently matches nothing
+        // (fd 10.3/10.4, both platforms). For those, ask fd for a full-path
+        // superset (`--full-path` with a `**/` anchor that absorbs the
+        // absolute search-root prefix) and restore exact scan-root-relative
+        // glob semantics with a host-side filter over the mapped logical
+        // paths below. The in-process backend applies the same filename/path
+        // split natively during its walk.
+        let path_shaped_pattern = input.pattern.contains('/');
+        let path_glob_filter = if path_shaped_pattern {
+            let mut builder = ignore::overrides::OverrideBuilder::new(scoped_root.logical_path());
+            builder
+                .add(&input.pattern)
+                .map_err(|error| Error::tool("find", error_for_line_output(&error)))?;
+            Some(
+                builder
+                    .build()
+                    .map_err(|error| Error::tool("find", error_for_line_output(&error)))?,
+            )
+        } else {
+            None
+        };
+
+        let raw_paths: Vec<PathBuf> = if self.backend == SearchBackend::Inproc {
+            let scan_root = scan_io_path.clone();
+            let walk_cwd = operation_cwd.clone();
+            let pattern = input.pattern.clone();
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let cancel_for_walk = Arc::clone(&cancelled);
+            let mut walk = Box::pin(asupersync::runtime::spawn_blocking_io(move || {
+                find_inproc_scan_sync(
+                    &scan_root,
+                    &walk_cwd,
+                    &pattern,
+                    path_shaped_pattern,
+                    scan_limit,
+                    &cancel_for_walk,
+                )
+            }));
+            let tick = Duration::from_millis(10);
+            let start_time = std::time::Instant::now();
+            let outcome = loop {
+                let agent_cx = AgentCx::for_current_or_request();
+                let cx = agent_cx.cx();
+                if cx.checkpoint().is_err() {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(Error::tool("find", "Command cancelled"));
+                }
+                if start_time.elapsed().as_millis() > 60_000 {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(Error::tool("find", "Command timed out after 60 seconds"));
+                }
+                let now = cx.timer_driver().map_or_else(wall_now, |timer| timer.now());
+                let sleeper = Box::pin(sleep(now, tick));
+                match futures::future::select(walk, sleeper).await {
+                    futures::future::Either::Left((result, _)) => break result,
+                    futures::future::Either::Right(((), pending)) => walk = pending,
+                }
+            };
+            outcome.map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("in-process find failed: {}", error_for_line_output(&err)),
+                )
+            })?
+        } else {
+            self.run_external_fd_scan(
+                &input,
+                &scoped_root,
+                &cwd_scope,
+                &scan_io_path,
+                scan_limit,
+                path_shaped_pattern,
+            )
+            .await?
+        };
+
+        if raw_paths.is_empty() {
+            let output = ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "No files found matching pattern",
+                ))],
+                details: None,
+                is_error: false,
+            };
+            cache_tool_output(
+                cache_key,
+                stable_cache_dependencies_for_scoped_scan(
+                    &scoped_root,
+                    &cwd_scope,
+                    cache_mode,
+                    recursive_cache_access,
+                    cache_deps.as_deref(),
+                ),
+                &output,
+            );
+            return Ok(output);
+        }
+
+        let mut entries: Vec<FindEntry> = Vec::new();
+        for raw_path in raw_paths {
+            let mapped = scoped_root.map_child_output(&raw_path).map_err(|error| {
+                Error::tool(
+                    "find",
+                    format!(
+                        "fd returned an invalid path: {}",
+                        error_for_line_output(&error)
+                    ),
+                )
+            })?;
+            let rel = mapped.relative;
+            let full_path = mapped.read_path;
+            // fd was invoked with --no-follow. Inspect the directory entry
+            // itself as well, otherwise `is_dir`/`metadata` follows a symlink
+            // or junction after the scan and leaks target type/mtime into the
+            // output and sort order.
+            let entry_metadata = std::fs::symlink_metadata(&full_path).ok();
+            let is_dir = entry_metadata
+                .as_ref()
+                .is_some_and(std::fs::Metadata::is_dir);
+            if let Some(workspace_ignore) = workspace_ignore.as_ref()
+                && workspace_ignore
+                    .matched_path_or_any_parents(&mapped.logical_path, is_dir)
+                    .is_ignore()
+            {
+                continue;
+            }
+            // Exact scan-root-relative glob semantics for path-shaped
+            // patterns; the external backend only produced the full-path
+            // superset (see above).
+            if let Some(path_glob_filter) = path_glob_filter.as_ref()
+                && path_glob_filter
+                    .matched(&mapped.logical_path, is_dir)
+                    .is_ignore()
+            {
+                continue;
+            }
+
+            let modified = entry_metadata.and_then(|meta| meta.modified().ok());
+            entries.push(FindEntry {
+                rel,
+                modified,
+                is_dir,
+            });
+        }
+        drop(path_glob_filter);
+        drop(workspace_ignore);
+
+        run_find_output_pipeline(
+            entries,
+            effective_limit,
+            cache_key,
+            &scoped_root,
+            &cwd_scope,
+            cache_mode,
+            recursive_cache_access,
+            cache_deps.as_deref(),
+            self.artifact_root.as_deref(),
+            tool_call_id,
+        )
+    }
+}
+
+impl FindTool {
+    /// External `fd` backend (escape hatch): spawn fd with the historical
+    /// argument surface and return scan-root-relative result paths.
+    #[allow(clippy::too_many_lines)]
+    async fn run_external_fd_scan(
+        &self,
+        input: &FindInput,
+        scoped_root: &ScopedScanRoot,
+        cwd_scope: &ScopedScanRoot,
+        scan_io_path: &Path,
+        scan_limit: usize,
+        path_shaped_pattern: bool,
+    ) -> Result<Vec<PathBuf>> {
         let fd_cmd = find_fd_binary().ok_or_else(|| {
             Error::tool(
                 "find",
@@ -8655,11 +9223,6 @@ impl Tool for FindTool {
             OsString::from(scan_limit.to_string()),
         ];
 
-        // NOTE: We rely on fd's native .gitignore discovery. Workspace-root
-        // rules above the scan root are applied as a post-filter on mapped
-        // result paths (see build_workspace_ignore_matcher for why
-        // --ignore-file cannot express them).
-        let workspace_ignore = build_workspace_ignore_matcher(&cwd_scope);
         let root_gitignore = scoped_root.child_operand().join(".gitignore");
         if scoped_root.logical_path() != cwd_scope.logical_path()
             && scan_io_path.join(".gitignore").exists()
@@ -8667,28 +9230,6 @@ impl Tool for FindTool {
             args.push(OsString::from("--ignore-file"));
             args.push(root_gitignore.as_os_str().to_owned());
         }
-
-        // fd matches plain `--glob` patterns against the FILENAME only, so a
-        // path-shaped pattern like `src/**/*.txt` silently matches nothing
-        // (fd 10.3/10.4, both platforms). For those, ask fd for a full-path
-        // superset (`--full-path` with a `**/` anchor that absorbs the
-        // absolute search-root prefix) and restore exact scan-root-relative
-        // glob semantics with a host-side filter over the mapped logical
-        // paths below.
-        let path_shaped_pattern = input.pattern.contains('/');
-        let path_glob_filter = if path_shaped_pattern {
-            let mut builder = ignore::overrides::OverrideBuilder::new(scoped_root.logical_path());
-            builder
-                .add(&input.pattern)
-                .map_err(|error| Error::tool("find", error_for_line_output(&error)))?;
-            Some(
-                builder
-                    .build()
-                    .map_err(|error| Error::tool("find", error_for_line_output(&error)))?,
-            )
-        } else {
-            None
-        };
 
         if path_shaped_pattern {
             args.push(OsString::from("--full-path"));
@@ -8706,7 +9247,7 @@ impl Tool for FindTool {
         }
         args.push(scoped_root.child_operand().into_os_string());
 
-        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, &scan_io_path)
+        let mut child = command_with_default_sigpipe_in_dir(fd_cmd, scan_io_path)
             .map_err(|e| {
                 Error::tool(
                     "find",
@@ -8840,29 +9381,7 @@ impl Tool for FindTool {
             }
         }
 
-        if stdout_bytes.is_empty() {
-            let output = ToolOutput {
-                content: vec![ContentBlock::Text(TextContent::new(
-                    "No files found matching pattern",
-                ))],
-                details: None,
-                is_error: false,
-            };
-            cache_tool_output(
-                cache_key,
-                stable_cache_dependencies_for_scoped_scan(
-                    &scoped_root,
-                    &cwd_scope,
-                    cache_mode,
-                    recursive_cache_access,
-                    cache_deps.as_deref(),
-                ),
-                &output,
-            );
-            return Ok(output);
-        }
-
-        let mut entries: Vec<FindEntry> = Vec::new();
+        let mut raw_paths = Vec::new();
         for raw_entry in stdout_bytes.split(|byte| *byte == b'\0') {
             if raw_entry.is_empty() {
                 continue;
@@ -8877,51 +9396,28 @@ impl Tool for FindTool {
             };
             #[cfg(not(unix))]
             let raw_path = PathBuf::from(String::from_utf8_lossy(raw_entry).into_owned());
-
-            let mapped = scoped_root.map_child_output(&raw_path).map_err(|error| {
-                Error::tool(
-                    "find",
-                    format!(
-                        "fd returned an invalid path: {}",
-                        error_for_line_output(&error)
-                    ),
-                )
-            })?;
-            let rel = mapped.relative;
-            let full_path = mapped.read_path;
-            // fd was invoked with --no-follow. Inspect the directory entry
-            // itself as well, otherwise `is_dir`/`metadata` follows a symlink
-            // or junction after the scan and leaks target type/mtime into the
-            // output and sort order.
-            let entry_metadata = std::fs::symlink_metadata(&full_path).ok();
-            let is_dir = entry_metadata
-                .as_ref()
-                .is_some_and(std::fs::Metadata::is_dir);
-            if let Some(workspace_ignore) = workspace_ignore.as_ref()
-                && workspace_ignore
-                    .matched_path_or_any_parents(&mapped.logical_path, is_dir)
-                    .is_ignore()
-            {
-                continue;
-            }
-            // Exact scan-root-relative glob semantics for path-shaped
-            // patterns; fd only produced the full-path superset (see above).
-            if let Some(path_glob_filter) = path_glob_filter.as_ref()
-                && path_glob_filter
-                    .matched(&mapped.logical_path, is_dir)
-                    .is_ignore()
-            {
-                continue;
-            }
-
-            let modified = entry_metadata.and_then(|meta| meta.modified().ok());
-            entries.push(FindEntry {
-                rel,
-                modified,
-                is_dir,
-            });
+            raw_paths.push(raw_path);
         }
+        Ok(raw_paths)
+    }
+}
 
+/// Shared find output assembly: sort newest-first, apply limits and
+/// truncation, spill artifacts, and cache the rendered output.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_find_output_pipeline(
+    mut entries: Vec<FindEntry>,
+    effective_limit: usize,
+    cache_key: String,
+    scoped_root: &ScopedScanRoot,
+    cwd_scope: &ScopedScanRoot,
+    cache_mode: ToolCacheFingerprintMode,
+    recursive_cache_access: Option<RecursiveScanAccess>,
+    cache_deps: Option<&[ToolCacheDependency]>,
+    artifact_root: Option<&Path>,
+    tool_call_id: &str,
+) -> Result<ToolOutput> {
+    {
         if entries.len() > FIND_SCAN_HARD_LIMIT {
             return Err(Error::tool(
                 "find",
@@ -8952,11 +9448,11 @@ impl Tool for FindTool {
             cache_tool_output(
                 cache_key,
                 stable_cache_dependencies_for_scoped_scan(
-                    &scoped_root,
-                    &cwd_scope,
+                    scoped_root,
+                    cwd_scope,
                     cache_mode,
                     recursive_cache_access,
-                    cache_deps.as_deref(),
+                    cache_deps,
                 ),
                 &output,
             );
@@ -8981,11 +9477,6 @@ impl Tool for FindTool {
         let mut result_output = std::mem::take(&mut truncation.content);
         let mut notices: Vec<String> = Vec::new();
         let mut details_map = serde_json::Map::new();
-
-        if !status.success() {
-            let code = status.code().unwrap_or(1);
-            notices.push(format!("fd exited with code {code}"));
-        }
 
         if result_limit_reached {
             notices.push(format!(
@@ -9014,7 +9505,7 @@ impl Tool for FindTool {
         };
 
         attach_text_artifact_if_needed_with_root(
-            self.artifact_root.as_deref(),
+            artifact_root,
             &mut result_output,
             &mut details,
             "find",
@@ -9031,11 +9522,11 @@ impl Tool for FindTool {
         cache_tool_output(
             cache_key,
             stable_cache_dependencies_for_scoped_scan(
-                &scoped_root,
-                &cwd_scope,
+                scoped_root,
+                cwd_scope,
                 cache_mode,
                 recursive_cache_access,
-                cache_deps.as_deref(),
+                cache_deps,
             ),
             &output,
         );

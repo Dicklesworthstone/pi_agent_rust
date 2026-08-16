@@ -97,6 +97,12 @@ pub struct Config {
     /// Session durability mode: `strict`, `balanced` (default), or `throughput`.
     #[serde(alias = "sessionDurability")]
     pub session_durability: Option<String>,
+    /// Search backend for the grep/find tools: `inproc` (default; in-process
+    /// ignore/grep crates, no external binaries) or `external` (shell out to
+    /// `rg`/`fd`, the pre-bd-cv653.1.5 behavior — kept as a debugging escape
+    /// hatch).
+    #[serde(alias = "searchBackend")]
+    pub search_backend: Option<String>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -589,6 +595,7 @@ impl Config {
             session_picker_input: other.session_picker_input.or(base.session_picker_input),
             session_store: other.session_store.or(base.session_store),
             session_durability: other.session_durability.or(base.session_durability),
+            search_backend: other.search_backend.or(base.search_backend),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),

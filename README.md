@@ -748,9 +748,15 @@ cargo install --path . --bin pi --locked
 
 ### Dependencies
 
-Pi has minimal runtime dependencies:
-- `fd`: Required for the `find` tool (install via `apt install fd-find` or `brew install fd`)
-- `rg`: Required for the `grep` tool (install via `apt install ripgrep` or `brew install ripgrep`)
+Pi has no required external runtime dependencies: the `grep` and `find`
+tools search in-process using the same engines ripgrep is built from
+(`grep-searcher`/`grep-regex` and the `ignore` walker), so patterns keep
+ripgrep's default (Rust regex crate) syntax. PCRE2-only features
+(lookaround, backreferences) were never exposed and remain unsupported.
+
+To shell out to `rg`/`fd` instead (debugging escape hatch), set
+`"search_backend": "external"` in settings.json and install them via
+`apt install ripgrep fd-find` or `brew install ripgrep fd`.
 
 ### Uninstall
 
@@ -1866,7 +1872,7 @@ Discover files by pattern:
 Input: { "pattern": "*.rs", "path": "src/", "limit": 1000 }
 ```
 
-- Glob patterns via `fd`
+- Glob patterns matched in-process (no `fd` required)
 - Sorted by modification time
 - Respects .gitignore
 
@@ -2454,7 +2460,9 @@ For a more complete guide, see [docs/troubleshooting.md](docs/troubleshooting.md
 
 ### "fd not found"
 
-The `find` tool requires `fd`:
+The `find` tool searches in-process by default and needs no `fd` binary.
+This error only appears with `"search_backend": "external"` in
+settings.json; either remove that setting or install `fd`:
 
 ```bash
 # Ubuntu/Debian

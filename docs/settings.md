@@ -150,6 +150,13 @@ Accessor defaults:
 }
 ```
 
+### Search
+
+- `search_backend` (string): Backend for the `grep`/`find` tools. `inproc`
+  (default) searches in-process with the same engines ripgrep uses (no `rg`
+  or `fd` binaries required); `external` shells out to `rg`/`fd` as before —
+  kept as a debugging escape hatch. Alias: `searchBackend`.
+
 ### Shell
 
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.
