@@ -2146,6 +2146,70 @@ fn register_hook_unknown_event_warns_and_still_registers() {
     );
 }
 
+/// gh #167 drift guard: `ExtensionEventName::ALL` must stay in lockstep with
+/// the enum (and therefore with the `Display` list, which the compiler already
+/// forces to be exhaustive). The `ordinal` match below is exhaustive, so
+/// adding a variant without updating this test — and, by extension, `ALL` —
+/// fails to compile; the runtime assertions then force `ALL` to cover every
+/// ordinal exactly once with a unique wire name.
+#[test]
+fn extension_event_name_all_is_exhaustive_and_unique() {
+    use crate::extensions::ExtensionEventName as E;
+
+    const fn ordinal(event: E) -> usize {
+        match event {
+            E::Startup => 0,
+            E::Input => 1,
+            E::BeforeAgentStart => 2,
+            E::Context => 3,
+            E::AgentStart => 4,
+            E::AgentEnd => 5,
+            E::TurnStart => 6,
+            E::TurnEnd => 7,
+            E::MessageStart => 8,
+            E::MessageUpdate => 9,
+            E::MessageEnd => 10,
+            E::ToolExecutionStart => 11,
+            E::ToolExecutionUpdate => 12,
+            E::ToolExecutionEnd => 13,
+            E::ToolCall => 14,
+            E::ToolResult => 15,
+            E::SessionStart => 16,
+            E::SessionBeforeSwitch => 17,
+            E::SessionSwitch => 18,
+            E::SessionBeforeFork => 19,
+            E::SessionFork => 20,
+            E::SessionBeforeCompact => 21,
+            E::SessionCompact => 22,
+            E::ResourcesDiscover => 23,
+            E::ModelSelect => 24,
+            E::UserBash => 25,
+            E::SessionBeforeTree => 26,
+            E::SessionTree => 27,
+            E::SessionShutdown => 28,
+        }
+    }
+
+    let mut seen_ordinals = vec![false; E::ALL.len()];
+    let mut names = std::collections::HashSet::new();
+    for event in E::ALL {
+        let idx = ordinal(event);
+        assert!(
+            !seen_ordinals[idx],
+            "duplicate variant in ExtensionEventName::ALL: {event}"
+        );
+        seen_ordinals[idx] = true;
+        assert!(
+            names.insert(event.to_string()),
+            "duplicate wire name in ExtensionEventName::ALL: {event}"
+        );
+    }
+    assert!(
+        seen_ordinals.iter().all(|seen| *seen),
+        "ExtensionEventName::ALL is missing at least one variant"
+    );
+}
+
 #[test]
 fn isolated_runtime_reset_drops_registry_routes_and_requires_cold_reload() {
     let manager = ExtensionManager::new();
