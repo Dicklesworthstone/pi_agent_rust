@@ -141,6 +141,7 @@ fn build_perf_app(harness: &TestHarness, messages: Vec<ConversationMessage>) -> 
         model_entry.clone(),
         vec![model_entry.clone()],
         vec![model_entry],
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),

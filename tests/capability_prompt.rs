@@ -138,6 +138,7 @@ fn build_app(harness: &TestHarness, extensions: Option<ExtensionManager>) -> PiA
         model_entry,
         model_scope,
         available_models,
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),
