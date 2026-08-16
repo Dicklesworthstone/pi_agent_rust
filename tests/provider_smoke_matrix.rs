@@ -19,7 +19,9 @@ use futures::StreamExt;
 use pi::model::{Message, UserContent, UserMessage};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, StreamEvent, StreamOptions};
-use pi::provider_metadata::{PROVIDER_METADATA, ProviderOnboardingMode, canonical_provider_id};
+use pi::provider_metadata::{
+    PROVIDER_METADATA, ProviderOnboardingMode, canonical_provider_id, provider_routing_defaults,
+};
 use pi::providers::create_provider;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -50,7 +52,13 @@ fn make_smoke_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntr
         },
         api_key: None,
         headers: HashMap::new(),
-        auth_header: false,
+        // Mirror the real registry: `built_in_models` populates `auth_header`
+        // from the provider's routing defaults, and since c2173764
+        // `create_provider` honors the entry value for OpenAI-family routes.
+        // A hand-built `false` here would suppress the Authorization header
+        // in a way no real registry entry does (bd-5g70z).
+        auth_header: provider_routing_defaults(provider)
+            .is_some_and(|defaults| defaults.auth_header),
         compat: None,
         oauth_config: None,
     }
