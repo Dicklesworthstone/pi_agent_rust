@@ -19362,6 +19362,14 @@ pub(crate) struct RegistrySnapshot {
     pub current_model_id: Option<String>,
     /// Current thinking level.
     pub current_thinking_level: Option<String>,
+    /// Whitelisted model-catalog snapshot for `ctx.modelRegistry.find()`
+    /// (gh #167). Serialized host-side via the same projection as the pi-ai
+    /// `getModels` hostcall, so no credential material can appear here.
+    pub extension_models: Arc<Vec<Value>>,
+    /// Current effective system prompt, seeded at extension boot so
+    /// `ctx.getSystemPrompt()` is answerable before the first
+    /// `before_agent_start` dispatch (gh #167).
+    pub current_system_prompt: Option<String>,
     /// Global kill-switch for hostcall compatibility lane.
     // The live path reads kill switches from the guarded manager state; the
     // snapshot copies them for read-only diagnostics and future RCU consumers.
@@ -19481,6 +19489,11 @@ struct ExtensionManagerInner {
     current_provider: Option<String>,
     current_model_id: Option<String>,
     current_thinking_level: Option<String>,
+    /// Whitelisted model-catalog snapshot for `ctx.modelRegistry.find()`
+    /// (gh #167). `Arc` so snapshot rebuilds never deep-clone the catalog.
+    extension_models: Arc<Vec<Value>>,
+    /// Current effective system prompt (gh #167), seeded at extension boot.
+    current_system_prompt: Option<String>,
     host_actions: Option<Arc<dyn ExtensionHostActions>>,
     policy_prompt_cache: HashMap<String, HashMap<String, PersistedDecision>>,
     /// Persistent store for "Allow Always" / "Deny Always" decisions.

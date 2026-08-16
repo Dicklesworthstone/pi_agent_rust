@@ -8255,6 +8255,14 @@ impl AgentSession {
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
         self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
+        // Keep the extension ctx catalog in sync when the registry is
+        // replaced after extension boot (e.g. after merging extension
+        // providers in main). No-op before boot; boot seeds it (gh #167).
+        if let Some(region) = &self.extensions {
+            region
+                .manager()
+                .set_extension_models(pi_ai_model_registry_values(&registry));
+        }
         self.model_registry = Some(registry);
     }
 
@@ -8590,6 +8598,15 @@ impl AgentSession {
                 // limit or falling back to the provider default.
                 stream_options.max_tokens = Some(entry.model.max_tokens);
                 self.refresh_extension_completion_host_state();
+                // gh #167: bump the extension ctx generation so handlers see
+                // the fresh ctx.model instead of a cached payload built for
+                // the previous model.
+                if let Some(region) = &self.extensions {
+                    region.manager().set_current_model(
+                        Some(provider_id.to_string()),
+                        Some(model_id.to_string()),
+                    );
+                }
                 Ok(())
             }
             Err(e) => Err(Error::validation(format!(
@@ -9315,6 +9332,19 @@ impl AgentSession {
             queue_modes: Arc::clone(&queue_modes),
             auto_compaction_enabled: self.compaction_settings.enabled,
         }));
+
+        // gh #167 ctx parity: seed the manager with the model catalog (for
+        // ctx.modelRegistry.find), the current provider/model pair (ctx.model
+        // fallback + cache-generation bump on switches), and the effective
+        // system prompt (ctx.getSystemPrompt before any before_agent_start).
+        if let Some(registry) = &self.model_registry {
+            manager.set_extension_models(pi_ai_model_registry_values(registry));
+        }
+        manager.set_current_model(
+            Some(self.agent.provider().name().to_string()),
+            Some(self.agent.provider().model_id().to_string()),
+        );
+        manager.set_system_prompt(self.agent.system_prompt().map(ToString::to_string));
 
         let injected = Arc::new(StdMutex::new(ExtensionInjectedQueue::new(
             steering_mode,

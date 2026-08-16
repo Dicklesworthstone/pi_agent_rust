@@ -132,6 +132,8 @@ impl ExtensionManager {
             current_provider: inner.current_provider.clone(),
             current_model_id: inner.current_model_id.clone(),
             current_thinking_level: inner.current_thinking_level.clone(),
+            extension_models: Arc::clone(&inner.extension_models),
+            current_system_prompt: inner.current_system_prompt.clone(),
             hostcall_compat_kill_switch_global: inner.hostcall_compat_kill_switch_global,
             hostcall_compat_kill_switch_extensions: inner
                 .hostcall_compat_kill_switch_extensions
@@ -3510,6 +3512,37 @@ impl ExtensionManager {
         self.refresh_snapshot_with_guard_release(guard);
     }
 
+    /// Publish the whitelisted model catalog consumed by
+    /// `ctx.modelRegistry.find()` in the JS bridge (gh #167).
+    ///
+    /// The caller must serialize entries through a credential-free projection
+    /// (see `pi_ai_model_entry_value` in `agent.rs`); this setter stores the
+    /// values verbatim and bumps the ctx generation so cached payloads are
+    /// rebuilt with the new catalog.
+    pub fn set_extension_models(&self, models: Vec<Value>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.extension_models = Arc::new(models);
+        guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    /// Publish the current effective system prompt so extensions can call
+    /// `ctx.getSystemPrompt()` before the first `before_agent_start`
+    /// dispatch (gh #167). Later `before_agent_start` payloads keep it fresh
+    /// per prompt inside the JS bridge.
+    pub fn set_system_prompt(&self, system_prompt: Option<String>) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.current_system_prompt = system_prompt;
+        guard.ctx_generation = guard.ctx_generation.wrapping_add(1);
+        self.refresh_snapshot_with_guard_release(guard);
+    }
+
     /// Collect tool definitions from all registered extensions.
     ///
     /// Uses the pre-computed snapshot (RCU) instead of locking the mutex.
@@ -4205,6 +4238,8 @@ impl ExtensionManager {
         model_registry_values: &HashMap<String, String>,
         current_provider: Option<&str>,
         current_model_id: Option<&str>,
+        extension_models: &[Value],
+        current_system_prompt: Option<&str>,
     ) -> Value {
         let mut ctx = serde_json::Map::new();
         ctx.insert("hasUI".into(), Value::Bool(has_ui));
@@ -4257,6 +4292,22 @@ impl ExtensionManager {
             ctx.insert("model".into(), model);
         }
 
+        // gh #167: whitelisted model catalog for the synchronous
+        // ctx.modelRegistry.find() shim. Entries are already projected
+        // through the credential-free `pi_ai_model_entry_value` shape.
+        if !extension_models.is_empty() {
+            ctx.insert(
+                "models".into(),
+                Value::Array(extension_models.to_owned()),
+            );
+        }
+
+        // gh #167: current system prompt (seeded at boot; refreshed per
+        // prompt from before_agent_start payloads inside the JS bridge).
+        if let Some(prompt) = current_system_prompt {
+            ctx.insert("systemPrompt".into(), Value::String(prompt.to_string()));
+        }
+
         Value::Object(ctx)
     }
 
@@ -4301,6 +4352,8 @@ impl ExtensionManager {
                 &snap.model_registry_values,
                 snap.current_provider.as_deref(),
                 snap.current_model_id.as_deref(),
+                &snap.extension_models,
+                snap.current_system_prompt.as_deref(),
             )
             .await,
         );

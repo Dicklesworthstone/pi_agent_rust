@@ -9169,8 +9169,122 @@ export function parseSessionEntries(text) {
   return out;
 }
 
-export function convertToLlm(entries) {
-  return entries;
+// Byte-identical to upstream messages.ts and the Rust builder constants in
+// session.rs (COMPACTION_SUMMARY_PREFIX/SUFFIX, BRANCH_SUMMARY_PREFIX/SUFFIX).
+// Note the deliberate upstream asymmetry: the branch suffix has no leading
+// newline while the compaction suffix does.
+export const COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+export const COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+export const BRANCH_SUMMARY_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+export const BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+// TS-faithful port of upstream messages.ts bashExecutionToText. This is
+// deliberately NOT the Rust session.rs variant: upstream always inserts a
+// newline before the closing fence (even after a trailing-newline output)
+// and only mentions truncation when fullOutputPath is present.
+export function bashExecutionToText(msg) {
+  const m = msg && typeof msg === "object" ? msg : {};
+  let text = `Ran \`${m.command}\`\n`;
+  if (m.output) {
+    text += `\`\`\`\n${m.output}\n\`\`\``;
+  } else {
+    text += "(no output)";
+  }
+  if (m.cancelled) {
+    text += "\n\n(command cancelled)";
+  } else if (m.exitCode !== null && m.exitCode !== undefined && m.exitCode !== 0) {
+    text += `\n\nCommand exited with code ${m.exitCode}`;
+  }
+  if (m.truncated && m.fullOutputPath) {
+    text += `\n\n[Output truncated. Full output: ${m.fullOutputPath}]`;
+  }
+  return text;
+}
+
+export function createCustomMessage(customType, content, display, details, timestamp) {
+  return {
+    role: "custom",
+    customType,
+    content,
+    display,
+    details,
+    timestamp: new Date(timestamp).getTime(),
+  };
+}
+
+export function createBranchSummaryMessage(summary, fromId, timestamp) {
+  return {
+    role: "branchSummary",
+    summary,
+    fromId,
+    timestamp: new Date(timestamp).getTime(),
+  };
+}
+
+export function createCompactionSummaryMessage(summary, tokensBefore, timestamp) {
+  return {
+    role: "compactionSummary",
+    summary,
+    tokensBefore,
+    timestamp: new Date(timestamp).getTime(),
+  };
+}
+
+// Port of upstream messages.ts convertToLlm (gh #167 / bd-9wkml): transform
+// AgentMessages (including custom roles) into LLM-compatible messages.
+// Role-by-role parity with upstream; non-object entries and unknown roles are
+// dropped, mirroring upstream's exhaustive switch returning undefined.
+export function convertToLlm(messages) {
+  const list = Array.isArray(messages) ? messages : [];
+  const out = [];
+  for (const m of list) {
+    if (!m || typeof m !== "object") continue;
+    switch (m.role) {
+      case "bashExecution":
+        // Skip messages excluded from context (!! prefix).
+        if (m.excludeFromContext) break;
+        out.push({
+          role: "user",
+          content: [{ type: "text", text: bashExecutionToText(m) }],
+          timestamp: m.timestamp,
+        });
+        break;
+      case "custom": {
+        const content =
+          typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content;
+        out.push({ role: "user", content, timestamp: m.timestamp });
+        break;
+      }
+      case "branchSummary":
+        out.push({
+          role: "user",
+          content: [
+            { type: "text", text: BRANCH_SUMMARY_PREFIX + m.summary + BRANCH_SUMMARY_SUFFIX },
+          ],
+          timestamp: m.timestamp,
+        });
+        break;
+      case "compactionSummary":
+        out.push({
+          role: "user",
+          content: [
+            { type: "text", text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
+          ],
+          timestamp: m.timestamp,
+        });
+        break;
+      case "user":
+      case "assistant":
+      case "toolResult":
+        out.push(m);
+        break;
+      default:
+        break;
+    }
+  }
+  return out;
 }
 
 export function serializeConversation(entries) {
@@ -9181,13 +9295,113 @@ export function serializeConversation(entries) {
   }
 }
 
-export function buildSessionContext(entries = [], _leafId = null, _byId = null) {
-  const list = Array.isArray(entries) ? entries.slice() : [];
-  return {
-    messages: list,
-    thinkingLevel: null,
-    model: null,
+// Port of upstream session-manager.ts buildSessionContext (gh #167 /
+// bd-9wkml): resolve the leaf->root branch, track thinkingLevel/model along
+// the path, and apply compaction kept-entry semantics. Port-side hardening
+// beyond upstream: a corrupted parentId chain (cycle/duplicate ids) must
+// terminate instead of hanging the extension runtime.
+export function buildSessionContext(entries = [], leafId = undefined, byId = undefined) {
+  const list = Array.isArray(entries) ? entries : [];
+  let index = byId && typeof byId.get === "function" ? byId : null;
+  if (!index) {
+    index = new Map();
+    for (const entry of list) {
+      if (entry && typeof entry === "object" && typeof entry.id === "string") {
+        index.set(entry.id, entry);
+      }
+    }
+  }
+
+  // Explicit null leaf: navigated to before the first entry.
+  if (leafId === null) {
+    return { messages: [], thinkingLevel: "off", model: null };
+  }
+
+  let leaf;
+  if (leafId) leaf = index.get(leafId);
+  if (!leaf) leaf = list[list.length - 1];
+  if (!leaf) {
+    return { messages: [], thinkingLevel: "off", model: null };
+  }
+
+  // Walk from leaf to root, collecting the path (cycle-guarded).
+  const path = [];
+  const visited = new Set();
+  let current = leaf;
+  while (current) {
+    const id = typeof current.id === "string" ? current.id : null;
+    if (id !== null) {
+      if (visited.has(id)) break;
+      visited.add(id);
+    }
+    path.unshift(current);
+    current = current.parentId ? index.get(current.parentId) : undefined;
+  }
+
+  // Extract settings and find the last compaction along the path.
+  let thinkingLevel = "off";
+  let model = null;
+  let compaction = null;
+  for (const entry of path) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.type === "thinking_level_change") {
+      thinkingLevel = entry.thinkingLevel;
+    } else if (entry.type === "model_change") {
+      model = { provider: entry.provider, modelId: entry.modelId };
+    } else if (entry.type === "message" && entry.message && entry.message.role === "assistant") {
+      model = { provider: entry.message.provider, modelId: entry.message.model };
+    } else if (entry.type === "compaction") {
+      compaction = entry;
+    }
+  }
+
+  const messages = [];
+  const appendMessage = (entry) => {
+    if (!entry || typeof entry !== "object") return;
+    if (entry.type === "message") {
+      messages.push(entry.message);
+    } else if (entry.type === "custom_message") {
+      messages.push(
+        createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+      );
+    } else if (entry.type === "branch_summary" && entry.summary) {
+      messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+    }
   };
+
+  if (compaction) {
+    // Summary first, then kept pre-compaction entries (from firstKeptEntryId
+    // up to the compaction), then everything after the compaction. When
+    // firstKeptEntryId is missing from the pre-compaction path (degenerate
+    // corrupted session), no pre-compaction entry is kept -- matching both
+    // upstream and the Rust builder's effective output.
+    messages.push(
+      createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp),
+    );
+
+    const compactionIdx = path.findIndex((e) => e && e.type === "compaction" && e.id === compaction.id);
+
+    let foundFirstKept = false;
+    for (let i = 0; i < compactionIdx; i++) {
+      const entry = path[i];
+      if (entry && entry.id === compaction.firstKeptEntryId) {
+        foundFirstKept = true;
+      }
+      if (foundFirstKept) {
+        appendMessage(entry);
+      }
+    }
+
+    for (let i = compactionIdx + 1; i < path.length; i++) {
+      appendMessage(path[i]);
+    }
+  } else {
+    for (const entry of path) {
+      appendMessage(entry);
+    }
+  }
+
+  return { messages, thinkingLevel, model };
 }
 
 export function parseFrontmatter(text) {
@@ -9592,6 +9806,14 @@ export default {
   truncateHead,
   truncateTail,
   parseSessionEntries,
+  COMPACTION_SUMMARY_PREFIX,
+  COMPACTION_SUMMARY_SUFFIX,
+  BRANCH_SUMMARY_PREFIX,
+  BRANCH_SUMMARY_SUFFIX,
+  bashExecutionToText,
+  createCustomMessage,
+  createBranchSummaryMessage,
+  createCompactionSummaryMessage,
   convertToLlm,
   serializeConversation,
   buildSessionContext,
@@ -19458,9 +19680,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             tracing::warn!(
                                 extension = %extension_id,
                                 event = %event_name,
-                                "extension registered a handler for an unknown event; \
-                                 it will never fire on this host (kept registered for \
-                                 forward-compatibility)"
+                                "extension registered a handler for an event this host \
+                                 never fires natively; it will only run if an extension \
+                                 emits it via pi.events.emit (kept registered for \
+                                 forward-compatibility; check for typos)"
                             );
                             Ok(())
                         },
@@ -21335,22 +21558,34 @@ function __pi_make_extension_ctx(ctx_payload) {
         sessionStateRaw && typeof sessionStateRaw === 'object' && !Array.isArray(sessionStateRaw)
             ? sessionStateRaw
             : null;
-    const sessionId =
-        sessionState && typeof sessionState.sessionId === 'string' && sessionState.sessionId
-            ? sessionState.sessionId
-            : null;
-    const sessionFile =
-        sessionState && typeof sessionState.sessionFile === 'string' && sessionState.sessionFile
-            ? sessionState.sessionFile
-            : null;
+    let sessionId = null;
+    let sessionFile = null;
     let sessionDir = null;
-    if (sessionFile) {
-        const cut = Math.max(sessionFile.lastIndexOf('/'), sessionFile.lastIndexOf('\\'));
-        if (cut > 0) sessionDir = sessionFile.slice(0, cut);
+    if (sessionState) {
+        sessionId =
+            typeof sessionState.sessionId === 'string' && sessionState.sessionId
+                ? sessionState.sessionId
+                : null;
+        sessionFile =
+            typeof sessionState.sessionFile === 'string' && sessionState.sessionFile
+                ? sessionState.sessionFile
+                : null;
+        if (sessionFile) {
+            const cut = Math.max(sessionFile.lastIndexOf('/'), sessionFile.lastIndexOf('\\'));
+            if (cut > 0) sessionDir = sessionFile.slice(0, cut);
+        }
+        __pi_session_identity.id = sessionId;
+        __pi_session_identity.file = sessionFile;
+        __pi_session_identity.dir = sessionDir;
+    } else {
+        // Session-less payloads (extension tool executions ship a minimal
+        // {cwd} ctx; shortcuts/emit may pass custom ctx objects) must not
+        // clobber the last known host session identity. Fall back to the
+        // mirror so identity getters stay correct mid-session (gh #167).
+        sessionId = __pi_session_identity.id;
+        sessionFile = __pi_session_identity.file;
+        sessionDir = __pi_session_identity.dir;
     }
-    __pi_session_identity.id = sessionId;
-    __pi_session_identity.file = sessionFile;
-    __pi_session_identity.dir = sessionDir;
 
     let model =
         ctx_payload && ctx_payload.model !== undefined && ctx_payload.model !== null
@@ -21360,9 +21595,20 @@ function __pi_make_extension_ctx(ctx_payload) {
         model = sessionState.model;
     }
 
-    if (ctx_payload && typeof ctx_payload.systemPrompt === 'string') {
+    // Seed-only: the host payload carries the boot-time system prompt so
+    // getSystemPrompt() is answerable before any before_agent_start. Once a
+    // fresher value is captured (before_agent_start payload or a handler's
+    // systemPrompt amendment), a cached host payload must not clobber it.
+    if (
+        ctx_payload &&
+        typeof ctx_payload.systemPrompt === 'string' &&
+        __pi_current_system_prompt === null
+    ) {
         __pi_current_system_prompt = ctx_payload.systemPrompt;
     }
+
+    const modelCatalog =
+        ctx_payload && Array.isArray(ctx_payload.models) ? ctx_payload.models : [];
 
     const sessionManager = {
         getEntries: () => entries,
@@ -21381,6 +21627,23 @@ function __pi_make_extension_ctx(ctx_payload) {
         model: model,
         getSystemPrompt: () => __pi_current_system_prompt,
         modelRegistry: {
+            // Synchronous catalog lookup (upstream ModelRegistry.find parity,
+            // gh #167 / bd-t9n21). Consumers call it without await (e.g.
+            // pi-better-compaction's native fallback), so it must not return
+            // a Promise. Results pass through a strict whitelist projection
+            // so credential-shaped metadata can never surface.
+            find: (provider, modelId) => {
+                const providerKey = String(provider === undefined || provider === null ? '' : provider);
+                const modelKey = String(modelId === undefined || modelId === null ? '' : modelId);
+                if (!providerKey || !modelKey) return undefined;
+                for (const raw of modelCatalog) {
+                    if (!raw || typeof raw !== 'object') continue;
+                    if (raw.provider === providerKey && raw.id === modelKey) {
+                        return __pi_project_model_entry(raw);
+                    }
+                }
+                return undefined;
+            },
             getApiKeyForProvider: async (provider) => {
                 const key = String(provider || '').trim();
                 if (!key) return undefined;
@@ -21390,6 +21653,32 @@ function __pi_make_extension_ctx(ctx_payload) {
             },
         },
     };
+}
+
+// Whitelisted fields for model objects handed to extensions. Mirrors the
+// host-side `pi_ai_model_entry_value` projection; anything outside this list
+// (api keys, headers, nested secrets in unexpected fields) is dropped.
+const __pi_model_entry_whitelist = [
+    'id',
+    'name',
+    'api',
+    'provider',
+    'baseUrl',
+    'reasoning',
+    'input',
+    'cost',
+    'contextWindow',
+    'maxTokens',
+    'authHeader',
+    'hasCredentials',
+];
+
+function __pi_project_model_entry(raw) {
+    const out = {};
+    for (const key of __pi_model_entry_whitelist) {
+        if (raw[key] !== undefined) out[key] = raw[key];
+    }
+    return out;
 }
 
 	async function __pi_dispatch_event_inner(eventName, event_payload, ctx, handlerPhase = 'all') {
@@ -24954,6 +25243,423 @@ mod tests {
                 ) && error.contains("gh #167"),
                 "unexpected compact() rejection: {error}"
             );
+        });
+    }
+
+    // ── gh #167 wave 2: session-less payloads must not clobber identity;
+    //    modelRegistry.find is sync + whitelisted; systemPrompt seeds from
+    //    the host payload without clobbering fresher captures ─────────────
+
+    #[test]
+    fn extension_ctx_sessionless_payload_keeps_last_known_identity() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.identity-keep", { name: "ext.identity-keep" });
+                    globalThis.identityKeep = { captures: [] };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        globalThis.identityKeep.captures.push({
+                            id: ctx.sessionManager.getSessionId(),
+                            file: ctx.sessionManager.getSessionFile(),
+                            dir: ctx.sessionManager.getSessionDir(),
+                        });
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register identity extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    const sessionPayload = {
+                        hasUI: false,
+                        cwd: '/workspace',
+                        sessionState: {
+                            sessionId: 'sess-live',
+                            sessionFile: '/tmp/pi/sessions/live.jsonl',
+                        },
+                    };
+                    // Mimics the minimal ctx payload extension tool executions
+                    // receive: no sessionState at all.
+                    const toolStylePayload = { hasUI: false, cwd: '/workspace' };
+                    globalThis.identityKeep.done = false;
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, sessionPayload)
+                        .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, toolStylePayload))
+                        .then(() => import('@mariozechner/pi-coding-agent'))
+                        .then((mod) => {
+                            const live = new mod.SessionManager();
+                            globalThis.identityKeep.shim = {
+                                id: live.getSessionId(),
+                                file: live.getSessionFile(),
+                                dir: live.getSessionDir(),
+                            };
+                        })
+                        .catch((error) => { globalThis.identityKeep.error = String(error); })
+                        .finally(() => { globalThis.identityKeep.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch identity events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "identityKeep").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // The session-full dispatch establishes identity ...
+            assert_eq!(probe["captures"][0]["id"], json!("sess-live"));
+            assert_eq!(
+                probe["captures"][0]["file"],
+                json!("/tmp/pi/sessions/live.jsonl")
+            );
+            // ... and a later session-less (tool-style) payload must not
+            // clobber it: the ctx getters fall back to the mirror.
+            assert_eq!(probe["captures"][1]["id"], json!("sess-live"));
+            assert_eq!(
+                probe["captures"][1]["file"],
+                json!("/tmp/pi/sessions/live.jsonl")
+            );
+            assert_eq!(probe["captures"][1]["dir"], json!("/tmp/pi/sessions"));
+            // The SessionManager shim also still reflects the live session.
+            assert_eq!(probe["shim"]["id"], json!("sess-live"));
+            assert_eq!(probe["shim"]["file"], json!("/tmp/pi/sessions/live.jsonl"));
+        });
+    }
+
+    #[test]
+    fn extension_ctx_model_registry_find_is_sync_and_whitelisted() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.model-find", { name: "ext.model-find" });
+                    globalThis.modelFind = { done: false };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        const found = ctx.modelRegistry.find('anthropic', 'claude-4');
+                        globalThis.modelFind.found = found === undefined ? "undefined" : found;
+                        globalThis.modelFind.foundIsPromise =
+                            !!(found && typeof found.then === 'function');
+                        globalThis.modelFind.missing =
+                            ctx.modelRegistry.find('anthropic', 'no-such-model') === undefined
+                                ? "undefined"
+                                : "present";
+                        globalThis.modelFind.blankProvider =
+                            ctx.modelRegistry.find('', 'claude-4') === undefined
+                                ? "undefined"
+                                : "present";
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register model-find extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, {
+                        hasUI: false,
+                        cwd: '/workspace',
+                        models: [
+                            {
+                                id: 'claude-4',
+                                provider: 'anthropic',
+                                api: 'anthropic-messages',
+                                name: 'Claude 4',
+                                baseUrl: 'https://api.anthropic.com',
+                                reasoning: true,
+                                contextWindow: 200000,
+                                maxTokens: 64000,
+                                authHeader: 'x-api-key',
+                                hasCredentials: true,
+                                // Hostile metadata that must never surface.
+                                apiKey: 'sk-secret-never-leak',
+                                headers: { Authorization: 'Bearer leak' },
+                                oauthToken: 'leaky-token',
+                            },
+                        ],
+                    })
+                        .catch((error) => { globalThis.modelFind.error = String(error); })
+                        .finally(() => { globalThis.modelFind.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch model-find event");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "modelFind").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            // Sync (upstream parity): consumers call find() without await.
+            assert_eq!(probe["foundIsPromise"], json!(false));
+            assert_eq!(probe["missing"], json!("undefined"));
+            assert_eq!(probe["blankProvider"], json!("undefined"));
+
+            let found = &probe["found"];
+            assert_eq!(found["id"], json!("claude-4"));
+            assert_eq!(found["provider"], json!("anthropic"));
+            assert_eq!(found["api"], json!("anthropic-messages"));
+            assert_eq!(found["contextWindow"], json!(200_000));
+            assert_eq!(found["maxTokens"], json!(64_000));
+            assert_eq!(found["authHeader"], json!("x-api-key"));
+            assert_eq!(found["hasCredentials"], json!(true));
+            // The whitelist projection must drop credential-shaped fields.
+            assert_eq!(found.get("apiKey"), None, "apiKey leaked: {found}");
+            assert_eq!(found.get("headers"), None, "headers leaked: {found}");
+            assert_eq!(found.get("oauthToken"), None, "oauthToken leaked: {found}");
+        });
+    }
+
+    #[test]
+    fn extension_ctx_system_prompt_seeds_from_payload_without_clobbering() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    __pi_begin_extension(__pi_test_secret, "ext.prompt-seed", { name: "ext.prompt-seed" });
+                    globalThis.promptSeed = { captures: [] };
+                    pi.on("agent_start", async (_ev, ctx) => {
+                        globalThis.promptSeed.captures.push(ctx.getSystemPrompt());
+                    });
+                    pi.on("before_agent_start", async (ev, _ctx) => {
+                        return { systemPrompt: ev.systemPrompt + " [amended]" };
+                    });
+                    __pi_end_extension(__pi_test_secret);
+                    "#,
+                ))
+                .await
+                .expect("register prompt-seed extension");
+            runtime
+                .eval(&privileged_test_script(
+                    &runtime,
+                    r#"
+                    // Host payloads carry the boot-time prompt (gh #167).
+                    const payload = { hasUI: false, cwd: '/workspace', systemPrompt: 'Base prompt.' };
+                    globalThis.promptSeed.done = false;
+                    __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, payload)
+                        .then(() => __pi_dispatch_extension_event(
+                            __pi_test_secret,
+                            'before_agent_start',
+                            { prompt: 'hi', systemPrompt: 'Base prompt.' },
+                            payload,
+                        ))
+                        .then(() => __pi_dispatch_extension_event(__pi_test_secret, 'agent_start', {}, payload))
+                        .catch((error) => { globalThis.promptSeed.error = String(error); })
+                        .finally(() => { globalThis.promptSeed.done = true; });
+                    "#,
+                ))
+                .await
+                .expect("dispatch prompt-seed events");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "promptSeed").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            // Before any before_agent_start, the payload seed answers.
+            assert_eq!(probe["captures"][0], json!("Base prompt."));
+            // After an amendment, a cached payload must NOT clobber it.
+            assert_eq!(probe["captures"][1], json!("Base prompt. [amended]"));
+        });
+    }
+
+    // ── gh #167 / bd-9wkml: convertToLlm + buildSessionContext ports ─────
+
+    #[test]
+    fn pi_coding_agent_convert_to_llm_ports_upstream_role_transforms() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.convertProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => {
+                            const messages = [
+                                { role: "user", content: "hello", timestamp: 1 },
+                                { role: "assistant", content: [], provider: "anthropic", model: "claude-4", timestamp: 2 },
+                                { role: "toolResult", toolCallId: "t1", content: [], timestamp: 3 },
+                                { role: "bashExecution", command: "ls", output: "a.txt", exitCode: 0, timestamp: 4 },
+                                { role: "bashExecution", command: "rm x", output: "", exitCode: 1, excludeFromContext: true, timestamp: 5 },
+                                { role: "custom", customType: "note", content: "remember", timestamp: 6 },
+                                { role: "custom", customType: "rich", content: [{ type: "text", text: "kept-as-is" }], timestamp: 7 },
+                                { role: "branchSummary", summary: "branch things", timestamp: 8 },
+                                { role: "compactionSummary", summary: "old history", timestamp: 9 },
+                                { role: "definitely_unknown", timestamp: 10 },
+                            ];
+                            globalThis.convertProbe.result = mod.convertToLlm(messages);
+                            globalThis.convertProbe.prefixes = {
+                                compactionPrefix: mod.COMPACTION_SUMMARY_PREFIX,
+                                compactionSuffix: mod.COMPACTION_SUMMARY_SUFFIX,
+                                branchPrefix: mod.BRANCH_SUMMARY_PREFIX,
+                                branchSuffix: mod.BRANCH_SUMMARY_SUFFIX,
+                            };
+                        })
+                        .catch((error) => { globalThis.convertProbe.error = String(error); })
+                        .finally(() => { globalThis.convertProbe.done = true; });
+                    "#,
+                )
+                .await
+                .expect("invoke convertToLlm");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "convertProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // Exact upstream constants (byte parity with session.rs).
+            assert_eq!(
+                probe["prefixes"]["compactionPrefix"],
+                json!("The conversation history before this point was compacted into the following summary:\n\n<summary>\n")
+            );
+            assert_eq!(probe["prefixes"]["compactionSuffix"], json!("\n</summary>"));
+            assert_eq!(
+                probe["prefixes"]["branchPrefix"],
+                json!("The following is a summary of a branch that this conversation came back from:\n\n<summary>\n")
+            );
+            assert_eq!(probe["prefixes"]["branchSuffix"], json!("</summary>"));
+
+            let result = probe["result"].as_array().expect("array result");
+            // 10 inputs, minus the excluded bashExecution and the unknown
+            // role, gives 8 messages.
+            assert_eq!(result.len(), 8, "unexpected convertToLlm output: {result:?}");
+
+            // Passthrough roles survive unchanged.
+            assert_eq!(result[0]["role"], json!("user"));
+            assert_eq!(result[1]["role"], json!("assistant"));
+            assert_eq!(result[2]["role"], json!("toolResult"));
+
+            // bashExecution becomes a user message with the rendered text.
+            assert_eq!(result[3]["role"], json!("user"));
+            assert_eq!(
+                result[3]["content"][0]["text"],
+                json!("Ran `ls`\n```\na.txt\n```")
+            );
+            assert_eq!(result[3]["timestamp"], json!(4));
+
+            // custom string content is wrapped; custom block content kept.
+            assert_eq!(result[4]["role"], json!("user"));
+            assert_eq!(result[4]["content"][0]["text"], json!("remember"));
+            assert_eq!(result[5]["content"][0]["text"], json!("kept-as-is"));
+
+            // branch/compaction summaries get the exact prefix/suffix bytes.
+            assert_eq!(
+                result[6]["content"][0]["text"],
+                json!("The following is a summary of a branch that this conversation came back from:\n\n<summary>\nbranch things</summary>")
+            );
+            assert_eq!(
+                result[7]["content"][0]["text"],
+                json!("The conversation history before this point was compacted into the following summary:\n\n<summary>\nold history\n</summary>")
+            );
+        });
+    }
+
+    #[test]
+    fn pi_coding_agent_build_session_context_ports_upstream_walk() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.buildProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => {
+                            const entries = [
+                                { type: "message", id: "e1", timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: "one" } },
+                                { type: "model_change", id: "e2", parentId: "e1", timestamp: "2026-01-01T00:00:01Z", provider: "openai", modelId: "gpt-5" },
+                                { type: "message", id: "e3", parentId: "e2", timestamp: "2026-01-01T00:00:02Z", message: { role: "assistant", content: [], provider: "anthropic", model: "claude-4" } },
+                                { type: "thinking_level_change", id: "e4", parentId: "e3", timestamp: "2026-01-01T00:00:03Z", thinkingLevel: "high" },
+                                { type: "compaction", id: "e5", parentId: "e4", timestamp: "2026-01-01T00:00:04Z", summary: "squashed", firstKeptEntryId: "e3", tokensBefore: 999 },
+                                { type: "message", id: "e6", parentId: "e5", timestamp: "2026-01-01T00:00:05Z", message: { role: "user", content: "after" } },
+                                // Dead branch that must not appear in the walk.
+                                { type: "message", id: "dead", parentId: "e1", timestamp: "2026-01-01T00:00:06Z", message: { role: "user", content: "dead branch" } },
+                            ];
+                            const full = mod.buildSessionContext(entries, "e6");
+                            const nullLeaf = mod.buildSessionContext(entries, null);
+                            const implicitLeaf = mod.buildSessionContext(entries.slice(0, 4));
+                            const cycle = mod.buildSessionContext([
+                                { type: "message", id: "a", parentId: "b", timestamp: "2026-01-01T00:00:00Z", message: { role: "user", content: "a" } },
+                                { type: "message", id: "b", parentId: "a", timestamp: "2026-01-01T00:00:01Z", message: { role: "user", content: "b" } },
+                            ], "a");
+                            globalThis.buildProbe.full = full;
+                            globalThis.buildProbe.nullLeaf = nullLeaf;
+                            globalThis.buildProbe.implicitLeaf = implicitLeaf;
+                            globalThis.buildProbe.cycleLen = cycle.messages.length;
+                        })
+                        .catch((error) => { globalThis.buildProbe.error = String((error && error.stack) || error); })
+                        .finally(() => { globalThis.buildProbe.done = true; });
+                    "#,
+                )
+                .await
+                .expect("invoke buildSessionContext");
+            drain_until_idle(&runtime, &clock).await;
+
+            let probe = get_global_json(&runtime, "buildProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+
+            // Compaction path: summary first, then kept e3 (firstKeptEntryId),
+            // then post-compaction e6. e1 (pre-kept) and the dead branch are
+            // dropped; the model comes from the assistant message, thinking
+            // level from the change entry.
+            let full = &probe["full"];
+            assert_eq!(full["thinkingLevel"], json!("high"));
+            assert_eq!(full["model"]["provider"], json!("anthropic"));
+            assert_eq!(full["model"]["modelId"], json!("claude-4"));
+            let messages = full["messages"].as_array().expect("messages");
+            assert_eq!(messages.len(), 3, "unexpected messages: {messages:?}");
+            assert_eq!(messages[0]["role"], json!("compactionSummary"));
+            assert_eq!(messages[0]["summary"], json!("squashed"));
+            assert_eq!(messages[0]["tokensBefore"], json!(999));
+            assert_eq!(messages[1]["role"], json!("assistant"));
+            assert_eq!(messages[2]["content"], json!("after"));
+
+            // Explicit null leaf: empty context (navigated before the root).
+            assert_eq!(probe["nullLeaf"]["messages"], json!([]));
+            assert_eq!(probe["nullLeaf"]["thinkingLevel"], json!("off"));
+            assert_eq!(probe["nullLeaf"]["model"], serde_json::Value::Null);
+
+            // Implicit leaf (undefined): last entry of the list wins; no
+            // compaction on that path, so all message entries appear and the
+            // model still tracks the assistant message.
+            let implicit = &probe["implicitLeaf"];
+            assert_eq!(implicit["thinkingLevel"], json!("high"));
+            assert_eq!(
+                implicit["messages"].as_array().map(Vec::len),
+                Some(2),
+                "implicit leaf should keep e1+e3: {implicit}"
+            );
+
+            // Corrupted parent chains terminate instead of hanging.
+            assert_eq!(probe["cycleLen"], json!(2));
         });
     }
 

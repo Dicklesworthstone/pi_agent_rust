@@ -1035,6 +1035,13 @@ impl PiApp {
         let Some(manager) = self.extensions.clone() else {
             return;
         };
+        // gh #167: bump the ctx generation before dispatching so the
+        // model_select handler (and every later event) sees the fresh
+        // ctx.model instead of a payload cached for the previous model.
+        manager.set_current_model(
+            Some(next.model.provider.clone()),
+            Some(next.model.id.clone()),
+        );
         let runtime_handle = self.runtime_handle.clone();
         let source = match source {
             "selector" | "command" => "set",
