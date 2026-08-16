@@ -565,8 +565,8 @@ fn session_artifacts_exist(path: &Path) -> Result<bool> {
     Ok(primary_exists || v2_exists || sqlite_sidecar_exists)
 }
 
-fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 3] {
-    ["-wal", "-shm", "-journal"].map(|suffix| {
+fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 7] {
+    crate::session_sqlite::SQLITE_SIDECAR_SUFFIXES.map(|suffix| {
         let mut candidate = path.as_os_str().to_os_string();
         candidate.push(suffix);
         PathBuf::from(candidate)
@@ -702,10 +702,10 @@ mod tests {
     use crate::model::UserContent;
     #[cfg(feature = "sqlite-sessions")]
     use crate::session::{SessionMessage, SessionStoreKind};
+    use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
     #[cfg(feature = "sqlite-sessions")]
     use asupersync::runtime::RuntimeBuilder;
-    use sqlmodel_core::Value;
-    use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
+    use fsqlite::SqliteValue as Value;
     #[cfg(feature = "sqlite-sessions")]
     use std::future::Future;
 
@@ -1284,23 +1284,27 @@ mod tests {
         index.reindex_all().expect("seed session index");
 
         let db_path = base_dir.join("session-index.sqlite");
-        let config = SqliteConfig::file(db_path.to_string_lossy())
-            .flags(OpenFlags::create_read_write())
-            .busy_timeout(5000);
-        let conn = SqliteConnection::open(&config).expect("open session index sqlite");
-        conn.execute_sync(
-            "UPDATE sessions
-             SET message_count=?1, size_bytes=?2, name=?3
-             WHERE path=?4",
-            &[
-                Value::BigInt(0),
-                Value::BigInt(
-                    i64::try_from(expected.size_bytes.saturating_sub(1)).expect("size fits in i64"),
-                ),
-                Value::Text("Stale name".to_string()),
-                Value::Text(session_path.display().to_string()),
-            ],
-        )
+        run_on_sqlite_thread(|| {
+            let conn = SqliteConnection::open_read_write(&db_path)
+                .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.execute_sync(
+                "UPDATE sessions
+                 SET message_count=?1, size_bytes=?2, name=?3
+                 WHERE path=?4",
+                &[
+                    Value::from(0i64),
+                    Value::from(
+                        i64::try_from(expected.size_bytes.saturating_sub(1))
+                            .expect("size fits in i64"),
+                    ),
+                    Value::from("Stale name"),
+                    Value::from(session_path.display().to_string()),
+                ],
+            )
+            .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.close()
+                .map_err(|err| crate::error::Error::session(err.to_string()))
+        })
         .expect("corrupt cached row");
 
         let sessions = list_sessions_for_project(&cwd, Some(&base_dir));
@@ -1632,7 +1636,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("noop-trash.sqlite");
-        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
         fs::write(&session_path, "db").expect("write SQLite primary");
         fs::write(&wal_path, "wal").expect("write SQLite WAL");
@@ -1672,7 +1676,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("aux-noop-trash.sqlite");
-        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
         fs::write(&session_path, "db").expect("write SQLite primary");
         fs::write(&wal_path, "wal").expect("write SQLite WAL");
@@ -1711,7 +1715,7 @@ mod tests {
     fn fresh_eyes_delete_sqlite_session_removes_all_sidecars() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("sqlite-session.sqlite");
-        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         fs::write(&session_path, "db").expect("write sqlite session");
         fs::write(&wal_path, "wal").expect("write sqlite wal");
         fs::write(&shm_path, "shm").expect("write sqlite shm");
@@ -1741,7 +1745,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("dangling-sidecars.sqlite");
-        let [wal_path, _, _] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, ..] = sqlite_auxiliary_paths(&session_path);
         let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
         let missing_target = tmp.path().join("missing-target");
         symlink(&missing_target, &wal_path).expect("create dangling WAL symlink");
@@ -1771,7 +1775,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("locked-delete.sqlite");
-        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         fs::write(&session_path, "db").expect("write SQLite primary");
         fs::write(&wal_path, "wal").expect("write SQLite WAL");
         fs::write(&shm_path, "shm").expect("write SQLite SHM");
@@ -1817,7 +1821,7 @@ mod tests {
     fn delete_sqlite_session_preserves_sidecars_when_primary_delete_fails() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let session_path = tmp.path().join("delete-fails.sqlite");
-        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         fs::create_dir(&session_path).expect("create directory in place of sqlite session");
         fs::write(&wal_path, "wal").expect("write sqlite wal");
         fs::write(&shm_path, "shm").expect("write sqlite shm");
@@ -1894,7 +1898,7 @@ esac
         let marker_dir = tempfile::tempdir().expect("marker tempdir");
         let invocation_marker = marker_dir.path().join("trash-invoked");
         let session_path = tmp.path().join("guarded.sqlite");
-        let [wal_path, shm_path, journal_path] = sqlite_auxiliary_paths(&session_path);
+        let [wal_path, shm_path, journal_path, ..] = sqlite_auxiliary_paths(&session_path);
         let v2_path = crate::session_store_v2::v2_sidecar_path(&session_path);
         fs::write(&session_path, b"database").expect("write primary");
         fs::write(&wal_path, b"wal").expect("write WAL");

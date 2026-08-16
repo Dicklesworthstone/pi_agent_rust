@@ -15,7 +15,7 @@ maintenance cadence for the Pi extension platform.
 | CI/CD pipelines | Primary maintainer | Self-healing via gate promotion |
 | Conformance corpus (223 extensions) | Automated via conformance harness | Manual triage for new failures |
 | Documentation | Primary maintainer + agents | Automated staleness checks |
-| Sibling crates (asupersync, rich_rust, charmed, sqlmodel) | Independently versioned | Cross-repo coordination via bead dependencies |
+| Sibling crates (asupersync, rich_rust, charmed, fsqlite) | Independently versioned | Cross-repo coordination via bead dependencies |
 
 ### Decision Authority
 

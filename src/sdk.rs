@@ -472,7 +472,7 @@ pub enum SessionPromptResult {
 /// Event wrapper used by the unified `SessionTransport` callback.
 #[derive(Debug, Clone)]
 pub enum SessionTransportEvent {
-    InProcess(AgentEvent),
+    InProcess(Box<AgentEvent>),
     Rpc(Value),
 }
 
@@ -740,7 +740,7 @@ impl SessionTransport {
                 let on_event = Arc::clone(&on_event);
                 let assistant = handle
                     .prompt(input, move |event| {
-                        (on_event)(SessionTransportEvent::InProcess(event));
+                        (on_event)(SessionTransportEvent::InProcess(Box::new(event)));
                     })
                     .await?;
                 Ok(SessionPromptResult::InProcess(Box::new(assistant)))

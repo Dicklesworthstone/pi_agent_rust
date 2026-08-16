@@ -3,9 +3,9 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
+use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
+use fsqlite::SqliteValue as Value;
 use serde::Deserialize;
-use sqlmodel_core::Value;
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -139,7 +139,7 @@ impl SessionIndex {
                     (
                         "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
                          FROM sessions WHERE cwd=?1 ORDER BY last_modified_ms DESC",
-                        vec![Value::Text(cwd.to_string())],
+                        vec![Value::from(cwd.to_string())],
                     )
                 },
             );
@@ -165,13 +165,13 @@ impl SessionIndex {
                 .map_err(|e| Error::session(format!("BEGIN failed: {e}")))?;
 
             let result = (|| -> Result<()> {
-                conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::Text(path)])
+                conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::from(path)])
                     .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
 
                 conn.execute_sync(
                     "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    &[Value::Text(current_epoch_ms())],
+                    &[Value::from(current_epoch_ms())],
                 )
                 .map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
                 Ok(())
@@ -352,7 +352,10 @@ impl SessionIndex {
         Ok(summary)
     }
 
-    fn with_lock<T>(&self, f: impl FnOnce(&SqliteConnection) -> Result<T>) -> Result<T> {
+    fn with_lock<T: Send>(
+        &self,
+        f: impl FnOnce(&SqliteConnection) -> Result<T> + Send,
+    ) -> Result<T> {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -362,24 +365,26 @@ impl SessionIndex {
         let _lock = crate::file_lock::DirLock::acquire(&self.lock_path, SESSION_INDEX_LOCK_TIMEOUT)
             .map_err(|e| Error::session(format!("session index lock: {e}")))?;
 
-        let config = SqliteConfig::file(self.db_path.to_string_lossy())
-            .flags(OpenFlags::create_read_write())
-            .busy_timeout(5000);
+        run_on_sqlite_thread(|| {
+            // Opens with strict multi-process refusal and a 5s busy timeout.
+            let conn = SqliteConnection::open_read_write(&self.db_path)
+                .map_err(|e| Error::session(format!("SQLite open: {e}")))?;
 
-        let conn = SqliteConnection::open(&config)
-            .map_err(|e| Error::session(format!("SQLite open: {e}")))?;
+            // Set pragmas for performance
+            conn.execute_raw("PRAGMA journal_mode = WAL")
+                .map_err(|e| Error::session(format!("PRAGMA journal_mode: {e}")))?;
+            conn.execute_raw("PRAGMA synchronous = NORMAL")
+                .map_err(|e| Error::session(format!("PRAGMA synchronous: {e}")))?;
+            conn.execute_raw("PRAGMA wal_autocheckpoint = 1000")
+                .map_err(|e| Error::session(format!("PRAGMA wal_autocheckpoint: {e}")))?;
+            conn.execute_raw("PRAGMA foreign_keys = ON")
+                .map_err(|e| Error::session(format!("PRAGMA foreign_keys: {e}")))?;
 
-        // Set pragmas for performance
-        conn.execute_raw("PRAGMA journal_mode = WAL")
-            .map_err(|e| Error::session(format!("PRAGMA journal_mode: {e}")))?;
-        conn.execute_raw("PRAGMA synchronous = NORMAL")
-            .map_err(|e| Error::session(format!("PRAGMA synchronous: {e}")))?;
-        conn.execute_raw("PRAGMA wal_autocheckpoint = 1000")
-            .map_err(|e| Error::session(format!("PRAGMA wal_autocheckpoint: {e}")))?;
-        conn.execute_raw("PRAGMA foreign_keys = ON")
-            .map_err(|e| Error::session(format!("PRAGMA foreign_keys: {e}")))?;
-
-        f(&conn)
+            let result = f(&conn)?;
+            conn.close()
+                .map_err(|e| Error::session(format!("SQLite close: {e}")))?;
+            Ok(result)
+        })
     }
 
     fn apply_refresh_changes(
@@ -397,7 +402,7 @@ impl SessionIndex {
                 for path in pruned_paths {
                     conn.execute_sync(
                         "DELETE FROM sessions WHERE path=?1",
-                        &[Value::Text(path.display().to_string())],
+                        &[Value::from(path.display().to_string())],
                     )
                     .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
                 }
@@ -505,14 +510,14 @@ fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
            size_bytes=excluded.size_bytes,
            name=excluded.name",
         &[
-            Value::Text(meta.path),
-            Value::Text(meta.id),
-            Value::Text(meta.cwd),
-            Value::Text(meta.timestamp),
-            Value::BigInt(message_count),
-            Value::BigInt(meta.last_modified_ms),
-            Value::BigInt(size_bytes),
-            meta.name.map_or(Value::Null, Value::Text),
+            Value::from(meta.path),
+            Value::from(meta.id),
+            Value::from(meta.cwd),
+            Value::from(meta.timestamp),
+            Value::from(message_count),
+            Value::from(meta.last_modified_ms),
+            Value::from(size_bytes),
+            meta.name.map_or(Value::Null, Value::from),
         ],
     )
     .map_err(|e| Error::session(format!("Insert failed: {e}")))?;
@@ -523,7 +528,7 @@ fn store_sync_epoch(conn: &SqliteConnection) -> Result<()> {
     conn.execute_sync(
         "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        &[Value::Text(current_epoch_ms())],
+        &[Value::from(current_epoch_ms())],
     )
     .map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
     Ok(())
@@ -542,35 +547,47 @@ fn sqlite_u64_from_i64(field: &str, value: i64) -> Result<u64> {
     })
 }
 
-fn row_to_meta(row: &sqlmodel_core::Row) -> Result<SessionMeta> {
-    let message_count = row
-        .get_named::<i64>("message_count")
-        .map_err(|e| Error::session(format!("get message_count: {e}")))?;
-    let size_bytes = row
-        .get_named::<i64>("size_bytes")
-        .map_err(|e| Error::session(format!("get size_bytes: {e}")))?;
+fn row_text(row: &fsqlite::Row, index: usize, column: &str) -> Result<String> {
+    match row.get(index) {
+        Some(Value::Text(text)) => Ok(text.as_str().to_string()),
+        other => Err(Error::session(format!(
+            "get {column}: expected TEXT, got {other:?}"
+        ))),
+    }
+}
+
+fn row_i64(row: &fsqlite::Row, index: usize, column: &str) -> Result<i64> {
+    match row.get(index) {
+        Some(Value::Integer(value)) => Ok(*value),
+        other => Err(Error::session(format!(
+            "get {column}: expected INTEGER, got {other:?}"
+        ))),
+    }
+}
+
+// Column order matches the `SELECT path,id,cwd,timestamp,message_count,
+// last_modified_ms,size_bytes,name` projection used by every sessions query.
+fn row_to_meta(row: &fsqlite::Row) -> Result<SessionMeta> {
+    let message_count = row_i64(row, 4, "message_count")?;
+    let size_bytes = row_i64(row, 6, "size_bytes")?;
 
     Ok(SessionMeta {
-        path: row
-            .get_named("path")
-            .map_err(|e| Error::session(format!("get path: {e}")))?,
-        id: row
-            .get_named("id")
-            .map_err(|e| Error::session(format!("get id: {e}")))?,
-        cwd: row
-            .get_named("cwd")
-            .map_err(|e| Error::session(format!("get cwd: {e}")))?,
-        timestamp: row
-            .get_named("timestamp")
-            .map_err(|e| Error::session(format!("get timestamp: {e}")))?,
+        path: row_text(row, 0, "path")?,
+        id: row_text(row, 1, "id")?,
+        cwd: row_text(row, 2, "cwd")?,
+        timestamp: row_text(row, 3, "timestamp")?,
         message_count: sqlite_u64_from_i64("message_count", message_count)?,
-        last_modified_ms: row
-            .get_named("last_modified_ms")
-            .map_err(|e| Error::session(format!("get last_modified_ms: {e}")))?,
+        last_modified_ms: row_i64(row, 5, "last_modified_ms")?,
         size_bytes: sqlite_u64_from_i64("size_bytes", size_bytes)?,
-        name: row
-            .get_named::<Option<String>>("name")
-            .map_err(|e| Error::session(format!("get name: {e}")))?,
+        name: match row.get(7) {
+            Some(Value::Text(text)) => Some(text.as_str().to_string()),
+            Some(Value::Null) | None => None,
+            other => {
+                return Err(Error::session(format!(
+                    "get name: expected TEXT or NULL, got {other:?}"
+                )));
+            }
+        },
     })
 }
 
@@ -677,14 +694,9 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
 
     let mut message_count = 0u64;
     let mut name = None;
-    loop {
-        let Some(line_buf) = read_capped_utf8_line(&mut reader).map_err(|err| {
-            Error::session(format!("Read session entry line {}: {err}", path.display()))
-        })?
-        else {
-            break;
-        };
-
+    while let Some(line_buf) = read_capped_utf8_line(&mut reader).map_err(|err| {
+        Error::session(format!("Read session entry line {}: {err}", path.display()))
+    })? {
         if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_buf) {
             match entry.r#type.as_str() {
                 "message" => message_count += 1,
@@ -760,8 +772,8 @@ where
 }
 
 #[cfg(feature = "sqlite-sessions")]
-fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 2] {
-    ["-wal", "-shm"].map(|suffix| {
+fn sqlite_auxiliary_paths(path: &Path) -> [PathBuf; 7] {
+    crate::session_sqlite::SQLITE_SIDECAR_SUFFIXES.map(|suffix| {
         let mut candidate = path.as_os_str().to_os_string();
         candidate.push(suffix);
         PathBuf::from(candidate)
@@ -912,9 +924,7 @@ fn load_last_sync_epoch_ms(conn: &SqliteConnection) -> Result<Option<i64>> {
     let Some(row) = rows.into_iter().next() else {
         return Ok(None);
     };
-    let value = row
-        .get_named::<String>("value")
-        .map_err(|err| Error::session(format!("get meta value: {err}")))?;
+    let value = row_text(&row, 0, "value")?;
     Ok(value.parse::<i64>().ok())
 }
 
@@ -991,8 +1001,7 @@ mod tests {
                     .into_iter()
                     .next()
                     .ok_or_else(|| Error::session("Missing meta row".to_string()))?;
-                row.get_named::<String>("value")
-                    .map_err(|err| Error::session(format!("get meta value: {err}")))
+                row_text(&row, 0, "value")
             })
             .expect("read meta.last_sync_epoch_ms")
     }
@@ -1474,7 +1483,7 @@ mod tests {
     fn file_stats_sqlite_includes_wal_and_shm_sizes() {
         let harness = TestHarness::new("file_stats_sqlite_includes_wal_and_shm_sizes");
         let path = harness.temp_path("test_session.sqlite");
-        let [wal_path, shm_path] = sqlite_auxiliary_paths(&path);
+        let [wal_path, shm_path, ..] = sqlite_auxiliary_paths(&path);
 
         fs::write(&path, b"db").expect("write sqlite db");
         fs::write(&wal_path, b"walpayload").expect("write sqlite wal");
@@ -1494,7 +1503,7 @@ mod tests {
         fs::create_dir_all(&project_dir).expect("create project dir");
 
         let path = project_dir.join("test.sqlite");
-        let [wal_path, _shm_path] = sqlite_auxiliary_paths(&path);
+        let [wal_path, ..] = sqlite_auxiliary_paths(&path);
         fs::write(&path, b"db").expect("write sqlite db");
 
         let base_millis = fs::metadata(&path)
@@ -1587,13 +1596,13 @@ mod tests {
                     "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     &[
-                        Value::Text("/tmp/negative-message-count.jsonl".to_string()),
-                        Value::Text("id-neg".to_string()),
-                        Value::Text("cwd-neg".to_string()),
-                        Value::Text("2026-01-01T00:00:00Z".to_string()),
-                        Value::BigInt(-1),
-                        Value::BigInt(1),
-                        Value::BigInt(1),
+                        Value::from("/tmp/negative-message-count.jsonl".to_string()),
+                        Value::from("id-neg".to_string()),
+                        Value::from("cwd-neg".to_string()),
+                        Value::from("2026-01-01T00:00:00Z".to_string()),
+                        Value::from(-1),
+                        Value::from(1),
+                        Value::from(1),
                         Value::Null,
                     ],
                 )
@@ -1625,13 +1634,13 @@ mod tests {
                     "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                     &[
-                        Value::Text("/tmp/negative-size-bytes.jsonl".to_string()),
-                        Value::Text("id-neg".to_string()),
-                        Value::Text("cwd-neg".to_string()),
-                        Value::Text("2026-01-01T00:00:00Z".to_string()),
-                        Value::BigInt(1),
-                        Value::BigInt(1),
-                        Value::BigInt(-1),
+                        Value::from("/tmp/negative-size-bytes.jsonl".to_string()),
+                        Value::from("id-neg".to_string()),
+                        Value::from("cwd-neg".to_string()),
+                        Value::from("2026-01-01T00:00:00Z".to_string()),
+                        Value::from(1),
+                        Value::from(1),
+                        Value::from(-1),
                         Value::Null,
                     ],
                 )
@@ -2515,14 +2524,14 @@ mod tests {
                             "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                              VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
                             &[
-                                Value::Text(path),
-                                Value::Text(row.id.clone()),
-                                Value::Text(row.cwd.clone()),
-                                Value::Text(row.timestamp.clone()),
-                                Value::BigInt(row.message_count),
-                                Value::BigInt(row.last_modified_ms),
-                                Value::BigInt(row.size_bytes),
-                                row.name.clone().map_or(Value::Null, Value::Text),
+                                Value::from(path),
+                                Value::from(row.id.clone()),
+                                Value::from(row.cwd.clone()),
+                                Value::from(row.timestamp.clone()),
+                                Value::from(row.message_count),
+                                Value::from(row.last_modified_ms),
+                                Value::from(row.size_bytes),
+                                row.name.clone().map_or(Value::Null, Value::from),
                             ],
                         )
                         .map_err(|err| Error::session(format!("insert session row {idx}: {err}")))?;

@@ -62,3 +62,77 @@ common 18→26, ast 20→29, parser 34→45, codegen 23→32, transforms_base 37
 ## Incidental fix landed during verification
 
 - Pre-existing `ts_multiple_extensions_loaded` e2e failure (verified failing before today's changes): `collect_js_extension_roots` keyed exclusive ownership per parent directory, so two single-file extensions in one `extensions/` dir always collided. Ownership is now per-entry-file inside an independent-extensions root (`e2e_ts_extension_loading` 128/128).
+
+---
+
+# FrankenSQLite Cutover — 2026-08-16 (bd-oc1wu)
+
+**sqlmodel-sqlite 0.3.3 + sqlmodel-core 0.3.2 (libsqlite3-sys C code) → fsqlite 0.3.4 (pure Rust).**
+All three deferral blockers from the 2026-08-14 entry cleared before execution: bd-r82et fixed in
+fsqlite ≥0.3.3 (verified ancestor of the release tag); fsqlite GH#353 (composite-UNIQUE auto-index
+corruption) does not apply because every pi table uses a single-column PRIMARY KEY; deps resolve
+cleanly on crates.io. The cutover also removed the dual-asupersync lockfile state (0.3.10 inert copy
+inside sqlmodel is gone; single asupersync 0.4.4 remains).
+
+## Execution shape (the load-bearing decisions)
+
+- **Dedicated 16 MiB-stack thread per transaction** (`session_sqlite::run_on_sqlite_thread`):
+  fsqlite's engine futures are deeply nested and overflow the 512 KiB default stack of spawned
+  macOS threads (verified empirically — stack overflow abort). A fresh thread also guarantees no
+  ambient asupersync runtime, so `futures::executor::block_on` drives the `!Send` connection
+  futures in fsqlite's detached mode without deadlocking a current-thread consumer runtime.
+- **Sync facade** `session_sqlite::SqliteConnection` (`execute_raw` = `execute_batch`,
+  `execute_sync` = `execute_with_params`, `query_sync` = `query_with_params`, explicit
+  checkpointing `close()`), so `session_index.rs`/call sites kept their shape.
+- **Opens:** writers use `Connection::open_strict_multi_process` + `PRAGMA busy_timeout = 5000`
+  (loud refusal on ambiguous multi-process states); read-only loads use `Connection::open_schema_only`
+  (read-only pager; verified to read a chmod-0444 database).
+- **Sidecar family extended** from `-wal/-shm/-journal` to the full fsqlite set (adds
+  `-fsqlite-ns-gate`, `-fsqlite-ns-use`, `-wal-cert`, `-wal-cert-head`) in the 0600-permission
+  sweep, preflight access checks, deletion/trash paths, and session-index file stats. fsqlite
+  namespace sidecars persist across connections by design and need read-write access even for
+  read-only opens.
+- **Typed errors:** `Error::Sqlite` now wraps `fsqlite::FrankenError`; the
+  `"no such table: pi_session_meta"` Display match became `FrankenError::NoSuchTable`, and the
+  locked/busy + corrupt hint classifiers match typed variants.
+
+## Verification (all on this darwin host, published fsqlite 0.3.4)
+
+- Standalone probe: INIT_SQL batch under strict_multi_process, BEGIN IMMEDIATE + 400-param insert,
+  positional read-back, typed NoSuchTable, WAL header bytes (2,2) after close, 0444 read-only load.
+- Multi-process probe: 6 worker processes × 25 `BEGIN IMMEDIATE` transactions against one shared
+  database (busy-retry loop, no external lock) → 150/150 rows, zero lost writes, and **stock
+  `sqlite3` reports `integrity_check = ok`** on the fsqlite-written file.
+- Reader-swarm probe (pi's exact load shape): 1 writer process + 5 concurrent read-only
+  (`open_schema_only`) reader processes → all readers observe committed rows, no failures.
+- `cargo test --lib`: 7144/7144. Session e2e suites (persistence incl. multi-process chaos harness,
+  conformance, index, picker): green. `cargo clippy --all-targets -- -D warnings`: clean.
+- **Known engine bound (honest):** fsqlite's own `swarm-multiprocess` harness (unserialized
+  mixed-write workers, run here at 2 and 8 workers × 120–300 s) FAILS liveness on this darwin host
+  — workers exhaust bounded busy-retry budgets on snapshot conflicts. No corruption (JSONL reports
+  validate; stock `integrity_check` = ok on probe DBs); this is the upstream "multi-process
+  multi-writer = partial" contract state. Pi never produces that shape: every session-file and
+  session-index writer (and every index reader) is serialized behind `DirLock`, and lock-free
+  readers are read-only opens — both shapes verified green above. Do NOT relax the DirLock
+  discipline while this upstream bound stands.
+
+## Binary size: budget raised 22 → 26 MiB
+
+The pure-Rust engine costs ~5.6 MiB of compiled core that LTO cannot remove
+(parser/planner/VDBE/MVCC/pager): release `pi` on darwin-arm64 measured
+**24.48 MiB** (25,667,648 bytes) vs 18.85 MiB before the cutover. Disabling
+fsqlite's default `json`/`fts5`/`rtree` extension features changed nothing
+(LTO had already stripped them; they stay disabled anyway). All budget
+encodings were raised in lockstep (src/perf_build.rs, bench.yml, release.yml,
+perf report fixtures, AGENTS.md/README/docs) and a follow-up bead tracks
+reclaiming the size before any tightening.
+
+## Behavioral deltas (deliberate)
+
+- WAL/SHM/namespace sidecars persist after close instead of being unlinked; tests asserting
+  "no sidecars after close" were updated to the fsqlite reality.
+- A read-only open of a database missing any runtime sidecar requires a writable parent directory
+  (fsqlite recreates the missing sidecar) — previously only WAL-mode databases without WAL/SHM did.
+- Old pi binaries (libsqlite3) and new binaries (fsqlite) must not open the same session database
+  concurrently; sequential hand-off is supported (checkpointed files are format-compatible both
+  ways — verified via stock sqlite3 read-back).

@@ -195,7 +195,7 @@
       "comparison": "maximum",
       "source": "not evaluated: authoritative benchmark lineage is incomplete",
       "status": "NO_DATA",
-      "threshold": 22.0,
+      "threshold": 26.0,
       "unit": "MB"
     },
     {
@@ -388,7 +388,7 @@
       "methodology": "ls -la target/release/pi (stripped)",
       "metric": "release binary size",
       "name": "binary_size_release",
-      "threshold": 22.0,
+      "threshold": 26.0,
       "unit": "MB"
     },
     {

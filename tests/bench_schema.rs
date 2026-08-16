@@ -130,7 +130,7 @@ const PERF_CLAIM_READINESS_BLOCKER_CODES: &[&str] = &[
     "strict_mode_disabled",
 ];
 const PERF_BUDGET_V0_2_0_INVENTORY_SHA256: &str =
-    "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
+    "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a";
 
 /// Known JSONL schemas with version and description.
 const SCHEMAS: &[(&str, &str)] = &[
@@ -7731,7 +7731,7 @@ fn generate_schema_doc() {
 
     md.push_str("### `pi.perf.budget_summary.v2`\n\n");
     md.push_str(
-        "Each `budgets` entry requires `name`, `category`, `metric`, `unit`, `threshold`, `comparison`, `ci_enforced`, and `methodology`. `comparison` is the exact enum `maximum` (`actual <= threshold`) or `minimum` (`actual >= threshold`); consumers must never infer direction from a budget name. Blanket performance claims are authorized only when strict, source-bound, same-run evidence gives every declared budget data and PASS status with zero data-contract failures; aggregate `budget_data_missing` and `budget_failed` blockers prevent non-CI results from escaping that rule. Incomplete lineage produces a canonical all-`NO_DATA` blocked sentinel without inspecting ambient artifacts, target paths, or mtimes. Inventory SHA-256 uses compact JSON in producer declaration order and the listed field order, with every threshold rendered using exactly six decimal places. The canonical v0.2.0 digest is `96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad`.\n\n",
+        "Each `budgets` entry requires `name`, `category`, `metric`, `unit`, `threshold`, `comparison`, `ci_enforced`, and `methodology`. `comparison` is the exact enum `maximum` (`actual <= threshold`) or `minimum` (`actual >= threshold`); consumers must never infer direction from a budget name. Blanket performance claims are authorized only when strict, source-bound, same-run evidence gives every declared budget data and PASS status with zero data-contract failures; aggregate `budget_data_missing` and `budget_failed` blockers prevent non-CI results from escaping that rule. Incomplete lineage produces a canonical all-`NO_DATA` blocked sentinel without inspecting ambient artifacts, target paths, or mtimes. Inventory SHA-256 uses compact JSON in producer declaration order and the listed field order, with every threshold rendered using exactly six decimal places. The canonical v0.2.0 digest is `481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a`.\n\n",
     );
 
     let protocol_contract = canonical_protocol_contract();

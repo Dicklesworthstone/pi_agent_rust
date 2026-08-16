@@ -452,16 +452,28 @@ fn json_hints(err: &serde_json::Error) -> ErrorHint {
     }
 }
 
-fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHint {
-    let message = err.to_string();
-    if message.contains("locked") {
+const fn sqlite_hints(err: &fsqlite::FrankenError) -> ErrorHint {
+    if matches!(
+        err,
+        fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::LockFailed { .. }
+            | fsqlite::FrankenError::MultiProcessContractViolation { .. }
+    ) {
         return ErrorHint {
             summary: "Database locked",
             hints: &["Close other Pi instances using this database"],
             context_fields: &["db_path"],
         };
     }
-    if message.contains("corrupt") {
+    if matches!(
+        err,
+        fsqlite::FrankenError::DatabaseCorrupt { .. }
+            | fsqlite::FrankenError::WalCorrupt { .. }
+            | fsqlite::FrankenError::NotADatabase { .. }
+    ) {
         return ErrorHint {
             summary: "Database corrupted",
             hints: &[

@@ -1057,7 +1057,7 @@ fn format_error_summary_skipped_when_contained_in_message() {
 
 #[test]
 fn format_error_with_hints_sqlite_locked() {
-    // Sqlite errors need special handling since we need the sqlmodel_core::Error type
+    // Sqlite errors need special handling since we need the fsqlite::FrankenError type
     // Test with session "locked" since that's matchable without sqlite
     let err = Error::session("session file locked by another process");
     let formatted = format_error_with_hints(&err);

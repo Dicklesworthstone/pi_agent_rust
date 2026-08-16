@@ -1158,8 +1158,9 @@ fn run_session_store_chaos_worker_from_env() {
                     .expect("append rollback extra");
                 let event = rollback_store
                     .rollback_to_checkpoint(
+                        // migrationId must be a UUID per validate_migration_id.
                         1,
-                        format!("{worker_id}-rollback-migration"),
+                        uuid::Uuid::new_v4().to_string(),
                         format!("{worker_id}-rollback-correlation"),
                     )
                     .expect("rollback V2 checkpoint");

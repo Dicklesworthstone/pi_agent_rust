@@ -45,7 +45,7 @@
     "inventory_digest": {
       "algorithm": "sha256",
       "budget_order": "producer_declaration_order",
-      "canonical_v0_2_0_sha256": "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad",
+      "canonical_v0_2_0_sha256": "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a",
       "container": "compact_json_array",
       "field_order": [
         "name",

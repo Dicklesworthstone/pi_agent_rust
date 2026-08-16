@@ -5815,12 +5815,9 @@ fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
 
     let mut message_count = 0u64;
     let mut name = None;
-    loop {
-        let Some(line_content) = read_capped_utf8_line(&mut reader)
-            .map_err(|e| Error::session(format!("Failed to read session entry: {e}")))?
-        else {
-            break;
-        };
+    while let Some(line_content) = read_capped_utf8_line(&mut reader)
+        .map_err(|e| Error::session(format!("Failed to read session entry: {e}")))?
+    {
         if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_content) {
             match entry.r#type.as_str() {
                 "message" => message_count += 1,
@@ -7272,12 +7269,9 @@ fn build_v2_sidecar_from_jsonl_into(jsonl_path: &Path, v2_root: &Path) -> Result
 /// deterministic legacy-ID synthesis used by normal JSONL loading.
 fn read_jsonl_entries_for_v2<R: std::io::BufRead>(reader: &mut R) -> Result<Vec<SessionEntry>> {
     let mut entries = Vec::new();
-    loop {
-        let Some(line) =
-            read_capped_utf8_line(reader).map_err(|err| crate::Error::Io(Box::new(err)))?
-        else {
-            break;
-        };
+    while let Some(line) =
+        read_capped_utf8_line(reader).map_err(|err| crate::Error::Io(Box::new(err)))?
+    {
         if line.trim().is_empty() {
             continue;
         }

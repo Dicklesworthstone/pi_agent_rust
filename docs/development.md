@@ -20,7 +20,7 @@ By default, `pi_agent_rust` depends on **published crates.io versions** of the s
 - `asupersync`
 - `rich_rust`
 - `charmed-*` (bubbletea/lipgloss/bubbles/glamour)
-- `sqlmodel-*` (core/sqlite)
+- `fsqlite` (FrankenSQLite, pure-Rust SQLite engine)
 
 If you want to hack on those repos locally (in lockstep), use a local-only Cargo patch. Assuming the sibling repos are checked out next to `pi_agent_rust` (e.g. `../asupersync`, `../rich_rust`, etc), add this to **your local checkout** (do not commit):
 
@@ -32,8 +32,7 @@ charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
 charmed-lipgloss = { path = "../charmed_rust/crates/lipgloss" }
 charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
 charmed-glamour = { path = "../charmed_rust/crates/glamour" }
-sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 ```
 
 ## Testing

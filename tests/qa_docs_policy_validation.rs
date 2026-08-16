@@ -201,7 +201,9 @@ fn testing_policy_allowlist_entries_reference_real_files() {
     let known_locations = [
         "tests/common/harness.rs",
         "tests/e2e_cli.rs",
-        "src/extensions.rs",
+        // The extensions allowlist entries moved into the decomposed module
+        // tree (GH #130); the policy references its test files now.
+        "src/extensions/tests/registration.rs",
     ];
     for loc in &known_locations {
         assert!(

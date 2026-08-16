@@ -1,11 +1,11 @@
-//! Search backend comparison benches (bd-cv653.1.5).
+//! Search backend comparison benches (`bd-cv653.1.5`).
 //!
 //! Engineering measurement (not a release claim): compares the in-process
 //! grep/find backends against the external `rg`/`fd` escape hatch on a
 //! synthetic source tree. The external lanes are skipped silently when the
 //! binaries are not installed.
 //!
-//! Run with: cargo bench --bench search_backends
+//! Run with: `cargo bench --bench search_backends`
 
 #[path = "bench_env.rs"]
 mod bench_env;

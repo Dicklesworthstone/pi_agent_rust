@@ -1,12 +1,107 @@
 use crate::error::{Error, Result};
 use crate::session::{SessionEntry, SessionHeader};
 use crate::session_metrics;
+use fsqlite::{FrankenError as SqliteError, Row as SqliteRow, SqliteValue};
 use sha2::{Digest as _, Sha256};
-use sqlmodel_core::{Error as SqliteError, Row as SqliteRow, Value as SqliteValue};
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::fmt::Write as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+
+/// Suffixes of every auxiliary file the fsqlite engine may create or read
+/// beside a database file. `-journal` covers legacy rollback-journal
+/// artifacts from the previous libsqlite3-backed engine; the four
+/// `-fsqlite-*`/`-wal-cert*` entries are fsqlite's namespace and WAL
+/// certification sidecars, which persist across connections by design.
+pub(crate) const SQLITE_SIDECAR_SUFFIXES: [&str; 7] = [
+    "-wal",
+    "-shm",
+    "-journal",
+    "-fsqlite-ns-gate",
+    "-fsqlite-ns-use",
+    "-wal-cert",
+    "-wal-cert-head",
+];
+
+/// fsqlite's engine futures are deeply nested and overflow the platform
+/// default stack for spawned threads (512 KiB on macOS), so every thread
+/// that drives them needs an explicit, generous stack.
+const SQLITE_THREAD_STACK_BYTES: usize = 16 * 1024 * 1024;
+
+/// Run `f` on a dedicated thread with a stack large enough for fsqlite's
+/// engine futures and no ambient asupersync runtime, so the `!Send`
+/// connection futures can be driven to completion by a plain block-on
+/// executor without deadlocking a current-thread consumer runtime.
+pub(crate) fn run_on_sqlite_thread<T: Send>(f: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+    std::thread::scope(|scope| {
+        let handle = std::thread::Builder::new()
+            .name("pi-sqlite".to_string())
+            .stack_size(SQLITE_THREAD_STACK_BYTES)
+            .spawn_scoped(scope, f)
+            .map_err(|err| Error::session(format!("Failed to spawn SQLite thread: {err}")))?;
+        match handle.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// Synchronous facade over an async [`fsqlite::Connection`].
+///
+/// Must be created and used entirely within a [`run_on_sqlite_thread`]
+/// closure: the wrapped connection is `!Send`, and each method re-enters a
+/// local block-on executor (cheap re-entry, no reactor required).
+pub(crate) struct SqliteConnection {
+    conn: fsqlite::Connection,
+}
+
+impl SqliteConnection {
+    pub(crate) fn open_read_write(path: &Path) -> std::result::Result<Self, SqliteError> {
+        let conn = futures::executor::block_on(fsqlite::Connection::open_strict_multi_process(
+            path.to_string_lossy().into_owned(),
+        ))?;
+        futures::executor::block_on(conn.execute("PRAGMA busy_timeout = 5000"))?;
+        Ok(Self { conn })
+    }
+
+    pub(crate) fn open_read_only(path: &Path) -> std::result::Result<Self, SqliteError> {
+        // Schema-only opens use fsqlite's read-only pager mode: row data is
+        // still served through pager-backed cursors, and every write path is
+        // refused with `FrankenError::ReadOnly`.
+        let conn = futures::executor::block_on(fsqlite::Connection::open_schema_only(
+            path.to_string_lossy().into_owned(),
+        ))?;
+        Ok(Self { conn })
+    }
+
+    /// Execute one or more statements without parameters.
+    pub(crate) fn execute_raw(&self, sql: &str) -> std::result::Result<(), SqliteError> {
+        futures::executor::block_on(self.conn.execute_batch(sql))
+    }
+
+    /// Execute a single parameterized statement.
+    pub(crate) fn execute_sync(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<usize, SqliteError> {
+        futures::executor::block_on(self.conn.execute_with_params(sql, params))
+    }
+
+    /// Run a parameterized query and collect all rows.
+    pub(crate) fn query_sync(
+        &self,
+        sql: &str,
+        params: &[SqliteValue],
+    ) -> std::result::Result<Vec<SqliteRow>, SqliteError> {
+        futures::executor::block_on(self.conn.query_with_params(sql, params))
+    }
+
+    /// Close the connection, checkpointing the WAL like a final libsqlite3
+    /// close did. Read-only connections may simply be dropped instead.
+    pub(crate) fn close(self) -> std::result::Result<(), SqliteError> {
+        futures::executor::block_on(self.conn.close())
+    }
+}
 
 const INIT_SQL: &str = r"
 PRAGMA journal_mode = WAL;
@@ -62,16 +157,18 @@ fn ensure_regular_sqlite_artifact_if_present(path: &Path) -> Result<bool> {
 fn open_sqlite_connection_read_only(path: &Path) -> Result<SqliteConnection> {
     ensure_regular_sqlite_artifact_if_present(path)?;
     crate::session::ensure_session_file_readable(path).map_err(|err| Error::Io(Box::new(err)))?;
-    let wal_and_shm_exist = ensure_preexisting_sqlite_sidecar_access(path, false)?;
-    if sqlite_database_uses_wal(path)? && !wal_and_shm_exist {
-        // This connection is not opened with SQLite's immutable URI option.
-        // A WAL-mode read may therefore need to create whichever sidecar is
-        // absent. Existing WAL and SHM files only need to be readable.
+    let all_sidecars_exist = ensure_preexisting_sqlite_sidecar_access(path, false)?;
+    // Validates the database header bytes even though fsqlite reads through
+    // both WAL and rollback-journal databases.
+    let _uses_wal = sqlite_database_uses_wal(path)?;
+    if !all_sidecars_exist {
+        // fsqlite creates any missing namespace/WAL sidecars even for a
+        // read-only open, which requires a writable parent directory.
+        // Existing sidecars only need to be openable in place.
         crate::session::ensure_session_parent_writable(path)
             .map_err(|err| Error::Io(Box::new(err)))?;
     }
-    let config = SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::read_only());
-    map_sqlite_result(SqliteConnection::open(&config))
+    map_sqlite_result(SqliteConnection::open_read_only(path))
 }
 
 fn sqlite_database_uses_wal(path: &Path) -> Result<bool> {
@@ -111,13 +208,25 @@ fn open_sqlite_connection_read_write(path: &Path) -> Result<SqliteConnection> {
             .map_err(|err| Error::Io(Box::new(err)))?;
     }
     ensure_preexisting_sqlite_sidecar_access(path, true)?;
-    let config = SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::create_read_write());
-    map_sqlite_result(SqliteConnection::open(&config))
+    map_sqlite_result(SqliteConnection::open_read_write(path))
 }
 
-fn row_get_string(row: &SqliteRow, column: &str) -> Result<String> {
-    row.get_named::<String>(column)
-        .map_err(|err| Error::session(format!("SQLite row read failed: {err}")))
+fn row_get_string(row: &SqliteRow, index: usize, column: &str) -> Result<String> {
+    match row.get(index) {
+        Some(SqliteValue::Text(text)) => Ok(text.as_str().to_string()),
+        other => Err(Error::session(format!(
+            "SQLite row read failed: expected TEXT for column {column}, got {other:?}"
+        ))),
+    }
+}
+
+fn row_get_i64(row: &SqliteRow, index: usize, column: &str) -> Result<i64> {
+    match row.get(index) {
+        Some(SqliteValue::Integer(value)) => Ok(*value),
+        other => Err(Error::session(format!(
+            "SQLite row read failed: expected INTEGER for column {column}, got {other:?}"
+        ))),
+    }
 }
 
 fn malformed_json_error(kind: &str, json: &str, error: &serde_json::Error) -> Error {
@@ -166,8 +275,8 @@ fn read_stored_header(conn: &SqliteConnection) -> Result<Option<SessionHeader>> 
     let Some(row) = rows.pop() else {
         return Ok(None);
     };
-    let row_id = row_get_string(&row, "id")?;
-    let header_json = row_get_string(&row, "json")?;
+    let row_id = row_get_string(&row, 0, "id")?;
+    let header_json = row_get_string(&row, 1, "json")?;
     let header: SessionHeader = parse_sqlite_json("session header", &header_json)?;
     header
         .validate()
@@ -184,12 +293,18 @@ fn rollback_quietly(conn: &SqliteConnection) {
     let _ = conn.execute_raw("ROLLBACK");
 }
 
-fn sqlite_artifact_paths(path: &Path) -> [PathBuf; 4] {
+fn sqlite_artifact_paths(path: &Path) -> [PathBuf; 8] {
+    let [wal, shm, journal, ns_gate, ns_use, wal_cert, wal_cert_head] =
+        SQLITE_SIDECAR_SUFFIXES.map(|suffix| append_sidecar_suffix(path, suffix));
     [
         path.to_path_buf(),
-        append_sidecar_suffix(path, "-wal"),
-        append_sidecar_suffix(path, "-shm"),
-        append_sidecar_suffix(path, "-journal"),
+        wal,
+        shm,
+        journal,
+        ns_gate,
+        ns_use,
+        wal_cert,
+        wal_cert_head,
     ]
 }
 
@@ -200,38 +315,31 @@ fn append_sidecar_suffix(path: &Path, suffix: &str) -> PathBuf {
 }
 
 fn ensure_preexisting_sqlite_sidecar_access(path: &Path, writable: bool) -> Result<bool> {
-    let [wal_path, shm_path] = [
-        append_sidecar_suffix(path, "-wal"),
-        append_sidecar_suffix(path, "-shm"),
-    ];
-    let mut existing_sidecars = 0usize;
-    for sidecar in [&wal_path, &shm_path] {
-        if !ensure_regular_sqlite_artifact_if_present(sidecar)? {
+    let mut missing_runtime_sidecars = false;
+    for suffix in SQLITE_SIDECAR_SUFFIXES {
+        let sidecar = append_sidecar_suffix(path, suffix);
+        if !ensure_regular_sqlite_artifact_if_present(&sidecar)? {
+            // A rollback journal only exists transiently during recovery; its
+            // absence never forces sidecar creation on open.
+            if suffix != "-journal" {
+                missing_runtime_sidecars = true;
+            }
             continue;
         }
-        existing_sidecars = existing_sidecars.saturating_add(1);
 
-        // SQLite 3.22+ can open a read-only WAL database when both existing
-        // sidecars are readable. A read-write connection may mutate either.
-        let access = if writable {
-            crate::session::ensure_session_file_read_write(sidecar)
+        // WAL/SHM/journal sidecars follow the connection mode: readable for a
+        // read-only open, writable for a read-write one. fsqlite's namespace
+        // gate/use sidecars are locked (and may be written) even by read-only
+        // opens, so they must always be read-write.
+        let needs_write = writable || matches!(suffix, "-fsqlite-ns-gate" | "-fsqlite-ns-use");
+        let access = if needs_write {
+            crate::session::ensure_session_file_read_write(&sidecar)
         } else {
-            crate::session::ensure_session_file_readable(sidecar)
+            crate::session::ensure_session_file_readable(&sidecar)
         };
         access.map_err(|err| Error::Io(Box::new(err)))?;
     }
-    let rollback_journal = append_sidecar_suffix(path, "-journal");
-    if ensure_regular_sqlite_artifact_if_present(&rollback_journal)? {
-        // A rollback journal is part of the database's recovery state. SQLite
-        // may read it during a read-only open and may update it during a save.
-        let access = if writable {
-            crate::session::ensure_session_file_read_write(&rollback_journal)
-        } else {
-            crate::session::ensure_session_file_readable(&rollback_journal)
-        };
-        access.map_err(|err| Error::Io(Box::new(err)))?;
-    }
-    Ok(existing_sidecars == 2)
+    Ok(!missing_runtime_sidecars)
 }
 
 #[cfg(unix)]
@@ -275,9 +383,7 @@ fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<StoredEntry>> {
 
     let mut entries = Vec::with_capacity(entry_rows.len());
     for (index, row) in entry_rows.into_iter().enumerate() {
-        let seq = row
-            .get_named::<i64>("seq")
-            .map_err(|err| Error::session(format!("SQLite row read failed: {err}")))?;
+        let seq = row_get_i64(&row, 0, "seq")?;
         let expected_seq = i64::try_from(index)
             .map_err(|_| Error::session("SQLite session entry count exceeds i64"))?
             .checked_add(1)
@@ -287,7 +393,7 @@ fn read_stored_entries(conn: &SqliteConnection) -> Result<Vec<StoredEntry>> {
                 "SQLite session entry sequence is not contiguous: expected={expected_seq} actual={seq}"
             )));
         }
-        let json = row_get_string(&row, "json")?;
+        let json = row_get_string(&row, 1, "json")?;
         let entry: SessionEntry = parse_sqlite_json("session entry", &json)?;
         let canonical_json = serde_json::to_string(&entry)?;
         entries.push(StoredEntry {
@@ -306,7 +412,7 @@ fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
 }
 
 fn is_missing_meta_table_error(err: &SqliteError) -> bool {
-    err.to_string().contains("no such table: pi_session_meta")
+    matches!(err, SqliteError::NoSuchTable { name } if name == "pi_session_meta")
 }
 
 fn query_session_meta_rows(conn: &SqliteConnection) -> Result<Vec<SqliteRow>> {
@@ -447,8 +553,8 @@ fn insert_entry_jsons(
                 sql.push(',');
             }
             let _ = write!(sql, "(?{},?{})", index * 2 + 1, index * 2 + 2);
-            params.push(SqliteValue::BigInt(seq));
-            params.push(SqliteValue::Text(entry_json.clone()));
+            params.push(SqliteValue::from(seq));
+            params.push(SqliteValue::from(entry_json.clone()));
             remaining -= 1;
             if remaining > 0 {
                 seq = seq
@@ -466,15 +572,15 @@ fn write_session_meta(conn: &SqliteConnection, entries: &[SessionEntry]) -> Resu
     map_sqlite_result(conn.execute_sync(
         "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
         &[
-            SqliteValue::Text("message_count".to_string()),
-            SqliteValue::Text(message_count.to_string()),
+            SqliteValue::from("message_count"),
+            SqliteValue::from(message_count.to_string()),
         ],
     ))?;
     map_sqlite_result(conn.execute_sync(
         "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
         &[
-            SqliteValue::Text("name".to_string()),
-            SqliteValue::Text(name.unwrap_or_default()),
+            SqliteValue::from("name"),
+            SqliteValue::from(name.unwrap_or_default()),
         ],
     ))?;
     Ok(())
@@ -494,14 +600,16 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
         });
     }
 
-    let conn = open_sqlite_connection_read_only(path)?;
+    run_on_sqlite_thread(|| {
+        let conn = open_sqlite_connection_read_only(path)?;
 
-    let header = read_stored_header(&conn)?
-        .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+        let header = read_stored_header(&conn)?
+            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
 
-    let entries = read_all_entries(&conn)?;
+        let entries = read_all_entries(&conn)?;
 
-    Ok((header, entries))
+        Ok((header, entries))
+    })
 }
 
 #[allow(
@@ -518,42 +626,44 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
         });
     }
 
-    let conn = open_sqlite_connection_read_only(path)?;
+    run_on_sqlite_thread(|| {
+        let conn = open_sqlite_connection_read_only(path)?;
 
-    let header = read_stored_header(&conn)?
-        .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+        let header = read_stored_header(&conn)?
+            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
 
-    let meta_rows = query_session_meta_rows(&conn)?;
+        let meta_rows = query_session_meta_rows(&conn)?;
 
-    let mut message_count: Option<u64> = None;
-    let mut name: Option<String> = None;
-    for row in meta_rows {
-        let key = row_get_string(&row, "key")?;
-        let value = row_get_string(&row, "value")?;
-        match key.as_str() {
-            "message_count" => message_count = value.parse::<u64>().ok(),
-            "name" if !value.is_empty() => {
-                name = Some(value);
+        let mut message_count: Option<u64> = None;
+        let mut name: Option<String> = None;
+        for row in meta_rows {
+            let key = row_get_string(&row, 0, "key")?;
+            let value = row_get_string(&row, 1, "value")?;
+            match key.as_str() {
+                "message_count" => message_count = value.parse::<u64>().ok(),
+                "name" if !value.is_empty() => {
+                    name = Some(value);
+                }
+                _ => {}
             }
-            _ => {}
         }
-    }
 
-    if message_count.is_none() || name.is_none() {
-        let entries = read_all_entries(&conn)?;
-        let (fallback_message_count, fallback_name) = compute_message_count_and_name(&entries);
-        if message_count.is_none() {
-            message_count = Some(fallback_message_count);
+        if message_count.is_none() || name.is_none() {
+            let entries = read_all_entries(&conn)?;
+            let (fallback_message_count, fallback_name) = compute_message_count_and_name(&entries);
+            if message_count.is_none() {
+                message_count = Some(fallback_message_count);
+            }
+            if name.is_none() {
+                name = fallback_name;
+            }
         }
-        if name.is_none() {
-            name = fallback_name;
-        }
-    }
 
-    Ok(SqliteSessionMeta {
-        header,
-        message_count: message_count.unwrap_or(0),
-        name,
+        Ok(SqliteSessionMeta {
+            header,
+            message_count: message_count.unwrap_or(0),
+            name,
+        })
     })
 }
 
@@ -564,6 +674,18 @@ mod tests {
     use crate::model::UserContent;
     use crate::session::{EntryBase, MessageEntry, SessionInfoEntry, SessionMessage};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn with_write_connection<T: Send>(
+        path: &Path,
+        f: impl FnOnce(&SqliteConnection) -> Result<T> + Send,
+    ) -> Result<T> {
+        run_on_sqlite_thread(|| {
+            let conn = map_sqlite_result(SqliteConnection::open_read_write(path))?;
+            let result = f(&conn)?;
+            map_sqlite_result(conn.close())?;
+            Ok(result)
+        })
+    }
 
     #[cfg(unix)]
     struct UnixModeGuard {
@@ -839,8 +961,9 @@ mod tests {
 
     #[test]
     fn map_sqlite_result_err() {
-        let config = SqliteConfig::file("bad\0path").flags(OpenFlags::create_read_write());
-        let result = map_sqlite_result::<i32>(SqliteConnection::open(&config).map(|_| 42));
+        let result = map_sqlite_result::<i32>(Err(SqliteError::NoSuchTable {
+            name: "pi_probe_table".to_string(),
+        }));
         let err = result.unwrap_err();
         match err {
             Error::Session(message) => {
@@ -977,13 +1100,12 @@ mod tests {
         };
         let invalid_json =
             serde_json::to_string(&invalid_header).expect("serialize invalid session header");
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
-            "UPDATE pi_session_header SET json = ?1",
-            &[sqlmodel_core::Value::Text(invalid_json)],
-        )
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_sync(
+                "UPDATE pi_session_header SET json = ?1",
+                &[SqliteValue::from(invalid_json)],
+            ))
+        })
         .expect("corrupt sqlite header row");
 
         let err = futures::executor::block_on(async { load_session_meta(&path).await })
@@ -1012,13 +1134,12 @@ mod tests {
         futures::executor::block_on(async { save_session(&path, &header, &entries, true).await })
             .expect("save sqlite session");
 
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
-            "DELETE FROM pi_session_meta WHERE key = ?1",
-            &[SqliteValue::Text("name".to_string())],
-        )
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_sync(
+                "DELETE FROM pi_session_meta WHERE key = ?1",
+                &[SqliteValue::from("name")],
+            ))
+        })
         .expect("delete name meta row");
 
         let meta = futures::executor::block_on(async { load_session_meta(&path).await })
@@ -1043,11 +1164,10 @@ mod tests {
         futures::executor::block_on(async { save_session(&path, &header, &entries, true).await })
             .expect("save sqlite session");
 
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_raw("DROP TABLE pi_session_meta")
-            .expect("drop sqlite meta table");
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_raw("DROP TABLE pi_session_meta"))
+        })
+        .expect("drop sqlite meta table");
 
         let meta = futures::executor::block_on(async { load_session_meta(&path).await })
             .expect("load sqlite meta");
@@ -1069,13 +1189,13 @@ mod tests {
         })
         .expect("save sqlite session");
 
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_raw("DROP TABLE pi_session_meta")
-            .expect("drop sqlite meta table");
-        conn.execute_raw("CREATE TABLE pi_session_meta (key TEXT PRIMARY KEY)")
-            .expect("create invalid sqlite meta table");
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_raw("DROP TABLE pi_session_meta"))?;
+            map_sqlite_result(
+                conn.execute_raw("CREATE TABLE pi_session_meta (key TEXT PRIMARY KEY)"),
+            )
+        })
+        .expect("rebuild invalid sqlite meta table");
 
         let err = futures::executor::block_on(async { load_session_meta(&path).await })
             .expect_err("invalid meta schema should fail");
@@ -1291,6 +1411,11 @@ mod tests {
             let sentinel = format!("external target for {suffix}");
             std::fs::write(&external_target, sentinel.as_bytes()).expect("write external target");
             let sidecar = append_sidecar_suffix(&path, suffix);
+            // fsqlite persists WAL/SHM sidecars after close; replace any real
+            // sidecar with the symlink under test.
+            if std::fs::symlink_metadata(&sidecar).is_ok() {
+                std::fs::remove_file(&sidecar).expect("remove persisted sidecar fixture");
+            }
             symlink(&external_target, &sidecar).expect("create SQLite sidecar symlink");
 
             let replacement_header = SessionHeader {
@@ -1346,29 +1471,17 @@ mod tests {
         })
         .expect("seed sqlite session");
 
-        let writer = open_sqlite_connection_read_write(&path).expect("open WAL writer");
-        map_sqlite_result(writer.execute_raw(INIT_SQL)).expect("initialize WAL writer");
-        map_sqlite_result(
-            writer.execute_raw("BEGIN IMMEDIATE; UPDATE pi_session_header SET id = id; COMMIT;"),
-        )
-        .expect("materialize WAL sidecars");
-
+        // fsqlite's WAL and SHM sidecars persist after a checkpointing close,
+        // so the seeded session already has both on disk.
         let wal_path = append_sidecar_suffix(&path, "-wal");
         let shm_path = append_sidecar_suffix(&path, "-shm");
-        assert!(
-            wal_path.exists(),
-            "WAL fixture must exist while writer is open"
-        );
-        assert!(
-            shm_path.exists(),
-            "SHM fixture must exist while writer is open"
-        );
+        assert!(wal_path.exists(), "WAL sidecar must persist after close");
+        assert!(shm_path.exists(), "SHM sidecar must persist after close");
         let mut wal_mode_guard = UnixModeGuard::apply(&wal_path, 0o400);
         let mut shm_mode_guard = UnixModeGuard::apply(&shm_path, 0o400);
         let result = futures::executor::block_on(async { load_session(&path).await });
         wal_mode_guard.restore();
         shm_mode_guard.restore();
-        drop(writer);
 
         let (loaded_header, loaded_entries) =
             result.expect("readable existing WAL and SHM must support a read-only open");
@@ -1378,44 +1491,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn readonly_open_requires_writable_parent_unless_both_sidecars_exist() {
-        for present_suffix in [None, Some("-wal"), Some("-shm")] {
+    fn readonly_open_requires_writable_parent_unless_all_sidecars_exist() {
+        for missing_suffix in ["-wal", "-shm", "-fsqlite-ns-gate", "-fsqlite-ns-use"] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("readonly-incomplete-sidecars.sqlite");
             let header = SessionHeader {
-                id: format!("sqlite-readonly-incomplete-{present_suffix:?}"),
+                id: format!("sqlite-readonly-incomplete-{missing_suffix}"),
                 ..SessionHeader::default()
             };
             futures::executor::block_on(async {
                 save_session(&path, &header, &[message_entry()], true).await
             })
             .expect("seed sqlite session");
-            let wal_path = append_sidecar_suffix(&path, "-wal");
-            let shm_path = append_sidecar_suffix(&path, "-shm");
+            // fsqlite persists its full sidecar family after close; removing
+            // one simulates a database copied without every sidecar, which
+            // forces the read-only open to recreate it in the parent.
+            let missing_path = append_sidecar_suffix(&path, missing_suffix);
             assert!(
-                !wal_path.exists() && !shm_path.exists(),
-                "closed seed connection should leave no WAL/SHM sidecars"
+                missing_path.exists(),
+                "seeded session must have the {missing_suffix} sidecar"
             );
-            if let Some(suffix) = present_suffix {
-                std::fs::write(append_sidecar_suffix(&path, suffix), b"sidecar-sentinel")
-                    .expect("write partial sidecar fixture");
-            }
+            std::fs::remove_file(&missing_path).expect("remove sidecar fixture");
 
             let mut mode_guard = UnixModeGuard::apply(dir.path(), 0o577);
             let result = futures::executor::block_on(async { load_session(&path).await });
             mode_guard.restore();
 
-            let error = result
-                .expect_err("an absent WAL or SHM sidecar requires a writable parent directory");
+            let error =
+                result.expect_err("an absent runtime sidecar requires a writable parent directory");
             assert_permission_denied(&error);
             assert!(path.exists(), "denied open must preserve the database");
-            if let Some(suffix) = present_suffix {
-                assert_eq!(
-                    std::fs::read(append_sidecar_suffix(&path, suffix))
-                        .expect("read preserved partial sidecar"),
-                    b"sidecar-sentinel"
-                );
-            }
         }
     }
 
@@ -1432,10 +1537,10 @@ mod tests {
             save_session(&path, &header, &[message_entry()], true).await
         })
         .expect("seed SQLite session");
-        let connection = open_sqlite_connection_read_write(&path).expect("open SQLite session");
-        map_sqlite_result(connection.execute_raw("PRAGMA journal_mode = DELETE;"))
-            .expect("switch fixture to rollback-journal mode");
-        drop(connection);
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_raw("PRAGMA journal_mode = DELETE;"))
+        })
+        .expect("switch fixture to rollback-journal mode");
         assert!(
             !sqlite_database_uses_wal(&path).expect("inspect SQLite header"),
             "fixture must advertise rollback-journal mode in its database header"
@@ -1899,13 +2004,13 @@ mod tests {
         })
         .expect("seed SQLite session");
         let malformed = format!("{{\"secret\":\"{SENTINEL}\",");
-        let conn = open_sqlite_connection_read_write(&path).expect("open SQLite fixture");
-        map_sqlite_result(conn.execute_sync(
-            "UPDATE pi_session_entries SET json = ?1 WHERE seq = 1",
-            &[SqliteValue::Text(malformed.clone())],
-        ))
+        with_write_connection(&path, |conn| {
+            map_sqlite_result(conn.execute_sync(
+                "UPDATE pi_session_entries SET json = ?1 WHERE seq = 1",
+                &[SqliteValue::from(malformed.clone())],
+            ))
+        })
         .expect("write malformed entry JSON");
-        drop(conn);
 
         let error = futures::executor::block_on(async { load_session(&path).await })
             .expect_err("malformed entry JSON must fail");
@@ -1919,14 +2024,13 @@ mod tests {
         let header_path = dir.path().join("redacted-header.sqlite");
         futures::executor::block_on(async { save_session(&header_path, &header, &[], true).await })
             .expect("seed header redaction session");
-        let header_conn =
-            open_sqlite_connection_read_write(&header_path).expect("open header fixture");
-        map_sqlite_result(header_conn.execute_sync(
-            "UPDATE pi_session_header SET json = ?1",
-            &[SqliteValue::Text(malformed.clone())],
-        ))
+        with_write_connection(&header_path, |conn| {
+            map_sqlite_result(conn.execute_sync(
+                "UPDATE pi_session_header SET json = ?1",
+                &[SqliteValue::from(malformed.clone())],
+            ))
+        })
         .expect("write malformed header JSON");
-        drop(header_conn);
         let header_error =
             futures::executor::block_on(async { load_session_meta(&header_path).await })
                 .expect_err("malformed header JSON must fail");
@@ -1964,78 +2068,82 @@ pub async fn save_session(
     }
 
     let _lock = crate::session::lock_session_persistence(path)?;
-    let conn = open_sqlite_connection_read_write(path)?;
-    map_sqlite_result(conn.execute_raw(INIT_SQL))?;
-    ensure_private_sqlite_permissions(path)?;
-    map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
+    run_on_sqlite_thread(|| {
+        let conn = open_sqlite_connection_read_write(path)?;
+        map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+        ensure_private_sqlite_permissions(path)?;
+        map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
 
-    // Serialize header + entries and track serialization time + bytes.
-    let save_result = (|| -> Result<(SessionHeader, Vec<SessionEntry>)> {
-        let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
-        let header_to_write = match read_stored_header(&conn)? {
-            Some(stored_header) => {
-                if stored_header.id != header.id {
-                    return Err(Error::session(
-                        "SQLite session header ID does not match the in-memory session ID",
-                    ));
+        // Serialize header + entries and track serialization time + bytes.
+        let save_result = (|| -> Result<(SessionHeader, Vec<SessionEntry>)> {
+            let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
+            let header_to_write = match read_stored_header(&conn)? {
+                Some(stored_header) => {
+                    if stored_header.id != header.id {
+                        return Err(Error::session(
+                            "SQLite session header ID does not match the in-memory session ID",
+                        ));
+                    }
+                    if header_dirty {
+                        header.clone()
+                    } else {
+                        stored_header
+                    }
                 }
-                if header_dirty {
-                    header.clone()
-                } else {
-                    stored_header
-                }
+                None => header.clone(),
+            };
+            let header_json = serde_json::to_string(&header_to_write)?;
+            let reconciled = reconcile_entries(read_stored_entries(&conn)?, entries)?;
+            crate::session::validate_session_entry_graph(&reconciled.entries)?;
+            validate_sqlite_json_for_write("session header", &header_json)?;
+            for entry_json in &reconciled.json {
+                validate_sqlite_json_for_write("session entry", entry_json)?;
             }
-            None => header.clone(),
-        };
-        let header_json = serde_json::to_string(&header_to_write)?;
-        let reconciled = reconcile_entries(read_stored_entries(&conn)?, entries)?;
-        crate::session::validate_session_entry_graph(&reconciled.entries)?;
-        validate_sqlite_json_for_write("session header", &header_json)?;
-        for entry_json in &reconciled.json {
-            validate_sqlite_json_for_write("session entry", entry_json)?;
-        }
-        validate_sqlite_sequence_range(0, reconciled.json.len())?;
-        let mut total_json_bytes = u64::try_from(header_json.len())
-            .map_err(|_| Error::session("SQLite header JSON length exceeds u64"))?;
-        for entry_json in &reconciled.json {
-            total_json_bytes = total_json_bytes
-                .checked_add(
-                    u64::try_from(entry_json.len())
-                        .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?,
-                )
-                .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
-        }
-        serialize_timer.finish();
-        metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
+            validate_sqlite_sequence_range(0, reconciled.json.len())?;
+            let mut total_json_bytes = u64::try_from(header_json.len())
+                .map_err(|_| Error::session("SQLite header JSON length exceeds u64"))?;
+            for entry_json in &reconciled.json {
+                total_json_bytes = total_json_bytes
+                    .checked_add(
+                        u64::try_from(entry_json.len())
+                            .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?,
+                    )
+                    .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
+            }
+            serialize_timer.finish();
+            metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
-        map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_entries", &[]))?;
-        map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_header", &[]))?;
-        map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_meta", &[]))?;
+            map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_entries", &[]))?;
+            map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_header", &[]))?;
+            map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_meta", &[]))?;
 
-        map_sqlite_result(conn.execute_sync(
-            "INSERT INTO pi_session_header (id,json) VALUES (?1,?2)",
-            &[
-                SqliteValue::Text(header_to_write.id.clone()),
-                SqliteValue::Text(header_json),
-            ],
-        ))?;
-        insert_entry_jsons(&conn, &reconciled.json, 0)?;
-        write_session_meta(&conn, &reconciled.entries)?;
+            map_sqlite_result(conn.execute_sync(
+                "INSERT INTO pi_session_header (id,json) VALUES (?1,?2)",
+                &[
+                    SqliteValue::from(header_to_write.id.clone()),
+                    SqliteValue::from(header_json),
+                ],
+            ))?;
+            insert_entry_jsons(&conn, &reconciled.json, 0)?;
+            write_session_meta(&conn, &reconciled.entries)?;
 
-        Ok((header_to_write, reconciled.entries))
-    })();
+            Ok((header_to_write, reconciled.entries))
+        })();
 
-    match save_result {
-        Ok((saved_header, saved_entries)) => {
-            map_sqlite_result(conn.execute_raw("COMMIT"))?;
-            ensure_private_sqlite_permissions(path)?;
-            Ok((saved_header, saved_entries))
+        match save_result {
+            Ok((saved_header, saved_entries)) => {
+                map_sqlite_result(conn.execute_raw("COMMIT"))?;
+                map_sqlite_result(conn.close())?;
+                ensure_private_sqlite_permissions(path)?;
+                Ok((saved_header, saved_entries))
+            }
+            Err(err) => {
+                rollback_quietly(&conn);
+                drop(conn);
+                Err(err)
+            }
         }
-        Err(err) => {
-            rollback_quietly(&conn);
-            Err(err)
-        }
-    }
+    })
 }
 
 /// Incrementally append new entries to an existing SQLite session database.
@@ -2062,62 +2170,66 @@ pub async fn append_entries(
     let _timer = metrics.start_timer(&metrics.sqlite_append);
 
     let _lock = crate::session::lock_session_persistence(path)?;
-    let conn = open_sqlite_connection_read_write(path)?;
+    run_on_sqlite_thread(|| {
+        let conn = open_sqlite_connection_read_write(path)?;
 
-    // Ensure WAL mode is active and tables exist (especially pi_session_meta for old DBs).
-    map_sqlite_result(conn.execute_raw(INIT_SQL))?;
-    ensure_private_sqlite_permissions(path)?;
-    map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
+        // Ensure WAL mode is active and tables exist (especially pi_session_meta for old DBs).
+        map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+        ensure_private_sqlite_permissions(path)?;
+        map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
 
-    let append_result = (|| -> Result<(SessionHeader, Vec<SessionEntry>)> {
-        let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
-        let stored_header = read_stored_header(&conn)?
-            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
-        if stored_header.id != expected_session_id {
-            return Err(Error::session(
-                "SQLite session header ID does not match the in-memory session ID",
-            ));
-        }
-        let stored_entries = read_stored_entries(&conn)?;
-        let existing_entry_count = stored_entries.len();
-        if start_seq > existing_entry_count {
-            return Err(Error::session(format!(
-                "SQLite append snapshot is ahead of persisted state: start={start_seq} persisted={existing_entry_count}"
-            )));
-        }
-        let reconciled = reconcile_entries(stored_entries, new_entries)?;
-        crate::session::validate_session_entry_graph(&reconciled.entries)?;
-        for entry_json in &reconciled.json {
-            validate_sqlite_json_for_write("session entry", entry_json)?;
-        }
-        validate_sqlite_sequence_range(existing_entry_count, reconciled.appended_json.len())?;
-        let mut total_json_bytes = 0u64;
-        for entry_json in &reconciled.appended_json {
-            total_json_bytes = total_json_bytes
-                .checked_add(
-                    u64::try_from(entry_json.len())
-                        .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?,
-                )
-                .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
-        }
-        serialize_timer.finish();
-        metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
+        let append_result = (|| -> Result<(SessionHeader, Vec<SessionEntry>)> {
+            let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
+            let stored_header = read_stored_header(&conn)?
+                .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+            if stored_header.id != expected_session_id {
+                return Err(Error::session(
+                    "SQLite session header ID does not match the in-memory session ID",
+                ));
+            }
+            let stored_entries = read_stored_entries(&conn)?;
+            let existing_entry_count = stored_entries.len();
+            if start_seq > existing_entry_count {
+                return Err(Error::session(format!(
+                    "SQLite append snapshot is ahead of persisted state: start={start_seq} persisted={existing_entry_count}"
+                )));
+            }
+            let reconciled = reconcile_entries(stored_entries, new_entries)?;
+            crate::session::validate_session_entry_graph(&reconciled.entries)?;
+            for entry_json in &reconciled.json {
+                validate_sqlite_json_for_write("session entry", entry_json)?;
+            }
+            validate_sqlite_sequence_range(existing_entry_count, reconciled.appended_json.len())?;
+            let mut total_json_bytes = 0u64;
+            for entry_json in &reconciled.appended_json {
+                total_json_bytes = total_json_bytes
+                    .checked_add(
+                        u64::try_from(entry_json.len())
+                            .map_err(|_| Error::session("SQLite entry JSON length exceeds u64"))?,
+                    )
+                    .ok_or_else(|| Error::session("SQLite serialized byte count overflow"))?;
+            }
+            serialize_timer.finish();
+            metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
-        insert_entry_jsons(&conn, &reconciled.appended_json, existing_entry_count)?;
-        write_session_meta(&conn, &reconciled.entries)?;
+            insert_entry_jsons(&conn, &reconciled.appended_json, existing_entry_count)?;
+            write_session_meta(&conn, &reconciled.entries)?;
 
-        Ok((stored_header, reconciled.entries))
-    })();
+            Ok((stored_header, reconciled.entries))
+        })();
 
-    match append_result {
-        Ok((saved_header, saved_entries)) => {
-            map_sqlite_result(conn.execute_raw("COMMIT"))?;
-            ensure_private_sqlite_permissions(path)?;
-            Ok((saved_header, saved_entries))
+        match append_result {
+            Ok((saved_header, saved_entries)) => {
+                map_sqlite_result(conn.execute_raw("COMMIT"))?;
+                map_sqlite_result(conn.close())?;
+                ensure_private_sqlite_permissions(path)?;
+                Ok((saved_header, saved_entries))
+            }
+            Err(err) => {
+                rollback_quietly(&conn);
+                drop(conn);
+                Err(err)
+            }
         }
-        Err(err) => {
-            rollback_quietly(&conn);
-            Err(err)
-        }
-    }
+    })
 }

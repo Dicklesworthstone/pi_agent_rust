@@ -217,8 +217,10 @@ grep-regex = "0.1"
 grep-searcher = "0.1"
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
-sqlmodel-sqlite = { version = "0.3.3" }
-sqlmodel-core = { version = "0.3.2" }
+# default-features off: pi's session storage needs only the core engine —
+# the json/fts5/rtree extension vtabs would add megabytes against the 22 MiB
+# release size budget.
+fsqlite = { version = "0.3.4", default-features = false, features = ["native"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -434,7 +436,7 @@ module_name_repetitions = "allow"
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
 # This project depends on published crates.io versions of asupersync,
-# rich_rust, charmed-*, and sqlmodel-*. CI builds verify this (no sibling
+# rich_rust, charmed-*, and fsqlite. CI builds verify this (no sibling
 # repos are checked out).
 #
 # To develop against LOCAL checkouts of these crates, uncomment the
@@ -455,5 +457,4 @@ module_name_repetitions = "allow"
 # charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
 # charmed-glamour = { path = "../charmed_rust/crates/glamour" }
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
-# sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-# sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+# fsqlite = { path = "../frankensqlite/crates/fsqlite" }

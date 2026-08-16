@@ -3052,7 +3052,7 @@ fn budget_inventory_has_stable_cross_language_serialization() {
     ));
     assert_eq!(
         budget_inventory_sha256(),
-        "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad",
+        "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a",
         "canonical v0.2.0 budget inventory drifted"
     );
 }

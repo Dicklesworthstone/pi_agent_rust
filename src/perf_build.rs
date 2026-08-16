@@ -14,7 +14,12 @@ pub const BENCH_BUILD_PROFILE_ENV: &str = "PI_BENCH_BUILD_PROFILE";
 pub const BENCH_ALLOCATOR_ENV: &str = "PI_BENCH_ALLOCATOR";
 
 /// Release binary-size budget (MB) shared by perf regression and budget gates.
-pub const BINARY_SIZE_RELEASE_BUDGET_MB: f64 = 22.0;
+///
+/// Raised 22.0 → 26.0 on 2026-08-16 with the FrankenSQLite cutover
+/// (bd-oc1wu): the pure-Rust engine replaces libsqlite3-sys C code and costs
+/// ~5.6 MiB of compiled core (parser/planner/VDBE/MVCC/pager) that LTO cannot
+/// remove. Reclaim tracked in the follow-up size bead before tightening.
+pub const BINARY_SIZE_RELEASE_BUDGET_MB: f64 = 26.0;
 
 /// Cargo profile family embedded by `build.rs` (`PROFILE`; custom release-derived
 /// profiles are reported by Cargo as `release`).

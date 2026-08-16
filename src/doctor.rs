@@ -13875,13 +13875,17 @@ fn doctor_swarm_context_intelligence_json_reports_posture() {
         };
         let invalid_json =
             serde_json::to_string(&invalid_header).expect("serialize invalid session header");
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
-            "UPDATE pi_session_header SET json = ?1",
-            &[sqlmodel_core::Value::Text(invalid_json)],
-        )
+        crate::session_sqlite::run_on_sqlite_thread(|| {
+            let conn = crate::session_sqlite::SqliteConnection::open_read_write(&path)
+                .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.execute_sync(
+                "UPDATE pi_session_header SET json = ?1",
+                &[fsqlite::SqliteValue::from(invalid_json)],
+            )
+            .map_err(|err| crate::error::Error::session(err.to_string()))?;
+            conn.close()
+                .map_err(|err| crate::error::Error::session(err.to_string()))
+        })
         .expect("corrupt sqlite header row");
         assert!(!is_session_healthy(&path));
     }

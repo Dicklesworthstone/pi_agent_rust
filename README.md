@@ -1980,7 +1980,8 @@ strip = true         # Remove symbol tables
 ```
 
 Binary size is explicitly budgeted in CI via `binary_size_release`, with a target
-threshold of `22.0 MiB` (the harness computes bytes / 1024 / 1024). A fresh
+threshold of `26.0 MiB` (the harness computes bytes / 1024 / 1024; raised from
+`22.0 MiB` with the FrankenSQLite cutover). A fresh
 `v0.2.0` release measurement is required before reporting the achieved size.
 Default release builds keep heavyweight extras opt-in; use `--features full`
 when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting

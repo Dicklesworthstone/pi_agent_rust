@@ -287,7 +287,7 @@ This port uses two key libraries from sibling projects:
 | Metric | Target | Notes |
 |--------|--------|-------|
 | Startup time | <100ms | No heavy initialization |
-| Binary size (release) | <22 MiB | CI size budget with LTO + strip enabled |
+| Binary size (release) | <26 MiB | CI size budget with LTO + strip enabled (raised from 22 MiB with the fsqlite cutover) |
 | TUI framerate | 60fps | Differential rendering |
 | Memory (idle) | <50MB | No leaks on long sessions |
 

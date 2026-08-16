@@ -155,14 +155,6 @@ jobs:
           path: charmed_rust
           fetch-depth: 1
 
-      - name: Checkout sqlmodel_rust
-        if: env.SHOULD_RUN == 'true'
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
       - name: Install system deps (fd, rg, xcb) [linux]
         if: env.SHOULD_RUN == 'true'
         run: |

@@ -52,7 +52,7 @@ pub enum Error {
 
     /// SQLite errors
     #[error("SQLite error: {0}")]
-    Sqlite(#[from] Box<sqlmodel_core::Error>),
+    Sqlite(#[from] Box<fsqlite::FrankenError>),
 
     /// User aborted operation
     #[error("Operation aborted")]
@@ -913,10 +913,17 @@ fn io_hints(err: &std::io::Error) -> ErrorHints {
     }
 }
 
-fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHints {
+fn sqlite_hints(err: &fsqlite::FrankenError) -> ErrorHints {
     let details = err.to_string();
-    let lower = details.to_lowercase();
-    if contains_any(&lower, &["database is locked", "busy"]) {
+    if matches!(
+        err,
+        fsqlite::FrankenError::DatabaseLocked { .. }
+            | fsqlite::FrankenError::Busy
+            | fsqlite::FrankenError::BusyRecovery
+            | fsqlite::FrankenError::BusySnapshot { .. }
+            | fsqlite::FrankenError::LockFailed { .. }
+            | fsqlite::FrankenError::MultiProcessContractViolation { .. }
+    ) {
         return build_hints(
             "SQLite database is locked.",
             vec![
@@ -963,8 +970,8 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<sqlmodel_core::Error> for Error {
-    fn from(value: sqlmodel_core::Error) -> Self {
+impl From<fsqlite::FrankenError> for Error {
+    fn from(value: fsqlite::FrankenError) -> Self {
         Self::Sqlite(Box::new(value))
     }
 }

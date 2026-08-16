@@ -92,7 +92,7 @@ Performance claims are blocked. Blocking reason codes:
 
 | Budget | Metric | Comparison | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|---|
-| `binary_size_release` | release binary size | <= | 22 MB | - | NO_DATA | Yes |
+| `binary_size_release` | release binary size | <= | 26 MB | - | NO_DATA | Yes |
 
 ## Protocol
 

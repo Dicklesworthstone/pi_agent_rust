@@ -89,16 +89,17 @@ jobs:
         run: |
           set -euo pipefail
           # Keep this byte-exact and aligned with the documented shipping target.
-          # "<22 MiB" means 22 * 1024 * 1024 bytes is already over budget.
-          MAX_BINARY_BYTES=$((22 * 1024 * 1024))
+          # "<26 MiB" means 26 * 1024 * 1024 bytes is already over budget.
+          # (Raised from 22 MiB with the fsqlite cutover, bd-oc1wu.)
+          MAX_BINARY_BYTES=$((26 * 1024 * 1024))
           SIZE_BYTES=$(stat --printf="%s" target/release/pi)
           {
             echo "## Binary Size"
             echo "- Size: ${SIZE_BYTES} bytes"
-            echo "- Budget: < ${MAX_BINARY_BYTES} bytes (22 MiB)"
+            echo "- Budget: < ${MAX_BINARY_BYTES} bytes (26 MiB)"
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$SIZE_BYTES" -ge "$MAX_BINARY_BYTES" ]; then
-            echo "::error::Binary size ${SIZE_BYTES} bytes violates the <22 MiB budget"
+            echo "::error::Binary size ${SIZE_BYTES} bytes violates the <26 MiB budget"
             exit 1
           fi
           echo "- Status: Within budget" >> "$GITHUB_STEP_SUMMARY"

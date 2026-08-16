@@ -2,7 +2,7 @@
 //!
 //! Covers:
 //! - All error constructors (config/session/provider/auth/tool/validation/extension/api)
-//! - From conversions (`io::Error`, `serde_json::Error`, `sqlmodel_core::Error`, `LockError`)
+//! - From conversions (`io::Error`, `serde_json::Error`, `fsqlite::FrankenError`, `LockError`)
 //! - Display formatting (ensures context appears in error messages)
 
 mod common;
@@ -937,7 +937,7 @@ fn hints_io_fallback() {
 
 #[test]
 fn hints_sqlite_locked() {
-    // We cannot easily construct a sqlmodel_core::Error with "database is locked",
+    // We cannot easily construct a fsqlite::FrankenError with "database is locked",
     // so test via the Error::Sqlite variant with a real sqlite error from a path issue.
     // Instead, test the provider path for locked-database semantics indirectly:
     // verify that the hints infrastructure works for a generic sqlite error.

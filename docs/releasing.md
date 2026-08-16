@@ -18,7 +18,7 @@ repository gates that cover the utility explicitly enable its internal feature.
 - **Tag format:** `vX.Y.Z` (SemVer). Example: `v0.2.0`.
 - **Pre-releases:** `vX.Y.Z-rc.1` (or similar). Example: `v0.2.0-rc.1`.
 - **Coupling:** `pi_agent_rust` (crate), `pi` (lib), and `pi` (binary) are all built from the same package, so they share one version number.
-- **Sibling repos:** `asupersync`, `rich_rust`, `charmed_rust`, `sqlmodel_rust` are versioned independently in their own repos.
+- **Sibling repos:** `asupersync`, `rich_rust`, `charmed_rust`, `frankensqlite` are versioned independently in their own repos.
 
 ### Publishing to crates.io
 `.github/workflows/publish.yml` is a manual-dispatch, non-authoritative
@@ -55,7 +55,7 @@ versions, registry sources, and checksums rather than unrelated repository HEADs
 `.github/workflows/release.yml` is triggered on tag pushes matching `v*` and will:
 - run the full frozen-SHA format/check/clippy/test and release-evidence gates
 - build `pi` for Linux/macOS/Windows and reject every native binary whose raw
-  executable size is greater than or equal to 22 MiB (23,068,672 bytes)
+  executable size is greater than or equal to 26 MiB (27,262,976 bytes)
 - attach platform archives, per-target build manifests, and `SHA256SUMS` to a
   verified draft, preserving matching assets and adding only missing ones on a
   safe rerun
@@ -1483,7 +1483,7 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
      all(.artifacts[];
        (.sha256 | test("^[0-9a-f]{64}$")) and
        (.size_bytes | type) == "number" and .size_bytes > 0 and
-       .size_bytes < 23068672 and .archive_format == "binary" and
+       .size_bytes < 27262976 and .archive_format == "binary" and
        .signed == false and .signature_file == "")
    ' "$raw_manifest" >/dev/null
    while IFS=$'\t' read -r raw_name expected_sha expected_size; do
@@ -1753,7 +1753,7 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
        if not (
            name in {"asupersync", "rich_rust"}
            or name.startswith("charmed-")
-           or name.startswith("sqlmodel-")
+           or name == "fsqlite" or name.startswith("fsqlite-")
        ):
            continue
        checksum = package.get("checksum")
@@ -1768,7 +1768,7 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
        })
    selected.sort(key=lambda item: (item["name"], item["version"]))
    identities = [(item["name"], item["version"]) for item in selected]
-   required = {"asupersync", "rich_rust", "sqlmodel-core", "sqlmodel-sqlite"}
+   required = {"asupersync", "rich_rust", "fsqlite"}
    if len(identities) != len(set(identities)) \
            or not required.issubset({name for name, _ in identities}):
        fail("locked release dependency selection is duplicate or incomplete")
@@ -1890,8 +1890,8 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
            "signature_file": "",
        }:
            fail(f"aggregate raw receipt differs for {dsr_target}")
-       if len(raw_bytes) >= 22 * 1024 * 1024:
-           fail(f"raw binary violates <22 MiB budget: {dsr_target}")
+       if len(raw_bytes) >= 26 * 1024 * 1024:
+           fail(f"raw binary violates <26 MiB budget: {dsr_target}")
        if environment.get("target") != dsr_target \
                or environment.get("method") != "native" \
                or not isinstance(environment.get("host"), str) \
@@ -2087,7 +2087,7 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
          (.archive.size | type) == "number" and .archive.size > 0 and
          (.binary.sha256 | test("^[0-9a-f]{64}$")) and
          (.binary.size | type) == "number" and
-         .binary.size > 0 and .binary.size < 23068672
+         .binary.size > 0 and .binary.size < 27262976
        ' "$manifest" >/dev/null
      done
    )

@@ -864,9 +864,9 @@ jobs:
           for package in lock["package"]:
               name = package["name"]
               if not (
-                  name in {"asupersync", "rich_rust"}
+                  name in {"asupersync", "rich_rust", "fsqlite"}
                   or name.startswith("charmed-")
-                  or name.startswith("sqlmodel-")
+                  or name.startswith("fsqlite-")
               ):
                   continue
               source = package.get("source")
@@ -889,7 +889,7 @@ jobs:
           if len(selected_identities) != len(set(selected_identities)):
               raise SystemExit("selected locked package provenance contains duplicate identities")
           selected_names = {package["name"] for package in selected}
-          required_names = {"asupersync", "rich_rust", "sqlmodel-core", "sqlmodel-sqlite"}
+          required_names = {"asupersync", "rich_rust", "fsqlite"}
           if not required_names.issubset(selected_names):
               missing = sorted(required_names - selected_names)
               raise SystemExit(f"missing required locked package provenance: {missing}")
@@ -928,11 +928,11 @@ jobs:
           binary = Path("target") / os.environ["RELEASE_TARGET"] / "release" / (
               "pi.exe" if is_windows else "pi"
           )
-          max_binary_bytes = 22 * 1024 * 1024
+          max_binary_bytes = 26 * 1024 * 1024
           binary_size = binary.stat().st_size
           if binary_size >= max_binary_bytes:
               raise SystemExit(
-                  f"release binary is {binary_size} bytes; policy requires < {max_binary_bytes} bytes (22 MiB)"
+                  f"release binary is {binary_size} bytes; policy requires < {max_binary_bytes} bytes (26 MiB)"
               )
           manifest = {
               "schema": "pi.release.build_manifest.v1",
@@ -1315,7 +1315,7 @@ jobs:
           selected = []
           for package in lock["package"]:
               name = package["name"]
-              if not (name in {"asupersync", "rich_rust"} or name.startswith("charmed-") or name.startswith("sqlmodel-")):
+              if not (name in {"asupersync", "rich_rust", "fsqlite"} or name.startswith("charmed-") or name.startswith("fsqlite-")):
                   continue
               source = package.get("source")
               checksum = package.get("checksum")
@@ -1324,7 +1324,7 @@ jobs:
               selected.append({"name": name, "version": package["version"], "source": source, "checksum": checksum})
           selected.sort(key=lambda package: (package["name"], package["version"]))
           identities = [(package["name"], package["version"]) for package in selected]
-          required = {"asupersync", "rich_rust", "sqlmodel-core", "sqlmodel-sqlite"}
+          required = {"asupersync", "rich_rust", "fsqlite"}
           if len(identities) != len(set(identities)) or not required.issubset({name for name, _ in identities}):
               fail("selected locked package provenance is duplicate or incomplete")
 
@@ -1376,8 +1376,8 @@ jobs:
               expected_binary = {"name": binary_name, "sha256": sha256(binary_bytes), "size": len(binary_bytes)}
               if manifest.get("binary") != expected_binary:
                   fail(f"{manifest_path} extracted binary digest/size binding failed")
-              if len(binary_bytes) >= 22 * 1024 * 1024:
-                  fail(f"{manifest_path} binary violates the <22 MiB release budget")
+              if len(binary_bytes) >= 26 * 1024 * 1024:
+                  fail(f"{manifest_path} binary violates the <26 MiB release budget")
               validate_binary(binary_bytes, target)
           print("Verified exact five-platform inventory, strict manifests, archives, binaries, and compiler provenance")
           PY

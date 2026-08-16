@@ -164,9 +164,9 @@ fn callback_ordering_stream_event_hook_extracts_from_message_update() {
 fn transport_session_transport_event_variants_debug() {
     let harness = TestHarness::new("transport_session_transport_event_variants_debug");
 
-    let in_process_event = SessionTransportEvent::InProcess(AgentEvent::AgentStart {
+    let in_process_event = SessionTransportEvent::InProcess(Box::new(AgentEvent::AgentStart {
         session_id: "test".into(),
-    });
+    }));
     let rpc_event = SessionTransportEvent::Rpc(json!({"type": "agent_start"}));
 
     let dbg_ip = format!("{in_process_event:?}");

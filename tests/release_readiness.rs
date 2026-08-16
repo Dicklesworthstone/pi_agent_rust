@@ -37,7 +37,7 @@ const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
 const PERF_CANONICAL_BUDGET_COUNT: usize = 19;
 const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
+    "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a";
 const PERF_MAX_EVIDENCE_AGE_HOURS: i64 = 168;
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",

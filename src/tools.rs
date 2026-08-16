@@ -3206,7 +3206,7 @@ pub(crate) fn search_backend_from_config(config: Option<&Config>) -> SearchBacke
         .map(str::trim)
     {
         Some("external") => SearchBackend::External,
-        Some("inproc") | Some("") | None => SearchBackend::Inproc,
+        Some("inproc" | "") | None => SearchBackend::Inproc,
         Some(other) => {
             tracing::warn!(
                 "unknown search_backend setting '{other}' (expected 'inproc' or 'external'); using inproc"
@@ -3786,14 +3786,17 @@ fn find_inproc_scan_sync(
         let is_dir = entry
             .file_type()
             .is_some_and(|file_type| file_type.is_dir());
-        let matched = if let Some(matcher) = &filename_matcher {
-            path.file_name()
-                .is_some_and(|name| matcher.is_match(Path::new(name)))
-        } else if let Some(matcher) = &path_matcher {
-            matcher.matched(path, is_dir).is_whitelist()
-        } else {
-            false
-        };
+        let matched = filename_matcher.as_ref().map_or_else(
+            || {
+                path_matcher
+                    .as_ref()
+                    .is_some_and(|matcher| matcher.matched(path, is_dir).is_whitelist())
+            },
+            |matcher| {
+                path.file_name()
+                    .is_some_and(|name| matcher.is_match(Path::new(name)))
+            },
+        );
         if matched {
             results.push(relative.to_path_buf());
             if results.len() >= scan_limit {
@@ -8317,7 +8320,9 @@ impl Tool for GrepTool {
                 outcome.map_err(|err| Error::tool("grep", error_for_line_output(&err)))?;
             matches = outcome.matches;
             match_count = outcome.match_count;
-            match_scan_limit_reached = outcome.limit_reached;
+            // outcome.limit_reached is equivalent to match_count > effective_limit
+            // (scan_limit is effective_limit + 1), which the shared truncation
+            // check below re-derives from match_count.
             outcome.scoped_root
         } else {
             let mut args: Vec<OsString> = vec![
@@ -9255,7 +9260,7 @@ impl FindTool {
                 )
             })?
             .args(args)
-            .current_dir(&scan_io_path)
+            .current_dir(scan_io_path)
             .stdin(cwd_scope.child_stdin().map_err(|error| {
                 Error::tool(
                     "find",
