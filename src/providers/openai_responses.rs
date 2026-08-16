@@ -2171,6 +2171,444 @@ mod tests {
         assert_eq!(value["reasoning"]["effort"], "max");
     }
 
+    // ========================================================================
+    // Raw-item preservation and replay (gh #167)
+    // ========================================================================
+
+    fn assistant_message_with_blocks(content: Vec<ContentBlock>) -> Message {
+        Message::Assistant(std::sync::Arc::new(AssistantMessage {
+            content,
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        }))
+    }
+
+    fn tool_result_message(tool_call_id: &str, text: &str) -> Message {
+        Message::ToolResult(std::sync::Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: tool_call_id.to_string(),
+            tool_name: "echo".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: None,
+            is_error: false,
+            timestamp: 0,
+        }))
+    }
+
+    fn raw_reasoning_item() -> Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "Plan the echo." }],
+            "encrypted_content": "gAAAAA-encrypted",
+            "status": "completed"
+        })
+    }
+
+    /// End-to-end round trip: a stream carrying reasoning + message +
+    /// function_call items is captured on the assistant message, and the next
+    /// request replays the preserved items with their original ids,
+    /// `encrypted_content`, and status fields (TS parity).
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_stream_captures_raw_items_and_build_request_replays_them() {
+        let events = vec![
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "summary_index": 0,
+                "delta": "Plan the echo."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": raw_reasoning_item()
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "Calling echo."
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "Calling echo.", "annotations": [] }
+                    ]
+                }
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": ""
+                }
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"text\":\"hi\"}"
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}",
+                    "status": "completed"
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 2, "total_tokens": 3 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+
+        // Parse-side capture on the assistant message.
+        let ContentBlock::Thinking(thinking) = &done_message.content[0] else {
+            panic!("expected thinking block first");
+        };
+        assert_eq!(thinking.thinking, "Plan the echo.");
+        let signature_value: Value = serde_json::from_str(
+            thinking
+                .thinking_signature
+                .as_deref()
+                .expect("thinking signature"),
+        )
+        .expect("signature parses as JSON");
+        assert_eq!(signature_value, raw_reasoning_item());
+
+        let ContentBlock::Text(text) = &done_message.content[1] else {
+            panic!("expected text block second");
+        };
+        assert_eq!(text.text_signature.as_deref(), Some("msg_1"));
+
+        let ContentBlock::ToolCall(tool_call) = &done_message.content[2] else {
+            panic!("expected tool call block third");
+        };
+        assert_eq!(tool_call.id, "call_1");
+        assert_eq!(tool_call.thought_signature.as_deref(), Some("fc_1"));
+
+        // The captured message survives a session JSONL round trip.
+        let serialized = serde_json::to_string(&Message::Assistant(done_message.clone().into()))
+            .expect("serialize");
+        let Message::Assistant(roundtripped) =
+            serde_json::from_str::<Message>(&serialized).expect("deserialize")
+        else {
+            panic!("expected assistant message");
+        };
+
+        // Request-side replay.
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Ping".to_string()),
+                    timestamp: 0,
+                }),
+                Message::Assistant(roundtripped),
+                tool_result_message("call_1", "ok"),
+            ],
+            vec![],
+        );
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                { "role": "user", "content": [{ "type": "input_text", "text": "Ping" }] },
+                raw_reasoning_item(),
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "Calling echo.", "annotations": [] }
+                    ]
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" }
+            ])
+        );
+    }
+
+    /// A reasoning item that produced no summary deltas but carries
+    /// `encrypted_content` still yields a thinking block holding the raw item,
+    /// so the encrypted reasoning is not lost.
+    #[test]
+    fn test_stream_creates_thinking_block_for_summaryless_encrypted_reasoning() {
+        let raw_item = json!({
+            "type": "reasoning",
+            "id": "rs_2",
+            "summary": [],
+            "encrypted_content": "gAAAAA-opaque"
+        });
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": raw_item
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        assert!(
+            out.iter()
+                .any(|event| matches!(event, StreamEvent::ThinkingStart { content_index: 0 }))
+        );
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+        let ContentBlock::Thinking(thinking) = &done_message.content[0] else {
+            panic!("expected thinking block");
+        };
+        assert!(thinking.thinking.is_empty());
+        let signature_value: Value = serde_json::from_str(
+            thinking
+                .thinking_signature
+                .as_deref()
+                .expect("thinking signature"),
+        )
+        .expect("signature parses");
+        assert_eq!(
+            signature_value,
+            json!({
+                "type": "reasoning",
+                "id": "rs_2",
+                "summary": [],
+                "encrypted_content": "gAAAAA-opaque"
+            })
+        );
+    }
+
+    /// A reasoning item with neither prior blocks nor `encrypted_content` has
+    /// nothing replayable and keeps the legacy behavior of being ignored.
+    #[test]
+    fn test_stream_ignores_reasoning_done_without_encrypted_content() {
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": { "type": "reasoning", "id": "rs_3", "summary": [] }
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "hi"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+        assert_eq!(done_message.content.len(), 1);
+        assert!(matches!(&done_message.content[0], ContentBlock::Text(_)));
+    }
+
+    /// Legacy sessions (no captured metadata) must build byte-identical
+    /// requests to the pre-preservation implementation: merged assistant text
+    /// with no id/status/annotations, function_call without an `id` field, and
+    /// untouched call ids.
+    #[test]
+    fn test_build_request_without_raw_metadata_keeps_legacy_shape() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![
+                Message::User(crate::model::UserMessage {
+                    content: UserContent::Text("Ping".to_string()),
+                    timestamp: 0,
+                }),
+                assistant_message_with_blocks(vec![
+                    ContentBlock::Thinking(ThinkingContent {
+                        thinking: "legacy thinking".to_string(),
+                        thinking_signature: None,
+                    }),
+                    ContentBlock::Text(TextContent::new("Part one. ")),
+                    ContentBlock::Text(TextContent::new("Part two.")),
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "call_legacy".to_string(),
+                        name: "echo".to_string(),
+                        arguments: json!({ "text": "hi" }),
+                        thought_signature: None,
+                    }),
+                ]),
+                tool_result_message("call_legacy", "ok"),
+            ],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let serialized = serde_json::to_string(&request).expect("serialize request");
+        let value: Value = serde_json::from_str(&serialized).expect("parse request");
+        assert_eq!(
+            value["input"],
+            json!([
+                { "role": "user", "content": [{ "type": "input_text", "text": "Ping" }] },
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Part one. Part two." }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_legacy",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_legacy", "output": "ok" }
+            ])
+        );
+        // Explicit absence checks for the new optional fields.
+        assert!(!serialized.contains("\"annotations\""));
+        assert!(!serialized.contains("\"status\""));
+        assert!(!serialized.contains("\"id\""));
+    }
+
+    /// Combined `call_id|item_id` tool-call ids written by TS pi-mono sessions
+    /// are split on replay: call_id keeps the prefix, and the embedded
+    /// `fc_...` suffix is replayed as the function_call item id.
+    #[test]
+    fn test_build_request_splits_ts_session_combined_tool_call_ids() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![
+                assistant_message_with_blocks(vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call_9|fc_9".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "text": "hi" }),
+                    thought_signature: None,
+                })]),
+                tool_result_message("call_9|fc_9", "ok"),
+            ],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "type": "function_call",
+                    "id": "fc_9",
+                    "call_id": "call_9",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_9", "output": "ok" }
+            ])
+        );
+    }
+
+    /// Foreign signatures (other providers' opaque blobs) never leak into
+    /// Responses requests: only JSON reasoning items, `msg`-prefixed text
+    /// signatures, and `fc`-prefixed item ids are replayed.
+    #[test]
+    fn test_build_request_ignores_foreign_signatures() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![assistant_message_with_blocks(vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "anthropic thinking".to_string(),
+                    thinking_signature: Some("EqQBCkgIBBAB".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "Hello".to_string(),
+                    text_signature: Some("sig123".to_string()),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_a".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({}),
+                    thought_signature: Some("gemini-opaque-blob".to_string()),
+                }),
+            ])],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "Hello" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_a",
+                    "name": "echo",
+                    "arguments": "{}"
+                }
+            ])
+        );
+    }
+
     #[test]
     fn test_stream_parses_text_and_tool_call() {
         let events = vec![
