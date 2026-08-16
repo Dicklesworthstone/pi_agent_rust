@@ -24794,7 +24794,10 @@ mod tests {
                 .await
                 .expect("register ctx parity extension");
             runtime
-                .eval(&privileged_test_script(&runtime, CTX_PARITY_DISPATCH_SEQUENCE))
+                .eval(&privileged_test_script(
+                    &runtime,
+                    CTX_PARITY_DISPATCH_SEQUENCE,
+                ))
                 .await
                 .expect("dispatch ctx parity events");
             drain_until_idle(&runtime, &clock).await;
@@ -24841,10 +24844,7 @@ mod tests {
             // SessionManager shim reflects the most recent host session
             // identity; inMemory() instances always report null.
             assert_eq!(probe["shimAfterInMemory"]["id"], json!("sess-memory"));
-            assert_eq!(
-                probe["shimAfterInMemory"]["file"],
-                serde_json::Value::Null
-            );
+            assert_eq!(probe["shimAfterInMemory"]["file"], serde_json::Value::Null);
             assert_eq!(probe["shimAfterInMemory"]["dir"], serde_json::Value::Null);
             assert_eq!(probe["shimDetached"]["id"], serde_json::Value::Null);
             assert_eq!(probe["shimDetached"]["file"], serde_json::Value::Null);

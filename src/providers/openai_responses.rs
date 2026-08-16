@@ -1168,25 +1168,23 @@ where
             .map(|(_, idx)| *idx)
             .min();
 
-        let idx = match existing_idx {
-            Some(idx) => idx,
-            None => {
-                if encrypted_content.is_none() {
-                    return;
-                }
-                self.ensure_started();
-                let idx =
-                    self.reasoning_block_for(ReasoningKind::Summary, item_id.to_string(), 0);
-                if !summary_text.is_empty() {
-                    self.apply_reasoning_snapshot(
-                        ReasoningKind::Summary,
-                        item_id.to_string(),
-                        0,
-                        summary_text.to_string(),
-                    );
-                }
-                idx
+        let idx = if let Some(idx) = existing_idx {
+            idx
+        } else {
+            if encrypted_content.is_none() {
+                return;
             }
+            self.ensure_started();
+            let idx = self.reasoning_block_for(ReasoningKind::Summary, item_id.to_string(), 0);
+            if !summary_text.is_empty() {
+                self.apply_reasoning_snapshot(
+                    ReasoningKind::Summary,
+                    item_id.to_string(),
+                    0,
+                    summary_text.to_string(),
+                );
+            }
+            idx
         };
 
         if let Some(ContentBlock::Thinking(block)) = self.partial.content.get_mut(idx) {
