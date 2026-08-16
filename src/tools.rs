@@ -8247,7 +8247,14 @@ impl Tool for GrepTool {
                 .remove(&file_path)
                 .ok_or_else(|| Error::tool("grep", "missing logical scanner result path"))?;
             let relative_path = format_grep_path(&logical_path, cwd_scope.logical_path());
-            let lines = get_file_lines_async(&file_path, &operation_cwd).await;
+            // A pinned regular-file root renders context from the held
+            // descriptor so a post-pin rename/symlink swap of the logical
+            // path cannot redirect or break the read.
+            let lines = if scoped_root.is_file_root() {
+                get_pinned_file_lines_async(&scoped_root).await
+            } else {
+                get_file_lines_async(&file_path, &operation_cwd).await
+            };
 
             if lines.is_empty() {
                 if let Some(first_match) = match_lines.first() {
@@ -8661,8 +8668,42 @@ impl Tool for FindTool {
             args.push(root_gitignore.as_os_str().to_owned());
         }
 
+        // fd matches plain `--glob` patterns against the FILENAME only, so a
+        // path-shaped pattern like `src/**/*.txt` silently matches nothing
+        // (fd 10.3/10.4, both platforms). For those, ask fd for a full-path
+        // superset (`--full-path` with a `**/` anchor that absorbs the
+        // absolute search-root prefix) and restore exact scan-root-relative
+        // glob semantics with a host-side filter over the mapped logical
+        // paths below.
+        let path_shaped_pattern = input.pattern.contains('/');
+        let path_glob_filter = if path_shaped_pattern {
+            let mut builder = ignore::overrides::OverrideBuilder::new(scoped_root.logical_path());
+            builder
+                .add(&input.pattern)
+                .map_err(|error| Error::tool("find", error_for_line_output(&error)))?;
+            Some(
+                builder
+                    .build()
+                    .map_err(|error| Error::tool("find", error_for_line_output(&error)))?,
+            )
+        } else {
+            None
+        };
+
+        if path_shaped_pattern {
+            args.push(OsString::from("--full-path"));
+        }
         args.push(OsString::from("--"));
-        args.push(OsString::from(&input.pattern));
+        if path_shaped_pattern {
+            let anchored = input.pattern.trim_start_matches('/');
+            if anchored.starts_with("**/") {
+                args.push(OsString::from(anchored));
+            } else {
+                args.push(OsString::from(format!("**/{anchored}")));
+            }
+        } else {
+            args.push(OsString::from(&input.pattern));
+        }
         args.push(scoped_root.child_operand().into_os_string());
 
         let mut child = command_with_default_sigpipe_in_dir(fd_cmd, &scan_io_path)
@@ -8859,6 +8900,15 @@ impl Tool for FindTool {
             if let Some(workspace_ignore) = workspace_ignore.as_ref()
                 && workspace_ignore
                     .matched_path_or_any_parents(&mapped.logical_path, is_dir)
+                    .is_ignore()
+            {
+                continue;
+            }
+            // Exact scan-root-relative glob semantics for path-shaped
+            // patterns; fd only produced the full-path superset (see above).
+            if let Some(path_glob_filter) = path_glob_filter.as_ref()
+                && path_glob_filter
+                    .matched(&mapped.logical_path, is_dir)
                     .is_ignore()
             {
                 continue;
@@ -10123,7 +10173,94 @@ async fn get_file_lines_async(path: &Path, cwd: &Path) -> Vec<String> {
             return Vec::new();
         }
     };
-    let content = String::from_utf8_lossy(&bytes);
+    split_grep_context_lines(&bytes, path)
+}
+
+/// Render grep context lines for a pinned regular-file scan root by reading
+/// the held descriptor itself (offset-independent `read_at`/`seek_read`), so
+/// a rename/symlink swap of the logical path after pinning cannot redirect or
+/// break context rendering.
+async fn get_pinned_file_lines_async(scoped_root: &ScopedScanRoot) -> Vec<String> {
+    let logical = scoped_root.logical_path().to_path_buf();
+    #[cfg(unix)]
+    let handle = match scoped_root.handle.try_clone() {
+        Ok(handle) => handle,
+        Err(err) => {
+            tracing::debug!(
+                "Failed to clone pinned grep file handle {}: {}",
+                path_for_line_output(&logical),
+                error_for_line_output(&err)
+            );
+            return Vec::new();
+        }
+    };
+    #[cfg(unix)]
+    let bytes = {
+        let read = asupersync::runtime::spawn_blocking_io(move || {
+            use std::os::unix::fs::FileExt as _;
+
+            let cap = usize::try_from(GREP_CONTEXT_MAX_FILE_BYTES).unwrap_or(usize::MAX);
+            let mut bytes = Vec::new();
+            let mut offset = 0u64;
+            // Heap-allocated: 64KiB on the stack trips clippy::large_stack_arrays.
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let read = handle.read_at(&mut chunk, offset)?;
+                if read == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..read]);
+                offset = offset.saturating_add(read as u64);
+                if bytes.len() > cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("pinned grep file exceeds {GREP_CONTEXT_MAX_FILE_BYTES} bytes"),
+                    ));
+                }
+            }
+            Ok(bytes)
+        })
+        .await;
+        match read {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::debug!(
+                    "Failed to read pinned grep file {}: {}",
+                    path_for_line_output(&logical),
+                    error_for_line_output(&err)
+                );
+                return Vec::new();
+            }
+        }
+    };
+    // Windows pins parent components rather than the file itself; the
+    // logical-path read below matches the platform's established posture.
+    #[cfg(not(unix))]
+    let bytes = {
+        let path_for_read = logical.clone();
+        match asupersync::runtime::spawn_blocking_io(move || {
+            read_file_capped_sync(&path_for_read, GREP_CONTEXT_MAX_FILE_BYTES)
+        })
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::debug!(
+                    "Failed to read pinned grep file {}: {}",
+                    path_for_line_output(&logical),
+                    error_for_line_output(&err)
+                );
+                return Vec::new();
+            }
+        }
+    };
+    split_grep_context_lines(&bytes, &logical)
+}
+
+/// Lossily decode grep file bytes into display lines, normalizing `\r`
+/// variants and enforcing [`GREP_CONTEXT_MAX_LINES`].
+fn split_grep_context_lines(bytes: &[u8], path: &Path) -> Vec<String> {
+    let content = String::from_utf8_lossy(bytes);
     let mut lines = Vec::new();
     for line in content.split('\n') {
         let trimmed = line.strip_suffix('\r').unwrap_or(line);
