@@ -3756,10 +3756,11 @@ fn scenario_pi_ai_helpers_fail_closed() {
 /// all three upstream hooks and fails open across the current host API
 /// surface.
 ///
-/// `before_provider_request` is not an event this host fires yet (bd-1q31s);
-/// registration keeps it fail-open with a logged warning, and dispatching it
-/// through the harness must still resolve to the plugin's `missing-model`
-/// skip path rather than an error.
+/// `before_provider_request` is a known host event (bd-1q31s): the Responses
+/// provider fires it with the fully-built request body before each send.
+/// Dispatching it through the harness without a resolvable ctx.model must
+/// still resolve to the plugin's `missing-model` skip path rather than an
+/// error.
 #[test]
 fn scenario_pi_better_compaction_registers_and_fails_open() {
     let (ext, mut items) = load_scenario_fixture("third-party__lll9p-pi-better-compaction");

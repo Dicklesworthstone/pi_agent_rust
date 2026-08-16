@@ -307,6 +307,41 @@ impl Provider for OpenAIResponsesProvider {
 
         let request_body = self.build_request(context, options);
 
+        // before_provider_request rewrite hook (gh #167 / bd-1q31s): offer
+        // the fully-built body to extensions, validate any rewrite, and fail
+        // open to the original body on rejection. The rewritten JSON is sent
+        // verbatim (after validation) so extension-added provider fields
+        // survive; auth headers are never part of the exchange.
+        let mut rewritten_body: Option<serde_json::Value> = None;
+        if let Some(hook) = &options.before_provider_request {
+            match serde_json::to_value(&request_body) {
+                Ok(original) => {
+                    let event = crate::provider::BeforeProviderRequestEvent {
+                        provider: self.provider.clone(),
+                        api: self.api.clone(),
+                        model: self.model.clone(),
+                        base_url: self.base_url.clone(),
+                        payload: original,
+                    };
+                    if let Some(mutated) = hook.rewrite(event).await {
+                        match validate_rewritten_responses_request(mutated) {
+                            Ok(validated) => rewritten_body = Some(validated),
+                            Err(reason) => {
+                                tracing::warn!(
+                                    "before_provider_request rewrite rejected (fail-open, original request kept): {reason}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "failed to serialize request body for before_provider_request (fail-open): {err}"
+                    );
+                }
+            }
+        }
+
         // Note: Content-Type is set by .json() below; setting it here too
         // produces a duplicate header that OpenAI's server rejects.
         let mut request = self.client.post(&self.base_url).header(
@@ -363,7 +398,10 @@ impl Provider for OpenAIResponsesProvider {
             &["authorization"],
         );
 
-        let request = request.json(&request_body)?;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -1446,6 +1484,30 @@ fn extract_chatgpt_account_id(token: &str) -> Option<String> {
 // OpenAI Responses API Types (minimal)
 // ============================================================================
 
+/// Validated re-ingest of a `before_provider_request` rewrite (bd-1q31s).
+///
+/// The typed request struct cannot round-trip through `Deserialize` (it holds
+/// `&'static str` fields), so validation is structural: the rewrite must be a
+/// JSON object that still names a model and carries an `input` array, and it
+/// must not disable streaming — the SSE reader depends on `stream: true`, so
+/// that invariant is re-imposed on the accepted value.
+fn validate_rewritten_responses_request(
+    mut value: serde_json::Value,
+) -> std::result::Result<serde_json::Value, String> {
+    let Some(object) = value.as_object_mut() else {
+        return Err("rewrite is not a JSON object".to_string());
+    };
+    match object.get("model") {
+        Some(serde_json::Value::String(model)) if !model.is_empty() => {}
+        _ => return Err("rewrite is missing a non-empty string `model`".to_string()),
+    }
+    if !object.get("input").is_some_and(serde_json::Value::is_array) {
+        return Err("rewrite is missing an `input` array".to_string());
+    }
+    object.insert("stream".to_string(), serde_json::Value::Bool(true));
+    Ok(value)
+}
+
 #[derive(Debug, Serialize)]
 pub struct OpenAIResponsesRequest {
     model: String,
@@ -2046,6 +2108,54 @@ mod tests {
         let provider = OpenAIResponsesProvider::new("gpt-4o");
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.api(), "openai-responses");
+    }
+
+    /// bd-1q31s: a `before_provider_request` rewrite must survive validated
+    /// re-ingest — objects keeping `model` + `input` pass (with `stream: true`
+    /// re-imposed and extension-added fields preserved), everything else is
+    /// rejected so the provider falls back to its original body.
+    #[test]
+    fn test_validate_rewritten_responses_request() {
+        let valid = serde_json::json!({
+            "model": "gpt-5.2-codex",
+            "input": [{"type": "message", "role": "user", "content": "hi"}],
+            "stream": false,
+            "custom_extension_field": {"kept": true},
+        });
+        let accepted = validate_rewritten_responses_request(valid).expect("valid rewrite accepted");
+        assert_eq!(
+            accepted["stream"],
+            serde_json::Value::Bool(true),
+            "stream: true must be re-imposed on accepted rewrites"
+        );
+        assert_eq!(accepted["custom_extension_field"]["kept"], true);
+
+        let missing_stream = serde_json::json!({
+            "model": "gpt-5.2-codex",
+            "input": [],
+        });
+        let accepted =
+            validate_rewritten_responses_request(missing_stream).expect("missing stream accepted");
+        assert_eq!(accepted["stream"], serde_json::Value::Bool(true));
+
+        for (label, invalid) in [
+            ("non-object", serde_json::json!("payload")),
+            ("missing model", serde_json::json!({"input": []})),
+            ("empty model", serde_json::json!({"model": "", "input": []})),
+            (
+                "missing input",
+                serde_json::json!({"model": "gpt-5.2-codex"}),
+            ),
+            (
+                "non-array input",
+                serde_json::json!({"model": "gpt-5.2-codex", "input": {}}),
+            ),
+        ] {
+            assert!(
+                validate_rewritten_responses_request(invalid).is_err(),
+                "rewrite must be rejected: {label}"
+            );
+        }
     }
 
     #[test]

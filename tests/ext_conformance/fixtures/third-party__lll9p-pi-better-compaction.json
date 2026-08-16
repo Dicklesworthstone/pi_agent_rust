@@ -7,7 +7,7 @@
     {
       "id": "scn-pi-better-compaction-reg-001",
       "kind": "registration",
-      "summary": "Registers session_start, session_before_compact, and before_provider_request handlers; before_provider_request is unknown on this host (bd-1q31s) but stays registered fail-open with a warning",
+      "summary": "Registers session_start, session_before_compact, and before_provider_request handlers; all three are known host events (before_provider_request implemented per bd-1q31s)",
       "expect": {
         "event_hooks_contains": [
           "before_provider_request",
@@ -52,7 +52,7 @@
     {
       "id": "scn-pi-better-compaction-evt-provider-request-001",
       "kind": "event",
-      "summary": "before_provider_request handler is dispatchable (registered fail-open); with no ctx.model it resolves missing-model and returns undefined, leaving the payload untouched; the host does not fire this event in production yet (bd-1q31s)",
+      "summary": "before_provider_request handler is dispatchable (the host fires this event from the Responses provider before each request, bd-1q31s); with no ctx.model it resolves missing-model and returns undefined, leaving the payload untouched",
       "event_name": "before_provider_request",
       "input": {
         "event": {

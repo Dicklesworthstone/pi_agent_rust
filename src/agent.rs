@@ -89,6 +89,30 @@ const SEMANTIC_CONTEXT_CUSTOM_TYPE: &str = "semantic_context_bundle";
 const DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_BYTES: u64 = 16 * 1024;
 const DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_ITEMS: usize = 16;
 
+/// Normalize a `before_provider_request` handler response into a proposed
+/// request-body rewrite (gh #167 / bd-1q31s).
+///
+/// Accepted shapes, mirroring upstream pi: the rewritten payload object
+/// directly, or `{ "payload": <object> }`. Null/undefined and non-object
+/// responses mean "no rewrite".
+fn normalize_before_provider_request_response(response: Value) -> Option<Value> {
+    if response.is_null() {
+        return None;
+    }
+    match response {
+        Value::Object(mut object) => object.remove("payload").map_or_else(
+            || Some(Value::Object(object)),
+            |inner| (!inner.is_null()).then_some(inner),
+        ),
+        other => {
+            tracing::warn!(
+                "before_provider_request handler returned a non-object rewrite (ignored): {other}"
+            );
+            None
+        }
+    }
+}
+
 fn compatible_tool_parallelism_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
@@ -1925,6 +1949,52 @@ impl Agent {
         }
     }
 
+    /// Build the `before_provider_request` interceptor handed to providers
+    /// via [`StreamOptions`] (gh #167 / bd-1q31s). See
+    /// [`normalize_before_provider_request_response`] for the accepted
+    /// handler-response shapes.
+    ///
+    /// The extension handler receives the fully-built provider request body
+    /// (never auth headers) and may return a rewritten body — either the
+    /// payload object directly (upstream pi convention) or wrapped as
+    /// `{ "payload": ... }`. Dispatch failures and null/undefined responses
+    /// fail open: the provider keeps its original request.
+    fn build_before_provider_request_hook(
+        extensions: ExtensionManager,
+    ) -> crate::provider::BeforeProviderRequestHook {
+        crate::provider::BeforeProviderRequestHook::new(move |event| {
+            let extensions = extensions.clone();
+            Box::pin(async move {
+                let payload = match serde_json::to_value(&event) {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        tracing::warn!(
+                            "failed to serialize before_provider_request event (fail-open): {err}"
+                        );
+                        return None;
+                    }
+                };
+                let response = match extensions
+                    .dispatch_event_with_response(
+                        ExtensionEventName::BeforeProviderRequest,
+                        Some(payload),
+                        EXTENSION_EVENT_TIMEOUT_MS,
+                    )
+                    .await
+                {
+                    Ok(response) => response?,
+                    Err(err) => {
+                        tracing::warn!(
+                            "before_provider_request extension hook failed (fail-open): {err}"
+                        );
+                        return None;
+                    }
+                };
+                normalize_before_provider_request_response(response)
+            })
+        })
+    }
+
     async fn dispatch_context_event(&self, messages: &[Message]) -> Option<Vec<Message>> {
         let Some(extensions) = &self.extensions else {
             return None;
@@ -1997,7 +2067,11 @@ impl Agent {
     ) -> Result<AssistantMessage> {
         // Build context and stream completion
         let provider = Arc::clone(&self.provider);
-        let stream_options = self.config.stream_options.clone();
+        let mut stream_options = self.config.stream_options.clone();
+        if let Some(extensions) = &self.extensions {
+            stream_options.before_provider_request =
+                Some(Self::build_before_provider_request_hook(extensions.clone()));
+        }
         let (system_prompt, tools, base_messages) = {
             let context = self.build_context();
             (
@@ -4611,6 +4685,37 @@ mod extensions_integration_tests {
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    /// bd-1q31s: handler responses accept the upstream shapes (rewritten
+    /// payload object directly, or `{ payload: ... }`) and treat null /
+    /// non-object responses as "no rewrite".
+    #[test]
+    fn before_provider_request_response_shapes_normalize() {
+        let direct = json!({"model": "m", "input": []});
+        assert_eq!(
+            normalize_before_provider_request_response(direct.clone()),
+            Some(direct.clone())
+        );
+
+        let wrapped = json!({"payload": {"model": "m", "input": []}});
+        assert_eq!(
+            normalize_before_provider_request_response(wrapped),
+            Some(json!({"model": "m", "input": []}))
+        );
+
+        assert_eq!(
+            normalize_before_provider_request_response(json!({"payload": null})),
+            None
+        );
+        assert_eq!(
+            normalize_before_provider_request_response(Value::Null),
+            None
+        );
+        assert_eq!(
+            normalize_before_provider_request_response(json!("not an object")),
+            None
+        );
+    }
 
     #[derive(Debug)]
     struct NoopProvider;

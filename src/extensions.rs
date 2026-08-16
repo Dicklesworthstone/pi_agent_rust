@@ -9665,6 +9665,9 @@ pub enum ExtensionEventName {
     BeforeAgentStart,
     /// Before provider call; can modify context messages.
     Context,
+    /// After the provider request body is fully built, before it is sent;
+    /// can rewrite the body (gh #167 / bd-1q31s).
+    BeforeProviderRequest,
     /// Agent started processing.
     AgentStart,
     /// Agent ended processing.
@@ -9724,6 +9727,7 @@ impl std::fmt::Display for ExtensionEventName {
             Self::Input => "input",
             Self::BeforeAgentStart => "before_agent_start",
             Self::Context => "context",
+            Self::BeforeProviderRequest => "before_provider_request",
             Self::AgentStart => "agent_start",
             Self::AgentEnd => "agent_end",
             Self::TurnStart => "turn_start",
@@ -9763,11 +9767,12 @@ impl ExtensionEventName {
     /// loud diagnostic when an extension registers a handler for an event
     /// this host will never fire (gh #167). Registration itself stays
     /// fail-open: unknown events remain registrable for forward-compat.
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Startup,
         Self::Input,
         Self::BeforeAgentStart,
         Self::Context,
+        Self::BeforeProviderRequest,
         Self::AgentStart,
         Self::AgentEnd,
         Self::TurnStart,
@@ -9807,7 +9812,8 @@ impl ExtensionEventName {
     /// **Actionable** events (not listed here) still use the longer
     /// budget so handlers have room to do meaningful work before a
     /// decision is made:
-    /// `BeforeAgentStart`, `Context`, `ToolCall`, `ToolResult` (can
+    /// `BeforeAgentStart`, `Context`, `BeforeProviderRequest` (can rewrite
+    /// the provider request body), `ToolCall`, `ToolResult` (can
     /// modify the tool's result payload), `Input`,
     /// `SessionBeforeSwitch`, `SessionBeforeFork`, `SessionBeforeCompact`,
     /// `SessionBeforeTree`, `ResourcesDiscover`.
@@ -9841,6 +9847,7 @@ impl ExtensionEventName {
             Self::Input
             | Self::BeforeAgentStart
             | Self::Context
+            | Self::BeforeProviderRequest
             | Self::ToolCall
             | Self::ToolResult
             | Self::SessionBeforeSwitch
