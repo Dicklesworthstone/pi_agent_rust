@@ -807,12 +807,22 @@ fn open_private_directory(path: &Path, create: bool) -> Result<File> {
     Ok(directory)
 }
 
+/// Metadata-only validation for store trees a healthy open never uses.
+///
+/// Deliberately avoids opening the directory: healthy resume must not require
+/// read access to unrelated trees (their modes may be locked down to 0o000 by
+/// the owner), and an `O_RDONLY` open would demand it for non-root callers.
 fn validate_private_directory_entry(path: &Path) -> Result<()> {
-    let directory = open_directory_nofollow(path, false)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(Error::session(format!(
+            "expected a real session-store directory: {}",
+            path.display()
+        )));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let metadata = directory.metadata()?;
         if metadata.permissions().mode() & 0o077 != 0 {
             return Err(Error::session(format!(
                 "session-store directory has non-private permissions: {}",
@@ -820,8 +830,6 @@ fn validate_private_directory_entry(path: &Path) -> Result<()> {
             )));
         }
     }
-    #[cfg(not(unix))]
-    drop(directory);
     Ok(())
 }
 
