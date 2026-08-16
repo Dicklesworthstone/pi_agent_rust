@@ -2827,16 +2827,13 @@ impl ScopedScanRoot {
     }
 
     /// Path for reading the pinned root's bytes when it is a regular file.
+    ///
     /// `io_path()` appends `/.` for directory traversal, which never resolves
-    /// for a file descriptor, so file reads need the bare descriptor path.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn file_read_path(&self) -> PathBuf {
-        use std::os::fd::AsRawFd as _;
-
-        PathBuf::from("/proc/self/fd").join(self.handle.as_raw_fd().to_string())
-    }
-
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    /// for a file descriptor. The bare `/proc/self/fd/N` form does not work
+    /// either: procfs descriptor entries are magic symlinks, and every scoped
+    /// read helper opens results with `O_NOFOLLOW`. Downstream readers verify
+    /// descriptor identity against this path themselves, so the logical path
+    /// is the correct read handle on every platform.
     fn file_read_path(&self) -> PathBuf {
         self.logical_path.clone()
     }
@@ -7650,12 +7647,16 @@ fn build_workspace_ignore_matcher(
     cwd_scope: &ScopedScanRoot,
 ) -> Option<ignore::gitignore::Gitignore> {
     let workspace_root = cwd_scope.logical_path();
-    let workspace_gitignore = workspace_root.join(".gitignore");
-    if !workspace_gitignore.is_file() {
-        return None;
-    }
+    // Read rule content through the pinned io-space path so a concurrent
+    // workspace-root swap cannot inject attacker-controlled ignore rules,
+    // while anchoring the patterns at the logical root they were written for.
+    let pinned_gitignore = cwd_scope.io_path().join(".gitignore");
+    let content = std::fs::read_to_string(pinned_gitignore).ok()?;
+    let logical_gitignore = workspace_root.join(".gitignore");
     let mut builder = ignore::gitignore::GitignoreBuilder::new(workspace_root);
-    builder.add(&workspace_gitignore);
+    for line in content.lines() {
+        let _ = builder.add_line(Some(logical_gitignore.clone()), line);
+    }
     builder.build().ok()
 }
 
