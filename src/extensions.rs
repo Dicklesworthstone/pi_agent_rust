@@ -889,6 +889,17 @@ pub trait ExtensionHostActions: Send + Sync {
             "@mariozechner/pi-ai model registry host bridge is not configured".to_string(),
         ))
     }
+
+    /// Host-side compaction bridge (gh #167 / bd-i28yz): run the native
+    /// compaction engine over `preparation` using the SESSION's own provider,
+    /// model, and credentials. Sandboxed extensions can neither choose the
+    /// endpoint nor observe the credential; malformed preparation or provider
+    /// failure must surface as an `Err` (never a fabricated summary).
+    async fn compact_session(&self, _preparation: Value) -> Result<Value> {
+        Err(Error::extension(
+            "@mariozechner/pi-coding-agent compact host bridge is not configured".to_string(),
+        ))
+    }
 }
 
 mod compatibility;
@@ -18580,6 +18591,7 @@ enum EventsHostcallOp {
     GetFlag,
     ListFlags,
     CompleteAi,
+    Compact,
 }
 
 fn parse_events_hostcall_op(op: &str) -> Option<EventsHostcallOp> {
@@ -18601,6 +18613,7 @@ fn parse_events_hostcall_op(op: &str) -> Option<EventsHostcallOp> {
         b"registerprovider" => Some(EventsHostcallOp::RegisterProvider),
         b"registerflag" => Some(EventsHostcallOp::RegisterFlag),
         b"completeai" => Some(EventsHostcallOp::CompleteAi),
+        b"compact" => Some(EventsHostcallOp::Compact),
         _ => None,
     })
 }
@@ -18884,6 +18897,28 @@ async fn dispatch_hostcall_events_ref(
             };
 
             match actions.complete_ai(request).await {
+                Ok(value) => HostcallOutcome::Success(value),
+                Err(err) => HostcallOutcome::Error {
+                    code: "provider".to_string(),
+                    message: err.to_string(),
+                },
+            }
+        }
+        EventsHostcallOp::Compact => {
+            // gh #167 / bd-i28yz: host-side compaction with the session's own
+            // provider/model/credentials. The payload carries only the
+            // preparation; extensions cannot pick a model or supply an API
+            // key, and validation/deserialization of the untrusted
+            // preparation happens inside the host action.
+            let Some(actions) = manager.host_actions() else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "No provider/session host bridge configured".to_string(),
+                };
+            };
+
+            let preparation = payload.get("preparation").cloned().unwrap_or(Value::Null);
+            match actions.compact_session(preparation).await {
                 Ok(value) => HostcallOutcome::Success(value),
                 Err(err) => HostcallOutcome::Error {
                     code: "provider".to_string(),

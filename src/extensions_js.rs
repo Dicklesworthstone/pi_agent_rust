@@ -9639,11 +9639,20 @@ export function rawKeyHint(key, description = "") {
   return keyLabel && label ? `${keyLabel} ${label}` : keyLabel || label;
 }
 
-// compact performs conversation compaction via LLM. Refuse placeholder data:
-// an extension feeding a fake summary into session_before_compact would
-// replace real history with garbage.
-export async function compact(_preparation, _model, _apiKey, _customInstructions, _signal) {
-  throw new Error("compact() is not yet bridged to the native compaction engine in pi_agent_rust; see gh #167");
+// compact performs conversation compaction host-side via pi's native
+// compaction engine (gh #167 / bd-i28yz). The model / apiKey /
+// customInstructions arguments are DELIBERATELY ignored: the host always
+// compacts with the SESSION's own provider, model, and credentials, so a
+// sandboxed extension can neither choose the endpoint nor supply (or
+// observe) a credential. On malformed preparation or provider failure the
+// returned Promise rejects -- pi's fail-open session_before_compact
+// handling then continues normal compaction; no placeholder summary is
+// ever fabricated.
+export async function compact(preparation, _model, _apiKey, _customInstructions, _signal) {
+  if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
+    throw new Error("compact() host bridge is unavailable in this runtime");
+  }
+  return await globalThis.pi.events("compact", { preparation: preparation ?? null });
 }
 
 /// Stub: AssistantMessageComponent for rendering assistant messages
@@ -21651,7 +21660,21 @@ function __pi_make_extension_ctx(ctx_payload) {
                 if (value === undefined || value === null) return undefined;
                 return String(value);
             },
+            // getApiKeyAndHeaders() is DELIBERATELY not exposed (gh #167 /
+            // bd-j8sxn): handing live API keys or auth headers to sandboxed
+            // JS would breach pi's deny-by-default env blocklist, which
+            // exists precisely to keep *_API_KEY / *_SECRET / *_TOKEN values
+            // away from extensions. Extensions that need compaction provider
+            // access use ctx.compact() (below), which runs host-side with
+            // the session's own credentials and never exposes them.
+            // pi-better-compaction feature-detects the absence and fails
+            // open to normal compaction.
         },
+        // Host-side compaction bridge (gh #167 / bd-i28yz): summarizes the
+        // given preparation with the SESSION's own provider, model, and
+        // credentials. Rejects on malformed preparation or provider failure;
+        // no fabricated summary is ever returned.
+        compact: async (preparation) => pi.events('compact', { preparation: preparation ?? null }),
     };
 }
 
@@ -25209,8 +25232,89 @@ mod tests {
         });
     }
 
+    /// gh #167 / bd-i28yz: the pi-coding-agent `compact()` export bridges to
+    /// the host `compact` events op with only the preparation (extension-
+    /// supplied model/apiKey are dropped host-side by design) and resolves
+    /// with the bridged compaction result shape.
     #[test]
-    fn pi_coding_agent_compact_rejects_instead_of_placeholder() {
+    fn pi_coding_agent_compact_bridges_to_host_compaction_op() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.compactProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => mod.compact(
+                            { firstKeptEntryId: 'entry-9', tokensBefore: 4200 },
+                            { id: 'attacker-model' },
+                            'attacker-key',
+                            undefined,
+                            undefined))
+                        .then((value) => { globalThis.compactProbe.value = value; })
+                        .catch((error) => {
+                            globalThis.compactProbe.error = String((error && error.message) || error);
+                        })
+                        .finally(() => { globalThis.compactProbe.done = true; });
+                    ",
+                )
+                .await
+                .expect("invoke compact bridge");
+
+            let mut completed = false;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                let state = get_global_json(&runtime, "compactProbe").await;
+                if state.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+                for request in runtime.drain_hostcall_requests() {
+                    let HostcallKind::Events { op } = &request.kind else {
+                        panic!("expected events hostcall, got {:?}", request.kind);
+                    };
+                    assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    // Only the preparation crosses the bridge; the
+                    // extension-chosen model/apiKey never do.
+                    assert_eq!(
+                        request.payload["preparation"]["firstKeptEntryId"],
+                        json!("entry-9")
+                    );
+                    assert_eq!(request.payload["preparation"]["tokensBefore"], json!(4200));
+                    assert_eq!(request.payload.get("model"), None);
+                    assert_eq!(request.payload.get("apiKey"), None);
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({
+                            "summary": "bridged summary",
+                            "firstKeptEntryId": "entry-9",
+                            "tokensBefore": 4200,
+                            "details": { "readFiles": [], "modifiedFiles": [] },
+                        })),
+                    );
+                    completed = true;
+                }
+            }
+            assert!(completed, "compact() never issued the compact hostcall");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "compactProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            assert_eq!(probe["value"]["summary"], json!("bridged summary"));
+            assert_eq!(probe["value"]["firstKeptEntryId"], json!("entry-9"));
+            assert_eq!(probe["value"]["tokensBefore"], json!(4200));
+        });
+    }
+
+    /// gh #167 / bd-i28yz: when the host rejects (malformed preparation, no
+    /// bridge, provider failure) the compact() Promise rejects cleanly and
+    /// never resolves with placeholder data.
+    #[test]
+    fn pi_coding_agent_compact_rejects_cleanly_on_host_error() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
             let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
@@ -25231,21 +25335,42 @@ mod tests {
                     ",
                 )
                 .await
-                .expect("invoke compact stub");
-            drain_until_idle(&runtime, &clock).await;
+                .expect("invoke compact bridge");
 
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                let state = get_global_json(&runtime, "compactProbe").await;
+                if state.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+                for request in runtime.drain_hostcall_requests() {
+                    let HostcallKind::Events { op } = &request.kind else {
+                        panic!("expected events hostcall, got {:?}", request.kind);
+                    };
+                    assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Error {
+                            code: "provider".to_string(),
+                            message:
+                                "compaction preparation: `firstKeptEntryId` must be a non-empty string"
+                                    .to_string(),
+                        },
+                    );
+                }
+            }
+
+            drain_until_idle(&runtime, &clock).await;
             let probe = get_global_json(&runtime, "compactProbe").await;
             assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
             assert_eq!(
-                probe.get("value"),
+                probe.get("value").filter(|value| !value.is_null()),
                 None,
                 "compact() must not resolve with placeholder data: {probe}"
             );
             let error = probe["error"].as_str().unwrap_or_default();
             assert!(
-                error.contains(
-                    "compact() is not yet bridged to the native compaction engine in pi_agent_rust"
-                ) && error.contains("gh #167"),
+                error.contains("`firstKeptEntryId` must be a non-empty string"),
                 "unexpected compact() rejection: {error}"
             );
         });

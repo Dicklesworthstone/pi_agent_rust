@@ -3660,6 +3660,41 @@ impl ExtensionHostActions for AgentSessionHostActions {
         }
         Ok(Value::Array(state.models.clone()))
     }
+
+    async fn compact_session(&self, preparation: Value) -> Result<Value> {
+        // gh #167 / bd-i28yz: bridge ctx.compact() / pi-coding-agent
+        // compact() to the native compaction engine. The preparation JSON is
+        // untrusted extension input; the strict deserializer rejects
+        // malformed shapes instead of defaulting them.
+        let preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
+
+        // Always compact with the SESSION's own provider + resolved API key
+        // (the same state the agent's auto-compaction path reads via
+        // `agent.provider()` / `agent.stream_options().api_key`, mirrored
+        // into the ai-completion host state and refreshed on model change).
+        // `custom_instructions` is None to match the auto-compaction path.
+        //
+        // Lock order / re-entrancy: this briefly locks only the
+        // ai-completion `StdMutex` (exactly like `complete_ai` /
+        // `list_ai_models`) and never touches the session mutex, while
+        // `dispatch_before_compact` holds neither when awaiting extension
+        // handlers -- so an extension calling compact() from inside
+        // `session_before_compact` cannot deadlock.
+        let (provider, api_key) = {
+            let state = self.ai_completion.lock().map_err(|_| {
+                Error::extension("extension completion host state mutex poisoned".to_string())
+            })?;
+            (
+                Arc::clone(&state.provider),
+                state.stream_options.api_key.clone().unwrap_or_default(),
+            )
+        };
+
+        let result = crate::compaction::compact(preparation, provider, &api_key, None).await?;
+        serde_json::to_value(&result).map_err(|err| {
+            Error::extension(format!("serialize extension compaction result: {err}"))
+        })
+    }
 }
 
 fn pi_ai_model_entry_value(entry: &ModelEntry) -> Value {
@@ -5330,6 +5365,105 @@ mod extensions_integration_tests {
 
             let models = actions.list_ai_models().await.expect("list models");
             assert_eq!(models[0]["id"], json!("capture-model"));
+        });
+    }
+
+    /// gh #167 / bd-i28yz: the compact_session host action deserializes a
+    /// valid preparation, compacts with the session's own provider, and
+    /// returns the {summary, firstKeptEntryId, tokensBefore, details} shape
+    /// consumed by the session_before_compact replacement contract; malformed
+    /// preparation is rejected with a validation error, never a fabricated
+    /// summary.
+    #[test]
+    fn agent_host_actions_compact_session_bridges_native_compaction() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(PiAiCaptureProvider {
+                calls: Arc::clone(&calls),
+            });
+            let actions = AgentSessionHostActions {
+                session,
+                injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_turn_active: Arc::new(AtomicBool::new(false)),
+                pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+                ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+                    provider,
+                    stream_options: StreamOptions::default(),
+                    models: Vec::new(),
+                })),
+            };
+
+            let preparation = json!({
+                "firstKeptEntryId": "entry-9",
+                "messagesToSummarize": [
+                    { "role": "user", "content": "investigate the flaky scheduler test" }
+                ],
+                "turnPrefixMessages": [],
+                "isSplitTurn": false,
+                "tokensBefore": 4200,
+                "previousSummary": "## Goal\nShip the scheduler fix",
+                "fileOps": {
+                    "read": ["src/lib.rs"],
+                    "written": [],
+                    "edited": ["src/agent.rs"]
+                },
+                "settings": {
+                    "enabled": true,
+                    "contextWindowTokens": 128_000,
+                    "reserveTokens": 10_240,
+                    "keepRecentTokens": 12_800
+                }
+            });
+
+            let result = actions
+                .compact_session(preparation)
+                .await
+                .expect("compact through session provider");
+
+            let summary = result["summary"].as_str().expect("summary string");
+            assert!(
+                summary.contains("captured"),
+                "summary must come from the session provider: {summary}"
+            );
+            assert_eq!(result["firstKeptEntryId"], json!("entry-9"));
+            assert_eq!(result["tokensBefore"], json!(4200));
+            assert_eq!(result["details"]["readFiles"], json!(["src/lib.rs"]));
+            assert_eq!(result["details"]["modifiedFiles"], json!(["src/agent.rs"]));
+
+            // Exactly one provider call, and it used the session's own
+            // provider (never an extension-chosen endpoint).
+            let captured_len = match calls.lock() {
+                Ok(guard) => guard.len(),
+                Err(poisoned) => poisoned.into_inner().len(),
+            };
+            assert_eq!(captured_len, 1);
+
+            // Malformed preparation is rejected with a validation error.
+            let err = actions
+                .compact_session(json!({ "firstKeptEntryId": "" }))
+                .await
+                .expect_err("empty firstKeptEntryId must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("`firstKeptEntryId` must be a non-empty string"),
+                "unexpected error: {err}"
+            );
+
+            let err = actions
+                .compact_session(json!("not-an-object"))
+                .await
+                .expect_err("non-object preparation must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("compaction preparation must be a JSON object"),
+                "unexpected error: {err}"
+            );
         });
     }
 

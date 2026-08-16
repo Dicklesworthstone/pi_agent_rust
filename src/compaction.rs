@@ -603,6 +603,180 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
     Value::Object(obj)
 }
 
+fn preparation_field<'a>(obj: &'a Map<String, Value>, camel: &str, snake: &str) -> Option<&'a Value> {
+    obj.get(camel).or_else(|| obj.get(snake))
+}
+
+fn preparation_string(obj: &Map<String, Value>, camel: &str, snake: &str) -> Result<String> {
+    preparation_field(obj, camel, snake)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::validation(format!(
+                "compaction preparation: `{camel}` must be a non-empty string"
+            ))
+        })
+}
+
+fn preparation_bool(obj: &Map<String, Value>, camel: &str, snake: &str) -> Result<bool> {
+    preparation_field(obj, camel, snake)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            Error::validation(format!("compaction preparation: `{camel}` must be a boolean"))
+        })
+}
+
+fn preparation_u64(obj: &Map<String, Value>, camel: &str, snake: &str) -> Result<u64> {
+    preparation_field(obj, camel, snake)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            Error::validation(format!(
+                "compaction preparation: `{camel}` must be an unsigned integer"
+            ))
+        })
+}
+
+fn preparation_messages(
+    obj: &Map<String, Value>,
+    camel: &str,
+    snake: &str,
+) -> Result<Vec<SessionMessage>> {
+    let value = preparation_field(obj, camel, snake).ok_or_else(|| {
+        Error::validation(format!(
+            "compaction preparation: `{camel}` must be an array of session messages"
+        ))
+    })?;
+    if !value.is_array() {
+        return Err(Error::validation(format!(
+            "compaction preparation: `{camel}` must be an array of session messages"
+        )));
+    }
+    serde_json::from_value::<Vec<SessionMessage>>(value.clone()).map_err(|err| {
+        Error::validation(format!(
+            "compaction preparation: `{camel}` contains a malformed session message: {err}"
+        ))
+    })
+}
+
+fn string_set_from_value(obj: &Map<String, Value>, key: &str) -> Result<HashSet<String>> {
+    let entries = obj.get(key).and_then(Value::as_array).ok_or_else(|| {
+        Error::validation(format!(
+            "compaction preparation: `fileOps.{key}` must be an array of strings"
+        ))
+    })?;
+    entries
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_string).ok_or_else(|| {
+                Error::validation(format!(
+                    "compaction preparation: `fileOps.{key}` must contain only strings"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn file_ops_from_value(value: &Value) -> Result<FileOperations> {
+    let obj = value.as_object().ok_or_else(|| {
+        Error::validation("compaction preparation: `fileOps` must be an object".to_string())
+    })?;
+    Ok(FileOperations {
+        read: string_set_from_value(obj, "read")?,
+        written: string_set_from_value(obj, "written")?,
+        edited: string_set_from_value(obj, "edited")?,
+    })
+}
+
+fn preparation_settings_u32(obj: &Map<String, Value>, camel: &str, snake: &str) -> Result<u32> {
+    let raw = preparation_field(obj, camel, snake)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            Error::validation(format!(
+                "compaction preparation: `settings.{camel}` must be an unsigned integer"
+            ))
+        })?;
+    u32::try_from(raw).map_err(|_| {
+        Error::validation(format!(
+            "compaction preparation: `settings.{camel}` exceeds u32::MAX"
+        ))
+    })
+}
+
+fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSettings> {
+    let obj = value.as_object().ok_or_else(|| {
+        Error::validation("compaction preparation: `settings` must be an object".to_string())
+    })?;
+    let enabled = obj.get("enabled").and_then(Value::as_bool).ok_or_else(|| {
+        Error::validation("compaction preparation: `settings.enabled` must be a boolean".to_string())
+    })?;
+    Ok(ResolvedCompactionSettings {
+        enabled,
+        context_window_tokens: preparation_settings_u32(
+            obj,
+            "contextWindowTokens",
+            "context_window_tokens",
+        )?,
+        reserve_tokens: preparation_settings_u32(obj, "reserveTokens", "reserve_tokens")?,
+        keep_recent_tokens: preparation_settings_u32(obj, "keepRecentTokens", "keep_recent_tokens")?,
+    })
+}
+
+/// Inverse of [`compaction_preparation_to_value`] for preparation JSON that
+/// crossed a trust boundary (the extension host bridge echoes the value a
+/// sandboxed extension hands back). Every required field is validated and
+/// malformed input is rejected with a descriptive error rather than being
+/// defaulted, so a caller can never smuggle a half-formed preparation into
+/// the compaction engine (gh #167 / bd-i28yz).
+pub fn compaction_preparation_from_value(value: &Value) -> Result<CompactionPreparation> {
+    let obj = value.as_object().ok_or_else(|| {
+        Error::validation("compaction preparation must be a JSON object".to_string())
+    })?;
+
+    let first_kept_entry_id = preparation_string(obj, "firstKeptEntryId", "first_kept_entry_id")?;
+    let messages_to_summarize =
+        preparation_messages(obj, "messagesToSummarize", "messages_to_summarize")?;
+    let turn_prefix_messages =
+        preparation_messages(obj, "turnPrefixMessages", "turn_prefix_messages")?;
+    let is_split_turn = preparation_bool(obj, "isSplitTurn", "is_split_turn")?;
+    let tokens_before = preparation_u64(obj, "tokensBefore", "tokens_before")?;
+
+    // The serializer omits `previousSummary` when absent, so a missing key or
+    // an explicit null both mean "no previous summary"; any other non-string
+    // shape is rejected.
+    let previous_summary = match preparation_field(obj, "previousSummary", "previous_summary") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(summary)) => Some(summary.clone()),
+        Some(_) => {
+            return Err(Error::validation(
+                "compaction preparation: `previousSummary` must be a string when present"
+                    .to_string(),
+            ));
+        }
+    };
+
+    let file_ops_value = preparation_field(obj, "fileOps", "file_ops").ok_or_else(|| {
+        Error::validation("compaction preparation: `fileOps` must be an object".to_string())
+    })?;
+    let file_ops = file_ops_from_value(file_ops_value)?;
+
+    let settings_value = obj.get("settings").ok_or_else(|| {
+        Error::validation("compaction preparation: `settings` must be an object".to_string())
+    })?;
+    let settings = compaction_settings_from_value(settings_value)?;
+
+    Ok(CompactionPreparation {
+        first_kept_entry_id,
+        messages_to_summarize,
+        turn_prefix_messages,
+        is_split_turn,
+        tokens_before,
+        previous_summary,
+        file_ops,
+        settings,
+    })
+}
+
 // =============================================================================
 // File op tracking (read/write/edit)
 // =============================================================================
@@ -3868,6 +4042,142 @@ mod tests {
             prep.messages_to_summarize.is_empty(),
             "Nothing before the turn to summarize"
         );
+    }
+
+    // ── preparation JSON round-trip (gh #167 / bd-i28yz) ─────────────
+
+    mod preparation_json {
+        use super::*;
+
+        fn make_preparation() -> CompactionPreparation {
+            let mut file_ops = FileOperations::default();
+            file_ops.read.insert("src/lib.rs".to_string());
+            file_ops.written.insert("src/new.rs".to_string());
+            file_ops.edited.insert("src/agent.rs".to_string());
+            CompactionPreparation {
+                first_kept_entry_id: "entry-9".to_string(),
+                messages_to_summarize: vec![
+                    make_user_text("investigate the flaky scheduler test"),
+                    make_assistant_text("Root cause is a race in the scheduler", 10, 5),
+                ],
+                turn_prefix_messages: vec![make_user_text("split turn prefix request")],
+                is_split_turn: true,
+                tokens_before: 4200,
+                previous_summary: Some("## Goal\nShip the scheduler fix".to_string()),
+                file_ops,
+                settings: ResolvedCompactionSettings::default(),
+            }
+        }
+
+        #[test]
+        fn round_trips_through_to_value_and_back() {
+            let prep = make_preparation();
+            let value = compaction_preparation_to_value(&prep);
+            let parsed = compaction_preparation_from_value(&value)
+                .expect("serializer output must deserialize");
+
+            assert_eq!(parsed.first_kept_entry_id, prep.first_kept_entry_id);
+            assert_eq!(
+                parsed.messages_to_summarize.len(),
+                prep.messages_to_summarize.len()
+            );
+            assert_eq!(
+                parsed.turn_prefix_messages.len(),
+                prep.turn_prefix_messages.len()
+            );
+            assert_eq!(parsed.is_split_turn, prep.is_split_turn);
+            assert_eq!(parsed.tokens_before, prep.tokens_before);
+            assert_eq!(parsed.previous_summary, prep.previous_summary);
+            assert_eq!(parsed.file_ops.read, prep.file_ops.read);
+            assert_eq!(parsed.file_ops.written, prep.file_ops.written);
+            assert_eq!(parsed.file_ops.edited, prep.file_ops.edited);
+            assert_eq!(parsed.settings.enabled, prep.settings.enabled);
+            assert_eq!(
+                parsed.settings.context_window_tokens,
+                prep.settings.context_window_tokens
+            );
+            assert_eq!(parsed.settings.reserve_tokens, prep.settings.reserve_tokens);
+            assert_eq!(
+                parsed.settings.keep_recent_tokens,
+                prep.settings.keep_recent_tokens
+            );
+        }
+
+        #[test]
+        fn missing_previous_summary_round_trips_as_none() {
+            let mut prep = make_preparation();
+            prep.previous_summary = None;
+            let value = compaction_preparation_to_value(&prep);
+            let parsed = compaction_preparation_from_value(&value).expect("deserialize");
+            assert_eq!(parsed.previous_summary, None);
+        }
+
+        #[test]
+        fn rejects_malformed_preparation() {
+            // Not an object.
+            let err =
+                compaction_preparation_from_value(&json!("nope")).expect_err("non-object");
+            assert!(err.to_string().contains("must be a JSON object"), "{err}");
+
+            // Missing / empty firstKeptEntryId.
+            let mut value = compaction_preparation_to_value(&make_preparation());
+            value["firstKeptEntryId"] = json!("");
+            let err = compaction_preparation_from_value(&value).expect_err("empty id");
+            assert!(
+                err.to_string()
+                    .contains("`firstKeptEntryId` must be a non-empty string"),
+                "{err}"
+            );
+
+            // Malformed message entry.
+            let mut value = compaction_preparation_to_value(&make_preparation());
+            value["messagesToSummarize"] = json!([{ "role": "no-such-role" }]);
+            let err = compaction_preparation_from_value(&value).expect_err("bad message");
+            assert!(
+                err.to_string()
+                    .contains("`messagesToSummarize` contains a malformed session message"),
+                "{err}"
+            );
+
+            // Wrong-typed tokensBefore.
+            let mut value = compaction_preparation_to_value(&make_preparation());
+            value["tokensBefore"] = json!("lots");
+            let err = compaction_preparation_from_value(&value).expect_err("bad tokens");
+            assert!(
+                err.to_string()
+                    .contains("`tokensBefore` must be an unsigned integer"),
+                "{err}"
+            );
+
+            // Non-string file op entry.
+            let mut value = compaction_preparation_to_value(&make_preparation());
+            value["fileOps"]["read"] = json!([42]);
+            let err = compaction_preparation_from_value(&value).expect_err("bad file op");
+            assert!(
+                err.to_string()
+                    .contains("`fileOps.read` must contain only strings"),
+                "{err}"
+            );
+
+            // Missing settings.
+            let mut value = compaction_preparation_to_value(&make_preparation());
+            value.as_object_mut().expect("object").remove("settings");
+            let err = compaction_preparation_from_value(&value).expect_err("no settings");
+            assert!(
+                err.to_string().contains("`settings` must be an object"),
+                "{err}"
+            );
+
+            // Non-string previousSummary.
+            let mut value = compaction_preparation_to_value(&make_preparation());
+            value["previousSummary"] = json!(17);
+            let err = compaction_preparation_from_value(&value).expect_err("bad summary");
+            assert!(
+                err.to_string()
+                    .contains("`previousSummary` must be a string when present"),
+                "{err}"
+            );
+        }
     }
 
     // ── deterministic fallback summarization ─────────────────────────
