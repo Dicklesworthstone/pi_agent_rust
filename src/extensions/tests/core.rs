@@ -925,6 +925,159 @@ fn discover_workspace_bundle_entries_ignores_huge_parent_clusters() {
     assert!(discovered.is_empty());
 }
 
+#[test]
+fn workspace_bundle_requires_declared_workspace_marker_at_root() {
+    // Mirrors the conformance corpus tier layout: a self-contained package
+    // (package.json with `pi.extensions = ["./index.ts"]`) sitting in an
+    // arbitrary parent directory next to unrelated sibling extensions.
+    // Without an explicit workspace marker at the parent, the siblings
+    // must never be absorbed into one bundle.
+    let temp = tempdir().expect("tempdir");
+    let tier_root = temp.path().join("third-party");
+    let package_dir = tier_root.join("self-contained-canvas");
+    let foreign_pkg = tier_root.join("foreign-with-manifest");
+    let foreign_bare = tier_root.join("foreign-bare");
+    std::fs::create_dir_all(&package_dir).expect("mkdir package dir");
+    std::fs::create_dir_all(&foreign_pkg).expect("mkdir foreign package");
+    std::fs::create_dir_all(&foreign_bare).expect("mkdir foreign bare");
+
+    let primary = package_dir.join("index.ts");
+    std::fs::write(&primary, "export default {};\n").expect("write primary");
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+    )
+    .expect("write package.json");
+    std::fs::write(foreign_pkg.join("index.ts"), "export default {};\n")
+        .expect("write foreign index");
+    std::fs::write(
+        foreign_pkg.join("package.json"),
+        r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+    )
+    .expect("write foreign package.json");
+    std::fs::write(foreign_bare.join("index.ts"), "export default {};\n")
+        .expect("write bare foreign index");
+
+    let bundle = discover_workspace_bundle_entries(&package_dir).expect("discover bundle");
+    assert!(
+        bundle.is_empty(),
+        "a parent without a workspace marker must not be treated as a bundle root: {bundle:?}"
+    );
+
+    let discovered = discover_related_extension_entries(&primary).expect("discover related");
+    assert_eq!(
+        discovered,
+        vec![safe_canonicalize(&primary)],
+        "a self-contained package must load exactly its own declared entry"
+    );
+}
+
+#[test]
+fn workspace_bundle_expands_when_root_declares_workspaces() {
+    let temp = tempdir().expect("tempdir");
+    let workspace_root = temp.path().join("monorepo");
+    let package_dir = workspace_root.join("primary-ext");
+    let sibling_dir = workspace_root.join("sibling-ext");
+    std::fs::create_dir_all(&package_dir).expect("mkdir primary");
+    std::fs::create_dir_all(&sibling_dir).expect("mkdir sibling");
+
+    std::fs::write(
+        workspace_root.join("package.json"),
+        r#"{ "name": "monorepo", "workspaces": ["primary-ext", "sibling-ext"] }"#,
+    )
+    .expect("write workspace package.json");
+
+    let primary = package_dir.join("index.ts");
+    std::fs::write(&primary, "export default {};\n").expect("write primary");
+    std::fs::write(
+        package_dir.join("package.json"),
+        r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+    )
+    .expect("write primary package.json");
+
+    let sibling = sibling_dir.join("index.ts");
+    std::fs::write(&sibling, "export default {};\n").expect("write sibling");
+    std::fs::write(
+        sibling_dir.join("package.json"),
+        r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
+    )
+    .expect("write sibling package.json");
+
+    let discovered = discover_related_extension_entries(&primary).expect("discover related");
+    assert!(discovered.contains(&safe_canonicalize(&primary)));
+    assert!(
+        discovered.contains(&safe_canonicalize(&sibling)),
+        "a declared workspace root must still bundle sibling packages: {discovered:?}"
+    );
+}
+
+#[test]
+fn discover_sibling_index_entries_skips_clusters_containing_packaged_siblings() {
+    // Mirrors the corpus tier layout for manifest-less extensions: bare
+    // `<repo>/index.ts` checkouts next to self-contained repos that carry
+    // their own package.json. The mixed parent is a collection of
+    // unrelated projects, not one bundle.
+    let temp = tempdir().expect("tempdir");
+    let tier_root = temp.path().join("third-party");
+    let primary_dir = tier_root.join("bare-sketch");
+    let bare_sibling = tier_root.join("bare-curl");
+    let packaged_sibling = tier_root.join("self-contained-repo");
+    std::fs::create_dir_all(&primary_dir).expect("mkdir primary");
+    std::fs::create_dir_all(&bare_sibling).expect("mkdir bare sibling");
+    std::fs::create_dir_all(&packaged_sibling).expect("mkdir packaged sibling");
+
+    let primary = primary_dir.join("index.ts");
+    std::fs::write(&primary, "export default {};\n").expect("write primary");
+    std::fs::write(bare_sibling.join("index.ts"), "export default {};\n")
+        .expect("write bare sibling index");
+    std::fs::write(packaged_sibling.join("index.ts"), "export default {};\n")
+        .expect("write packaged sibling index");
+    std::fs::write(
+        packaged_sibling.join("package.json"),
+        r#"{ "type": "module", "dependencies": { "diff": "^7.0.0" } }"#,
+    )
+    .expect("write packaged sibling package.json");
+
+    let discovered = discover_sibling_index_entries(&primary);
+    assert!(
+        discovered.is_empty(),
+        "a cluster containing self-contained packages must not be inferred as a bundle: {discovered:?}"
+    );
+
+    let related = discover_related_extension_entries(&primary).expect("discover related");
+    assert_eq!(
+        related,
+        vec![safe_canonicalize(&primary)],
+        "a bare extension under a mixed parent must load only itself"
+    );
+}
+
+#[test]
+fn discover_sibling_index_entries_skips_cluster_root_with_package_json() {
+    let temp = tempdir().expect("tempdir");
+    let cluster = temp.path().join("some-project");
+    let dir_a = cluster.join("a-ext");
+    let dir_b = cluster.join("b-ext");
+    std::fs::create_dir_all(&dir_a).expect("mkdir a-ext");
+    std::fs::create_dir_all(&dir_b).expect("mkdir b-ext");
+    std::fs::write(
+        cluster.join("package.json"),
+        r#"{ "type": "module", "dependencies": {} }"#,
+    )
+    .expect("write cluster package.json");
+
+    let a_index = dir_a.join("index.ts");
+    let b_index = dir_b.join("index.ts");
+    std::fs::write(&a_index, "export default {};\n").expect("write a index");
+    std::fs::write(&b_index, "export default {};\n").expect("write b index");
+
+    let discovered = discover_sibling_index_entries(&a_index);
+    assert!(
+        discovered.is_empty(),
+        "a cluster root owning a package.json is a project, not a bare bundle: {discovered:?}"
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 fn sample_protocol_messages() -> Vec<(&'static str, ExtensionMessage)> {
     vec![

@@ -13078,10 +13078,48 @@ fn resolve_package_declared_entries(
     Ok(out)
 }
 
+/// True when `dir` explicitly declares itself a multi-package workspace
+/// root: a `package.json` with a `workspaces` field (npm/yarn/bun) or a
+/// `pnpm-workspace.yaml` marker file. Upstream pi never expands discovery
+/// beyond the directory it was pointed at, so inferring workspace-ness for
+/// a *parent* directory is a port-side heuristic that must fail closed: a
+/// self-contained extension package (for example one declaring
+/// `pi.extensions = ["./index.ts"]`) sitting in an arbitrary parent
+/// directory — a corpus tier checkout, `~/projects`, a vendored registry
+/// mirror — must never cause its unrelated siblings to be absorbed into
+/// one bundle. Only a root that opts in with an explicit workspace marker
+/// may donate sibling packages.
+fn is_declared_workspace_root(dir: &Path) -> bool {
+    if dir.join("pnpm-workspace.yaml").is_file() {
+        return true;
+    }
+    let package_json = dir.join("package.json");
+    if !package_json.is_file() {
+        return false;
+    }
+    let Ok(raw) = fs::read_to_string(&package_json) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    match json.get("workspaces") {
+        Some(Value::Array(entries)) => !entries.is_empty(),
+        Some(Value::Object(map)) => !map.is_empty(),
+        _ => false,
+    }
+}
+
 fn discover_workspace_bundle_entries(package_dir: &Path) -> Result<Vec<PathBuf>> {
     let Some(workspace_root) = package_dir.parent() else {
         return Ok(Vec::new());
     };
+
+    // Never infer a workspace from a lone self-contained child package:
+    // the parent must explicitly declare itself a workspace root.
+    if !is_declared_workspace_root(workspace_root) {
+        return Ok(Vec::new());
+    }
 
     let mut cluster_dirs = Vec::new();
     if let Ok(entries) = fs::read_dir(workspace_root) {
@@ -13178,11 +13216,25 @@ fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
 
+    // A sibling-index bundle is only inferred for homogeneous clusters of
+    // bare `<dir>/index.*` directories. When the cluster root or any of
+    // its child directories carries its own package.json, those children
+    // are self-contained packages or unrelated projects living side by
+    // side (a corpus tier checkout, `~/projects`, a registry mirror), not
+    // fragments of one bundle — clustering there would absorb foreign
+    // extensions wholesale. Fail closed and load only the primary.
+    if cluster_root.join("package.json").is_file() {
+        return Vec::new();
+    }
+
     let mut candidate_dirs = Vec::new();
     if let Ok(entries) = fs::read_dir(cluster_root) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
+                if path.join("package.json").is_file() {
+                    return Vec::new();
+                }
                 candidate_dirs.push(path);
             }
         }
