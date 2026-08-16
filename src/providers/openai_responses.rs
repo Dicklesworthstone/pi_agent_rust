@@ -130,7 +130,8 @@ impl OpenAIResponsesProvider {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> OpenAIResponsesRequest {
-        let input = build_openai_responses_input(context);
+        let input =
+            build_openai_responses_input(context, &self.model, &self.provider, &self.api);
         let tools: Option<Vec<OpenAIResponsesTool>> = if context.tools.is_empty() {
             None
         } else {
@@ -1066,8 +1067,26 @@ where
                 }
             }
             OpenAIResponsesChunk::OutputItemDone { item } => {
-                let typed: OpenAIResponsesOutputItemDone = serde_json::from_value(item.clone())
-                    .map_err(|e| Error::api(format!("JSON parse error: {e}\nData: {data}")))?;
+                // Legacy parity: before the raw-item capture lane, only
+                // `function_call` was a known done-item shape — anything else
+                // (including malformed `reasoning`/`message` payloads) fell
+                // into the `#[serde(other)]` arm and was ignored. Keep the
+                // hard error for malformed function calls, and keep the new
+                // capture paths opportunistic so a partial item never aborts
+                // the stream.
+                let typed = match serde_json::from_value::<OpenAIResponsesOutputItemDone>(
+                    item.clone(),
+                ) {
+                    Ok(typed) => typed,
+                    Err(e) => {
+                        if item.get("type").and_then(serde_json::Value::as_str)
+                            == Some("function_call")
+                        {
+                            return Err(Error::api(format!("JSON parse error: {e}\nData: {data}")));
+                        }
+                        OpenAIResponsesOutputItemDone::Unknown
+                    }
+                };
                 match typed {
                     OpenAIResponsesOutputItemDone::FunctionCall {
                         id,
@@ -1563,7 +1582,12 @@ fn convert_tool_to_openai_responses(tool: &ToolDef) -> OpenAIResponsesTool {
     }
 }
 
-fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInputItem> {
+fn build_openai_responses_input(
+    context: &Context<'_>,
+    model: &str,
+    provider: &str,
+    api: &str,
+) -> Vec<OpenAIResponsesInputItem> {
     let mut input = Vec::with_capacity(context.messages.len());
 
     // System prompt is sent as top-level `instructions` field, not in input array.
@@ -1580,6 +1604,14 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                 }],
             }),
             Message::Assistant(assistant) => {
+                // TS parity (`convertResponsesMessages`): when this assistant
+                // turn was produced by a *different model* on the same
+                // provider/api, the original `fc_...` item ids must not be
+                // replayed — OpenAI validates reasoning/function-call pairing
+                // per model and 400s on ids minted by another model.
+                let is_different_model = assistant.model != model
+                    && assistant.provider == provider
+                    && assistant.api == api;
                 // Preserve ordering between text and tool calls.
                 let mut pending_text = String::new();
                 let flush_pending =
@@ -1603,18 +1635,32 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                                 // its id + status so OpenAI's reasoning pairing
                                 // validation recognizes it (TS parity).
                                 flush_pending(&mut pending_text, &mut input);
-                                input.push(OpenAIResponsesInputItem::AssistantMessageItem {
-                                    r#type: "message",
-                                    role: "assistant",
-                                    id: item_id,
-                                    status: "completed",
-                                    content: vec![
-                                        OpenAIResponsesAssistantContentPart::OutputText {
-                                            text: t.text.clone(),
-                                            annotations: Some(Vec::new()),
-                                        },
-                                    ],
-                                });
+                                let part = OpenAIResponsesAssistantContentPart::OutputText {
+                                    text: t.text.clone(),
+                                    annotations: Some(Vec::new()),
+                                };
+                                // A multi-part message item streams one text
+                                // block per content_index, each stamped with
+                                // the same `msg_...` id. Fold them back into a
+                                // single item — OpenAI rejects duplicate input
+                                // item ids.
+                                if let Some(OpenAIResponsesInputItem::AssistantMessageItem {
+                                    id,
+                                    content,
+                                    ..
+                                }) = input.last_mut()
+                                    && *id == item_id
+                                {
+                                    content.push(part);
+                                } else {
+                                    input.push(OpenAIResponsesInputItem::AssistantMessageItem {
+                                        r#type: "message",
+                                        role: "assistant",
+                                        id: item_id,
+                                        status: "completed",
+                                        content: vec![part],
+                                    });
+                                }
                             } else {
                                 pending_text.push_str(&t.text);
                             }
@@ -1634,7 +1680,11 @@ fn build_openai_responses_input(context: &Context<'_>) -> Vec<OpenAIResponsesInp
                             let (call_id, embedded_item_id) = split_responses_tool_call_id(&tc.id);
                             input.push(OpenAIResponsesInputItem::FunctionCall {
                                 r#type: "function_call",
-                                id: replayable_function_call_item_id(tc, embedded_item_id),
+                                id: if is_different_model {
+                                    None
+                                } else {
+                                    replayable_function_call_item_id(tc, embedded_item_id)
+                                },
                                 call_id: call_id.to_string(),
                                 name: tc.name.clone(),
                                 arguments: tc.arguments.to_string(),
@@ -1687,9 +1737,9 @@ fn split_responses_tool_call_id(id: &str) -> (&str, Option<&str>) {
 ///
 /// Prefers the id captured on parse (stored in `thought_signature`), falling
 /// back to a TS-session embedded id. Only ids that look like Responses
-/// function-call item ids (`fc` prefix, within OpenAI's 64-char limit) are
-/// replayed; anything else (e.g. a Gemini thought signature) is ignored so the
-/// request keeps the legacy shape.
+/// function-call item ids (`fc_` prefix, within OpenAI's 64-char limit) are
+/// replayed; anything else (e.g. a Gemini thought signature imported from a
+/// TS session) is ignored so the request keeps the legacy shape.
 fn replayable_function_call_item_id(
     tool_call: &ToolCall,
     embedded_item_id: Option<&str>,
@@ -1698,7 +1748,7 @@ fn replayable_function_call_item_id(
         .thought_signature
         .as_deref()
         .or(embedded_item_id)
-        .filter(|id| id.starts_with("fc") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
+        .filter(|id| id.starts_with("fc_") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
         .map(ToString::to_string)
 }
 
@@ -1710,7 +1760,7 @@ fn replayable_function_call_item_id(
 fn replayable_message_item_id(text: &TextContent) -> Option<String> {
     text.text_signature
         .as_deref()
-        .filter(|id| id.starts_with("msg") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
+        .filter(|id| id.starts_with("msg_") && id.len() <= MAX_RESPONSES_ITEM_ID_LEN)
         .map(ToString::to_string)
 }
 
@@ -2564,8 +2614,8 @@ mod tests {
     }
 
     /// Foreign signatures (other providers' opaque blobs) never leak into
-    /// Responses requests: only JSON reasoning items, `msg`-prefixed text
-    /// signatures, and `fc`-prefixed item ids are replayed.
+    /// Responses requests: only JSON reasoning items, `msg_`-prefixed text
+    /// signatures, and `fc_`-prefixed item ids are replayed.
     #[test]
     fn test_build_request_ignores_foreign_signatures() {
         let provider = OpenAIResponsesProvider::new("gpt-test");
@@ -2605,6 +2655,190 @@ mod tests {
                     "name": "echo",
                     "arguments": "{}"
                 }
+            ])
+        );
+    }
+
+    /// Malformed `reasoning`/`message` done items (and non-object items) are
+    /// ignored, exactly as the pre-capture implementation ignored every
+    /// non-`function_call` done item via `#[serde(other)]`. The stream must
+    /// not abort on an unparseable opportunistic-capture payload.
+    #[test]
+    fn test_stream_tolerates_malformed_reasoning_and_message_done_items() {
+        let events = vec![
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": { "type": "message" } // missing id
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": { "type": "reasoning", "id": 123 } // non-string id
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "output_index": 2,
+                "item": "not-an-object"
+            }),
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "content_index": 0,
+                "delta": "still streaming"
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "incomplete_details": null,
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            }),
+        ];
+
+        let out = collect_events(&events);
+        let done_message = out
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::Done { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .expect("done message");
+        assert_eq!(done_message.content.len(), 1);
+        let ContentBlock::Text(text) = &done_message.content[0] else {
+            panic!("expected text block");
+        };
+        assert_eq!(text.text, "still streaming");
+        assert!(text.text_signature.is_none());
+    }
+
+    /// A malformed `function_call` done item keeps the legacy hard error: the
+    /// pre-capture code failed the whole-chunk parse for these, and silently
+    /// dropping a tool call would corrupt the conversation.
+    #[test]
+    fn test_stream_errors_on_malformed_function_call_done_item() {
+        let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
+        let event_source = crate::sse::SseStream::new(Box::pin(empty));
+        let mut state = StreamState::new(
+            event_source,
+            "gpt-test".to_string(),
+            "openai-responses".to_string(),
+            "openai".to_string(),
+        );
+        let data = json!({
+            "type": "response.output_item.done",
+            "output_index": 0,
+            "item": { "type": "function_call", "id": "fc_1" } // missing call_id/name
+        })
+        .to_string();
+        let err = state
+            .process_event(&data)
+            .expect_err("malformed function_call done item must error");
+        assert!(err.to_string().contains("JSON parse error"));
+    }
+
+    /// Text blocks stamped with the same `msg_...` id (a multi-part message
+    /// item) fold back into a single replayed `message` item — OpenAI rejects
+    /// duplicate input item ids. Distinct ids stay distinct items.
+    #[test]
+    fn test_build_request_merges_multipart_message_item() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let context = Context::owned(
+            None,
+            vec![assistant_message_with_blocks(vec![
+                ContentBlock::Text(TextContent {
+                    text: "Part one. ".to_string(),
+                    text_signature: Some("msg_1".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "Part two.".to_string(),
+                    text_signature: Some("msg_1".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "New item.".to_string(),
+                    text_signature: Some("msg_2".to_string()),
+                }),
+            ])],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_1",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "Part one. ", "annotations": [] },
+                        { "type": "output_text", "text": "Part two.", "annotations": [] }
+                    ]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "id": "msg_2",
+                    "status": "completed",
+                    "content": [
+                        { "type": "output_text", "text": "New item.", "annotations": [] }
+                    ]
+                }
+            ])
+        );
+    }
+
+    /// TS parity (`isDifferentModel` in `convertResponsesMessages`): an
+    /// assistant turn produced by a different model on the same provider/api
+    /// must not replay its `fc_...` item id — OpenAI validates
+    /// reasoning/function-call pairing per model. The raw reasoning item and
+    /// message id keep replaying (the TS reference only gates the fc id).
+    #[test]
+    fn test_build_request_omits_fc_item_id_for_different_model_same_api() {
+        let provider = OpenAIResponsesProvider::new("gpt-test");
+        let other_model = Message::Assistant(std::sync::Arc::new(AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "Plan the echo.".to_string(),
+                    thinking_signature: Some(raw_reasoning_item().to_string()),
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo".to_string(),
+                    arguments: json!({ "text": "hi" }),
+                    thought_signature: Some("fc_1".to_string()),
+                }),
+            ],
+            api: "openai-responses".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-other".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            stop_details: None,
+            error_message: None,
+            timestamp: 0,
+        }));
+        let context = Context::owned(
+            None,
+            vec![other_model, tool_result_message("call_1", "ok")],
+            vec![],
+        );
+
+        let request = provider.build_request(&context, &StreamOptions::default());
+        let value = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(
+            value["input"],
+            json!([
+                raw_reasoning_item(),
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "echo",
+                    "arguments": "{\"text\":\"hi\"}"
+                },
+                { "type": "function_call_output", "call_id": "call_1", "output": "ok" }
             ])
         );
     }
