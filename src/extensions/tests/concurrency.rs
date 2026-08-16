@@ -717,7 +717,10 @@ fn event_coalescer_characterization_replacement_keeps_first_and_latest_payload()
     );
 
     runtime.block_on(async {
-        for _ in 0..256 {
+        // Deadline-based: see the handoff test below — yield-only budgets
+        // flake on loaded hosts when OS threads are involved.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             if coalescer
                 .in_flight
                 .lock()
@@ -726,7 +729,7 @@ fn event_coalescer_characterization_replacement_keeps_first_and_latest_payload()
             {
                 return;
             }
-            asupersync::runtime::yield_now().await;
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
         }
         panic!("coalesced dispatch did not become idle");
     });
@@ -783,7 +786,10 @@ fn event_coalescer_characterization_batch_drain_resolves_every_payload_in_order(
     );
 
     runtime.block_on(async {
-        for _ in 0..256 {
+        // Deadline-based: see the handoff test below — yield-only budgets
+        // flake on loaded hosts when OS threads are involved.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             let buffer_empty = coalescer
                 .batch_buffer
                 .lock()
@@ -795,7 +801,7 @@ fn event_coalescer_characterization_batch_drain_resolves_every_payload_in_order(
             if buffer_empty && !drain_scheduled {
                 return;
             }
-            asupersync::runtime::yield_now().await;
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
         }
         panic!("batch drain did not become idle");
     });
@@ -854,7 +860,11 @@ fn event_coalescer_characterization_handoff_does_not_strand_payload() {
     });
 
     runtime.block_on(async {
-        for _ in 0..256 {
+        // Deadline-based wait: the drain depends on OS threads getting
+        // scheduled, so a pure yield_now() budget (which spins in
+        // microseconds on a current-thread runtime) flakes on loaded hosts.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
             if coalescer
                 .in_flight
                 .lock()
@@ -863,7 +873,7 @@ fn event_coalescer_characterization_handoff_does_not_strand_payload() {
             {
                 return;
             }
-            asupersync::runtime::yield_now().await;
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(2)).await;
         }
         panic!("replacement handoff did not become idle");
     });
