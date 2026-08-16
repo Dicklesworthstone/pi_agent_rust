@@ -318,6 +318,10 @@ harness = false
 name = "tui_perf"
 harness = false
 
+[[bench]]
+name = "search_backends"
+harness = false
+
 # Gap H: jemalloc for 10-20% allocation-heavy path improvement.
 # Keep the global jemalloc override to targets where tikv-jemallocator is a
 # supported allocator choice. BSD-family targets stay on the platform allocator.

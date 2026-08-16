@@ -15326,6 +15326,65 @@ mod tests {
     // Grep Tool Tests
     // ========================================================================
 
+    /// bd-cv653.1.5: the in-process and external search backends must render
+    /// byte-identical tool output for the same corpus. Skips silently when
+    /// the external binaries are not installed (the escape hatch is optional;
+    /// the in-process default carries the suite).
+    #[test]
+    fn search_backends_render_identical_output() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("src/nested")).unwrap();
+            std::fs::write(
+                tmp.path().join("src/alpha.txt"),
+                "needle one\nplain line\nneedle two\n",
+            )
+            .unwrap();
+            std::fs::write(tmp.path().join("src/nested/beta.txt"), "needle three\n").unwrap();
+            std::fs::write(tmp.path().join("skip.log"), "needle ignored\n").unwrap();
+            std::fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
+
+            if rg_available() {
+                let grep_input = serde_json::json!({ "pattern": "needle", "context": 1 });
+                let inproc = GrepTool::with_backend(tmp.path(), SearchBackend::Inproc)
+                    .execute("grep-parity-inproc", grep_input.clone(), None)
+                    .await
+                    .expect("inproc grep");
+                reset_tool_output_cache_for_tests();
+                let external = GrepTool::with_backend(tmp.path(), SearchBackend::External)
+                    .execute("grep-parity-external", grep_input, None)
+                    .await
+                    .expect("external grep");
+                // rg's multi-file result order is traversal-dependent, so
+                // compare per-line content rather than byte order.
+                let sorted_lines = |text: String| {
+                    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+                    lines.sort();
+                    lines
+                };
+                assert_eq!(
+                    sorted_lines(get_text(&inproc.content)),
+                    sorted_lines(get_text(&external.content))
+                );
+            }
+
+            if find_fd_binary().is_some() {
+                let find_input = serde_json::json!({ "pattern": "*.txt" });
+                reset_tool_output_cache_for_tests();
+                let inproc = FindTool::with_backend(tmp.path(), SearchBackend::Inproc)
+                    .execute("find-parity-inproc", find_input.clone(), None)
+                    .await
+                    .expect("inproc find");
+                reset_tool_output_cache_for_tests();
+                let external = FindTool::with_backend(tmp.path(), SearchBackend::External)
+                    .execute("find-parity-external", find_input, None)
+                    .await
+                    .expect("external find");
+                assert_eq!(get_text(&inproc.content), get_text(&external.content));
+            }
+        });
+    }
+
     #[test]
     fn test_grep_basic_pattern() {
         asupersync::test_utils::run_test(|| async {

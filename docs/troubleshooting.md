@@ -111,19 +111,21 @@ Interactive editor parity (autocomplete/bang/paste) is tracked by **bd-1iwi**.
 
 ## Missing system dependencies
 
-The `find` tool requires `fd`:
+The `grep` and `find` tools search in-process by default and need no
+external binaries. "fd/rg is not available" errors only appear with
+`"search_backend": "external"` in settings.json; either remove that
+setting or install the binaries:
+
 ```bash
 # Ubuntu/Debian
-apt install fd-find
+apt install ripgrep fd-find
 
 # macOS
-brew install fd
+brew install ripgrep fd
 
-# The binary might be named fdfind
+# The fd binary might be named fdfind
 ln -s $(which fdfind) ~/.local/bin/fd
 ```
-
-`rg` (ripgrep) is optional but recommended for faster searches.
 
 ## Tool output truncated
 
