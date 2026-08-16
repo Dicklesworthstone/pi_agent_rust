@@ -1001,6 +1001,30 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
     }
 }
 
+/// Heuristic estimate of the model-context tokens contributed by a slice of
+/// session entries, using the same char-based estimator (`estimate_tokens`) as
+/// the rest of the compaction module.
+///
+/// Unlike [`estimate_context_tokens`], this deliberately ignores any retained
+/// assistant `usage` metrics: those belong to the *pre-compaction* provider
+/// request and would massively inflate an estimate of the context the *next*
+/// request will see. Callers use this to compute the `tokensAfter` field of
+/// compaction result payloads — the estimated size of the post-compaction
+/// current-path context.
+///
+/// The estimate is computed by reference: entries are converted to messages
+/// lazily, one at a time, so the full post-compaction message list is never
+/// materialized.
+#[must_use]
+pub fn estimate_entries_context_tokens(entries: &[&SessionEntry]) -> u64 {
+    entries
+        .iter()
+        .copied()
+        .filter_map(message_from_entry)
+        .map(|msg| estimate_tokens(&msg))
+        .fold(0u64, u64::saturating_add)
+}
+
 fn should_compact(
     context_tokens: u64,
     context_window: u32,
@@ -2942,6 +2966,51 @@ mod tests {
         // "hi" => 1, "hello" => 2, "bye" => 1.
         assert_eq!(estimate.tokens, 4);
         assert!(estimate.last_usage_index.is_none());
+    }
+
+    // ── estimate_entries_context_tokens (tokensAfter heuristic) ──────
+
+    #[test]
+    fn tokens_after_estimate_uses_char_heuristic_not_tokens_before() {
+        // A post-compaction current path: the compaction summary plus the
+        // kept tail. The compaction entry carries a huge `tokens_before`
+        // (999_999) that must never leak into the post-compaction estimate.
+        let summary = compact_entry("c1", "summary text here", 999_999);
+        let kept_user = user_entry("u1", "hello world"); // 11 chars => 4 tokens
+        let entries: Vec<&SessionEntry> = vec![&summary, &kept_user];
+        let tokens = estimate_entries_context_tokens(&entries);
+        assert!(tokens > 0, "post-compaction estimate must be positive");
+        assert!(
+            tokens < 1000,
+            "estimate must reflect char heuristic, not tokens_before: {tokens}"
+        );
+    }
+
+    #[test]
+    fn tokens_after_estimate_ignores_stale_assistant_usage() {
+        // An assistant message retained after compaction still carries the
+        // provider `usage` from its ORIGINAL (pre-compaction) request. That
+        // stale usage must NOT inflate the post-compaction estimate.
+        let user = user_entry("u1", "hi"); // 2 chars => 1 token
+        let assistant = assistant_entry("a1", "ok", 500_000, 250_000); // 2 chars => 1 token
+        let entries: Vec<&SessionEntry> = vec![&user, &assistant];
+
+        let heuristic = estimate_entries_context_tokens(&entries);
+        assert_eq!(heuristic, 2, "char heuristic: 'hi' => 1, 'ok' => 1");
+
+        // Sanity: the usage-aware estimator WOULD balloon to the stale total,
+        // proving the two paths diverge and tokensAfter uses the heuristic.
+        let messages: Vec<SessionMessage> = entries
+            .iter()
+            .copied()
+            .filter_map(message_from_entry)
+            .collect();
+        let usage_aware = estimate_context_tokens(&messages).tokens;
+        assert!(
+            usage_aware >= 750_000,
+            "usage-aware estimate: {usage_aware}"
+        );
+        assert!(heuristic < usage_aware);
     }
 
     // ── extract_file_ops_from_message ────────────────────────────────

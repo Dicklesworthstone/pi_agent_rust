@@ -606,6 +606,11 @@ pub struct RpcCompactionResult {
     pub summary: String,
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
+    /// Estimated tokens the next provider request will see after this
+    /// compaction is applied. Additive/backward-compatible: defaults to `0`
+    /// when deserializing payloads emitted before this field existed.
+    #[serde(default)]
+    pub tokens_after: u64,
     #[serde(default)]
     pub details: Value,
 }
