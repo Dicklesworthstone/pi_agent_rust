@@ -100,9 +100,15 @@ fn anthropic_request_shape_minimal() {
     let req = provider.build_request(&context, &default_options());
     let v = serde_json::to_value(&req).expect("serialize");
 
-    // Locked: model, system as top-level string, messages array, stream bool
+    // Locked: model, system as top-level typed block array (the array form is
+    // required so system can carry prompt-cache `cache_control` breakpoints —
+    // deliberate change with the Anthropic prompt-caching work), messages
+    // array, stream bool
     assert_eq!(v["model"], "claude-sonnet-4-5");
-    assert_eq!(v["system"], "You are helpful.");
+    assert_eq!(
+        v["system"],
+        json!([{"type": "text", "text": "You are helpful."}])
+    );
     assert_eq!(v["stream"], true);
     assert!(v["messages"].is_array());
     assert_eq!(v["messages"][0]["role"], "user");
@@ -982,8 +988,8 @@ fn system_prompt_handling_differs_by_provider() {
     let anthropic = AnthropicProvider::new("claude-sonnet-4-5");
     let v = serde_json::to_value(anthropic.build_request(&context, &options)).unwrap();
     assert!(
-        v["system"].is_string(),
-        "Anthropic: system as top-level string"
+        v["system"].is_array() && v["system"][0]["type"] == "text",
+        "Anthropic: system as top-level typed block array (cache_control-capable)"
     );
     assert!(
         !v["messages"]

@@ -148,6 +148,7 @@ fn build_app_with_models_and_config(
         current,
         scope,
         available,
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),

@@ -140,6 +140,7 @@ fn build_app_with_config(harness: &TestHarness, config: Config) -> PiApp {
         model_entry,
         model_scope,
         available_models,
+        None,
         Vec::new(),
         event_tx,
         test_runtime_handle(),
