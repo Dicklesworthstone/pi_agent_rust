@@ -7510,6 +7510,7 @@ fn process_rg_json_match_line(
         line_res,
         None,
         None,
+        None,
         matches,
         match_count,
         match_limit_reached,
@@ -7517,10 +7518,12 @@ fn process_rg_json_match_line(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_rg_json_match_line_with_filter(
     line_res: std::io::Result<String>,
     scoped_root: Option<&ScopedScanRoot>,
     glob_override: Option<&ignore::overrides::Override>,
+    workspace_ignore: Option<&ignore::gitignore::Gitignore>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
@@ -7561,7 +7564,9 @@ fn process_rg_json_match_line_with_filter(
     }
 
     let file_path = path_from_rg_json(&event)?;
-    if let (Some(scoped_root), Some(glob_override)) = (scoped_root, glob_override) {
+    if let Some(scoped_root) = scoped_root
+        && (glob_override.is_some() || workspace_ignore.is_some())
+    {
         let mapped = scoped_root.map_child_output(&file_path).map_err(|error| {
             Error::tool(
                 "grep",
@@ -7571,9 +7576,17 @@ fn process_rg_json_match_line_with_filter(
                 ),
             )
         })?;
-        if glob_override
-            .matched(&mapped.logical_path, false)
-            .is_ignore()
+        if let Some(glob_override) = glob_override
+            && glob_override
+                .matched(&mapped.logical_path, false)
+                .is_ignore()
+        {
+            return Ok(());
+        }
+        if let Some(workspace_ignore) = workspace_ignore
+            && workspace_ignore
+                .matched_path_or_any_parents(&mapped.logical_path, false)
+                .is_ignore()
         {
             return Ok(());
         }
@@ -7593,10 +7606,12 @@ fn process_rg_json_match_line_with_filter(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drain_rg_stdout(
     stdout_rx: &std::sync::mpsc::Receiver<std::io::Result<String>>,
     scoped_root: &ScopedScanRoot,
     glob_override: Option<&ignore::overrides::Override>,
+    workspace_ignore: Option<&ignore::gitignore::Gitignore>,
     matches: &mut Vec<(PathBuf, usize)>,
     match_count: &mut usize,
     match_limit_reached: &mut bool,
@@ -7607,6 +7622,7 @@ fn drain_rg_stdout(
             line_res,
             Some(scoped_root),
             glob_override,
+            workspace_ignore,
             matches,
             match_count,
             match_limit_reached,
@@ -7617,6 +7633,30 @@ fn drain_rg_stdout(
         }
     }
     Ok(())
+}
+
+/// Build a gitignore matcher for the workspace root's `.gitignore`, applied
+/// to scanner results as a post-filter.
+///
+/// External scanners run from the pinned scan root with `--no-ignore-parent`,
+/// so a workspace-root `.gitignore` above the scan root is invisible to their
+/// native discovery. Passing it via `--ignore-file` does not work either:
+/// rg/fd anchor such patterns to the scanner's working directory, so rules
+/// like `subdir/file.txt` written relative to the workspace root can never
+/// match while scanning inside `subdir`. Matching mapped logical result paths
+/// against a matcher rooted at the workspace keeps the workspace-relative
+/// anchoring the rules were written for.
+fn build_workspace_ignore_matcher(
+    cwd_scope: &ScopedScanRoot,
+) -> Option<ignore::gitignore::Gitignore> {
+    let workspace_root = cwd_scope.logical_path();
+    let workspace_gitignore = workspace_root.join(".gitignore");
+    if !workspace_gitignore.is_file() {
+        return None;
+    }
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(workspace_root);
+    builder.add(&workspace_gitignore);
+    builder.build().ok()
 }
 
 fn build_grep_glob_override(
@@ -7907,25 +7947,18 @@ impl Tool for GrepTool {
         let glob_override =
             build_grep_glob_override(cwd_scope.logical_path(), input.glob.as_deref())?;
 
-        // Mirror find-tool behavior: explicitly pass root/nested .gitignore files
-        // so ignore rules apply consistently even outside a git worktree.
+        // Mirror find-tool behavior: rg discovers .gitignore files natively
+        // during traversal, while workspace-root rules above the scan root are
+        // applied as a post-filter on mapped result paths (see
+        // build_workspace_ignore_matcher for why --ignore-file cannot express
+        // them). Explicit file operands bypass ignore filtering entirely, so
+        // neither applies to single-file scans.
+        let workspace_ignore = if is_directory {
+            build_workspace_ignore_matcher(&cwd_scope)
+        } else {
+            None
+        };
         if is_directory {
-            // NOTE: We rely on rg's native .gitignore discovery. We only explicitly pass
-            // the root .gitignore if it exists, to ensure it's respected even if the
-            // search path logic might otherwise miss it (e.g. searching a subdir).
-            // We do NOT perform a blocking `glob("**/.gitignore")` here, as that stalls
-            // the async runtime on large repos. Explicit file operands bypass ignore
-            // filtering, so do not load unrelated directory controls for that case.
-            let workspace_gitignore = operation_cwd.join(".gitignore");
-            if workspace_gitignore.exists() {
-                args.push(OsString::from("--ignore-file"));
-                args.push(
-                    cwd_scope
-                        .inherited_child_operand()
-                        .join(".gitignore")
-                        .into_os_string(),
-                );
-            }
             let root_gitignore = scoped_root.child_operand().join(".gitignore");
             if scoped_root.logical_path() != cwd_scope.logical_path()
                 && scan_io_path.join(".gitignore").exists()
@@ -8040,6 +8073,7 @@ impl Tool for GrepTool {
                 &stdout_rx,
                 &scoped_root,
                 glob_override.as_ref(),
+                workspace_ignore.as_ref(),
                 &mut matches,
                 &mut match_count,
                 &mut match_scan_limit_reached,
@@ -8065,6 +8099,7 @@ impl Tool for GrepTool {
             &stdout_rx,
             &scoped_root,
             glob_override.as_ref(),
+            workspace_ignore.as_ref(),
             &mut matches,
             &mut match_count,
             &mut match_scan_limit_reached,
@@ -8095,6 +8130,7 @@ impl Tool for GrepTool {
                     &stdout_rx,
                     &scoped_root,
                     glob_override.as_ref(),
+                    workspace_ignore.as_ref(),
                     &mut matches,
                     &mut match_count,
                     &mut match_scan_limit_reached,
@@ -8128,6 +8164,7 @@ impl Tool for GrepTool {
                 &stdout_rx,
                 &scoped_root,
                 glob_override.as_ref(),
+                workspace_ignore.as_ref(),
                 &mut matches,
                 &mut match_count,
                 &mut match_scan_limit_reached,
@@ -8610,20 +8647,11 @@ impl Tool for FindTool {
             OsString::from(scan_limit.to_string()),
         ];
 
-        // NOTE: We rely on fd's native .gitignore discovery. We only explicitly pass
-        // the root .gitignore if it exists, to ensure it's respected even if the
-        // search path logic might otherwise miss it.
-        // We do NOT perform a blocking `glob("**/.gitignore")` here.
-        let workspace_gitignore = operation_cwd.join(".gitignore");
-        if workspace_gitignore.exists() {
-            args.push(OsString::from("--ignore-file"));
-            args.push(
-                cwd_scope
-                    .inherited_child_operand()
-                    .join(".gitignore")
-                    .into_os_string(),
-            );
-        }
+        // NOTE: We rely on fd's native .gitignore discovery. Workspace-root
+        // rules above the scan root are applied as a post-filter on mapped
+        // result paths (see build_workspace_ignore_matcher for why
+        // --ignore-file cannot express them).
+        let workspace_ignore = build_workspace_ignore_matcher(&cwd_scope);
         let root_gitignore = scoped_root.child_operand().join(".gitignore");
         if scoped_root.logical_path() != cwd_scope.logical_path()
             && scan_io_path.join(".gitignore").exists()
@@ -8827,6 +8855,13 @@ impl Tool for FindTool {
             let is_dir = entry_metadata
                 .as_ref()
                 .is_some_and(std::fs::Metadata::is_dir);
+            if let Some(workspace_ignore) = workspace_ignore.as_ref()
+                && workspace_ignore
+                    .matched_path_or_any_parents(&mapped.logical_path, is_dir)
+                    .is_ignore()
+            {
+                continue;
+            }
 
             let modified = entry_metadata.and_then(|meta| meta.modified().ok());
             entries.push(FindEntry {
