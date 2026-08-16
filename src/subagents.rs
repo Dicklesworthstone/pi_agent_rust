@@ -29,7 +29,10 @@ const MAX_PARALLEL_TASKS: usize = 8;
 const DEFAULT_CONCURRENCY: usize = 4;
 const MAX_SUBAGENT_DEPTH: usize = 3;
 const MAX_CHILD_OUTPUT_BYTES: usize = 256 * 1024;
-const SUBAGENT_RESULT_SCHEMA: &str = "pi.subagent.result.v1";
+/// v2 (bd-cv653.5.1) extends v1 additively with `data`, `schemaValid`,
+/// `validationErrors`, and `schemaRetries` on schema-bearing results; every
+/// v1 field is unchanged, so v1 consumers keep working.
+const SUBAGENT_RESULT_SCHEMA: &str = "pi.subagent.result.v2";
 const SUBAGENT_PROGRESS_SCHEMA: &str = "pi.subagent.progress.v1";
 /// Per-field byte budget for `output`/`error` in the opt-in structured block.
 const STRUCTURED_FIELD_LIMIT_BYTES: usize = 2 * 1024;
@@ -146,15 +149,15 @@ impl SubagentTool {
                 Ok(ordered.into_iter().map(|(_, result)| result).collect())
             }
             RequestMode::Chain(tasks) => {
-                let mut previous = String::new();
+                let mut previous: Option<SubagentResult> = None;
                 let mut results = Vec::with_capacity(tasks.len());
                 for (step, task) in tasks.into_iter().enumerate() {
-                    let task = task.with_rendered_previous(&previous);
+                    let task = task.with_rendered_previous_result(previous.as_ref());
                     let result = self
                         .run_one(&agents, task, Some(step + 1), on_update.clone())
                         .await;
-                    previous.clone_from(&result.output);
                     let failed = result.is_error;
+                    previous = Some(result.clone());
                     results.push(result);
                     if failed {
                         break;
@@ -203,8 +206,10 @@ impl Tool for SubagentTool {
             "properties": {
                 "agent": {"type": "string", "description": "Named agent for a single delegation."},
                 "task": {"type": "string", "description": "Task for a single delegation."},
+                "outputSchema": {"type": "object", "description": "JSON Schema the single delegation's final output must match; the parent validates and returns parsed data."},
+                "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive", "description": "permissive keeps an invalid result with a warning; strict fails the task."},
                 "tasks": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Independent tasks to run in parallel."},
-                "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output."},
+                "chain": {"type": "array", "maxItems": MAX_PARALLEL_TASKS, "items": {"$ref": "#/definitions/task"}, "description": "Sequential tasks; {previous} is replaced with the prior child output, and {{previous.data.<field.path>}} addresses the prior task's schema-validated data."},
                 "concurrency": {"type": "integer", "minimum": 1, "maximum": MAX_PARALLEL_TASKS},
                 "scope": {"type": "string", "enum": ["both", "user", "project"], "default": "both"}
             },
@@ -215,7 +220,9 @@ impl Tool for SubagentTool {
                     "properties": {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
-                        "cwd": {"type": "string"}
+                        "cwd": {"type": "string"},
+                        "outputSchema": {"type": "object", "description": "JSON Schema this task's final output must match."},
+                        "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"}
                     }
                 }
             },
@@ -272,6 +279,11 @@ struct SubagentRequest {
     agent: Option<String>,
     #[serde(default)]
     task: Option<String>,
+    /// Single-delegation form of the per-task `outputSchema` (bd-cv653.5.1).
+    #[serde(default)]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    schema_mode: SchemaMode,
     #[serde(default)]
     tasks: Option<Vec<SubagentTask>>,
     #[serde(default)]
@@ -292,6 +304,8 @@ impl SubagentRequest {
                 agent: agent.clone(),
                 task: task.clone(),
                 cwd: None,
+                output_schema: self.output_schema.clone(),
+                schema_mode: self.schema_mode,
             });
         let selected = usize::from(single.is_some())
             + usize::from(self.tasks.is_some())
@@ -357,13 +371,74 @@ struct SubagentTask {
     task: String,
     #[serde(default)]
     cwd: Option<PathBuf>,
+    /// JSON Schema the child's final output must match (bd-cv653.5.1).
+    /// Overrides the agent definition's `output_schema` when both are set.
+    #[serde(default)]
+    output_schema: Option<Value>,
+    #[serde(default)]
+    schema_mode: SchemaMode,
+}
+
+/// How a schema-validation failure that survives the corrective retry is
+/// treated (bd-cv653.5.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum SchemaMode {
+    /// Accept the invalid result, exposing `schema_valid: false` plus
+    /// `validation_errors` as a warning.
+    #[default]
+    Permissive,
+    /// Fail the task with the validation errors.
+    Strict,
 }
 
 impl SubagentTask {
-    fn with_rendered_previous(mut self, previous: &str) -> Self {
-        self.task = self.task.replace(concat!("{", "previous", "}"), previous);
+    /// Render `{previous}` (raw prior output — historical contract) and, when
+    /// the prior result is schema-valid, `{{previous.data.<dotted.path>}}`
+    /// field references (bd-cv653.5.1). Unresolvable field references are
+    /// left verbatim so mistakes stay visible instead of silently vanishing.
+    fn with_rendered_previous_result(mut self, previous: Option<&SubagentResult>) -> Self {
+        let raw = previous.map_or("", |result| result.output.as_str());
+        self.task = self.task.replace(concat!("{", "previous", "}"), raw);
+        if let Some(data) = previous
+            .filter(|result| result.schema_valid == Some(true))
+            .and_then(|result| result.data.as_ref())
+        {
+            self.task = render_previous_data_fields(&self.task, data);
+        }
         self
     }
+}
+
+/// Replace `{{previous.data.<path>}}` tokens with values addressed out of the
+/// prior task's parsed `data`. Scalars render bare; objects/arrays render as
+/// compact JSON. Missing paths leave the token untouched.
+fn render_previous_data_fields(task: &str, data: &Value) -> String {
+    const OPEN: &str = "{{previous.data.";
+    const CLOSE: &str = "}}";
+    let mut rendered = String::with_capacity(task.len());
+    let mut rest = task;
+    while let Some(start) = rest.find(OPEN) {
+        rendered.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            rendered.push_str(&rest[start..]);
+            return rendered;
+        };
+        let path = &after_open[..end];
+        let pointer = format!("/{}", path.replace('.', "/"));
+        match data.pointer(&pointer) {
+            Some(Value::String(text)) => rendered.push_str(text),
+            Some(Value::Null) | None => {
+                // Leave the token verbatim so the miss is visible.
+                rendered.push_str(&rest[start..start + OPEN.len() + end + CLOSE.len()]);
+            }
+            Some(value) => rendered.push_str(&value.to_string()),
+        }
+        rest = &after_open[end + CLOSE.len()..];
+    }
+    rendered.push_str(rest);
+    rendered
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
@@ -391,6 +466,10 @@ struct AgentDefinition {
     tools: Option<Vec<String>>,
     skills: Vec<PathBuf>,
     system_prompt: String,
+    /// Default JSON Schema for the child's final output, from the definition's
+    /// single-line `output_schema:` frontmatter field (bd-cv653.5.1). A task's
+    /// `outputSchema` overrides it.
+    output_schema: Option<Value>,
     source: AgentSource,
     file_path: PathBuf,
 }
@@ -479,6 +558,20 @@ fn load_agent_dir(
                     .collect()
             })
             .unwrap_or_default();
+        let output_schema = frontmatter
+            .get("output_schema")
+            .map(|raw| {
+                serde_json::from_str::<Value>(raw).map_err(|error| {
+                    Error::tool(
+                        "subagent",
+                        format!(
+                            "Agent definition {} has an invalid output_schema (must be single-line JSON): {error}",
+                            path.display()
+                        ),
+                    )
+                })
+            })
+            .transpose()?;
         agents.insert(
             name.clone(),
             AgentDefinition {
@@ -492,6 +585,7 @@ fn load_agent_dir(
                 tools,
                 skills,
                 system_prompt: body,
+                output_schema,
                 source,
                 file_path: path,
             },
@@ -591,12 +685,105 @@ impl ChildRunner {
         }
     }
 
+    /// Run one task, applying the typed-output contract (bd-cv653.5.1) when
+    /// an `outputSchema` is in play: the child gets a schema directive
+    /// appended to its system prompt; the parent validates the final output,
+    /// grants exactly one corrective re-run on failure, and then either
+    /// annotates (permissive) or fails (strict) a still-invalid result.
+    ///
+    /// Children are ephemeral (`--no-session`), so the corrective retry is a
+    /// fresh child run carrying the validation errors, not an in-session
+    /// follow-up. Tolerant-dialect repair before validation (bd-cv653.7.8)
+    /// composes here once that layer exists.
     async fn run_one(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
         task: SubagentTask,
         step: Option<usize>,
         on_update: Option<UpdateCallback>,
+    ) -> SubagentResult {
+        let schema = task.output_schema.clone().or_else(|| {
+            agents
+                .get(&task.agent)
+                .and_then(|agent| agent.output_schema.clone())
+        });
+        let Some(schema) = schema else {
+            return self
+                .run_child_process(agents, task, step, on_update, None)
+                .await;
+        };
+        // Reject an uncompilable schema before spending a child launch.
+        // (Compiled per call rather than held across awaits so the future
+        // stays Send without depending on the validator's auto-traits.)
+        if let Err(error) = compile_output_schema(&schema) {
+            return agents.get(&task.agent).map_or_else(
+                || SubagentResult::unknown(task.clone(), step),
+                |agent| {
+                    SubagentResult::failed(
+                        agent,
+                        task.clone(),
+                        step,
+                        format!("Invalid outputSchema: {error}"),
+                    )
+                },
+            );
+        }
+
+        let schema_mode = task.schema_mode;
+        let mut result = self
+            .run_child_process(agents, task.clone(), step, on_update.clone(), Some(&schema))
+            .await;
+        if result.is_error {
+            return result;
+        }
+
+        let mut retries = 0usize;
+        let mut outcome = validate_child_output(&result.output, &schema);
+        if let Err(errors) = &outcome {
+            // Bounded corrective retry: exactly one fresh run with the errors.
+            retries = 1;
+            let corrective = SubagentTask {
+                task: corrective_retry_task(&task.task, errors),
+                ..task.clone()
+            };
+            let retry_result = self
+                .run_child_process(agents, corrective, step, on_update, Some(&schema))
+                .await;
+            if !retry_result.is_error {
+                result = retry_result;
+                outcome = validate_child_output(&result.output, &schema);
+            }
+        }
+
+        result.schema_retries = Some(retries);
+        match outcome {
+            Ok(data) => {
+                result.data = Some(data);
+                result.schema_valid = Some(true);
+            }
+            Err(errors) => {
+                result.schema_valid = Some(false);
+                result.validation_errors = Some(errors);
+                if schema_mode == SchemaMode::Strict {
+                    result.status = SubagentStatus::Failed;
+                    result.is_error = true;
+                    result.error.get_or_insert_with(|| {
+                        "Child output failed schema validation after the corrective retry (schemaMode: strict)."
+                            .to_string()
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    async fn run_child_process(
+        &self,
+        agents: &BTreeMap<String, AgentDefinition>,
+        task: SubagentTask,
+        step: Option<usize>,
+        on_update: Option<UpdateCallback>,
+        output_schema: Option<&Value>,
     ) -> SubagentResult {
         let Some(agent) = agents.get(&task.agent) else {
             return SubagentResult::unknown(task, step);
@@ -610,7 +797,12 @@ impl ChildRunner {
                 format!("Working directory does not exist: {}", cwd.display()),
             );
         }
-        let args = child_args(agent, &task.task, self.role_model_spec.as_deref());
+        let args = child_args(
+            agent,
+            &task.task,
+            self.role_model_spec.as_deref(),
+            output_schema,
+        );
         let mut result =
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args);
         let update = on_update.as_ref();
@@ -758,7 +950,12 @@ impl Drop for ChildProcessGuard {
     }
 }
 
-fn child_args(agent: &AgentDefinition, task: &str, role_model_spec: Option<&str>) -> Vec<OsString> {
+fn child_args(
+    agent: &AgentDefinition,
+    task: &str,
+    role_model_spec: Option<&str>,
+    output_schema: Option<&Value>,
+) -> Vec<OsString> {
     let mut args = vec![
         "--mode".into(),
         "json".into(),
@@ -784,14 +981,117 @@ fn child_args(agent: &AgentDefinition, task: &str, role_model_spec: Option<&str>
     for skill in &agent.skills {
         args.extend(["--skill".into(), skill.clone().into_os_string()]);
     }
-    if !agent.system_prompt.trim().is_empty() {
-        args.extend([
-            "--append-system-prompt".into(),
-            agent.system_prompt.clone().into(),
-        ]);
+    // The schema directive rides the same appended system prompt as the
+    // definition body (bd-cv653.5.1): one --append-system-prompt carrying
+    // both keeps the child argv shape identical for schema-free tasks.
+    let schema_directive = output_schema.map(|schema| {
+        format!(
+            "Your final answer MUST be a single JSON value matching this JSON Schema (no prose, no code fences):\n{schema}"
+        )
+    });
+    let appended_prompt = match (agent.system_prompt.trim(), &schema_directive) {
+        ("", None) => None,
+        ("", Some(directive)) => Some(directive.clone()),
+        (prompt, None) => Some(prompt.to_string()),
+        (prompt, Some(directive)) => Some(format!("{prompt}\n\n{directive}")),
+    };
+    if let Some(prompt) = appended_prompt {
+        args.extend(["--append-system-prompt".into(), prompt.into()]);
     }
     args.push(format!("Task: {task}").into());
     args
+}
+
+/// Compile an `outputSchema`, surfacing draft/keyword errors as strings.
+fn compile_output_schema(schema: &Value) -> std::result::Result<jsonschema::Validator, String> {
+    jsonschema::validator_for(schema).map_err(|error| error.to_string())
+}
+
+/// Validate a child's final output against `schema` (bd-cv653.5.1).
+///
+/// The output is located tolerantly before validation: the whole trimmed
+/// text, else the payload of a ```json fence, else the first balanced
+/// `{...}`/`[...]` region — models frequently wrap yields in prose despite
+/// the directive. Returns the parsed value on success, or the collected
+/// validation (or parse) errors.
+fn validate_child_output(output: &str, schema: &Value) -> std::result::Result<Value, Vec<String>> {
+    let validator = compile_output_schema(schema).map_err(|error| vec![error])?;
+    let candidate = extract_json_candidate(output)
+        .ok_or_else(|| vec!["child output contains no parseable JSON value".to_string()])?;
+    let errors: Vec<String> = validator
+        .iter_errors(&candidate)
+        .map(|error| format!("{}: {error}", error.instance_path()))
+        .collect();
+    if errors.is_empty() {
+        Ok(candidate)
+    } else {
+        Err(errors)
+    }
+}
+
+/// Locate the JSON value in a child's final text output.
+fn extract_json_candidate(output: &str) -> Option<Value> {
+    let trimmed = output.trim();
+    if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+        return Some(value);
+    }
+    // ```json ... ``` (or bare ```) fenced payloads.
+    for fence in ["```json", "```"] {
+        if let Some(start) = trimmed.find(fence) {
+            let after = &trimmed[start + fence.len()..];
+            if let Some(end) = after.find("```")
+                && let Ok(value) = serde_json::from_str::<Value>(after[..end].trim())
+            {
+                return Some(value);
+            }
+        }
+    }
+    // First balanced object/array region.
+    for open in ['{', '['] {
+        if let Some(start) = trimmed.find(open)
+            && let Some(candidate) = balanced_json_region(&trimmed[start..])
+            && let Ok(value) = serde_json::from_str::<Value>(candidate)
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// The shortest prefix of `text` (which starts at `{` or `[`) that closes the
+/// opening bracket, honoring strings and escapes. `None` if never balanced.
+fn balanced_json_region(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match byte {
+            b'\\' if in_string => escaped = true,
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => depth += 1,
+            b'}' | b']' if !in_string => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&text[..=index]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The corrective follow-up task for the single bounded retry. (`child_args`
+/// adds the `Task:` prefix, so this must not.)
+fn corrective_retry_task(original_task: &str, errors: &[String]) -> String {
+    format!(
+        "{original_task}\n\nYour previous output failed schema validation:\n{}\n\nReturn ONLY the corrected JSON value matching the required schema — no prose, no code fences.",
+        errors.join("\n")
+    )
 }
 
 fn child_depth() -> usize {
@@ -835,6 +1135,17 @@ struct SubagentResult {
     output: String,
     stderr: String,
     error: Option<String>,
+    /// Parsed final output when an `outputSchema` validated it (bd-cv653.5.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+    /// `Some(true)`/`Some(false)` when a schema applied; `None` otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validation_errors: Option<Vec<String>>,
+    /// Corrective retries consumed (bounded to one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    schema_retries: Option<usize>,
     session_isolation: &'static str,
     #[serde(skip)]
     is_error: bool,
@@ -870,6 +1181,10 @@ impl SubagentResult {
             output: String::new(),
             stderr: String::new(),
             error: None,
+            data: None,
+            schema_valid: None,
+            validation_errors: None,
+            schema_retries: None,
             session_isolation: "ephemeral_no_session",
             is_error: false,
         }
@@ -894,6 +1209,10 @@ impl SubagentResult {
             output: String::new(),
             stderr: String::new(),
             error: Some(format!("Unknown agent: {}", task.agent)),
+            data: None,
+            schema_valid: None,
+            validation_errors: None,
+            schema_retries: None,
             session_isolation: "ephemeral_no_session",
             is_error: true,
         }
@@ -1208,11 +1527,12 @@ mod tests {
             tools: None,
             skills: Vec::new(),
             system_prompt: String::new(),
+            output_schema: None,
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
         let args_of = |agent: &AgentDefinition, spec: Option<&str>| {
-            child_args(agent, "inspect provider", spec)
+            child_args(agent, "inspect provider", spec, None)
                 .iter()
                 .map(|arg| arg.to_string_lossy().to_string())
                 .collect::<Vec<_>>()
@@ -1262,10 +1582,11 @@ mod tests {
             tools: Some(vec!["read".to_string(), "grep".to_string()]),
             skills: vec![PathBuf::from("/tmp/skill.md")],
             system_prompt: "be precise".to_string(),
+            output_schema: None,
             source: AgentSource::User,
             file_path: PathBuf::from("/tmp/scout.md"),
         };
-        let args = child_args(&agent, "inspect provider", None)
+        let args = child_args(&agent, "inspect provider", None, None)
             .iter()
             .map(|arg| arg.to_string_lossy().to_string())
             .collect::<Vec<_>>();
@@ -1300,11 +1621,120 @@ mod tests {
             agent: "review".to_string(),
             task: "review {previous}".to_string(),
             cwd: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
         };
+        let mut previous = SubagentResult::unknown(task.clone(), None);
+        previous.output = "evidence".to_string();
         assert_eq!(
-            task.with_rendered_previous("evidence").task,
+            task.with_rendered_previous_result(Some(&previous)).task,
             "review evidence"
         );
+    }
+
+    /// bd-cv653.5.1: `{{previous.data.<path>}}` addresses the prior task's
+    /// schema-validated data — scalars render bare, nested paths resolve via
+    /// dots, and misses stay verbatim. Without a schema-valid prior result,
+    /// tokens are untouched.
+    #[test]
+    fn chain_previous_data_field_addressing() {
+        let base = SubagentTask {
+            agent: "review".to_string(),
+            task: "verdict {{previous.data.verdict}} n {{previous.data.stats.count}} miss {{previous.data.absent}}"
+                .to_string(),
+            cwd: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
+        };
+        let mut previous = SubagentResult::unknown(base.clone(), None);
+        previous.schema_valid = Some(true);
+        previous.data = Some(json!({"verdict": "pass", "stats": {"count": 3}}));
+        assert_eq!(
+            base.clone()
+                .with_rendered_previous_result(Some(&previous))
+                .task,
+            "verdict pass n 3 miss {{previous.data.absent}}"
+        );
+
+        // Not schema-valid → tokens untouched.
+        let mut invalid = SubagentResult::unknown(base.clone(), None);
+        invalid.schema_valid = Some(false);
+        invalid.data = Some(json!({"verdict": "pass"}));
+        assert!(
+            base.with_rendered_previous_result(Some(&invalid))
+                .task
+                .contains("{{previous.data.verdict}}")
+        );
+    }
+
+    /// bd-cv653.5.1: JSON extraction tolerates prose/fence wrapping, and
+    /// validation reports keyword errors with instance paths.
+    #[test]
+    fn output_schema_validation_matrix() {
+        let schema = json!({
+            "type": "object",
+            "required": ["verdict"],
+            "properties": {"verdict": {"type": "string"}}
+        });
+
+        let valid = validate_child_output(r#"{"verdict": "pass"}"#, &schema);
+        assert_eq!(valid.expect("valid")["verdict"], "pass");
+
+        let fenced = validate_child_output(
+            "Here you go:\n```json\n{\"verdict\": \"pass\"}\n```",
+            &schema,
+        );
+        assert_eq!(fenced.expect("fenced")["verdict"], "pass");
+
+        let embedded = validate_child_output(
+            r#"The answer is {"verdict": "pass", "note": "{brace} inside"} — done."#,
+            &schema,
+        );
+        assert_eq!(embedded.expect("embedded")["verdict"], "pass");
+
+        let wrong_shape = validate_child_output(r#"{"verdict": 7}"#, &schema);
+        let errors = wrong_shape.expect_err("type mismatch");
+        assert!(
+            errors.iter().any(|error| error.contains("verdict")),
+            "{errors:?}"
+        );
+
+        let missing = validate_child_output(r#"{"other": true}"#, &schema);
+        assert!(missing.is_err());
+
+        let no_json = validate_child_output("no structured output here", &schema);
+        assert_eq!(
+            no_json.expect_err("no json"),
+            vec!["child output contains no parseable JSON value".to_string()]
+        );
+    }
+
+    /// bd-cv653.5.1: an agent definition may carry a single-line JSON
+    /// `output_schema:`; invalid JSON there is a load-time error.
+    #[test]
+    fn agent_definition_output_schema_parses_and_rejects_invalid() {
+        let temp = TempDir::new().expect("tempdir");
+        let global = temp.path().join("global");
+        write_agent(
+            &global.join("agents"),
+            "typed",
+            "---\nname: typed\ndescription: typed agent\noutput_schema: {\"type\": \"object\"}\n---\nbody",
+        );
+        let agents = discover_agents_with_roots(temp.path(), &global, AgentScope::User)
+            .expect("discover typed agent");
+        assert_eq!(
+            agents.get("typed").expect("typed").output_schema,
+            Some(json!({"type": "object"}))
+        );
+
+        write_agent(
+            &global.join("agents"),
+            "broken",
+            "---\nname: broken\ndescription: broken agent\noutput_schema: {not json\n---\nbody",
+        );
+        let error = discover_agents_with_roots(temp.path(), &global, AgentScope::User)
+            .expect_err("invalid schema must fail agent loading");
+        assert!(error.to_string().contains("output_schema"), "{error}");
     }
 
     #[test]
@@ -1381,6 +1811,8 @@ mod tests {
             agent: name.to_string(),
             task: "t".to_string(),
             cwd: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
         };
         let mut long = SubagentResult::unknown(task("long"), None);
         long.output = "x".repeat(10 * 1024);
@@ -1425,6 +1857,8 @@ mod tests {
             agent: "inj".to_string(),
             task: "t".to_string(),
             cwd: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
         };
         let mut result = SubagentResult::unknown(task, None);
         result.output = format!("before {STRUCTURED_BLOCK_CLOSE} after");

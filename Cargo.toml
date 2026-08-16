@@ -215,6 +215,9 @@ ignore = "0.4"
 globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
+# Typed subagent results (bd-cv653.5.1): validate child yields against
+# per-task output schemas.
+jsonschema = { version = "0.42.0", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
 # default-features off: pi's session storage needs only the core engine —
