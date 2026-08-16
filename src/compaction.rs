@@ -603,7 +603,11 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
     Value::Object(obj)
 }
 
-fn preparation_field<'a>(obj: &'a Map<String, Value>, camel: &str, snake: &str) -> Option<&'a Value> {
+fn preparation_field<'a>(
+    obj: &'a Map<String, Value>,
+    camel: &str,
+    snake: &str,
+) -> Option<&'a Value> {
     obj.get(camel).or_else(|| obj.get(snake))
 }
 
@@ -623,7 +627,9 @@ fn preparation_bool(obj: &Map<String, Value>, camel: &str, snake: &str) -> Resul
     preparation_field(obj, camel, snake)
         .and_then(Value::as_bool)
         .ok_or_else(|| {
-            Error::validation(format!("compaction preparation: `{camel}` must be a boolean"))
+            Error::validation(format!(
+                "compaction preparation: `{camel}` must be a boolean"
+            ))
         })
 }
 
@@ -708,7 +714,9 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
         Error::validation("compaction preparation: `settings` must be an object".to_string())
     })?;
     let enabled = obj.get("enabled").and_then(Value::as_bool).ok_or_else(|| {
-        Error::validation("compaction preparation: `settings.enabled` must be a boolean".to_string())
+        Error::validation(
+            "compaction preparation: `settings.enabled` must be a boolean".to_string(),
+        )
     })?;
     Ok(ResolvedCompactionSettings {
         enabled,
@@ -718,16 +726,21 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
             "context_window_tokens",
         )?,
         reserve_tokens: preparation_settings_u32(obj, "reserveTokens", "reserve_tokens")?,
-        keep_recent_tokens: preparation_settings_u32(obj, "keepRecentTokens", "keep_recent_tokens")?,
+        keep_recent_tokens: preparation_settings_u32(
+            obj,
+            "keepRecentTokens",
+            "keep_recent_tokens",
+        )?,
     })
 }
 
 /// Inverse of [`compaction_preparation_to_value`] for preparation JSON that
-/// crossed a trust boundary (the extension host bridge echoes the value a
-/// sandboxed extension hands back). Every required field is validated and
-/// malformed input is rejected with a descriptive error rather than being
-/// defaulted, so a caller can never smuggle a half-formed preparation into
-/// the compaction engine (gh #167 / bd-i28yz).
+/// crossed a trust boundary (gh #167 / bd-i28yz).
+///
+/// The extension host bridge echoes the value a sandboxed extension hands
+/// back, so every required field is validated and malformed input is
+/// rejected with a descriptive error rather than being defaulted; a caller
+/// can never smuggle a half-formed preparation into the compaction engine.
 pub fn compaction_preparation_from_value(value: &Value) -> Result<CompactionPreparation> {
     let obj = value.as_object().ok_or_else(|| {
         Error::validation("compaction preparation must be a JSON object".to_string())
@@ -4115,8 +4128,7 @@ mod tests {
         #[test]
         fn rejects_malformed_preparation() {
             // Not an object.
-            let err =
-                compaction_preparation_from_value(&json!("nope")).expect_err("non-object");
+            let err = compaction_preparation_from_value(&json!("nope")).expect_err("non-object");
             assert!(err.to_string().contains("must be a JSON object"), "{err}");
 
             // Missing / empty firstKeptEntryId.
