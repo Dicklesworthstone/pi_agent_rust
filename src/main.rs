@@ -1710,9 +1710,23 @@ async fn run(
     // always registered — the tool self-errors outside plan mode.
     {
         let plan_state = agent_session.agent.plan_state();
-        agent_session.agent.extend_tools(vec![
-            Box::new(pi::plan::SubmitPlanTool::new(plan_state)) as Box<dyn pi::tools::Tool>
-        ]);
+        let auto_approve = cli.plan_yolo || config.plan_auto_approve();
+        agent_session
+            .agent
+            .extend_tools(vec![Box::new(pi::plan::SubmitPlanTool::new(
+                plan_state.clone(),
+                auto_approve,
+            )) as Box<dyn pi::tools::Tool>]);
+        if cli.plan_mode {
+            plan_state.enter_planning();
+            let cx = pi::agent_cx::AgentCx::for_request();
+            if let Ok(mut inner) = agent_session.session.lock(cx.cx()).await {
+                inner.append_custom_entry(
+                    "plan_mode".to_string(),
+                    Some(serde_json::json!({"mode": "planning", "via": "--plan-mode"})),
+                );
+            }
+        }
     }
     // The ask tool's picker handler is installed by the interactive host
     // below; non-interactive sessions resolve via ask_policy (bd-cv653.3.8).
@@ -2010,6 +2024,14 @@ async fn run(
                 model: cli.model.clone(),
                 api_key: cli.api_key.clone(),
                 working_directory: Some(cwd.clone()),
+                // Session persistence honors the same flags as the default
+                // stack: saved by default, --no-session for ephemeral,
+                // --session/--session-dir for explicit paths. The SDK path
+                // creates its own session file; the default stack's early
+                // session was dropped above without writing anything.
+                no_session: cli.no_session,
+                session_path: cli.session.as_ref().map(PathBuf::from),
+                session_dir: cli.session_dir.as_ref().map(PathBuf::from),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
