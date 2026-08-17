@@ -363,6 +363,84 @@ pub enum AuthStorageLoadFailure {
     Other(Error),
 }
 
+// === Credential rotation (bd-cv653.3.2) ===
+//
+// Plural list env vars (`<FIRST_AUTH_ENV_KEY>S`, e.g. `OPENAI_API_KEYS`)
+// stack multiple keys for one provider. Rotation is process-stable (one
+// process = one session for print/RPC single runs) with affinity derived from
+// the auth-file path + provider, and per-credential exponential backoff on
+// 429. Documented boundary (flywheel composition): the owner's caam performs
+// ACCOUNT-level switching for CLI subscriptions externally; this ring handles
+// KEY-level rotation inside pi. Never shell out to caam from the hot path.
+static CREDENTIAL_RINGS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, crate::failover::CredentialRing>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Resolve the current usable key from a provider's rotation ring, if the
+/// plural list env var is set. `None` = rotation not configured for this
+/// provider (caller falls back to the single-key paths).
+fn resolve_rotated_key<F>(provider: &str, auth_path: &Path, mut env_lookup: F) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let plural_var = env_keys_for_provider(provider)
+        .first()
+        .map(|key| format!("{key}S"))?;
+    let list_value = env_lookup(&plural_var)?;
+    let keys: Vec<String> = list_value
+        .split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .map(str::to_string)
+        .collect();
+    // Rotation engages only with 2+ keys: a single "stacked" key offers no
+    // rotation value, and requiring the comma keeps permissive env closures
+    // (anything-set probes) from hijacking the single-key precedence path.
+    if keys.len() < 2 {
+        return None;
+    }
+    let seed =
+        crate::failover::session_affinity_hash(&format!("{}:{provider}", auth_path.display()));
+    {
+        let mut map = CREDENTIAL_RINGS.lock().ok()?;
+        let value = {
+            let ring = map.entry(provider.to_string()).or_insert_with(|| {
+                crate::failover::CredentialRing::new(keys, seed)
+                    .expect("non-empty key list checked above")
+            });
+            ring.current_key(std::time::Instant::now())
+                .map(str::to_string)
+        };
+        drop(map);
+        value
+    }
+}
+
+/// Report a 429/rate-limit against a credential (bd-cv653.3.2). The key backs
+/// off exponentially; the next `resolve_api_key` rotates to a healthy sibling.
+pub fn report_provider_rate_limit(provider: &str, key: &str) {
+    if key.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut map) = CREDENTIAL_RINGS.lock()
+        && let Some(ring) = map.get_mut(provider)
+    {
+        ring.report_rate_limited(
+            key,
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(300),
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_credential_rings_for_tests() {
+    if let Ok(mut map) = CREDENTIAL_RINGS.lock() {
+        map.clear();
+    }
+}
+
 impl AuthStorageLoadFailure {
     #[must_use]
     pub fn into_error(self) -> Error {
@@ -1550,6 +1628,14 @@ impl AuthStorage {
             "sap-ai-core" => &[],
             _ => env_keys_for_provider(provider),
         };
+
+        // Credential rotation (bd-cv653.3.2): a plural list env var stacks
+        // multiple keys for this provider; the ring picks the healthy one.
+        if !matches!(canonical_provider, "amazon-bedrock" | "sap-ai-core")
+            && let Some(key) = resolve_rotated_key(provider, &self.path, &mut env_lookup)
+        {
+            return Some(key);
+        }
 
         if let Some(key) = generic_env_keys.iter().find_map(|var| {
             env_lookup(var).and_then(|value| {
@@ -6245,6 +6331,63 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .to_string()
+    }
+
+    // === Credential rotation wiring (bd-cv653.3.2) ===
+
+    // The credential ring is process-global; these tests reset it, so they
+    // must not interleave (cargo runs tests on parallel threads).
+    static ROTATION_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    #[test]
+    fn rotated_key_reads_plural_env_list_and_uses_affinity() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "k-aaa, k-bbb ,k-ccc".to_string());
+        let first = resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env)
+            .expect("plural list resolves a key");
+        assert!(["k-aaa", "k-bbb", "k-ccc"].contains(&first.as_str()));
+        // Same auth path + provider → same affinity pick (stability).
+        let again = resolve_rotated_key("openai", Path::new("/tmp/auth-a.json"), env)
+            .expect("stable affinity");
+        assert_eq!(first, again);
+    }
+
+    #[test]
+    fn rotated_key_backs_off_limited_key_and_rotates() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "k-aaa,k-bbb".to_string());
+        let first =
+            resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env).expect("first key");
+        report_provider_rate_limit("openai", &first);
+        let next = resolve_rotated_key("openai", Path::new("/tmp/auth-b.json"), env)
+            .expect("rotation provides sibling");
+        assert_ne!(first, next, "backed-off key must rotate to its sibling");
+    }
+
+    #[test]
+    fn rotated_key_all_cooling_falls_through_to_none() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let env = |var: &str| (var == "OPENAI_API_KEYS").then(|| "k-one,k-two".to_string());
+        let first = resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env)
+            .expect("first key resolves");
+        report_provider_rate_limit("openai", &first);
+        let second = resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env)
+            .expect("sibling rotates in");
+        report_provider_rate_limit("openai", &second);
+        // Both keys now inside the 300s max backoff window: nothing usable.
+        assert!(resolve_rotated_key("openai", Path::new("/tmp/auth-c.json"), env).is_none());
+    }
+
+    #[test]
+    fn rotation_ignores_non_plural_vars_and_bedrock() {
+        let _guard = ROTATION_TEST_LOCK.lock().expect("rotation test lock");
+        reset_credential_rings_for_tests();
+        let env = |var: &str| (var == "OPENAI_API_KEY").then(|| "k-single".to_string());
+        assert!(resolve_rotated_key("openai", Path::new("/tmp/auth-d.json"), env).is_none());
     }
 
     #[test]

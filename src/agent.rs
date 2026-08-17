@@ -1066,6 +1066,30 @@ pub enum AgentEvent {
         #[serde(rename = "finalError", skip_serializing_if = "Option::is_none")]
         final_error: Option<String>,
     },
+    /// Cross-model failover start (bd-cv653.3.2): the active model is being
+    /// swapped to a fallback-chain entry after a classified transient failure.
+    FailoverStart {
+        #[serde(rename = "fromProvider")]
+        from_provider: String,
+        #[serde(rename = "fromModel")]
+        from_model: String,
+        #[serde(rename = "toProvider")]
+        to_provider: String,
+        #[serde(rename = "toModel")]
+        to_model: String,
+        /// Failure class that triggered the failover (quota/overload/transient).
+        class: String,
+        attempt: u32,
+    },
+    /// Cross-model failover end (bd-cv653.3.2): the turn completed on a
+    /// failover entry, or the primary was restored after cooldown.
+    FailoverEnd {
+        success: bool,
+        provider: String,
+        model: String,
+        #[serde(rename = "restoredPrimary")]
+        restored_primary: bool,
+    },
     /// Extension error during event dispatch or execution.
     ExtensionError {
         #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
@@ -7277,6 +7301,8 @@ mod abort_tests {
             AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
             AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
+            AgentEvent::FailoverStart { .. } => "failover_start",
+            AgentEvent::FailoverEnd { .. } => "failover_end",
             AgentEvent::ExtensionError { .. } => "extension_error",
         }
     }

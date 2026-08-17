@@ -389,9 +389,11 @@ pub struct TitlingSettings {
     pub auto_title: Option<bool>,
 }
 
-/// A path-scoped model-set override (bd-cv653.3.2). Applies when the current
-/// working directory is inside `path` (or `path` itself); the most specific
-/// matching prefix wins over less specific prefixes and the global settings.
+/// A path-scoped model-set override (bd-cv653.3.2).
+///
+/// Applies when the current working directory is inside `path` (or `path`
+/// itself); the most specific matching prefix wins over less specific
+/// prefixes and the global settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelScopeOverride {

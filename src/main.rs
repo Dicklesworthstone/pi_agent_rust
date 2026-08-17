@@ -1549,11 +1549,21 @@ async fn run(
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
     }
 
+    // Path-scoped model sets + disabled providers (bd-cv653.3.2): the most
+    // specific matching override pins this repo's model set; disabled
+    // providers are filtered out of the scoped pool entirely.
+    let scope_override = config
+        .model_scope_overrides
+        .as_deref()
+        .and_then(|overrides| pi::failover::best_scope_override(overrides, &cwd));
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         pi::app::parse_models_arg(models_arg)
+    } else if let Some(scope_models) = scope_override.and_then(|ov| ov.enabled_models.clone()) {
+        scope_models
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
+    let disabled_providers = config.disabled_providers.clone().unwrap_or_default();
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
@@ -1562,6 +1572,15 @@ async fn run(
             &model_registry,
             has_cli_api_key_override(cli.api_key.as_deref()),
         )
+        .into_iter()
+        .filter(|scoped| {
+            !pi::failover::provider_is_disabled(
+                &disabled_providers,
+                scope_override,
+                &scoped.model.model.provider,
+            )
+        })
+        .collect()
     };
     let has_extensions = !resources.extensions().is_empty();
 
@@ -1968,7 +1987,17 @@ async fn run(
             .iter()
             .map(|sm| sm.model.clone())
             .collect::<Vec<_>>();
-        let available_models = model_registry.get_available();
+        let available_models = model_registry
+            .get_available()
+            .into_iter()
+            .filter(|entry| {
+                !pi::failover::provider_is_disabled(
+                    &disabled_providers,
+                    scope_override,
+                    &entry.model.provider,
+                )
+            })
+            .collect::<Vec<_>>();
         let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
 
         run_interactive_mode(
@@ -1997,6 +2026,11 @@ async fn run(
             &resources,
             runtime_handle.clone(),
             &config,
+            Some(FailoverResolution {
+                available_models: &model_registry.get_available(),
+                auth: &auth,
+                cli_api_key: cli.api_key.as_deref(),
+            }),
         )
         .await;
         // Explicitly shut down extension runtimes before the session drops.
@@ -7066,6 +7100,16 @@ async fn run_acp_mode(options: pi::acp::AcpOptions) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+/// Resolution context for cross-model failover in print mode (bd-cv653.3.2):
+/// the model pool, auth storage, and any CLI key override used to resolve
+/// fallback-chain entries into concrete providers.
+#[derive(Clone, Copy)]
+struct FailoverResolution<'a> {
+    available_models: &'a [ModelEntry],
+    auth: &'a AuthStorage,
+    cli_api_key: Option<&'a str>,
+}
+
 async fn run_print_mode(
     session: &mut AgentSession,
     mode: &str,
@@ -7074,6 +7118,7 @@ async fn run_print_mode(
     resources: &ResourceLoader,
     runtime_handle: RuntimeHandle,
     config: &Config,
+    failover_ctx: Option<FailoverResolution<'_>>,
 ) -> Result<()> {
     if mode.ne("text") && mode.ne("json") {
         bail!("Unknown mode: {mode}");
@@ -7175,6 +7220,7 @@ async fn run_print_mode(
             is_json,
             &text_stream_state,
             PromptInput::Content(content),
+            failover_ctx,
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
@@ -7199,6 +7245,7 @@ async fn run_print_mode(
             is_json,
             &text_stream_state,
             PromptInput::Text(message),
+            failover_ctx,
         )
         .await?;
         sent_prompts = sent_prompts.saturating_add(1);
@@ -7378,6 +7425,103 @@ fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
 /// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`
 /// event emission. Mirrors the retry behaviour in RPC mode (`src/rpc.rs`).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// Print-mode failover swap (bd-cv653.3.2): classify the terminal error; if
+/// eligible, resolve the next chain entry, swap the agent's provider, emit
+/// FailoverStart (json mode), and record the session audit + ModelChange.
+/// Returns the swapped-to `(provider, model)` so the caller can continue the
+/// turn on it; `None` means no failover happened.
+async fn try_print_failover(
+    session: &mut AgentSession,
+    config: &Config,
+    failover_ctx: Option<FailoverResolution<'_>>,
+    position: &mut usize,
+    error_text: Option<&str>,
+    is_json: bool,
+) -> Option<(String, String)> {
+    let ctx = failover_ctx?;
+    let error_text = error_text?;
+    let class = pi::failover::classify_failover(error_text)?;
+    let chains = config.retry.as_ref()?.fallback_chains.as_ref()?;
+
+    let current_provider = session.agent.provider();
+    let (from_provider, from_model) = (
+        current_provider.name().to_string(),
+        current_provider.model_id().to_string(),
+    );
+    let chain = pi::failover::chain_for(chains, "default", &from_provider, &from_model)?;
+    let cap = config.max_failovers_per_turn() as usize;
+
+    while *position < chain.entries.len() && *position < cap {
+        let spec = &chain.entries[*position];
+        let candidate = (|| {
+            let (provider, model_id) = pi::provider_metadata::split_provider_model_spec(spec)?;
+            ctx.available_models
+                .iter()
+                .find(|m| {
+                    pi::provider_metadata::provider_ids_match(&m.model.provider, provider)
+                        && m.model.id.eq_ignore_ascii_case(model_id)
+                })
+                .cloned()
+                .or_else(|| pi::models::ad_hoc_model_entry(provider, model_id))
+        })();
+        *position += 1;
+        let Some(entry) = candidate else { continue };
+        let key = pi::models::resolve_model_key(ctx.cli_api_key, ctx.auth, &entry);
+        if pi::models::model_requires_configured_credential(&entry) && key.is_none() {
+            continue; // never fail over into an auth error
+        }
+
+        let Ok(provider_impl) = providers::create_provider(
+            &entry,
+            session.extensions.as_ref().map(ExtensionRegion::manager),
+        ) else {
+            continue;
+        };
+        session.agent.set_provider(provider_impl);
+        session.agent.stream_options_mut().api_key.clone_from(&key);
+        session
+            .agent
+            .stream_options_mut()
+            .headers
+            .clone_from(&entry.headers);
+
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        if is_json {
+            emit_json_event(&AgentEvent::FailoverStart {
+                from_provider: from_provider.clone(),
+                from_model: from_model.clone(),
+                to_provider: to_provider.clone(),
+                to_model: to_model.clone(),
+                class: format!("{class:?}").to_ascii_lowercase(),
+                attempt: *position as u32,
+            });
+        }
+
+        // Session audit + model-change entries (persisted sessions only).
+        {
+            let cx = pi::agent_cx::AgentCx::for_request();
+            if let Ok(mut inner) = session.session.lock(cx.cx()).await {
+                inner.append_custom_entry(
+                    "failover".to_string(),
+                    Some(serde_json::json!({
+                        "from": format!("{from_provider}/{from_model}"),
+                        "to": format!("{to_provider}/{to_model}"),
+                        "class": format!("{class:?}").to_ascii_lowercase(),
+                        "attempt": *position,
+                    })),
+                );
+                inner.header.provider = Some(to_provider.clone());
+                inner.header.model_id = Some(to_model.clone());
+                inner.append_model_change(to_provider.clone(), to_model.clone());
+            }
+        }
+
+        return Some((to_provider, to_model));
+    }
+    None
+}
+
 async fn run_print_prompt_with_retry<H, EH>(
     session: &mut AgentSession,
     config: &Config,
@@ -7388,6 +7532,7 @@ async fn run_print_prompt_with_retry<H, EH>(
     is_json: bool,
     text_stream_state: &Arc<StdMutex<PrintTextStreamState>>,
     input: PromptInput,
+    failover_ctx: Option<FailoverResolution<'_>>,
 ) -> Result<AssistantMessage>
 where
     H: Fn() -> EH + Sync,
@@ -7421,6 +7566,7 @@ where
     }
 
     let mut retry_count: u32 = 0;
+    let mut failover_position: usize = 0;
     let mut current_result = first_result;
 
     loop {
@@ -7473,6 +7619,30 @@ where
             Ok(msg) => {
                 // Success or non-retryable error or max retries reached.
                 let success = !matches!(msg.stop_reason, StopReason::Error);
+                if !success {
+                    // Failover (bd-cv653.3.2): a classified transient failure
+                    // on the final retry walks the fallback chain.
+                    if let Some(_swapped) = try_print_failover(
+                        session,
+                        config,
+                        failover_ctx,
+                        &mut failover_position,
+                        msg.error_message.as_deref(),
+                        is_json,
+                    )
+                    .await
+                    {
+                        retry_count = 0;
+                        let _ = session.revert_incomplete_response().await;
+                        current_result = session
+                            .run_continue_with_abort(
+                                Some(abort_signal.clone()),
+                                make_event_handler(),
+                            )
+                            .await;
+                        continue;
+                    }
+                }
                 if retry_count > 0 && is_json {
                     emit_json_event(&AgentEvent::AutoRetryEnd {
                         success,
@@ -7488,6 +7658,16 @@ where
             }
             Err(err) => {
                 let err_str = err.to_string();
+                // Rotation bookkeeping (bd-cv653.3.2): a 429 backs the current
+                // key off so the next resolve rotates to a healthy sibling.
+                if pi::failover::classify_failover(&err_str)
+                    == Some(pi::failover::FailoverClass::Quota)
+                {
+                    let provider_name = session.agent.provider().name().to_string();
+                    if let Some(key) = session.agent.stream_options().api_key.clone() {
+                        pi::auth::report_provider_rate_limit(&provider_name, &key);
+                    }
+                }
                 // Classify from the TYPED error first (transient io::ErrorKind
                 // via the source chain), then fall back to message-text matching
                 // for prose-only errors (pi_agent_rust#118).
@@ -7516,10 +7696,44 @@ where
                     // any already-completed tool cycles from earlier in the turn
                     // are preserved rather than re-executed.
                     let _ = session.revert_incomplete_response().await;
+                    // Credential rotation (bd-cv653.3.2): re-resolve the key so
+                    // a backed-off credential rotates to its healthy sibling on
+                    // the retry. Explicit --api-key stays pinned by design.
+                    if failover_ctx.is_none_or(|ctx| ctx.cli_api_key.is_none()) {
+                        let provider_name = session.agent.provider().name().to_string();
+                        if let Some(auth) = failover_ctx.map(|ctx| ctx.auth)
+                            && let Some(fresh) = auth.resolve_api_key(&provider_name, None)
+                        {
+                            session.agent.stream_options_mut().api_key = Some(fresh);
+                        }
+                    }
                     current_result = session
                         .run_continue_with_abort(Some(abort_signal.clone()), make_event_handler())
                         .await;
                 } else {
+                    // Failover (bd-cv653.3.2): HTTP/transport errors surface on
+                    // the Err path, so the chain walk must live here too —
+                    // not only on the Ok-with-error-result path.
+                    if let Some(_swapped) = try_print_failover(
+                        session,
+                        config,
+                        failover_ctx,
+                        &mut failover_position,
+                        Some(err_str.as_str()),
+                        is_json,
+                    )
+                    .await
+                    {
+                        retry_count = 0;
+                        let _ = session.revert_incomplete_response().await;
+                        current_result = session
+                            .run_continue_with_abort(
+                                Some(abort_signal.clone()),
+                                make_event_handler(),
+                            )
+                            .await;
+                        continue;
+                    }
                     if retry_count > 0 && is_json {
                         emit_json_event(&AgentEvent::AutoRetryEnd {
                             success: false,

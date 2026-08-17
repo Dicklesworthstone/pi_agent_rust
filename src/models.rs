@@ -1285,7 +1285,27 @@ pub(crate) fn normalize_api_key_opt(api_key: Option<String>) -> Option<String> {
     })
 }
 
-pub(crate) fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
+/// Resolve the API key for a model entry with the standard precedence
+/// (bd-cv653.3.2).
+///
+/// Precedence: CLI `--api-key` > stored auth credentials > the entry's
+/// inline key. Lifted to the public surface for the print-mode failover.
+#[must_use]
+pub fn resolve_model_key(
+    cli_api_key: Option<&str>,
+    auth: &crate::auth::AuthStorage,
+    entry: &ModelEntry,
+) -> Option<String> {
+    cli_api_key
+        .and_then(|key| {
+            let trimmed = key.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        })
+        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
+        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+}
+
+pub fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
     let provider = entry.model.provider.as_str();
     let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
 
@@ -4239,7 +4259,7 @@ where
     })
 }
 
-pub(crate) fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<ModelEntry> {
+pub fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<ModelEntry> {
     let auth = AuthStorage::load(crate::config::Config::auth_path()).ok();
     let mut entry = ad_hoc_model_entry_with_sap_resolver(provider, model_id, || {
         auth.as_ref().and_then(resolve_sap_credentials)

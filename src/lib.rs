@@ -142,6 +142,7 @@ pub mod extension_validation;
 pub mod extensions;
 #[doc(hidden)]
 pub mod extensions_js;
+pub mod failover;
 #[doc(hidden)]
 pub mod file_lock;
 #[doc(hidden)]

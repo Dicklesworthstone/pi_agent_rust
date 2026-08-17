@@ -27,7 +27,7 @@ use crate::extensions::{
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
-use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
+use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
@@ -432,6 +432,12 @@ struct RpcSharedState {
     follow_up_mode: QueueMode,
     auto_compaction_enabled: bool,
     auto_retry_enabled: bool,
+    /// Cross-turn failover state (bd-cv653.3.2): cooldown tracker and the
+    /// currently active non-primary model `(provider, model_id)`, if any.
+    failover_cooldown: Option<crate::failover::CooldownTracker>,
+    active_failover_model: Option<(String, String)>,
+    /// Position of the last used entry in the active chain (per-chain walk).
+    failover_chain_position: Option<usize>,
 }
 
 const MAX_RPC_PENDING_MESSAGES: usize = 128;
@@ -464,6 +470,13 @@ impl RpcSharedState {
             follow_up_mode: config.follow_up_queue_mode(),
             auto_compaction_enabled: config.compaction_enabled(),
             auto_retry_enabled: config.retry_enabled(),
+            failover_cooldown: config
+                .retry
+                .as_ref()
+                .and_then(|r| r.fallback_chains.as_ref())
+                .map(|_| crate::failover::CooldownTracker::new(config.failover_cooldown_secs())),
+            active_failover_model: None,
+            failover_chain_position: None,
         }
     }
 
@@ -2314,8 +2327,24 @@ async fn run_prompt_with_retry(
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
 
+    // Cooldown restore (bd-cv653.3.2): if a previous turn failed over and the
+    // cooldown has elapsed, swap back to the primary before running.
+    maybe_restore_primary(
+        Arc::clone(&session),
+        Arc::clone(&shared_state),
+        out_tx.clone(),
+        &options,
+        &cx,
+    )
+    .await;
+
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
+    let mut failovers_this_turn: u32 = 0;
+    // Distinct from retry_count: a failover resets the retry BUDGET but must
+    // never replay the first attempt (which would re-add the user message and
+    // re-execute completed tool cycles — pi_agent_rust#125 semantics).
+    let mut first_attempt_done = false;
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
@@ -2350,8 +2379,19 @@ async fn run_prompt_with_retry(
             let event_handler =
                 rpc_agent_event_handler(out_tx.clone(), runtime_for_events, extensions);
 
-            if retry_count == 0 {
+            if first_attempt_done {
+                // Retry: resume the turn from the last completed state instead of
+                // replaying it from the user message. The incomplete output of the
+                // failed request was stripped via `revert_incomplete_response`
+                // below; every completed tool cycle stays on the path, so the
+                // retry re-issues only the failed provider request — no tool
+                // re-execution, no re-billing of prior work (pi_agent_rust#125).
+                guard
+                    .run_continue_with_abort(Some(abort_signal), event_handler)
+                    .await
+            } else {
                 // First attempt: add the user message and run the turn.
+                first_attempt_done = true;
                 if images.is_empty() {
                     guard
                         .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
@@ -2362,16 +2402,6 @@ async fn run_prompt_with_retry(
                         .run_with_content_with_abort(blocks, Some(abort_signal), event_handler)
                         .await
                 }
-            } else {
-                // Retry: resume the turn from the last completed state instead of
-                // replaying it from the user message. The incomplete output of the
-                // failed request was stripped via `revert_incomplete_response`
-                // below; every completed tool cycle stays on the path, so the
-                // retry re-issues only the failed provider request — no tool
-                // re-execution, no re-billing of prior work (pi_agent_rust#125).
-                guard
-                    .run_continue_with_abort(Some(abort_signal), event_handler)
-                    .await
             }
         };
 
@@ -2436,8 +2466,20 @@ async fn run_prompt_with_retry(
                     final_error_hints = Some(error_hints_value(&err));
                     break;
                 }
-                final_error = Some(err_str);
+                final_error = Some(err_str.clone());
                 final_error_hints = Some(error_hints_value(&err));
+                // Rotation bookkeeping (bd-cv653.3.2): a 429 backs the current
+                // key off so the next resolve rotates to a healthy sibling.
+                if crate::failover::classify_failover(&err_str)
+                    == Some(crate::failover::FailoverClass::Quota)
+                    && let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
+                {
+                    let provider = guard.agent.provider();
+                    let provider_name = provider.name().to_string();
+                    if let Some(key) = guard.agent.stream_options().api_key.clone() {
+                        crate::auth::report_provider_rate_limit(&provider_name, &key);
+                    }
+                }
             }
         }
 
@@ -2445,6 +2487,32 @@ async fn run_prompt_with_retry(
             .await
             .is_ok_and(|state| state.auto_retry_enabled);
         if !retry_enabled || retry_count >= max_retries {
+            // Failover (bd-cv653.3.2): the same-model retry budget is spent.
+            // If the error class is failover-eligible and a chain entry
+            // remains, swap providers and continue the turn there. The
+            // per-turn cap bounds total failover cost.
+            let failed_over = failovers_this_turn < options.config.max_failovers_per_turn()
+                && try_failover_to_next_chain_entry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    out_tx.clone(),
+                    &options,
+                    final_error.as_deref(),
+                    &cx,
+                )
+                .await;
+            if failed_over {
+                retry_count = 0;
+                failovers_this_turn += 1;
+                final_error = None;
+                final_error_hints = None;
+                // Same strip as the retry path: drop the failed request's
+                // incomplete output before the new model resumes (#125).
+                if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                    let _ = guard.revert_incomplete_response().await;
+                }
+                continue;
+            }
             break;
         }
 
@@ -2490,6 +2558,15 @@ async fn run_prompt_with_retry(
         // than replaying the whole turn (pi_agent_rust#125).
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
             let _ = guard.revert_incomplete_response().await;
+            // Credential rotation (bd-cv653.3.2): re-resolve the key so a
+            // backed-off credential rotates on the retry. CLI-pinned keys
+            // never rotate.
+            if options.cli_api_key.is_none() {
+                let provider_name = guard.agent.provider().name().to_string();
+                if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
+                    guard.agent.stream_options_mut().api_key = Some(fresh);
+                }
+            }
         }
     }
 
@@ -2536,6 +2613,251 @@ async fn run_prompt_with_retry(
         // itself; this covers its early returns before that claim.
         is_compacting.store(false, Ordering::SeqCst);
     }
+}
+
+/// Cooldown restore (bd-cv653.3.2): when a previous turn failed over and the
+/// cooldown elapsed, swap the agent back to the primary model recorded in the
+/// session header before the failover... i.e. the model the session used
+/// before `active_failover_model` was set. Emits FailoverEnd(restoredPrimary).
+async fn maybe_restore_primary(
+    session: Arc<Mutex<AgentSession>>,
+    shared_state: Arc<Mutex<RpcSharedState>>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    options: &RpcOptions,
+    cx: &AgentCx,
+) {
+    let Some((failed_provider, failed_model)) = ({
+        let Ok(state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await else {
+            return;
+        };
+        let Some((provider, model)) = state.active_failover_model.clone() else {
+            return;
+        };
+        let tracker_ok = state
+            .failover_cooldown
+            .as_ref()
+            .is_some_and(|tracker| tracker.should_use_primary(std::time::Instant::now()));
+        if tracker_ok {
+            Some((provider, model))
+        } else {
+            None
+        }
+    }) else {
+        return;
+    };
+    let _ = (failed_provider, failed_model); // recorded for the audit entry below
+
+    // The primary identity is the session header's stored provider/model —
+    // apply_model_change updated it on failover, so the pre-failover primary
+    // must be re-derived from the ModelChange history instead.
+    let primary = {
+        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx).await else {
+            return;
+        };
+        let inner = guard.session.lock(cx.cx()).await.ok();
+        inner.and_then(|inner_session| {
+            inner_session
+                .entries_for_current_path()
+                .iter()
+                .rev()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::ModelChange(mc) => {
+                        Some((mc.provider.clone(), mc.model_id.clone(), mc.role.clone()))
+                    }
+                    _ => None,
+                })
+                // First ModelChange WITHOUT a failover role tag is the primary.
+                .find(|(_p, _m, role)| role.is_none())
+                .map(|(p, m, _)| (p, m))
+        })
+    };
+    let Some((provider, model_id)) = primary else {
+        return;
+    };
+
+    let Some(entry) = options
+        .available_models
+        .iter()
+        .find(|m| {
+            crate::provider_metadata::provider_ids_match(&m.model.provider, &provider)
+                && m.model.id.eq_ignore_ascii_case(&model_id)
+        })
+        .cloned()
+        .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id))
+    else {
+        return;
+    };
+
+    let restored = async {
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx).await?;
+        let provider_impl = providers::create_provider(
+            &entry,
+            guard
+                .extensions
+                .as_ref()
+                .map(crate::extensions::ExtensionRegion::manager),
+        )?;
+        guard.agent.set_provider(provider_impl);
+        let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
+        guard.agent.stream_options_mut().api_key.clone_from(&key);
+        guard
+            .agent
+            .stream_options_mut()
+            .headers
+            .clone_from(&entry.headers);
+        apply_model_change(&mut guard, &entry).await
+    }
+    .await;
+    if restored.is_ok() {
+        let _ = out_tx.send(agent_event(AgentEvent::FailoverEnd {
+            success: true,
+            provider: provider.clone(),
+            model: model_id.clone(),
+            restored_primary: true,
+        }));
+        if let Ok(mut state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await {
+            state.active_failover_model = None;
+            state.failover_chain_position = None;
+            if let Some(tracker) = state.failover_cooldown.as_mut() {
+                tracker.reset();
+            }
+        }
+    }
+}
+
+/// Failover walk (bd-cv653.3.2): classify the terminal error; if it is
+/// failover-eligible, resolve the next chain entry, swap the provider in the
+/// session's agent, emit FailoverStart, and record the cooldown + audit entry.
+/// Returns true when a swap happened (the caller restarts the retry budget).
+async fn try_failover_to_next_chain_entry(
+    session: Arc<Mutex<AgentSession>>,
+    shared_state: Arc<Mutex<RpcSharedState>>,
+    out_tx: std::sync::mpsc::SyncSender<String>,
+    options: &RpcOptions,
+    error_text: Option<&str>,
+    cx: &AgentCx,
+) -> bool {
+    let Some(error_text) = error_text else {
+        return false;
+    };
+    let Some(class) = crate::failover::classify_failover(error_text) else {
+        return false; // auth/loud errors never fail over
+    };
+    let Some(chains) = options
+        .config
+        .retry
+        .as_ref()
+        .and_then(|r| r.fallback_chains.as_ref())
+    else {
+        return false;
+    };
+
+    // Current provider/model from the agent.
+    let (current_provider, current_model) = {
+        let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx).await else {
+            return false;
+        };
+        let provider = guard.agent.provider();
+        (provider.name().to_string(), provider.model_id().to_string())
+    };
+    let Some(chain) =
+        crate::failover::chain_for(chains, "default", &current_provider, &current_model)
+    else {
+        return false;
+    };
+
+    let mut position = {
+        let Ok(state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await else {
+            return false;
+        };
+        state.failover_chain_position.unwrap_or(0)
+    };
+    let cap = options.config.max_failovers_per_turn() as usize;
+
+    while position < chain.entries.len() && position < cap {
+        let spec = &chain.entries[position];
+        let candidate = (|| {
+            let (provider, model_id) = crate::provider_metadata::split_provider_model_spec(spec)?;
+            options
+                .available_models
+                .iter()
+                .find(|m| {
+                    crate::provider_metadata::provider_ids_match(&m.model.provider, provider)
+                        && m.model.id.eq_ignore_ascii_case(model_id)
+                })
+                .cloned()
+                .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id))
+        })();
+        position += 1;
+        let Some(entry) = candidate else {
+            continue;
+        };
+        let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
+        if model_requires_configured_credential(&entry) && key.is_none() {
+            // Skip entries we cannot authenticate: failing over into an
+            // auth error would be strictly worse than the quota error.
+            continue;
+        }
+
+        let swapped = async {
+            let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), cx).await?;
+            let provider_impl = providers::create_provider(
+                &entry,
+                guard
+                    .extensions
+                    .as_ref()
+                    .map(crate::extensions::ExtensionRegion::manager),
+            )?;
+            guard.agent.set_provider(provider_impl);
+            guard.agent.stream_options_mut().api_key.clone_from(&key);
+            guard
+                .agent
+                .stream_options_mut()
+                .headers
+                .clone_from(&entry.headers);
+            apply_model_change(&mut guard, &entry).await
+        }
+        .await;
+        if swapped.is_err() {
+            continue;
+        }
+
+        let to_provider = entry.model.provider.clone();
+        let to_model = entry.model.id.clone();
+        let _ = out_tx.send(agent_event(AgentEvent::FailoverStart {
+            from_provider: current_provider.clone(),
+            from_model: current_model.clone(),
+            to_provider: to_provider.clone(),
+            to_model: to_model.clone(),
+            class: format!("{class:?}").to_ascii_lowercase(),
+            attempt: position as u32,
+        }));
+
+        if let Ok(mut state) = OwnedMutexGuard::lock(Arc::clone(&shared_state), cx).await {
+            state.active_failover_model = Some((to_provider.clone(), to_model.clone()));
+            state.failover_chain_position = Some(position);
+            if let Some(tracker) = state.failover_cooldown.as_mut() {
+                tracker.record_primary_failure(std::time::Instant::now());
+            }
+        }
+
+        // Session audit entry (bd-cv653.3.2 requirement).
+        if let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx).await
+            && let Ok(mut inner) = guard.session.lock(cx.cx()).await
+        {
+            inner.append_custom_entry(
+                "failover".to_string(),
+                Some(serde_json::json!({
+                    "from": format!("{current_provider}/{current_model}"),
+                    "to": format!("{to_provider}/{to_model}"),
+                    "class": format!("{class:?}").to_ascii_lowercase(),
+                    "attempt": position,
+                })),
+            );
+        }
+        return true;
+    }
+    false
 }
 
 async fn run_extension_command(
@@ -3384,6 +3706,7 @@ mod retry_tests {
                 max_retries: Some(1),
                 base_delay_ms: Some(1),
                 max_delay_ms: Some(1),
+                ..Default::default()
             });
 
             let mut shared = RpcSharedState::new(&config);
@@ -3494,6 +3817,7 @@ mod retry_tests {
                 max_retries: Some(3),
                 base_delay_ms: Some(1000),
                 max_delay_ms: Some(1000),
+                ..Default::default()
             });
 
             let mut shared = RpcSharedState::new(&config);
@@ -3617,6 +3941,7 @@ mod retry_tests {
                 max_retries: Some(3),
                 base_delay_ms: Some(1000),
                 max_delay_ms: Some(1000),
+                ..Default::default()
             });
 
             let mut shared = RpcSharedState::new(&config);
@@ -3737,6 +4062,7 @@ mod retry_tests {
                 max_retries: Some(10),
                 base_delay_ms: Some(1000),
                 max_delay_ms: Some(1000),
+                ..Default::default()
             });
 
             let auth_path = tempfile::tempdir()
@@ -5208,18 +5534,12 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
     Ok(images)
 }
 
-fn resolve_model_key(
+pub(crate) fn resolve_model_key(
     cli_api_key: Option<&str>,
     auth: &AuthStorage,
     entry: &ModelEntry,
 ) -> Option<String> {
-    cli_api_key
-        .and_then(|key| {
-            let trimmed = key.trim();
-            (!trimmed.is_empty()).then(|| trimmed.to_string())
-        })
-        .or_else(|| normalize_api_key_opt(auth.resolve_api_key(&entry.model.provider, None)))
-        .or_else(|| normalize_api_key_opt(entry.api_key.clone()))
+    crate::models::resolve_model_key(cli_api_key, auth, entry)
 }
 
 fn parse_thinking_level(level: &str) -> Result<crate::model::ThinkingLevel> {
