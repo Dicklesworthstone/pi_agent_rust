@@ -64,6 +64,8 @@ pub struct Config {
     pub tools: Option<ToolSettings>,
     /// Plan-mode settings (bd-cv653.3.5).
     pub plan: Option<PlanSettings>,
+    /// Read-tool settings (bd-cv653.2.2 URL reads).
+    pub read: Option<ReadSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -431,6 +433,16 @@ pub struct PlanSettings {
     pub auto_approve: Option<bool>,
 }
 
+/// Read-tool configuration (bd-cv653.2.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadSettings {
+    /// Allow fetching private/loopback/link-local URL targets (SSRF override).
+    /// Default: false (blocked with a named `[SSRF_BLOCKED]` error).
+    #[serde(alias = "urlAllowPrivateTargets")]
+    pub url_allow_private_targets: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -701,6 +713,7 @@ impl Config {
             model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
             tools: merge_tools(base.tools, other.tools),
             plan: merge_plan(base.plan, other.plan),
+            read: merge_read(base.read, other.read),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -1427,6 +1440,20 @@ fn merge_titling(
     match (base, other) {
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge read settings (other wins).
+fn merge_read(base: Option<ReadSettings>, other: Option<ReadSettings>) -> Option<ReadSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ReadSettings {
+            url_allow_private_targets: other
+                .url_allow_private_targets
+                .or(base.url_allow_private_targets),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

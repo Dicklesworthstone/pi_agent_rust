@@ -247,6 +247,7 @@ pub mod todo;
 pub mod tools;
 #[doc(hidden)]
 pub mod tui;
+pub mod url_read;
 #[doc(hidden)]
 pub mod validation_broker;
 #[doc(hidden)]

@@ -173,6 +173,12 @@ asupersync = { version = "0.4.4", default-features = false, features = ["tls-web
 futures = "0.3"
 async-trait = "0.1"
 
+# URL reads (bd-cv653.2.2): HTML reader-mode conversion + PDF text extraction
+# htmd is lean and always on; pdf-extract adds ~6 MiB so it is opt-in
+# (release binary size budget, 22 MiB). `full` includes it.
+htmd = "0.5.5"
+pdf-extract = { version = "0.12", optional = true }
+
 # URL parsing/building
 url = "2"
 
@@ -388,8 +394,12 @@ full = [
     "sqlite-sessions",
     "syntax-highlighting",
     "tui",
+    "url-pdf",
     "rich_rust/full",
 ]
+# PDF extraction for URL reads (bd-cv653.2.2) — opt-in to keep the default
+# release binary inside the 22 MiB size budget.
+url-pdf = ["dep:pdf-extract"]
 # Interactive terminal front-end (crossterm + charmed_rust stack). Enabled by
 # default so CLI users get an identical `pi` binary with no action required.
 # Disabling it (`--no-default-features`) lets SDK/library consumers compile the

@@ -5193,11 +5193,14 @@ impl ToolRegistry {
 
         for name in enabled {
             match *name {
-                "read" => tools.push(Box::new(ReadTool::with_settings(
-                    cwd,
-                    image_auto_resize,
-                    block_images,
-                ))),
+                "read" => tools.push(Box::new(
+                    ReadTool::with_settings(cwd, image_auto_resize, block_images).with_url_policy(
+                        config
+                            .and_then(|c| c.read.as_ref())
+                            .and_then(|r| r.url_allow_private_targets)
+                            .unwrap_or(false),
+                    ),
+                )),
                 "bash" => tools.push(Box::new(BashTool::with_shell(
                     cwd,
                     shell_path.clone(),
@@ -5356,6 +5359,9 @@ pub struct ReadTool {
     auto_resize: bool,
     block_images: bool,
     artifact_root: Option<PathBuf>,
+    /// SSRF override for URL reads (bd-cv653.2.2): allow private/loopback
+    /// targets (from `read.urlAllowPrivateTargets`).
+    allow_private_urls: bool,
     #[cfg(test)]
     after_open_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -5367,6 +5373,7 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: None,
+            allow_private_urls: false,
             #[cfg(test)]
             after_open_hook: None,
         }
@@ -5378,9 +5385,17 @@ impl ReadTool {
             auto_resize,
             block_images,
             artifact_root: None,
+            allow_private_urls: false,
             #[cfg(test)]
             after_open_hook: None,
         }
+    }
+
+    /// SSRF override for URL reads (bd-cv653.2.2).
+    #[must_use]
+    pub const fn with_url_policy(mut self, allow_private_urls: bool) -> Self {
+        self.allow_private_urls = allow_private_urls;
+        self
     }
 
     #[cfg(test)]
@@ -5390,6 +5405,7 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: Some(artifact_root.to_path_buf()),
+            allow_private_urls: false,
             after_open_hook: None,
         }
     }
@@ -5404,6 +5420,7 @@ impl ReadTool {
             auto_resize: true,
             block_images: false,
             artifact_root: None,
+            allow_private_urls: false,
             after_open_hook: Some(Arc::new(after_open_hook)),
         }
     }
@@ -5426,6 +5443,85 @@ where
         }
     })
     .await
+}
+
+impl ReadTool {
+    /// URL reads (bd-cv653.2.2): fetch + convert, then window with the same
+    /// 1-based offset/limit and continuation-notice shapes as file reads.
+    /// 1-based offset/limit and continuation-notice shapes as file reads.
+    /// A trailing `:raw` selector bypasses conversion (plaintext passthrough).
+    async fn execute_url_read(&self, input: &ReadInput) -> Result<ToolOutput> {
+        let (raw, url) = input.path.strip_suffix(":raw").map_or_else(
+            || (false, input.path.clone()),
+            |stripped| (true, stripped.to_string()),
+        );
+        let policy = if self.allow_private_urls {
+            crate::url_read::SsrfPolicy::AllowPrivateTargets
+        } else {
+            crate::url_read::SsrfPolicy::BlockPrivateTargets
+        };
+        let mut outcome = crate::url_read::fetch_and_convert(&url, policy).await?;
+        if raw {
+            outcome.content = format!(
+                "[raw fetch of {url}]\n\n{}",
+                outcome.content // converters already ran; raw shows the wire text when it was plaintext
+            );
+        }
+        if outcome.download_truncated {
+            outcome.content.push_str(
+                "\n\n[Download truncated at 10 MiB; the source page continues beyond this point.]",
+            );
+        }
+
+        let lines: Vec<&str> = outcome.content.lines().collect();
+        let total_lines = lines.len();
+        let start_line = usize::try_from(input.offset.unwrap_or(1))
+            .unwrap_or(1)
+            .max(1);
+        if start_line > total_lines && total_lines > 0 {
+            return Err(Error::validation(format!(
+                "Offset {start_line} is beyond end of URL content ({total_lines} lines total)"
+            )));
+        }
+        let limit = usize::try_from(input.limit.unwrap_or(2000))
+            .unwrap_or(2000)
+            .max(1);
+        let end_line = start_line
+            .saturating_add(limit)
+            .saturating_sub(1)
+            .min(total_lines);
+        let window = if total_lines == 0 {
+            String::new()
+        } else {
+            lines[(start_line - 1)..end_line].join("\n")
+        };
+
+        let mut output_text = window;
+        if end_line < total_lines {
+            let next_offset = end_line + 1;
+            let _ = std::fmt::Write::write_fmt(
+                &mut output_text,
+                format_args!(
+                    "\n\n[Showing lines {start_line}-{end_line} of {total_lines}. Use offset={next_offset} to continue.]"
+                ),
+            );
+        }
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output_text))],
+            details: Some(serde_json::json!({
+                "url": outcome.final_url,
+                "contentType": outcome.kind.as_str(),
+                "wireContentType": outcome.wire_content_type,
+                "extractor": outcome.extractor,
+                "totalLines": total_lines,
+                "offset": start_line,
+                "limit": limit,
+                "truncated": end_line < total_lines || outcome.download_truncated,
+            })),
+            is_error: false,
+        })
+    }
 }
 
 #[async_trait]
@@ -5490,6 +5586,12 @@ impl Tool for ReadTool {
             return Err(Error::validation(
                 "`offset` must be non-negative".to_string(),
             ));
+        }
+
+        // URL reads (bd-cv653.2.2): http(s) paths fetch + convert to
+        // reader-mode markdown; pagination/truncation shapes match file reads.
+        if input.path.starts_with("http://") || input.path.starts_with("https://") {
+            return self.execute_url_read(&input).await;
         }
 
         let path = resolve_read_path(&input.path, &self.cwd);
