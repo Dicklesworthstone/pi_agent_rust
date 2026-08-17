@@ -10197,6 +10197,28 @@ impl AgentSession {
         self.run_text_with_abort(input, None, on_event).await
     }
 
+    /// Drain the dialect-repair ledger into session Custom entries
+    /// (bd-cv653.7.8) so repairs are replayable/auditable.
+    async fn persist_repair_ledger(&mut self) {
+        let repairs = self.agent.drain_repair_ledger();
+        if repairs.is_empty() {
+            return;
+        }
+        let cx = pi::agent_cx::AgentCx::for_request();
+        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
+            for entry in &repairs {
+                inner.append_custom_entry(
+                    "dialect_repair".to_string(),
+                    Some(serde_json::json!({
+                        "tool": entry.tool,
+                        "strippedBytes": entry.stripped_bytes,
+                        "remainingTextBytes": entry.remaining_text_bytes,
+                    })),
+                );
+            }
+        }
+    }
+
     pub async fn run_text_with_abort(
         &mut self,
         input: String,
@@ -10241,6 +10263,7 @@ impl AgentSession {
             };
 
             self.agent.set_system_prompt(base_system_prompt);
+            self.persist_repair_ledger().await;
             result
         }
         .await;
@@ -14307,6 +14330,8 @@ mod tests {
     /// Emits a text-embedded tool call on stream 1, plain text on stream 2.
     struct TextCallProvider {
         calls: std::sync::atomic::AtomicUsize,
+        /// When true, report a Native-mapped model id (no repair path).
+        native: bool,
     }
 
     #[async_trait]
@@ -14319,7 +14344,7 @@ mod tests {
             "test-api"
         }
         fn model_id(&self) -> &str {
-            "qwen3-mock" // maps to Dialect::Xmlish
+            if self.native { "gpt-4o" } else { "qwen3-mock" }
         }
 
         async fn stream(
@@ -14347,7 +14372,12 @@ mod tests {
                     }),
                     Ok(StreamEvent::Done {
                         reason: StopReason::Stop,
-                        message: make(Vec::new(), StopReason::Stop),
+                        message: make(
+                            vec![ContentBlock::Text(TextContent::new(
+                                "Checking the file. <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"fixture.txt\"}}</tool_call>",
+                            ))],
+                            StopReason::Stop,
+                        ),
                     }),
                 ]
             } else {
@@ -14375,10 +14405,39 @@ mod tests {
             .build()
             .expect("runtime build");
         runtime.block_on(async {
+            // CONTROL: Native dialect (no repair path) — a plain-text turn
+            // must complete without hitting the iteration cap. If this
+            // loops, the test provider is the artifact, not the repair.
+            let control = Arc::new(TextCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                native: true,
+            });
+            let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+            let mut control_agent = Agent::new(control, control_tools, AgentConfig::default());
+            control_agent.config.max_tool_iterations = 5;
+            let control_session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut control_session = AgentSession::new(
+                control_agent,
+                control_session,
+                false,
+                ResolvedCompactionSettings::default(),
+            );
+            let control_result = control_session
+                .run_text_with_abort("hello".to_string(), None, |_| {})
+                .await;
+            if let Err(err) = &control_result {
+                assert!(
+                    !err.to_string().contains("Maximum tool iterations"),
+                    "control provider looped: {err}"
+                );
+            }
+        });
+        runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
             std::fs::write(temp.path().join("fixture.txt"), "hello-fixture").expect("write fixture");
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                native: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
@@ -14418,9 +14477,30 @@ mod tests {
                 StopReason::Stop,
                 "turn ends cleanly after the repair"
             );
-            let drained = agent_session.agent.drain_repair_ledger();
-            assert_eq!(drained.len(), 1, "one repair recorded");
-            assert_eq!(drained[0].tool, "read");
+            // The session layer drained the ledger into a dialect_repair
+            // Custom entry at run completion (bd-cv653.7.8).
+            let entries = {
+                let cx = asupersync::Cx::for_request();
+                let inner = agent_session.session.lock(&cx).await.expect("session lock");
+                let found: Vec<_> = inner
+                    .entries_for_current_path()
+                    .iter()
+                    .filter_map(|e| match e {
+                        crate::session::SessionEntry::Custom(c)
+                            if c.custom_type == "dialect_repair" =>
+                        {
+                            Some(c.data.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                found
+            };
+            assert_eq!(entries.len(), 1, "one repair entry in the session");
+            assert_eq!(
+                entries[0].as_ref().and_then(|d| d.get("tool")).and_then(Value::as_str),
+                Some("read")
+            );
         });
     }
 }
