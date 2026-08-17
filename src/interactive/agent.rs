@@ -2199,6 +2199,25 @@ After approving access in the browser, press Enter in Pi to complete login."
             return self.dispatch_extension_command(&command, args);
         }
 
+        // Bare prompt-template invocation (#172): autocomplete advertises
+        // `/name` for every loaded prompt template, so `/name [args]` must
+        // expand the template instead of falling through to
+        // "Unknown command". Built-in and extension commands keep priority.
+        if let Some(rest) = message.strip_prefix('/')
+            && !message.starts_with("/skill:")
+        {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            let is_template = !name.is_empty()
+                && self
+                    .resources
+                    .prompts()
+                    .iter()
+                    .any(|template| template.name == name);
+            if is_template {
+                return self.handle_slash_template(rest);
+            }
+        }
+
         if message.starts_with('/') && !message.starts_with("/skill:") {
             let command = message.split_whitespace().next().unwrap_or(message);
             let error = format!("Unknown command: {command}");
@@ -2648,6 +2667,49 @@ mod stream_delta_batcher_tests {
     fn build_test_app() -> PiApp {
         let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app
+    }
+
+    #[test]
+    fn submit_message_expands_bare_prompt_template_command() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.resources
+            .push_prompt_for_tests(crate::resources::PromptTemplate {
+                name: "tc-plan".to_string(),
+                description: "Planning template".to_string(),
+                content: "Plan the following: $ARGUMENTS".to_string(),
+                source: "test".to_string(),
+                file_path: std::path::PathBuf::from("tc-plan.md"),
+            });
+
+        let _ = app.submit_message("/tc-plan ship it");
+
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("Unknown command")),
+            "bare template invocation must not report Unknown command"
+        );
+        assert!(
+            app.history
+                .entries()
+                .iter()
+                .any(|entry| entry.value.contains("tc-plan")),
+            "template expansion should record a history entry"
+        );
+    }
+
+    #[test]
+    fn submit_message_unknown_slash_command_still_errors() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+
+        let _ = app.submit_message("/definitely-not-a-template");
+
+        assert!(
+            app.messages
+                .iter()
+                .any(|m| m.content.contains("Unknown command")),
+            "unknown commands must still be reported"
+        );
     }
 
     fn build_test_extension_manager_with_command_output(

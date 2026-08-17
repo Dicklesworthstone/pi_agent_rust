@@ -149,6 +149,9 @@ impl AutocompleteProvider {
         if let Some(token) = model_argument_token(text, cursor) {
             return self.suggest_model_argument(&token);
         }
+        if let Some(token) = template_argument_token(text, cursor) {
+            return self.suggest_template_argument(&token);
+        }
         let segment = token_at_cursor(text, cursor);
 
         if segment.text.starts_with('/') {
@@ -444,6 +447,42 @@ impl AutocompleteProvider {
                         label: candidate.slug.clone(),
                         insert: candidate.slug.clone(),
                         description: candidate.description.clone(),
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        sort_scored_items(&mut items);
+        let items = items
+            .into_iter()
+            .take(self.max_items)
+            .map(|s| s.item)
+            .collect();
+
+        AutocompleteResponse {
+            replace: token.range.clone(),
+            items,
+        }
+    }
+
+    fn suggest_template_argument(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
+        let query = token.text.trim();
+        let mut items = self
+            .catalog
+            .prompt_templates
+            .iter()
+            .filter_map(|template| {
+                let (is_prefix, score) = fuzzy_match_score(&template.name, query)?;
+                Some(ScoredItem {
+                    is_prefix,
+                    score,
+                    kind_rank: kind_rank(AutocompleteItemKind::PromptTemplate),
+                    label: template.name.clone(),
+                    item: AutocompleteItem {
+                        kind: AutocompleteItemKind::PromptTemplate,
+                        label: template.name.clone(),
+                        insert: template.name.clone(),
+                        description: template.description.clone(),
                     },
                 })
             })
@@ -798,6 +837,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
             name: "mcp",
             description: "Show MCP server status (Model Context Protocol)",
         },
+        BuiltinSlashCommand {
+            name: "template",
+            description: "Expand a prompt template by name",
+        },
     ]
 }
 
@@ -1048,6 +1091,10 @@ fn auth_provider_argument_token(text: &str, cursor: usize) -> Option<TokenAtCurs
     slash_first_argument_token(text, cursor, &["/login", "/logout"])
 }
 
+fn template_argument_token(text: &str, cursor: usize) -> Option<TokenAtCursor<'_>> {
+    slash_first_argument_token(text, cursor, &["/template"])
+}
+
 fn should_prefer_absolute_path_completion(
     token_text: &str,
     path_response: &AutocompleteResponse,
@@ -1117,6 +1164,64 @@ mod tests {
             resp.items.iter().any(|item| item.insert == "/review"
                 && item.kind == AutocompleteItemKind::PromptTemplate)
         );
+    }
+
+    #[test]
+    fn template_command_suggests_template_name_argument() {
+        let catalog = AutocompleteCatalog {
+            prompt_templates: vec![
+                NamedEntry {
+                    name: "tc-plan".to_string(),
+                    description: Some("Planning template".to_string()),
+                },
+                NamedEntry {
+                    name: "tc-explain".to_string(),
+                    description: None,
+                },
+            ],
+            skills: Vec::new(),
+            extension_commands: Vec::new(),
+            enable_skill_commands: false,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        let text = "/template tc-";
+        let resp = provider.suggest(text, text.len());
+        assert!(
+            resp.items.iter().any(|item| item.insert == "tc-plan"
+                && item.kind == AutocompleteItemKind::PromptTemplate),
+            "expected tc-plan suggestion, got: {:?}",
+            resp.items
+        );
+        assert!(resp.items.iter().any(|item| item.insert == "tc-explain"));
+    }
+
+    #[test]
+    fn template_argument_completion_ignores_later_arguments() {
+        let catalog = AutocompleteCatalog {
+            prompt_templates: vec![NamedEntry {
+                name: "tc-plan".to_string(),
+                description: None,
+            }],
+            skills: Vec::new(),
+            extension_commands: Vec::new(),
+            enable_skill_commands: false,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        let text = "/template tc-plan extra";
+        let resp = provider.suggest(text, text.len());
+        assert!(
+            !resp
+                .items
+                .iter()
+                .any(|item| item.kind == AutocompleteItemKind::PromptTemplate),
+            "later arguments must not trigger template-name completion"
+        );
+    }
+
+    #[test]
+    fn builtin_slash_commands_contains_template() {
+        let cmds = builtin_slash_commands();
+        assert!(cmds.iter().any(|c| c.name == "template"));
     }
 
     #[test]

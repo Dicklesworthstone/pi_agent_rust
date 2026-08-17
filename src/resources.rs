@@ -552,6 +552,12 @@ impl ResourceLoader {
         &self.skills
     }
 
+    /// Test-only: inject a prompt template directly, bypassing disk loading.
+    #[cfg(test)]
+    pub(crate) fn push_prompt_for_tests(&mut self, template: PromptTemplate) {
+        self.prompts.push(template);
+    }
+
     pub fn prompts(&self) -> &[PromptTemplate] {
         &self.prompts
     }
