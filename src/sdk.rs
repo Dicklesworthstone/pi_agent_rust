@@ -449,6 +449,11 @@ pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> T
 pub struct AgentSessionHandle {
     session: AgentSession,
     listeners: EventListeners,
+    /// Ask tool handle when the session enabled it (bd-cv653.3.8). `AskTool`
+    /// is `Clone` over shared state, so a host can install a channel UI and
+    /// resolve pending cards via `respond_ui` — without it the tool falls
+    /// back to its non-interactive policy.
+    ask_tool: Option<crate::ask::AskTool>,
 }
 
 /// Snapshot of the current agent session state.
@@ -1245,7 +1250,19 @@ impl AgentSessionHandle {
         session: AgentSession,
         listeners: EventListeners,
     ) -> Self {
-        Self { session, listeners }
+        Self {
+            session,
+            listeners,
+            ask_tool: None,
+        }
+    }
+
+    /// Ask tool handle, when this session enabled the ask tool. Cloning is
+    /// cheap (shared state); hosts use it to install a picker surface via
+    /// `install_channel_ui` and resolve cards via `respond_ui`.
+    #[must_use]
+    pub fn ask_tool(&self) -> Option<crate::ask::AskTool> {
+        self.ask_tool.clone()
     }
 
     /// Send one user prompt through the agent loop.
@@ -1811,6 +1828,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         sdk_test_mode,
         options.include_cwd_in_prompt,
         Some(&foreign_rules),
+        &config,
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
@@ -1872,12 +1890,16 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
         ]);
     }
-    // Ask tool (opt-in): SDK sessions have no picker surface, so it resolves
-    // via ask_policy (recommended auto-answer by default, bd-cv653.3.8).
+    // Ask tool (opt-in): without a host-installed picker surface it resolves
+    // via ask_policy (recommended auto-answer by default, bd-cv653.3.8). A
+    // clone is kept on the returned handle so embedders (e.g. the ftui launch
+    // path) can install a channel UI and pair respond_ui replies.
+    let mut ask_tool_handle = None;
     if enabled_tools.contains(&"ask") {
         let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
             config.ask_policy.as_deref(),
         ));
+        ask_tool_handle = Some(ask.clone());
         agent_session
             .agent
             .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
@@ -1950,6 +1972,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
+        ask_tool: ask_tool_handle,
     })
 }
 

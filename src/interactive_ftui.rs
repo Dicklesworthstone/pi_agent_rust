@@ -912,6 +912,7 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<String>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
+    let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -923,6 +924,7 @@ pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
                     return;
                 }
             };
+            let runtime_handle = runtime.handle();
             runtime.block_on(async move {
                 let mut handle = match crate::sdk::create_agent_session(session_options).await {
                     Ok(handle) => handle,
@@ -931,6 +933,41 @@ pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
                         return;
                     }
                 };
+                // Ask tool: install the channel picker surface so cards reach
+                // the UI as PiMsg::AskUiRequest, and pair replies back through
+                // respond_ui (same bridge shape as the RPC host). Both pumps
+                // are spawned tasks: asks arrive MID-TURN while the driver
+                // loop is blocked inside prompt().await, so pumping replies
+                // from the loop itself would deadlock the pending tool call.
+                if let Some(ask) = handle.ask_tool() {
+                    let (ask_ui_tx, mut ask_ui_rx) =
+                        asupersync::channel::mpsc::channel::<AskUiRequest>(4);
+                    ask.install_channel_ui(ask_ui_tx);
+                    let ask_fwd_tx = agent_tx.clone();
+                    runtime_handle.spawn(async move {
+                        let cx = crate::agent_cx::AgentCx::for_request();
+                        while let Ok(request) = ask_ui_rx.recv(&cx).await {
+                            let _ = ask_fwd_tx.send(PiMsg::AskUiRequest(request));
+                        }
+                    });
+                    runtime_handle.spawn(async move {
+                        loop {
+                            match ask_reply_rx.try_recv() {
+                                Ok(reply) => {
+                                    let _ = ask.respond_ui(&reply.request_id, reply.response);
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    asupersync::time::sleep(
+                                        asupersync::time::wall_now(),
+                                        SUBMIT_POLL,
+                                    )
+                                    .await;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                            }
+                        }
+                    });
+                }
                 let _ = agent_tx.send(PiMsg::System(String::from(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
                 )));
@@ -960,7 +997,9 @@ pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
             });
         })?;
 
-    let model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
+    let model = PiFtuiModel::new(agent_rx)
+        .with_submit_channel(submit_tx)
+        .with_ask_reply_channel(ask_reply_tx);
     let result = ftui::App::fullscreen(model).with_mouse().run();
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
