@@ -278,6 +278,10 @@ pub enum UiCommand {
     Prompt(String),
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
+    /// Run a shell command (`!cmd`). Display-only in the preview: output is
+    /// not injected into the agent context yet (the bubbletea stack's `!`
+    /// context-inclusion arrives with session-append support).
+    Bash { command: String },
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -558,6 +562,12 @@ impl PiFtuiModel {
                 let text = sanitize(&text).into_owned();
                 self.push_entry(EntryRole::System, text);
             }
+            PiMsg::BashResult { display, .. } => {
+                let text = sanitize(&display).into_owned();
+                self.push_entry(EntryRole::System, text);
+                self.current_tool = None;
+                self.scroll_from_tail = 0;
+            }
             PiMsg::AskUiRequest(request) => {
                 if request.request.questions.is_empty() {
                     // Defensive: an empty card resolves immediately as
@@ -667,6 +677,24 @@ impl PiFtuiModel {
         self.scroll_from_tail = 0;
         self.push_entry(EntryRole::User, clean.clone());
 
+        // Bash routing comes before slash commands, matching submit_message.
+        // `!` and `!!` both run display-only here (context inclusion is a
+        // launch-path follow-up), so the prefixes collapse.
+        let bang = clean
+            .strip_prefix("!!")
+            .or_else(|| clean.strip_prefix('!'))
+            .map(str::trim);
+        if let Some(command) = bang {
+            if command.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("usage: !<command>"));
+            } else {
+                self.send_command(UiCommand::Bash {
+                    command: command.to_string(),
+                });
+            }
+            return;
+        }
+
         // Slash-command routing seed (mirrors submit_message's chain; only
         // session-affecting commands the preview can honor are wired).
         if let Some(rest) = clean.strip_prefix("/model") {
@@ -701,8 +729,9 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model <provider>/<model>, /theme, /help — \
-                     everything else is still on the charmed stack",
+                    "ftui preview commands: /model <provider>/<model>, /theme, /help, \
+                     !<command> (display-only) — everything else is still on the \
+                     charmed stack",
                 ),
             );
             return;
@@ -1175,6 +1204,11 @@ pub fn run(
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
+    let bash_cwd = session_options
+        .working_directory
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -1255,6 +1289,36 @@ pub fn run(
                                 Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
                             };
                             let _ = agent_tx.send(msg);
+                        }
+                        Ok(UiCommand::Bash { command }) => {
+                            let _ = agent_tx.send(PiMsg::ToolStart {
+                                name: String::from("bash"),
+                                tool_id: String::from("ftui-bash"),
+                            });
+                            let result = crate::tools::run_bash_command(
+                                &bash_cwd, None, None, &command, None, None,
+                            )
+                            .await;
+                            let msg = match result {
+                                Ok(result) => PiMsg::BashResult {
+                                    display: crate::session::bash_execution_to_text(
+                                        &command,
+                                        &result.output,
+                                        result.exit_code,
+                                        result.cancelled,
+                                        result.truncated,
+                                        result.full_output_path.as_deref(),
+                                    ),
+                                    content_for_agent: None,
+                                },
+                                Err(err) => PiMsg::AgentError(format!("bash: {err}")),
+                            };
+                            let _ = agent_tx.send(msg);
+                            let _ = agent_tx.send(PiMsg::ToolEnd {
+                                name: String::from("bash"),
+                                tool_id: String::from("ftui-bash"),
+                                is_error: false,
+                            });
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
@@ -2026,6 +2090,53 @@ mod tests {
         sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
         assert!(sim.model().picker.is_none());
         assert_eq!(sim.model().palette.accent, accent_before);
+    }
+
+    #[test]
+    fn bang_routes_bash_command_and_result_renders() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "!echo hi");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Bash {
+                command: "echo hi".into()
+            }
+        );
+        // `!!` collapses to the same display-only path.
+        type_str(&mut sim, "!!ls");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Bash {
+                command: "ls".into()
+            }
+        );
+        // Bare `!` errors locally.
+        type_str(&mut sim, "!");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("usage: !")),
+            "bare-bang usage error missing"
+        );
+        // A BashResult renders into the transcript as a system entry.
+        sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
+            display: "$ echo hi\nhi".into(),
+            content_for_agent: None,
+        }));
+        let rendered = buffer_text(sim.capture_frame(40, 10), 40, 10);
+        assert!(
+            rendered.contains("echo hi"),
+            "bash display missing: {rendered:?}"
+        );
     }
 
     #[test]

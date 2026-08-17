@@ -37,6 +37,11 @@ fn main() -> std::io::Result<()> {
                     )));
                     continue;
                 }
+                UiCommand::Bash { command } => {
+                    let _ =
+                        agent_tx.send(PiMsg::System(format!("(fake agent) would run: {command}")));
+                    continue;
+                }
             };
             if agent_tx.send(PiMsg::AgentStart).is_err() {
                 return;
