@@ -56,6 +56,10 @@ pub struct RpcOptions {
     pub cli_api_key: Option<String>,
     pub auth: AuthStorage,
     pub runtime_handle: RuntimeHandle,
+    /// Ask-tool picker bridge (bd-cv653.3.8): when present, ask requests are
+    /// emitted as `ask_request` frames and answered via the `ask_response`
+    /// command; absent, the tool resolves via `ask_policy`.
+    pub ask_tool: Option<crate::ask::AskTool>,
 }
 
 #[derive(Debug, Clone)]
@@ -656,6 +660,24 @@ pub async fn run(
     let rpc_ui_state: Option<Arc<Mutex<RpcUiBridgeState>>> = rpc_extension_manager
         .as_ref()
         .map(|_| Arc::new(Mutex::new(RpcUiBridgeState::default())));
+
+    // Ask-tool frames (bd-cv653.3.8): each picker request is emitted as an
+    // `ask_request` event keyed by its request id; the client answers with
+    // an `ask_response` command. Response routing is id-keyed through the
+    // AskTool's own pending map (with its built-in wait budget), so no
+    // active/queue ordering state is needed here.
+    if let Some(ref ask) = options.ask_tool {
+        let (ask_ui_tx, mut ask_ui_rx) =
+            asupersync::channel::mpsc::channel::<crate::ask::AskUiRequest>(4);
+        ask.install_channel_ui(ask_ui_tx);
+        let out_tx_ask = out_tx.clone();
+        options.runtime_handle.spawn(async move {
+            let cx = AgentCx::for_request();
+            while let Ok(request) = ask_ui_rx.recv(&cx).await {
+                let _ = out_tx_ask.send(event(&ask_request_rpc_event(&request)));
+            }
+        });
+    }
 
     if let Some(ref manager) = rpc_extension_manager {
         let (extension_ui_tx, mut extension_ui_rx) =
@@ -2090,6 +2112,29 @@ pub async fn run(
                 ));
             }
 
+            "ask_response" => {
+                let Some(ask) = options.ask_tool.as_ref() else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "ask_response",
+                        "The ask tool is not enabled in this session",
+                    ));
+                    continue;
+                };
+                match rpc_parse_ask_response(&parsed) {
+                    Ok((request_id, response)) => {
+                        let resolved = ask.respond_ui(&request_id, response);
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "ask_response",
+                            Some(json!({ "resolved": resolved })),
+                        ));
+                    }
+                    Err(message) => {
+                        let _ = out_tx.send(response_error(id, "ask_response", message));
+                    }
+                }
+            }
             "extension_ui_response" => {
                 if let (Some(manager), Some(ui_state)) =
                     (rpc_extension_manager.as_ref(), rpc_ui_state.as_ref())
@@ -2622,6 +2667,60 @@ fn agent_event(event: AgentEvent) -> String {
         })
         .to_string()
     })
+}
+
+/// The `ask_request` event frame for one picker request (bd-cv653.3.8).
+fn ask_request_rpc_event(request: &crate::ask::AskUiRequest) -> Value {
+    json!({
+        "type": "ask_request",
+        "id": request.id,
+        "questions": request.request.questions,
+        "timeoutMs": crate::ask::ASK_UI_TIMEOUT_MS,
+    })
+}
+
+/// Parse an `ask_response` command: `requestId` (or `id` alias) plus either
+/// `dismissed: true` or an `answers` array of `{questionId, selected[],
+/// other?}` objects.
+fn rpc_parse_ask_response(
+    parsed: &Value,
+) -> std::result::Result<(String, crate::ask::AskResponse), String> {
+    let request_id = parsed
+        .get("requestId")
+        .or_else(|| parsed.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "Missing requestId field".to_string())?
+        .to_string();
+    let dismissed = parsed
+        .get("dismissed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if dismissed {
+        return Ok((
+            request_id,
+            crate::ask::AskResponse {
+                answers: Vec::new(),
+                dismissed: true,
+            },
+        ));
+    }
+    let answers_value = parsed
+        .get("answers")
+        .cloned()
+        .ok_or_else(|| "Missing answers field (or dismissed: true)".to_string())?;
+    let answers: Vec<crate::ask::AskAnswer> = serde_json::from_value(answers_value)
+        .map_err(|error| format!("Invalid answers: {error}"))?;
+    if answers.is_empty() {
+        return Err("answers must not be empty (use dismissed: true to cancel)".to_string());
+    }
+    Ok((
+        request_id,
+        crate::ask::AskResponse {
+            answers,
+            dismissed: false,
+        },
+    ))
 }
 
 fn rpc_emit_extension_ui_request(
@@ -3311,6 +3410,7 @@ mod retry_tests {
                 cli_api_key: None,
                 auth,
                 runtime_handle,
+                ask_tool: None,
             };
 
             run_prompt_with_retry(
@@ -3420,6 +3520,7 @@ mod retry_tests {
                 cli_api_key: None,
                 auth,
                 runtime_handle,
+                ask_tool: None,
             };
 
             let retry_abort_for_thread = Arc::clone(&retry_abort);
@@ -3542,6 +3643,7 @@ mod retry_tests {
                 cli_api_key: None,
                 auth,
                 runtime_handle,
+                ask_tool: None,
             };
 
             let retry_cx = asupersync::Cx::for_testing();
@@ -3650,6 +3752,7 @@ mod retry_tests {
                 cli_api_key: None,
                 auth,
                 runtime_handle,
+                ask_tool: None,
             };
 
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -7698,6 +7801,7 @@ export default function init(pi) {
                 cli_api_key: None,
                 auth,
                 runtime_handle,
+                ask_tool: None,
             };
 
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
@@ -8780,5 +8884,77 @@ export default function init(pi) {
         let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
         let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
         assert_eq!(resp.value, Some(json!("Beta")));
+    }
+
+    /// bd-cv653.3.8: the ask_request frame carries the request id, the
+    /// serialized questions (camelCase wire), and the wait budget.
+    #[test]
+    fn ask_request_frame_shape() {
+        let request: crate::ask::AskRequest = serde_json::from_value(json!({
+            "questions": [{
+                "id": "q1",
+                "question": "Pick?",
+                "recommended": 1,
+                "options": [{"label": "A"}, {"label": "B", "description": "beta"}]
+            }]
+        }))
+        .expect("ask request");
+        let frame = ask_request_rpc_event(&crate::ask::AskUiRequest {
+            id: "ask-1".to_string(),
+            request,
+        });
+        assert_eq!(frame["type"], "ask_request");
+        assert_eq!(frame["id"], "ask-1");
+        assert_eq!(frame["timeoutMs"], crate::ask::ASK_UI_TIMEOUT_MS);
+        assert_eq!(frame["questions"][0]["question"], "Pick?");
+        assert_eq!(frame["questions"][0]["recommended"], 1);
+        assert_eq!(frame["questions"][0]["options"][1]["description"], "beta");
+    }
+
+    /// bd-cv653.3.8: ask_response parsing — answers, dismissal, aliases,
+    /// and the malformed cases.
+    #[test]
+    fn ask_response_parse_matrix() {
+        let (id, response) = rpc_parse_ask_response(&json!({
+            "type": "ask_response",
+            "requestId": "ask-1",
+            "answers": [{"questionId": "q1", "selected": ["B"]}]
+        }))
+        .expect("valid answers");
+        assert_eq!(id, "ask-1");
+        assert!(!response.dismissed);
+        assert_eq!(response.answers[0].question_id, "q1");
+        assert_eq!(response.answers[0].selected, vec!["B"]);
+
+        // `id` alias + Other free text.
+        let (_, response) = rpc_parse_ask_response(&json!({
+            "id": "ask-2",
+            "answers": [{"questionId": "q1", "selected": [], "other": "free text"}]
+        }))
+        .expect("other answer");
+        assert_eq!(response.answers[0].other.as_deref(), Some("free text"));
+
+        // Dismissal needs no answers.
+        let (_, response) = rpc_parse_ask_response(&json!({
+            "requestId": "ask-3",
+            "dismissed": true
+        }))
+        .expect("dismissed");
+        assert!(response.dismissed);
+
+        for (label, bad) in [
+            ("missing id", json!({"answers": []})),
+            ("missing answers", json!({"requestId": "x"})),
+            ("empty answers", json!({"requestId": "x", "answers": []})),
+            (
+                "malformed answer",
+                json!({"requestId": "x", "answers": [{"selected": "not-a-list"}]}),
+            ),
+        ] {
+            assert!(
+                rpc_parse_ask_response(&bad).is_err(),
+                "must reject: {label}"
+            );
+        }
     }
 }

@@ -60,6 +60,7 @@ pub struct AskRequest {
 
 /// Answer to one question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AskAnswer {
     /// The question's `id` (or its index rendered as a string).
     pub question_id: String,

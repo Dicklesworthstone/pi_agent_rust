@@ -1872,6 +1872,16 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
         ]);
     }
+    // Ask tool (opt-in): SDK sessions have no picker surface, so it resolves
+    // via ask_policy (recommended auto-answer by default, bd-cv653.3.8).
+    if enabled_tools.contains(&"ask") {
+        let ask = crate::ask::AskTool::new(crate::ask::AskPolicy::from_config(
+            config.ask_policy.as_deref(),
+        ));
+        agent_session
+            .agent
+            .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
+    }
 
     if !options.extension_paths.is_empty() {
         let extension_paths = options

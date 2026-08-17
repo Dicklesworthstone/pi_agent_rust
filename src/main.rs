@@ -1959,6 +1959,7 @@ async fn run(
             cli.api_key.clone(),
             auth.clone(),
             runtime_handle.clone(),
+            ask_tool,
         ))
         .await
     } else if is_interactive {
@@ -6989,6 +6990,7 @@ fn rpc_available_models(registry: &ModelRegistry, cli_api_key: Option<&str>) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_rpc_mode(
     session: AgentSession,
     resources: ResourceLoader,
@@ -6998,6 +7000,7 @@ async fn run_rpc_mode(
     cli_api_key: Option<String>,
     auth: AuthStorage,
     runtime_handle: RuntimeHandle,
+    ask_tool: Option<pi::ask::AskTool>,
 ) -> Result<()> {
     use futures::FutureExt;
 
@@ -7018,6 +7021,7 @@ async fn run_rpc_mode(
             cli_api_key,
             auth,
             runtime_handle,
+            ask_tool,
         },
     )
     .fuse();
