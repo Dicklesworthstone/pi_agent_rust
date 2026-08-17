@@ -777,6 +777,7 @@ impl ChildRunner {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_child_process(
         &self,
         agents: &BTreeMap<String, AgentDefinition>,
@@ -1938,5 +1939,135 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
             }),
             "missing child-process evidence: {output:?}"
         );
+    }
+
+    /// Write an executable stub child that emits `first` on its first run and
+    /// `second` from then on (state via a marker file next to the script).
+    #[cfg(unix)]
+    fn write_two_phase_child(temp: &Path, first: &str, second: &str) -> PathBuf {
+        let child = temp.join("two-phase-child.sh");
+        let marker = temp.join("two-phase-marker");
+        // `printf '%s\n' '<line>'` passes the JSON event through untouched:
+        // no printf escape processing, and the single-quoted argument may
+        // freely contain double quotes and backslashes (`first`/`second` are
+        // already JSON-string-escaped payloads for the `text` field).
+        std::fs::write(
+            &child,
+            format!(
+                r#"#!/bin/sh
+if [ -f "{marker}" ]; then
+  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{second}"}}]}}]}}'
+else
+  : > "{marker}"
+  printf '%s\n' '{{"type":"agent_end","messages":[{{"role":"assistant","content":[{{"type":"text","text":"{first}"}}]}}]}}'
+fi
+"#,
+                marker = marker.display(),
+            ),
+        )
+        .expect("write two-phase child");
+        let mut permissions = std::fs::metadata(&child)
+            .expect("child metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&child, permissions).expect("make child executable");
+        child
+    }
+
+    /// bd-cv653.5.1 acceptance 1+2 (happy half): invalid first output, one
+    /// corrective retry, valid second output → parsed `data`, `schemaValid`
+    /// true, one recorded retry, task not an error.
+    #[test]
+    #[cfg(unix)]
+    fn output_schema_retry_then_valid_yields_parsed_data() {
+        let temp = TempDir::new().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        write_agent(
+            &global_dir.join("agents"),
+            "typed",
+            "---\nname: typed\ndescription: typed child\n---\nReturn JSON.",
+        );
+        let child =
+            write_two_phase_child(temp.path(), "not json at all", r#"{\"verdict\": \"pass\"}"#);
+
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child);
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let output = runtime
+            .block_on(tool.execute(
+                "typed-retry",
+                json!({
+                    "agent": "typed",
+                    "task": "produce a verdict",
+                    "outputSchema": {
+                        "type": "object",
+                        "required": ["verdict"],
+                        "properties": {"verdict": {"type": "string"}}
+                    }
+                }),
+                None,
+            ))
+            .expect("typed subagent run");
+
+        assert!(!output.is_error, "{output:?}");
+        let details = output.details.expect("details");
+        let result = &details["results"][0];
+        assert_eq!(result["schemaValid"], true, "{result}");
+        assert_eq!(result["schemaRetries"], 1, "{result}");
+        assert_eq!(result["data"]["verdict"], "pass", "{result}");
+        assert_eq!(details["schema"], SUBAGENT_RESULT_SCHEMA);
+    }
+
+    /// bd-cv653.5.1 acceptance 2 (exhaustion half): output stays invalid
+    /// through the single retry — permissive keeps the raw result with
+    /// warning fields; strict fails the task with the validation errors.
+    #[test]
+    #[cfg(unix)]
+    fn output_schema_exhaustion_permissive_warns_strict_fails() {
+        for (mode, expect_error) in [("permissive", false), ("strict", true)] {
+            let temp = TempDir::new().expect("tempdir");
+            let global_dir = temp.path().join("global");
+            write_agent(
+                &global_dir.join("agents"),
+                "typed",
+                "---\nname: typed\ndescription: typed child\n---\nReturn JSON.",
+            );
+            let child = write_two_phase_child(temp.path(), "still not json", "also not json");
+
+            let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child);
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            let output = runtime
+                .block_on(tool.execute(
+                    "typed-exhausted",
+                    json!({
+                        "agent": "typed",
+                        "task": "produce a verdict",
+                        "outputSchema": {"type": "object"},
+                        "schemaMode": mode
+                    }),
+                    None,
+                ))
+                .expect("typed subagent run");
+
+            assert_eq!(output.is_error, expect_error, "mode={mode}: {output:?}");
+            let details = output.details.expect("details");
+            let result = &details["results"][0];
+            assert_eq!(result["schemaValid"], false, "mode={mode}: {result}");
+            assert_eq!(result["schemaRetries"], 1, "mode={mode}: {result}");
+            assert!(
+                result["validationErrors"]
+                    .as_array()
+                    .is_some_and(|errors| !errors.is_empty()),
+                "mode={mode}: {result}"
+            );
+            assert_eq!(
+                result["status"],
+                if expect_error { "failed" } else { "completed" },
+                "mode={mode}: {result}"
+            );
+        }
     }
 }
