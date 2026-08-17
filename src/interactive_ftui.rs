@@ -147,6 +147,48 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
     }
 }
 
+/// Who produced a transcript entry. Drives the prefix and style each role
+/// gets in the conversation view (the seed of the real message rendering —
+/// markdown/tool cards layer onto this).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRole {
+    User,
+    Assistant,
+    System,
+    Error,
+    Ask,
+}
+
+impl EntryRole {
+    /// Prefix for the entry's first rendered line.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::User => "› ",
+            Self::System => "· ",
+            Self::Error => "✗ ",
+            Self::Assistant | Self::Ask => "",
+        }
+    }
+
+    fn style(self) -> ftui::Style {
+        match self {
+            Self::User => ftui::Style::new().bold(),
+            Self::Assistant => ftui::Style::new(),
+            Self::System | Self::Ask => ftui::Style::new().dim(),
+            Self::Error => ftui::Style::new()
+                .bold()
+                .fg(ftui::PackedRgba::rgb(220, 80, 80)),
+        }
+    }
+}
+
+/// One sanitized conversation entry (message, note, card, or error).
+#[derive(Debug)]
+struct TranscriptEntry {
+    role: EntryRole,
+    text: String,
+}
+
 /// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
 /// of the bubbletea stack: the card renders into the transcript and the
 /// editor collects the reply (`1`/label to select, comma-separated for multi,
@@ -193,7 +235,7 @@ pub struct PiFtuiModel {
     /// What the agent is doing right now (drives header + input routing).
     state: AgentUiState,
     /// Sanitized transcript lines (completed messages / system notes).
-    transcript: Vec<String>,
+    transcript: Vec<TranscriptEntry>,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
     streaming: String,
     /// Running tool (name shown in the status region while active).
@@ -340,7 +382,7 @@ impl PiFtuiModel {
         let transcript: usize = self
             .transcript
             .iter()
-            .map(|e| e.lines().count().max(1))
+            .map(|e| e.text.lines().count().max(1))
             .sum();
         let streaming = if self.streaming.is_empty() {
             0
@@ -348,6 +390,10 @@ impl PiFtuiModel {
             self.streaming.lines().count().max(1)
         };
         transcript + streaming
+    }
+
+    fn push_entry(&mut self, role: EntryRole, text: String) {
+        self.transcript.push(TranscriptEntry { role, text });
     }
 
     /// Cap for `scroll_from_tail`: can't scroll further up than the content.
@@ -399,10 +445,12 @@ impl PiFtuiModel {
                 ..
             } => {
                 if !self.streaming.is_empty() {
-                    self.transcript.push(std::mem::take(&mut self.streaming));
+                    let text = std::mem::take(&mut self.streaming);
+                    self.push_entry(EntryRole::Assistant, text);
                 }
                 if let Some(err) = error_message {
-                    self.transcript.push(format!("error: {}", sanitize(&err)));
+                    let text = sanitize(&err).into_owned();
+                    self.push_entry(EntryRole::Error, text);
                 }
                 if let Some(usage) = usage {
                     self.usage_line = Some(format!(
@@ -415,13 +463,15 @@ impl PiFtuiModel {
                 self.thinking.clear();
             }
             PiMsg::AgentError(err) => {
-                self.transcript.push(format!("error: {}", sanitize(&err)));
+                let text = sanitize(&err).into_owned();
+                self.push_entry(EntryRole::Error, text);
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
-                self.transcript.push(sanitize(&text).into_owned());
+                let text = sanitize(&text).into_owned();
+                self.push_entry(EntryRole::System, text);
             }
             PiMsg::AskUiRequest(request) => {
                 if request.request.questions.is_empty() {
@@ -451,7 +501,8 @@ impl PiFtuiModel {
         let total = request.request.questions.len();
         let card =
             crate::ask::format_question_card(&request.request.questions[index], index, total);
-        self.transcript.push(sanitize(card.trim_end()).into_owned());
+        let text = sanitize(card.trim_end()).into_owned();
+        self.push_entry(EntryRole::Ask, text);
         self.scroll_from_tail = 0;
     }
 
@@ -475,12 +526,13 @@ impl PiFtuiModel {
         let question = &ask.request.request.questions[index];
         match crate::ask::parse_question_reply(question, &raw) {
             Err(err) => {
-                self.transcript.push(format!("  ! {}", sanitize(&err)));
+                let text = format!("  ! {}", sanitize(&err));
+                self.push_entry(EntryRole::Ask, text);
                 self.scroll_from_tail = 0;
                 self.active_ask = Some(ask); // same question again
             }
             Ok(QuestionReply::Cancel) => {
-                self.transcript.push(String::from("  (dismissed)"));
+                self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
                 self.scroll_from_tail = 0;
                 self.send_ask_reply(ask.request.id, Vec::new(), true);
             }
@@ -494,7 +546,8 @@ impl PiFtuiModel {
                     || format!("  → {}", selected.join(", ")),
                     |text| format!("  → {text}"),
                 );
-                self.transcript.push(sanitize(&echo).into_owned());
+                let echo = sanitize(&echo).into_owned();
+                self.push_entry(EntryRole::Ask, echo);
                 let question_id = question.id.clone().unwrap_or_else(|| index.to_string());
                 ask.answers.push(AskAnswer {
                     question_id,
@@ -525,7 +578,7 @@ impl PiFtuiModel {
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
         let clean = sanitize(trimmed).into_owned();
-        self.transcript.push(format!("› {clean}"));
+        self.push_entry(EntryRole::User, clean.clone());
         if let Some(tx) = &self.submit_tx {
             // A dead agent loop is not a UI error; the transcript echo above
             // still shows what was typed.
@@ -592,7 +645,7 @@ impl PiFtuiModel {
                     Some(AppAction::Interrupt) if self.active_ask.is_some() => {
                         // Escape dismisses the pending ask card.
                         if let Some(ask) = self.active_ask.take() {
-                            self.transcript.push(String::from("  (dismissed)"));
+                            self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
                             self.scroll_from_tail = 0;
                             self.send_ask_reply(ask.request.id, Vec::new(), true);
                         }
@@ -656,17 +709,33 @@ impl PiFtuiModel {
         Cmd::none()
     }
 
-    fn conversation_text(&self) -> String {
-        let mut body = String::new();
-        for line in &self.transcript {
-            body.push_str(line);
-            body.push('\n');
+    /// Build the styled conversation: each entry gets its role prefix on the
+    /// first line, matching indent on continuation lines, and the role style.
+    fn conversation_text(&self) -> Text<'static> {
+        let mut lines: Vec<ftui::text::Line<'static>> =
+            Vec::with_capacity(self.conversation_line_count());
+        let mut push_block = |role: EntryRole, content: &str| {
+            let style = role.style();
+            let prefix = role.prefix();
+            let indent = " ".repeat(prefix.chars().count());
+            for (i, line) in content.lines().enumerate() {
+                let lead = if i == 0 { prefix } else { indent.as_str() };
+                let mut rendered = String::with_capacity(lead.len() + line.len());
+                rendered.push_str(lead);
+                rendered.push_str(line);
+                lines.push(ftui::text::Line::styled(rendered, style));
+            }
+            if content.is_empty() {
+                lines.push(ftui::text::Line::styled(prefix.to_string(), style));
+            }
+        };
+        for entry in &self.transcript {
+            push_block(entry.role, &entry.text);
         }
         if !self.streaming.is_empty() {
-            body.push_str(&self.streaming);
-            body.push('\n');
+            push_block(EntryRole::Assistant, &self.streaming);
         }
-        body
+        Text::from_lines(lines)
     }
 }
 
@@ -692,18 +761,14 @@ impl Model for PiFtuiModel {
         // sticks to the bottom; scrolling up pins an offset measured from the
         // tail so streaming appends don't yank the view.
         let body_text = self.conversation_text();
-        let total_lines = if body_text.is_empty() {
-            0
-        } else {
-            body_text.lines().count()
-        };
+        let total_lines = body_text.lines().len();
         let visible = usize::from(regions.body.height).max(1);
         let from_tail = self
             .scroll_from_tail
             .min(total_lines.saturating_sub(visible));
         let offset = total_lines.saturating_sub(visible + from_tail);
         let offset_u16 = u16::try_from(offset).unwrap_or(u16::MAX);
-        Paragraph::new(Text::raw(&body_text))
+        Paragraph::new(body_text)
             .scroll((offset_u16, 0))
             .render(regions.body, frame);
 
@@ -942,7 +1007,10 @@ mod tests {
             error_message: None,
         }));
         assert_eq!(sim.model().state, AgentUiState::Ready);
-        assert_eq!(sim.model().transcript, vec!["hello world".to_string()]);
+        let transcript = &sim.model().transcript;
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "hello world");
+        assert_eq!(transcript[0].role, EntryRole::Assistant);
         assert!(sim.model().streaming.is_empty());
     }
 
@@ -1021,7 +1089,10 @@ mod tests {
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(submit_rx.try_recv().expect("submitted"), "hi");
         assert!(sim.model().input.is_empty(), "editor not cleared");
-        assert_eq!(sim.model().transcript, vec!["› hi".to_string()]);
+        let transcript = &sim.model().transcript;
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].text, "hi");
+        assert_eq!(transcript[0].role, EntryRole::User);
     }
 
     #[test]
