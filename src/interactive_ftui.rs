@@ -41,6 +41,7 @@ use ftui::widgets::spinner::{DOTS, SpinnerState};
 use ftui::widgets::textarea::TextArea;
 use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
+use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
 use crate::interactive::PiMsg;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
@@ -145,6 +146,25 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
     }
 }
 
+/// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
+/// of the bubbletea stack: the card renders into the transcript and the
+/// editor collects the reply (`1`/label to select, comma-separated for multi,
+/// free text for Other, `cancel` to dismiss).
+struct ActiveAsk {
+    request: AskUiRequest,
+    question_index: usize,
+    answers: Vec<AskAnswer>,
+}
+
+/// A completed ask interaction, ready for `AskTool::respond_ui`. The launch
+/// path receives these over the reply channel and resolves the pending tool
+/// call; tests read the channel directly.
+#[derive(Debug)]
+pub struct AskUiReply {
+    pub request_id: String,
+    pub response: AskResponse,
+}
+
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
 /// the editor only receives keys while `Ready` (matching
 /// `editor_input_is_available()` in the bubbletea stack).
@@ -185,6 +205,10 @@ pub struct PiFtuiModel {
     spinner: SpinnerState,
     /// Usage summary from the last completed turn, shown in the footer.
     usage_line: Option<String>,
+    /// Ask-tool card currently collecting answers via the editor.
+    active_ask: Option<ActiveAsk>,
+    /// Where completed ask interactions go (launch path calls respond_ui).
+    ask_reply_tx: Option<Sender<AskUiReply>>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
     term: (u16, u16),
     /// Conversation scroll, measured in lines UP from the tail. 0 means
@@ -254,6 +278,8 @@ impl PiFtuiModel {
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
+            active_ask: None,
+            ask_reply_tx: None,
             term: (80, 24),
             scroll_from_tail: 0,
             input: TextArea::new()
@@ -270,6 +296,14 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_submit_channel(mut self, tx: Sender<String>) -> Self {
         self.submit_tx = Some(tx);
+        self
+    }
+
+    /// Route completed ask-tool interactions to the launch path, which pairs
+    /// them back to the pending tool call via `AskTool::respond_ui`.
+    #[must_use]
+    pub fn with_ask_reply_channel(mut self, tx: Sender<AskUiReply>) -> Self {
+        self.ask_reply_tx = Some(tx);
         self
     }
 
@@ -383,12 +417,95 @@ impl PiFtuiModel {
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
                 self.transcript.push(sanitize(&text).into_owned());
             }
+            PiMsg::AskUiRequest(request) => {
+                if request.request.questions.is_empty() {
+                    // Defensive: an empty card resolves immediately as
+                    // dismissed rather than deadlocking the pending tool.
+                    self.send_ask_reply(request.id, Vec::new(), true);
+                } else {
+                    self.push_ask_card(&request, 0);
+                    self.active_ask = Some(ActiveAsk {
+                        request,
+                        question_index: 0,
+                        answers: Vec::new(),
+                    });
+                }
+            }
             PiMsg::UiShutdown => return Cmd::quit(),
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
             _ => {}
         }
         Cmd::none()
+    }
+
+    /// Render one ask question card into the transcript (sanitized — the
+    /// question text originates from the model/tool side).
+    fn push_ask_card(&mut self, request: &AskUiRequest, index: usize) {
+        let total = request.request.questions.len();
+        let card =
+            crate::ask::format_question_card(&request.request.questions[index], index, total);
+        self.transcript.push(sanitize(card.trim_end()).into_owned());
+        self.scroll_from_tail = 0;
+    }
+
+    fn send_ask_reply(&self, request_id: String, answers: Vec<AskAnswer>, dismissed: bool) {
+        if let Some(tx) = &self.ask_reply_tx {
+            let _ = tx.send(AskUiReply {
+                request_id,
+                response: AskResponse { answers, dismissed },
+            });
+        }
+    }
+
+    /// Consume the editor content as the reply to the active ask question.
+    fn submit_ask_answer(&mut self) {
+        let Some(mut ask) = self.active_ask.take() else {
+            return;
+        };
+        let raw = self.input.text();
+        self.input.set_text("");
+        let index = ask.question_index;
+        let question = &ask.request.request.questions[index];
+        match crate::ask::parse_question_reply(question, &raw) {
+            Err(err) => {
+                self.transcript.push(format!("  ! {}", sanitize(&err)));
+                self.scroll_from_tail = 0;
+                self.active_ask = Some(ask); // same question again
+            }
+            Ok(QuestionReply::Cancel) => {
+                self.transcript.push(String::from("  (dismissed)"));
+                self.scroll_from_tail = 0;
+                self.send_ask_reply(ask.request.id, Vec::new(), true);
+            }
+            Ok(reply) => {
+                let (selected, other) = match reply {
+                    QuestionReply::Selected(labels) => (labels, None),
+                    QuestionReply::Other(text) => (Vec::new(), Some(text)),
+                    QuestionReply::Cancel => unreachable!("handled above"),
+                };
+                let echo = other.as_ref().map_or_else(
+                    || format!("  → {}", selected.join(", ")),
+                    |text| format!("  → {text}"),
+                );
+                self.transcript.push(sanitize(&echo).into_owned());
+                let question_id = question.id.clone().unwrap_or_else(|| index.to_string());
+                ask.answers.push(AskAnswer {
+                    question_id,
+                    selected,
+                    other,
+                });
+                let next = index + 1;
+                if next < ask.request.request.questions.len() {
+                    self.push_ask_card(&ask.request, next);
+                    ask.question_index = next;
+                    self.active_ask = Some(ask);
+                } else {
+                    self.scroll_from_tail = 0;
+                    self.send_ask_reply(ask.request.id, ask.answers, false);
+                }
+            }
+        }
     }
 
     /// Submit the editor content: echo into the transcript, hand it to the
@@ -444,10 +561,12 @@ impl PiFtuiModel {
                     }
                     _ => {}
                 }
-                if self.editor_available() {
+                if self.input_active() {
                     if key.code == KeyCode::Enter {
                         if key.modifiers.contains(Modifiers::ALT) {
                             self.input.insert_newline();
+                        } else if self.active_ask.is_some() {
+                            self.submit_ask_answer();
                         } else {
                             self.submit_input();
                         }
@@ -467,7 +586,7 @@ impl PiFtuiModel {
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
             _ => {
-                if self.editor_available() {
+                if self.input_active() {
                     // Paste and other editor-relevant events flow through.
                     self.input.handle_event(event);
                 }
@@ -476,10 +595,11 @@ impl PiFtuiModel {
         Cmd::none()
     }
 
-    /// Editor accepts input only while the agent is idle, matching
-    /// `editor_input_is_available()` in the bubbletea stack.
-    fn editor_available(&self) -> bool {
-        self.state == AgentUiState::Ready
+    /// Editor accepts input while the agent is idle (matching
+    /// `editor_input_is_available()` in the bubbletea stack) or while an
+    /// ask card is collecting its reply mid-turn.
+    fn input_active(&self) -> bool {
+        self.state == AgentUiState::Ready || self.active_ask.is_some()
     }
 
     fn consume_scroll(&mut self, scroll: impl FnOnce(&mut Self)) -> Cmd<PiFtuiMsg> {
@@ -562,8 +682,9 @@ impl Model for PiFtuiModel {
             Paragraph::new(Text::raw(&status_line)).render(regions.status, frame);
         }
 
-        // Input editor while idle; processing note while the agent works.
-        if self.editor_available() {
+        // Input editor while idle or answering an ask card; processing note
+        // while the agent works uninterruptibly.
+        if self.input_active() {
             self.input.render(regions.input, frame);
         } else {
             Paragraph::new(Text::raw("… processing (ctrl+c to quit)")).render(regions.input, frame);
@@ -962,6 +1083,125 @@ mod tests {
             "missing usage footer: {rendered:?}"
         );
         assert!(sim.model().thinking.is_empty(), "thinking not cleared");
+    }
+
+    fn ask_request(id: &str, questions: Vec<crate::ask::AskQuestion>) -> AskUiRequest {
+        AskUiRequest {
+            id: id.to_string(),
+            request: crate::ask::AskRequest { questions },
+        }
+    }
+
+    fn question(q: &str, options: &[&str], multi: bool) -> crate::ask::AskQuestion {
+        crate::ask::AskQuestion {
+            id: None,
+            question: q.to_string(),
+            header: None,
+            options: options
+                .iter()
+                .map(|label| crate::ask::AskOption {
+                    label: (*label).to_string(),
+                    description: None,
+                })
+                .collect(),
+            multi,
+            recommended: None,
+        }
+    }
+
+    fn type_str(sim: &mut ProgramSimulator<PiFtuiModel>, s: &str) {
+        for ch in s.chars() {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+    }
+
+    #[test]
+    fn ask_card_collects_answers_across_questions() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(agent_rx).with_ask_reply_channel(reply_tx);
+        drop(agent_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // Mid-turn: agent working, ask arrives with two questions.
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-1",
+            vec![
+                question("Pick a color?", &["red", "blue"], false),
+                question("Pick tools?", &["hammer", "saw"], true),
+            ],
+        ))));
+        let rendered = buffer_text(sim.capture_frame(50, 12), 50, 12);
+        assert!(
+            rendered.contains("Pick a color?"),
+            "card not rendered: {rendered:?}"
+        );
+        // Editor is active mid-turn for the reply; select by number.
+        type_str(&mut sim, "2");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        // Second card renders; multi-select by labels.
+        let rendered = buffer_text(sim.capture_frame(50, 14), 50, 14);
+        assert!(
+            rendered.contains("Pick tools?"),
+            "second card missing: {rendered:?}"
+        );
+        type_str(&mut sim, "hammer, saw");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let reply = reply_rx.try_recv().expect("ask reply sent");
+        assert_eq!(reply.request_id, "ask-1");
+        assert!(!reply.response.dismissed);
+        assert_eq!(reply.response.answers.len(), 2);
+        assert_eq!(reply.response.answers[0].selected, vec!["blue".to_string()]);
+        assert_eq!(
+            reply.response.answers[1].selected,
+            vec!["hammer".to_string(), "saw".to_string()]
+        );
+        assert!(sim.model().active_ask.is_none(), "ask not cleared");
+    }
+
+    #[test]
+    fn ask_cancel_dismisses() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(agent_rx).with_ask_reply_channel(reply_tx);
+        drop(agent_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-2",
+            vec![question("Sure?", &["yes", "no"], false)],
+        ))));
+        type_str(&mut sim, "cancel");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let reply = reply_rx.try_recv().expect("dismissal sent");
+        assert!(reply.response.dismissed);
+        assert!(reply.response.answers.is_empty());
+        assert!(sim.model().active_ask.is_none());
+    }
+
+    #[test]
+    fn ask_free_text_becomes_other_answer() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(agent_rx).with_ask_reply_channel(reply_tx);
+        drop(agent_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-3",
+            vec![question("Which env?", &["dev", "prod"], false)],
+        ))));
+        type_str(&mut sim, "staging with canary");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let reply = reply_rx.try_recv().expect("reply sent");
+        assert_eq!(
+            reply.response.answers[0].other.as_deref(),
+            Some("staging with canary")
+        );
+        assert!(reply.response.answers[0].selected.is_empty());
     }
 
     #[test]
