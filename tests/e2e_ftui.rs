@@ -320,6 +320,29 @@ fn launch_with_sentinel(session: &TuiSession, sentinel: &str, inline: bool) {
         .start_session(session.harness.temp_dir(), &script_path);
 }
 
+/// Capture the pane INCLUDING scrollback history. The inline UI may occupy
+/// the whole visible pane (its body region is `Fill`), pushing pre-launch
+/// content into history — which is exactly where "preserved scrollback"
+/// lives. The alternate screen has no history, so in fullscreen mode this
+/// still cannot see the primary screen's hidden content.
+fn capture_with_history(session: &TuiSession) -> String {
+    let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
+    let output = cmd
+        .args([
+            "-L",
+            &session.tmux.socket_name,
+            "capture-pane",
+            "-p",
+            "-t",
+            &session.tmux.session_name,
+            "-S",
+            "-200",
+        ])
+        .output()
+        .expect("tmux capture-pane with history"); // ubs:ignore test assertion expect
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
 /// One scrollback case in its own lock scope (the tmux e2e lock is
 /// non-reentrant, so the inline and control cases must not overlap).
 fn scrollback_case(name: &str, sentinel: &str, inline: bool, expect_visible: bool) -> bool {
@@ -328,13 +351,14 @@ fn scrollback_case(name: &str, sentinel: &str, inline: bool, expect_visible: boo
         return false;
     };
     launch_with_sentinel(&session, sentinel, inline);
-    let pane = session
+    session
         .tmux
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+    let pane = capture_with_history(&session);
     if expect_visible {
         assert!(
             pane.contains(sentinel),
-            "inline mode hid pre-launch shell content; pane:\n{pane}"
+            "inline mode lost pre-launch shell content (not even in history); pane:\n{pane}"
         );
     } else {
         assert!(

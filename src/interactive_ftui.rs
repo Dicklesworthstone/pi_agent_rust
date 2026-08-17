@@ -1200,9 +1200,12 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 /// Not yet at parity with the bubbletea stack (slash commands, bash `!`,
 /// pickers, extension UIs, ask respond_ui wiring); tracked on the bead.
 /// Inline-mode UI height bounds: enough rows for chrome + a few conversation
-/// lines at minimum, capped so the shell above stays visible.
+/// lines at minimum, capped so the shell above stays visible. The cap must
+/// stay well under common terminal heights (24 rows): an inline UI as tall
+/// as the screen erases the very scrollback the mode exists to preserve
+/// (proven by the e2e_ftui scrollback capture lane).
 const INLINE_MIN_HEIGHT: u16 = 10;
-const INLINE_MAX_HEIGHT: u16 = 24;
+const INLINE_MAX_HEIGHT: u16 = 15;
 
 /// Install the ask-tool picker bridge for the driver runtime: cards forward
 /// to the UI as `PiMsg::AskUiRequest`; answered cards pair back through
