@@ -1196,13 +1196,44 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 const INLINE_MIN_HEIGHT: u16 = 10;
 const INLINE_MAX_HEIGHT: u16 = 24;
 
+/// Install the ask-tool picker bridge for the driver runtime: cards forward
+/// to the UI as `PiMsg::AskUiRequest`; answered cards pair back through
+/// `respond_ui`. Both pumps are spawned tasks because asks arrive MID-TURN
+/// while the driver loop is blocked inside `prompt().await` — pumping from
+/// the loop itself would deadlock the pending tool call.
+fn install_ask_bridge(
+    ask: crate::ask::AskTool,
+    agent_tx: &Sender<PiMsg>,
+    ask_reply_rx: Receiver<AskUiReply>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) {
+    let (ask_ui_tx, mut ask_ui_rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(4);
+    ask.install_channel_ui(ask_ui_tx);
+    let ask_fwd_tx = agent_tx.clone();
+    runtime_handle.spawn(async move {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        while let Ok(request) = ask_ui_rx.recv(&cx).await {
+            let _ = ask_fwd_tx.send(PiMsg::AskUiRequest(request));
+        }
+    });
+    runtime_handle.spawn(async move {
+        loop {
+            match ask_reply_rx.try_recv() {
+                Ok(reply) => {
+                    let _ = ask.respond_ui(&reply.request_id, reply.response);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    });
+}
+
 /// Run a `!command` for the driver loop: tool-status blips around the shared
 /// bash runner, result rendered via the session display formatter.
-async fn run_bash_ui_command(
-    cwd: &std::path::Path,
-    command: &str,
-    agent_tx: &Sender<PiMsg>,
-) {
+async fn run_bash_ui_command(cwd: &std::path::Path, command: &str, agent_tx: &Sender<PiMsg>) {
     let _ = agent_tx.send(PiMsg::ToolStart {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
@@ -1270,33 +1301,7 @@ pub fn run(
                 // loop is blocked inside prompt().await, so pumping replies
                 // from the loop itself would deadlock the pending tool call.
                 if let Some(ask) = handle.ask_tool() {
-                    let (ask_ui_tx, mut ask_ui_rx) =
-                        asupersync::channel::mpsc::channel::<AskUiRequest>(4);
-                    ask.install_channel_ui(ask_ui_tx);
-                    let ask_fwd_tx = agent_tx.clone();
-                    runtime_handle.spawn(async move {
-                        let cx = crate::agent_cx::AgentCx::for_request();
-                        while let Ok(request) = ask_ui_rx.recv(&cx).await {
-                            let _ = ask_fwd_tx.send(PiMsg::AskUiRequest(request));
-                        }
-                    });
-                    runtime_handle.spawn(async move {
-                        loop {
-                            match ask_reply_rx.try_recv() {
-                                Ok(reply) => {
-                                    let _ = ask.respond_ui(&reply.request_id, reply.response);
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                                    asupersync::time::sleep(
-                                        asupersync::time::wall_now(),
-                                        SUBMIT_POLL,
-                                    )
-                                    .await;
-                                }
-                                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                            }
-                        }
-                    });
+                    install_ask_bridge(ask, &agent_tx, ask_reply_rx, &runtime_handle);
                 }
                 let _ = agent_tx.send(PiMsg::System(String::from(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
