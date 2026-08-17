@@ -247,9 +247,11 @@ pub struct AskUiReply {
     pub response: AskResponse,
 }
 
-/// Command from the UI to the agent driver. The seed of the bubbletea
-/// stack's input-routing chain: prompts run agent turns; slash commands that
-/// need the session act here (`/model`), everything else is still unported.
+/// Command from the UI to the agent driver.
+///
+/// The seed of the bubbletea stack's input-routing chain: prompts run agent
+/// turns; slash commands that need the session act here (`/model`),
+/// everything else is still unported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
     /// Run an agent turn with this prompt.
