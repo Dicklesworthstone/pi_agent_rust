@@ -154,7 +154,7 @@ fn e2e_ftui_launch_help_bash_quit() {
 /// (no fake provider streams in this lane yet); raw mode + mouse capture +
 /// alt-screen are all active at signal time, which is the terminal state
 /// that matters.
-fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool) {
+fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_activity: bool) {
     use std::fmt::Write as _;
 
     let Some((_lock, session)) = new_locked_session(name) else {
@@ -219,6 +219,17 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool) {
         .tmux
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
 
+    if mid_activity {
+        // Land the signal while the UI is actively rendering: a long bash
+        // command keeps the driver busy, the tool status live, and the
+        // spinner tick chain re-arming when the signal arrives.
+        session.tmux.send_literal("!sleep 5");
+        session.tmux.send_key("Enter");
+        session
+            .tmux
+            .wait_for_pane_contains("running bash", COMMAND_TIMEOUT);
+    }
+
     // An unreadable/unparseable pid file is an immediate test failure.
     let pid_text = std::fs::read_to_string(&pid_file).expect("read pi pid"); // ubs:ignore test assertion expect
     let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
@@ -261,14 +272,33 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool) {
 /// SIGTERM must restore the terminal via RAII before exiting.
 #[test]
 fn e2e_ftui_sigterm_restores_terminal() {
-    run_signal_teardown("e2e_ftui_sigterm_restores_terminal", "-TERM", false);
+    run_signal_teardown("e2e_ftui_sigterm_restores_terminal", "-TERM", false, false);
+}
+
+/// SIGTERM while the UI is mid-activity (bash running, spinner animating)
+/// must still restore — the closest lane to "SIGKILL mid-stream" until a VCR
+/// streamed-turn variant lands (a KILLed process can never restore, so TERM
+/// is the restorable signal worth proving under load).
+#[test]
+fn e2e_ftui_sigterm_mid_activity_restores_terminal() {
+    run_signal_teardown(
+        "e2e_ftui_sigterm_mid_activity_restores_terminal",
+        "-TERM",
+        false,
+        true,
+    );
 }
 
 /// SIGKILL cannot restore (POSIX); the shell must survive and `stty sane`
 /// must recover the pane.
 #[test]
 fn e2e_ftui_sigkill_recoverable_with_stty_sane() {
-    run_signal_teardown("e2e_ftui_sigkill_recoverable_with_stty_sane", "-9", true);
+    run_signal_teardown(
+        "e2e_ftui_sigkill_recoverable_with_stty_sane",
+        "-9",
+        true,
+        false,
+    );
 }
 
 /// Acceptance #2 capture proof: with `--inline`, shell content printed
