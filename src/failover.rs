@@ -224,12 +224,32 @@ impl CredentialRing {
     }
 
     /// All keys currently cooling (observability/testing).
-    #[cfg(test)]
+    #[must_use]
     pub(crate) fn cooling_count(&self, now: Instant) -> usize {
         self.backoff_until
             .iter()
             .filter(|until| until.is_some_and(|u| now < u))
             .count()
+    }
+
+    /// Masked key fingerprints for diagnostics (never logs raw secrets).
+    #[must_use]
+    pub(crate) fn key_fingerprints(&self) -> Vec<String> {
+        self.keys
+            .iter()
+            .map(|key| {
+                let len = key.len();
+                let tail: String = key
+                    .chars()
+                    .rev()
+                    .take(2)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect();
+                format!("len{len}/..{tail}")
+            })
+            .collect()
     }
 }
 

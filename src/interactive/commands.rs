@@ -2792,7 +2792,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
-    /// `/plan` (bd-cv653.3.5): enter plan mode, or manage a submitted plan.
     fn handle_slash_plan(&mut self, args: &str) -> Option<Cmd> {
         let sub = args.trim().to_ascii_lowercase();
         let plan_state = {
@@ -2803,145 +2802,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             agent_guard.plan_state()
         };
         match sub.as_str() {
-            "" | "on" | "start" => {
-                if plan_state.mode() != crate::plan::PlanMode::Off {
-                    self.status_message = Some(format!(
-                        "Already in plan mode ({})",
-                        plan_state.mode().as_str()
-                    ));
-                    return None;
-                }
-                plan_state.enter_planning();
-                // Stash the current model so approval can restore it, then
-                // switch to the plan role when one is configured.
-                plan_state.stash_previous_model(
-                    &self.model_entry.model.provider,
-                    &self.model_entry.model.id,
-                );
-                if let Some(spec) = self
-                    .config
-                    .model_roles
-                    .as_ref()
-                    .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
-                {
-                    let spec = spec.to_string();
-                    if let Some((provider, model_id)) =
-                        crate::provider_metadata::split_provider_model_spec(&spec)
-                    {
-                        let entry = self
-                            .available_models
-                            .iter()
-                            .find(|m| {
-                                crate::provider_metadata::provider_ids_match(
-                                    &m.model.provider,
-                                    provider,
-                                ) && m.model.id.eq_ignore_ascii_case(model_id)
-                            })
-                            .cloned()
-                            .or_else(|| {
-                                crate::models::ad_hoc_model_entry(provider, model_id)
-                            });
-                        if let Some(entry) = entry {
-                            let key = resolve_model_key_from_default_auth(&entry);
-                            match providers::create_provider(&entry, self.extensions.as_ref()) {
-                                Ok(provider_impl) => {
-                                    if let Err(message) = self.switch_active_model(
-                                        &entry,
-                                        provider_impl,
-                                        key.as_deref(),
-                                        "plan-role",
-                                    ) {
-                                        self.status_message = Some(message);
-                                    }
-                                }
-                                Err(err) => {
-                                    self.status_message = Some(err.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Ok(mut session_guard) = self.session.try_lock() {
-                    session_guard.append_custom_entry(
-                        "plan_mode".to_string(),
-                        Some(serde_json::json!({"mode": "planning"})),
-                    );
-                }
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: "Plan mode: read-only. Inspect with read/grep/find/ls, then call submit_plan with the full plan for review.".to_string(),
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.status_message = Some("Plan mode: planning (read-only)".to_string());
-                self.scroll_to_bottom();
-            }
+            "" | "on" | "start" => self.enter_plan_mode(&plan_state),
             "status" => {
-                self.status_message = Some(format!(
-                    "Plan mode: {}",
-                    plan_state.mode().as_str()
-                ));
+                self.status_message = Some(format!("Plan mode: {}", plan_state.mode().as_str()));
             }
-            "approve" => match plan_state.approve() {
-                Some(plan) => {
-                    // Pin the plan into the agent's system context for the
-                    // execution turns (bd-cv653.3.5).
-                    if let Ok(mut agent_guard) = self.agent.try_lock() {
-                        let existing = agent_guard
-                            .config
-                            .system_prompt
-                            .clone()
-                            .unwrap_or_default();
-                        agent_guard.set_system_prompt(Some(format!(
-                            "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
-                        )));
-                    }
-                    if let Some((provider, model_id)) = plan_state.take_previous_model() {
-                        let entry = self
-                            .available_models
-                            .iter()
-                            .find(|m| {
-                                crate::provider_metadata::provider_ids_match(
-                                    &m.model.provider,
-                                    &provider,
-                                ) && m.model.id.eq_ignore_ascii_case(&model_id)
-                            })
-                            .cloned()
-                            .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id));
-                        if let Some(entry) = entry {
-                            let key = resolve_model_key_from_default_auth(&entry);
-                            if let Ok(provider_impl) =
-                                providers::create_provider(&entry, self.extensions.as_ref())
-                            {
-                                let _ = self.switch_active_model(
-                                    &entry,
-                                    provider_impl,
-                                    key.as_deref(),
-                                    "plan-restore",
-                                );
-                            }
-                        }
-                    }
-                    if let Ok(mut session_guard) = self.session.try_lock() {
-                        session_guard.append_custom_entry(
-                            "plan_mode".to_string(),
-                            Some(serde_json::json!({"mode": "approved"})),
-                        );
-                    }
-                    self.status_message = Some("Plan approved — execute it.".to_string());
-                }
-                None => {
-                    self.status_message = Some("No submitted plan to approve".to_string());
-                }
-            },
+            "approve" => self.approve_plan_mode(&plan_state),
             "reject" => {
                 if plan_state.reject() {
-                    if let Ok(mut session_guard) = self.session.try_lock() {
-                        session_guard.append_custom_entry(
-                            "plan_mode".to_string(),
-                            Some(serde_json::json!({"mode": "rejected"})),
-                        );
-                    }
+                    Self::log_plan_transition(&self.session, "rejected");
                     self.status_message =
                         Some("Plan rejected — still planning; revise and resubmit".to_string());
                 } else {
@@ -2950,12 +2818,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             "off" | "exit" => {
                 plan_state.exit();
-                if let Ok(mut session_guard) = self.session.try_lock() {
-                    session_guard.append_custom_entry(
-                        "plan_mode".to_string(),
-                        Some(serde_json::json!({"mode": "off"})),
-                    );
-                }
+                Self::log_plan_transition(&self.session, "off");
                 self.status_message = Some("Plan mode off".to_string());
             }
             other => {
@@ -2965,6 +2828,96 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
         }
         None
+    }
+
+    fn log_plan_transition(session: &Arc<Mutex<crate::session::Session>>, mode: &str) {
+        if let Ok(mut guard) = session.try_lock() {
+            guard.append_custom_entry(
+                "plan_mode".to_string(),
+                Some(serde_json::json!({"mode": mode})),
+            );
+        }
+    }
+
+    /// Switch the active model to a role-resolved spec when one is configured.
+    fn switch_to_role_spec(&mut self, spec: &str, source: &str) {
+        let Some((provider, model_id)) = crate::provider_metadata::split_provider_model_spec(spec)
+        else {
+            return;
+        };
+        let entry = self
+            .available_models
+            .iter()
+            .find(|m| {
+                crate::provider_metadata::provider_ids_match(&m.model.provider, provider)
+                    && m.model.id.eq_ignore_ascii_case(model_id)
+            })
+            .cloned()
+            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
+        if let Some(entry) = entry {
+            let key = resolve_model_key_from_default_auth(&entry);
+            if let Ok(provider_impl) = providers::create_provider(&entry, self.extensions.as_ref())
+            {
+                let _ = self.switch_active_model(&entry, provider_impl, key.as_deref(), source);
+            }
+        }
+    }
+
+    fn enter_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
+        if plan_state.mode() != crate::plan::PlanMode::Off {
+            self.status_message = Some(format!(
+                "Already in plan mode ({})",
+                plan_state.mode().as_str()
+            ));
+            return;
+        }
+        plan_state.enter_planning();
+        plan_state
+            .stash_previous_model(&self.model_entry.model.provider, &self.model_entry.model.id);
+        if let Some(spec) = self
+            .config
+            .model_roles
+            .as_ref()
+            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
+            .map(str::to_string)
+        {
+            self.switch_to_role_spec(&spec, "plan-role");
+        }
+        Self::log_plan_transition(&self.session, "planning");
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: "Plan mode: read-only. Inspect with read/grep/find/ls, then call submit_plan with the full plan for review.".to_string(),
+            thinking: None,
+            collapsed: false,
+        });
+        self.status_message = Some("Plan mode: planning (read-only)".to_string());
+        self.scroll_to_bottom();
+    }
+
+    fn approve_plan_mode(&mut self, plan_state: &crate::plan::PlanState) {
+        match plan_state.approve() {
+            Some(plan) => {
+                // Pin the plan into the agent's system context for the
+                // execution turns (bd-cv653.3.5).
+                if let Ok(mut agent_guard) = self.agent.try_lock() {
+                    let existing = agent_guard
+                        .system_prompt()
+                        .map(str::to_string)
+                        .unwrap_or_default();
+                    agent_guard.set_system_prompt(Some(format!(
+                        "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
+                    )));
+                }
+                if let Some((provider, model_id)) = plan_state.take_previous_model() {
+                    self.switch_to_role_spec(&format!("{provider}/{model_id}"), "plan-restore");
+                }
+                Self::log_plan_transition(&self.session, "approved");
+                self.status_message = Some("Plan approved — execute it.".to_string());
+            }
+            None => {
+                self.status_message = Some("No submitted plan to approve".to_string());
+            }
+        }
     }
 
     pub(super) fn handle_slash_thinking(&mut self, args: &str) -> Option<Cmd> {

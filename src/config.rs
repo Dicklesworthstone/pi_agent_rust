@@ -62,6 +62,8 @@ pub struct Config {
     pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
     /// Tool load modes (`tools.loadMode`, bd-cv653.1.6).
     pub tools: Option<ToolSettings>,
+    /// Plan-mode settings (bd-cv653.3.5).
+    pub plan: Option<PlanSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -419,6 +421,16 @@ pub struct ToolSettings {
     pub load_mode: Option<std::collections::HashMap<String, String>>,
 }
 
+/// Plan-mode configuration (bd-cv653.3.5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlanSettings {
+    /// Auto-approve submitted plans without interactive review
+    /// (`--plan-yolo` wins over this). Default: false.
+    #[serde(alias = "autoApprove", alias = "yolo")]
+    pub auto_approve: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -688,6 +700,7 @@ impl Config {
             disabled_providers: other.disabled_providers.or(base.disabled_providers),
             model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
             tools: merge_tools(base.tools, other.tools),
+            plan: merge_plan(base.plan, other.plan),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -801,6 +814,14 @@ impl Config {
             .and_then(|r| r.max_failovers_per_turn)
             .unwrap_or(8)
             .min(8)
+    }
+
+    /// Whether submitted plans auto-approve (bd-cv653.3.5). Default: false.
+    pub fn plan_auto_approve(&self) -> bool {
+        self.plan
+            .as_ref()
+            .and_then(|p| p.auto_approve)
+            .unwrap_or(false)
     }
 
     pub fn steering_queue_mode(&self) -> QueueMode {
@@ -1406,6 +1427,18 @@ fn merge_titling(
     match (base, other) {
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge plan-mode settings (other wins).
+fn merge_plan(base: Option<PlanSettings>, other: Option<PlanSettings>) -> Option<PlanSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(PlanSettings {
+            auto_approve: other.auto_approve.or(base.auto_approve),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

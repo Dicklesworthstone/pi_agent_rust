@@ -321,6 +321,15 @@ pub struct Cli {
     #[arg(long, value_name = "PROVIDER/MODEL")]
     pub plan: Option<String>,
 
+    /// Start in plan mode: read-only planning until a plan is approved
+    /// (bd-cv653.3.5).
+    #[arg(long)]
+    pub plan_mode: bool,
+
+    /// Auto-approve submitted plans without review (unattended runs).
+    #[arg(long)]
+    pub plan_yolo: bool,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each

@@ -412,6 +412,12 @@ where
                 .map(str::to_string)
         };
         drop(map);
+        if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
+            eprintln!(
+                "[rotation] resolve provider={provider} -> {:?}",
+                value.as_deref()
+            );
+        }
         value
     }
 }
@@ -419,18 +425,37 @@ where
 /// Report a 429/rate-limit against a credential (bd-cv653.3.2). The key backs
 /// off exponentially; the next `resolve_api_key` rotates to a healthy sibling.
 pub fn report_provider_rate_limit(provider: &str, key: &str) {
+    if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
+        eprintln!(
+            "[rotation] report provider={provider} key_len={}",
+            key.len()
+        );
+    }
     if key.trim().is_empty() {
         return;
     }
     if let Ok(mut map) = CREDENTIAL_RINGS.lock()
         && let Some(ring) = map.get_mut(provider)
     {
-        ring.report_rate_limited(
+        // 15s base: must comfortably exceed the retry-delay path even on
+        // heavily loaded hosts, or a sibling retry re-resolves after expiry
+        // and lands on the same (still hot) key — observed as e2e flake.
+        let expiry = ring.report_rate_limited(
             key,
             std::time::Instant::now(),
-            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(15),
             std::time::Duration::from_secs(300),
         );
+        if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
+            eprintln!(
+                "[rotation] reported; ring keys={:?} cooling_now={}",
+                ring.key_fingerprints(),
+                ring.cooling_count(std::time::Instant::now())
+            );
+            let _ = expiry;
+        }
+    } else if std::env::var_os("PI_DEBUG_ROTATION").is_some() {
+        eprintln!("[rotation] report but NO RING found for {provider}");
     }
 }
 

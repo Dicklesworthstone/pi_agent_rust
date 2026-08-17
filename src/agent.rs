@@ -3464,11 +3464,11 @@ impl Agent {
             return self
                 .tools
                 .get(inner)
-                .map_or_else(crate::tools::ToolEffects::read, |tool| tool.effects());
+                .map_or_else(crate::tools::ToolEffects::read, crate::tools::Tool::effects);
         }
         self.tools
             .get(&tool_call.name)
-            .map_or_else(crate::tools::ToolEffects::read, |tool| tool.effects())
+            .map_or_else(crate::tools::ToolEffects::read, crate::tools::Tool::effects)
     }
 
     async fn execute_tool_without_hooks(
@@ -3479,7 +3479,10 @@ impl Agent {
         // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
         // tool whose effects intersect the mutation/process BARRIER set. For
         // xdev run calls the INNER tool's effects decide, not the union.
-        if !self.plan_state.allows_effects(self.effects_for_call(tool_call)) {
+        if !self
+            .plan_state
+            .allows_effects(self.effects_for_call(tool_call))
+        {
             return (
                 Self::xdev_text_output(
                     &crate::plan::PlanState::block_message(&tool_call.name),
@@ -14037,5 +14040,182 @@ mod tests {
         assert!(full_registry.is_discoverable("ast_grep"));
         assert!(!full_registry.is_discoverable("read"));
         assert!(full_registry.get("xdev").is_some(), "xdev auto-registered");
+    }
+
+    // === Plan mode (bd-cv653.3.5) ===
+
+    #[test]
+    fn plan_gate_blocks_mutation_and_allows_reads() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target = temp.path().join("scratch.txt");
+            std::fs::write(&target, "original").expect("write fixture");
+
+            let provider = Arc::new(SilentProvider);
+            let tools = ToolRegistry::new(
+                &["read", "write", "bash", "grep", "ls", "ast_grep"],
+                temp.path(),
+                None,
+            );
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.plan_state().enter_planning();
+
+            // Mutation is blocked with the structured, model-readable error…
+            let write_call = ToolCall {
+                id: "w1".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"path": "scratch.txt", "content": "changed"}),
+                thought_signature: None,
+            };
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}))
+                .await;
+            assert!(is_error, "write must be blocked while planning");
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
+            // …and the file is untouched (zero bytes changed).
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read back"),
+                "original"
+            );
+
+            // Reads flow freely.
+            let read_call = ToolCall {
+                id: "r1".to_string(),
+                name: "read".to_string(),
+                arguments: json!({"path": "scratch.txt"}),
+                thought_signature: None,
+            };
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&read_call, Arc::new(|_| {}))
+                .await;
+            assert!(!is_error, "read must pass the gate");
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("original"), "read returns content: {text}");
+
+            // Bash (process effect) is blocked in plan mode.
+            let bash_call = ToolCall {
+                id: "b1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({"command": "echo hi"}),
+                thought_signature: None,
+            };
+            let (_output, is_error) = agent
+                .execute_tool_without_hooks(&bash_call, Arc::new(|_| {}))
+                .await;
+            assert!(is_error, "bash is blocked while planning");
+
+            // Approval re-opens mutation.
+            agent
+                .plan_state()
+                .submit_plan("goal: test; steps: 1) write".to_string());
+            assert!(agent.plan_state().approve().is_some());
+            let write_call = ToolCall {
+                id: "w2".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"path": "scratch.txt", "content": "changed"}),
+                thought_signature: None,
+            };
+            let (_output, is_error) = agent
+                .execute_tool_without_hooks(&write_call, Arc::new(|_| {}))
+                .await;
+            assert!(!is_error, "write allowed after approval");
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("read back"),
+                "changed"
+            );
+        });
+    }
+
+    #[test]
+    fn plan_gate_xdev_run_uses_inner_tool_effects() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("main.rs"), "fn main() {}\n").expect("fixture");
+            let provider = Arc::new(SilentProvider);
+            let tools = ToolRegistry::new(
+                &["read", "write", "ast_grep", "ast_edit"],
+                temp.path(),
+                None,
+            );
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.plan_state().enter_planning();
+
+            // xdev run on a read-only tool (ast_grep) passes the gate.
+            let run_read = ToolCall {
+                id: "x1".to_string(),
+                name: "xdev".to_string(),
+                arguments: json!({
+                    "action": "run",
+                    "name": "ast_grep",
+                    "args": {"pattern": "fn $NAME($$$)", "path": "."}
+                }),
+                thought_signature: None,
+            };
+            let (_output, is_error) = agent
+                .execute_tool_without_hooks(&run_read, Arc::new(|_| {}))
+                .await;
+            assert!(
+                !is_error,
+                "xdev run on a read-only tool passes while planning"
+            );
+
+            // xdev run on a mutating tool (ast_edit) is blocked.
+            let run_write = ToolCall {
+                id: "x2".to_string(),
+                name: "xdev".to_string(),
+                arguments: json!({
+                    "action": "run",
+                    "name": "ast_edit",
+                    "args": {"ops": [{"pat": "fn main() {}", "out": ""}], "path": "."}
+                }),
+                thought_signature: None,
+            };
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&run_write, Arc::new(|_| {}))
+                .await;
+            assert!(
+                is_error,
+                "xdev run on a mutating tool is blocked while planning"
+            );
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("PLAN_MODE_BLOCKED"), "gate error: {text}");
+        });
+    }
+
+    #[test]
+    fn plan_mode_session_entries_round_trip() {
+        let mut session = Session::in_memory();
+        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "planning"})));
+        session.append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "approved"})));
+        let json = serde_json::to_string(session.entries_for_current_path()[1]).expect("ser");
+        let parsed: crate::session::SessionEntry = serde_json::from_str(&json).expect("reparse");
+        let crate::session::SessionEntry::Custom(custom) = &parsed else {
+            panic!("expected custom entry");
+        };
+        assert_eq!(custom.custom_type, "plan_mode");
+        assert_eq!(
+            custom
+                .data
+                .as_ref()
+                .and_then(|d| d.get("mode"))
+                .and_then(Value::as_str),
+            Some("approved")
+        );
     }
 }

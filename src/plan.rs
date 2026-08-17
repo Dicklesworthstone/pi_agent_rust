@@ -2,33 +2,40 @@
 //!
 //! While `Planning`, the tool executor rejects any tool whose effects
 //! intersect the mutation/process BARRIER set with a structured, model-readable
-//! error — reads, searches, and analysis flow freely. The agent ends planning
-//! by submitting a structured plan via the `submit_plan` tool; the plan is
-//! reviewed (TUI card / `/plan approve|reject` / RPC `approve_plan`), and on
-//! approval the plan becomes a pinned context document for execution turns.
+//! error — reads, searches, and analysis flow freely.
 //!
-//! `--plan-yolo` / `plan.autoApprove` auto-approves for unattended runs.
-//! Every transition is logged as session entries (replay-safe).
+//! The agent ends planning by submitting a structured plan via `submit_plan`;
+//! the plan is reviewed (TUI card / `/plan approve|reject` / RPC
+//! `approve_plan`), and on approval it becomes a pinned context document for
+//! execution turns. `--plan-yolo` / `plan.autoApprove` auto-approves for
+//! unattended runs. Every transition is logged as session entries
+//! (replay-safe).
 
 use crate::tools::ToolEffects;
 use std::sync::{Arc, RwLock};
 
-/// The `submit_plan` tool: the agent calls this with the full plan to end
-/// planning and request review (bd-cv653.3.5). Session-host-coupled: the
-/// shared [`PlanState`] is created by the agent and handed here at registry
-/// extension time (like ask/todo).
+/// The `submit_plan` tool (bd-cv653.3.5).
+///
+/// The agent calls this with the full plan to end planning and request
+/// review. Session-host-coupled: the shared [`PlanState`] is created by the
+/// agent and handed here at registry extension time (like ask/todo).
 pub struct SubmitPlanTool {
     state: PlanState,
+    auto_approve: bool,
 }
 
 impl SubmitPlanTool {
     #[must_use]
-    pub fn new(state: PlanState) -> Self {
-        Self { state }
+    pub const fn new(state: PlanState, auto_approve: bool) -> Self {
+        Self {
+            state,
+            auto_approve,
+        }
     }
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl crate::tools::Tool for SubmitPlanTool {
     fn name(&self) -> &str {
         "submit_plan"
@@ -81,14 +88,14 @@ impl crate::tools::Tool for SubmitPlanTool {
             return Ok(crate::tools::ToolOutput {
                 content: vec![crate::model::ContentBlock::Text(
                     crate::model::TextContent::new(
-                        "Plan is too short to review — include goal, ordered steps, files to touch, and verification."
+                        "Plan is too short to review — include goal, ordered steps, files to touch, and verification.",
                     ),
                 )],
                 details: None,
                 is_error: true,
             });
         }
-        if !self.state.submit_plan(plan) {
+        if !self.state.submit_plan(plan.clone()) {
             return Ok(crate::tools::ToolOutput {
                 content: vec![crate::model::ContentBlock::Text(
                     crate::model::TextContent::new(
@@ -97,6 +104,21 @@ impl crate::tools::Tool for SubmitPlanTool {
                 )],
                 details: None,
                 is_error: true,
+            });
+        }
+        if self.auto_approve {
+            // --plan-yolo / plan.autoApprove (bd-cv653.3.5): skip review; the
+            // plan rides back in the tool result so execution continues with
+            // it in context immediately.
+            let _ = self.state.approve();
+            return Ok(crate::tools::ToolOutput {
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new(format!(
+                        "Plan auto-approved (plan yolo). Execute it now:\n\n{plan}"
+                    )),
+                )],
+                details: Some(serde_json::json!({"planReview": "auto_approved"})),
+                is_error: false,
             });
         }
         Ok(crate::tools::ToolOutput {
@@ -111,11 +133,11 @@ impl crate::tools::Tool for SubmitPlanTool {
     }
 }
 
-
 /// Plan-mode state machine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PlanMode {
     /// Normal operation.
+    #[default]
     Off,
     /// Read-only planning; mutations are blocked.
     Planning,
@@ -129,10 +151,10 @@ impl PlanMode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            PlanMode::Off => "off",
-            PlanMode::Planning => "planning",
-            PlanMode::PendingApproval => "pending_approval",
-            PlanMode::Approved => "approved",
+            Self::Off => "off",
+            Self::Planning => "planning",
+            Self::PendingApproval => "pending_approval",
+            Self::Approved => "approved",
         }
     }
 }
@@ -153,12 +175,6 @@ struct PlanStateInner {
     previous_model: Option<(String, String)>,
 }
 
-impl Default for PlanMode {
-    fn default() -> Self {
-        PlanMode::Off
-    }
-}
-
 impl PlanState {
     #[must_use]
     pub fn new() -> Self {
@@ -167,7 +183,7 @@ impl PlanState {
 
     #[must_use]
     pub fn mode(&self) -> PlanMode {
-        self.inner.read().map(|inner| inner.mode).unwrap_or(PlanMode::Off)
+        self.inner.read().map_or(PlanMode::Off, |inner| inner.mode)
     }
 
     /// Enter planning. Returns the previous mode.

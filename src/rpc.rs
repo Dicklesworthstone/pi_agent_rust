@@ -160,6 +160,9 @@ fn normalize_command_type(command_type: &str) -> &str {
         "set-follow-up-mode" | "setFollowUpMode" => "set_follow_up_mode",
         "set-auto-compaction" | "setAutoCompaction" => "set_auto_compaction",
         "set-auto-retry" | "setAutoRetry" => "set_auto_retry",
+        "set-plan-mode" | "setPlanMode" => "set_plan_mode",
+        "approve-plan" | "approvePlan" => "approve_plan",
+        "reject-plan" | "rejectPlan" => "reject_plan",
         _ => command_type,
     }
 }
@@ -1067,6 +1070,100 @@ pub async fn run(
                     handle.abort();
                 }
                 let _ = out_tx.send(response_ok(id, "abort", None));
+            }
+
+            "set_plan_mode" => {
+                // bd-cv653.3.5: enable/disable plan mode. mode: "on"|"off".
+                let mode = parsed
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("on")
+                    .to_ascii_lowercase();
+                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = out_tx.send(response_error(id, "set_plan_mode", "session lock failed"));
+                    continue;
+                };
+                let plan_state = guard.agent.plan_state();
+                let enabled = !matches!(mode.as_str(), "off" | "false" | "0");
+                let Ok(mut inner) = guard.session.lock(cx.cx()).await else {
+                    let _ = out_tx.send(response_error(id, "set_plan_mode", "session busy"));
+                    continue;
+                };
+                if enabled {
+                    plan_state.enter_planning();
+                    inner.append_custom_entry(
+                        "plan_mode".to_string(),
+                        Some(json!({"mode": "planning"})),
+                    );
+                } else {
+                    plan_state.exit();
+                    inner
+                        .append_custom_entry("plan_mode".to_string(), Some(json!({"mode": "off"})));
+                }
+                drop(inner);
+                drop(guard);
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "set_plan_mode",
+                    Some(json!({"planMode": if enabled { "planning" } else { "off" }})),
+                ));
+            }
+
+            "approve_plan" => {
+                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = out_tx.send(response_error(id, "approve_plan", "session lock failed"));
+                    continue;
+                };
+                let plan_state = guard.agent.plan_state();
+                match plan_state.approve() {
+                    Some(plan) => {
+                        if let Ok(mut inner) = guard.session.lock(cx.cx()).await {
+                            inner.append_custom_entry(
+                                "plan_mode".to_string(),
+                                Some(json!({"mode": "approved"})),
+                            );
+                        }
+                        let _ = out_tx.send(response_ok(
+                            id,
+                            "approve_plan",
+                            Some(json!({"approved": true, "plan": plan})),
+                        ));
+                    }
+                    None => {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "approve_plan",
+                            "no submitted plan to approve",
+                        ));
+                    }
+                }
+            }
+
+            "reject_plan" => {
+                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = out_tx.send(response_error(id, "reject_plan", "session lock failed"));
+                    continue;
+                };
+                let plan_state = guard.agent.plan_state();
+                if plan_state.reject() {
+                    if let Ok(mut inner) = guard.session.lock(cx.cx()).await {
+                        inner.append_custom_entry(
+                            "plan_mode".to_string(),
+                            Some(json!({"mode": "rejected"})),
+                        );
+                    }
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "reject_plan",
+                        Some(json!({"rejected": true})),
+                    ));
+                } else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "reject_plan",
+                        "no submitted plan to reject",
+                    ));
+                }
             }
 
             "get_state" => {
