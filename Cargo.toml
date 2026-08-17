@@ -273,8 +273,18 @@ swc_ecma_visit = "29.0.0"
 wasmtime = { version = "47.0.3", features = ["component-model"], optional = true }
 filetime = "0.2.27"
 
-# Image processing (optional)
-image = { version = "0.25", optional = true }
+# Image processing (optional). Formats limited to what the read tool
+# actually decodes (jpg/png/gif/webp — see its schema docs) plus rayon for
+# decode parallelism: the default-formats set would pull avif → ravif →
+# rav1e → paste, adding two RUSTSEC inventory warnings (unmaintained
+# `paste`, bd-kytip) and megabytes of AV1 encoder against the size budget.
+image = { version = "0.25", optional = true, default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "webp",
+    "rayon",
+] }
 
 [build-dependencies]
 crc32c = "0.6.8"
