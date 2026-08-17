@@ -7168,6 +7168,7 @@ struct FailoverResolution<'a> {
     cli_api_key: Option<&'a str>,
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_print_mode(
     session: &mut AgentSession,
     mode: &str,
@@ -7480,12 +7481,9 @@ fn is_retryable_prompt_result(msg: &AssistantMessage) -> bool {
     pi::error::is_retryable_error(err_msg, Some(msg.usage.input), None)
 }
 
-/// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`
-/// event emission. Mirrors the retry behaviour in RPC mode (`src/rpc.rs`).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 /// Print-mode failover swap (bd-cv653.3.2): classify the terminal error; if
 /// eligible, resolve the next chain entry, swap the agent's provider, emit
-/// FailoverStart (json mode), and record the session audit + ModelChange.
+/// `FailoverStart` (json mode), and record the session audit + `ModelChange`.
 /// Returns the swapped-to `(provider, model)` so the caller can continue the
 /// turn on it; `None` means no failover happened.
 async fn try_print_failover(
@@ -7552,7 +7550,7 @@ async fn try_print_failover(
                 to_provider: to_provider.clone(),
                 to_model: to_model.clone(),
                 class: format!("{class:?}").to_ascii_lowercase(),
-                attempt: *position as u32,
+                attempt: u32::try_from(*position).unwrap_or(u32::MAX),
             });
         }
 
@@ -7580,6 +7578,9 @@ async fn try_print_failover(
     None
 }
 
+/// Execute a single prompt with automatic retry and `AutoRetryStart`/`AutoRetryEnd`
+/// event emission. Mirrors the retry behaviour in RPC mode (`src/rpc.rs`).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_print_prompt_with_retry<H, EH>(
     session: &mut AgentSession,
     config: &Config,

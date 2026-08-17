@@ -549,6 +549,7 @@ mod tests {
     // === Converter-pipeline fixtures (bd-cv653.2.2 conformance lane) ===
 
     #[test]
+    #[allow(clippy::literal_string_with_formatting_args)]
     fn pipeline_html_fixture_full_page() {
         let html = r#"<!DOCTYPE html><html><head><title>T</title><style>body{color:red}</style></head>
         <body><nav><a href="/">home</a></nav><main><h1>Guide</h1><h2 id="part-1">Part 1</h2>
@@ -653,7 +654,8 @@ mod tests {
         let mut xref = format!("xref\n0 {}\n", offsets.len() + 1);
         xref.push_str("0000000000 65535 f \n");
         for off in &offsets {
-            xref.push_str(&format!("{off:010} 00000 n \n"));
+            use std::fmt::Write as _;
+            let _ = writeln!(xref, "{off:010} 00000 n ");
         }
         out.extend_from_slice(xref.as_bytes());
         out.extend_from_slice(
