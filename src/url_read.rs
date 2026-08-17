@@ -297,7 +297,8 @@ fn convert_pdf(bytes: &[u8]) -> crate::error::Result<String> {
         .map_err(|err| Error::tool("read", format!("PDF extraction failed: {err}")))?;
     let mut out = String::new();
     for (index, text) in pages.iter().enumerate() {
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\n--- page {} ---\n", index + 1));
+        let _ =
+            std::fmt::Write::write_fmt(&mut out, format_args!("\n--- page {} ---\n", index + 1));
         out.push_str(text.trim());
         out.push('\n');
     }
@@ -606,7 +607,12 @@ mod tests {
     #[cfg(not(feature = "url-pdf"))]
     #[test]
     fn pdf_without_feature_returns_named_error() {
-        let outcome = convert_bytes("https://x.test/d.pdf", "application/pdf", b"%PDF-1.4", false);
+        let outcome = convert_bytes(
+            "https://x.test/d.pdf",
+            "application/pdf",
+            b"%PDF-1.4",
+            false,
+        );
         let err = outcome.expect_err("pdf without feature must error");
         assert!(err.to_string().contains("PDF_NOT_COMPILED"));
     }
