@@ -37,6 +37,7 @@ use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
 use ftui::text::Text;
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::textarea::TextArea;
 use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::interactive::PiMsg;
@@ -140,14 +141,32 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
     }
 }
 
+/// Agent activity as the UI sees it. Drives which surfaces accept input:
+/// the editor only receives keys while `Ready` (matching
+/// `editor_input_is_available()` in the bubbletea stack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentUiState {
+    Ready,
+    Working,
+}
+
+impl AgentUiState {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Working => "working",
+        }
+    }
+}
+
 /// Seed ftui model: proves the Elm loop shape against real pi message types.
 ///
 /// Covers init/update/view/subscriptions end to end but holds only what its
 /// tests assert on; the real conversation state migrates here from
 /// `interactive::state` as the view port proceeds.
 pub struct PiFtuiModel {
-    /// One-line status: what the agent is doing right now.
-    status: String,
+    /// What the agent is doing right now (drives header + input routing).
+    state: AgentUiState,
     /// Sanitized transcript lines (completed messages / system notes).
     transcript: Vec<String>,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
@@ -163,6 +182,12 @@ pub struct PiFtuiModel {
     /// semantics as `follow_stream_tail` in the bubbletea stack, but derived
     /// instead of stored so update() never needs the rendered line count.
     scroll_from_tail: usize,
+    /// The input editor (ftui-widgets TextArea replaces bubbles TextArea).
+    input: TextArea,
+    /// Where submitted user input goes. The launch path hands the sending
+    /// half of the channel its agent loop consumes; tests read the receiver
+    /// directly. `None` falls back to echoing into the transcript only.
+    submit_tx: Option<Sender<String>>,
     /// Shared slot for the agent-event receiver: `subscriptions()` re-declares
     /// the bridge each cycle, and the one instance the runtime actually starts
     /// takes the receiver out of this slot (see [`AgentEventSubscription`]).
@@ -180,20 +205,23 @@ struct Regions {
     footer: Rect,
 }
 
-/// Rows of fixed chrome around the conversation body: header, status, input,
-/// footer. Used to derive the body height for scroll math in `update()`
-/// (where no `Frame` exists yet).
-const FIXED_CHROME_ROWS: u16 = 4;
+/// Rows of single-line chrome around the conversation body: header, status,
+/// footer. The input region's height is dynamic (see
+/// [`PiFtuiModel::input_rows`]), so total chrome = this + input rows.
+const FIXED_CHROME_ROWS: u16 = 3;
 
-fn layout_regions(area: Rect) -> Regions {
+/// The input editor grows with its content up to this many rows.
+const MAX_INPUT_ROWS: u16 = 5;
+
+fn layout_regions(area: Rect, input_rows: u16) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
         .constraints([
-            Constraint::Fixed(1), // header
-            Constraint::Fill,     // conversation body
-            Constraint::Fixed(1), // status line (tool/todo/messages)
-            Constraint::Fixed(1), // input (placeholder until the editor port)
-            Constraint::Fixed(1), // footer (usage)
+            Constraint::Fixed(1),          // header
+            Constraint::Fill,              // conversation body
+            Constraint::Fixed(1),          // status line (tool/todo/messages)
+            Constraint::Fixed(input_rows), // input editor
+            Constraint::Fixed(1),          // footer (usage)
         ])
         .split(area);
     Regions {
@@ -208,20 +236,50 @@ fn layout_regions(area: Rect) -> Regions {
 impl PiFtuiModel {
     pub fn new(agent_rx: Receiver<PiMsg>) -> Self {
         Self {
-            status: String::from("ready"),
+            state: AgentUiState::Ready,
             transcript: Vec::new(),
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
             term: (80, 24),
             scroll_from_tail: 0,
+            input: TextArea::new()
+                .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
+                .with_focus(true)
+                .with_soft_wrap(true),
+            submit_tx: None,
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
         }
     }
 
+    /// Route submitted input to the agent loop via this channel. The launch
+    /// path calls this before starting the program.
+    #[must_use]
+    pub fn with_submit_channel(mut self, tx: Sender<String>) -> Self {
+        self.submit_tx = Some(tx);
+        self
+    }
+
+    /// Rows the input editor currently needs (content-driven, clamped).
+    fn input_rows(&self) -> u16 {
+        let lines = if self.input.is_empty() {
+            1
+        } else {
+            self.input.text().lines().count().max(1)
+        };
+        u16::try_from(lines)
+            .unwrap_or(MAX_INPUT_ROWS)
+            .min(MAX_INPUT_ROWS)
+    }
+
     /// Visible conversation rows given the tracked terminal size.
     fn body_height(&self) -> usize {
-        usize::from(self.term.1.saturating_sub(FIXED_CHROME_ROWS)).max(1)
+        usize::from(
+            self.term
+                .1
+                .saturating_sub(FIXED_CHROME_ROWS + self.input_rows()),
+        )
+        .max(1)
     }
 
     /// Total rendered conversation lines (transcript + in-flight stream).
@@ -259,7 +317,7 @@ impl PiFtuiModel {
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
         match msg {
             PiMsg::AgentStart => {
-                self.status = String::from("working");
+                self.state = AgentUiState::Working;
             }
             PiMsg::TextDelta(delta) => {
                 // Adversarial-content safety: agent/tool text is sanitized
@@ -282,12 +340,12 @@ impl PiFtuiModel {
                 if let Some(err) = error_message {
                     self.transcript.push(format!("error: {}", sanitize(&err)));
                 }
-                self.status = String::from("ready");
+                self.state = AgentUiState::Ready;
                 self.current_tool = None;
             }
             PiMsg::AgentError(err) => {
                 self.transcript.push(format!("error: {}", sanitize(&err)));
-                self.status = String::from("ready");
+                self.state = AgentUiState::Ready;
                 self.current_tool = None;
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
@@ -301,6 +359,27 @@ impl PiFtuiModel {
         Cmd::none()
     }
 
+    /// Submit the editor content: echo into the transcript, hand it to the
+    /// agent loop (when wired), clear the editor, resume tail follow.
+    fn submit_input(&mut self) {
+        let text = self.input.text();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        // User input is the one text source the user typed themself, but it
+        // still goes through sanitize: paste can smuggle control sequences.
+        let clean = sanitize(trimmed).into_owned();
+        self.transcript.push(format!("› {clean}"));
+        if let Some(tx) = &self.submit_tx {
+            // A dead agent loop is not a UI error; the transcript echo above
+            // still shows what was typed.
+            let _ = tx.send(clean);
+        }
+        self.input.set_text("");
+        self.scroll_from_tail = 0;
+    }
+
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
         match event {
             Event::Key(key) => {
@@ -310,13 +389,30 @@ impl PiFtuiModel {
                     return Cmd::quit();
                 }
                 let page = self.body_height().saturating_sub(1).max(1);
+                let shift = key.modifiers.contains(Modifiers::SHIFT);
+                // Conversation scroll bindings win over the editor, mirroring
+                // the bubbletea stack (PgUp/PgDn, Shift+Up/Down, End).
                 match key.code {
-                    KeyCode::Up => self.scroll_up(1),
-                    KeyCode::Down => self.scroll_down(1),
-                    KeyCode::PageUp => self.scroll_up(page),
-                    KeyCode::PageDown => self.scroll_down(page),
-                    KeyCode::End => self.scroll_from_tail = 0,
+                    KeyCode::PageUp => return self.consume_scroll(|m| m.scroll_up(page)),
+                    KeyCode::PageDown => return self.consume_scroll(|m| m.scroll_down(page)),
+                    KeyCode::Up if shift => return self.consume_scroll(|m| m.scroll_up(1)),
+                    KeyCode::Down if shift => return self.consume_scroll(|m| m.scroll_down(1)),
+                    KeyCode::End => {
+                        self.scroll_from_tail = 0;
+                        return Cmd::none();
+                    }
                     _ => {}
+                }
+                if self.editor_available() {
+                    if key.code == KeyCode::Enter {
+                        if key.modifiers.contains(Modifiers::ALT) {
+                            self.input.insert_newline();
+                        } else {
+                            self.submit_input();
+                        }
+                        return Cmd::none();
+                    }
+                    self.input.handle_event(event);
                 }
             }
             Event::Mouse(mouse) => match mouse.kind {
@@ -329,8 +425,24 @@ impl PiFtuiModel {
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
-            _ => {}
+            _ => {
+                if self.editor_available() {
+                    // Paste and other editor-relevant events flow through.
+                    self.input.handle_event(event);
+                }
+            }
         }
+        Cmd::none()
+    }
+
+    /// Editor accepts input only while the agent is idle, matching
+    /// `editor_input_is_available()` in the bubbletea stack.
+    fn editor_available(&self) -> bool {
+        self.state == AgentUiState::Ready
+    }
+
+    fn consume_scroll(&mut self, scroll: impl FnOnce(&mut Self)) -> Cmd<PiFtuiMsg> {
+        scroll(self);
         Cmd::none()
     }
 
@@ -360,10 +472,10 @@ impl Model for PiFtuiModel {
 
     fn view(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        let regions = layout_regions(area);
+        let regions = layout_regions(area, self.input_rows());
 
         // Header: identity + agent state.
-        let header = format!("pi · {}", self.status);
+        let header = format!("pi · {}", self.state.label());
         Paragraph::new(Text::raw(&header)).render(regions.header, frame);
 
         // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
@@ -398,8 +510,12 @@ impl Model for PiFtuiModel {
             Paragraph::new(Text::raw(&status_line)).render(regions.status, frame);
         }
 
-        // Input placeholder: the textarea port (P2) replaces this row.
-        Paragraph::new(Text::raw("› ")).render(regions.input, frame);
+        // Input editor while idle; processing note while the agent works.
+        if self.editor_available() {
+            self.input.render(regions.input, frame);
+        } else {
+            Paragraph::new(Text::raw("… processing (ctrl+c to quit)")).render(regions.input, frame);
+        }
 
         // Footer: scroll position indicator until the usage footer ports.
         let footer = if from_tail > 0 {
@@ -447,7 +563,7 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
-        assert_eq!(sim.model().status, "working");
+        assert_eq!(sim.model().state, AgentUiState::Working);
         sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("hello ".into())));
         sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("world".into())));
         assert_eq!(sim.model().streaming, "hello world");
@@ -456,7 +572,7 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
         }));
-        assert_eq!(sim.model().status, "ready");
+        assert_eq!(sim.model().state, AgentUiState::Ready);
         assert_eq!(sim.model().transcript, vec!["hello world".to_string()]);
         assert!(sim.model().streaming.is_empty());
     }
@@ -516,7 +632,83 @@ mod tests {
             "frame missing transcript line: {rendered:?}"
         );
         assert!(rendered.contains("pi · ready"), "frame missing header");
-        assert!(rendered.contains("› "), "frame missing input placeholder");
+        assert!(
+            rendered.contains("Type a message"),
+            "frame missing input placeholder: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn typing_and_enter_submits_to_channel_and_transcript() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<String>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for ch in ['h', 'i'] {
+            sim.inject_event(key(KeyCode::Char(ch), Modifiers::empty()));
+        }
+        assert_eq!(sim.model().input.text(), "hi");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("submitted"), "hi");
+        assert!(sim.model().input.is_empty(), "editor not cleared");
+        assert_eq!(sim.model().transcript, vec!["› hi".to_string()]);
+    }
+
+    #[test]
+    fn alt_enter_inserts_newline_and_grows_input_region() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        assert_eq!(sim.model().input_rows(), 1);
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::ALT));
+        sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "a\nb");
+        assert_eq!(sim.model().input_rows(), 2);
+    }
+
+    #[test]
+    fn empty_submit_is_a_noop() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().transcript.is_empty());
+    }
+
+    #[test]
+    fn editor_ignores_keys_while_agent_works() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.inject_event(key(KeyCode::Char('x'), Modifiers::empty()));
+        assert!(
+            sim.model().input.is_empty(),
+            "editor took input while working"
+        );
+        let rendered = buffer_text(sim.capture_frame(40, 8), 40, 8);
+        assert!(rendered.contains("processing"), "missing processing note");
+    }
+
+    #[test]
+    fn submitted_text_is_sanitized() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<String>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // Simulate a hostile paste carrying an OSC title change.
+        sim.inject_event(Event::Paste(ftui::PasteEvent::new(
+            "hello\x1b]0;pwned\x07world",
+            true,
+        )));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let submitted = submit_rx.try_recv().expect("submitted");
+        assert!(!submitted.contains('\x1b'), "ESC survived: {submitted:?}");
+        assert!(submitted.contains("hello"));
+        assert!(submitted.contains("world"));
     }
 
     #[test]

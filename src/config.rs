@@ -51,6 +51,15 @@ pub struct Config {
     pub model_roles: Option<ModelRoleSettings>,
     /// Automatic session titling (see [`TitlingSettings`], bd-cv653.3.1).
     pub titling: Option<TitlingSettings>,
+    /// Providers whose models are hidden from selection and cycling
+    /// (bd-cv653.3.2). Canonical ids or aliases, case-insensitive.
+    #[serde(alias = "disabledProviders")]
+    pub disabled_providers: Option<Vec<String>>,
+    /// Path-scoped model sets (bd-cv653.3.2): pin a different model set on
+    /// one repo without touching the global config. Most specific matching
+    /// path prefix wins.
+    #[serde(alias = "modelScopeOverrides")]
+    pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -328,6 +337,20 @@ pub struct RetrySettings {
     pub base_delay_ms: Option<u32>,
     #[serde(alias = "maxDelayMs")]
     pub max_delay_ms: Option<u32>,
+    /// Cross-model failover chains (bd-cv653.3.2): maps a role name
+    /// (`default`/`smol`/…) or an exact `provider/model` spec to an ordered
+    /// list of fallback `provider/model` specs. On a classified transient
+    /// failure (429/quota/overload after the retry budget) the NEXT entry
+    /// continues the turn; the primary is restored after the cooldown.
+    #[serde(alias = "fallbackChains")]
+    pub fallback_chains: Option<std::collections::HashMap<String, Vec<String>>>,
+    /// Seconds before the primary model is retried after a failover
+    /// (default 300).
+    #[serde(alias = "failoverCooldownSecs", alias = "cooldownSecs")]
+    pub failover_cooldown_secs: Option<u64>,
+    /// Maximum failovers within a single turn (default 8, hard cap).
+    #[serde(alias = "maxFailoversPerTurn")]
+    pub max_failovers_per_turn: Option<u32>,
 }
 
 /// Per-role model assignments (bd-cv653.3.1).
@@ -364,6 +387,20 @@ pub struct TitlingSettings {
     /// Master switch for automatic session titling (default: true).
     #[serde(alias = "autoTitle", alias = "auto")]
     pub auto_title: Option<bool>,
+}
+
+/// A path-scoped model-set override (bd-cv653.3.2). Applies when the current
+/// working directory is inside `path` (or `path` itself); the most specific
+/// matching prefix wins over less specific prefixes and the global settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelScopeOverride {
+    /// Directory prefix this override applies to (absolute or `~`-rooted).
+    pub path: String,
+    #[serde(alias = "enabledModels")]
+    pub enabled_models: Option<Vec<String>>,
+    #[serde(alias = "disabledProviders")]
+    pub disabled_providers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -632,6 +669,8 @@ impl Config {
             enabled_models: other.enabled_models.or(base.enabled_models),
             model_roles: merge_model_roles(base.model_roles, other.model_roles),
             titling: merge_titling(base.titling, other.titling),
+            disabled_providers: other.disabled_providers.or(base.disabled_providers),
+            model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -727,6 +766,24 @@ impl Config {
             .as_ref()
             .and_then(|t| t.auto_title)
             .unwrap_or(true)
+    }
+
+    /// Seconds before the primary model is retried after a failover
+    /// (bd-cv653.3.2). Default: 300.
+    pub fn failover_cooldown_secs(&self) -> u64 {
+        self.retry
+            .as_ref()
+            .and_then(|r| r.failover_cooldown_secs)
+            .unwrap_or(300)
+    }
+
+    /// Maximum failovers within a single turn (bd-cv653.3.2). Default: 8.
+    pub fn max_failovers_per_turn(&self) -> u32 {
+        self.retry
+            .as_ref()
+            .and_then(|r| r.max_failovers_per_turn)
+            .unwrap_or(8)
+            .min(8)
     }
 
     pub fn steering_queue_mode(&self) -> QueueMode {
@@ -1276,6 +1333,9 @@ fn merge_retry(base: Option<RetrySettings>, other: Option<RetrySettings>) -> Opt
             max_retries: other.max_retries.or(base.max_retries),
             base_delay_ms: other.base_delay_ms.or(base.base_delay_ms),
             max_delay_ms: other.max_delay_ms.or(base.max_delay_ms),
+            fallback_chains: other.fallback_chains.or(base.fallback_chains),
+            failover_cooldown_secs: other.failover_cooldown_secs.or(base.failover_cooldown_secs),
+            max_failovers_per_turn: other.max_failovers_per_turn.or(base.max_failovers_per_turn),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1594,6 +1654,123 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
+
+    #[test]
+    fn failover_settings_parse_chains_cooldown_and_cap() {
+        let json = json!({
+            "retry": {
+                "enabled": true,
+                "maxRetries": 2,
+                "fallbackChains": {
+                    "default": ["openai/gpt-5-mini", "google/gemini-3-pro"],
+                    "anthropic/claude-opus-4-7": ["openai/gpt-5.5"]
+                },
+                "failoverCooldownSecs": 120,
+                "maxFailoversPerTurn": 3
+            }
+        });
+        let config: Config = serde_json::from_value(json).expect("parse failover settings");
+        let retry = config.retry.clone().expect("retry settings present");
+        let chains = retry.fallback_chains.expect("chains present");
+        assert_eq!(
+            chains.get("default").unwrap(),
+            &vec![
+                "openai/gpt-5-mini".to_string(),
+                "google/gemini-3-pro".to_string()
+            ]
+        );
+        assert_eq!(
+            chains.get("anthropic/claude-opus-4-7").unwrap(),
+            &vec!["openai/gpt-5.5".to_string()]
+        );
+        assert_eq!(retry.failover_cooldown_secs, Some(120));
+        assert_eq!(retry.max_failovers_per_turn, Some(3));
+        assert_eq!(config.failover_cooldown_secs(), 120);
+        assert_eq!(config.max_failovers_per_turn(), 3);
+    }
+
+    #[test]
+    fn failover_settings_defaults_apply_when_unset() {
+        let config = Config::default();
+        assert_eq!(config.failover_cooldown_secs(), 300);
+        assert_eq!(config.max_failovers_per_turn(), 8);
+        assert!(config.disabled_providers.is_none());
+        assert!(config.model_scope_overrides.is_none());
+    }
+
+    #[test]
+    fn disabled_providers_and_scope_overrides_parse() {
+        let json = json!({
+            "disabledProviders": ["anthropic", "OpenAI"],
+            "modelScopeOverrides": [
+                {
+                    "path": "/repo/a",
+                    "enabledModels": ["openai/gpt-5.5"],
+                    "disabledProviders": ["google"]
+                },
+                {"path": "/repo", "disabledProviders": ["mistral"]}
+            ]
+        });
+        let config: Config = serde_json::from_value(json).expect("parse scope settings");
+        assert_eq!(
+            config.disabled_providers.as_deref(),
+            Some(["anthropic".to_string(), "OpenAI".to_string()].as_slice())
+        );
+        let overrides = config.model_scope_overrides.expect("overrides");
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[0].path, "/repo/a");
+        assert_eq!(
+            overrides[0].enabled_models.as_deref(),
+            Some(["openai/gpt-5.5".to_string()].as_slice())
+        );
+        assert_eq!(
+            overrides[1].disabled_providers.as_deref(),
+            Some(["mistral".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn failover_chains_merge_field_wise() {
+        let base = RetrySettings {
+            fallback_chains: Some(HashMap::from([(
+                "default".to_string(),
+                vec!["openai/gpt-5-mini".to_string()],
+            )])),
+            failover_cooldown_secs: Some(60),
+            ..Default::default()
+        };
+        let other = RetrySettings {
+            max_retries: Some(5),
+            ..Default::default()
+        };
+        let merged = merge_retry(Some(base), Some(other)).expect("merged");
+        assert!(merged.fallback_chains.is_some(), "base chains preserved");
+        assert_eq!(merged.failover_cooldown_secs, Some(60));
+        assert_eq!(merged.max_retries, Some(5));
+    }
+
+    #[test]
+    fn scope_override_and_disabled_round_trip_serialization() {
+        let mut config = Config::default();
+        config.disabled_providers = Some(vec!["anthropic".to_string()]);
+        config.model_scope_overrides = Some(vec![super::ModelScopeOverride {
+            path: "/repo/a".to_string(),
+            enabled_models: Some(vec!["openai/gpt-5.5".to_string()]),
+            disabled_providers: Some(vec!["google".to_string()]),
+        }]);
+        let json = serde_json::to_value(&config).expect("serialize");
+        let parsed: Config = serde_json::from_value(json).expect("round-trip");
+        assert_eq!(
+            parsed.disabled_providers.as_deref(),
+            Some(["anthropic".to_string()].as_slice())
+        );
+        let overrides = parsed.model_scope_overrides.expect("overrides");
+        assert_eq!(overrides[0].path, "/repo/a");
+        assert_eq!(
+            overrides[0].disabled_providers.as_deref(),
+            Some(["google".to_string()].as_slice())
+        );
+    }
 
     fn write_file(path: &std::path::Path, contents: &str) {
         if let Some(parent) = path.parent() {
@@ -3400,8 +3577,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_base_delay in prop::option::of(100u32..5000),
             ) {
-                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None };
-                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None };
+                let base = RetrySettings { enabled: b_en, max_retries: b_max, base_delay_ms: None, max_delay_ms: None, ..Default::default() };
+                let other = RetrySettings { enabled: o_en, max_retries: None, base_delay_ms: o_base_delay, max_delay_ms: None, ..Default::default() };
                 let result = merge_retry(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.max_retries, b_max); // other had None, base passes through
