@@ -60,6 +60,10 @@ fn main() -> std::io::Result<()> {
         }
     });
 
-    let model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
+    let model = PiFtuiModel::new(agent_rx)
+        .with_submit_channel(submit_tx)
+        .with_palette(pi::interactive_ftui::FtuiPalette::from_theme(
+            &pi::theme::Theme::dark(),
+        ));
     ftui::App::fullscreen(model).with_mouse().run()
 }

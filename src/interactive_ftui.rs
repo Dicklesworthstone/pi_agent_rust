@@ -147,6 +147,47 @@ impl Subscription<PiFtuiMsg> for AgentEventSubscription {
     }
 }
 
+/// Resolved color palette for the ftui stack.
+///
+/// Converted from pi's [`Theme`](crate::theme::Theme) hex colors so
+/// `pi --ftui` honors the user's configured theme. Colors that fail to parse
+/// fall back to the built-in palette per-field.
+#[derive(Debug, Clone, Copy)]
+pub struct FtuiPalette {
+    accent: ftui::PackedRgba,
+    muted: ftui::PackedRgba,
+    error: ftui::PackedRgba,
+    warning: ftui::PackedRgba,
+}
+
+impl Default for FtuiPalette {
+    fn default() -> Self {
+        Self {
+            accent: ftui::PackedRgba::rgb(97, 175, 239),
+            muted: ftui::PackedRgba::rgb(130, 137, 151),
+            error: ftui::PackedRgba::rgb(220, 80, 80),
+            warning: ftui::PackedRgba::rgb(229, 192, 123),
+        }
+    }
+}
+
+impl FtuiPalette {
+    #[must_use]
+    pub fn from_theme(theme: &crate::theme::Theme) -> Self {
+        let fallback = Self::default();
+        let parse = |hex: &str, fallback: ftui::PackedRgba| {
+            crate::theme::parse_hex_color(hex)
+                .map_or(fallback, |(r, g, b)| ftui::PackedRgba::rgb(r, g, b))
+        };
+        Self {
+            accent: parse(&theme.colors.accent, fallback.accent),
+            muted: parse(&theme.colors.muted, fallback.muted),
+            error: parse(&theme.colors.error, fallback.error),
+            warning: parse(&theme.colors.warning, fallback.warning),
+        }
+    }
+}
+
 /// Who produced a transcript entry. Drives the prefix and style each role
 /// gets in the conversation view (the seed of the real message rendering —
 /// markdown/tool cards layer onto this).
@@ -170,14 +211,12 @@ impl EntryRole {
         }
     }
 
-    fn style(self) -> ftui::Style {
+    fn style(self, palette: &FtuiPalette) -> ftui::Style {
         match self {
-            Self::User => ftui::Style::new().bold(),
+            Self::User => ftui::Style::new().bold().fg(palette.accent),
             Self::Assistant => ftui::Style::new(),
-            Self::System | Self::Ask => ftui::Style::new().dim(),
-            Self::Error => ftui::Style::new()
-                .bold()
-                .fg(ftui::PackedRgba::rgb(220, 80, 80)),
+            Self::System | Self::Ask => ftui::Style::new().dim().fg(palette.muted),
+            Self::Error => ftui::Style::new().bold().fg(palette.error),
         }
     }
 }
@@ -248,6 +287,8 @@ pub struct PiFtuiModel {
     spinner: SpinnerState,
     /// Usage summary from the last completed turn, shown in the footer.
     usage_line: Option<String>,
+    /// Theme-derived colors for chrome and role styling.
+    palette: FtuiPalette,
     /// Keybinding catalog (defaults now; user config once the launch path
     /// wires `KeyBindings::load_from_user_config`). Shared naming with the
     /// bubbletea stack via `KeyBinding::from_ftui_key`.
@@ -325,6 +366,7 @@ impl PiFtuiModel {
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
+            palette: FtuiPalette::default(),
             keybindings: KeyBindings::default(),
             active_ask: None,
             ask_reply_tx: None,
@@ -352,6 +394,13 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_ask_reply_channel(mut self, tx: Sender<AskUiReply>) -> Self {
         self.ask_reply_tx = Some(tx);
+        self
+    }
+
+    /// Apply a theme-derived palette (defaults to the built-in colors).
+    #[must_use]
+    pub const fn with_palette(mut self, palette: FtuiPalette) -> Self {
+        self.palette = palette;
         self
     }
 
@@ -723,6 +772,7 @@ impl PiFtuiModel {
         let md = ftui_extras::markdown::MarkdownRenderer::new(
             ftui_extras::markdown::MarkdownTheme::default(),
         );
+        let palette = self.palette;
         let mut lines: Vec<ftui::text::Line<'static>> =
             Vec::with_capacity(self.conversation_line_count());
         let mut push_block = |role: EntryRole, content: &str| {
@@ -731,7 +781,7 @@ impl PiFtuiModel {
                 lines.extend(rendered.lines().iter().cloned());
                 return;
             }
-            let style = role.style();
+            let style = role.style(&palette);
             let prefix = role.prefix();
             let indent = " ".repeat(prefix.chars().count());
             for (i, line) in content.lines().enumerate() {
@@ -774,7 +824,12 @@ impl Model for PiFtuiModel {
 
         // Header: identity + agent state.
         let header = format!("pi · {}", self.state.label());
-        Paragraph::new(Text::raw(&header)).render(regions.header, frame);
+        let header_style = ftui::Style::new().bold().fg(self.palette.accent);
+        Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+            header,
+            header_style,
+        )]))
+        .render(regions.header, frame);
 
         // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
         // sticks to the bottom; scrolling up pins an offset measured from the
@@ -812,7 +867,16 @@ impl Model for PiFtuiModel {
                 .map_or_else(String::new, |todo| format!("todo {todo}"))
         };
         if !status_line.is_empty() {
-            Paragraph::new(Text::raw(&status_line)).render(regions.status, frame);
+            let status_style = if self.state == AgentUiState::Working {
+                ftui::Style::new().fg(self.palette.warning)
+            } else {
+                ftui::Style::new().dim().fg(self.palette.muted)
+            };
+            Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+                status_line,
+                status_style,
+            )]))
+            .render(regions.status, frame);
         }
 
         // Input editor while idle or answering an ask card; processing note
@@ -831,7 +895,12 @@ impl Model for PiFtuiModel {
         } else {
             String::from("pi — ftui preview")
         };
-        Paragraph::new(Text::raw(&footer)).render(regions.footer, frame);
+        let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
+        Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+            footer,
+            footer_style,
+        )]))
+        .render(regions.footer, frame);
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<PiFtuiMsg>>> {
@@ -928,7 +997,10 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 ///
 /// Not yet at parity with the bubbletea stack (slash commands, bash `!`,
 /// pickers, extension UIs, ask respond_ui wiring); tracked on the bead.
-pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
+pub fn run(
+    session_options: crate::sdk::SessionOptions,
+    theme: &crate::theme::Theme,
+) -> std::io::Result<()> {
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<String>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
@@ -1018,7 +1090,8 @@ pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
 
     let model = PiFtuiModel::new(agent_rx)
         .with_submit_channel(submit_tx)
-        .with_ask_reply_channel(ask_reply_tx);
+        .with_ask_reply_channel(ask_reply_tx)
+        .with_palette(FtuiPalette::from_theme(theme));
     let result = ftui::App::fullscreen(model).with_mouse().run();
 
     // The UI (and with it the submit sender) is gone; the driver's next poll

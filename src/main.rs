@@ -1654,6 +1654,7 @@ async fn run(
         test_mode,
         !cli.hide_cwd_in_prompt,
         Some(&foreign_rules),
+        &config,
     )?;
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
@@ -1854,6 +1855,7 @@ async fn run(
                         test_mode,
                         !cli.hide_cwd_in_prompt,
                         Some(&foreign_rules),
+                        &config,
                     )?;
                     agent_session.agent.set_system_prompt(Some(system_prompt));
                 }
@@ -2002,7 +2004,8 @@ async fn run(
                 working_directory: Some(cwd.clone()),
                 ..Default::default()
             };
-            pi::interactive_ftui::run(options).map_err(Into::into)
+            let theme = pi::theme::Theme::resolve(&config, &cwd);
+            pi::interactive_ftui::run(options, &theme).map_err(Into::into)
         }
         #[cfg(not(feature = "ftui"))]
         unreachable!("ftui_requested is false without the ftui feature")

@@ -613,7 +613,7 @@ fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+pub(crate) fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let value = value.trim();
     let hex = value.strip_prefix('#')?;
     if hex.len() != 6 || !hex.is_ascii() {
