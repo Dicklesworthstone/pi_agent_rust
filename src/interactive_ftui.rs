@@ -525,7 +525,12 @@ impl PiFtuiModel {
             PiMsg::ToolStart { name, .. } => {
                 self.current_tool = Some(sanitize(&name).into_owned());
             }
-            PiMsg::ToolEnd { .. } => {
+            PiMsg::ToolEnd { name, is_error, .. } => {
+                // Durable trace: one line per tool run (the full collapsible
+                // tool cards of the bubbletea stack come with the view port).
+                let mark = if is_error { "✗" } else { "✓" };
+                let text = format!("{mark} {}", sanitize(&name));
+                self.push_entry(EntryRole::System, text);
                 self.current_tool = None;
             }
             PiMsg::TodoSummary { summary } => {
@@ -1638,6 +1643,23 @@ mod tests {
         assert!(
             !rendered.contains("running bash"),
             "tool status not cleared"
+        );
+        assert!(
+            rendered.contains("✓ bash"),
+            "durable tool trace missing: {rendered:?}"
+        );
+        // Errored tools leave an ✗ trace.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "edit".into(),
+            tool_id: "t2".into(),
+            is_error: true,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("✗ edit")),
+            "error trace missing"
         );
     }
 
