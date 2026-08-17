@@ -572,7 +572,7 @@ mod tests {
             phases: None,
             tasks: Some(tasks.iter().map(|task| (*task).to_string()).collect()),
         };
-        apply_op(&mut list, &op).expect("init");
+        apply_op(&mut list, &op).expect("init"); // ubs:ignore test helper
         list
     }
 
@@ -695,7 +695,7 @@ mod tests {
                 &op(serde_json::json!({"op": bad, "task": "missing"})),
             )
             .expect_err("unknown task");
-            assert!(error.to_string().contains("unknown task"), "{error}");
+            assert!(error.to_string().contains("unknown task"), "{error}"); // ubs:ignore test assertion
         }
         assert_eq!(serde_json::to_value(&list).expect("snapshot"), before);
     }
