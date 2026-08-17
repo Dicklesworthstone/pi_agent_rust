@@ -260,6 +260,10 @@ pub struct AskUiReply {
 struct PickerOverlay {
     title: String,
     items: Vec<String>,
+    /// Selection values when they differ from the display items (e.g. the
+    /// session picker shows names but selects paths). Empty → items are the
+    /// values.
+    values: Vec<String>,
     selected: usize,
     kind: PickerKind,
 }
@@ -271,6 +275,9 @@ enum PickerKind {
     /// Model picker (`/model` with no arguments): items are
     /// `provider/model-id` strings; selection routes `UiCommand::SetModel`.
     Model,
+    /// Session picker (`/resume`): items are display labels, values are
+    /// session file paths; selection routes `UiCommand::ResumeSession`.
+    Session,
 }
 
 /// Command from the UI to the agent driver.
@@ -288,6 +295,9 @@ pub enum UiCommand {
     /// not injected into the agent context yet (the bubbletea stack's `!`
     /// context-inclusion arrives with session-append support).
     Bash { command: String },
+    /// Resume a saved session (`/resume` picker): the driver swaps its
+    /// session handle and replays the conversation into the transcript.
+    ResumeSession { path: String },
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -339,6 +349,8 @@ pub struct PiFtuiModel {
     available_models: Vec<String>,
     /// Set by `/exit`//`/quit`; the update loop turns it into `Cmd::quit()`.
     pending_quit: bool,
+    /// `(display label, session path)` entries for the `/resume` picker.
+    available_sessions: Vec<(String, String)>,
     /// Keybinding catalog (defaults now; user config once the launch path
     /// wires `KeyBindings::load_from_user_config`). Shared naming with the
     /// bubbletea stack via `KeyBinding::from_ftui_key`.
@@ -420,6 +432,7 @@ impl PiFtuiModel {
             picker: None,
             available_models: Vec::new(),
             pending_quit: false,
+            available_sessions: Vec::new(),
             keybindings: KeyBindings::default(),
             active_ask: None,
             ask_reply_tx: None,
@@ -461,6 +474,13 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_models(mut self, models: Vec<String>) -> Self {
         self.available_models = models;
+        self
+    }
+
+    /// Provide `(display label, session path)` entries for `/resume`.
+    #[must_use]
+    pub fn with_available_sessions(mut self, sessions: Vec<(String, String)>) -> Self {
+        self.available_sessions = sessions;
         self
     }
 
@@ -586,6 +606,28 @@ impl PiFtuiModel {
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
                 let text = sanitize(&text).into_owned();
                 self.push_entry(EntryRole::System, text);
+            }
+            PiMsg::ConversationReset {
+                messages, status, ..
+            } => {
+                // Rebuild the transcript from the resumed/forked session.
+                self.transcript.clear();
+                self.streaming.clear();
+                for message in messages {
+                    let role = match message.role {
+                        crate::interactive::MessageRole::User => EntryRole::User,
+                        crate::interactive::MessageRole::Assistant => EntryRole::Assistant,
+                        crate::interactive::MessageRole::Tool
+                        | crate::interactive::MessageRole::System => EntryRole::System,
+                    };
+                    let text = sanitize(&message.content).into_owned();
+                    self.push_entry(role, text);
+                }
+                if let Some(status) = status {
+                    let text = sanitize(&status).into_owned();
+                    self.push_entry(EntryRole::System, text);
+                }
+                self.scroll_from_tail = 0;
             }
             PiMsg::BashResult { display, .. } => {
                 let text = sanitize(&display).into_owned();
@@ -720,8 +762,17 @@ impl PiFtuiModel {
             return;
         }
 
-        // Slash-command routing seed (mirrors submit_message's chain; only
-        // session-affecting commands the preview can honor are wired).
+        if clean.starts_with('/') && self.route_slash_command(&clean) {
+            return;
+        }
+
+        self.send_command(UiCommand::Prompt(clean));
+    }
+
+    /// Slash-command routing seed (mirrors submit_message's chain; only
+    /// commands the preview can honor are wired). Returns true when the
+    /// input was consumed as a command (including local errors).
+    fn route_slash_command(&mut self, clean: &str) -> bool {
         if let Some(rest) = clean.strip_prefix("/model") {
             let spec = rest.trim();
             if spec.is_empty() {
@@ -735,6 +786,7 @@ impl PiFtuiModel {
                     self.picker = Some(PickerOverlay {
                         title: String::from("Model (Enter to switch, Esc to close)"),
                         items: self.available_models.clone(),
+                        values: Vec::new(),
                         selected: 0,
                         kind: PickerKind::Model,
                     });
@@ -754,20 +806,40 @@ impl PiFtuiModel {
                     String::from("usage: /model <provider>/<model>"),
                 );
             }
-            return;
+            return true;
         }
         if clean == "/exit" || clean == "/quit" {
             self.pending_quit = true;
-            return;
+            return true;
         }
         if clean == "/theme" {
             self.picker = Some(PickerOverlay {
                 title: String::from("Theme (Enter to apply, Esc to close)"),
                 items: vec![String::from("dark"), String::from("light")],
+                values: Vec::new(),
                 selected: 0,
                 kind: PickerKind::Theme,
             });
-            return;
+            return true;
+        }
+        if clean == "/resume" {
+            if self.available_sessions.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
+            } else {
+                let (items, values) = self
+                    .available_sessions
+                    .iter()
+                    .map(|(label, path)| (label.clone(), path.clone()))
+                    .unzip();
+                self.picker = Some(PickerOverlay {
+                    title: String::from("Resume session (Enter to load, Esc to close)"),
+                    items,
+                    values,
+                    selected: 0,
+                    kind: PickerKind::Session,
+                });
+            }
+            return true;
         }
         if clean == "/help" {
             self.push_entry(
@@ -778,18 +850,18 @@ impl PiFtuiModel {
                      the charmed stack",
                 ),
             );
-            return;
+            return true;
         }
-        if clean.starts_with('/') && !clean.starts_with("/skill:") {
-            let command = clean.split_whitespace().next().unwrap_or(&clean);
+        if !clean.starts_with("/skill:") {
+            let command = clean.split_whitespace().next().unwrap_or(clean);
             self.push_entry(
                 EntryRole::Error,
                 format!("Unknown command in ftui preview: {command} (try /help)"),
             );
-            return;
+            return true;
         }
-
-        self.send_command(UiCommand::Prompt(clean));
+        // /skill: inputs flow through to the agent as prompts.
+        false
     }
 
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
@@ -810,7 +882,11 @@ impl PiFtuiModel {
                 let Some(mut picker) = self.picker.take() else {
                     return;
                 };
-                let choice = picker.items.swap_remove(picker.selected);
+                let choice = if picker.values.is_empty() {
+                    picker.items.swap_remove(picker.selected)
+                } else {
+                    picker.values.swap_remove(picker.selected)
+                };
                 self.apply_picker_choice(picker.kind, &choice);
             }
             _ => {}
@@ -843,6 +919,13 @@ impl PiFtuiModel {
                 } else {
                     self.push_entry(EntryRole::Error, format!("malformed model entry: {choice}"));
                 }
+            }
+            PickerKind::Session => {
+                self.push_entry(EntryRole::System, String::from("resuming session ..."));
+                self.scroll_from_tail = 0;
+                self.send_command(UiCommand::ResumeSession {
+                    path: choice.to_string(),
+                });
             }
         }
     }
@@ -1261,15 +1344,19 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 const INLINE_MIN_HEIGHT: u16 = 10;
 const INLINE_MAX_HEIGHT: u16 = 15;
 
-/// Install the ask-tool picker bridge for the driver runtime: cards forward
-/// to the UI as `PiMsg::AskUiRequest`; answered cards pair back through
-/// `respond_ui`. Both pumps are spawned tasks because asks arrive MID-TURN
-/// while the driver loop is blocked inside `prompt().await` — pumping from
-/// the loop itself would deadlock the pending tool call.
-fn install_ask_bridge(
-    ask: crate::ask::AskTool,
+/// Shared slot for the CURRENT ask tool: `/resume` swaps the session handle
+/// (and with it the ask tool), so the long-lived reply pump resolves against
+/// whatever tool is current when the reply arrives.
+type CurrentAsk = Arc<Mutex<Option<crate::ask::AskTool>>>;
+
+/// Install the per-handle half of the ask bridge: a channel picker surface on
+/// the tool plus a forwarder task that turns cards into `PiMsg::AskUiRequest`.
+/// The forwarder dies naturally when the handle (and its ask tool clones)
+/// drop. Spawned, not inline: asks arrive MID-TURN while the driver loop is
+/// blocked inside `prompt().await`.
+fn install_ask_forwarder(
+    ask: &crate::ask::AskTool,
     agent_tx: &Sender<PiMsg>,
-    ask_reply_rx: Receiver<AskUiReply>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) {
     let (ask_ui_tx, mut ask_ui_rx) = asupersync::channel::mpsc::channel::<AskUiRequest>(4);
@@ -1281,11 +1368,25 @@ fn install_ask_bridge(
             let _ = ask_fwd_tx.send(PiMsg::AskUiRequest(request));
         }
     });
+}
+
+/// Spawn the long-lived reply pump: answered cards pair back through the
+/// CURRENT ask tool's `respond_ui` (see [`CurrentAsk`]).
+fn spawn_ask_reply_pump(
+    current_ask: CurrentAsk,
+    ask_reply_rx: Receiver<AskUiReply>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) {
     runtime_handle.spawn(async move {
         loop {
             match ask_reply_rx.try_recv() {
                 Ok(reply) => {
-                    let _ = ask.respond_ui(&reply.request_id, reply.response);
+                    let guard = current_ask
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(ask) = guard.as_ref() {
+                        let _ = ask.respond_ui(&reply.request_id, reply.response);
+                    }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
                     asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL).await;
@@ -1294,6 +1395,90 @@ fn install_ask_bridge(
             }
         }
     });
+}
+
+/// Run one agent turn for a submitted prompt, translating events back to the
+/// UI and surfacing turn errors as transcript entries.
+async fn run_prompt_turn(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    prompt: String,
+    agent_tx: &Sender<PiMsg>,
+) {
+    // ubs:ignore Sender clone per turn — the event callback must own its sender
+    let tx = agent_tx.clone();
+    let result = handle
+        .prompt(prompt, move |event| {
+            for msg in agent_event_to_pi_msgs(&event) {
+                let _ = tx.send(msg);
+            }
+        })
+        .await;
+    if let Err(err) = result {
+        let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
+    }
+}
+
+/// Handle `/resume` in the driver: open the chosen session file with the
+/// launch selection preserved, rewire the ask bridge to the new handle, and
+/// replay the conversation into the UI. Returns the replacement handle on
+/// success (the caller swaps it in); failures surface as UI errors and keep
+/// the current session.
+async fn resume_session_command(
+    path: &str,
+    template: &crate::sdk::SessionOptions,
+    current_ask: &CurrentAsk,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> Option<crate::sdk::AgentSessionHandle> {
+    let options = crate::sdk::SessionOptions {
+        session_path: Some(std::path::PathBuf::from(path)),
+        provider: template.provider.clone(),
+        model: template.model.clone(),
+        api_key: template.api_key.clone(),
+        working_directory: template.working_directory.clone(),
+        session_dir: template.session_dir.clone(),
+        no_session: false,
+        ..Default::default()
+    };
+    match crate::sdk::create_agent_session(options).await {
+        Ok(handle) => {
+            *current_ask
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = handle.ask_tool();
+            if let Some(ask) = handle.ask_tool() {
+                install_ask_forwarder(&ask, agent_tx, runtime_handle);
+            }
+            send_conversation_reset(&handle, agent_tx, "session resumed").await;
+            Some(handle)
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("resume: {err}")));
+            None
+        }
+    }
+}
+
+/// Snapshot the handle's conversation and reset the UI transcript from it.
+async fn send_conversation_reset(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+    status: &str,
+) {
+    match handle
+        .with_session(crate::interactive::conversation_from_session)
+        .await
+    {
+        Ok((messages, usage)) => {
+            let _ = agent_tx.send(PiMsg::ConversationReset {
+                messages,
+                usage,
+                status: Some(status.to_string()),
+            });
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("conversation snapshot: {err}")));
+        }
+    }
 }
 
 /// Run a `!command` for the driver loop: tool-status blips around the shared
@@ -1331,6 +1516,7 @@ pub fn run(
     theme: &crate::theme::Theme,
     inline: bool,
     available_models: Vec<String>,
+    available_sessions: Vec<(String, String)>,
 ) -> std::io::Result<()> {
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
@@ -1340,6 +1526,17 @@ pub fn run(
         .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Template for /resume: a resumed session keeps the launch selection
+    // (provider/model/key/cwd) but swaps the session file.
+    let resume_template = crate::sdk::SessionOptions {
+        provider: session_options.provider.clone(),
+        model: session_options.model.clone(),
+        api_key: session_options.api_key.clone(),
+        working_directory: session_options.working_directory.clone(),
+        session_dir: session_options.session_dir.clone(),
+        no_session: false,
+        ..Default::default()
+    };
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
@@ -1360,33 +1557,21 @@ pub fn run(
                         return;
                     }
                 };
-                // Ask tool: install the channel picker surface so cards reach
-                // the UI as PiMsg::AskUiRequest, and pair replies back through
-                // respond_ui (same bridge shape as the RPC host). Both pumps
-                // are spawned tasks: asks arrive MID-TURN while the driver
-                // loop is blocked inside prompt().await, so pumping replies
-                // from the loop itself would deadlock the pending tool call.
+                // Ask tool bridge (same shape as the RPC host): per-handle
+                // forwarder + a long-lived reply pump against the CURRENT
+                // tool, so /resume handle swaps keep replies pairable.
+                let current_ask: CurrentAsk = Arc::new(Mutex::new(handle.ask_tool()));
                 if let Some(ask) = handle.ask_tool() {
-                    install_ask_bridge(ask, &agent_tx, ask_reply_rx, &runtime_handle);
+                    install_ask_forwarder(&ask, &agent_tx, &runtime_handle);
                 }
+                spawn_ask_reply_pump(Arc::clone(&current_ask), ask_reply_rx, &runtime_handle);
                 let _ = agent_tx.send(PiMsg::System(String::from(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
                 )));
                 loop {
                     match submit_rx.try_recv() {
                         Ok(UiCommand::Prompt(prompt)) => {
-                            // ubs:ignore Sender clone per turn — the event callback must own its sender
-                            let tx = agent_tx.clone();
-                            let result = handle
-                                .prompt(prompt, move |event| {
-                                    for msg in agent_event_to_pi_msgs(&event) {
-                                        let _ = tx.send(msg);
-                                    }
-                                })
-                                .await;
-                            if let Err(err) = result {
-                                let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
-                            }
+                            run_prompt_turn(&mut handle, prompt, &agent_tx).await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
                             let msg = match handle.set_model(&provider, &model).await {
@@ -1397,6 +1582,19 @@ pub fn run(
                         }
                         Ok(UiCommand::Bash { command }) => {
                             run_bash_ui_command(&bash_cwd, &command, &agent_tx).await;
+                        }
+                        Ok(UiCommand::ResumeSession { path }) => {
+                            if let Some(new_handle) = resume_session_command(
+                                &path,
+                                &resume_template,
+                                &current_ask,
+                                &agent_tx,
+                                &runtime_handle,
+                            )
+                            .await
+                            {
+                                handle = new_handle;
+                            }
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
@@ -1412,7 +1610,8 @@ pub fn run(
         .with_submit_channel(submit_tx)
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme))
-        .with_available_models(available_models);
+        .with_available_models(available_models)
+        .with_available_sessions(available_sessions);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
@@ -2232,6 +2431,93 @@ mod tests {
                 .iter()
                 .any(|e| e.role == EntryRole::Error && e.text.contains("no models available")),
             "empty-registry error missing"
+        );
+    }
+
+    #[test]
+    fn resume_picker_shows_labels_and_routes_paths() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_sessions(vec![
+                (
+                    String::from("fix parser · 12 msgs"),
+                    String::from("/tmp/sessions/a.jsonl"),
+                ),
+                (
+                    String::from("older run · 3 msgs"),
+                    String::from("/tmp/sessions/b.jsonl"),
+                ),
+            ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/resume");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("▸ fix parser · 12 msgs"),
+            "labels not shown: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("/tmp/sessions"),
+            "paths leaked into display: {rendered:?}"
+        );
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::ResumeSession {
+                path: "/tmp/sessions/b.jsonl".into()
+            }
+        );
+    }
+
+    #[test]
+    fn conversation_reset_rebuilds_transcript() {
+        use crate::interactive::{ConversationMessage, MessageRole};
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // Preexisting content is replaced wholesale.
+        sim.send(PiFtuiMsg::Agent(PiMsg::System("old line".into())));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ConversationReset {
+            messages: vec![
+                ConversationMessage {
+                    role: MessageRole::User,
+                    content: "restore me".into(),
+                    thinking: None,
+                    collapsed: false,
+                },
+                ConversationMessage {
+                    role: MessageRole::Assistant,
+                    content: "restored reply".into(),
+                    thinking: None,
+                    collapsed: false,
+                },
+            ],
+            usage: crate::model::Usage::default(),
+            status: Some("session resumed".into()),
+        }));
+        let transcript = &sim.model().transcript;
+        assert!(
+            !transcript.iter().any(|e| e.text.contains("old line")),
+            "stale transcript survived reset"
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|e| e.role == EntryRole::User && e.text == "restore me")
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Assistant && e.text == "restored reply")
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|e| e.text.contains("session resumed"))
         );
     }
 

@@ -89,7 +89,9 @@ use self::commands::{
     format_startup_oauth_hint, parse_bash_command, parse_extension_command,
     should_show_startup_oauth_hint,
 };
-use self::conversation::conversation_from_session;
+// Session→conversation snapshot; re-exported for the ftui migration stack
+// (bd-cv653.9.1) to rebuild its transcript after /resume.
+pub use self::conversation::conversation_from_session;
 use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
 pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use self::file_refs::{

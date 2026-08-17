@@ -2040,7 +2040,23 @@ async fn run(
                 .into_iter()
                 .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
                 .collect::<Vec<_>>();
-            pi::interactive_ftui::run(options, &theme, cli.inline, ftui_models).map_err(Into::into)
+            // /resume picker entries: this cwd's saved sessions, newest first
+            // (same index the session picker uses). Failures degrade to an
+            // empty list — /resume then reports "no saved sessions".
+            let ftui_sessions = pi::session_index::SessionIndex::new()
+                .list_sessions(Some(&cwd.display().to_string()))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|meta| {
+                    let label = match &meta.name {
+                        Some(name) => format!("{name} · {} msgs", meta.message_count),
+                        None => format!("{} · {} msgs", meta.id, meta.message_count),
+                    };
+                    (label, meta.path)
+                })
+                .collect::<Vec<_>>();
+            pi::interactive_ftui::run(options, &theme, cli.inline, ftui_models, ftui_sessions)
+                .map_err(Into::into)
         }
         #[cfg(not(feature = "ftui"))]
         unreachable!("ftui_requested is false without the ftui feature")
