@@ -377,7 +377,6 @@ mod tests {
         assert_eq!(default_tier("web_search"), LoadMode::Essential);
         assert_eq!(default_tier("ast_grep"), LoadMode::Discoverable);
         assert_eq!(default_tier("lsp"), LoadMode::Discoverable);
-        assert_eq!(default_tier("web_search"), LoadMode::Discoverable);
     }
 
     #[test]

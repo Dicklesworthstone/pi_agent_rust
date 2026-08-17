@@ -45,15 +45,28 @@ impl Dialect {
 /// `dialect` on the provider entry (read by the caller).
 #[must_use]
 pub fn dialect_for_model(provider: &str, model_id: &str) -> Dialect {
+    const XMLISH_MARKERS: &[&str] = &[
+        "qwen3",
+        "kimi-k2",
+        "glm-4",
+        "glm4",
+        "minimax",
+        "deepseek-r1",
+        "deepseek-reasoner",
+        "hermes",
+        "nous",
+        "dolphin",
+    ];
     let id = model_id.to_ascii_lowercase();
     let provider = provider.to_ascii_lowercase();
-    if provider.contains("openai") && (id.starts_with("gpt-5") || id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4")) {
+    if provider.contains("openai")
+        && (id.starts_with("gpt-5")
+            || id.starts_with("o1")
+            || id.starts_with("o3")
+            || id.starts_with("o4"))
+    {
         return Dialect::Harmony;
     }
-    const XMLISH_MARKERS: &[&str] = &[
-        "qwen3", "kimi-k2", "glm-4", "glm4", "minimax", "deepseek-r1",
-        "deepseek-reasoner", "hermes", "nous", "dolphin",
-    ];
     if XMLISH_MARKERS.iter().any(|marker| id.contains(marker)) {
         return Dialect::Xmlish;
     }
@@ -112,7 +125,10 @@ pub fn extract_text_tool_calls(
     out
 }
 
-fn parse_candidate_payload(payload: &str, is_known_tool: &dyn Fn(&str) -> bool) -> Option<(String, Value)> {
+fn parse_candidate_payload(
+    payload: &str,
+    is_known_tool: &dyn Fn(&str) -> bool,
+) -> Option<(String, Value)> {
     let value: Value = serde_json::from_str(payload.trim()).ok()?;
     let name = value.get("name").and_then(Value::as_str)?;
     if !is_known_tool(name) {
@@ -163,7 +179,9 @@ fn extract_fenced(
     while let Some(open) = text[cursor..].find("```") {
         let fence_start = cursor + open;
         let after_open = &text[fence_start + 3..];
-        let Some(newline) = after_open.find('\n') else { break };
+        let Some(newline) = after_open.find('\n') else {
+            break;
+        };
         let lang = after_open[..newline].trim();
         let content_start = fence_start + 3 + newline + 1;
         let Some(close_rel) = text[content_start..].find("```") else {
@@ -171,8 +189,10 @@ fn extract_fenced(
         };
         let content_end = content_start + close_rel;
         let payload = &text[content_start..content_end];
-        if matches!(lang, "json" | "tool_call" | "tool" | "tool_use" | "toolcall")
-            && let Some((name, arguments)) = parse_candidate_payload(payload, is_known_tool)
+        if matches!(
+            lang,
+            "json" | "tool_call" | "tool" | "tool_use" | "toolcall"
+        ) && let Some((name, arguments)) = parse_candidate_payload(payload, is_known_tool)
         {
             out.push(RepairCandidate {
                 name,
@@ -193,13 +213,18 @@ fn extract_xmlish(
     is_known_tool: &dyn Fn(&str) -> bool,
     out: &mut Vec<RepairCandidate>,
 ) {
-    for (open_tag, close_tag) in [("<tool_call>", "</tool_call>"), ("<tool_use>", "</tool_use>")] {
+    for (open_tag, close_tag) in [
+        ("<tool_call>", "</tool_call>"),
+        ("<tool_use>", "</tool_use>"),
+    ] {
         if let Some(open) = text.find(open_tag)
             && let Some(close_rel) = text[open + open_tag.len()..].find(close_tag)
         {
             let start = open + open_tag.len();
             let end = start + close_rel;
-            if let Some((name, arguments)) = parse_candidate_payload(&text[start..end], is_known_tool) {
+            if let Some((name, arguments)) =
+                parse_candidate_payload(&text[start..end], is_known_tool)
+            {
                 out.push(RepairCandidate {
                     name,
                     arguments,
@@ -243,7 +268,7 @@ fn extract_xmlish(
 pub fn strip_candidates(text: &str, candidates: &[RepairCandidate]) -> String {
     let mut out = text.to_string();
     let mut spans: Vec<(usize, usize)> = candidates.iter().map(|c| (c.start, c.end)).collect();
-    spans.sort_by(|a, b| b.0.cmp(&a.0));
+    spans.sort_by_key(|span| std::cmp::Reverse(span.0));
     for (start, end) in spans {
         if end <= out.len() && start <= end {
             out.replace_range(start..end, "");
@@ -328,8 +353,14 @@ mod tests {
     fn dialect_mapping_is_conservative() {
         assert_eq!(dialect_for_model("openai", "gpt-5.5"), Dialect::Harmony);
         assert_eq!(dialect_for_model("ollama", "qwen3:32b"), Dialect::Xmlish);
-        assert_eq!(dialect_for_model("openrouter", "kimi-k2-0711"), Dialect::Xmlish);
-        assert_eq!(dialect_for_model("anthropic", "claude-opus-4-7"), Dialect::Native);
+        assert_eq!(
+            dialect_for_model("openrouter", "kimi-k2-0711"),
+            Dialect::Xmlish
+        );
+        assert_eq!(
+            dialect_for_model("anthropic", "claude-opus-4-7"),
+            Dialect::Native
+        );
         assert_eq!(dialect_for_model("openai", "gpt-4o"), Dialect::Native);
     }
 

@@ -1278,7 +1278,9 @@ impl Agent {
     /// structured calls already present, tools enabled, one repair per
     /// message, candidate names must be registered tools.
     fn maybe_repair_dialect_tool_calls(&self, msg: AssistantMessage) -> AssistantMessage {
-        use crate::dialects::{Dialect, dialect_for_model, extract_text_tool_calls, strip_candidates};
+        use crate::dialects::{
+            Dialect, dialect_for_model, extract_text_tool_calls, strip_candidates,
+        };
 
         if !extract_tool_calls(&msg.content).is_empty() {
             return msg; // structured calls present — nothing to repair
@@ -10199,7 +10201,7 @@ impl AgentSession {
 
     /// Drain the dialect-repair ledger into session Custom entries
     /// (bd-cv653.7.8) so repairs are replayable/auditable.
-    async fn persist_repair_ledger(&mut self) {
+    async fn persist_repair_ledger(&self) {
         let repairs = self.agent.drain_repair_ledger();
         if repairs.is_empty() {
             return;
@@ -14389,7 +14391,9 @@ mod tests {
                     Ok(StreamEvent::Done {
                         reason: StopReason::Stop,
                         message: make(
-                            vec![ContentBlock::Text(TextContent::new("The file says hello-fixture."))],
+                            vec![ContentBlock::Text(TextContent::new(
+                                "The file says hello-fixture.",
+                            ))],
                             StopReason::Stop,
                         ),
                     }),
@@ -14434,7 +14438,8 @@ mod tests {
         });
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
-            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture").expect("write fixture");
+            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
+                .expect("write fixture");
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 native: false,
@@ -14457,7 +14462,9 @@ mod tests {
                 .flat_map(|m| match m {
                     crate::model::Message::Assistant(msg) => msg.content.clone(),
                     crate::model::Message::User(u) => match &u.content {
-                        crate::model::UserContent::Text(t) => vec![ContentBlock::Text(TextContent::new(t))],
+                        crate::model::UserContent::Text(t) => {
+                            vec![ContentBlock::Text(TextContent::new(t))]
+                        }
                         crate::model::UserContent::Blocks(blocks) => blocks.clone(),
                     },
                     crate::model::Message::ToolResult(r) => r.content.clone(),
@@ -14498,7 +14505,10 @@ mod tests {
             };
             assert_eq!(entries.len(), 1, "one repair entry in the session");
             assert_eq!(
-                entries[0].as_ref().and_then(|d| d.get("tool")).and_then(Value::as_str),
+                entries[0]
+                    .as_ref()
+                    .and_then(|d| d.get("tool"))
+                    .and_then(Value::as_str),
                 Some("read")
             );
         });

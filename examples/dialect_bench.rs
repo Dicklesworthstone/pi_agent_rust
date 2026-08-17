@@ -1,10 +1,10 @@
-//! dialect_bench (bd-cv653.7.8): the offline oracle for tool-call dialect
+//! `dialect_bench` (bd-cv653.7.8): the offline oracle for tool-call dialect
 //! repair. Runs a fixture corpus of weak-model emissions through the dialect
 //! extractor and reports first-attempt apply rate + false-positive rate as
 //! JSON. `--live` is a documented gate for future provider-backed scoring
 //! (requires real keys; not part of CI).
 
-use pi::dialects::{Dialect, dialect_for_model, extract_text_tool_calls};
+use pi::dialects::{Dialect, extract_text_tool_calls};
 use serde_json::json;
 use std::fmt::Write as _;
 
@@ -99,6 +99,7 @@ fn corpus() -> Vec<Case> {
     ]
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--live") {
@@ -183,7 +184,11 @@ fn main() {
         "rows": rows,
     });
     let mut out = String::new();
-    let _ = write!(out, "{}", serde_json::to_string_pretty(&report).expect("render"));
+    let _ = write!(
+        out,
+        "{}",
+        serde_json::to_string_pretty(&report).expect("render")
+    );
     println!("{out}");
 
     // Gate: 100% apply rate on the positive corpus, 0% false positives.
@@ -191,5 +196,8 @@ fn main() {
         eprintln!("ORACLE GATE FAILED: apply_rate={apply_rate} false_positives={fp}");
         std::process::exit(1);
     }
-    eprintln!("oracle gate: apply_rate=100%, false_positives=0 ({} cases)", rows.len());
+    eprintln!(
+        "oracle gate: apply_rate=100%, false_positives=0 ({} cases)",
+        rows.len()
+    );
 }
