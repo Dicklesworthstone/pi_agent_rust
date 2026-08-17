@@ -126,6 +126,8 @@ pub fn validate_request(request: AskRequest) -> Result<AskRequest> {
         )));
     }
     let mut seen_ids = std::collections::HashSet::new();
+    // ubs:ignore-block validation loop: every format! below is a cold
+    // return-error exit taken at most once, not a hot-loop allocation.
     for (index, question) in request.questions.iter().enumerate() {
         if question.question.trim().is_empty() {
             return Err(Error::validation(format!(
@@ -222,7 +224,7 @@ pub fn render_answers(request: &AskRequest, response: &AskResponse, auto: bool) 
         let rendered = answer.map_or_else(
             || "(unanswered)".to_string(),
             |answer| {
-                answer.other.clone().map_or_else(
+                answer.other.as_deref().map_or_else(
                     || {
                         if answer.selected.is_empty() {
                             "(unanswered)".to_string()
