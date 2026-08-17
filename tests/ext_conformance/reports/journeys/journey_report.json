@@ -3,161 +3,34 @@
     {
       "category": "command_provider",
       "failed": 0,
-      "passed": 33,
+      "passed": 36,
       "skipped": 0
     },
     {
       "category": "event_subscriber",
-      "failed": 1,
-      "passed": 34,
+      "failed": 0,
+      "passed": 37,
       "skipped": 0
     },
     {
       "category": "multi_capability",
-      "failed": 11,
-      "passed": 31,
-      "skipped": 0
-    },
-    {
-      "category": "passive",
-      "failed": 2,
-      "passed": 0,
+      "failed": 0,
+      "passed": 38,
       "skipped": 0
     },
     {
       "category": "tool_provider",
-      "failed": 1,
-      "passed": 12,
+      "failed": 0,
+      "passed": 14,
       "skipped": 0
     }
   ],
-  "failed": 15,
-  "failures": [
-    {
-      "category": "tool_provider",
-      "extension_id": "bash-spawn-hook",
-      "failure_reason": "Extension 'bash-spawn-hook': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"bash\"], expected={}, actual={\"bash\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_bash_spawn_hook --nocapture --exact",
-      "tier": 1
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "community/hjanuschka-plan-mode",
-      "failure_reason": "Extension 'community/hjanuschka-plan-mode': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"plan\"], expected={}, actual={\"plan\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_community_hjanuschka_plan_mode --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "community/mitsuhiko-uv",
-      "failure_reason": "Extension 'community/mitsuhiko-uv': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"bash\"], expected={}, actual={\"bash\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_community_mitsuhiko_uv --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "community/qualisero-session-color",
-      "failure_reason": "Extension 'community/qualisero-session-color': event-handler identities differ from the manifest; expected={\"resize\", \"session_start\", \"session_switch\"}, actual={\"session_start\", \"session_switch\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_community_qualisero_session_color --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "passive",
-      "extension_id": "community/tmustier-tab-status",
-      "failure_reason": "Extension 'community/tmustier-tab-status': event-handler identities differ from the manifest; expected={}, actual={\"agent_end\", \"agent_start\", \"before_agent_start\", \"session_shutdown\", \"session_start\", \"session_switch\", \"tool_call\", \"tool_result\", \"turn_start\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_community_tmustier_tab_status --nocapture --exact",
-      "tier": 1
-    },
-    {
-      "category": "passive",
-      "extension_id": "npm/benvargas-pi-ancestor-discovery",
-      "failure_reason": "Extension 'npm/benvargas-pi-ancestor-discovery': event-handler identities differ from the manifest; expected={}, actual={\"resources_discover\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_npm_benvargas_pi_ancestor_discovery --nocapture --exact",
-      "tier": 1
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "npm/ogulcancelik-pi-sketch",
-      "failure_reason": "Extension 'npm/ogulcancelik-pi-sketch': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_npm_ogulcancelik_pi_sketch --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "npm/pi-prompt-template-model",
-      "failure_reason": "Extension 'npm/pi-prompt-template-model': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"model-mode\"], expected={}, actual={\"model-mode\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_npm_pi_prompt_template_model --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "npm/vpellegrino-pi-skills",
-      "failure_reason": "Extension 'npm/vpellegrino-pi-skills': event-handler identities differ from the manifest; expected={\"close\", \"data\"}, actual={}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_npm_vpellegrino_pi_skills --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "overlay-qa-tests",
-      "failure_reason": "Extension 'overlay-qa-tests': event-handler identities differ from the manifest; expected={\"close\", \"data\"}, actual={}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_overlay_qa_tests --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "preset",
-      "failure_reason": "Extension 'preset': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"preset\"], expected={}, actual={\"preset\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_preset --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "ssh",
-      "failure_reason": "Extension 'ssh': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"ssh\"], expected={}, actual={\"ssh\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_ssh --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "third-party/lsj5031-pi-notification-extension",
-      "failure_reason": "Extension 'third-party/lsj5031-pi-notification-extension': event-handler identities differ from the manifest; expected={\"agent_end\", \"data\", \"end\", \"error\", \"session_start\", \"timeout\"}, actual={\"agent_end\", \"session_start\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_lsj5031_pi_notification_extension --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "multi_capability",
-      "extension_id": "third-party/ogulcancelik-pi-sketch",
-      "failure_reason": "Extension 'third-party/ogulcancelik-pi-sketch': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_ogulcancelik_pi_sketch --nocapture --exact",
-      "tier": 2
-    },
-    {
-      "category": "event_subscriber",
-      "extension_id": "third-party/rytswd-direnv",
-      "failure_reason": "Extension 'third-party/rytswd-direnv': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_start\", \"tool_result\"}, actual={\"session_start\", \"tool_result\"}",
-      "failure_step": "load_extension",
-      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_third_party_rytswd_direnv --nocapture --exact",
-      "tier": 2
-    }
-  ],
-  "generated_at": "2026-08-16T01:55:24.854Z",
+  "failed": 0,
+  "failures": [],
+  "generated_at": "2026-08-17T14:34:41.139Z",
   "must_pass_count": 125,
-  "pass_rate_pct": 88.0,
-  "passed": 110,
+  "pass_rate_pct": 100.0,
+  "passed": 125,
   "schema": "pi.ext.journey_report.v1",
   "skipped": 0,
   "tested": 125
