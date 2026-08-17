@@ -337,6 +337,8 @@ pub struct PiFtuiModel {
     /// `provider/model-id` entries for the `/model` picker (from the launch
     /// path's model registry; empty when unset).
     available_models: Vec<String>,
+    /// Set by `/exit`//`/quit`; the update loop turns it into `Cmd::quit()`.
+    pending_quit: bool,
     /// Keybinding catalog (defaults now; user config once the launch path
     /// wires `KeyBindings::load_from_user_config`). Shared naming with the
     /// bubbletea stack via `KeyBinding::from_ftui_key`.
@@ -417,6 +419,7 @@ impl PiFtuiModel {
             palette: FtuiPalette::default(),
             picker: None,
             available_models: Vec::new(),
+            pending_quit: false,
             keybindings: KeyBindings::default(),
             active_ask: None,
             ask_reply_tx: None,
@@ -753,6 +756,10 @@ impl PiFtuiModel {
             }
             return;
         }
+        if clean == "/exit" || clean == "/quit" {
+            self.pending_quit = true;
+            return;
+        }
         if clean == "/theme" {
             self.picker = Some(PickerOverlay {
                 title: String::from("Theme (Enter to apply, Esc to close)"),
@@ -766,9 +773,9 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model <provider>/<model>, /theme, /help, \
-                     !<command> (display-only) — everything else is still on the \
-                     charmed stack",
+                    "ftui preview commands: /model [provider/model], /theme, /exit, \
+                     /help, !<command> (display-only) — everything else is still on \
+                     the charmed stack",
                 ),
             );
             return;
@@ -923,6 +930,9 @@ impl PiFtuiModel {
                             self.submit_ask_answer();
                         } else {
                             self.submit_input();
+                            if self.pending_quit {
+                                return Cmd::quit();
+                            }
                         }
                         return Cmd::none();
                     }
@@ -2196,6 +2206,16 @@ mod tests {
             }
         );
         assert!(sim.model().picker.is_none());
+    }
+
+    #[test]
+    fn slash_exit_quits() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/exit");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(!sim.is_running(), "/exit did not quit");
     }
 
     #[test]
