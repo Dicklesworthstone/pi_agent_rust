@@ -1706,6 +1706,14 @@ async fn run(
             Box::new(pi::todo::TodoTool::new(todo_session)) as Box<dyn pi::tools::Tool>
         ]);
     }
+    // submit_plan shares the agent's plan-mode state (bd-cv653.3.5); it is
+    // always registered — the tool self-errors outside plan mode.
+    {
+        let plan_state = agent_session.agent.plan_state();
+        agent_session.agent.extend_tools(vec![
+            Box::new(pi::plan::SubmitPlanTool::new(plan_state)) as Box<dyn pi::tools::Tool>
+        ]);
+    }
     // The ask tool's picker handler is installed by the interactive host
     // below; non-interactive sessions resolve via ask_policy (bd-cv653.3.8).
     let ask_tool = enabled_tools.contains(&"ask").then(|| {

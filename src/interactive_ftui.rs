@@ -247,6 +247,17 @@ pub struct AskUiReply {
     pub response: AskResponse,
 }
 
+/// Command from the UI to the agent driver. The seed of the bubbletea
+/// stack's input-routing chain: prompts run agent turns; slash commands that
+/// need the session act here (`/model`), everything else is still unported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiCommand {
+    /// Run an agent turn with this prompt.
+    Prompt(String),
+    /// Switch the session's active model (`/model provider/model`).
+    SetModel { provider: String, model: String },
+}
+
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
 /// the editor only receives keys while `Ready` (matching
 /// `editor_input_is_available()` in the bubbletea stack).
@@ -309,7 +320,7 @@ pub struct PiFtuiModel {
     /// Where submitted user input goes. The launch path hands the sending
     /// half of the channel its agent loop consumes; tests read the receiver
     /// directly. `None` falls back to echoing into the transcript only.
-    submit_tx: Option<Sender<String>>,
+    submit_tx: Option<Sender<UiCommand>>,
     /// Shared slot for the agent-event receiver: `subscriptions()` re-declares
     /// the bridge each cycle, and the one instance the runtime actually starts
     /// takes the receiver out of this slot (see [`AgentEventSubscription`]).
@@ -384,7 +395,7 @@ impl PiFtuiModel {
     /// Route submitted input to the agent loop via this channel. The launch
     /// path calls this before starting the program.
     #[must_use]
-    pub fn with_submit_channel(mut self, tx: Sender<String>) -> Self {
+    pub fn with_submit_channel(mut self, tx: Sender<UiCommand>) -> Self {
         self.submit_tx = Some(tx);
         self
     }
@@ -627,14 +638,59 @@ impl PiFtuiModel {
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
         let clean = sanitize(trimmed).into_owned();
+        self.input.set_text("");
+        self.scroll_from_tail = 0;
         self.push_entry(EntryRole::User, clean.clone());
+
+        // Slash-command routing seed (mirrors submit_message's chain; only
+        // session-affecting commands the preview can honor are wired).
+        if let Some(rest) = clean.strip_prefix("/model") {
+            let spec = rest.trim();
+            if let Some((provider, model)) = spec.split_once('/')
+                && !provider.is_empty()
+                && !model.is_empty()
+            {
+                self.push_entry(EntryRole::System, format!("switching model to {spec} ..."));
+                self.send_command(UiCommand::SetModel {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                });
+            } else {
+                self.push_entry(
+                    EntryRole::Error,
+                    String::from("usage: /model <provider>/<model>"),
+                );
+            }
+            return;
+        }
+        if clean == "/help" {
+            self.push_entry(
+                EntryRole::System,
+                String::from(
+                    "ftui preview commands: /model <provider>/<model>, /help — \
+                     everything else is still on the charmed stack",
+                ),
+            );
+            return;
+        }
+        if clean.starts_with('/') && !clean.starts_with("/skill:") {
+            let command = clean.split_whitespace().next().unwrap_or(&clean);
+            self.push_entry(
+                EntryRole::Error,
+                format!("Unknown command in ftui preview: {command} (try /help)"),
+            );
+            return;
+        }
+
+        self.send_command(UiCommand::Prompt(clean));
+    }
+
+    fn send_command(&self, command: UiCommand) {
         if let Some(tx) = &self.submit_tx {
             // A dead agent loop is not a UI error; the transcript echo above
             // still shows what was typed.
-            let _ = tx.send(clean);
+            let _ = tx.send(command);
         }
-        self.input.set_text("");
-        self.scroll_from_tail = 0;
     }
 
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
@@ -1001,7 +1057,7 @@ pub fn run(
     session_options: crate::sdk::SessionOptions,
     theme: &crate::theme::Theme,
 ) -> std::io::Result<()> {
-    let (submit_tx, submit_rx) = std::sync::mpsc::channel::<String>();
+    let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
 
@@ -1064,7 +1120,7 @@ pub fn run(
                 )));
                 loop {
                     match submit_rx.try_recv() {
-                        Ok(prompt) => {
+                        Ok(UiCommand::Prompt(prompt)) => {
                             // ubs:ignore Sender clone per turn — the event callback must own its sender
                             let tx = agent_tx.clone();
                             let result = handle
@@ -1077,6 +1133,13 @@ pub fn run(
                             if let Err(err) = result {
                                 let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
                             }
+                        }
+                        Ok(UiCommand::SetModel { provider, model }) => {
+                            let msg = match handle.set_model(&provider, &model).await {
+                                Ok(()) => PiMsg::System(format!("model set to {provider}/{model}")),
+                                Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
+                            };
+                            let _ = agent_tx.send(msg);
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
@@ -1209,7 +1272,7 @@ mod tests {
     #[test]
     fn typing_and_enter_submits_to_channel_and_transcript() {
         let (_agent_tx, rx) = mpsc::channel();
-        let (submit_tx, submit_rx) = mpsc::channel::<String>();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
         let mut sim = ProgramSimulator::new(model);
         sim.init();
@@ -1218,7 +1281,10 @@ mod tests {
         }
         assert_eq!(sim.model().input.text(), "hi");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert_eq!(submit_rx.try_recv().expect("submitted"), "hi");
+        assert_eq!(
+            submit_rx.try_recv().expect("submitted"),
+            UiCommand::Prompt("hi".into())
+        );
         assert!(sim.model().input.is_empty(), "editor not cleared");
         let transcript = &sim.model().transcript;
         assert_eq!(transcript.len(), 1);
@@ -1266,7 +1332,7 @@ mod tests {
     #[test]
     fn submitted_text_is_sanitized() {
         let (_agent_tx, rx) = mpsc::channel();
-        let (submit_tx, submit_rx) = mpsc::channel::<String>();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
         let mut sim = ProgramSimulator::new(model);
         sim.init();
@@ -1276,10 +1342,74 @@ mod tests {
             true,
         )));
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        let submitted = submit_rx.try_recv().expect("submitted");
+        let UiCommand::Prompt(submitted) = submit_rx.try_recv().expect("submitted") else {
+            panic!("expected a prompt command");
+        };
         assert!(!submitted.contains('\x1b'), "ESC survived: {submitted:?}");
         assert!(submitted.contains("hello"));
         assert!(submitted.contains("world"));
+    }
+
+    #[test]
+    fn slash_model_routes_set_model_and_bad_specs_error() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model openai/gpt-5");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "openai".into(),
+                model: "gpt-5".into(),
+            }
+        );
+        // Bad spec: error entry, nothing sent.
+        type_str(&mut sim, "/model nonsense");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err(), "bad spec reached the driver");
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("usage: /model")),
+            "usage error missing"
+        );
+    }
+
+    #[test]
+    fn unknown_slash_command_errors_locally() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/tree");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            submit_rx.try_recv().is_err(),
+            "unknown command reached driver"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("/tree")),
+            "unknown-command error missing"
+        );
+        // /help stays local too.
+        type_str(&mut sim, "/help");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::System && e.text.contains("/model")),
+            "help text missing"
+        );
     }
 
     #[test]

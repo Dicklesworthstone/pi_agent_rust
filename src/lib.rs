@@ -192,6 +192,7 @@ pub mod permissions;
 #[cfg(feature = "wasm-host")]
 #[doc(hidden)]
 pub mod pi_wasm;
+pub mod plan;
 #[doc(hidden)]
 pub mod platform;
 #[doc(hidden)]

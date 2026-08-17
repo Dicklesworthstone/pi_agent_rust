@@ -18,17 +18,26 @@ use std::thread;
 use std::time::Duration;
 
 use pi::interactive::PiMsg;
-use pi::interactive_ftui::PiFtuiModel;
+use pi::interactive_ftui::{PiFtuiModel, UiCommand};
 use pi::model::StopReason;
 
 fn main() -> std::io::Result<()> {
-    // UI → agent (submitted prompts) and agent → UI (PiMsg events).
-    let (submit_tx, submit_rx) = mpsc::channel::<String>();
+    // UI → agent (submitted commands) and agent → UI (PiMsg events).
+    let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = mpsc::channel::<PiMsg>();
 
     // Scripted fake agent: one streamed reply per submitted prompt.
     thread::spawn(move || {
-        for prompt in submit_rx {
+        for command in submit_rx {
+            let prompt = match command {
+                UiCommand::Prompt(prompt) => prompt,
+                UiCommand::SetModel { provider, model } => {
+                    let _ = agent_tx.send(PiMsg::System(format!(
+                        "(fake agent) pretending to switch to {provider}/{model}"
+                    )));
+                    continue;
+                }
+            };
             if agent_tx.send(PiMsg::AgentStart).is_err() {
                 return;
             }

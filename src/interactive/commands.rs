@@ -40,6 +40,7 @@ pub enum SlashCommand {
     Template,
     Share,
     Mcp,
+    Plan,
 }
 
 impl SlashCommand {
@@ -79,6 +80,7 @@ impl SlashCommand {
             "/template" => Self::Template,
             "/share" => Self::Share,
             "/mcp" => Self::Mcp,
+            "/plan" => Self::Plan,
             _ => return None,
         };
 
@@ -113,6 +115,7 @@ impl SlashCommand {
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload session HTML to a secret GitHub gist and show URL
   /mcp               - Show MCP server status (Model Context Protocol)
+  /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2271,6 +2274,7 @@ impl PiApp {
             SlashCommand::Template => self.handle_slash_template(args),
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Mcp => self.handle_slash_mcp(args),
+            SlashCommand::Plan => self.handle_slash_plan(args),
         }
     }
 
@@ -2785,6 +2789,181 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             );
         }
         self.status_message = Some(format!("Role {role} set to {provider}/{model_id}"));
+        None
+    }
+
+    /// `/plan` (bd-cv653.3.5): enter plan mode, or manage a submitted plan.
+    fn handle_slash_plan(&mut self, args: &str) -> Option<Cmd> {
+        let sub = args.trim().to_ascii_lowercase();
+        let plan_state = {
+            let Ok(agent_guard) = self.agent.try_lock() else {
+                self.status_message = Some("Agent busy; try again".to_string());
+                return None;
+            };
+            agent_guard.plan_state()
+        };
+        match sub.as_str() {
+            "" | "on" | "start" => {
+                if plan_state.mode() != crate::plan::PlanMode::Off {
+                    self.status_message = Some(format!(
+                        "Already in plan mode ({})",
+                        plan_state.mode().as_str()
+                    ));
+                    return None;
+                }
+                plan_state.enter_planning();
+                // Stash the current model so approval can restore it, then
+                // switch to the plan role when one is configured.
+                plan_state.stash_previous_model(
+                    &self.model_entry.model.provider,
+                    &self.model_entry.model.id,
+                );
+                if let Some(spec) = self
+                    .config
+                    .model_roles
+                    .as_ref()
+                    .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Plan))
+                {
+                    let spec = spec.to_string();
+                    if let Some((provider, model_id)) =
+                        crate::provider_metadata::split_provider_model_spec(&spec)
+                    {
+                        let entry = self
+                            .available_models
+                            .iter()
+                            .find(|m| {
+                                crate::provider_metadata::provider_ids_match(
+                                    &m.model.provider,
+                                    provider,
+                                ) && m.model.id.eq_ignore_ascii_case(model_id)
+                            })
+                            .cloned()
+                            .or_else(|| {
+                                crate::models::ad_hoc_model_entry(provider, model_id)
+                            });
+                        if let Some(entry) = entry {
+                            let key = resolve_model_key_from_default_auth(&entry);
+                            match providers::create_provider(&entry, self.extensions.as_ref()) {
+                                Ok(provider_impl) => {
+                                    if let Err(message) = self.switch_active_model(
+                                        &entry,
+                                        provider_impl,
+                                        key.as_deref(),
+                                        "plan-role",
+                                    ) {
+                                        self.status_message = Some(message);
+                                    }
+                                }
+                                Err(err) => {
+                                    self.status_message = Some(err.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(mut session_guard) = self.session.try_lock() {
+                    session_guard.append_custom_entry(
+                        "plan_mode".to_string(),
+                        Some(serde_json::json!({"mode": "planning"})),
+                    );
+                }
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: "Plan mode: read-only. Inspect with read/grep/find/ls, then call submit_plan with the full plan for review.".to_string(),
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.status_message = Some("Plan mode: planning (read-only)".to_string());
+                self.scroll_to_bottom();
+            }
+            "status" => {
+                self.status_message = Some(format!(
+                    "Plan mode: {}",
+                    plan_state.mode().as_str()
+                ));
+            }
+            "approve" => match plan_state.approve() {
+                Some(plan) => {
+                    // Pin the plan into the agent's system context for the
+                    // execution turns (bd-cv653.3.5).
+                    if let Ok(mut agent_guard) = self.agent.try_lock() {
+                        let existing = agent_guard
+                            .config
+                            .system_prompt
+                            .clone()
+                            .unwrap_or_default();
+                        agent_guard.set_system_prompt(Some(format!(
+                            "{existing}\n\n## Approved Plan (execute this)\n\n{plan}"
+                        )));
+                    }
+                    if let Some((provider, model_id)) = plan_state.take_previous_model() {
+                        let entry = self
+                            .available_models
+                            .iter()
+                            .find(|m| {
+                                crate::provider_metadata::provider_ids_match(
+                                    &m.model.provider,
+                                    &provider,
+                                ) && m.model.id.eq_ignore_ascii_case(&model_id)
+                            })
+                            .cloned()
+                            .or_else(|| crate::models::ad_hoc_model_entry(&provider, &model_id));
+                        if let Some(entry) = entry {
+                            let key = resolve_model_key_from_default_auth(&entry);
+                            if let Ok(provider_impl) =
+                                providers::create_provider(&entry, self.extensions.as_ref())
+                            {
+                                let _ = self.switch_active_model(
+                                    &entry,
+                                    provider_impl,
+                                    key.as_deref(),
+                                    "plan-restore",
+                                );
+                            }
+                        }
+                    }
+                    if let Ok(mut session_guard) = self.session.try_lock() {
+                        session_guard.append_custom_entry(
+                            "plan_mode".to_string(),
+                            Some(serde_json::json!({"mode": "approved"})),
+                        );
+                    }
+                    self.status_message = Some("Plan approved — execute it.".to_string());
+                }
+                None => {
+                    self.status_message = Some("No submitted plan to approve".to_string());
+                }
+            },
+            "reject" => {
+                if plan_state.reject() {
+                    if let Ok(mut session_guard) = self.session.try_lock() {
+                        session_guard.append_custom_entry(
+                            "plan_mode".to_string(),
+                            Some(serde_json::json!({"mode": "rejected"})),
+                        );
+                    }
+                    self.status_message =
+                        Some("Plan rejected — still planning; revise and resubmit".to_string());
+                } else {
+                    self.status_message = Some("No submitted plan to reject".to_string());
+                }
+            }
+            "off" | "exit" => {
+                plan_state.exit();
+                if let Ok(mut session_guard) = self.session.try_lock() {
+                    session_guard.append_custom_entry(
+                        "plan_mode".to_string(),
+                        Some(serde_json::json!({"mode": "off"})),
+                    );
+                }
+                self.status_message = Some("Plan mode off".to_string());
+            }
+            other => {
+                self.status_message = Some(format!(
+                    "Unknown /plan subcommand {other:?}: use /plan [approve|reject|off|status]"
+                ));
+            }
+        }
         None
     }
 

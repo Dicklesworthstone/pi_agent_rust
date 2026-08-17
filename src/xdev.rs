@@ -68,6 +68,8 @@ const ESSENTIAL_DEFAULTS: &[&str] = &[
     "ask",
     "todo",
     "xdev",
+    // Tiny schema, required the moment plan mode activates (bd-cv653.3.5).
+    "submit_plan",
 ];
 
 /// Tools that are opt-in ONLY (never in the default enabled set, never
@@ -119,6 +121,7 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
         "ast_edit",
         "ask",
         "todo",
+        "submit_plan",
     ]
 }
 

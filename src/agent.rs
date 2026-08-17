@@ -1207,6 +1207,10 @@ pub struct Agent {
     /// Bumped on promotion; `cached_tool_defs` rebuilds when its stored
     /// generation is stale.
     tool_defs_generation: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Plan-mode state (bd-cv653.3.5): shared with the `submit_plan` tool;
+    /// the executor consults the gate before every tool call.
+    plan_state: crate::plan::PlanState,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1259,7 +1263,14 @@ impl Agent {
             scoped_rules: None,
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            plan_state: crate::plan::PlanState::new(),
         }
+    }
+
+    /// The shared plan-mode state (bd-cv653.3.5).
+    #[must_use]
+    pub fn plan_state(&self) -> crate::plan::PlanState {
+        self.plan_state.clone()
     }
 
     /// Install glob-scoped imported workspace rules (bd-cv653.6.2). Each rule
@@ -3431,11 +3442,53 @@ impl Agent {
         }
     }
 
+    /// Effective side effects for a tool call (bd-cv653.3.5): for `xdev run`
+    /// dispatches, the INNER tool's effects decide (read-only runs stay
+    /// allowed in plan mode); unknown names default to read-only here — the
+    /// not-found path produces its own error downstream.
+    fn effects_for_call(&self, tool_call: &ToolCall) -> crate::tools::ToolEffects {
+        if tool_call.name == "xdev" {
+            let action = tool_call
+                .arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list");
+            if action != "run" {
+                return crate::tools::ToolEffects::read();
+            }
+            let inner = tool_call
+                .arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            return self
+                .tools
+                .get(inner)
+                .map_or_else(crate::tools::ToolEffects::read, |tool| tool.effects());
+        }
+        self.tools
+            .get(&tool_call.name)
+            .map_or_else(crate::tools::ToolEffects::read, |tool| tool.effects())
+    }
+
     async fn execute_tool_without_hooks(
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
     ) -> (ToolOutput, bool) {
+        // Plan-mode gate (bd-cv653.3.5): Planning/PendingApproval reject any
+        // tool whose effects intersect the mutation/process BARRIER set. For
+        // xdev run calls the INNER tool's effects decide, not the union.
+        if !self.plan_state.allows_effects(self.effects_for_call(tool_call)) {
+            return (
+                Self::xdev_text_output(
+                    &crate::plan::PlanState::block_message(&tool_call.name),
+                    true,
+                ),
+                true,
+            );
+        }
+
         // Load modes (bd-cv653.1.6): intercept the xdev dispatcher's
         // run/promote actions so the inner tool executes through the normal
         // path (effects/approval already applied to this outer call).

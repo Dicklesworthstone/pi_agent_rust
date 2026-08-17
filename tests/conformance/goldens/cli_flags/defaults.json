@@ -41,7 +41,7 @@
   "theme": null,
   "theme_path": [],
   "thinking": null,
-  "tools": "read,bash,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,ask,todo",
+  "tools": "read,bash,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,ask,todo,submit_plan",
   "verbose": false,
   "version": false
 }
