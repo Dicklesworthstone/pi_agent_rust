@@ -206,6 +206,12 @@ unicode-width = { version = "0.2", optional = true }
 textwrap = { version = "0.16", optional = true }
 arboard = { version = "3.6.1", optional = true }
 
+# FrankenTUI migration target (bd-cv653.9.1). Coexists with the charmed_rust
+# stack behind the default-OFF `ftui` feature while the interactive runtime is
+# ported module by module; the bubbletea stack is deleted at cutover.
+# runtime-only features for now — widget/extras features grow with the port.
+ftui = { version = "0.5", default-features = false, features = ["runtime"], optional = true }
+
 # Filesystem
 dirs = "6"
 tempfile = "3.25.0"
@@ -385,6 +391,10 @@ tui = [
     "dep:unicode-width",
     "dep:textwrap",
 ]
+# FrankenTUI migration stack (bd-cv653.9.1): default-OFF while the interactive
+# runtime is ported. Requires `tui` because the bridge reuses PiMsg and the
+# existing agent-event plumbing during coexistence.
+ftui = ["dep:ftui", "tui"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]

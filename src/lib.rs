@@ -167,6 +167,9 @@ pub mod http_shim;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod interactive;
+#[cfg(feature = "ftui")]
+#[doc(hidden)]
+pub mod interactive_ftui;
 #[doc(hidden)]
 pub mod keybindings;
 #[doc(hidden)]

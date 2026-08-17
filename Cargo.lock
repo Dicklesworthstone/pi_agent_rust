@@ -178,7 +178,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -189,7 +189,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1819,7 +1819,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1992,7 +1992,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2487,6 +2487,166 @@ dependencies = [
  "serde",
  "tracing",
  "xxhash-rust",
+]
+
+[[package]]
+name = "ftui"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3291fa66fe476dd0cd19c3d54689ab9e834b56ffc7ac9c8d5081a796bc3f364e"
+dependencies = [
+ "ftui-core",
+ "ftui-layout",
+ "ftui-render",
+ "ftui-runtime",
+ "ftui-style",
+ "ftui-text",
+ "ftui-widgets",
+]
+
+[[package]]
+name = "ftui-a11y"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d5953c62962a9c2db4015d827e84577d4343883f39fee9aacbaa095a1cea8d5e"
+dependencies = [
+ "ahash",
+ "ftui-core",
+]
+
+[[package]]
+name = "ftui-backend"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "067165cc0a293978457fa75aabe8ff1d5bb15bcd46f12b2f72c2c3da03a7e8d8"
+dependencies = [
+ "ftui-core",
+ "ftui-render",
+]
+
+[[package]]
+name = "ftui-core"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7a9484364b0e5e3992517c17404b630a7bd403475dfecc5b4da0bc36d4e1d87"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "bitflags 2.13.1",
+ "getrandom 0.3.4",
+ "getrandom 0.4.3",
+ "libc",
+ "signal-hook 0.4.4",
+ "unicode-display-width",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+ "web-time",
+]
+
+[[package]]
+name = "ftui-i18n"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7874722a0ce160fc3bcf6e07bd2dc88969fd4affd5bb96f9402607a8e3ec8404"
+
+[[package]]
+name = "ftui-layout"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e133cdfeea98af75e7f6f386d2f7e2f0e36e81132d4d0bbd0f826ac5a49fb838"
+dependencies = [
+ "ftui-core",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
+name = "ftui-render"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f89c71ce0d4d84758aa18183e890e833882436dab571c717b9e0a909b99b6fd"
+dependencies = [
+ "ahash",
+ "bitflags 2.13.1",
+ "bumpalo",
+ "ftui-core",
+ "memchr",
+ "smallvec",
+ "unicode-segmentation",
+ "web-time",
+]
+
+[[package]]
+name = "ftui-runtime"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca69e9ca3059fc54a536f11eb40caa9ef78123c0318f800e9aac673d48839ae8"
+dependencies = [
+ "arc-swap",
+ "ftui-backend",
+ "ftui-core",
+ "ftui-i18n",
+ "ftui-layout",
+ "ftui-render",
+ "ftui-style",
+ "ftui-text",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+ "web-time",
+]
+
+[[package]]
+name = "ftui-style"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90daee8258f778332e7b54be899fa06f2bdb2c1e498156b20a01202772371f00"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "ftui-render",
+ "tracing",
+]
+
+[[package]]
+name = "ftui-text"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ece5d8ed10603bf7814d43867a7a4ae7ddbe15569c7d5c3e6f11b9fd97db678e"
+dependencies = [
+ "ftui-core",
+ "ftui-layout",
+ "ftui-render",
+ "ftui-style",
+ "lru 0.18.2",
+ "ropey",
+ "rustc-hash",
+ "smallvec",
+ "tracing",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+]
+
+[[package]]
+name = "ftui-widgets"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "394213c80bd5ee3fbac49547ec178389e13afb36c74fee41cb79ba008bd98904"
+dependencies = [
+ "ahash",
+ "bitflags 2.13.1",
+ "ftui-a11y",
+ "ftui-core",
+ "ftui-layout",
+ "ftui-render",
+ "ftui-runtime",
+ "ftui-style",
+ "ftui-text",
+ "unicode-segmentation",
+ "unicode-width 0.2.2",
+ "web-time",
 ]
 
 [[package]]
@@ -4433,7 +4593,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4729,7 +4889,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d8fae84b431384b68627d0f9b3b1245fcf9f46f6c0e3dc902e9dce64edd1967"
 dependencies = [
  "libc",
- "windows-sys 0.42.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4922,6 +5082,7 @@ dependencies = [
  "flate2",
  "fs4",
  "fsqlite",
+ "ftui",
  "futures",
  "getrandom 0.4.3",
  "glob",
@@ -5284,7 +5445,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5777,6 +5938,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ropey"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93411e420bcd1a75ddd1dc3caf18c23155eda2c090631a85af21ba19e97093b5"
+dependencies = [
+ "smallvec",
+ "str_indices",
+]
+
+[[package]]
 name = "rquickjs"
 version = "0.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5865,7 +6036,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6267,7 +6438,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6296,7 +6467,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6314,6 +6485,12 @@ dependencies = [
  "libc",
  "winapi",
 ]
+
+[[package]]
+name = "str_indices"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d08889ec5408683408db66ad89e0e1f93dff55c73a4ccc71c427d5b277ee47e6"
 
 [[package]]
 name = "streaming-iterator"
@@ -6730,7 +6907,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7210,6 +7387,15 @@ name = "unicode-bom"
 version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eec5d1121208364f6793f7d2e222bf75a915c19557537745b195b253dd64217"
+
+[[package]]
+name = "unicode-display-width"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a43273b656140aa2bb8e65351fe87c255f0eca706b2538a9bd4a590a3490bf3"
+dependencies = [
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "unicode-general-category"
@@ -7906,7 +8092,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
