@@ -382,6 +382,77 @@ fn e2e_ftui_inline_preserves_scrollback_fullscreen_hides_it() {
     scrollback_case("e2e_ftui_scrollback_fullscreen", SENTINEL, false, false);
 }
 
+/// Acceptance #3 lane (tmux-achievable part): a resize storm while the UI is
+/// live must not crash, wedge, or corrupt the session — after the storm the
+/// UI still routes input and quits cleanly. Torn-frame detection proper
+/// belongs to the ftui-harness flicker tooling; this proves survival and
+/// post-storm correctness end to end.
+#[test]
+fn e2e_ftui_resize_storm_survives() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_resize_storm_survives") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&ftui_args());
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+
+    // Storm: rapid alternating geometries, ending back at 80x24.
+    for (w, h) in [
+        ("40", "12"),
+        ("120", "40"),
+        ("32", "10"),
+        ("100", "30"),
+        ("60", "18"),
+        ("80", "24"),
+    ] {
+        let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
+        let status = cmd
+            .args([
+                "-L",
+                &session.tmux.socket_name,
+                "resize-window",
+                "-t",
+                &session.tmux.session_name,
+                "-x",
+                w,
+                "-y",
+                h,
+            ])
+            .status()
+            .expect("tmux resize-window"); // ubs:ignore test assertion expect
+        assert!(status.success(), "resize to {w}x{h} failed");
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    // Let the resize coalescer settle on the final geometry: transiently
+    // rendering for a stale size during the storm is expected (latest-wins
+    // with bounded latency); the assertions below are about steady state.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Post-storm: the UI must still route input correctly...
+    session.send_text_and_wait(
+        "post_storm_help",
+        "/help",
+        "ftui preview commands",
+        COMMAND_TIMEOUT,
+    );
+    // ...and the steady-state frame must be laid out for the final geometry
+    // (a stale-size frame pushes the header off the top of the pane).
+    std::thread::sleep(Duration::from_millis(300));
+    let pane = session.tmux.capture_pane();
+    assert!(
+        pane.contains("pi ·"),
+        "header missing after resize storm settled; got:\n{pane}"
+    );
+
+    // ...and still tear down cleanly.
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// Acceptance #2 lane: the inline (scrollback-preserving) runtime path boots,
 /// renders, and quits cleanly.
 #[test]
