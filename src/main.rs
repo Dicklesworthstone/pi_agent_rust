@@ -2035,7 +2035,12 @@ async fn run(
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
-            pi::interactive_ftui::run(options, &theme, cli.inline).map_err(Into::into)
+            let ftui_models = model_registry
+                .get_available()
+                .into_iter()
+                .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+                .collect::<Vec<_>>();
+            pi::interactive_ftui::run(options, &theme, cli.inline, ftui_models).map_err(Into::into)
         }
         #[cfg(not(feature = "ftui"))]
         unreachable!("ftui_requested is false without the ftui feature")

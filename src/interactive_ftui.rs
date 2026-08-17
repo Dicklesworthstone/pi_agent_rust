@@ -268,6 +268,9 @@ struct PickerOverlay {
 enum PickerKind {
     /// Built-in theme picker (`/theme`): applies the palette UI-side.
     Theme,
+    /// Model picker (`/model` with no arguments): items are
+    /// `provider/model-id` strings; selection routes `UiCommand::SetModel`.
+    Model,
 }
 
 /// Command from the UI to the agent driver.
@@ -331,6 +334,9 @@ pub struct PiFtuiModel {
     palette: FtuiPalette,
     /// Modal picker overlay; captures all keys while open.
     picker: Option<PickerOverlay>,
+    /// `provider/model-id` entries for the `/model` picker (from the launch
+    /// path's model registry; empty when unset).
+    available_models: Vec<String>,
     /// Keybinding catalog (defaults now; user config once the launch path
     /// wires `KeyBindings::load_from_user_config`). Shared naming with the
     /// bubbletea stack via `KeyBinding::from_ftui_key`.
@@ -410,6 +416,7 @@ impl PiFtuiModel {
             usage_line: None,
             palette: FtuiPalette::default(),
             picker: None,
+            available_models: Vec::new(),
             keybindings: KeyBindings::default(),
             active_ask: None,
             ask_reply_tx: None,
@@ -444,6 +451,13 @@ impl PiFtuiModel {
     #[must_use]
     pub const fn with_palette(mut self, palette: FtuiPalette) -> Self {
         self.palette = palette;
+        self
+    }
+
+    /// Provide the `provider/model-id` list backing the `/model` picker.
+    #[must_use]
+    pub fn with_available_models(mut self, models: Vec<String>) -> Self {
+        self.available_models = models;
         self
     }
 
@@ -707,7 +721,22 @@ impl PiFtuiModel {
         // session-affecting commands the preview can honor are wired).
         if let Some(rest) = clean.strip_prefix("/model") {
             let spec = rest.trim();
-            if let Some((provider, model)) = spec.split_once('/')
+            if spec.is_empty() {
+                // Bare /model opens the picker over the registry list.
+                if self.available_models.is_empty() {
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from("no models available; use /model <provider>/<model>"),
+                    );
+                } else {
+                    self.picker = Some(PickerOverlay {
+                        title: String::from("Model (Enter to switch, Esc to close)"),
+                        items: self.available_models.clone(),
+                        selected: 0,
+                        kind: PickerKind::Model,
+                    });
+                }
+            } else if let Some((provider, model)) = spec.split_once('/')
                 && !provider.is_empty()
                 && !model.is_empty()
             {
@@ -792,6 +821,21 @@ impl PiFtuiModel {
                 self.palette = FtuiPalette::from_theme(&theme);
                 self.push_entry(EntryRole::System, format!("theme set to {choice}"));
                 self.scroll_from_tail = 0;
+            }
+            PickerKind::Model => {
+                if let Some((provider, model)) = choice.split_once('/') {
+                    self.push_entry(
+                        EntryRole::System,
+                        format!("switching model to {choice} ..."),
+                    );
+                    self.scroll_from_tail = 0;
+                    self.send_command(UiCommand::SetModel {
+                        provider: provider.to_string(),
+                        model: model.to_string(),
+                    });
+                } else {
+                    self.push_entry(EntryRole::Error, format!("malformed model entry: {choice}"));
+                }
             }
         }
     }
@@ -1276,6 +1320,7 @@ pub fn run(
     session_options: crate::sdk::SessionOptions,
     theme: &crate::theme::Theme,
     inline: bool,
+    available_models: Vec<String>,
 ) -> std::io::Result<()> {
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
@@ -1356,7 +1401,8 @@ pub fn run(
     let model = PiFtuiModel::new(agent_rx)
         .with_submit_channel(submit_tx)
         .with_ask_reply_channel(ask_reply_tx)
-        .with_palette(FtuiPalette::from_theme(theme));
+        .with_palette(FtuiPalette::from_theme(theme))
+        .with_available_models(available_models);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
@@ -2116,6 +2162,56 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("theme set to light")),
             "confirmation note missing"
+        );
+    }
+
+    #[test]
+    fn bare_model_command_opens_picker_and_selection_routes_set_model() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx)
+            .with_submit_channel(submit_tx)
+            .with_available_models(vec![
+                String::from("openai/gpt-5"),
+                String::from("anthropic/claude-opus-5"),
+            ]);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker did not open");
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("▸ openai/gpt-5"),
+            "first entry not selected: {rendered:?}"
+        );
+        // Down + Enter selects the anthropic entry and routes SetModel.
+        sim.inject_event(key(KeyCode::Down, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetModel {
+                provider: "anthropic".into(),
+                model: "claude-opus-5".into(),
+            }
+        );
+        assert!(sim.model().picker.is_none());
+    }
+
+    #[test]
+    fn bare_model_command_errors_without_registry() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/model");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_none());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("no models available")),
+            "empty-registry error missing"
         );
     }
 
