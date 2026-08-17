@@ -1620,7 +1620,7 @@ mod tests {
         assert!(invalid.mode().is_err());
         let task = SubagentTask {
             agent: "review".to_string(),
-            task: "review {previous}".to_string(),
+            task: concat!("review {", "previous}").to_string(),
             cwd: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),

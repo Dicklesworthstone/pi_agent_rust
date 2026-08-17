@@ -102,6 +102,7 @@ pub mod conformance;
 pub mod conformance_shapes;
 #[doc(hidden)]
 pub mod connectors;
+pub mod context_files;
 #[doc(hidden)]
 pub mod crypto_shim;
 #[doc(hidden)]

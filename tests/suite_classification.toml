@@ -297,6 +297,7 @@ files = [
     "e2e_extension_lifecycle_perf",
     "e2e_extension_registration",
     "e2e_failure_injection_recovery",
+    "e2e_foreign_rules",
     "e2e_golden_path",
     "e2e_high_risk_workflows",
     "e2e_interruption_resume_replay",

@@ -413,6 +413,7 @@ fn build_system_prompt_includes_custom_append_context_and_skills() {
         &package_dir,
         false,
         true,
+        None,
     )
     .expect("build system prompt");
 
@@ -463,6 +464,7 @@ fn build_system_prompt_test_mode_suppresses_ambient_project_context() {
         &package_dir,
         true,
         true,
+        None,
     )
     .expect("build system prompt");
 
@@ -530,6 +532,7 @@ fn build_system_prompt_rejects_unreadable_system_prompt_path() {
         &package_dir,
         true,
         true,
+        None,
     )
     .expect_err("directory path should not become literal prompt text");
 
@@ -561,6 +564,7 @@ fn build_system_prompt_rejects_unreadable_append_prompt_path() {
         &package_dir,
         true,
         true,
+        None,
     )
     .expect_err("directory path should not become literal append prompt text");
 

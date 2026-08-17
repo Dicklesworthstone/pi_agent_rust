@@ -60,6 +60,7 @@ use sha2::{Digest as _, Sha256};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -1169,6 +1170,44 @@ pub struct Agent {
 
     /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
     cached_tool_defs: Option<Vec<ToolDef>>,
+
+    /// Path-scoped imported workspace rules (bd-cv653.6.2), delivered as
+    /// steering messages the first time a tool call touches a matching path.
+    scoped_rules: Option<ScopedRuleState>,
+}
+
+/// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
+struct ScopedRuleState {
+    rules: Vec<crate::context_files::ForeignRule>,
+    matcher: crate::context_files::ScopedRuleMatcher,
+    workspace_root: PathBuf,
+    activated: std::collections::HashSet<usize>,
+}
+
+/// JSON keys of tool inputs that name filesystem paths, used to decide when
+/// a scoped rule's globs are touched. Budget-capped: only string values and
+/// first-level arrays of strings are inspected.
+const PATH_LIKE_INPUT_KEYS: [&str; 6] =
+    ["path", "file_path", "filePath", "file", "directory", "cwd"];
+
+/// Extract path-like strings from a tool call's arguments (borrowed;
+/// allocation-free). These are matcher *inputs*, never joined onto a
+/// filesystem path.
+fn path_like_inputs(arguments: &Value) -> Vec<&str> {
+    let Some(object) = arguments.as_object() else {
+        return Vec::new();
+    };
+    PATH_LIKE_INPUT_KEYS
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .flat_map(|value| match value {
+            Value::String(_) => std::slice::from_ref(value).iter(),
+            Value::Array(entries) => entries.iter(),
+            _ => [].iter(),
+        })
+        .filter_map(Value::as_str)
+        .filter(|candidate| !candidate.is_empty())
+        .collect()
 }
 
 impl Agent {
@@ -1184,6 +1223,71 @@ impl Agent {
             follow_up_fetchers: Vec::new(),
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
+            scoped_rules: None,
+        }
+    }
+
+    /// Install glob-scoped imported workspace rules (bd-cv653.6.2). Each rule
+    /// is delivered once, as a steering message, the first time a tool call
+    /// touches a path matching its globs.
+    pub fn set_foreign_scoped_rules(
+        &mut self,
+        rules: Vec<crate::context_files::ForeignRule>,
+        workspace_root: PathBuf,
+    ) {
+        let matcher = crate::context_files::ScopedRuleMatcher::new(&rules);
+        if matcher.is_empty() {
+            self.scoped_rules = None;
+            return;
+        }
+        self.scoped_rules = Some(ScopedRuleState {
+            rules,
+            matcher,
+            workspace_root,
+            activated: std::collections::HashSet::new(),
+        });
+    }
+
+    /// Match `tool_calls` against scoped imported rules and queue newly
+    /// activated rule content as steering messages (delivered at the next
+    /// boundary, before the following provider request).
+    fn activate_scoped_rules_for_tool_calls(&mut self, tool_calls: &[ToolCall]) {
+        let Some(state) = &mut self.scoped_rules else {
+            return;
+        };
+        let mut newly_activated = Vec::new();
+        for tool_call in tool_calls {
+            for path in path_like_inputs(&tool_call.arguments) {
+                for index in state
+                    .matcher
+                    .matching_rules(Path::new(&path), &state.workspace_root)
+                {
+                    if state.activated.insert(index) {
+                        newly_activated.push(index);
+                    }
+                }
+            }
+        }
+        for index in newly_activated {
+            let Some(rule) = state.rules.get(index) else {
+                continue;
+            };
+            let text = format!(
+                "<imported-rule source=\"{}\" format=\"{}\">\n{}\n</imported-rule>\nThis workspace rule applies to files you are now working with. Follow it for the rest of the session.",
+                rule.source,
+                rule.format.label(),
+                rule.content.trim()
+            );
+            tracing::info!(
+                event = "pi.context_files.scoped_rule_activated",
+                source = %rule.source,
+                format = rule.format.label(),
+                "imported scoped rule activated"
+            );
+            self.message_queue.push_steering(Message::User(UserMessage {
+                content: UserContent::Text(text),
+                timestamp: Utc::now().timestamp_millis(),
+            }));
         }
     }
 
@@ -2952,6 +3056,13 @@ impl Agent {
             }
         }
 
+        // Imported scoped rules (bd-cv653.6.2): activation is decided from
+        // the tool calls' path inputs AFTER the batches ran (queuing earlier
+        // would trip the steering check above and skip the tools). Newly
+        // activated rules ride the steering queue, so the model sees them
+        // alongside these tool results, before its next request.
+        self.activate_scoped_rules_for_tool_calls(tool_calls);
+
         // Phase 3: Process results sequentially and handle skips.
         for (index, tool_call) in tool_calls.iter().enumerate() {
             // Check for new steering if we haven't already found some.
@@ -4685,6 +4796,59 @@ mod extensions_integration_tests {
     use std::pin::Pin;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
+
+    /// bd-cv653.6.2: a glob-scoped imported rule is queued as steering the
+    /// first time a tool call touches a matching path — exactly once — and
+    /// non-matching tool calls queue nothing.
+    #[test]
+    fn scoped_rules_activate_once_per_rule_via_tool_call_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+        let tools = ToolRegistry::new(&[], tmp.path(), None);
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+        agent.set_foreign_scoped_rules(
+            vec![crate::context_files::ForeignRule {
+                content: "Use strict TypeScript.".to_string(),
+                globs: vec!["*.ts".to_string()],
+                always_apply: false,
+                source: ".cursor/rules/ts.mdc".to_string(),
+                format: crate::context_files::ForeignRuleFormat::CursorMdc,
+            }],
+            tmp.path().to_path_buf(),
+        );
+
+        let tool_call = |path: &str| ToolCall {
+            id: "call".to_string(),
+            name: "read".to_string(),
+            arguments: json!({ "path": path }),
+            thought_signature: None,
+        };
+
+        agent.activate_scoped_rules_for_tool_calls(&[tool_call("README.md")]);
+        assert!(
+            agent.message_queue.pop_steering().is_empty(),
+            "non-matching path must not activate the rule"
+        );
+
+        agent.activate_scoped_rules_for_tool_calls(&[tool_call("src/main.ts")]);
+        let delivered = agent.message_queue.pop_steering();
+        assert_eq!(delivered.len(), 1, "matching path activates the rule once");
+        let Message::User(user) = &delivered[0] else {
+            panic!("rule must arrive as a user steering message");
+        };
+        let UserContent::Text(text) = &user.content else {
+            panic!("rule steering must be text");
+        };
+        assert!(text.contains("imported-rule"));
+        assert!(text.contains(".cursor/rules/ts.mdc"));
+        assert!(text.contains("Use strict TypeScript."));
+
+        agent.activate_scoped_rules_for_tool_calls(&[tool_call("other/lib.ts")]);
+        assert!(
+            agent.message_queue.pop_steering().is_empty(),
+            "an activated rule must not re-queue"
+        );
+    }
 
     /// bd-1q31s: handler responses accept the upstream shapes (rewritten
     /// payload object directly, or `{ payload: ... }`) and treat null /

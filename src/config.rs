@@ -103,6 +103,12 @@ pub struct Config {
     /// hatch).
     #[serde(alias = "searchBackend")]
     pub search_backend: Option<String>,
+    /// Import rules from other tools' native config files found in the
+    /// workspace — Cursor MDC/.cursorrules, Cline, Copilot instructions,
+    /// Windsurf, GEMINI.md (bd-cv653.6.2). Read-only; native AGENTS.md /
+    /// CLAUDE.md conventions always win. Default `true`.
+    #[serde(alias = "foreignRules")]
+    pub foreign_rules: Option<bool>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -643,6 +649,7 @@ impl Config {
             session_store: other.session_store.or(base.session_store),
             session_durability: other.session_durability.or(base.session_durability),
             search_backend: other.search_backend.or(base.search_backend),
+            foreign_rules: other.foreign_rules.or(base.foreign_rules),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),
@@ -765,6 +772,12 @@ impl Config {
             .as_ref()
             .and_then(|r| r.max_delay_ms)
             .unwrap_or(60000)
+    }
+
+    /// Whether foreign-format workspace rules are imported (bd-cv653.6.2).
+    #[must_use]
+    pub fn foreign_rules_enabled(&self) -> bool {
+        self.foreign_rules.unwrap_or(true)
     }
 
     pub fn image_auto_resize(&self) -> bool {

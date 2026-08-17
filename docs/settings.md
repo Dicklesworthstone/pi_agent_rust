@@ -157,6 +157,18 @@ Accessor defaults:
   or `fd` binaries required); `external` shells out to `rg`/`fd` as before —
   kept as a debugging escape hatch. Alias: `searchBackend`.
 
+### Imported rules (foreign formats)
+
+- `foreign_rules` (bool): Import rules from other tools' native config files
+  found in the workspace — Cursor `.cursor/rules/*.mdc` and `.cursorrules`,
+  Cline `.clinerules`, Copilot `.github/copilot-instructions.md` and
+  `*.instructions.md` (`applyTo` globs), Windsurf `.windsurfrules` /
+  `.windsurf/rules/`, and `GEMINI.md`. Always-apply rules join the system
+  prompt with provenance headers; glob-scoped rules are delivered the first
+  time a tool call touches a matching path. Import is read-only, deduped
+  against `AGENTS.md`/`CLAUDE.md` (native wins), and budget-capped with a
+  truncation notice. Default `true`. Alias: `foreignRules`.
+
 ### Shell
 
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.

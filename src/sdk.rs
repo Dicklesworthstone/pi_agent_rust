@@ -1793,6 +1793,14 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         .map(String::as_str)
         .collect::<Vec<_>>();
 
+    let sdk_test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    // Foreign-format workspace rules (bd-cv653.6.2), shared with the agent's
+    // scoped-rule activation below.
+    let foreign_rules = if config.foreign_rules_enabled() && !sdk_test_mode {
+        crate::context_files::discover_foreign_rules(&cwd)
+    } else {
+        crate::context_files::ForeignRules::default()
+    };
     let system_prompt = app::build_system_prompt(
         &cli,
         &cwd,
@@ -1800,8 +1808,9 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         None,
         &global_dir,
         &package_dir,
-        std::env::var_os("PI_TEST_MODE").is_some(),
+        sdk_test_mode,
         options.include_cwd_in_prompt,
+        Some(&foreign_rules),
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
@@ -1850,6 +1859,11 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         compaction_settings,
     );
     agent_session.set_api_key_override(options.api_key.clone());
+    if foreign_rules.scoped_rules().next().is_some() {
+        agent_session
+            .agent
+            .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
+    }
 
     if !options.extension_paths.is_empty() {
         let extension_paths = options

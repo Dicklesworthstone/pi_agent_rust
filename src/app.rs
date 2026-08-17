@@ -157,6 +157,7 @@ pub fn build_system_prompt(
     package_dir: &Path,
     test_mode: bool,
     include_cwd: bool,
+    foreign_rules: Option<&crate::context_files::ForeignRules>,
 ) -> Result<String> {
     use std::fmt::Write as _;
 
@@ -183,6 +184,15 @@ pub fn build_system_prompt(
         for file in &context_files {
             let _ = write!(prompt, "## {}\n\n{}\n\n", file.path, file.content);
         }
+    }
+
+    // Foreign-format rules import (bd-cv653.6.2): always-apply rules join the
+    // system block; scoped rules are advertised and delivered on activation.
+    if let Some(block) =
+        foreign_rules.and_then(crate::context_files::ForeignRules::system_prompt_block)
+    {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
     }
 
     if let Some(skills_prompt) = skills_prompt {

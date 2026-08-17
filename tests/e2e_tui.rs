@@ -232,6 +232,7 @@ fn build_vcr_system_prompt_for_args(
         &package_dir,
         true,
         true,
+        None,
     )
     .expect("build vcr system prompt")
 }

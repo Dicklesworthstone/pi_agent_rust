@@ -873,6 +873,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         package_dir,
         true, // test_mode
         true, // include_cwd
+        None,
     )
     .expect("build system prompt");
     assert!(prompt.contains("<TIMESTAMP>"));
@@ -895,6 +896,7 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
         package_dir,
         false,
         true,
+        None,
     )
     .expect("build system prompt");
     assert!(!prompt.contains("<TIMESTAMP>"));
@@ -916,6 +918,7 @@ fn build_system_prompt_with_skills_prompt() {
         package_dir,
         true,
         true,
+        None,
     )
     .expect("build system prompt");
     assert!(prompt.contains("Available Skills"));
@@ -937,6 +940,7 @@ fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
         package_dir,
         true,
         true,
+        None,
     )
     .expect("build system prompt");
     assert!(

@@ -1613,6 +1613,14 @@ async fn run(
         String::new()
     };
     let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    // Foreign-format workspace rules (bd-cv653.6.2): discovered once here,
+    // shared by the system prompt (always-apply block) and the agent
+    // (scoped-rule activation).
+    let foreign_rules = if config.foreign_rules_enabled() && !test_mode {
+        pi::context_files::discover_foreign_rules(&cwd)
+    } else {
+        pi::context_files::ForeignRules::default()
+    };
     let system_prompt = pi::app::build_system_prompt(
         &cli,
         &cwd,
@@ -1626,6 +1634,7 @@ async fn run(
         &package_dir,
         test_mode,
         !cli.hide_cwd_in_prompt,
+        Some(&foreign_rules),
     )?;
     let provider =
         providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
@@ -1664,6 +1673,11 @@ async fn run(
     )
     .with_runtime_handle(runtime_handle.clone());
     agent_session.set_api_key_override(cli.api_key.clone());
+    if foreign_rules.scoped_rules().next().is_some() {
+        agent_session
+            .agent
+            .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
+    }
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
@@ -1801,6 +1815,7 @@ async fn run(
                         &package_dir,
                         test_mode,
                         !cli.hide_cwd_in_prompt,
+                        Some(&foreign_rules),
                     )?;
                     agent_session.agent.set_system_prompt(Some(system_prompt));
                 }
