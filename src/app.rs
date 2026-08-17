@@ -1051,8 +1051,13 @@ const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-5.3-codex"),
     ("openai", "gpt-5.2-codex"),
     ("openai", "gpt-5.1-codex"),
-    ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
     ("anthropic", "claude-opus-4-5"),
+    // Bedrock is credential-exempt (structured AWS credentials resolve at
+    // request time, so it always counts as "available"). Rank it BELOW
+    // providers whose availability proves a configured key — otherwise a
+    // user holding only an Anthropic key gets defaulted onto Bedrock and
+    // fails at the first request (66fdd46f regression).
+    ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
     ("azure-openai-responses", "gpt-5.2"),
     ("google", "gemini-2.5-pro"),
     ("google-gemini-cli", "gemini-2.5-pro"),

@@ -1,12 +1,12 @@
 //! E2E (bd-cv653.3.2): cross-model failover, auth-error refusal, and
 //! credential rotation over real processes against a mock OpenAI-compatible
 //! server. No network beyond loopback; structured JSONL logs per
-//! tests/common/logging.rs.
+//! `tests/common/logging.rs`.
 //!
 //! Case 1: primary 429s until the retry budget is spent → the fallback-chain
 //!         entry completes the turn (print mode).
 //! Case 2: primary 401s → loud error, the fallback entry is NEVER called.
-//! Case 3: OPENAI_API_KEYS=k1,k2 with a 429 on k1 → the retry carries k2.
+//! Case 3: `OPENAI_API_KEYS=k1,k2` with a 429 on k1 → the retry carries k2.
 
 mod common;
 
@@ -44,7 +44,8 @@ fn text_sse_body(text: &str) -> String {
     .join("\n")
 }
 
-/// OpenAI Responses-API SSE: output_text delta + response.completed.
+/// SSE body for the `OpenAI` Responses API: `output_text` delta plus
+/// `response.completed`.
 fn responses_sse_body(text: &str) -> String {
     [
         format!(
@@ -286,6 +287,7 @@ fn e2e_failover_401_never_fails_over() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_credential_rotation_swaps_key_on_429() {
     let harness = TestHarness::new("e2e_credential_rotation_swaps_key_on_429");
     harness
@@ -411,6 +413,7 @@ fn e2e_credential_rotation_swaps_key_on_429() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_path_scope_pins_repo_model_set() {
     let harness = TestHarness::new("e2e_path_scope_pins_repo_model_set");
     harness
