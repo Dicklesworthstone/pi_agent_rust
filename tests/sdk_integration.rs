@@ -853,6 +853,8 @@ fn sdk_conformance_event_ordering() {
             AgentEvent::AutoCompactionEnd { .. } => "AutoCompactionEnd",
             AgentEvent::AutoRetryStart { .. } => "AutoRetryStart",
             AgentEvent::AutoRetryEnd { .. } => "AutoRetryEnd",
+            AgentEvent::FailoverStart { .. } => "FailoverStart",
+            AgentEvent::FailoverEnd { .. } => "FailoverEnd",
             AgentEvent::ExtensionError { .. } => "ExtensionError",
         })
         .collect();

@@ -1,3 +1,8 @@
+// This harness builds a mock `rch` as an executable shell script and admits it
+// through PATH; the fixtures are POSIX-only, so keep the whole target off
+// non-unix builds.
+#![cfg(unix)]
+
 use serde::Deserialize;
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt as _;

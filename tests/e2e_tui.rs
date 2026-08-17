@@ -233,6 +233,7 @@ fn build_vcr_system_prompt_for_args(
         true,
         true,
         None,
+        &pi::config::Config::default(),
     )
     .expect("build vcr system prompt")
 }

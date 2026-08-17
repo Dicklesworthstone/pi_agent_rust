@@ -182,6 +182,7 @@ fn build_system_prompt_includes_imported_rules_block() {
         true, // test_mode keeps ambient ancestor context out; rules are explicit
         true,
         Some(&rules),
+        &pi::config::Config::default(),
     )
     .expect("build system prompt with imported rules");
 

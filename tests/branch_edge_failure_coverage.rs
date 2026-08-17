@@ -874,6 +874,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         true, // test_mode
         true, // include_cwd
         None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(prompt.contains("<TIMESTAMP>"));
@@ -897,6 +898,7 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
         false,
         true,
         None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(!prompt.contains("<TIMESTAMP>"));
@@ -919,6 +921,7 @@ fn build_system_prompt_with_skills_prompt() {
         true,
         true,
         None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(prompt.contains("Available Skills"));
@@ -941,6 +944,7 @@ fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
         true,
         true,
         None,
+        &pi::config::Config::default(),
     )
     .expect("build system prompt");
     assert!(

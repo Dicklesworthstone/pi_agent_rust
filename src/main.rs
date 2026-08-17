@@ -9208,6 +9208,7 @@ mod tests {
                 max_retries: Some(3),
                 base_delay_ms: Some(2000),
                 max_delay_ms: Some(60_000),
+                ..pi::config::RetrySettings::default()
             }),
             ..Config::default()
         };
@@ -9222,6 +9223,7 @@ mod tests {
                 max_retries: Some(5),
                 base_delay_ms: Some(1000),
                 max_delay_ms: Some(60_000),
+                ..pi::config::RetrySettings::default()
             }),
             ..Config::default()
         };
@@ -9237,6 +9239,7 @@ mod tests {
                 max_retries: Some(10),
                 base_delay_ms: Some(2000),
                 max_delay_ms: Some(10_000),
+                ..pi::config::RetrySettings::default()
             }),
             ..Config::default()
         };
