@@ -222,13 +222,13 @@
           "provider_id": "github-copilot",
           "display_name": "GitHub Copilot",
           "aliases": ["copilot", "github-copilot-enterprise"],
-          "api_family": "openai (Copilot variant)",
+          "api_family": "Copilot multi-transport (OpenAI Chat/Responses or Anthropic Messages)",
           "base_url": "(GitHub API, token exchange)",
           "env_required": { "GITHUB_COPILOT_API_KEY": "..." },
           "env_optional": { "GITHUB_TOKEN": "ghp_... (alternative auth)" },
-          "minimal_cli": "pi --provider github-copilot --model gpt-4o",
+          "minimal_cli": "pi --provider github-copilot --model gpt-5.6-terra",
           "advanced_cli": [
-            "pi --provider copilot --model gpt-4o"
+            "pi --provider copilot --model gemini-3.7-flash"
           ],
           "supports": ["text", "tool_calling", "streaming"],
           "expected_behavior": {
@@ -238,8 +238,9 @@
           },
           "key_caveats": [
             "Requires active GitHub Copilot subscription",
-            "Token exchange against GitHub API required before each session",
-            "Enterprise version has separate token handling"
+            "Token exchange against GitHub API is required before inference",
+            "Model metadata selects Chat Completions, Responses, or Anthropic Messages",
+            "Set PI_COPILOT_GITHUB_API_BASE or GITHUB_API_URL for GitHub Enterprise token exchange"
           ]
         },
         {
@@ -605,7 +606,7 @@
     "native_adapter": [
       "pi --provider amazon-bedrock --model anthropic.claude-sonnet-4-20250514-v1:0 -m 'Say OK'",
       "pi --provider azure-openai --model gpt-4o -m 'Say OK'",
-      "pi --provider github-copilot --model gpt-4o -m 'Say OK'",
+      "pi --provider github-copilot --model gpt-5.6-terra -m 'Say OK'",
       "pi --provider gitlab --model claude-sonnet-4 -m 'Say OK'"
     ],
     "openai_compatible": [

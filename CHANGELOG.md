@@ -48,6 +48,11 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Features
 
+- **Current GitHub Copilot model catalog and transport routing** — the bundled
+  active catalog now includes GPT-5.6 Sol/Terra/Luna, Gemini 3.7 Flash,
+  MAI-Code-1.1-Flash, and the other current stable Copilot models. Copilot
+  requests now select Chat Completions, Responses, or Anthropic Messages from
+  model metadata, and provider-only selection defaults to `gpt-5.6-terra`.
 - **Native, opt-in subagent orchestration** — the ninth built-in tool can run
   one named child agent, bounded parallel tasks, or a sequential chain. Child
   processes inherit the parent environment (including auth/router variables),

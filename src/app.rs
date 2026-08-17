@@ -1031,7 +1031,10 @@ const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("google-gemini-cli", "gemini-2.5-pro"),
     ("google-antigravity", "gemini-3-pro-high"),
     ("google-vertex", "gemini-3-pro-preview"),
-    ("github-copilot", "gpt-4o"),
+    ("github-copilot", "gpt-5.6-terra"),
+    ("github-copilot", "gpt-5.6-sol"),
+    ("github-copilot", "gpt-5.6-luna"),
+    ("github-copilot", "gpt-5.5"),
     ("openrouter", "openai/gpt-5.1-codex"),
     ("vercel-ai-gateway", "anthropic/claude-opus-4.5"),
     ("xai", "grok-4-fast-non-reasoning"),
@@ -1889,14 +1892,14 @@ mod tests {
     }
 
     #[test]
-    fn select_model_and_thinking_provider_only_synthesizes_ad_hoc_for_coding_plan_provider() {
-        // Coding-plan providers have no registry entries; selecting them by
-        // provider alone must synthesize an ad-hoc model from the default table
-        // instead of failing with "No models available".
+    fn select_model_and_thinking_provider_only_synthesizes_ad_hoc_for_provider_defaults() {
+        // Providers with no registry entries can synthesize an ad-hoc model
+        // from the default table instead of failing with "No models available".
         for (provider_arg, expected_model_id) in [
             ("zai-coding-plan", "glm-5.2"),
             ("minimax-coding-plan", "MiniMax-M3"),
             ("kimi-for-coding", "kimi-for-coding"),
+            ("github-copilot", "gpt-5.6-terra"),
         ] {
             let cli = cli::Cli::parse_from(["pi", "--provider", provider_arg]);
             let config = Config::default();
@@ -1924,6 +1927,12 @@ mod tests {
                 selection.model_entry.model.id, expected_model_id,
                 "provider {provider_arg} should default to {expected_model_id}"
             );
+            if provider_arg == "github-copilot" {
+                assert_eq!(
+                    selection.model_entry.model.api, "openai-responses",
+                    "Copilot ad-hoc defaults must preserve model transport metadata"
+                );
+            }
         }
     }
 
@@ -1949,6 +1958,11 @@ mod tests {
             provider_default_model_id("kimi-coding"),
             Some("kimi-for-coding")
         );
+        assert_eq!(
+            provider_default_model_id("github-copilot"),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(provider_default_model_id("copilot"), Some("gpt-5.6-terra"));
         assert_eq!(provider_default_model_id("totally-unknown"), None);
     }
 
@@ -1968,6 +1982,24 @@ mod tests {
 
         assert_eq!(selection.model_entry.model.provider, "openai");
         assert_eq!(selection.model_entry.model.id, "gpt-5.4");
+    }
+
+    #[test]
+    fn select_model_and_thinking_provider_only_prefers_copilot_terra_default() {
+        let cli = cli::Cli::parse_from(["pi", "--provider", "github-copilot"]);
+        let config = Config::default();
+        let session = Session::in_memory();
+        let registry = registry_with_entries(vec![
+            test_model_entry("gemini-3.7-flash", "github-copilot", true),
+            test_model_entry("gpt-5.6-terra", "github-copilot", true),
+        ]);
+
+        let selection =
+            select_model_and_thinking(&cli, &config, &session, &registry, &[], Path::new("/tmp"))
+                .expect("provider-only selection should choose the Copilot default");
+
+        assert_eq!(selection.model_entry.model.provider, "github-copilot");
+        assert_eq!(selection.model_entry.model.id, "gpt-5.6-terra");
     }
 
     #[test]

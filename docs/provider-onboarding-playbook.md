@@ -542,9 +542,9 @@ Expected check:
 {
   "providers": {
     "github-copilot": {
-      "baseUrl": "https://api.github.com",
+      "api": "openai-responses",
       "models": [
-        { "id": "gpt-4o" }
+        { "id": "gpt-5.6-terra" }
       ]
     }
   }
@@ -553,11 +553,12 @@ Expected check:
 
 ```bash
 export GITHUB_TOKEN="..."   # or GITHUB_COPILOT_API_KEY
-pi --provider github-copilot --model gpt-4o -p "Say hello"
+pi --provider github-copilot --model gpt-5.6-terra -p "Say hello"
 ```
 
 Expected check:
-- Provider performs token exchange against GitHub API before chat call.
+- Provider performs token exchange against GitHub API before inference.
+- Model metadata selects Chat Completions, Responses, or Anthropic Messages.
 - If token exchange fails, error contains Copilot-specific diagnostic context.
 
 ### 6) GitLab Duo (`gitlab` / alias `gitlab-duo`)

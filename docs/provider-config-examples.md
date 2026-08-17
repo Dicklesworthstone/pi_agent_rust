@@ -195,9 +195,9 @@ export GITHUB_COPILOT_API_KEY="..."
 # or
 export GITHUB_TOKEN="ghp_..."
 
-pi --provider github-copilot --model gpt-4o
+pi --provider github-copilot --model gpt-5.6-terra
 # or with alias
-pi --provider copilot --model gpt-4o
+pi --provider copilot --model gemini-3.7-flash
 ```
 
 **Auth**: Token via `GITHUB_COPILOT_API_KEY` or `GITHUB_TOKEN`
@@ -205,8 +205,11 @@ pi --provider copilot --model gpt-4o
 
 **Caveats**:
 - Requires active GitHub Copilot subscription
-- Token exchange against GitHub API happens before each session
-- Enterprise version has separate token handling
+- Token exchange against GitHub API happens before inference
+- The native adapter selects Chat Completions, Responses, or Anthropic Messages
+  from the selected model's registry metadata
+- Set `PI_COPILOT_GITHUB_API_BASE` (or `GITHUB_API_URL`) for GitHub Enterprise
+  token exchange
 
 ### GitLab Duo
 

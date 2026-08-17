@@ -1172,11 +1172,39 @@ fn upstream_provider_model_ids() -> &'static HashMap<String, Vec<String>> {
     UPSTREAM_PROVIDER_MODEL_IDS_CACHE.get_or_init(parse_upstream_provider_model_ids)
 }
 
+pub(crate) fn github_copilot_api_for_model(model_id: &str) -> &'static str {
+    let id = model_id.trim().to_ascii_lowercase();
+    if id.starts_with("claude-") && id != "claude-fable-5" {
+        "anthropic-messages"
+    } else if id.starts_with("gpt-5") || id.starts_with("grok-") || id.starts_with("mai-code-") {
+        "openai-responses"
+    } else {
+        "openai-completions"
+    }
+}
+
+fn legacy_generated_model_is_admitted(entry: &LegacyGeneratedModel) -> bool {
+    let provider = entry.provider.trim();
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    if canonical_provider != "github-copilot" {
+        return true;
+    }
+
+    let normalized_model_id = canonicalize_model_id_for_provider(canonical_provider, &entry.id);
+    upstream_provider_model_ids()
+        .get(canonical_provider)
+        .is_some_and(|ids| {
+            ids.iter()
+                .any(|id| id.eq_ignore_ascii_case(&normalized_model_id))
+        })
+}
+
 pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] {
     MODEL_AUTOCOMPLETE_CACHE
         .get_or_init(|| {
             let mut candidates = legacy_generated_models()
                 .iter()
+                .filter(|entry| legacy_generated_model_is_admitted(entry))
                 .map(|entry| ModelAutocompleteCandidate {
                     slug: format!("{}/{}", entry.provider, entry.id),
                     description: Some(entry.name.clone()).filter(|name| !name.trim().is_empty()),
@@ -1992,7 +2020,11 @@ fn append_upstream_nonlegacy_models(
                 model: Model {
                     id: normalized_model_id.clone(),
                     name: normalized_model_id.clone(),
-                    api: defaults.api.to_string(),
+                    api: if canonical_provider == "github-copilot" {
+                        github_copilot_api_for_model(&normalized_model_id).to_string()
+                    } else {
+                        defaults.api.to_string()
+                    },
                     provider: canonical_provider.to_string(),
                     base_url: defaults.base_url.to_string(),
                     reasoning,
@@ -2028,6 +2060,10 @@ fn built_in_models(
     let mut provider_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
 
     for legacy in legacy_generated_models() {
+        if !legacy_generated_model_is_admitted(legacy) {
+            continue;
+        }
+
         let provider = legacy.provider.trim();
         if provider.is_empty() {
             continue;
@@ -2048,7 +2084,10 @@ fn built_in_models(
         }
 
         let routing_defaults = provider_routing_defaults(provider);
-        let api_string = if mode == ModelRegistryLoadMode::Full {
+        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+        let api_string = if canonical_provider == "github-copilot" {
+            github_copilot_api_for_model(&normalized_model_id).to_string()
+        } else if mode == ModelRegistryLoadMode::Full {
             legacy
                 .api
                 .parse::<Api>()
@@ -2088,7 +2127,6 @@ fn built_in_models(
             _ => routing_defaults.is_some_and(|defaults| defaults.auth_header),
         };
 
-        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
         let api_key = resolve_provider_api_key_cached(
             auth,
             canonical_provider,
@@ -4206,17 +4244,27 @@ where
         });
     }
 
-    let defaults = ad_hoc_provider_defaults(provider)?;
+    let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+    let defaults = if canonical_provider == "github-copilot" {
+        native_adapter_seed_defaults(canonical_provider)?
+    } else {
+        ad_hoc_provider_defaults(provider)?
+    };
     let normalized_model_id = canonicalize_model_id_for_provider(provider, model_id);
     if normalized_model_id.is_empty() {
         return None;
     }
     let reasoning = effective_reasoning(&normalized_model_id, defaults.reasoning);
+    let api = if canonical_provider == "github-copilot" {
+        github_copilot_api_for_model(&normalized_model_id).to_string()
+    } else {
+        defaults.api.to_string()
+    };
     Some(ModelEntry {
         model: Model {
             id: normalized_model_id.clone(),
             name: normalized_model_id,
-            api: defaults.api.to_string(),
+            api,
             provider: provider.to_string(),
             base_url: defaults.base_url.to_string(),
             reasoning,
@@ -4518,6 +4566,9 @@ mod tests {
 
         let mut missing = Vec::new();
         for legacy in legacy_generated_models() {
+            if !legacy_generated_model_is_admitted(legacy) {
+                continue;
+            }
             let normalized_id = canonicalize_model_id_for_provider(&legacy.provider, &legacy.id);
             if normalized_id.is_empty() {
                 continue;
@@ -4776,12 +4827,30 @@ mod tests {
         let (_dir, auth) = test_auth_storage();
         let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
 
-        let copilot = models
-            .iter()
-            .find(|m| m.model.provider == "github-copilot" && m.model.id == "claude-opus-4.6")
-            .expect("github-copilot snapshot model should be admitted");
-        assert_eq!(copilot.model.api, "openai-completions");
-        assert!(copilot.auth_header);
+        for (model_id, expected_api) in [
+            ("claude-opus-4.8", "anthropic-messages"),
+            ("gemini-3.7-flash", "openai-completions"),
+            ("gpt-5.6-sol", "openai-responses"),
+            ("gpt-5.6-terra", "openai-responses"),
+            ("gpt-5.6-luna", "openai-responses"),
+            ("mai-code-1.1-flash", "openai-responses"),
+        ] {
+            let copilot = models
+                .iter()
+                .find(|m| m.model.provider == "github-copilot" && m.model.id == model_id)
+                .unwrap_or_else(|| panic!("github-copilot snapshot model {model_id}"));
+            assert_eq!(copilot.model.api, expected_api);
+            assert!(copilot.auth_header);
+        }
+
+        for retired_model in ["gpt-4o", "gpt-5.2-codex", "claude-sonnet-4"] {
+            assert!(
+                !models.iter().any(|m| {
+                    m.model.provider == "github-copilot" && m.model.id == retired_model
+                }),
+                "retired Copilot model {retired_model} must not remain in the active catalog"
+            );
+        }
 
         // azure-openai has an empty seed base_url and requires a user-supplied
         // resource, so its snapshot IDs must NOT become registry entries. The
@@ -4792,6 +4861,50 @@ mod tests {
             !models.iter().any(|m| m.model.id == "model-router"),
             "azure-openai snapshot entries (e.g. model-router) must not be admitted from the upstream snapshot"
         );
+    }
+
+    #[test]
+    fn embedded_github_copilot_snapshot_matches_active_stable_catalog() {
+        let snapshot: HashMap<String, Vec<String>> =
+            serde_json::from_str(&crate::embedded_assets::provider_upstream_model_ids_json())
+                .expect("embedded provider model snapshot");
+        let actual = snapshot
+            .get("github-copilot")
+            .expect("github-copilot snapshot");
+        let expected = [
+            "claude-fable-5",
+            "claude-haiku-4.5",
+            "claude-opus-4.5",
+            "claude-opus-4.6",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-opus-5",
+            "claude-sonnet-4.5",
+            "claude-sonnet-4.6",
+            "claude-sonnet-5",
+            "gemini-3.1-pro-preview",
+            "gemini-3.5-flash",
+            "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "gpt-5-mini",
+            "gpt-5.3-codex",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5.5",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "grok-4.5",
+            "grok-4.6",
+            "kimi-k2.7-code",
+            "kimi-k3",
+            "mai-code-1-flash-picker",
+            "mai-code-1.1-flash",
+        ]
+        .map(str::to_string);
+
+        assert_eq!(actual, &expected);
     }
 
     #[test]
@@ -4832,6 +4945,26 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.slug == "openrouter/anthropic/claude-sonnet-4.6")
         );
+        for model_id in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gemini-3.7-flash",
+            "mai-code-1.1-flash",
+        ] {
+            let slug = format!("github-copilot/{model_id}");
+            assert!(
+                candidates.iter().any(|candidate| candidate.slug == slug),
+                "missing autocomplete candidate {slug}"
+            );
+        }
+        for retired_model in ["gpt-4o", "gpt-5.2-codex", "claude-sonnet-4"] {
+            let slug = format!("github-copilot/{retired_model}");
+            assert!(
+                candidates.iter().all(|candidate| candidate.slug != slug),
+                "retired Copilot model leaked into autocomplete: {slug}"
+            );
+        }
         assert!(
             candidates
                 .iter()

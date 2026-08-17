@@ -1048,14 +1048,14 @@ pub fn create_provider(
         }
         ProviderRouteKind::NativeCopilot => {
             let github_token = resolve_copilot_token(entry)?;
-            let mut provider = copilot::CopilotProvider::new(&entry.model.id, github_token)
-                .with_provider_name(&entry.model.provider)
-                .with_compat(entry.compat.clone())
-                .with_client(client);
-            if !entry.model.base_url.is_empty() {
-                provider = provider.with_github_api_base(&entry.model.base_url);
-            }
-            Ok(Arc::new(provider))
+            Ok(Arc::new(
+                copilot::CopilotProvider::new(&entry.model.id, github_token)
+                    .with_api_name(effective_api)
+                    .with_reasoning(entry.model.reasoning)
+                    .with_provider_name(&entry.model.provider)
+                    .with_compat(entry.compat.clone())
+                    .with_client(client),
+            ))
         }
         ProviderRouteKind::NativeGitlab => Ok(Arc::new(
             gitlab::GitLabProvider::new(&entry.model.id)
@@ -2471,6 +2471,25 @@ export default function init(pi) {
         let (route, canonical, _api) = resolve_provider_route(&entry).expect("copilot alias route");
         assert_eq!(route, ProviderRouteKind::NativeCopilot);
         assert_eq!(canonical, "github-copilot");
+    }
+
+    #[test]
+    fn create_provider_copilot_preserves_transport_metadata() {
+        for (model_id, api) in [
+            ("gemini-3.7-flash", "openai-completions"),
+            ("gpt-5.6-terra", "openai-responses"),
+            ("claude-opus-4.8", "anthropic-messages"),
+        ] {
+            let entry = model_entry(
+                "github-copilot",
+                api,
+                model_id,
+                "https://api.individual.githubcopilot.com",
+            );
+            let provider = create_provider(&entry, None).expect("Copilot provider");
+            assert_eq!(provider.model_id(), model_id);
+            assert_eq!(provider.api(), api);
+        }
     }
 
     #[test]
