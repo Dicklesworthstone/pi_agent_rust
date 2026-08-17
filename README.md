@@ -497,6 +497,7 @@ Pi supports two extension runtime families with capability-gated host connectors
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
 - Trust-state lifecycle and kill-switch controls with audited state transitions (`pending`/`acknowledged`/`trusted`/`killed`)
+- Workspace trust-on-first-use gate: project-local `.pi/settings.json` packages and `.pi/extensions/` require a one-time interactive approval (keyed to workspace path + content digest; `--trust`, `PI_WORKSPACE_TRUST`, or global `trustAllWorkspaces` for automation; non-interactive launches fail closed)
 - Hostcall reactor mesh with deterministic shard routing, bounded queue backpressure, and optional NUMA-aware telemetry
 - Fresh owner-isolated realms on every reload, with versioned persistent transpile caching instead of mutable realm reuse
 

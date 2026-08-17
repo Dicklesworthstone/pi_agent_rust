@@ -153,6 +153,12 @@ pub struct Config {
     #[serde(alias = "thinkingBudgets")]
     pub thinking_budgets: Option<ThinkingBudgets>,
 
+    // Workspace trust (GH #151): trust every workspace's project-local
+    // configuration without the first-use prompt. Automation escape hatch;
+    // only honored when set in the GLOBAL settings file.
+    #[serde(alias = "trustAllWorkspaces")]
+    pub trust_all_workspaces: Option<bool>,
+
     // Extensions/Skills/etc.
     pub packages: Option<Vec<PackageSource>>,
     pub extensions: Option<Vec<String>>,
@@ -518,6 +524,18 @@ impl Config {
         global_dir: &std::path::Path,
         cwd: &std::path::Path,
     ) -> Result<Self> {
+        Self::load_with_roots_and_project_trust(config_path, global_dir, cwd, true)
+    }
+
+    /// [`Self::load_with_roots`], but skipping the project settings merge when
+    /// the workspace is untrusted (GH #151). An explicit `PI_CONFIG_PATH`
+    /// override is user-provided and always honored.
+    pub fn load_with_roots_and_project_trust(
+        config_path: Option<&std::path::Path>,
+        global_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        project_trusted: bool,
+    ) -> Result<Self> {
         if let Some(path) = config_path {
             let config = Self::load_from_path(&Self::resolve_config_override_path(path, cwd))?;
             config.emit_queue_mode_diagnostics();
@@ -525,10 +543,39 @@ impl Config {
         }
 
         let global = Self::load_from_path(&global_dir.join("settings.json"))?;
+        if !project_trusted {
+            global.emit_queue_mode_diagnostics();
+            return Ok(global);
+        }
         let project = Self::load_from_path(&cwd.join(Self::project_dir()).join("settings.json"))?;
         let merged = Self::merge(global, project);
         merged.emit_queue_mode_diagnostics();
         Ok(merged)
+    }
+
+    /// Load only the global settings (plus any `PI_CONFIG_PATH` override),
+    /// ignoring project-local `.pi/settings.json`. Used for untrusted
+    /// workspaces and for pre-trust reads of global-only knobs such as
+    /// `trustAllWorkspaces`.
+    pub fn load_global_only() -> Result<Self> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config_path = Self::config_path_override_from_env(&cwd);
+        Self::load_with_roots_and_project_trust(
+            config_path.as_deref(),
+            &Self::global_dir(),
+            &cwd,
+            false,
+        )
+    }
+
+    /// [`Self::load`], but skipping the project settings merge when the
+    /// workspace is untrusted (GH #151).
+    pub fn load_with_project_trust(project_trusted: bool) -> Result<Self> {
+        if project_trusted {
+            Self::load()
+        } else {
+            Self::load_global_only()
+        }
     }
 
     pub fn settings_path_with_roots(
@@ -627,6 +674,9 @@ impl Config {
 
             // Thinking Budgets
             thinking_budgets: merge_thinking_budgets(base.thinking_budgets, other.thinking_budgets),
+
+            // Workspace trust
+            trust_all_workspaces: other.trust_all_workspaces.or(base.trust_all_workspaces),
 
             // Extensions/Skills/etc.
             packages: other.packages.or(base.packages),
@@ -1569,6 +1619,36 @@ mod tests {
             Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
         assert_eq!(config.theme.as_deref(), Some("override"));
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
+    }
+
+    #[test]
+    fn untrusted_load_ignores_project_settings() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{ "theme": "global", "trustAllWorkspaces": false }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{ "theme": "project", "packages": ["npm:evil"] }"#,
+        );
+
+        let trusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, true)
+            .expect("load trusted config");
+        assert_eq!(trusted.theme.as_deref(), Some("project"));
+        assert!(trusted.packages.is_some());
+
+        let untrusted = Config::load_with_roots_and_project_trust(None, &global_dir, &cwd, false)
+            .expect("load untrusted config");
+        assert_eq!(
+            untrusted.theme.as_deref(),
+            Some("global"),
+            "untrusted workspaces must not merge project settings"
+        );
+        assert!(untrusted.packages.is_none());
+        assert_eq!(untrusted.trust_all_workspaces, Some(false));
     }
 
     #[test]

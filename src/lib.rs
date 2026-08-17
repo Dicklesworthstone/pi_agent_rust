@@ -245,6 +245,7 @@ pub mod validation_broker;
 pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
+pub mod workspace_trust;
 
 pub use error::{Error, Result as PiResult};
 #[doc(hidden)]

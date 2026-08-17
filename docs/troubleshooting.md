@@ -70,6 +70,30 @@ Common fixes:
 Extension discovery is tracked under **bd-1e0** (install + resolution). If an
 extension fails to load, expect diagnostics to improve as that bead lands.
 
+**Symptom:** project-local `.pi/settings.json` packages or `.pi/extensions/`
+entries are not loading, or a "Trust this workspace?" prompt appears.
+
+Project-local configuration can execute code (npm/git package installs run
+lifecycle scripts; project extensions run JavaScript at session startup), so
+Pi gates it behind a workspace trust decision (GH #151):
+
+- On the first interactive launch in a workspace that declares such
+  configuration, Pi lists what would execute and asks once. The answer is
+  remembered in `~/.pi/agent/workspace-trust.json`, keyed to the workspace
+  path **and** a content digest — editing `.pi/settings.json` or anything
+  under `.pi/extensions/` re-prompts.
+- Non-interactive launches (`--mode rpc`, `-p/--print`, piped stdin) fail
+  closed: project-local configuration is skipped for that run with a warning,
+  and nothing is persisted.
+- Automation: pass `--trust` once (persists the decision for the current
+  content), set `PI_WORKSPACE_TRUST=trusted`/`untrusted` for a one-shot
+  override, or set `"trustAllWorkspaces": true` in the **global**
+  `~/.pi/agent/settings.json`.
+- Explicit CLI resource paths (`-e/--extension`, `--skill`, ...) are treated
+  as user consent and are never gated.
+- To revoke trust, edit or delete the workspace's entry in
+  `~/.pi/agent/workspace-trust.json`.
+
 ## Sessions (persistence + recovery)
 
 Sessions live under:

@@ -1211,7 +1211,66 @@ async fn run(
         }
     }
 
-    let mut config = Config::load()?;
+    // Workspace trust (GH #151): before any project settings merge or
+    // resource resolution, decide whether this workspace's project-local
+    // configuration (.pi/settings.json packages, .pi/extensions/) may load
+    // and execute. Explicit CLI resource paths are user consent and stay
+    // ungated.
+    let workspace_trusted = {
+        let all_resources_disabled =
+            cli.no_skills && cli.no_prompt_templates && cli.no_extensions && cli.no_themes;
+        // A PI_CONFIG_PATH override already disables project settings and
+        // project auto-discovery everywhere (ResolveRoots::from_override), so
+        // no project-declared code can run and there is nothing to gate.
+        let config_override_active = Config::config_path_override_from_env(&cwd).is_some();
+        if all_resources_disabled || config_override_active {
+            // With every resource class disabled, configured resolution is
+            // skipped entirely (Issue #38 fast path) and no project-declared
+            // code can run, so there is nothing to gate.
+            true
+        } else {
+            let interactive_allowed = cli.command.is_none()
+                && cli.export.is_none()
+                && !cli.print
+                && cli.list_models.is_none()
+                && cli.mode.as_deref().is_none_or(|mode| mode == "interactive")
+                && io::stdin().is_terminal()
+                && io::stdout().is_terminal();
+            // trustAllWorkspaces is honored from the GLOBAL settings only: a
+            // project file granting itself trust would defeat the gate.
+            let trust_all = Config::load_global_only()
+                .ok()
+                .and_then(|global| global.trust_all_workspaces)
+                .unwrap_or(false);
+            let inputs = pi::workspace_trust::TrustInputs {
+                cli_trust: cli.trust,
+                trust_all_workspaces: trust_all,
+                env_override: std::env::var(pi::workspace_trust::TRUST_ENV_VAR).ok(),
+                interactive: interactive_allowed,
+            };
+            let state = pi::workspace_trust::establish(
+                &cwd,
+                &pi::workspace_trust::WorkspaceTrustStore::default_path(),
+                &inputs,
+                prompt_workspace_trust,
+            )?;
+            if !state.trusted {
+                if state.source == pi::workspace_trust::TrustSource::NonInteractive {
+                    eprintln!(
+                        "Warning: workspace not trusted (non-interactive session); project-local .pi configuration was skipped. Pass --trust once, set {}=trusted, or launch interactively to decide.",
+                        pi::workspace_trust::TRUST_ENV_VAR
+                    );
+                } else {
+                    eprintln!(
+                        "Note: project-local .pi configuration is disabled for this untrusted workspace. Run with --trust to enable it."
+                    );
+                }
+            }
+            state.trusted
+        }
+    };
+
+    let mut config = Config::load_with_project_trust(workspace_trusted)?;
     if let Some(theme_spec) = cli.theme.as_deref() {
         // Theme already validated above
         config.theme = Some(theme_spec.to_string());
@@ -1245,7 +1304,7 @@ async fn run(
     if startup_is_interactive {
         spawn_session_index_maintenance();
     }
-    let package_manager = PackageManager::new(cwd.clone());
+    let package_manager = PackageManager::new(cwd.clone()).with_project_trust(workspace_trusted);
     let resource_cli = ResourceCliOptions {
         no_skills: cli.no_skills,
         no_prompt_templates: cli.no_prompt_templates,
@@ -6791,6 +6850,65 @@ fn print_model_table<R: ModelTableRow>(rows: &[R]) {
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let _ = write_model_table(&mut out, rows);
+}
+
+/// Interactive first-use workspace-trust prompt (GH #151). Returns
+/// `Ok(true)` to trust; EOF and empty answers deny.
+fn prompt_workspace_trust(
+    surface: &pi::workspace_trust::WorkspaceTrustSurface,
+) -> pi::PiResult<bool> {
+    const MAX_LISTED_EXTENSIONS: usize = 10;
+
+    eprintln!();
+    eprintln!("This workspace declares project-local Pi configuration that can execute code:");
+    if surface.has_project_settings {
+        let noun = if surface.package_count == 1 {
+            "package entry"
+        } else {
+            "package entries"
+        };
+        eprintln!(
+            "  - .pi/settings.json ({} {noun}; npm/git installs run lifecycle scripts)",
+            surface.package_count
+        );
+    }
+    if !surface.extension_entries.is_empty() {
+        let noun = if surface.extension_entries.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        eprintln!(
+            "  - .pi/extensions ({} {noun}; JavaScript runs at session startup):",
+            surface.extension_entries.len()
+        );
+        for entry in surface.extension_entries.iter().take(MAX_LISTED_EXTENSIONS) {
+            eprintln!("      {entry}");
+        }
+        if surface.extension_entries.len() > MAX_LISTED_EXTENSIONS {
+            eprintln!(
+                "      ... and {} more",
+                surface.extension_entries.len() - MAX_LISTED_EXTENSIONS
+            );
+        }
+    }
+    eprintln!(
+        "Trusting is remembered for this content; changes to it re-prompt. Untrusted workspaces run with project-local configuration disabled."
+    );
+    loop {
+        eprint!("Trust this workspace? [y/N] ");
+        io::stderr().flush().map_err(pi::Error::from)?;
+        let mut input = String::new();
+        let bytes = io::stdin().read_line(&mut input).map_err(pi::Error::from)?;
+        if bytes == 0 {
+            return Ok(false);
+        }
+        match input.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Ok(true),
+            "" | "n" | "no" => return Ok(false),
+            _ => eprintln!("Please answer y or n."),
+        }
+    }
 }
 
 fn prompt_line(prompt: &str) -> Result<Option<String>> {

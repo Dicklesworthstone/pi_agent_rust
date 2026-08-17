@@ -2083,6 +2083,85 @@ fn e2e_cli_config_without_tty_surfaces_invalid_package_settings() {
     );
 }
 
+fn write_untrusted_workspace_surface(harness: &CliTestHarness) {
+    let extensions_dir = harness.harness.temp_dir().join(".pi").join("extensions");
+    fs::create_dir_all(&extensions_dir).expect("create project extensions dir");
+    fs::write(
+        extensions_dir.join("marker.js"),
+        "export default function init() {}\n",
+    )
+    .expect("write project extension");
+}
+
+#[test]
+fn e2e_cli_workspace_trust_fails_closed_non_interactive() {
+    let mut harness = CliTestHarness::new("e2e_cli_workspace_trust_fails_closed_non_interactive");
+    // The default PI_CONFIG_PATH override would legitimately skip the gate.
+    harness.env.remove("PI_CONFIG_PATH");
+    write_untrusted_workspace_surface(&harness);
+
+    // Non-interactive main-path launch (piped stdio): the gate must fail
+    // closed with a warning and must not persist a decision.
+    let result = harness.run(&["-p", "ping"]);
+    assert_contains(&harness.harness, &result.stderr, "workspace not trusted");
+    let store_path = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("agent dir env"),
+    )
+    .join("workspace-trust.json");
+    assert!(
+        !store_path.exists(),
+        "non-interactive denial must not persist a trust decision"
+    );
+}
+
+#[test]
+fn e2e_cli_workspace_trust_env_override_and_flag_persistence() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_workspace_trust_env_override_and_flag_persistence");
+    harness.env.remove("PI_CONFIG_PATH");
+    write_untrusted_workspace_surface(&harness);
+
+    // PI_WORKSPACE_TRUST=trusted suppresses the warning without persisting.
+    harness
+        .env
+        .insert("PI_WORKSPACE_TRUST".to_string(), "trusted".to_string());
+    let result = harness.run(&["-p", "ping"]);
+    assert!(
+        !result.stderr.contains("workspace not trusted"),
+        "env-trusted run must not warn about workspace trust; stderr: {}",
+        result.stderr
+    );
+    harness.env.remove("PI_WORKSPACE_TRUST");
+
+    // --trust persists the decision for the current content digest.
+    let result = harness.run(&["--trust", "-p", "ping"]);
+    assert!(
+        !result.stderr.contains("workspace not trusted"),
+        "--trust run must not warn about workspace trust; stderr: {}",
+        result.stderr
+    );
+    let store_path = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("agent dir env"),
+    )
+    .join("workspace-trust.json");
+    let store = fs::read_to_string(&store_path).expect("read workspace trust store");
+    assert_contains(&harness.harness, &store, "\"decision\": \"trusted\"");
+
+    // A follow-up run without the flag reuses the stored decision.
+    let result = harness.run(&["-p", "ping"]);
+    assert!(
+        !result.stderr.contains("workspace not trusted"),
+        "stored trust must suppress the warning; stderr: {}",
+        result.stderr
+    );
+}
+
 #[test]
 fn e2e_cli_export_html_creates_file_and_contains_metadata() {
     let harness = CliTestHarness::new("e2e_cli_export_html_creates_file_and_contains_metadata");

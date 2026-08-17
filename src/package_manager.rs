@@ -127,6 +127,12 @@ impl ResolveRoots {
 #[derive(Debug, Clone)]
 pub struct PackageManager {
     cwd: PathBuf,
+    /// Workspace-trust gate (GH #151): when false, project-local settings and
+    /// auto-discovery (`.pi/settings.json` packages, `.pi/extensions/`, …)
+    /// are excluded from resolution. Defaults to true because every explicit
+    /// `pi install`/`pi remove`-style subcommand is direct user consent; the
+    /// interactive startup path lowers it for untrusted workspaces.
+    project_trust: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,7 +240,19 @@ pub const PACKAGE_TRUST_AUDIT_SCHEMA: &str = "pi.package_trust_audit.v1";
 
 impl PackageManager {
     pub const fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            project_trust: true,
+        }
+    }
+
+    /// Apply the workspace-trust decision (GH #151). With `trusted == false`,
+    /// [`Self::resolve`] behaves as if the workspace declared no project-local
+    /// settings or resources.
+    #[must_use]
+    pub const fn with_project_trust(mut self, trusted: bool) -> Self {
+        self.project_trust = trusted;
+        self
     }
 
     /// Resolve a shorthand source (`id`/`name`) via the local extension index when possible.
@@ -645,8 +663,18 @@ impl PackageManager {
     ///
     /// This matches pi-mono's `DefaultPackageManager.resolve()` semantics.
     pub async fn resolve(&self) -> Result<ResolvedPaths> {
-        let roots = ResolveRoots::from_env(&self.cwd);
+        let roots = self.effective_roots();
         self.resolve_with_roots(&roots).await
+    }
+
+    /// Default resolution roots with the workspace-trust gate applied: an
+    /// untrusted workspace resolves as if it declared no project settings or
+    /// project resources (see `test_config_override_roots_ignore_project_
+    /// package_filters` for what a disabled flag excludes).
+    fn effective_roots(&self) -> ResolveRoots {
+        let mut roots = ResolveRoots::from_env(&self.cwd);
+        roots.project_settings_enabled &= self.project_trust;
+        roots
     }
 
     pub async fn resolve_with_roots(&self, roots: &ResolveRoots) -> Result<ResolvedPaths> {
@@ -4873,6 +4901,24 @@ mod tests {
             !roots.project_settings_enabled,
             "full config override should disable project settings"
         );
+    }
+
+    #[test]
+    fn with_project_trust_gates_effective_roots() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let cwd = temp_dir.path().to_path_buf();
+
+        let trusted = PackageManager::new(cwd.clone());
+        let untrusted = PackageManager::new(cwd).with_project_trust(false);
+
+        // Without a PI_CONFIG_PATH override, trust is the only thing that can
+        // lower the project flag.
+        if trusted.effective_roots().project_settings_enabled {
+            assert!(
+                !untrusted.effective_roots().project_settings_enabled,
+                "untrusted workspaces must resolve with project settings disabled"
+            );
+        }
     }
 
     #[test]

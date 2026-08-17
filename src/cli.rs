@@ -67,6 +67,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "list-providers"
         | "refresh-models"
         | "persist-models"
+        | "trust"
         | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"
@@ -442,6 +443,12 @@ pub struct Cli {
     /// Disable extension discovery
     #[arg(long)]
     pub no_extensions: bool,
+
+    /// Trust this workspace: allow project-local .pi/settings.json packages
+    /// and .pi/extensions to load and execute (persisted for the current
+    /// content digest; content changes re-prompt)
+    #[arg(long)]
+    pub trust: bool,
 
     /// Extension capability policy: safe, balanced, or permissive (legacy alias: standard)
     #[arg(long, value_name = "PROFILE")]
@@ -1425,6 +1432,30 @@ mod tests {
     fn no_extensions_flag() {
         let cli = Cli::parse_from(["pi", "--no-extensions"]);
         assert!(cli.no_extensions);
+    }
+
+    #[test]
+    fn trust_flag() {
+        let cli = Cli::parse_from(["pi", "--trust"]);
+        assert!(cli.trust);
+        let cli = Cli::parse_from(["pi"]);
+        assert!(!cli.trust);
+    }
+
+    #[test]
+    fn trust_flag_is_builtin_not_extension_flag() {
+        let parsed = parse_with_extension_flags(vec![
+            "pi".to_string(),
+            "--trust".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse --trust with print mode");
+        assert!(parsed.cli.trust, "--trust must survive preprocessing");
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "--trust must not be extracted as an extension flag"
+        );
     }
 
     #[test]
