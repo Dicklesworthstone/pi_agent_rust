@@ -66,6 +66,7 @@ fixture_test!(test_hashline_edit_fixtures, "hashline_edit_tool");
 fixture_test!(test_ast_grep_fixtures, "ast_grep_tool");
 fixture_test!(test_ast_edit_fixtures, "ast_edit_tool");
 fixture_test!(test_xdev_fixtures, "xdev_tool");
+fixture_test!(test_web_search_fixtures, "web_search_tool");
 fixture_test!(test_cli_flag_fixtures, "cli_flags");
 
 /// Run truncation tests from fixtures.
