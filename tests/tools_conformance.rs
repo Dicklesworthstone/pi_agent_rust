@@ -2934,7 +2934,33 @@ fn normalize_tool_diagnostic_for_snapshot(mut diagnostic: serde_json::Value) -> 
         }
     }
 
+    // Canonical (sorted) key order, so the golden is stable regardless of
+    // whether serde_json's `preserve_order` feature is active. fsqlite's
+    // `native` feature currently forces it on transitively (bd-nhm45), which
+    // otherwise flips every map to insertion order.
+    sort_json_object_keys(&mut diagnostic);
     diagnostic
+}
+
+/// Recursively rewrite every JSON object into sorted-key order.
+fn sort_json_object_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(object).into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (_, entry) in &mut entries {
+                sort_json_object_keys(entry);
+            }
+            object.extend(entries);
+        }
+        serde_json::Value::Array(array) => {
+            for entry in array {
+                sort_json_object_keys(entry);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]
