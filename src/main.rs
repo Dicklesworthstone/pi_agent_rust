@@ -1957,6 +1957,11 @@ async fn run(
     // Clone session handle for shutdown flush (ensures autosave queue is drained).
     let session_handle = Arc::clone(&agent_session.session);
 
+    #[cfg(feature = "ftui")]
+    let ftui_requested = is_interactive && cli.ftui;
+    #[cfg(not(feature = "ftui"))]
+    let ftui_requested = false;
+
     let result = if mode.eq("rpc") {
         let available_models = rpc_available_models(&model_registry, cli.api_key.as_deref());
         let rpc_scoped_models = selection
@@ -1981,6 +1986,26 @@ async fn run(
             ask_tool,
         ))
         .await
+    } else if ftui_requested {
+        // FrankenTUI preview stack (bd-cv653.9.1): experimental, runs an
+        // ephemeral SDK session on its own driver runtime; the charmed
+        // stack stays the default until parity is proven. Drop the default
+        // stack's session first so nothing holds its resources while the
+        // preview runs.
+        drop(agent_session);
+        #[cfg(feature = "ftui")]
+        {
+            let options = pi::sdk::SessionOptions {
+                provider: cli.provider.clone(),
+                model: cli.model.clone(),
+                api_key: cli.api_key.clone(),
+                working_directory: Some(cwd.clone()),
+                ..Default::default()
+            };
+            pi::interactive_ftui::run(options).map_err(Into::into)
+        }
+        #[cfg(not(feature = "ftui"))]
+        unreachable!("ftui_requested is false without the ftui feature")
     } else if is_interactive {
         let model_scope = selection
             .scoped_models

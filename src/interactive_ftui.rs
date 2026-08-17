@@ -760,6 +760,151 @@ impl Model for PiFtuiModel {
     }
 }
 
+// ── Launch path ─────────────────────────────────────────────────────────────
+
+/// Translate one [`AgentEvent`](crate::agent::AgentEvent) into the `PiMsg`
+/// vocabulary the model consumes. Pure so tests can pin the mapping.
+///
+/// Deliberately narrow: lifecycle, streaming deltas, tool lifecycle, and
+/// error surfacing. Retry/failover/compaction events surface as system notes;
+/// everything else is dropped until its surface is ported.
+pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
+    use crate::agent::AgentEvent as E;
+    use crate::model::AssistantMessageEvent as A;
+
+    match event {
+        E::AgentStart { .. } => vec![PiMsg::AgentStart],
+        E::AgentEnd {
+            messages, error, ..
+        } => {
+            let last_assistant = messages.iter().rev().find_map(|message| match message {
+                crate::model::Message::Assistant(assistant) => Some(assistant),
+                _ => None,
+            });
+            vec![PiMsg::AgentDone {
+                usage: last_assistant.map(|a| a.usage.clone()),
+                stop_reason: last_assistant
+                    .map_or(crate::model::StopReason::Stop, |a| a.stop_reason),
+                error_message: error.clone(),
+            }]
+        }
+        E::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
+            A::TextDelta { delta, .. } => vec![PiMsg::TextDelta(delta.clone())],
+            A::ThinkingDelta { delta, .. } => vec![PiMsg::ThinkingDelta(delta.clone())],
+            _ => Vec::new(),
+        },
+        E::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            ..
+        } => vec![PiMsg::ToolStart {
+            name: tool_name.clone(),
+            tool_id: tool_call_id.clone(),
+        }],
+        E::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            is_error,
+            ..
+        } => vec![PiMsg::ToolEnd {
+            name: tool_name.clone(),
+            tool_id: tool_call_id.clone(),
+            is_error: *is_error,
+        }],
+        E::AutoRetryStart {
+            attempt,
+            max_attempts,
+            error_message,
+            ..
+        } => vec![PiMsg::SystemNote(format!(
+            "retry {attempt}/{max_attempts}: {error_message}"
+        ))],
+        E::ExtensionError { event, error, .. } => {
+            vec![PiMsg::System(format!("extension error ({event}): {error}"))]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Poll cadence for picking up submitted prompts in the driver loop.
+const SUBMIT_POLL: Duration = Duration::from_millis(50);
+
+/// Run the ftui interactive stack against a real in-process agent session
+/// (bd-cv653.9.1 rollout: `pi --ftui`). Blocks until the UI exits.
+///
+/// Architecture: the UI runs the ftui `Program` on the calling thread; a
+/// driver thread owns an asupersync runtime plus the
+/// [`AgentSessionHandle`](crate::sdk::AgentSessionHandle) and turns submitted
+/// prompts into agent turns, translating [`AgentEvent`](crate::agent::AgentEvent)s
+/// back through the [`AgentEventSubscription`] channel. Dropping the UI drops
+/// the submit sender, which winds down the driver.
+///
+/// Not yet at parity with the bubbletea stack (slash commands, bash `!`,
+/// pickers, extension UIs, ask respond_ui wiring); tracked on the bead.
+pub fn run(session_options: crate::sdk::SessionOptions) -> std::io::Result<()> {
+    let (submit_tx, submit_rx) = std::sync::mpsc::channel::<String>();
+    let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
+
+    let driver = std::thread::Builder::new()
+        .name("pi-ftui-agent-driver".into())
+        .spawn(move || {
+            let runtime = match asupersync::runtime::RuntimeBuilder::new().build() {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    let _ = agent_tx.send(PiMsg::AgentError(format!("runtime build: {err}")));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let mut handle = match crate::sdk::create_agent_session(session_options).await {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
+                        return;
+                    }
+                };
+                let _ = agent_tx.send(PiMsg::System(String::from(
+                    "ftui preview stack — experimental (bd-cv653.9.1)",
+                )));
+                loop {
+                    match submit_rx.try_recv() {
+                        Ok(prompt) => {
+                            // ubs:ignore Sender clone per turn — the event callback must own its sender
+                            let tx = agent_tx.clone();
+                            let result = handle
+                                .prompt(prompt, move |event| {
+                                    for msg in agent_event_to_pi_msgs(&event) {
+                                        let _ = tx.send(msg);
+                                    }
+                                })
+                                .await;
+                            if let Err(err) = result {
+                                let _ = agent_tx.send(PiMsg::AgentError(err.to_string()));
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
+                                .await;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+            });
+        })?;
+
+    let model = PiFtuiModel::new(agent_rx).with_submit_channel(submit_tx);
+    let result = ftui::App::fullscreen(model).with_mouse().run();
+
+    // The UI (and with it the submit sender) is gone; the driver's next poll
+    // sees Disconnected and unwinds. Join briefly so session teardown (saves)
+    // completes before process exit paths run.
+    let _ = driver.join();
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1289,6 +1434,65 @@ mod tests {
         let reply = reply_rx.try_recv().expect("dismissal sent");
         assert!(reply.response.dismissed);
         assert!(sim.model().active_ask.is_none());
+    }
+
+    #[test]
+    fn agent_event_translation_covers_lifecycle_stream_and_tools() {
+        use crate::agent::AgentEvent as E;
+        use crate::model::{AssistantMessage, AssistantMessageEvent as A, Message, Usage};
+        use std::sync::Arc;
+
+        let msgs = agent_event_to_pi_msgs(&E::AgentStart {
+            session_id: Arc::from("s1"),
+        });
+        assert!(matches!(msgs.as_slice(), [PiMsg::AgentStart]));
+
+        let assistant = Arc::new(AssistantMessage {
+            usage: Usage {
+                input: 10,
+                output: 5,
+                total_tokens: 15,
+                ..Default::default()
+            },
+            stop_reason: StopReason::Stop,
+            ..Default::default()
+        });
+        let partial = Arc::clone(&assistant);
+        let msgs = agent_event_to_pi_msgs(&E::MessageUpdate {
+            message: Message::Assistant(Arc::clone(&assistant)),
+            assistant_message_event: A::TextDelta {
+                content_index: 0,
+                delta: "hi".into(),
+                partial,
+            },
+        });
+        assert!(matches!(msgs.as_slice(), [PiMsg::TextDelta(d)] if d == "hi"));
+
+        let msgs = agent_event_to_pi_msgs(&E::ToolExecutionStart {
+            tool_call_id: "t1".into(),
+            tool_name: "bash".into(),
+            args: serde_json::json!({}),
+        });
+        assert!(
+            matches!(msgs.as_slice(), [PiMsg::ToolStart { name, tool_id }] if name == "bash" && tool_id == "t1")
+        );
+
+        let msgs = agent_event_to_pi_msgs(&E::AgentEnd {
+            session_id: Arc::from("s1"),
+            messages: vec![Message::Assistant(assistant)],
+            error: None,
+        });
+        match msgs.as_slice() {
+            [
+                PiMsg::AgentDone {
+                    usage: Some(usage),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                },
+            ] => assert_eq!(usage.total_tokens, 15),
+            // ubs:ignore panic in #[cfg(test)] match-else is an assertion failure, not library code
+            other => panic!("unexpected translation: {other:?}"),
+        }
     }
 
     #[test]
