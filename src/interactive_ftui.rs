@@ -1196,6 +1196,40 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 const INLINE_MIN_HEIGHT: u16 = 10;
 const INLINE_MAX_HEIGHT: u16 = 24;
 
+/// Run a `!command` for the driver loop: tool-status blips around the shared
+/// bash runner, result rendered via the session display formatter.
+async fn run_bash_ui_command(
+    cwd: &std::path::Path,
+    command: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let _ = agent_tx.send(PiMsg::ToolStart {
+        name: String::from("bash"),
+        tool_id: String::from("ftui-bash"),
+    });
+    let result = crate::tools::run_bash_command(cwd, None, None, command, None, None).await;
+    let msg = match result {
+        Ok(result) => PiMsg::BashResult {
+            display: crate::session::bash_execution_to_text(
+                command,
+                &result.output,
+                result.exit_code,
+                result.cancelled,
+                result.truncated,
+                result.full_output_path.as_deref(),
+            ),
+            content_for_agent: None,
+        },
+        Err(err) => PiMsg::AgentError(format!("bash: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+    let _ = agent_tx.send(PiMsg::ToolEnd {
+        name: String::from("bash"),
+        tool_id: String::from("ftui-bash"),
+        is_error: false,
+    });
+}
+
 pub fn run(
     session_options: crate::sdk::SessionOptions,
     theme: &crate::theme::Theme,
@@ -1291,34 +1325,7 @@ pub fn run(
                             let _ = agent_tx.send(msg);
                         }
                         Ok(UiCommand::Bash { command }) => {
-                            let _ = agent_tx.send(PiMsg::ToolStart {
-                                name: String::from("bash"),
-                                tool_id: String::from("ftui-bash"),
-                            });
-                            let result = crate::tools::run_bash_command(
-                                &bash_cwd, None, None, &command, None, None,
-                            )
-                            .await;
-                            let msg = match result {
-                                Ok(result) => PiMsg::BashResult {
-                                    display: crate::session::bash_execution_to_text(
-                                        &command,
-                                        &result.output,
-                                        result.exit_code,
-                                        result.cancelled,
-                                        result.truncated,
-                                        result.full_output_path.as_deref(),
-                                    ),
-                                    content_for_agent: None,
-                                },
-                                Err(err) => PiMsg::AgentError(format!("bash: {err}")),
-                            };
-                            let _ = agent_tx.send(msg);
-                            let _ = agent_tx.send(PiMsg::ToolEnd {
-                                name: String::from("bash"),
-                                tool_id: String::from("ftui-bash"),
-                                is_error: false,
-                            });
+                            run_bash_ui_command(&bash_cwd, &command, &agent_tx).await;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
