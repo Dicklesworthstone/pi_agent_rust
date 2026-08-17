@@ -371,6 +371,7 @@ Watch the response appear incrementally, with thinking blocks shown inline.
 | `ls` | List directory contents | What's in src/? |
 | `subagent` | Delegate isolated work to a named Rust Pi child agent | Ask a scout to inspect a provider |
 | `todo` | Session task list with phases and auto-promotion (opt-in) | Track a multi-step refactor |
+| `ask` | Structured mid-turn option picker (opt-in) | Choose between two migration paths |
 
 All tools include:
 - Automatic truncation for large outputs (2000 lines / 1MB)

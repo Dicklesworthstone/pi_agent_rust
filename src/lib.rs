@@ -80,6 +80,7 @@ pub mod agent;
 pub mod agent_cx;
 #[doc(hidden)]
 pub mod app;
+pub mod ask;
 #[doc(hidden)]
 pub mod ast_tools;
 #[doc(hidden)]

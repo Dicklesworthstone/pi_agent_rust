@@ -169,6 +169,14 @@ Accessor defaults:
   against `AGENTS.md`/`CLAUDE.md` (native wins), and budget-capped with a
   truncation notice. Default `true`. Alias: `foreignRules`.
 
+### Ask tool
+
+- `ask_policy` (string): How the `ask` tool (opt-in via `--tools ...,ask`)
+  resolves in sessions without an interactive picker (print/JSON mode).
+  `recommended` (default) auto-answers with each question's recommended
+  option and loudly annotates the result; `error` fails the tool call.
+  Alias: `askPolicy`.
+
 ### Shell
 
 - `shell_path` (string): Shell binary path. Default `/bin/bash`.

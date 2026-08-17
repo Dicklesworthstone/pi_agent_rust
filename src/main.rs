@@ -1686,6 +1686,17 @@ async fn run(
             Box::new(pi::todo::TodoTool::new(todo_session)) as Box<dyn pi::tools::Tool>
         ]);
     }
+    // The ask tool's picker handler is installed by the interactive host
+    // below; non-interactive sessions resolve via ask_policy (bd-cv653.3.8).
+    let ask_tool = enabled_tools.contains(&"ask").then(|| {
+        let tool = pi::ask::AskTool::new(pi::ask::AskPolicy::from_config(
+            config.ask_policy.as_deref(),
+        ));
+        agent_session
+            .agent
+            .extend_tools(vec![Box::new(tool.clone()) as Box<dyn pi::tools::Tool>]);
+        tool
+    });
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
@@ -1973,6 +1984,7 @@ async fn run(
             resource_cli,
             cwd.clone(),
             runtime_handle.clone(),
+            ask_tool,
         )
         .await
     } else {
@@ -7534,6 +7546,7 @@ async fn run_interactive_mode(
     resource_cli: ResourceCliOptions,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
+    ask_tool: Option<pi::ask::AskTool>,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(initial) = initial {
@@ -7569,6 +7582,7 @@ async fn run_interactive_mode(
         extensions,
         cwd,
         runtime_handle,
+        ask_tool,
     )
     .await;
     // Explicitly shut down extension runtimes so the QuickJS GC can

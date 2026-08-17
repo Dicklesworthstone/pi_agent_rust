@@ -109,6 +109,11 @@ pub struct Config {
     /// CLAUDE.md conventions always win. Default `true`.
     #[serde(alias = "foreignRules")]
     pub foreign_rules: Option<bool>,
+    /// How the `ask` tool resolves in non-interactive sessions
+    /// (bd-cv653.3.8): `recommended` (default; auto-answer with the
+    /// recommended option, loudly) or `error` (fail the tool call).
+    #[serde(alias = "askPolicy")]
+    pub ask_policy: Option<String>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -650,6 +655,7 @@ impl Config {
             session_durability: other.session_durability.or(base.session_durability),
             search_backend: other.search_backend.or(base.search_backend),
             foreign_rules: other.foreign_rules.or(base.foreign_rules),
+            ask_policy: other.ask_policy.or(base.ask_policy),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),

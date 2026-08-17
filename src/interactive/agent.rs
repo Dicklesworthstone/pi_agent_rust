@@ -552,6 +552,10 @@ impl PiApp {
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary;
             }
+            PiMsg::AskUiRequest(request) => {
+                self.ask_ui_queue.push_back(request);
+                self.advance_ask_ui_queue();
+            }
             PiMsg::AgentDone {
                 usage,
                 stop_reason,
@@ -1331,6 +1335,109 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
     }
 
+    /// Ask cards (bd-cv653.3.8): show the next queued request's current
+    /// question as a conversation card and focus the input for the reply.
+    fn advance_ask_ui_queue(&mut self) {
+        if self.active_ask_ui.is_some() {
+            return;
+        }
+        let Some(request) = self.ask_ui_queue.pop_front() else {
+            return;
+        };
+        self.active_ask_ui = Some(crate::interactive::ActiveAskCard {
+            request,
+            question_index: 0,
+            answers: Vec::new(),
+        });
+        self.show_active_ask_question();
+    }
+
+    fn show_active_ask_question(&mut self) {
+        let Some(card) = &self.active_ask_ui else {
+            return;
+        };
+        let questions = &card.request.request.questions;
+        let Some(question) = questions.get(card.question_index) else {
+            return;
+        };
+        let prompt =
+            crate::ask::format_question_card(question, card.question_index, questions.len());
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: prompt,
+            thinking: None,
+            collapsed: false,
+        });
+        self.scroll_to_bottom();
+        self.input.focus();
+    }
+
+    /// Handle one line of input for the active ask card. Returns `true`
+    /// when the input was consumed by the card.
+    fn handle_ask_ui_input(&mut self, message: &str) -> bool {
+        let Some(mut card) = self.active_ask_ui.take() else {
+            return false;
+        };
+        let questions = &card.request.request.questions;
+        let Some(question) = questions.get(card.question_index) else {
+            // Defensive: malformed state — dismiss rather than wedge input.
+            self.finish_ask_ui(&card, true);
+            return true;
+        };
+        match crate::ask::parse_question_reply(question, message) {
+            Err(error) => {
+                self.status_message = Some(error);
+                self.active_ask_ui = Some(card);
+            }
+            Ok(crate::ask::QuestionReply::Cancel) => {
+                self.finish_ask_ui(&card, true);
+            }
+            Ok(reply) => {
+                let (selected, other) = match reply {
+                    crate::ask::QuestionReply::Selected(selected) => (selected, None),
+                    crate::ask::QuestionReply::Other(other) => (Vec::new(), Some(other)),
+                    crate::ask::QuestionReply::Cancel => unreachable!("handled above"),
+                };
+                card.answers.push(crate::ask::AskAnswer {
+                    question_id: crate::ask::effective_question_id(question, card.question_index),
+                    selected,
+                    other,
+                });
+                card.question_index += 1;
+                if card.question_index < card.request.request.questions.len() {
+                    self.active_ask_ui = Some(card);
+                    self.show_active_ask_question();
+                } else {
+                    self.finish_ask_ui(&card, false);
+                }
+            }
+        }
+        self.input.reset();
+        self.input.focus();
+        true
+    }
+
+    fn finish_ask_ui(&mut self, card: &crate::interactive::ActiveAskCard, dismissed: bool) {
+        let response = crate::ask::AskResponse {
+            answers: if dismissed {
+                Vec::new()
+            } else {
+                card.answers.clone()
+            },
+            dismissed,
+        };
+        let delivered = self
+            .ask_tool
+            .as_ref()
+            .is_some_and(|tool| tool.respond_ui(&card.request.id, response));
+        if !delivered {
+            self.status_message = Some("Ask request expired before the answer".to_string());
+        } else if dismissed {
+            self.status_message = Some("Question dismissed".to_string());
+        }
+        self.advance_ask_ui_queue();
+    }
+
     fn advance_extension_ui_queue(&mut self) {
         if self.active_extension_ui.is_some() {
             return;
@@ -2047,6 +2154,12 @@ After approving access in the browser, press Enter in Pi to complete login."
     pub(super) fn submit_message(&mut self, message: &str) -> Option<Cmd> {
         let message = message.trim();
         if message.is_empty() {
+            return None;
+        }
+
+        // Ask cards consume input before every other interpretation
+        // (bd-cv653.3.8): a pending question owns the input line.
+        if self.handle_ask_ui_input(message) {
             return None;
         }
 

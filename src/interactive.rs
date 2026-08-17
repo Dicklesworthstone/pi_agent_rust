@@ -1648,7 +1648,7 @@ const fn bool_label(value: bool) -> &'static str {
 }
 
 /// Run the interactive mode.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub async fn run_interactive(
     agent: Agent,
     session: Arc<Mutex<Session>>,
@@ -1664,6 +1664,7 @@ pub async fn run_interactive(
     extensions: Option<ExtensionManager>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
+    ask_tool: Option<crate::ask::AskTool>,
 ) -> anyhow::Result<()> {
     let should_check_for_updates = config.should_check_for_updates();
     let show_hardware_cursor = config
@@ -1708,6 +1709,24 @@ pub async fn run_interactive(
 
     let extensions = extensions;
 
+    // Ask-tool picker bridge (bd-cv653.3.8): requests flow through a channel
+    // into the UI loop; answers return via AskTool::respond_ui, mirroring the
+    // extension-UI request/response flow below.
+    if let Some(ask) = &ask_tool {
+        let (ask_ui_tx, mut ask_ui_rx) = mpsc::channel::<crate::ask::AskUiRequest>(4);
+        ask.install_channel_ui(ask_ui_tx);
+        let ask_event_tx = event_tx.clone();
+        let ask_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        runtime_handle.spawn(async move {
+            while let Ok(request) = ask_ui_rx.recv(&ask_ui_cx).await {
+                if !enqueue_pi_event(&ask_event_tx, &ask_ui_cx, PiMsg::AskUiRequest(request)).await
+                {
+                    break;
+                }
+            }
+        });
+    }
+
     if let Some(manager) = &extensions {
         let (extension_ui_tx, mut extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
         manager.set_ui_sender(extension_ui_tx);
@@ -1745,7 +1764,7 @@ pub async fn run_interactive(
     // (Windows-specific UX win — see pi_agent_rust#78). When disabled,
     // users scroll with Page Up/Down or arrow keys instead.
     {
-        let app = Box::new(PiApp::new(
+        let mut app = Box::new(PiApp::new(
             agent,
             session,
             config,
@@ -1766,6 +1785,7 @@ pub async fn run_interactive(
             messages,
             usage,
         ));
+        app.ask_tool = ask_tool;
         let mut program = Program::new(app)
             .with_alt_screen()
             .with_input_receiver(ui_rx);
@@ -1793,6 +1813,15 @@ pub(crate) async fn enqueue_pi_event(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx, ms
 
 pub(crate) async fn enqueue_ui_shutdown(event_tx: &mpsc::Sender<PiMsg>, cx: &Cx) {
     let _ = enqueue_pi_event(event_tx, cx, PiMsg::UiShutdown).await;
+}
+
+/// In-flight ask card (bd-cv653.3.8): one question shown at a time,
+/// accumulating answers until the request completes or is cancelled.
+#[derive(Debug, Clone)]
+pub(crate) struct ActiveAskCard {
+    pub(crate) request: crate::ask::AskUiRequest,
+    pub(crate) question_index: usize,
+    pub(crate) answers: Vec<crate::ask::AskAnswer>,
 }
 
 /// Custom message types for async agent events.
@@ -1830,6 +1859,8 @@ pub enum PiMsg {
     /// Session todo list changed (bd-cv653.3.9). Carries the compact
     /// `todo_list.v1` summary line for the footer; `None` clears it.
     TodoSummary { summary: Option<String> },
+    /// The ask tool needs the user to answer question cards (bd-cv653.3.8).
+    AskUiRequest(crate::ask::AskUiRequest),
     /// Agent finished with final message.
     AgentDone {
         usage: Option<Usage>,
@@ -2354,6 +2385,11 @@ pub struct PiApp {
     extension_compacting: Arc<AtomicBool>,
     extension_ui_queue: VecDeque<ExtensionUiRequest>,
     active_extension_ui: Option<ExtensionUiRequest>,
+    /// Ask-tool picker state (bd-cv653.3.8): the shared tool handle for
+    /// answering, queued requests, and the in-flight card.
+    ask_tool: Option<crate::ask::AskTool>,
+    ask_ui_queue: VecDeque<crate::ask::AskUiRequest>,
+    active_ask_ui: Option<ActiveAskCard>,
     extension_custom_overlay: Option<ExtensionCustomOverlay>,
     extension_custom_active: bool,
     extension_custom_key_queue: VecDeque<String>,
@@ -2679,6 +2715,9 @@ impl PiApp {
             extension_compacting: extension_compacting.clone(),
             extension_ui_queue: VecDeque::new(),
             active_extension_ui: None,
+            ask_tool: None,
+            ask_ui_queue: VecDeque::new(),
+            active_ask_ui: None,
             extension_custom_overlay: None,
             extension_custom_active: false,
             extension_custom_key_queue: VecDeque::new(),

@@ -5211,6 +5211,9 @@ impl ToolRegistry {
                 ))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                // "ask" is session-host-coupled (its picker handler is
+                // installed by the interactive host) and joins via
+                // extend_tools in main.rs/sdk.rs, like "todo".
                 "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
                 "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
                 "subagent" => {

@@ -680,3 +680,58 @@ fn todo_summary_message_drives_footer_line() {
     assert!(!app.view().contains("1/2 · implement"));
     assert_eq!(app.view_effective_conversation_height(), base_height);
 }
+
+/// bd-cv653.3.8: an ask card owns the input line — the question renders as a
+/// system card, numbered answers advance through the questions, and answers
+/// route to AskTool::respond_ui (an expired request surfaces a status).
+#[test]
+fn ask_card_consumes_input_and_advances_questions() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    let tool = crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended);
+    app.ask_tool = Some(tool);
+
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [
+            {"id": "q1", "question": "Pick one?", "recommended": 0,
+             "options": [{"label": "Alpha"}, {"label": "Beta"}]},
+            {"id": "q2", "question": "And another?",
+             "options": [{"label": "Left"}, {"label": "Right"}]}
+        ]
+    }))
+    .expect("ask request");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-1".to_string(),
+        request,
+    }));
+
+    let view = app.view();
+    assert!(view.contains("question 1 of 2"), "card rendered");
+    assert!(view.contains("Alpha (recommended)"), "recommended badge");
+
+    // First answer advances to the second card.
+    app.submit_message("2");
+    assert!(app.view().contains("question 2 of 2"));
+
+    // Second answer completes; with no pending reply slot (this request was
+    // injected directly, not via install_channel_ui) the expiry status shows.
+    app.submit_message("left");
+    assert!(app.active_ask_ui.is_none());
+    assert_eq!(
+        app.status_message.as_deref(),
+        Some("Ask request expired before the answer")
+    );
+
+    // A fresh card can be dismissed with 'cancel'.
+    let request: crate::ask::AskRequest = serde_json::from_value(serde_json::json!({
+        "questions": [{"question": "Again?", "options": [{"label": "A"}, {"label": "B"}]}]
+    }))
+    .expect("ask request 2");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-2".to_string(),
+        request,
+    }));
+    app.submit_message("cancel");
+    assert!(app.active_ask_ui.is_none());
+}
