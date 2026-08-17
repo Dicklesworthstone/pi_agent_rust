@@ -136,3 +136,25 @@ reclaiming the size before any tightening.
 - Old pi binaries (libsqlite3) and new binaries (fsqlite) must not open the same session database
   concurrently; sequential hand-off is supported (checkpointed files are format-compatible both
   ways — verified via stock sqlite3 read-back).
+
+## Follow-up — 2026-08-17: fsqlite 0.3.4 → 0.3.5 (frankensqlite#356, bd-nhm45)
+
+fsqlite 0.3.5 decouples `extensions` from the `native` feature and scopes
+serde_json's `preserve_order` to fsqlite-ext-json, so pi's
+`default-features = false, features = ["native"]` spec finally takes effect:
+
+- The five `fsqlite-ext-*` vtab crates left pi's lockfile entirely;
+  `fsqlite-core` resolves as `diagnostic-pragmas,native`.
+- The runtime serde_json feature set is back to `default,raw_value,std` —
+  the `preserve_order` leak that flipped every serialized JSON map to
+  insertion order (bd-nhm45) is gone. (`preserve_order` still appears in the
+  HOST/build-dep universe via tree-sitter's build script; resolver v2 keeps
+  that out of the shipped artifact.) The order-agnostic golden normalizer
+  from 14a57a4e stays, as it is correct under either ordering.
+- **Size: no reclaim.** Release `pi` measured 24.56 MiB (25,751,280 bytes)
+  vs 24.48 MiB on 0.3.4 — confirming LTO had already stripped the unused
+  extension vtab code and the ~5.6 MiB cutover cost is the engine core
+  (VDBE/btree/pager/planner/parser). The 26 MiB budget stands; any future
+  diet is upstream engine work, not a downstream feature toggle.
+- Gates: 7183/7183 lib tests, session e2e suites green, clippy `-D warnings`
+  clean, fmt clean.

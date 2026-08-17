@@ -220,10 +220,11 @@ grep-searcher = "0.1"
 jsonschema = { version = "0.42.0", default-features = false }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
 crossbeam-queue = "0.3"
-# default-features off: pi's session storage needs only the core engine —
-# the json/fts5/rtree extension vtabs would add megabytes against the 22 MiB
-# release size budget.
-fsqlite = { version = "0.3.4", default-features = false, features = ["native"] }
+# default-features off: pi's session storage needs only the core engine.
+# Effective since fsqlite 0.3.5 (frankensqlite#356): `native` no longer
+# force-enables the extension vtabs, and serde_json's `preserve_order` no
+# longer leaks into pi's dependency graph (bd-nhm45).
+fsqlite = { version = "0.3.5", default-features = false, features = ["native"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
