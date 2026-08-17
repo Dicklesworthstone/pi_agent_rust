@@ -1,31 +1,34 @@
-//! FrankenTUI migration stack (bd-cv653.9.1) — feature-gated seed.
+//! FrankenTUI migration stack (bd-cv653.9.1) — feature-gated preview.
 //!
 //! This module hosts the ftui-runtime port of the interactive front-end. It is
 //! compiled only with `--features ftui` (default OFF) so the charmed_rust
 //! stack in [`crate::interactive`] stays the shipped TUI while the port
 //! proceeds module by module. The bubbletea stack is deleted at cutover — no
-//! permanent duality.
+//! permanent duality. Run it with `pi --ftui` (add `--inline` to keep shell
+//! scrollback), or try the fake-agent demo: `cargo run --example ftui_preview
+//! --features ftui`.
 //!
 //! What is real today:
-//! - [`PiFtuiMsg`]: the typed Elm message for the ftui `Model`, wrapping
-//!   terminal events and the existing [`PiMsg`](crate::interactive::PiMsg)
-//!   agent-event enum (which already models every async event the current TUI
-//!   handles — the port reuses it verbatim instead of inventing a parallel
-//!   vocabulary).
+//! - [`PiFtuiMsg`]: the typed Elm message wrapping terminal events and the
+//!   existing [`PiMsg`](crate::interactive::PiMsg) agent-event vocabulary.
 //! - [`AgentEventSubscription`]: the async→UI bridge as an ftui
-//!   `Subscription`, replacing bubbletea's `with_input_receiver`. The agent
-//!   side keeps sending `PiMsg` over a std mpsc channel exactly as it does
-//!   today; the subscription drains it on a runtime-managed background thread
-//!   with clean stop semantics.
-//! - [`PiFtuiModel`]: a deliberately minimal `Model` proving the
-//!   init/update/view/subscriptions shape end to end, testable headlessly via
-//!   `ftui::runtime::simulator::ProgramSimulator`. All agent/tool-originated
-//!   text passes through `ftui::render::sanitize` before it can reach a frame
-//!   (the content-safety upgrade the migration is required to switch on).
+//!   `Subscription` (stable-id dedup, shared receiver slot, stop-aware
+//!   drain), replacing bubbletea's `with_input_receiver`.
+//! - [`PiFtuiModel`]: layout regions (header / markdown conversation /
+//!   status / growing `TextArea` editor / footer), tail-follow scroll,
+//!   spinner ticks, theme-derived [`FtuiPalette`], the shared keybinding
+//!   catalog via `KeyBinding::from_ftui_key`, inline ask cards, a modal
+//!   picker overlay (`/theme`), and input routing for `/model`, `/help`, and
+//!   display-only `!`/`!!` bash. All agent/tool-originated text passes
+//!   through `ftui::render::sanitize` before it can reach a frame.
+//! - [`run`]: the `pi --ftui` launch path — a driver thread owns an
+//!   asupersync runtime plus an SDK session; prompts become real agent turns
+//!   ([`agent_event_to_pi_msgs`] pins the translation), asks pair through
+//!   `respond_ui`, sessions persist per the usual CLI flags.
 //!
-//! What is deliberately NOT here yet: the full view port (conversation
-//! rendering, editor, footer, overlays) — that is the mechanical bulk of the
-//! migration and lands incrementally against this skeleton.
+//! Still on the bubbletea stack: remaining slash commands and pickers
+//! (session//tree/branch), bash context-inclusion, extension UIs, and the
+//! PTY/e2e acceptance lanes — tracked on the bead.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
