@@ -12654,9 +12654,6 @@ pub type NativeRustExtensionRuntimeHandle =
     native_runtime_duplicate_scaffold::NativeRustExtensionRuntimeHandle;
 
 const JS_EXTENSION_ENTRY_EXTS: &[&str] = &["ts", "tsx", "jsx", "js", "mjs", "cjs", "mts", "cts"];
-const MAX_BUNDLE_CLUSTER_DIRS: usize = 40;
-const MAX_AUXILIARY_EXAMPLE_ENTRIES: usize = 24;
-const AUXILIARY_EXTENSION_DIR_NAMES: &[&str] = &["examples", "example", "demos", "demo"];
 
 fn is_supported_js_extension_entry(path: &Path) -> bool {
     path.extension()
@@ -12763,132 +12760,13 @@ fn collect_extension_entries_from_dir(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn is_likely_auxiliary_extension_entry(path: &Path) -> bool {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if file_name.contains("extension")
-        || file_name.contains("plugin")
-        || file_name.contains("command")
-    {
-        return true;
-    }
-
-    let Ok(raw) = fs::read(path) else {
-        return false;
-    };
-    let preview_len = raw.len().min(32_768);
-    let preview = String::from_utf8_lossy(&raw[..preview_len]);
-    [
-        "registerCommand(",
-        "registerTool(",
-        "registerProvider(",
-        "registerShortcut(",
-        "registerFlag(",
-        "pi.registerCommand(",
-        "pi.registerTool(",
-        "pi.registerProvider(",
-        "export default function",
-    ]
-    .iter()
-    .any(|needle| preview.contains(needle))
-}
-
-fn is_likely_flat_extension_entry(path: &Path) -> bool {
-    let Ok(raw) = fs::read(path) else {
-        return false;
-    };
-    let preview_len = raw.len().min(32_768);
-    let preview = String::from_utf8_lossy(&raw[..preview_len]);
-
-    let has_default_initializer = [
-        "export default function",
-        "export default async function",
-        "export default(",
-        "export default (",
-        "export default async(",
-        "export default async (",
-    ]
-    .iter()
-    .any(|needle| preview.contains(needle));
-
-    let has_named_initializer = named_flat_extension_initializer_regex().is_match(&preview);
-    let has_default_object_initializer =
-        default_object_flat_extension_initializer_regex().is_match(&preview);
-
-    let has_registration = [
-        "registerCommand(",
-        "registerTool(",
-        "registerProvider(",
-        "registerShortcut(",
-        "registerFlag(",
-        "pi.registerCommand(",
-        "pi.registerTool(",
-        "pi.registerProvider(",
-        "pi.registerShortcut(",
-        "pi.registerFlag(",
-    ]
-    .iter()
-    .any(|needle| preview.contains(needle));
-
-    has_default_initializer
-        || has_named_initializer
-        || has_default_object_initializer
-        || has_registration
-}
-
-const FLAT_EXTENSION_INITIALIZER_NAMES: &str =
-    r"(?:activate|init(?:ialize)?|setup|register|plugin|main)";
-
-fn named_flat_extension_initializer_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(&format!(
-            r"(?m)\bexport\s+(?:async\s+)?function\s+{FLAT_EXTENSION_INITIALIZER_NAMES}\b|\bexport\s+(?:const|let|var)\s+{FLAT_EXTENSION_INITIALIZER_NAMES}\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
-        ))
-        .expect("named flat extension initializer regex")
-    })
-}
-
-fn default_object_flat_extension_initializer_regex() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(&format!(
-            r#"(?ms)\bexport\s+default\s*\{{.*?(?:\b(?:async\s+)?{FLAT_EXTENSION_INITIALIZER_NAMES}\s*\(|\b{FLAT_EXTENSION_INITIALIZER_NAMES}\s*:\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)|["'`]{FLAT_EXTENSION_INITIALIZER_NAMES}["'`]\s*(?:\(|:\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)))"#
-        ))
-        .expect("default object flat extension initializer regex")
-    })
-}
-
-fn discover_auxiliary_example_entries(
-    package_dir: &Path,
-    canonical_primary: &Path,
-) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for dir_name in AUXILIARY_EXTENSION_DIR_NAMES {
-        let candidate_dir = package_dir.join(dir_name);
-        for candidate in collect_extension_entries_from_dir(&candidate_dir) {
-            if candidate == canonical_primary {
-                continue;
-            }
-            if !is_likely_auxiliary_extension_entry(&candidate) {
-                continue;
-            }
-            if seen.insert(candidate.clone()) {
-                out.push(candidate);
-                if out.len() >= MAX_AUXILIARY_EXAMPLE_ENTRIES {
-                    return out;
-                }
-            }
-        }
-    }
-
-    out
-}
+// Upstream pi-mono expands ONLY entries explicitly declared by an applicable
+// `package.json#pi.extensions` (plus the conventional `extensions/` directory
+// and scoped npm package resolution). The former port-side inference layer —
+// sibling entries, workspace-bundle clustering, auxiliary example scanning,
+// and the flat-entry initializer heuristics — executed unrelated workspace
+// files as extensions and was removed for upstream parity (bd-4bumf; the
+// direction was independently proposed in PR #169 by @CCherry07).
 
 fn read_pi_extensions_from_package(package_json_path: &Path) -> Result<Option<Vec<String>>> {
     if !package_json_path.is_file() {
@@ -12958,16 +12836,6 @@ fn read_pi_extensions_from_package(package_json_path: &Path) -> Result<Option<Ve
     }
 }
 
-fn parse_package_name_from_package(package_json_path: &Path) -> Option<String> {
-    let raw = fs::read_to_string(package_json_path).ok()?;
-    let json = serde_json::from_str::<Value>(&raw).ok()?;
-    json.get("name")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(ToOwned::to_owned)
-}
-
 fn find_package_json_ancestors(mut dir: Option<&Path>) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -13008,48 +12876,12 @@ fn collect_extension_roots_from_paths(paths: &[PathBuf]) -> Vec<PathBuf> {
     roots
 }
 
-fn extract_node_modules_package_name(entry: &str) -> Option<String> {
-    let normalized = entry.replace('\\', "/");
-    let marker = "node_modules/";
-    let start = normalized.find(marker)?;
-    let mut parts = normalized[start + marker.len()..].split('/');
-    let first = parts.next()?;
-    if first.starts_with('@') {
-        let second = parts.next()?;
-        Some(format!("{first}/{second}"))
-    } else {
-        Some(first.to_string())
-    }
-}
-
-fn find_workspace_package_dir_by_name(
-    workspace_root: &Path,
-    package_name: &str,
-) -> Option<PathBuf> {
-    let entries = fs::read_dir(workspace_root).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let package_json = path.join("package.json");
-        if !package_json.is_file() {
-            continue;
-        }
-        if parse_package_name_from_package(&package_json).is_some_and(|name| name == package_name) {
-            return Some(path);
-        }
-    }
-    None
-}
-
 fn resolve_package_declared_entries(
     package_dir: &Path,
     package_entries: &[String],
-) -> Result<Vec<PathBuf>> {
+) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
-    let workspace_root = package_dir.parent();
 
     for raw_entry in package_entries {
         let mut resolved = Vec::new();
@@ -13060,32 +12892,6 @@ fn resolve_package_declared_entries(
             resolved.push(path);
         }
 
-        if resolved.is_empty()
-            && raw_entry.contains("node_modules/")
-            && let Some(workspace_root) = workspace_root
-            && let Some(package_name) = extract_node_modules_package_name(raw_entry)
-            && let Some(workspace_package_dir) =
-                find_workspace_package_dir_by_name(workspace_root, &package_name)
-        {
-            let nested_package_json = workspace_package_dir.join("package.json");
-            match read_pi_extensions_from_package(&nested_package_json)? {
-                Some(nested_entries) if !nested_entries.is_empty() => {
-                    resolved.extend(resolve_package_declared_entries(
-                        &workspace_package_dir,
-                        &nested_entries,
-                    )?);
-                }
-                Some(_) => {}
-                None => {
-                    if let Some(index_path) =
-                        resolve_extension_entry_file(&workspace_package_dir.join("index"))
-                    {
-                        resolved.push(index_path);
-                    }
-                }
-            }
-        }
-
         for path in resolved {
             if seen.insert(path.clone()) {
                 out.push(path);
@@ -13093,126 +12899,7 @@ fn resolve_package_declared_entries(
         }
     }
 
-    Ok(out)
-}
-
-/// True when `dir` explicitly declares itself a multi-package workspace
-/// root: a `package.json` with a `workspaces` field (npm/yarn/bun) or a
-/// `pnpm-workspace.yaml` marker file. Upstream pi never expands discovery
-/// beyond the directory it was pointed at, so inferring workspace-ness for
-/// a *parent* directory is a port-side heuristic that must fail closed: a
-/// self-contained extension package (for example one declaring
-/// `pi.extensions = ["./index.ts"]`) sitting in an arbitrary parent
-/// directory — a corpus tier checkout, `~/projects`, a vendored registry
-/// mirror — must never cause its unrelated siblings to be absorbed into
-/// one bundle. Only a root that opts in with an explicit workspace marker
-/// may donate sibling packages.
-///
-/// Both npm/yarn `workspaces` shapes are recognized: the shorthand array of
-/// globs and the object form, whose member list lives under `packages`
-/// (yarn additionally allows `nohoist`, which declares no members on its
-/// own). A declared-but-empty member list is not a workspace root: there
-/// are no members to donate, so clustering stays off. Malformed JSON fails
-/// open toward "not a workspace" rather than erroring discovery.
-fn is_declared_workspace_root(dir: &Path) -> bool {
-    if dir.join("pnpm-workspace.yaml").is_file() {
-        return true;
-    }
-    let package_json = dir.join("package.json");
-    if !package_json.is_file() {
-        return false;
-    }
-    let Ok(raw) = fs::read_to_string(&package_json) else {
-        return false;
-    };
-    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
-        return false;
-    };
-    match json.get("workspaces") {
-        Some(Value::Array(entries)) => !entries.is_empty(),
-        Some(Value::Object(map)) => map
-            .get("packages")
-            .and_then(Value::as_array)
-            .is_some_and(|packages| !packages.is_empty()),
-        _ => false,
-    }
-}
-
-fn discover_workspace_bundle_entries(package_dir: &Path) -> Result<Vec<PathBuf>> {
-    let Some(workspace_root) = package_dir.parent() else {
-        return Ok(Vec::new());
-    };
-
-    // Never infer a workspace from a lone self-contained child package:
-    // the parent must explicitly declare itself a workspace root.
-    if !is_declared_workspace_root(workspace_root) {
-        tracing::debug!(
-            event = "ext.discovery.bundle.skipped",
-            package_dir = %package_dir.display(),
-            workspace_root = %workspace_root.display(),
-            reason = "parent lacks workspace marker (package.json workspaces / pnpm-workspace.yaml)",
-            "Not clustering sibling packages: parent did not opt in as a workspace root"
-        );
-        return Ok(Vec::new());
-    }
-
-    let mut cluster_dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir(workspace_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                cluster_dirs.push(path);
-            }
-        }
-    }
-    if cluster_dirs.is_empty() || cluster_dirs.len() > MAX_BUNDLE_CLUSTER_DIRS {
-        return Ok(Vec::new());
-    }
-    cluster_dirs.sort();
-
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    for dir in &cluster_dirs {
-        let package_json = dir.join("package.json");
-        let Some(package_entries) = read_pi_extensions_from_package(&package_json)? else {
-            continue;
-        };
-        for path in resolve_package_declared_entries(dir, &package_entries)? {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-    }
-
-    let mut root_files = Vec::new();
-    if let Ok(entries) = fs::read_dir(workspace_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && is_supported_js_extension_entry(&path) {
-                root_files.push(path);
-            }
-        }
-    }
-    root_files.sort();
-    for path in root_files {
-        let canonical = safe_canonicalize(&path);
-        if seen.insert(canonical.clone()) {
-            out.push(canonical);
-        }
-    }
-
-    for dir in cluster_dirs {
-        if dir.join("package.json").is_file() {
-            continue;
-        }
-        for path in collect_extension_entries_from_dir(&dir) {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-    }
-    Ok(out)
+    out
 }
 
 /// True when `dir` follows the independent-extensions auto-discovery
@@ -13226,166 +12913,19 @@ fn is_independent_extensions_root(dir: &Path) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("extensions"))
 }
 
-fn discover_sibling_index_entries(primary: &Path) -> Vec<PathBuf> {
-    let canonical_primary = safe_canonicalize(primary);
-    if primary
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_none_or(|stem| !stem.eq_ignore_ascii_case("index"))
-    {
-        return Vec::new();
-    }
-    let Some(parent_dir) = primary.parent() else {
-        return Vec::new();
-    };
-    let Some(cluster_root) = parent_dir.parent() else {
-        return Vec::new();
-    };
-
-    // Skip sibling-index clustering when the cluster root is a known
-    // auto-discovery root (e.g., ~/.pi/agent/extensions/ or .pi/extensions/).
-    // Subdirectories there are independent extensions, not packages of a
-    // single workspace bundle. Mirrors the equivalent guard in
-    // `discover_sibling_extension_entries`.
-    if is_independent_extensions_root(cluster_root) {
-        return Vec::new();
-    }
-
-    // A sibling-index bundle is only inferred for homogeneous clusters of
-    // bare `<dir>/index.*` directories. When the cluster root or any of
-    // its child directories carries its own package.json, those children
-    // are self-contained packages or unrelated projects living side by
-    // side (a corpus tier checkout, `~/projects`, a registry mirror), not
-    // fragments of one bundle — clustering there would absorb foreign
-    // extensions wholesale. Fail closed and load only the primary.
-    if cluster_root.join("package.json").is_file() {
-        tracing::debug!(
-            event = "ext.discovery.sibling_index.skipped",
-            primary = %primary.display(),
-            cluster_root = %cluster_root.display(),
-            reason = "cluster root carries its own package.json",
-            "Not clustering bare sibling index entries: loading only the primary entry"
-        );
-        return Vec::new();
-    }
-
-    let mut candidate_dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir(cluster_root) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if path.join("package.json").is_file() {
-                    tracing::debug!(
-                        event = "ext.discovery.sibling_index.skipped",
-                        primary = %primary.display(),
-                        cluster_root = %cluster_root.display(),
-                        packaged_sibling = %path.display(),
-                        reason = "cluster contains a self-contained packaged sibling",
-                        "Not clustering bare sibling index entries: loading only the primary entry"
-                    );
-                    return Vec::new();
-                }
-                candidate_dirs.push(path);
-            }
-        }
-    }
-    if candidate_dirs.len() < 2 || candidate_dirs.len() > MAX_BUNDLE_CLUSTER_DIRS {
-        return Vec::new();
-    }
-    candidate_dirs.sort();
-
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    for dir in candidate_dirs {
-        for ext in JS_EXTENSION_ENTRY_EXTS {
-            let candidate = dir.join(format!("index.{ext}"));
-            if let Some(path) = resolve_extension_entry_file(&candidate) {
-                if seen.insert(path.clone()) {
-                    out.push(path);
-                }
-                break;
-            }
-        }
-    }
-
-    if out.len() < 2 || !out.iter().any(|path| path == &canonical_primary) {
-        return Vec::new();
-    }
-    out
-}
-
-fn discover_sibling_extension_entries(primary: &Path) -> Vec<PathBuf> {
-    let canonical_primary = safe_canonicalize(primary);
-    let Some(parent_dir) = primary.parent() else {
-        return Vec::new();
-    };
-
-    // Skip sibling discovery when the parent is a known auto-discovery root
-    // (e.g., ~/.pi/agent/extensions/ or .pi/extensions/). Files in these
-    // directories are independent extensions, not siblings of a single package.
-    if is_independent_extensions_root(parent_dir) {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    let mut seen = BTreeSet::new();
-    let mut sibling_files = Vec::new();
-    let mut sibling_dirs = Vec::new();
-    if let Ok(entries) = fs::read_dir(parent_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && is_supported_js_extension_entry(&path) {
-                sibling_files.push(path);
-                continue;
-            }
-            if !path.is_dir() {
-                continue;
-            }
-            if let Some(index_path) = resolve_extension_entry_file(&path.join("index")) {
-                sibling_dirs.push(index_path);
-            }
-            if let Some(dir_name) = path.file_name().and_then(|name| name.to_str())
-                && let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name))
-            {
-                sibling_dirs.push(named_path);
-            }
-        }
-    }
-    sibling_files.sort();
-    sibling_dirs.sort();
-
-    for path in sibling_files {
-        if !is_likely_flat_extension_entry(&path) {
-            continue;
-        }
-        let canonical = safe_canonicalize(&path);
-        if seen.insert(canonical.clone()) {
-            out.push(canonical);
-        }
-    }
-    for path in sibling_dirs {
-        if seen.insert(path.clone()) {
-            out.push(path);
-        }
-    }
-
-    if out.len() < 2 || !out.iter().any(|path| path == &canonical_primary) {
-        return Vec::new();
-    }
-
-    out
-}
-
+/// Expand a primary entry to its package-declared co-entries, exactly as
+/// upstream pi does: the largest applicable ancestor `package.json` whose
+/// `pi.extensions` list resolves to a set containing the primary donates its
+/// declared entries. Nothing else is ever inferred — no sibling files, no
+/// workspace clustering, no example scanning (bd-4bumf; see the module note
+/// above).
 fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
     let canonical_primary = safe_canonicalize(primary);
     let mut out = vec![canonical_primary.clone()];
     let mut seen = BTreeSet::new();
     let _ = seen.insert(canonical_primary.clone());
 
-    let mut selected_package_dir: Option<PathBuf> = None;
-    let mut selected_package_entries_len = 0usize;
     let mut selected_resolved: Vec<PathBuf> = Vec::new();
-    let mut saw_manifest_extensions = false;
     for package_json in find_package_json_ancestors(primary.parent()) {
         let Some(package_dir) = package_json.parent() else {
             continue;
@@ -13393,68 +12933,18 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
         let Some(package_entries) = read_pi_extensions_from_package(&package_json)? else {
             continue;
         };
-        saw_manifest_extensions = true;
-        let resolved = resolve_package_declared_entries(package_dir, &package_entries)?;
+        let resolved = resolve_package_declared_entries(package_dir, &package_entries);
         if !resolved.contains(&canonical_primary) {
             continue;
         }
         if resolved.len() > selected_resolved.len() {
-            selected_package_dir = Some(package_dir.to_path_buf());
-            selected_package_entries_len = package_entries.len();
             selected_resolved = resolved;
         }
     }
 
-    let has_declared_package_entries = !selected_resolved.is_empty();
-    if has_declared_package_entries {
-        for path in selected_resolved {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-
-        let is_primary_index = canonical_primary
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .is_some_and(|stem| stem.eq_ignore_ascii_case("index"));
-        if selected_package_entries_len == 1
-            && is_primary_index
-            && let Some(package_dir) = selected_package_dir.as_deref()
-        {
-            let bundle_entries = discover_workspace_bundle_entries(package_dir)?;
-            if bundle_entries.len() >= 2
-                && bundle_entries.iter().any(|path| path == &canonical_primary)
-            {
-                for path in bundle_entries {
-                    if seen.insert(path.clone()) {
-                        out.push(path);
-                    }
-                }
-            }
-        }
-    } else if saw_manifest_extensions {
-        return Ok(out);
-    }
-
-    if !has_declared_package_entries {
-        for path in discover_sibling_extension_entries(&canonical_primary) {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-    }
-    if let Some(package_dir) = selected_package_dir.as_deref() {
-        for path in discover_auxiliary_example_entries(package_dir, &canonical_primary) {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
-        }
-    }
-    if !has_declared_package_entries {
-        for path in discover_sibling_index_entries(&canonical_primary) {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
+    for path in selected_resolved {
+        if seen.insert(path.clone()) {
+            out.push(path);
         }
     }
 

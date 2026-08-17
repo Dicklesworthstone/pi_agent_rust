@@ -1,14 +1,14 @@
 {
   "schema": "pi.ext.health_delta.v1",
-  "generated_at": "2026-08-17T14:34:55.821Z",
+  "generated_at": "2026-08-17T17:05:27.000Z",
   "baseline_path": "/Users/jemanuel/projects/pi_agent_rust/.claude/worktrees/fsqlite-cutover/tests/ext_conformance/reports/conformance_baseline.json",
   "baseline_date": "2026-08-04T03:26:54Z",
   "current_summary": {
     "excluded": 1,
-    "failed": 8,
+    "failed": 10,
     "manifest_count": 227,
-    "pass_rate_pct": 96.46017699115043,
-    "passed": 218,
+    "pass_rate_pct": 95.57522123893806,
+    "passed": 216,
     "skipped": 1,
     "tested": 226
   },
@@ -19,10 +19,10 @@
     "tested": 223
   },
   "aggregate_delta": {
-    "fail_delta": 8,
+    "fail_delta": 10,
     "net_change": 0,
-    "pass_delta": -5,
-    "rate_delta_pct": -3.5398230088495666
+    "pass_delta": -7,
+    "rate_delta_pct": -4.424778761061944
   },
   "regressions": [],
   "fixes": [],
@@ -667,8 +667,9 @@
     {
       "id": "npm/marckrenn-pi-sub-bar",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'npm/marckrenn-pi-sub-bar': runtime commands identities differ from the manifest; missing declared identities=[\"sub-core:settings\"], unexpected runtime identities=[], expected={\"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\"}, actual={\"sub-bar:import\", \"sub-bar:settings\"}"
     },
     {
       "id": "npm/marckrenn-pi-sub-core",
@@ -1262,8 +1263,9 @@
     {
       "id": "third-party/marckrenn-pi-sub",
       "tier": 3,
-      "delta_type": "new_pass",
-      "current_status": "pass"
+      "delta_type": "new_failure",
+      "current_status": "fail",
+      "failure_reason": "Extension 'third-party/marckrenn-pi-sub': runtime commands identities differ from the manifest; missing declared identities=[\"sub-core:settings\"], unexpected runtime identities=[], expected={\"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\"}, actual={\"sub-bar:import\", \"sub-bar:settings\"}"
     },
     {
       "id": "third-party/michalvavra-agents",

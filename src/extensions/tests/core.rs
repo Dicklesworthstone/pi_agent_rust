@@ -417,69 +417,24 @@ fn read_pi_extensions_errors_on_empty_string_entries() {
 }
 
 #[test]
-fn discover_sibling_index_entries_keeps_primary_even_when_not_sorted_first() {
+fn discover_related_never_clusters_bare_sibling_index_dirs() {
+    // Upstream parity (bd-4bumf): sibling `<dir>/index.*` clusters are never
+    // inferred as one bundle, regardless of cluster shape or size.
     let temp = tempdir().expect("tempdir");
     let cluster = temp.path().join("bundle");
-    let dir_a = cluster.join("a-ext");
-    let dir_b = cluster.join("b-ext");
-    let dir_c = cluster.join("c-ext");
-    std::fs::create_dir_all(&dir_a).expect("mkdir a-ext");
-    std::fs::create_dir_all(&dir_b).expect("mkdir b-ext");
-    std::fs::create_dir_all(&dir_c).expect("mkdir c-ext");
-
-    let a_index = dir_a.join("index.ts");
-    let b_index = dir_b.join("index.ts");
-    let c_index = dir_c.join("index.ts");
-    std::fs::write(&a_index, "export default {};\n").expect("write a index");
-    std::fs::write(&b_index, "export default {};\n").expect("write b index");
-    std::fs::write(&c_index, "export default {};\n").expect("write c index");
-
-    let discovered = discover_sibling_index_entries(&b_index);
-    assert_eq!(discovered.len(), 3);
-    assert!(discovered.contains(&safe_canonicalize(&a_index)));
-    assert!(discovered.contains(&safe_canonicalize(&b_index)));
-    assert!(discovered.contains(&safe_canonicalize(&c_index)));
-}
-
-#[test]
-fn discover_sibling_index_entries_skips_auto_discovery_extensions_root() {
-    let temp = tempdir().expect("tempdir");
-    let extensions_root = temp.path().join("extensions");
-    for id in ["alpha", "beta", "gamma"] {
-        let dir = extensions_root.join(id);
-        std::fs::create_dir_all(&dir).expect("mkdir extension dir");
+    for id in ["a-ext", "b-ext", "c-ext"] {
+        let dir = cluster.join(id);
+        std::fs::create_dir_all(&dir).expect("mkdir sibling dir");
         std::fs::write(dir.join("index.ts"), "export default {};\n").expect("write index");
     }
 
-    let primary = extensions_root.join("beta").join("index.ts");
-    let discovered = discover_sibling_index_entries(&primary);
-    assert!(
-        discovered.is_empty(),
-        "independent extensions under an auto-discovery extensions root must not be clustered as a bundle: {discovered:?}"
-    );
-}
-
-#[test]
-fn discover_sibling_index_entries_ignores_huge_parent_clusters() {
-    let temp = tempdir().expect("tempdir");
-    let cluster = temp.path().join("bundle");
-    std::fs::create_dir_all(&cluster).expect("mkdir bundle");
-
-    let primary_dir = cluster.join("pkg-00");
-    std::fs::create_dir_all(&primary_dir).expect("mkdir primary dir");
-    let primary = primary_dir.join("index.ts");
-    std::fs::write(&primary, "export default {};\n").expect("write primary");
-
-    for idx in 1..=MAX_BUNDLE_CLUSTER_DIRS {
-        let dir = cluster.join(format!("pkg-{idx:02}"));
-        std::fs::create_dir_all(&dir).expect("mkdir sibling dir");
-        std::fs::write(dir.join("index.ts"), "export default {};\n").expect("write sibling index");
-    }
-
-    let discovered = discover_sibling_index_entries(&primary);
-    assert!(
-        discovered.is_empty(),
-        "large clusters should not trigger sibling index expansion"
+    let primary = cluster.join("b-ext").join("index.ts");
+    let discovered =
+        discover_related_extension_entries(&primary).expect("discover related entries");
+    assert_eq!(
+        discovered,
+        vec![safe_canonicalize(&primary)],
+        "bare sibling index dirs must never be absorbed into a bundle"
     );
 }
 
@@ -590,95 +545,35 @@ fn discover_related_extension_entries_prefers_ancestor_bundle_with_more_entries(
 }
 
 #[test]
-fn discover_related_extension_entries_includes_flat_siblings_without_manifest() {
+fn discover_related_never_infers_flat_sibling_entries() {
+    // Upstream parity (bd-4bumf): without a `package.json#pi.extensions`
+    // manifest, sibling files are never absorbed — no matter how much they
+    // look like extensions (default/named/object initializers, register
+    // calls). Only the primary loads.
     let temp = tempdir().expect("tempdir");
     let root = temp.path().join("flat");
     std::fs::create_dir_all(&root).expect("mkdir flat");
 
     let a = root.join("a.ts");
-    let b = root.join("b.ts");
     std::fs::write(&a, "export default function initA(_pi) {}\n").expect("write a");
-    std::fs::write(&b, "export default function initB(_pi) {}\n").expect("write b");
+    for (name, body) in [
+        ("b.ts", "export default function initB(_pi) {}\n"),
+        ("c.ts", "export async function activate(_pi) {}\n"),
+        (
+            "d.ts",
+            "export default { initialize: async (_pi) => {} };\n",
+        ),
+        ("e.ts", "pi.registerCommand(\"e\", {});\n"),
+    ] {
+        std::fs::write(root.join(name), body).expect("write sibling");
+    }
 
-    let discovered = discover_related_extension_entries(&a).expect("discover flat sibling entries");
-    assert_eq!(discovered.len(), 2);
-    assert!(discovered.contains(&safe_canonicalize(&a)));
-    assert!(discovered.contains(&safe_canonicalize(&b)));
-}
-
-#[test]
-fn discover_related_extension_entries_includes_named_initializer_siblings() {
-    let temp = tempdir().expect("tempdir");
-    let root = temp.path().join("named-init");
-    std::fs::create_dir_all(&root).expect("mkdir named-init");
-
-    let alpha = root.join("alpha.ts");
-    let beta = root.join("beta.ts");
-    std::fs::write(&alpha, "export async function activate(_pi) {}\n").expect("write alpha");
-    std::fs::write(&beta, "export function initialize(_pi) {}\n").expect("write beta");
-
-    let discovered =
-        discover_related_extension_entries(&alpha).expect("discover named initializer");
-    assert_eq!(discovered.len(), 2);
-    assert!(discovered.contains(&safe_canonicalize(&alpha)));
-    assert!(discovered.contains(&safe_canonicalize(&beta)));
-}
-
-#[test]
-fn discover_related_extension_entries_includes_default_object_initializer_siblings() {
-    let temp = tempdir().expect("tempdir");
-    let root = temp.path().join("default-object");
-    std::fs::create_dir_all(&root).expect("mkdir default-object");
-
-    let alpha = root.join("alpha.ts");
-    let beta = root.join("beta.ts");
-    std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
-    std::fs::write(&beta, "export default { initialize: async (_pi) => {} };\n")
-        .expect("write beta");
-
-    let discovered = discover_related_extension_entries(&alpha).expect("discover default object");
-    assert_eq!(discovered.len(), 2);
-    assert!(discovered.contains(&safe_canonicalize(&alpha)));
-    assert!(discovered.contains(&safe_canonicalize(&beta)));
-}
-
-#[test]
-fn discover_related_extension_entries_includes_quoted_default_object_initializer_siblings() {
-    let temp = tempdir().expect("tempdir");
-    let root = temp.path().join("quoted-default-object");
-    std::fs::create_dir_all(&root).expect("mkdir quoted-default-object");
-
-    let alpha = root.join("alpha.ts");
-    let beta = root.join("beta.ts");
-    std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
-    std::fs::write(
-        &beta,
-        "export default { \"initialize\": async (_pi) => {} };\n",
-    )
-    .expect("write beta");
-
-    let discovered = discover_related_extension_entries(&alpha).expect("discover quoted object");
-    assert_eq!(discovered.len(), 2);
-    assert!(discovered.contains(&safe_canonicalize(&alpha)));
-    assert!(discovered.contains(&safe_canonicalize(&beta)));
-}
-
-#[test]
-fn discover_related_extension_entries_includes_quoted_default_object_method_siblings() {
-    let temp = tempdir().expect("tempdir");
-    let root = temp.path().join("quoted-default-method");
-    std::fs::create_dir_all(&root).expect("mkdir quoted-default-method");
-
-    let alpha = root.join("alpha.ts");
-    let beta = root.join("beta.ts");
-    std::fs::write(&alpha, "export default { activate(_pi) {} };\n").expect("write alpha");
-    std::fs::write(&beta, "export default { \"initialize\"(_pi) {} };\n").expect("write beta");
-
-    let discovered =
-        discover_related_extension_entries(&alpha).expect("discover quoted object method");
-    assert_eq!(discovered.len(), 2);
-    assert!(discovered.contains(&safe_canonicalize(&alpha)));
-    assert!(discovered.contains(&safe_canonicalize(&beta)));
+    let discovered = discover_related_extension_entries(&a).expect("discover related entries");
+    assert_eq!(
+        discovered,
+        vec![safe_canonicalize(&a)],
+        "flat siblings must never be inferred as co-entries"
+    );
 }
 
 #[test]
@@ -835,7 +730,10 @@ fn discover_related_extension_entries_errors_on_empty_string_manifest_entry() {
 }
 
 #[test]
-fn discover_related_extension_entries_includes_likely_example_extension_entries() {
+fn discover_related_never_scans_example_dirs_beyond_the_manifest() {
+    // Upstream parity (bd-4bumf): a package manifest declares the COMPLETE
+    // entry set. Example/demo directories are never scanned for additional
+    // entrypoints, however extension-like their contents look.
     let temp = tempdir().expect("tempdir");
     let package_dir = temp.path().join("pkg");
     let extensions_dir = package_dir.join("extensions");
@@ -851,78 +749,20 @@ fn discover_related_extension_entries_includes_likely_example_extension_entries(
 
     let primary = extensions_dir.join("main.ts");
     let example_entry = examples_dir.join("test-extension.ts");
-    let helper = examples_dir.join("helper.ts");
-
     std::fs::write(&primary, "export default {};\n").expect("write primary");
     std::fs::write(
         &example_entry,
         "export default function (pi) { pi.registerCommand('demo', { handler() {} }); }\n",
     )
     .expect("write example entry");
-    std::fs::write(&helper, "export const helper = true;\n").expect("write helper");
 
     let discovered =
-        discover_related_extension_entries(&primary).expect("discover example entries");
-    assert!(discovered.contains(&safe_canonicalize(&primary)));
-    assert!(discovered.contains(&safe_canonicalize(&example_entry)));
-    assert!(
-        !discovered.contains(&safe_canonicalize(&helper)),
-        "non-extension helper files in examples should be ignored"
+        discover_related_extension_entries(&primary).expect("discover related entries");
+    assert_eq!(
+        discovered,
+        vec![safe_canonicalize(&primary)],
+        "examples/ must never donate inferred entrypoints"
     );
-}
-
-#[test]
-fn discover_related_extension_entries_includes_sibling_index_when_helper_files_exist() {
-    let temp = tempdir().expect("tempdir");
-    let cluster = temp.path().join("bundle");
-    let a_dir = cluster.join("a-ext");
-    let b_dir = cluster.join("b-ext");
-    std::fs::create_dir_all(&a_dir).expect("mkdir a-ext");
-    std::fs::create_dir_all(&b_dir).expect("mkdir b-ext");
-
-    let a_index = a_dir.join("index.ts");
-    let a_helper = a_dir.join("helper.ts");
-    let b_index = b_dir.join("index.ts");
-    std::fs::write(&a_index, "export default {};\n").expect("write a index");
-    std::fs::write(&a_helper, "export const helper = true;\n").expect("write a helper");
-    std::fs::write(&b_index, "export default {};\n").expect("write b index");
-
-    let discovered =
-        discover_related_extension_entries(&a_index).expect("discover sibling indexes");
-    assert!(discovered.contains(&safe_canonicalize(&a_index)));
-    assert!(
-        !discovered.contains(&safe_canonicalize(&a_helper)),
-        "plain helper modules should not become synthetic extension entrypoints"
-    );
-    assert!(
-        discovered.contains(&safe_canonicalize(&b_index)),
-        "sibling index entries should still be included when local helpers are present"
-    );
-}
-
-#[test]
-fn discover_workspace_bundle_entries_ignores_huge_parent_clusters() {
-    let temp = tempdir().expect("tempdir");
-    let cluster = temp.path().join("cluster");
-    std::fs::create_dir_all(&cluster).expect("mkdir cluster");
-    let package_dir = cluster.join("pkg-00");
-    std::fs::create_dir_all(&package_dir).expect("mkdir package dir");
-
-    for idx in 0..=MAX_BUNDLE_CLUSTER_DIRS {
-        let dir = cluster.join(format!("pkg-{idx:02}"));
-        std::fs::create_dir_all(&dir).expect("mkdir sibling package");
-        let entry = dir.join("index.ts");
-        std::fs::write(&entry, "export default {};\n").expect("write sibling entry");
-        std::fs::write(
-            dir.join("package.json"),
-            r#"{ "pi": { "extensions": ["./index.ts"] } }"#,
-        )
-        .expect("write sibling package");
-    }
-
-    let discovered =
-        discover_workspace_bundle_entries(&package_dir).expect("discover workspace bundle");
-    assert!(discovered.is_empty());
 }
 
 #[test]
@@ -958,12 +798,6 @@ fn workspace_bundle_requires_declared_workspace_marker_at_root() {
     std::fs::write(foreign_bare.join("index.ts"), "export default {};\n")
         .expect("write bare foreign index");
 
-    let bundle = discover_workspace_bundle_entries(&package_dir).expect("discover bundle");
-    assert!(
-        bundle.is_empty(),
-        "a parent without a workspace marker must not be treated as a bundle root: {bundle:?}"
-    );
-
     let discovered = discover_related_extension_entries(&primary).expect("discover related");
     assert_eq!(
         discovered,
@@ -973,7 +807,7 @@ fn workspace_bundle_requires_declared_workspace_marker_at_root() {
 }
 
 #[test]
-fn workspace_bundle_expands_when_root_declares_workspaces() {
+fn workspace_bundle_never_expands_even_when_root_declares_workspaces() {
     let temp = tempdir().expect("tempdir");
     let workspace_root = temp.path().join("monorepo");
     let package_dir = workspace_root.join("primary-ext");
@@ -1004,10 +838,10 @@ fn workspace_bundle_expands_when_root_declares_workspaces() {
     .expect("write sibling package.json");
 
     let discovered = discover_related_extension_entries(&primary).expect("discover related");
-    assert!(discovered.contains(&safe_canonicalize(&primary)));
-    assert!(
-        discovered.contains(&safe_canonicalize(&sibling)),
-        "a declared workspace root must still bundle sibling packages: {discovered:?}"
+    assert_eq!(
+        discovered,
+        vec![safe_canonicalize(&primary)],
+        "upstream parity (bd-4bumf): even a declared workspace root never donates sibling packages — each package's manifest governs exactly its own entries: {discovered:?}"
     );
 }
 
@@ -1038,12 +872,6 @@ fn discover_sibling_index_entries_skips_clusters_containing_packaged_siblings() 
     )
     .expect("write packaged sibling package.json");
 
-    let discovered = discover_sibling_index_entries(&primary);
-    assert!(
-        discovered.is_empty(),
-        "a cluster containing self-contained packages must not be inferred as a bundle: {discovered:?}"
-    );
-
     let related = discover_related_extension_entries(&primary).expect("discover related");
     assert_eq!(
         related,
@@ -1053,7 +881,7 @@ fn discover_sibling_index_entries_skips_clusters_containing_packaged_siblings() 
 }
 
 #[test]
-fn discover_sibling_index_entries_skips_cluster_root_with_package_json() {
+fn discover_related_keeps_project_subdirs_independent_under_project_root() {
     let temp = tempdir().expect("tempdir");
     let cluster = temp.path().join("some-project");
     let dir_a = cluster.join("a-ext");
@@ -1071,10 +899,11 @@ fn discover_sibling_index_entries_skips_cluster_root_with_package_json() {
     std::fs::write(&a_index, "export default {};\n").expect("write a index");
     std::fs::write(&b_index, "export default {};\n").expect("write b index");
 
-    let discovered = discover_sibling_index_entries(&a_index);
-    assert!(
-        discovered.is_empty(),
-        "a cluster root owning a package.json is a project, not a bare bundle: {discovered:?}"
+    let discovered = discover_related_extension_entries(&a_index).expect("discover related");
+    assert_eq!(
+        discovered,
+        vec![safe_canonicalize(&a_index)],
+        "subdirectories of a project root must never be clustered: {discovered:?}"
     );
 }
 
@@ -1107,93 +936,39 @@ fn write_two_package_workspace(workspace_root: &Path) -> (PathBuf, PathBuf) {
 }
 
 #[test]
-fn workspace_bundle_accepts_pnpm_workspace_marker() {
-    let temp = tempdir().expect("tempdir");
-    let workspace_root = temp.path().join("pnpm-monorepo");
-    std::fs::create_dir_all(&workspace_root).expect("mkdir root");
-    let (primary, sibling) = write_two_package_workspace(&workspace_root);
-    std::fs::write(
-        workspace_root.join("pnpm-workspace.yaml"),
-        "packages:\n  - \"*\"\n",
-    )
-    .expect("write pnpm-workspace.yaml");
-
-    assert!(is_declared_workspace_root(&workspace_root));
-    let discovered = discover_related_extension_entries(&primary).expect("discover related");
-    assert!(
-        discovered.contains(&safe_canonicalize(&sibling)),
-        "a pnpm-workspace.yaml marker must allow sibling bundling: {discovered:?}"
-    );
-}
-
-#[test]
-fn workspace_bundle_accepts_object_form_workspaces_packages() {
-    let temp = tempdir().expect("tempdir");
-    let workspace_root = temp.path().join("object-monorepo");
-    std::fs::create_dir_all(&workspace_root).expect("mkdir root");
-    let (primary, sibling) = write_two_package_workspace(&workspace_root);
-    std::fs::write(
-        workspace_root.join("package.json"),
-        r#"{ "name": "monorepo", "workspaces": { "packages": ["primary-ext", "sibling-ext"] } }"#,
-    )
-    .expect("write workspace package.json");
-
-    assert!(is_declared_workspace_root(&workspace_root));
-    let discovered = discover_related_extension_entries(&primary).expect("discover related");
-    assert!(
-        discovered.contains(&safe_canonicalize(&sibling)),
-        "the yarn/npm object `workspaces.packages` form must allow bundling: {discovered:?}"
-    );
-}
-
-#[test]
-fn workspace_bundle_rejects_memberless_or_malformed_workspace_declarations() {
-    let cases: [(&str, &str); 3] = [
-        ("empty-array", r#"{ "workspaces": [] }"#),
+fn workspace_markers_never_enable_sibling_bundling() {
+    // Upstream parity (bd-4bumf): no workspace marker of any dialect —
+    // pnpm-workspace.yaml, npm/yarn `workspaces` array, or the object
+    // `workspaces.packages` form — turns sibling packages into one bundle.
+    let marker_cases: [(&str, &str, &str); 3] = [
+        ("pnpm", "pnpm-workspace.yaml", "packages:\n  - \"*\"\n"),
         (
-            "object-without-packages",
-            r#"{ "workspaces": { "nohoist": ["**/react-native"] } }"#,
+            "npm-array",
+            "package.json",
+            r#"{ "name": "monorepo", "workspaces": ["primary-ext", "sibling-ext"] }"#,
         ),
         (
-            "object-empty-packages",
-            r#"{ "workspaces": { "packages": [] } }"#,
+            "object-packages",
+            "package.json",
+            r#"{ "name": "monorepo", "workspaces": { "packages": ["primary-ext", "sibling-ext"] } }"#,
         ),
     ];
 
-    for (label, root_manifest) in cases {
+    for (label, marker_file, marker_body) in marker_cases {
         let temp = tempdir().expect("tempdir");
         let workspace_root = temp.path().join(label);
         std::fs::create_dir_all(&workspace_root).expect("mkdir root");
         let (primary, _sibling) = write_two_package_workspace(&workspace_root);
-        std::fs::write(workspace_root.join("package.json"), root_manifest)
-            .expect("write workspace package.json");
+        std::fs::write(workspace_root.join(marker_file), marker_body)
+            .expect("write workspace marker");
 
-        assert!(
-            !is_declared_workspace_root(&workspace_root),
-            "case {label}: a member-less workspaces declaration must not opt in"
-        );
-        let discovered = discover_related_extension_entries(&primary)
-            .unwrap_or_else(|err| panic!("case {label}: discovery must fail open, got: {err}"));
+        let discovered = discover_related_extension_entries(&primary).expect("discover related");
         assert_eq!(
             discovered,
             vec![safe_canonicalize(&primary)],
-            "case {label}: without workspace members only the primary entry may load"
+            "case {label}: workspace markers must not donate sibling packages: {discovered:?}"
         );
     }
-
-    // A malformed root manifest must fail open at the workspace-marker
-    // check itself (never treat unreadable JSON as an opt-in). Full
-    // discovery separately fails closed on malformed ancestor manifests,
-    // covered by `discover_related_extension_entries_errors_on_malformed_package_manifest`.
-    let temp = tempdir().expect("tempdir");
-    let workspace_root = temp.path().join("malformed-json");
-    std::fs::create_dir_all(&workspace_root).expect("mkdir root");
-    std::fs::write(workspace_root.join("package.json"), r#"{ "workspaces": ["#)
-        .expect("write malformed package.json");
-    assert!(
-        !is_declared_workspace_root(&workspace_root),
-        "malformed package.json must not be treated as a workspace opt-in"
-    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2944,6 +2719,14 @@ fn multi_entry_loader_fails_closed_on_failing_non_primary_entrypoints() {
         let failing_dir = bundle_root.join("b-failing");
         std::fs::create_dir_all(&primary_dir).expect("mkdir primary");
         std::fs::create_dir_all(&failing_dir).expect("mkdir failing");
+        // Both entries are declared by the package manifest: sibling
+        // inference no longer exists (bd-4bumf), and fail-closed multi-entry
+        // loading is a property of manifest-declared bundles.
+        std::fs::write(
+            bundle_root.join("package.json"),
+            r#"{ "pi": { "extensions": ["./a-primary/index.ts", "./b-failing/index.ts"] } }"#,
+        )
+        .expect("write bundle package.json");
 
         let primary_entry = primary_dir.join("index.ts");
         std::fs::write(
