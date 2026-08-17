@@ -100,12 +100,12 @@ fn env_key(keys: &[&str]) -> Option<String> {
 
 // === Paid/keyed rungs ===
 
-fn perplexity_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    key: Option<&str>,
-) -> RungFuture {
+fn perplexity_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
     let body = json!({
         "model": "sonar",
         "messages": [{"role": "user", "content": with_site(query, filters)}],
@@ -166,12 +166,12 @@ fn perplexity_run(
     })
 }
 
-fn brave_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    key: Option<&str>,
-) -> RungFuture {
+fn brave_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let url = format!(
         "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
@@ -225,12 +225,12 @@ fn brave_run(
     })
 }
 
-fn tavily_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    key: Option<&str>,
-) -> RungFuture {
+fn tavily_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let limit = filters.limit.min(20);
     let body = json!({
@@ -288,12 +288,12 @@ fn tavily_run(
     })
 }
 
-fn exa_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    key: Option<&str>,
-) -> RungFuture {
+fn exa_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let limit = filters.limit.min(25);
     let body = json!({
@@ -350,12 +350,12 @@ fn exa_run(
     })
 }
 
-fn jina_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    key: Option<&str>,
-) -> RungFuture {
+fn jina_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let url = format!("https://s.jina.ai/{}", urlencoded(&with_site(query, filters)));
     Box::pin(async move {
@@ -405,12 +405,12 @@ fn jina_run(
     })
 }
 
-fn kagi_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    key: Option<&str>,
-) -> RungFuture {
+fn kagi_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    key: Option<&'a str>,
+) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let url = format!(
         "https://kagi.com/api/v0/search?q={}&limit={}",
@@ -468,12 +468,12 @@ fn kagi_run(
 
 // === Keyless public rungs (HTML scrapers; defensive, parse-what-you-can) ===
 
-fn duckduckgo_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    _key: Option<&str>,
-) -> RungFuture {
+fn duckduckgo_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    _key: Option<&'a str>,
+) -> RungFuture<'a> {
     let url = format!(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoded(&with_site(query, filters))
@@ -522,12 +522,12 @@ fn duckduckgo_run(
     })
 }
 
-fn startpage_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    _key: Option<&str>,
-) -> RungFuture {
+fn startpage_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    _key: Option<&'a str>,
+) -> RungFuture<'a> {
     let url = format!(
         "https://www.startpage.com/sp/search?query={}",
         urlencoded(&with_site(query, filters))
@@ -574,12 +574,12 @@ fn startpage_run(
     })
 }
 
-fn mojeek_run(
-    client: &crate::http::client::Client,
-    query: &str,
-    filters: &SearchFilters,
-    _key: Option<&str>,
-) -> RungFuture {
+fn mojeek_run<'a>(
+    client: &'a crate::http::client::Client,
+    query: &'a str,
+    filters: &'a SearchFilters,
+    _key: Option<&'a str>,
+) -> RungFuture<'a> {
     let url = format!(
         "https://www.mojeek.com/search?q={}",
         urlencoded(&with_site(query, filters))
@@ -627,18 +627,67 @@ fn mojeek_run(
 }
 
 /// The rung table. Order in the chain comes from DEFAULT_CHAIN.
+#[allow(clippy::type_complexity)]
 pub fn all_rungs() -> HashMap<&'static str, ProviderRung> {
-    HashMap::from([
-        rung("perplexity", &["PERPLEXITY_API_KEY"], false, perplexity_run),
-        rung("brave", &["BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"], false, brave_run),
-        rung("tavily", &["TAVILY_API_KEY"], false, tavily_run),
-        rung("exa", &["EXA_API_KEY"], false, exa_run),
-        rung("jina", &["JINA_API_KEY"], false, jina_run),
-        rung("kagi", &["KAGI_API_KEY"], false, kagi_run),
-        rung("duckduckgo", &[], true, duckduckgo_run),
-        rung("startpage", &[], true, startpage_run),
-        rung("mojeek", &[], true, mojeek_run),
-    ])
+    let mut map = HashMap::new();
+    let mut add = |rung: ProviderRung| {
+        map.insert(rung.name, rung);
+    };
+    add(ProviderRung {
+        name: "perplexity",
+        env_keys: &["PERPLEXITY_API_KEY"],
+        keyless: false,
+        run: perplexity_run,
+    });
+    add(ProviderRung {
+        name: "brave",
+        env_keys: &["BRAVE_API_KEY", "BRAVE_SEARCH_API_KEY"],
+        keyless: false,
+        run: brave_run,
+    });
+    add(ProviderRung {
+        name: "tavily",
+        env_keys: &["TAVILY_API_KEY"],
+        keyless: false,
+        run: tavily_run,
+    });
+    add(ProviderRung {
+        name: "exa",
+        env_keys: &["EXA_API_KEY"],
+        keyless: false,
+        run: exa_run,
+    });
+    add(ProviderRung {
+        name: "jina",
+        env_keys: &["JINA_API_KEY"],
+        keyless: false,
+        run: jina_run,
+    });
+    add(ProviderRung {
+        name: "kagi",
+        env_keys: &["KAGI_API_KEY"],
+        keyless: false,
+        run: kagi_run,
+    });
+    add(ProviderRung {
+        name: "duckduckgo",
+        env_keys: &[],
+        keyless: true,
+        run: duckduckgo_run,
+    });
+    add(ProviderRung {
+        name: "startpage",
+        env_keys: &[],
+        keyless: true,
+        run: startpage_run,
+    });
+    add(ProviderRung {
+        name: "mojeek",
+        env_keys: &[],
+        keyless: true,
+        run: mojeek_run,
+    });
+    map
 }
 
 #[allow(clippy::type_complexity)]
@@ -660,12 +709,12 @@ const fn rung(
 
 /// Circuit-breaker state per rung (process-local; cheap and honest).
 static CIRCUIT_FAILURES: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<&'static str, (u32, std::time::Instant)>>,
+    std::sync::Mutex<HashMap<String, (u32, std::time::Instant)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 const CIRCUIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
 
-fn rung_available(name: &'static str) -> bool {
+fn rung_available(name: &str) -> bool {
     let Ok(map) = CIRCUIT_FAILURES.lock() else { return true };
     match map.get(name) {
         Some((count, since)) if *count >= 2 => since.elapsed() >= CIRCUIT_COOLDOWN,
@@ -673,15 +722,15 @@ fn rung_available(name: &'static str) -> bool {
     }
 }
 
-fn rung_report_failure(name: &'static str) {
+fn rung_report_failure(name: &str) {
     if let Ok(mut map) = CIRCUIT_FAILURES.lock() {
-        let entry = map.entry(name).or_insert((0, std::time::Instant::now()));
+        let entry = map.entry(name.to_string()).or_insert((0, std::time::Instant::now()));
         entry.0 += 1;
         entry.1 = std::time::Instant::now();
     }
 }
 
-fn rung_report_success(name: &'static str) {
+fn rung_report_success(name: &str) {
     if let Ok(mut map) = CIRCUIT_FAILURES.lock() {
         map.remove(name);
     }
