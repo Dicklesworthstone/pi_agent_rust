@@ -98,6 +98,18 @@ fn env_key(keys: &[&str]) -> Option<String> {
     })
 }
 
+/// Base-URL override per rung (bd-cv653.2.1): `PI_WEBSEARCH_BASE_<NAME>`
+/// redirects a provider's endpoint — used by the e2e harness to point rungs
+/// at a loopback mock, and by operators routing through a proxy.
+fn base_url_for(name: &str, default: &str) -> String {
+    let var = format!("PI_WEBSEARCH_BASE_{}", name.to_ascii_uppercase());
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 // === Paid/keyed rungs ===
 
 fn perplexity_run<'a>(
@@ -174,7 +186,8 @@ fn brave_run<'a>(
 ) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let url = format!(
-        "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
+        "{}/res/v1/web/search?q={}&count={}",
+        base_url_for("brave", "https://api.search.brave.com"),
         urlencoded(&with_site(query, filters)),
         filters.limit.min(20)
     );
@@ -357,7 +370,11 @@ fn jina_run<'a>(
     key: Option<&'a str>,
 ) -> RungFuture<'a> {
     let key = key.map(str::to_string);
-    let url = format!("https://s.jina.ai/{}", urlencoded(&with_site(query, filters)));
+    let url = format!(
+        "{}/{}",
+        base_url_for("jina", "https://s.jina.ai"),
+        urlencoded(&with_site(query, filters))
+    );
     Box::pin(async move {
         let Some(key) = key else { return Err(RungError::NoKey) };
         let response = client
@@ -413,7 +430,8 @@ fn kagi_run<'a>(
 ) -> RungFuture<'a> {
     let key = key.map(str::to_string);
     let url = format!(
-        "https://kagi.com/api/v0/search?q={}&limit={}",
+        "{}/api/v0/search?q={}&limit={}",
+        base_url_for("kagi", "https://kagi.com"),
         urlencoded(&with_site(query, filters)),
         filters.limit.min(25)
     );
@@ -475,7 +493,8 @@ fn duckduckgo_run<'a>(
     _key: Option<&'a str>,
 ) -> RungFuture<'a> {
     let url = format!(
-        "https://html.duckduckgo.com/html/?q={}",
+        "{}/html/?q={}",
+        base_url_for("duckduckgo", "https://html.duckduckgo.com"),
         urlencoded(&with_site(query, filters))
     );
     Box::pin(async move {
@@ -529,7 +548,8 @@ fn startpage_run<'a>(
     _key: Option<&'a str>,
 ) -> RungFuture<'a> {
     let url = format!(
-        "https://www.startpage.com/sp/search?query={}",
+        "{}/sp/search?query={}",
+        base_url_for("startpage", "https://www.startpage.com"),
         urlencoded(&with_site(query, filters))
     );
     Box::pin(async move {
@@ -581,7 +601,8 @@ fn mojeek_run<'a>(
     _key: Option<&'a str>,
 ) -> RungFuture<'a> {
     let url = format!(
-        "https://www.mojeek.com/search?q={}",
+        "{}/search?q={}",
+        base_url_for("mojeek", "https://www.mojeek.com"),
         urlencoded(&with_site(query, filters))
     );
     Box::pin(async move {
