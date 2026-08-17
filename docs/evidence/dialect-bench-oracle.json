@@ -1,0 +1,75 @@
+{
+  "bead": "bd-cv653.7.8",
+  "rows": [
+    {
+      "case": "xmlish_tool_call_tag",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tp"
+    },
+    {
+      "case": "fenced_json_block",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tp"
+    },
+    {
+      "case": "bare_json_object",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tp"
+    },
+    {
+      "case": "tool_name_tag",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tp"
+    },
+    {
+      "case": "prose_around_object_no_extract",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tn"
+    },
+    {
+      "case": "rust_fence_example_no_extract",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tn"
+    },
+    {
+      "case": "unknown_tool_no_extract",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tn"
+    },
+    {
+      "case": "non_object_args_no_extract",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tn"
+    },
+    {
+      "case": "plain_prose_no_extract",
+      "dialect": "xmlish",
+      "ok": true,
+      "verdict": "tn"
+    },
+    {
+      "case": "native_dialect_untouched",
+      "dialect": "native",
+      "ok": true,
+      "verdict": "tn"
+    }
+  ],
+  "schema": "pi.dialect_bench.v1",
+  "totals": {
+    "cases": 10,
+    "false_positive_rate": 0.0,
+    "false_positives": 0,
+    "first_attempt_apply_rate": 1.0,
+    "misses": 0,
+    "true_negatives": 6,
+    "true_positives": 4
+  }
+}

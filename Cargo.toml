@@ -71,6 +71,10 @@ name = "basic_sdk"
 path = "examples/basic_sdk.rs"
 
 [[example]]
+name = "dialect_bench"
+path = "examples/dialect_bench.rs"
+
+[[example]]
 name = "ext_artifact_manifest"
 path = "examples/ext_artifact_manifest.rs"
 
