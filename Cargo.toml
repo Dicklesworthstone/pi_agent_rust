@@ -135,6 +135,11 @@ name = "ext_workloads"
 path = "examples/ext_workloads.rs"
 
 [[example]]
+name = "ftui_preview"
+path = "examples/ftui_preview.rs"
+required-features = ["ftui"]
+
+[[example]]
 name = "pi_debug"
 path = "examples/pi_debug.rs"
 
@@ -209,8 +214,9 @@ arboard = { version = "3.6.1", optional = true }
 # FrankenTUI migration target (bd-cv653.9.1). Coexists with the charmed_rust
 # stack behind the default-OFF `ftui` feature while the interactive runtime is
 # ported module by module; the bubbletea stack is deleted at cutover.
-# runtime-only features for now — widget/extras features grow with the port.
-ftui = { version = "0.5", default-features = false, features = ["runtime"], optional = true }
+# crossterm backend for now (pi already ships crossterm via `tui`); the Unix
+# native-backend (ftui-tty) switch is a later rollout step per the bead.
+ftui = { version = "0.5", default-features = false, features = ["runtime", "crossterm"], optional = true }
 
 # Filesystem
 dirs = "6"
