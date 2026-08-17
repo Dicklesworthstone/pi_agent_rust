@@ -1211,6 +1211,10 @@ pub struct Agent {
     /// Plan-mode state (bd-cv653.3.5): shared with the `submit_plan` tool;
     /// the executor consults the gate before every tool call.
     plan_state: crate::plan::PlanState,
+
+    /// Dialect repair ledger (bd-cv653.7.8): every text→tool-call fixup this
+    /// session, drained by the session layer into session Custom entries.
+    repair_ledger: Arc<StdMutex<crate::dialects::RepairLedger>>,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1264,13 +1268,93 @@ impl Agent {
             promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
+            repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
         }
+    }
+
+    /// Dialect repair (bd-cv653.7.8): when a weak model emits its tool call
+    /// as text, extract and synthesize it into a real ToolCall block so the
+    /// turn continues. Guards: non-native dialect mapping, Stop reason, no
+    /// structured calls already present, tools enabled, one repair per
+    /// message, candidate names must be registered tools.
+    fn maybe_repair_dialect_tool_calls(&self, msg: AssistantMessage) -> AssistantMessage {
+        use crate::dialects::{Dialect, dialect_for_model, extract_text_tool_calls, strip_candidates};
+
+        if !extract_tool_calls(&msg.content).is_empty() {
+            return msg; // structured calls present — nothing to repair
+        }
+        if !matches!(msg.stop_reason, StopReason::Stop) {
+            return msg;
+        }
+        if self.tools.tools().is_empty() {
+            return msg;
+        }
+        let provider = self.provider();
+        if dialect_for_model(provider.name(), provider.model_id()) == Dialect::Native {
+            return msg;
+        }
+
+        let text = msg
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(t) => Some(t.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            return msg;
+        }
+        let candidates = extract_text_tool_calls(&text, &|name| self.tools.get(name).is_some());
+        if candidates.is_empty() {
+            return msg;
+        }
+
+        let remaining = strip_candidates(&text, &candidates);
+        let mut content: Vec<ContentBlock> = Vec::new();
+        if !remaining.is_empty() {
+            content.push(ContentBlock::Text(TextContent::new(remaining.clone())));
+        }
+        for (index, candidate) in candidates.iter().enumerate() {
+            content.push(ContentBlock::ToolCall(ToolCall {
+                id: format!("dialect-repair-{index}"),
+                name: candidate.name.clone(),
+                arguments: candidate.arguments.clone(),
+                thought_signature: None,
+            }));
+        }
+        if let Ok(mut ledger) = self.repair_ledger.lock() {
+            for candidate in &candidates {
+                ledger.record(
+                    &candidate.name,
+                    candidate.end - candidate.start,
+                    remaining.len(),
+                );
+            }
+        }
+        tracing::info!(
+            event = "pi.dialect.repair",
+            tools = ?candidates.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            remaining_text_bytes = remaining.len(),
+            "Repaired text-emitted tool call into structured call"
+        );
+        AssistantMessage { content, ..msg }
     }
 
     /// The shared plan-mode state (bd-cv653.3.5).
     #[must_use]
     pub fn plan_state(&self) -> crate::plan::PlanState {
         self.plan_state.clone()
+    }
+
+    /// Drain the dialect-repair ledger (bd-cv653.7.8): the session layer
+    /// turns entries into session Custom entries for the audit trail.
+    pub fn drain_repair_ledger(&self) -> Vec<crate::dialects::RepairEntry> {
+        self.repair_ledger
+            .lock()
+            .map(|mut ledger| std::mem::take(&mut ledger.entries))
+            .unwrap_or_default()
     }
 
     /// Install glob-scoped imported workspace rules (bd-cv653.6.2). Each rule
@@ -1772,7 +1856,7 @@ impl Agent {
                 );
 
                 let assistant_message = match assistant_result {
-                    Ok(msg) => msg,
+                    Ok(msg) => self.maybe_repair_dialect_tool_calls(msg),
                     Err(err) => {
                         let err_string = err.to_string();
                         let steering_to_add = self.drain_steering_messages().await;
@@ -14216,5 +14300,127 @@ mod tests {
                 .and_then(Value::as_str),
             Some("approved")
         );
+    }
+
+    // === Dialect repair turn (bd-cv653.7.8) ===
+
+    /// Emits a text-embedded tool call on stream 1, plain text on stream 2.
+    struct TextCallProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for TextCallProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+        fn api(&self) -> &str {
+            "test-api"
+        }
+        fn model_id(&self) -> &str {
+            "qwen3-mock" // maps to Dialect::Xmlish
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let make = |content: Vec<ContentBlock>, reason: StopReason| AssistantMessage {
+                content,
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "qwen3-mock".to_string(),
+                usage: Usage::default(),
+                stop_reason: reason,
+                stop_details: None,
+                error_message: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            let events: Vec<Result<StreamEvent>> = if call_number == 0 {
+                vec![
+                    Ok(StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "Checking the file. <tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"fixture.txt\"}}</tool_call>".to_string(),
+                    }),
+                    Ok(StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message: make(Vec::new(), StopReason::Stop),
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta {
+                        content_index: 0,
+                        delta: "The file says hello-fixture.".to_string(),
+                    }),
+                    Ok(StreamEvent::Done {
+                        reason: StopReason::Stop,
+                        message: make(
+                            vec![ContentBlock::Text(TextContent::new("The file says hello-fixture."))],
+                            StopReason::Stop,
+                        ),
+                    }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn dialect_repair_continues_turn_and_executes_tool() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture").expect("write fixture");
+            let provider = Arc::new(TextCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+
+            let final_message = agent_session
+                .run_text_with_abort("check the fixture".to_string(), None, |_| {})
+                .await
+                .expect("run completes");
+
+            let texts: Vec<String> = agent_session
+                .agent
+                .messages()
+                .iter()
+                .flat_map(|m| match m {
+                    crate::model::Message::Assistant(msg) => msg.content.clone(),
+                    crate::model::Message::User(u) => match &u.content {
+                        crate::model::UserContent::Text(t) => vec![ContentBlock::Text(TextContent::new(t))],
+                        crate::model::UserContent::Blocks(blocks) => blocks.clone(),
+                    },
+                    crate::model::Message::ToolResult(r) => r.content.clone(),
+                    _ => Vec::new(),
+                })
+                .filter_map(|b| match b {
+                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                texts.iter().any(|t| t.contains("hello-fixture")),
+                "tool result with fixture content present: {texts:?}"
+            );
+            assert_eq!(
+                final_message.stop_reason,
+                StopReason::Stop,
+                "turn ends cleanly after the repair"
+            );
+            let drained = agent_session.agent.drain_repair_ledger();
+            assert_eq!(drained.len(), 1, "one repair recorded");
+            assert_eq!(drained[0].tool, "read");
+        });
     }
 }
