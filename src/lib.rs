@@ -106,6 +106,7 @@ pub mod connectors;
 pub mod context_files;
 #[doc(hidden)]
 pub mod crypto_shim;
+pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
 #[doc(hidden)]
@@ -142,7 +143,6 @@ pub mod extension_validation;
 pub mod extensions;
 #[doc(hidden)]
 pub mod extensions_js;
-pub mod dialects;
 pub mod failover;
 #[doc(hidden)]
 pub mod file_lock;

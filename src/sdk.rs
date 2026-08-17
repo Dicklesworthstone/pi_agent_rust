@@ -1509,6 +1509,26 @@ impl AgentSessionHandle {
         })
     }
 
+    /// Run a read-only closure against the locked session.
+    ///
+    /// Lets embedding hosts take arbitrary snapshots (message history, header
+    /// fields, usage) without the SDK growing one accessor per shape — e.g.
+    /// the ftui launch path rebuilds its transcript after a session resume
+    /// via `interactive::conversation_from_session`.
+    pub async fn with_session<R>(
+        &self,
+        f: impl FnOnce(&crate::session::Session) -> R,
+    ) -> Result<R> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let guard = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        Ok(f(&guard))
+    }
+
     /// Trigger an immediate compaction pass (if compaction is enabled).
     pub async fn compact(
         &mut self,
