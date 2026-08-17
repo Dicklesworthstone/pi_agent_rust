@@ -1,14 +1,14 @@
 {
   "schema": "pi.ext.health_delta.v1",
-  "generated_at": "2026-08-16T01:55:39.983Z",
-  "baseline_path": "/Users/jemanuel/projects/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
+  "generated_at": "2026-08-17T14:34:55.821Z",
+  "baseline_path": "/Users/jemanuel/projects/pi_agent_rust/.claude/worktrees/fsqlite-cutover/tests/ext_conformance/reports/conformance_baseline.json",
   "baseline_date": "2026-08-04T03:26:54Z",
   "current_summary": {
     "excluded": 1,
-    "failed": 73,
+    "failed": 8,
     "manifest_count": 227,
-    "pass_rate_pct": 67.69911504424779,
-    "passed": 153,
+    "pass_rate_pct": 96.46017699115043,
+    "passed": 218,
     "skipped": 1,
     "tested": 226
   },
@@ -19,10 +19,10 @@
     "tested": 223
   },
   "aggregate_delta": {
-    "fail_delta": 73,
+    "fail_delta": 8,
     "net_change": 0,
-    "pass_delta": -70,
-    "rate_delta_pct": -32.30088495575221
+    "pass_delta": -5,
+    "rate_delta_pct": -3.5398230088495666
   },
   "regressions": [],
   "fixes": [],
@@ -30,9 +30,8 @@
     {
       "id": "agents-mikeastock/extensions",
       "tier": 5,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'agents-mikeastock/extensions': event-handler identities differ from the manifest; expected={\"SIGINT\", \"SIGTERM\", \"agent_end\", \"agent_start\", \"close\", \"connect\", \"data\", \"error\", \"exit\", \"session_shutdown\", \"tool_call\"}, actual={\"tool_call\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "antigravity-image-gen",
@@ -49,9 +48,8 @@
     {
       "id": "bash-spawn-hook",
       "tier": 1,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'bash-spawn-hook': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"bash\"], expected={}, actual={\"bash\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "bookmark",
@@ -122,9 +120,8 @@
     {
       "id": "community/hjanuschka-plan-mode",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/hjanuschka-plan-mode': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"plan\"], expected={}, actual={\"plan\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/hjanuschka-resistance",
@@ -159,9 +156,8 @@
     {
       "id": "community/jyaunches-canvas",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/jyaunches-canvas': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_start\"}, actual={\"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/mitsuhiko-answer",
@@ -172,9 +168,8 @@
     {
       "id": "community/mitsuhiko-control",
       "tier": 5,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/mitsuhiko-control': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"session-control\"], expected={}, actual={\"session-control\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/mitsuhiko-cwd-history",
@@ -215,9 +210,8 @@
     {
       "id": "community/mitsuhiko-uv",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/mitsuhiko-uv': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"bash\"], expected={}, actual={\"bash\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/mitsuhiko-whimsical",
@@ -228,30 +222,26 @@
     {
       "id": "community/nicobailon-interactive-shell",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/nicobailon-interactive-shell': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"interactive_shell\"], expected={}, actual={\"interactive_shell\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/nicobailon-interview-tool",
       "tier": 4,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/nicobailon-interview-tool': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/nicobailon-mcp-adapter",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/nicobailon-mcp-adapter': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"mcp-config\"], expected={}, actual={\"mcp-config\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/nicobailon-powerline-footer",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/nicobailon-powerline-footer': event-handler identities differ from the manifest; expected={\"agent_end\", \"agent_start\", \"before_agent_start\", \"close\", \"data\", \"error\", \"session_start\", \"tool_call\", \"tool_result\", \"user_bash\", \"user_message\"}, actual={\"agent_end\", \"agent_start\", \"before_agent_start\", \"session_start\", \"tool_call\", \"tool_result\", \"user_bash\", \"user_message\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/nicobailon-rewind-hook",
@@ -262,9 +252,8 @@
     {
       "id": "community/nicobailon-subagents",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/nicobailon-subagents': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"subagent\", \"subagent_status\"], expected={}, actual={\"subagent\", \"subagent_status\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/ogulcancelik-ghostty-theme-sync",
@@ -275,16 +264,14 @@
     {
       "id": "community/prateekmedia-checkpoint",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/prateekmedia-checkpoint': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_before_fork\", \"session_before_tree\", \"session_fork\", \"session_start\", \"session_switch\", \"turn_start\"}, actual={\"session_before_fork\", \"session_before_tree\", \"session_fork\", \"session_start\", \"session_switch\", \"turn_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/prateekmedia-lsp",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/prateekmedia-lsp': event-handler identities differ from the manifest; expected={\"agent_end\", \"agent_start\", \"data\", \"error\", \"exit\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\", \"tool_call\", \"tool_result\"}, actual={\"agent_end\", \"agent_start\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\", \"tool_call\", \"tool_result\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/prateekmedia-permission",
@@ -295,9 +282,8 @@
     {
       "id": "community/prateekmedia-ralph-loop",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/prateekmedia-ralph-loop': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/prateekmedia-repeat",
@@ -326,9 +312,8 @@
     {
       "id": "community/qualisero-pi-agent-scip",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/qualisero-pi-agent-scip': event-handler identities differ from the manifest; expected={\"before_agent_start\", \"close\", \"data\", \"error\", \"session_start\"}, actual={\"before_agent_start\", \"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/qualisero-safe-git",
@@ -345,9 +330,8 @@
     {
       "id": "community/qualisero-session-color",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/qualisero-session-color': event-handler identities differ from the manifest; expected={\"resize\", \"session_start\", \"session_switch\"}, actual={\"session_start\", \"session_switch\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/qualisero-session-emoji",
@@ -418,9 +402,8 @@
     {
       "id": "community/tmustier-tab-status",
       "tier": 1,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'community/tmustier-tab-status': event-handler identities differ from the manifest; expected={}, actual={\"agent_end\", \"agent_start\", \"before_agent_start\", \"session_shutdown\", \"session_start\", \"session_switch\", \"tool_call\", \"tool_result\", \"turn_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "community/tmustier-usage-extension",
@@ -594,9 +577,8 @@
     {
       "id": "npm/aliou-pi-extension-dev",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/aliou-pi-extension-dev': manifest tools capability=false, but runtime registered 4 tools: {\"detect_package_manager\", \"pi_changelog\", \"pi_docs\", \"pi_version\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/aliou-pi-guardrails",
@@ -607,16 +589,14 @@
     {
       "id": "npm/aliou-pi-linkup",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/aliou-pi-linkup': event-handler identities differ from the manifest; expected={\"session_start\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/aliou-pi-processes",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/aliou-pi-processes': manifest tools capability=false, but runtime registered 1 tools: {\"processes\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/aliou-pi-synthetic",
@@ -627,16 +607,14 @@
     {
       "id": "npm/aliou-pi-toolchain",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/aliou-pi-toolchain': runtime tools identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"bash\"], expected={}, actual={\"bash\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/benvargas-pi-ancestor-discovery",
       "tier": 1,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/benvargas-pi-ancestor-discovery': event-handler identities differ from the manifest; expected={}, actual={\"resources_discover\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/benvargas-pi-antigravity-image-gen",
@@ -653,9 +631,8 @@
     {
       "id": "npm/checkpoint-pi",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/checkpoint-pi': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_before_fork\", \"session_before_tree\", \"session_fork\", \"session_start\", \"session_switch\", \"turn_start\"}, actual={\"session_before_fork\", \"session_before_tree\", \"session_fork\", \"session_start\", \"session_switch\", \"turn_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
@@ -666,44 +643,38 @@
     {
       "id": "npm/juanibiapina-pi-extension-settings",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/juanibiapina-pi-extension-settings': manifest commands capability=false, but runtime registered 1 commands: {\"extension-settings\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/juanibiapina-pi-files",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/juanibiapina-pi-files': manifest commands capability=false, but runtime registered 1 commands: {\"files\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/juanibiapina-pi-gob",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/juanibiapina-pi-gob': manifest commands capability=false, but runtime registered 1 commands: {\"gob\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/lsp-pi",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/lsp-pi': event-handler identities differ from the manifest; expected={\"agent_end\", \"agent_start\", \"data\", \"error\", \"exit\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\", \"tool_call\", \"tool_result\", \"uncaughtException\"}, actual={\"agent_end\", \"agent_start\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\", \"tool_call\", \"tool_result\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/marckrenn-pi-sub-bar",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/marckrenn-pi-sub-bar': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"sub-core:settings\"], expected={\"sub-bar:import\", \"sub-bar:settings\"}, actual={\"sub-bar:import\", \"sub-bar:settings\", \"sub-core:settings\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/marckrenn-pi-sub-core",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/marckrenn-pi-sub-core': manifest tools capability=true, but runtime registered 0 tools: {}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/mitsupi",
@@ -715,9 +686,8 @@
     {
       "id": "npm/ogulcancelik-pi-sketch",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/ogulcancelik-pi-sketch': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/oh-my-pi-basics",
@@ -747,16 +717,14 @@
     {
       "id": "npm/pi-annotate",
       "tier": 5,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-annotate': event-handler identities differ from the manifest; expected={\"close\", \"connect\", \"data\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-bash-confirm",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-bash-confirm': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\", \"session_start\", \"timeout\", \"tool_call\"}, actual={\"session_start\", \"tool_call\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-brave-search",
@@ -799,9 +767,8 @@
     {
       "id": "npm/pi-interview",
       "tier": 4,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-interview': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-mcp-adapter",
@@ -825,9 +792,8 @@
     {
       "id": "npm/pi-messenger",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-messenger': event-handler identities differ from the manifest; expected={\"agent_end\", \"close\", \"data\", \"error\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\", \"tool_call\", \"tool_result\", \"turn_end\"}, actual={\"agent_end\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\", \"tool_call\", \"tool_result\", \"turn_end\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-model-switch",
@@ -856,9 +822,8 @@
     {
       "id": "npm/pi-package-test",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-package-test': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"cost\", \"flicker-corp\", \"fun-working\", \"handoff\", \"loop\", \"mem\", \"oracle\", \"plan\", \"remember\", \"resistance\", \"signature-flicker\", \"speedread\", \"status\", \"status-refresh\", \"ultrathink\", \"usage\"], expected={\"footer\"}, actual={\"cost\", \"flicker-corp\", \"footer\", \"fun-working\", \"handoff\", \"loop\", \"mem\", \"oracle\", \"plan\", \"remember\", \"resistance\", \"signature-flicker\", \"speedread\", \"status\", \"status-refresh\", \"ultrathink\", \"usage\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-poly-notify",
@@ -876,9 +841,8 @@
     {
       "id": "npm/pi-prompt-template-model",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-prompt-template-model': runtime commands identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"model-mode\"], expected={}, actual={\"model-mode\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-repoprompt-mcp",
@@ -901,9 +865,8 @@
     {
       "id": "npm/pi-search-agent",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-search-agent': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"line\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-session-ask",
@@ -914,9 +877,8 @@
     {
       "id": "npm/pi-shadow-git",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-shadow-git': event-handler identities differ from the manifest; expected={\"agent_end\", \"session_shutdown\", \"session_start\", \"tool_call\", \"tool_result\", \"turn_end\", \"turn_start\"}, actual={\"session_shutdown\", \"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-shell-completions",
@@ -969,30 +931,26 @@
     {
       "id": "npm/pi-watch",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-watch': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"watch\"], expected={}, actual={\"watch\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/pi-web-access",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/pi-web-access': event-handler identities differ from the manifest; expected={\"exit\", \"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\"}, actual={\"session_fork\", \"session_shutdown\", \"session_start\", \"session_switch\", \"session_tree\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/qualisero-pi-agent-scip",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/qualisero-pi-agent-scip': manifest tools capability=false, but runtime registered 6 tools: {\"scip_find_definition\", \"scip_find_references\", \"scip_list_symbols\", \"scip_project_tree\", \"scip_reindex\", \"scip_search_symbols\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/ralph-loop-pi",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/ralph-loop-pi': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/repeat-pi",
@@ -1022,9 +980,8 @@
     {
       "id": "npm/vaayne-agent-kit",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/vaayne-agent-kit': event-handler identities differ from the manifest; expected={\"agent_end\", \"before_agent_start\", \"close\", \"data\", \"error\", \"model_select\", \"session_shutdown\", \"session_start\", \"session_switch\", \"tool_call\", \"turn_end\", \"turn_start\"}, actual={\"agent_end\", \"before_agent_start\", \"model_select\", \"session_shutdown\", \"session_start\", \"session_switch\", \"tool_call\", \"turn_end\", \"turn_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/vaayne-pi-mcp",
@@ -1035,9 +992,8 @@
     {
       "id": "npm/vaayne-pi-subagent",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/vaayne-pi-subagent': event-handler identities differ from the manifest; expected={\"before_agent_start\", \"close\", \"data\", \"error\", \"session_start\"}, actual={\"before_agent_start\", \"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/vaayne-pi-web-tools",
@@ -1054,9 +1010,8 @@
     {
       "id": "npm/vpellegrino-pi-skills",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'npm/vpellegrino-pi-skills': event-handler identities differ from the manifest; expected={\"close\", \"data\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "npm/walterra-pi-charts",
@@ -1079,9 +1034,8 @@
     {
       "id": "overlay-qa-tests",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'overlay-qa-tests': event-handler identities differ from the manifest; expected={\"close\", \"data\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "overlay-test",
@@ -1116,16 +1070,14 @@
     {
       "id": "plan-mode",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'plan-mode': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"plan\"], expected={}, actual={\"plan\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "preset",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'preset': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"preset\"], expected={}, actual={\"preset\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "prompt-url-widget",
@@ -1178,9 +1130,8 @@
     {
       "id": "sandbox",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'sandbox': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"no-sandbox\"], expected={}, actual={\"no-sandbox\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "send-user-message",
@@ -1215,9 +1166,8 @@
     {
       "id": "ssh",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'ssh': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"ssh\"], expected={}, actual={\"ssh\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "status-line",
@@ -1228,9 +1178,8 @@
     {
       "id": "subagent",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'subagent': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "summarize",
@@ -1247,30 +1196,26 @@
     {
       "id": "third-party/aliou-pi-extensions",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/aliou-pi-extensions': runtime commands identities differ from the manifest; missing declared identities=[\"dumb-zone-status\", \"extensions:update\", \"plan:list\", \"plan:save\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"session:copy-id\", \"session:copy-path\"], unexpected runtime identities=[], expected={\"ad-name\", \"dumb-zone-status\", \"extensions:update\", \"plan:list\", \"plan:save\", \"processes\", \"providers:toggle-widget\", \"providers:usage\", \"session:copy-id\", \"session:copy-path\", \"system-prompt\", \"theme\"}, actual={\"ad-name\", \"system-prompt\", \"theme\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/ben-vargas-pi-packages",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/ben-vargas-pi-packages': manifest commands capability=true, but runtime registered 0 commands: {}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/charles-cooper-pi-extensions",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/charles-cooper-pi-extensions': event-handler identities differ from the manifest; expected={\"before_agent_start\", \"close\", \"data\", \"error\", \"model_select\", \"session_before_compact\", \"session_compact\", \"session_start\"}, actual={\"before_agent_start\", \"model_select\", \"session_before_compact\", \"session_compact\", \"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/cv-pi-ssh-remote",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/cv-pi-ssh-remote': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"ssh-command\", \"ssh-cwd\", \"ssh-host\", \"ssh-no-mount\", \"ssh-port\", \"ssh-strict-host-key\", \"ssh-timeout\"], expected={}, actual={\"ssh-command\", \"ssh-cwd\", \"ssh-host\", \"ssh-no-mount\", \"ssh-port\", \"ssh-strict-host-key\", \"ssh-timeout\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/graffioh-pi-screenshots-picker",
@@ -1293,16 +1238,14 @@
     {
       "id": "third-party/kcosr-pi-extensions",
       "tier": 5,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/kcosr-pi-extensions': manifest commands capability=true, but runtime registered 0 commands: {}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/limouren-agent-things",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/limouren-agent-things': runtime flags identities differ from the manifest; missing declared identities=[], unexpected runtime identities=[\"sandbox\"], expected={}, actual={\"sandbox\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/lll9p-pi-better-compaction",
@@ -1313,16 +1256,14 @@
     {
       "id": "third-party/lsj5031-pi-notification-extension",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/lsj5031-pi-notification-extension': event-handler identities differ from the manifest; expected={\"agent_end\", \"data\", \"end\", \"error\", \"session_start\", \"timeout\"}, actual={\"agent_end\", \"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/marckrenn-pi-sub",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/marckrenn-pi-sub': manifest tools capability=true, but runtime registered 0 tools: {}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/michalvavra-agents",
@@ -1333,16 +1274,14 @@
     {
       "id": "third-party/ogulcancelik-pi-sketch",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/ogulcancelik-pi-sketch': event-handler identities differ from the manifest; expected={\"data\", \"end\", \"error\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/openclaw-openclaw",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/openclaw-openclaw': runtime commands identities differ from the manifest; missing declared identities=[\"files\", \"tui\"], unexpected runtime identities=[], expected={\"diff\", \"files\", \"tui\"}, actual={\"diff\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/pasky-pi-amplike",
@@ -1353,9 +1292,8 @@
     {
       "id": "third-party/qualisero-pi-agent-scip",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/qualisero-pi-agent-scip': event-handler identities differ from the manifest; expected={\"before_agent_start\", \"close\", \"data\", \"error\", \"session_start\"}, actual={\"before_agent_start\", \"session_start\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/raunovillberg-pi-stuffed",
@@ -1366,9 +1304,8 @@
     {
       "id": "third-party/rytswd-direnv",
       "tier": 2,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/rytswd-direnv': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"session_start\", \"tool_result\"}, actual={\"session_start\", \"tool_result\"}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/rytswd-questionnaire",
@@ -1385,16 +1322,14 @@
     {
       "id": "third-party/vtemian-pi-config",
       "tier": 4,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/vtemian-pi-config': event-handler identities differ from the manifest; expected={\"close\", \"data\", \"error\", \"tool_result\"}, actual={}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/w-winter-dot314",
       "tier": 3,
-      "delta_type": "new_failure",
-      "current_status": "fail",
-      "failure_reason": "Extension 'third-party/w-winter-dot314': manifest commands capability=true, but runtime registered 0 commands: {}"
+      "delta_type": "new_pass",
+      "current_status": "pass"
     },
     {
       "id": "third-party/zenobi-us-pi-dcp",
