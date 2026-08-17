@@ -114,6 +114,7 @@ fn setup_rpc(
         cli_api_key: None,
         auth,
         runtime_handle: runtime_handle.clone(),
+        ask_tool: None,
     };
 
     let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);

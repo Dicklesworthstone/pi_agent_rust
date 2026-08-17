@@ -98,6 +98,7 @@ fn rpc_rejects_invalid_json_and_missing_type() {
             cli_api_key: None,
             auth,
             runtime_handle: handle.clone(),
+            ask_tool: None,
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -170,6 +171,7 @@ fn rpc_errors_on_unknown_command_and_missing_params() {
             cli_api_key: None,
             auth,
             runtime_handle: handle.clone(),
+            ask_tool: None,
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
@@ -293,6 +295,7 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
             cli_api_key: None,
             auth,
             runtime_handle: handle.clone(),
+            ask_tool: None,
         };
 
         let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);

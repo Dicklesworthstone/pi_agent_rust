@@ -293,6 +293,7 @@ fn build_options(
         cli_api_key: None,
         auth,
         runtime_handle: handle.clone(),
+        ask_tool: None,
     }
 }
 

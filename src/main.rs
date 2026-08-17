@@ -6990,7 +6990,6 @@ fn rpc_available_models(registry: &ModelRegistry, cli_api_key: Option<&str>) -> 
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 async fn run_rpc_mode(
     session: AgentSession,
     resources: ResourceLoader,
