@@ -30,6 +30,7 @@ const fn message_role(message: &Message) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn format_event(event: &AgentEvent) -> serde_json::Value {
     match event {
         AgentEvent::AgentStart { .. } => json!({ "event": "agent_start" }),

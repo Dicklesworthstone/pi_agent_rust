@@ -50,6 +50,7 @@ fn text_sse_body(text: &str) -> String {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_rpc_session_discovers_runs_and_promotes_via_xdev() {
     let harness = TestHarness::new("e2e_rpc_session_discovers_runs_and_promotes_via_xdev");
     harness

@@ -13964,14 +13964,13 @@ mod tests {
                 .await;
             assert!(!is_error);
 
-            let defs_after = agent
+            let has_promoted_tool = agent
                 .build_context()
                 .tools
                 .iter()
-                .map(|def| def.name.clone())
-                .collect::<Vec<_>>();
+                .any(|def| def.name == "ast_grep");
             assert!(
-                defs_after.contains(&"ast_grep".to_string()),
+                has_promoted_tool,
                 "promoted tool enters the schema mid-session"
             );
         });

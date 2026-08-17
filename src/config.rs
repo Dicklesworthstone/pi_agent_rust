@@ -1846,13 +1846,15 @@ mod tests {
 
     #[test]
     fn scope_override_and_disabled_round_trip_serialization() {
-        let mut config = Config::default();
-        config.disabled_providers = Some(vec!["anthropic".to_string()]);
-        config.model_scope_overrides = Some(vec![super::ModelScopeOverride {
-            path: "/repo/a".to_string(),
-            enabled_models: Some(vec!["openai/gpt-5.5".to_string()]),
-            disabled_providers: Some(vec!["google".to_string()]),
-        }]);
+        let config = Config {
+            disabled_providers: Some(vec!["anthropic".to_string()]),
+            model_scope_overrides: Some(vec![super::ModelScopeOverride {
+                path: "/repo/a".to_string(),
+                enabled_models: Some(vec!["openai/gpt-5.5".to_string()]),
+                disabled_providers: Some(vec!["google".to_string()]),
+            }]),
+            ..Config::default()
+        };
         let json = serde_json::to_value(&config).expect("serialize");
         let parsed: Config = serde_json::from_value(json).expect("round-trip");
         assert_eq!(

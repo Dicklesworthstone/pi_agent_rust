@@ -8,12 +8,10 @@
       "source_tier": "agents-mikeastock",
       "capabilities": {
         "registers_tools": true,
-        "registers_commands": true,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "tool_call"
-        ],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -27,16 +25,11 @@
       ],
       "registrations": {
         "tools": [
-          "AskUserQuestion",
-          "session_query"
+          "AskUserQuestion"
         ],
-        "commands": [
-          "handoff"
-        ],
+        "commands": [],
         "flags": [],
-        "event_handlers": [
-          "tool_call"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -1304,14 +1297,12 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "async_subagent:complete",
           "session_branch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "subagent:complete",
           "subagent:started",
-          "subagent_enhanced:complete",
           "tool_result"
         ],
         "uses_exec": true,
@@ -1333,14 +1324,12 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
-          "async_subagent:complete",
           "session_branch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "subagent:complete",
           "subagent:started",
-          "subagent_enhanced:complete",
           "tool_result"
         ]
       }
@@ -1425,20 +1414,10 @@
       "source_tier": "community",
       "capabilities": {
         "registers_tools": true,
-        "registers_commands": true,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "agent_end",
-          "agent_start",
-          "session_fork",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "session_tree",
-          "tool_call",
-          "tool_result"
-        ],
+        "subscribes_events": [],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1454,21 +1433,9 @@
         "tools": [
           "lsp"
         ],
-        "commands": [
-          "lsp"
-        ],
+        "commands": [],
         "flags": [],
-        "event_handlers": [
-          "agent_end",
-          "agent_start",
-          "session_fork",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "session_tree",
-          "tool_call",
-          "tool_result"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -3626,20 +3593,12 @@
         "registers_providers": false,
         "subscribes_events": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -3656,26 +3615,17 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings",
-          "sub-core:settings"
+          "sub-bar:settings"
         ],
         "flags": [],
         "event_handlers": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ]
       }
     },
@@ -4019,12 +3969,7 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "bash-confirm",
-          "demo-bash-confirm",
-          "test-bash-confirm",
-          "test-edit-mode",
-          "test-safe-patterns",
-          "test-unsafe-patterns"
+          "bash-confirm"
         ],
         "flags": [],
         "event_handlers": [
@@ -4587,21 +4532,13 @@
       "entry_path": "npm/pi-package-test/extensions/confirm-destructive.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
-        "registers_flags": true,
+        "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start",
-          "session_before_compact",
           "session_before_fork",
-          "session_before_switch",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "tool_call"
+          "session_before_switch"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -4613,44 +4550,14 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "copy_to_clipboard",
-          "plan",
-          "signal_loop_success"
-        ],
+        "tools": [],
         "commands": [
-          "cost",
-          "flicker-corp",
-          "footer",
-          "fun-working",
-          "handoff",
-          "loop",
-          "mem",
-          "oracle",
-          "plan",
-          "remember",
-          "resistance",
-          "signature-flicker",
-          "speedread",
-          "status",
-          "status-refresh",
-          "ultrathink",
-          "usage"
+          "footer"
         ],
-        "flags": [
-          "plan"
-        ],
+        "flags": [],
         "event_handlers": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start",
-          "session_before_compact",
           "session_before_fork",
-          "session_before_switch",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "tool_call"
+          "session_before_switch"
         ]
       }
     },
@@ -6920,15 +6827,13 @@
       "entry_path": "third-party/charles-cooper-pi-extensions/per-model-system-prompt.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": true,
-        "registers_commands": true,
+        "registers_tools": false,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
           "model_select",
-          "session_before_compact",
-          "session_compact",
           "session_start"
         ],
         "uses_exec": true,
@@ -6943,18 +6848,12 @@
         "exec"
       ],
       "registrations": {
-        "tools": [
-          "subagent"
-        ],
-        "commands": [
-          "subagent"
-        ],
+        "tools": [],
+        "commands": [],
         "flags": [],
         "event_handlers": [
           "before_agent_start",
           "model_select",
-          "session_before_compact",
-          "session_compact",
           "session_start"
         ]
       }
@@ -7271,20 +7170,12 @@
         "registers_providers": false,
         "subscribes_events": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7301,26 +7192,17 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings",
-          "sub-core:settings"
+          "sub-bar:settings"
         ],
         "flags": [],
         "event_handlers": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ]
       }
     },
@@ -7334,11 +7216,7 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end",
-          "before_agent_start",
-          "session_start",
-          "tool_call",
-          "tool_result"
+          "agent_end"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -7354,11 +7232,7 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
-          "agent_end",
-          "before_agent_start",
-          "session_start",
-          "tool_call",
-          "tool_result"
+          "agent_end"
         ]
       }
     },
@@ -7427,7 +7301,7 @@
       "entry_path": "third-party/pasky-pi-amplike/handoff.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -7442,9 +7316,7 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "session_query"
-        ],
+        "tools": [],
         "commands": [
           "handoff"
         ],

@@ -1,8 +1,8 @@
 //! E2E (bd-cv653.3.5 acceptance #1-#3): plan mode over RPC with a real binary
-//! and scripted mock provider. Sequence: set_plan_mode(on) → scripted write is
-//! blocked (PLAN_MODE_BLOCKED, zero bytes changed) → scripted submit_plan →
-//! approve_plan command → scripted write executes. JSONL logs per
-//! tests/common/logging.rs.
+//! and scripted mock provider. Sequence: `set_plan_mode(on)` → scripted write
+//! is blocked (`PLAN_MODE_BLOCKED`, zero bytes changed) → scripted
+//! `submit_plan` → `approve_plan` command → scripted write executes. JSONL
+//! logs per `tests/common/logging.rs`.
 
 mod common;
 
@@ -51,6 +51,7 @@ fn text_sse_body(text: &str) -> String {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_rpc_plan_mode_blocks_approves_executes() {
     let harness = TestHarness::new("e2e_rpc_plan_mode_blocks_approves_executes");
     harness
