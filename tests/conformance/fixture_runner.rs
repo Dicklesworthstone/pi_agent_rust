@@ -58,6 +58,27 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "hashline_edit" => Box::new(pi::tools::HashlineEditTool::new(temp_dir.path())),
         "ast_grep" => Box::new(pi::ast_tools::AstGrepTool::new(temp_dir.path())),
         "ast_edit" => Box::new(pi::ast_tools::AstEditTool::new(temp_dir.path())),
+        "xdev" => {
+            // The dispatcher's snapshot is built from the real discoverable
+            // tools so fixtures exercise the genuine contract (bd-cv653.1.6).
+            let ast_grep = pi::ast_tools::AstGrepTool::new(temp_dir.path());
+            let ast_edit = pi::ast_tools::AstEditTool::new(temp_dir.path());
+            let snapshot = vec![
+                pi::xdev::DiscoverableToolInfo {
+                    name: ast_grep.name().to_string(),
+                    one_liner: pi::xdev::one_liner(ast_grep.description()),
+                    description: ast_grep.description().to_string(),
+                    parameters: ast_grep.parameters(),
+                },
+                pi::xdev::DiscoverableToolInfo {
+                    name: ast_edit.name().to_string(),
+                    one_liner: pi::xdev::one_liner(ast_edit.description()),
+                    description: ast_edit.description().to_string(),
+                    parameters: ast_edit.parameters(),
+                },
+            ];
+            Box::new(pi::xdev::XdevTool::new(temp_dir.path(), snapshot))
+        }
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
         }

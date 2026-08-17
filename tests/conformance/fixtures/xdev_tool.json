@@ -1,0 +1,131 @@
+{
+  "version": "1.0",
+  "tool": "xdev",
+  "description": "Load-mode dispatcher contract (bd-cv653.1.6): list/describe from the snapshot, named errors for unknown tools/actions, and the run/promote interception contract (loud error when a host did not install it).",
+  "cases": [
+    {
+      "name": "xdev_list_shows_discoverable",
+      "description": "list names discoverable tools with one-liners",
+      "requirement_ids": [
+        "XDEV-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "main.rs",
+          "content": "fn main() {}\n"
+        }
+      ],
+      "input": {
+        "action": "list"
+      },
+      "expected": {
+        "content_contains": [
+          "ast_grep",
+          "ast_edit",
+          "Discoverable tools"
+        ]
+      }
+    },
+    {
+      "name": "xdev_list_omits_essential_tools",
+      "description": "list never advertises essential-tier tools as discoverable (planted negative)",
+      "requirement_ids": [
+        "XDEV-2"
+      ],
+      "input": {
+        "action": "list"
+      },
+      "expected": {
+        "content_not_contains": [
+          "- read:",
+          "- bash:",
+          "- xdev:"
+        ]
+      }
+    },
+    {
+      "name": "xdev_describe_returns_schema",
+      "description": "describe returns full description + JSON schema for the target",
+      "requirement_ids": [
+        "XDEV-3"
+      ],
+      "input": {
+        "action": "describe",
+        "name": "ast_grep"
+      },
+      "expected": {
+        "content_contains": [
+          "\"name\":\"ast_grep\"",
+          "\"parameters\"",
+          "pattern"
+        ]
+      }
+    },
+    {
+      "name": "xdev_describe_unknown_tool_named_error",
+      "description": "describe on an unknown tool names it in the error",
+      "requirement_ids": [
+        "XDEV-4"
+      ],
+      "input": {
+        "action": "describe",
+        "name": "nosuch_tool"
+      },
+      "expected": {
+        "content_contains": [
+          "nosuch_tool",
+          "xdev list"
+        ]
+      }
+    },
+    {
+      "name": "xdev_unknown_action_named_error",
+      "description": "unknown action returns a named usage error",
+      "requirement_ids": [
+        "XDEV-5"
+      ],
+      "input": {
+        "action": "frobnicate"
+      },
+      "expected": {
+        "content_contains": [
+          "frobnicate",
+          "list|describe|run|promote"
+        ]
+      }
+    },
+    {
+      "name": "xdev_run_without_interception_named_error",
+      "description": "run reaching the tool directly (no agent interception installed) fails loudly with the interception contract",
+      "requirement_ids": [
+        "XDEV-6"
+      ],
+      "expect_error": true,
+      "error_contains": "interception",
+      "input": {
+        "action": "run",
+        "name": "ast_grep",
+        "args": {
+          "pattern": "$A.unwrap()",
+          "path": "."
+        }
+      },
+      "expected": {}
+    },
+    {
+      "name": "xdev_promote_without_interception_named_error",
+      "description": "promote reaching the tool directly fails loudly with the interception contract",
+      "requirement_ids": [
+        "XDEV-7"
+      ],
+      "expect_error": true,
+      "error_contains": "interception",
+      "input": {
+        "action": "promote",
+        "name": "ast_grep"
+      },
+      "expected": {}
+    }
+  ]
+}

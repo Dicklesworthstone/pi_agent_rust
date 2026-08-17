@@ -1193,11 +1193,20 @@ pub struct Agent {
     message_queue: MessageQueue,
 
     /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
-    cached_tool_defs: Option<Vec<ToolDef>>,
+    /// The generation counter covers mid-session `xdev` promotions (bd-cv653.1.6).
+    cached_tool_defs: Option<(u64, Vec<ToolDef>)>,
 
     /// Path-scoped imported workspace rules (bd-cv653.6.2), delivered as
     /// steering messages the first time a tool call touches a matching path.
     scoped_rules: Option<ScopedRuleState>,
+
+    /// Discoverable tools promoted into the live schema mid-session via
+    /// `xdev promote` (bd-cv653.1.6). Interior-mutable because tool
+    /// execution takes `&self`.
+    promoted_tools: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// Bumped on promotion; `cached_tool_defs` rebuilds when its stored
+    /// generation is stale.
+    tool_defs_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1248,6 +1257,8 @@ impl Agent {
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
             scoped_rules: None,
+            promoted_tools: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1460,20 +1471,40 @@ impl Agent {
         };
 
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
-        if self.cached_tool_defs.is_none() {
+        // Load modes (bd-cv653.1.6): discoverable-tier tools are excluded
+        // until promoted; the generation counter invalidates on promotion.
+        let generation = self
+            .tool_defs_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let cache_fresh = self
+            .cached_tool_defs
+            .as_ref()
+            .is_some_and(|cached| cached.0 == generation);
+        if !cache_fresh {
+            let promoted = self
+                .promoted_tools
+                .lock()
+                .map(|set| set.clone())
+                .unwrap_or_default();
             let defs: Vec<ToolDef> = self
                 .tools
                 .tools()
                 .iter()
+                .filter(|t| !self.tools.is_discoverable(t.name()) || promoted.contains(t.name()))
                 .map(|t| ToolDef {
                     name: t.name().to_string(),
                     description: t.description().to_string(),
                     parameters: t.parameters(),
                 })
                 .collect();
-            self.cached_tool_defs = Some(defs);
+            self.cached_tool_defs = Some((generation, defs));
         }
-        let tools = Cow::Borrowed(self.cached_tool_defs.as_deref().unwrap());
+        let tools = Cow::Borrowed(
+            self.cached_tool_defs
+                .as_ref()
+                .map(|(_, defs)| defs.as_slice())
+                .expect("cache populated above"),
+        );
 
         Context {
             system_prompt: self.config.system_prompt.as_deref().map(Cow::Borrowed),
@@ -3317,11 +3348,104 @@ impl Agent {
         self.execute_tool(tool_call, on_event, latency).await
     }
 
+    /// xdev dispatcher interception (bd-cv653.1.6). `run` executes the inner
+    /// tool through the normal `Tool::execute` contract (its own input
+    /// validation produces the named errors); `promote` moves the tool into
+    /// the live schema and invalidates the def cache. Returns `None` for
+    /// `list`/`describe` (the XdevTool handles those itself).
+    async fn dispatch_xdev(&self, tool_call: &ToolCall) -> Option<ToolOutput> {
+        let args = &tool_call.arguments;
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
+        match action {
+            "run" => {
+                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    return Some(Self::xdev_text_output("xdev run requires a `name`", true));
+                }
+                if !self.tools.is_discoverable(name) {
+                    return Some(Self::xdev_text_output(
+                        &if self.tools.get(name).is_some() {
+                            format!("{name:?} is already in the live schema — call it directly.")
+                        } else {
+                            format!("No discoverable tool named {name:?}; use xdev list.")
+                        },
+                        true,
+                    ));
+                }
+                let inner_args = args.get("args").cloned().unwrap_or_else(|| json!({}));
+                let Some(inner) = self.tools.get(name) else {
+                    return Some(Self::xdev_text_output(
+                        &format!("Tool {name:?} not registered"),
+                        true,
+                    ));
+                };
+                let mut output = inner
+                    .execute(&tool_call.id, inner_args, None)
+                    .await
+                    .unwrap_or_else(|err| Self::xdev_text_output(&err.to_string(), true));
+                output.details = Some(json!({
+                    "dispatchedVia": "xdev",
+                    "tool": name,
+                }));
+                Some(output)
+            }
+            "promote" => {
+                let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+                if name.is_empty() {
+                    return Some(Self::xdev_text_output(
+                        "xdev promote requires a `name`",
+                        true,
+                    ));
+                }
+                if !self.tools.is_discoverable(name) {
+                    return Some(Self::xdev_text_output(
+                        &if self.tools.get(name).is_some() {
+                            format!("{name:?} is already in the live schema.")
+                        } else {
+                            format!("No discoverable tool named {name:?}; use xdev list.")
+                        },
+                        true,
+                    ));
+                }
+                if let Ok(mut set) = self.promoted_tools.lock() {
+                    set.insert(name.to_string());
+                }
+                self.tool_defs_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Self::xdev_text_output(
+                    &format!(
+                        "Promoted {name:?} into the live schema for the rest of this session. You can now call it directly."
+                    ),
+                    false,
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn xdev_text_output(text: &str, is_error: bool) -> ToolOutput {
+        ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: None,
+            is_error,
+        }
+    }
+
     async fn execute_tool_without_hooks(
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
     ) -> (ToolOutput, bool) {
+        // Load modes (bd-cv653.1.6): intercept the xdev dispatcher's
+        // run/promote actions so the inner tool executes through the normal
+        // path (effects/approval already applied to this outer call).
+        if tool_call.name == "xdev"
+            && let Some(output) = self.dispatch_xdev(tool_call).await
+        {
+            let is_error = output.is_error;
+            return (output, is_error);
+        }
+
         // Find the tool
         let Some(tool) = self.tools.get(&tool_call.name) else {
             return (Self::tool_not_found_output(&tool_call.name), true);
@@ -13646,5 +13770,219 @@ mod tests {
         assert_eq!(json["success"], false);
         assert_eq!(json["attempt"], 3);
         assert_eq!(json["finalError"], "max retries exceeded");
+    }
+
+    // === Tool load modes / xdev dispatcher (bd-cv653.1.6) ===
+
+    fn xdev_test_agent(enabled: &[&str], cwd: &Path) -> Agent {
+        let provider = Arc::new(SilentProvider);
+        let tools = ToolRegistry::new(enabled, cwd, None);
+        Agent::new(provider, tools, AgentConfig::default())
+    }
+
+    fn xdev_call(action: &str, name: Option<&str>, args: Option<Value>) -> ToolCall {
+        let mut arguments = json!({ "action": action });
+        if let Some(name) = name {
+            arguments["name"] = json!(name);
+        }
+        if let Some(inner) = args {
+            arguments["args"] = inner;
+        }
+        ToolCall {
+            id: "call-xdev-1".to_string(),
+            name: "xdev".to_string(),
+            arguments,
+            thought_signature: None,
+        }
+    }
+
+    #[test]
+    fn xdev_list_and_describe_via_tool_execute() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
+            let xdev = agent.tools.get("xdev").expect("xdev registered");
+
+            let list = xdev
+                .execute("c1", json!({"action": "list"}), None)
+                .await
+                .expect("list");
+            let list_text = match &list.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(
+                list_text.contains("ast_grep"),
+                "list shows discoverable ast_grep"
+            );
+            assert!(!list.is_error);
+
+            let describe = xdev
+                .execute(
+                    "c2",
+                    json!({"action": "describe", "name": "ast_grep"}),
+                    None,
+                )
+                .await
+                .expect("describe");
+            let describe_text = match &describe.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let parsed: Value = serde_json::from_str(&describe_text).expect("describe JSON");
+            assert_eq!(parsed["name"], "ast_grep");
+            assert!(parsed["parameters"]["properties"]["pattern"].is_object());
+        });
+    }
+
+    #[test]
+    fn xdev_run_executes_discoverable_tool_through_agent() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                temp.path().join("main.rs"),
+                "fn main() { let _ = compute().unwrap(); }\nfn compute() -> i32 { 1 }\n",
+            )
+            .expect("write fixture");
+            let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
+            let call = xdev_call(
+                "run",
+                Some("ast_grep"),
+                Some(json!({"pattern": "$EXPR.unwrap()", "path": "."})),
+            );
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .await;
+            assert!(!is_error, "run must succeed: {:?}", output.content);
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(
+                text.contains("main.rs"),
+                "run output names the fixture file: {text}"
+            );
+            assert_eq!(
+                output
+                    .details
+                    .as_ref()
+                    .and_then(|d| d.get("dispatchedVia"))
+                    .and_then(Value::as_str),
+                Some("xdev")
+            );
+        });
+    }
+
+    #[test]
+    fn xdev_promote_moves_tool_into_live_schema() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
+
+            // Before promotion: ast_grep is discoverable, so the schema omits it.
+            let defs_before = agent
+                .build_context()
+                .tools
+                .iter()
+                .map(|def| def.name.clone())
+                .collect::<Vec<_>>();
+            assert!(defs_before.contains(&"read".to_string()));
+            assert!(defs_before.contains(&"xdev".to_string()));
+            assert!(
+                !defs_before.contains(&"ast_grep".to_string()),
+                "discoverable tool must be hidden pre-promotion"
+            );
+
+            let call = xdev_call("promote", Some("ast_grep"), None);
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .await;
+            assert!(!is_error);
+
+            let defs_after = agent
+                .build_context()
+                .tools
+                .iter()
+                .map(|def| def.name.clone())
+                .collect::<Vec<_>>();
+            assert!(
+                defs_after.contains(&"ast_grep".to_string()),
+                "promoted tool enters the schema mid-session"
+            );
+        });
+    }
+
+    #[test]
+    fn xdev_run_unknown_tool_named_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let agent = xdev_test_agent(&["read", "ast_grep"], temp.path());
+            let call = xdev_call("run", Some("nosuch_tool"), Some(json!({})));
+            let (output, is_error) = agent
+                .execute_tool_without_hooks(&call, Arc::new(|_| {}))
+                .await;
+            assert!(is_error, "unknown discoverable tool must error");
+            let text = match &output.content[0] {
+                ContentBlock::Text(t) => t.text.clone(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            assert!(text.contains("nosuch_tool"), "error names the tool: {text}");
+        });
+    }
+
+    #[test]
+    fn xdev_schema_token_accounting() {
+        // Bead evidence: schema-token delta essential-only vs all-tools.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let full_registry = ToolRegistry::new(
+            &[
+                "read",
+                "bash",
+                "edit",
+                "write",
+                "grep",
+                "find",
+                "ls",
+                "hashline_edit",
+                "ast_grep",
+                "ast_edit",
+            ],
+            temp.path(),
+            None,
+        );
+        let all_defs: usize = full_registry
+            .tools()
+            .iter()
+            .map(|t| serde_json::to_string(&json!({"name": t.name(), "description": t.description(), "parameters": t.parameters()})).unwrap().len())
+            .sum();
+        let essential_defs: usize = full_registry
+            .tools()
+            .iter()
+            .filter(|t| !full_registry.is_discoverable(t.name()))
+            .map(|t| serde_json::to_string(&json!({"name": t.name(), "description": t.description(), "parameters": t.parameters()})).unwrap().len())
+            .sum();
+        println!(
+            "xdev token accounting: all={all_defs} bytes, essential={essential_defs} bytes, saved={}",
+            all_defs - essential_defs
+        );
+        assert!(
+            essential_defs < all_defs,
+            "essential schema must be strictly smaller ({essential_defs} < {all_defs})"
+        );
+        assert!(full_registry.is_discoverable("ast_grep"));
+        assert!(!full_registry.is_discoverable("read"));
+        assert!(full_registry.get("xdev").is_some(), "xdev auto-registered");
     }
 }

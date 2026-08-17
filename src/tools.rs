@@ -5174,6 +5174,10 @@ pub(crate) fn resize_image_if_needed(
 /// - Enumerating tool schemas when building provider requests.
 pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
+    /// Discoverable-tier tool names (bd-cv653.1.6): excluded from the provider
+    /// schema until promoted via `xdev promote`. Everything not in this set
+    /// is in the schema (essential tier).
+    discoverable: std::collections::HashSet<String>,
 }
 
 impl ToolRegistry {
@@ -5231,17 +5235,77 @@ impl ToolRegistry {
             }
         }
 
-        Self { tools }
+        // Tool load modes (bd-cv653.1.6): register the xdev dispatcher when
+        // the enabled set contains discoverable-tier tools and `xdev` itself
+        // is not turned off. The dispatcher's snapshot powers list/describe;
+        // run/promote are intercepted by the agent executor.
+        let discoverable_names;
+        {
+            let discoverable: Vec<crate::xdev::DiscoverableToolInfo> = tools
+                .iter()
+                .filter(|tool| {
+                    crate::xdev::tier_for(tool.name(), config)
+                        == crate::xdev::LoadMode::Discoverable
+                })
+                .map(|tool| crate::xdev::DiscoverableToolInfo {
+                    name: tool.name().to_string(),
+                    one_liner: crate::xdev::one_liner(tool.description()),
+                    description: tool.description().to_string(),
+                    parameters: tool.parameters(),
+                })
+                .collect();
+            discoverable_names = discoverable.iter().map(|info| info.name.clone()).collect();
+            let xdev_enabled = crate::xdev::tier_for("xdev", config) != crate::xdev::LoadMode::Off;
+            if !discoverable.is_empty() && xdev_enabled {
+                tools.push(Box::new(crate::xdev::XdevTool::new(cwd, discoverable)));
+            }
+        }
+
+        Self {
+            tools,
+            discoverable: discoverable_names,
+        }
     }
 
     /// Construct a registry from a pre-built tool list.
     pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            discoverable: std::collections::HashSet::new(),
+        }
     }
 
     /// Convert the registry into the owned tool list.
     pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
         self.tools
+    }
+
+    /// Whether a tool is currently discoverable-tier (hidden from the
+    /// provider schema until promoted). bd-cv653.1.6.
+    #[must_use]
+    pub fn is_discoverable(&self, name: &str) -> bool {
+        self.discoverable.contains(name)
+    }
+
+    /// Promote a discoverable tool into the live schema set.
+    pub fn mark_promoted(&mut self, name: &str) {
+        self.discoverable.remove(name);
+    }
+
+    /// Names + one-liners of currently discoverable tools (for the
+    /// system-prompt index).
+    #[must_use]
+    pub fn discoverable_index(&self) -> Vec<(String, String)> {
+        self.tools
+            .iter()
+            .filter(|tool| self.discoverable.contains(tool.name()))
+            .map(|tool| {
+                (
+                    tool.name().to_string(),
+                    crate::xdev::one_liner(tool.description()),
+                )
+            })
+            .collect()
     }
 
     /// Append a tool.

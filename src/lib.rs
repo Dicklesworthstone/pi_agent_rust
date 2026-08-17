@@ -253,6 +253,7 @@ pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
 pub mod workspace_trust;
+pub mod xdev;
 
 pub use error::{Error, Result as PiResult};
 #[doc(hidden)]

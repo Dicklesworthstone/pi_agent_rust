@@ -798,13 +798,20 @@ fn ast_tools_are_gated_behind_tools_flag() {
     assert!(not_enabled.get("ast_grep").is_none());
     assert!(not_enabled.get("ast_edit").is_none());
 
-    // The default built-in set does not silently enable the structural tools.
+    // Load modes (bd-cv653.1.6): the default built-in set enables the
+    // structural tools as DISCOVERABLE (reachable via xdev, hidden from the
+    // schema until promoted) — present but not schema-silent.
     let defaults = pi::cli::parse_with_extension_flags(vec!["pi".to_string()])
         .expect("default CLI parse")
         .cli;
     let names = defaults.enabled_tools();
-    assert!(!names.contains(&"ast_grep"));
-    assert!(!names.contains(&"ast_edit"));
+    assert!(names.contains(&"ast_grep"));
+    assert!(names.contains(&"ast_edit"));
+
+    let default_registry = ToolRegistry::new(&names, cwd, None);
+    assert!(default_registry.is_discoverable("ast_grep"));
+    assert!(default_registry.is_discoverable("ast_edit"));
+    assert!(!default_registry.is_discoverable("read"));
 
     let cli = pi::cli::parse_with_extension_flags(vec![
         "pi".to_string(),

@@ -60,6 +60,8 @@ pub struct Config {
     /// path prefix wins.
     #[serde(alias = "modelScopeOverrides")]
     pub model_scope_overrides: Option<Vec<ModelScopeOverride>>,
+    /// Tool load modes (`tools.loadMode`, bd-cv653.1.6).
+    pub tools: Option<ToolSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -405,6 +407,18 @@ pub struct ModelScopeOverride {
     pub disabled_providers: Option<Vec<String>>,
 }
 
+/// Tool load-mode configuration (bd-cv653.1.6).
+///
+/// `loadMode` maps a tool name to `essential` (always in the provider
+/// schema), `discoverable` (behind the xdev dispatcher), or `off`. The
+/// `--tools` CLI flag wins over every entry here.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolSettings {
+    #[serde(alias = "loadMode")]
+    pub load_mode: Option<std::collections::HashMap<String, String>>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -673,6 +687,7 @@ impl Config {
             titling: merge_titling(base.titling, other.titling),
             disabled_providers: other.disabled_providers.or(base.disabled_providers),
             model_scope_overrides: other.model_scope_overrides.or(base.model_scope_overrides),
+            tools: merge_tools(base.tools, other.tools),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -1392,6 +1407,24 @@ fn merge_titling(
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),
         }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge tool settings (other wins per tool-mode entry).
+fn merge_tools(base: Option<ToolSettings>, other: Option<ToolSettings>) -> Option<ToolSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut modes = base.load_mode.unwrap_or_default();
+            if let Some(other_modes) = other.load_mode {
+                modes.extend(other_modes);
+            }
+            Some(ToolSettings {
+                load_mode: if modes.is_empty() { None } else { Some(modes) },
+            })
+        }
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
         (None, None) => None,

@@ -435,10 +435,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit,subagent)
+    /// Specific tools to enable (comma-separated). Default: the essential
+    /// set plus discoverable tools behind the xdev dispatcher (bd-cv653.1.6);
+    /// `subagent` stays opt-in only.
     #[arg(
         long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
+        value_name = "TOOLS",
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,ask,todo"
     )]
     pub tools: String,
 
@@ -1136,6 +1139,10 @@ mod tests {
                 "find",
                 "ls",
                 "hashline_edit",
+                "ast_grep",
+                "ast_edit",
+                "ask",
+                "todo",
             ]
         );
     }
@@ -1507,7 +1514,10 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(cli.tools, "read,bash,edit,write,grep,find,ls,hashline_edit");
+        assert_eq!(
+            cli.tools,
+            "read,bash,edit,write,grep,find,ls,hashline_edit,ast_grep,ast_edit,ask,todo"
+        );
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────
