@@ -43,6 +43,7 @@ use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
 use crate::interactive::PiMsg;
+use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -205,6 +206,10 @@ pub struct PiFtuiModel {
     spinner: SpinnerState,
     /// Usage summary from the last completed turn, shown in the footer.
     usage_line: Option<String>,
+    /// Keybinding catalog (defaults now; user config once the launch path
+    /// wires `KeyBindings::load_from_user_config`). Shared naming with the
+    /// bubbletea stack via `KeyBinding::from_ftui_key`.
+    keybindings: KeyBindings,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
     /// Where completed ask interactions go (launch path calls respond_ui).
@@ -278,6 +283,7 @@ impl PiFtuiModel {
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
+            keybindings: KeyBindings::default(),
             active_ask: None,
             ask_reply_tx: None,
             term: (80, 24),
@@ -541,37 +547,80 @@ impl PiFtuiModel {
                 return Cmd::none();
             }
             Event::Key(key) => {
+                // Hard escape hatch independent of the catalog: the preview
+                // stack always quits on ctrl+c. (The bubbletea stack's richer
+                // ctrl+c semantics — clear input, double-press to exit,
+                // abort-turn — arrive with the launch-path integration.)
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
                 if ctrl_c {
                     return Cmd::quit();
                 }
+
+                // Resolve through the shared keybinding catalog so user
+                // config behaves identically on both stacks. Chords can bind
+                // several context-dependent actions (ctrl+d = delete-forward
+                // in a non-empty editor, exit otherwise), so resolve the set
+                // against UI state.
+                let actions = KeyBinding::from_ftui_key(key)
+                    .map(|binding| self.keybindings.matching_actions(&binding))
+                    .unwrap_or_default();
+                let pick = |wanted: AppAction| actions.contains(&wanted).then_some(wanted);
+                let action = pick(AppAction::PageUp)
+                    .or_else(|| pick(AppAction::PageDown))
+                    .or_else(|| pick(AppAction::Submit))
+                    .or_else(|| pick(AppAction::NewLine))
+                    .or_else(|| pick(AppAction::Interrupt))
+                    .or_else(|| pick(AppAction::CursorLineEnd))
+                    .or_else(|| {
+                        // Exit only wins when the editor is empty; otherwise
+                        // the chord falls through to the editor (delete
+                        // forward for the default ctrl+d).
+                        if self.input.is_empty() {
+                            pick(AppAction::Exit)
+                        } else {
+                            None
+                        }
+                    });
                 let page = self.body_height().saturating_sub(1).max(1);
-                let shift = key.modifiers.contains(Modifiers::SHIFT);
-                // Conversation scroll bindings win over the editor, mirroring
-                // the bubbletea stack (PgUp/PgDn, Shift+Up/Down, End).
-                match key.code {
-                    KeyCode::PageUp => return self.consume_scroll(|m| m.scroll_up(page)),
-                    KeyCode::PageDown => return self.consume_scroll(|m| m.scroll_down(page)),
-                    KeyCode::Up if shift => return self.consume_scroll(|m| m.scroll_up(1)),
-                    KeyCode::Down if shift => return self.consume_scroll(|m| m.scroll_down(1)),
-                    KeyCode::End => {
-                        self.scroll_from_tail = 0;
+                match action {
+                    Some(AppAction::PageUp) => return self.consume_scroll(|m| m.scroll_up(page)),
+                    Some(AppAction::PageDown) => {
+                        return self.consume_scroll(|m| m.scroll_down(page));
+                    }
+                    Some(AppAction::Exit) if self.input.is_empty() => return Cmd::quit(),
+                    Some(AppAction::Interrupt) if self.active_ask.is_some() => {
+                        // Escape dismisses the pending ask card.
+                        if let Some(ask) = self.active_ask.take() {
+                            self.transcript.push(String::from("  (dismissed)"));
+                            self.scroll_from_tail = 0;
+                            self.send_ask_reply(ask.request.id, Vec::new(), true);
+                        }
                         return Cmd::none();
                     }
-                    _ => {}
-                }
-                if self.input_active() {
-                    if key.code == KeyCode::Enter {
-                        if key.modifiers.contains(Modifiers::ALT) {
-                            self.input.insert_newline();
-                        } else if self.active_ask.is_some() {
+                    Some(AppAction::Submit) if self.input_active() => {
+                        if self.active_ask.is_some() {
                             self.submit_ask_answer();
                         } else {
                             self.submit_input();
                         }
                         return Cmd::none();
                     }
+                    Some(AppAction::NewLine) if self.input_active() => {
+                        self.input.insert_newline();
+                        return Cmd::none();
+                    }
+                    Some(AppAction::CursorLineEnd) if self.input.is_empty() => {
+                        // End with an empty editor resumes tail-follow; with
+                        // content it falls through to the editor's line-end.
+                        self.scroll_from_tail = 0;
+                        return Cmd::none();
+                    }
+                    _ => {}
+                }
+                if self.input_active() {
+                    // Unrouted keys reach the editor (its own emacs-style
+                    // bindings cover cursor/delete/kill-ring behavior).
                     self.input.handle_event(event);
                 }
             }
@@ -1202,6 +1251,44 @@ mod tests {
             Some("staging with canary")
         );
         assert!(reply.response.answers[0].selected.is_empty());
+    }
+
+    #[test]
+    fn catalog_routes_shift_enter_newline_and_ctrl_d_exit() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // shift+enter → NewLine action via the catalog.
+        sim.inject_event(key(KeyCode::Char('a'), Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Enter, Modifiers::SHIFT));
+        sim.inject_event(key(KeyCode::Char('b'), Modifiers::empty()));
+        assert_eq!(sim.model().input.text(), "a\nb");
+        // ctrl+d with content → editor delete-forward (no exit).
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert!(sim.is_running(), "ctrl+d exited despite editor content");
+        // Drain the editor, then ctrl+d → Exit.
+        sim.model_mut().input.set_text("");
+        sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
+        assert!(!sim.is_running(), "ctrl+d on empty editor did not exit");
+    }
+
+    #[test]
+    fn escape_dismisses_active_ask() {
+        let (agent_tx, agent_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel::<AskUiReply>();
+        let model = PiFtuiModel::new(agent_rx).with_ask_reply_channel(reply_tx);
+        drop(agent_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-esc",
+            vec![question("Continue?", &["yes", "no"], false)],
+        ))));
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        let reply = reply_rx.try_recv().expect("dismissal sent");
+        assert!(reply.response.dismissed);
+        assert!(sim.model().active_ask.is_none());
     }
 
     #[test]

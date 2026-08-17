@@ -821,6 +821,78 @@ impl KeyBinding {
             modifiers,
         })
     }
+
+    /// Convert an ftui key event to a `KeyBinding` (FrankenTUI migration,
+    /// bd-cv653.9.1). Mirrors [`Self::from_bubbletea_key`]'s catalog naming
+    /// exactly — same lowercase key names, same char-lowercasing with shift
+    /// dropped on plain characters — so a user's keybinding config resolves
+    /// identically on both stacks during coexistence.
+    #[cfg(feature = "ftui")]
+    #[must_use]
+    pub fn from_ftui_key(key: &ftui::KeyEvent) -> Option<Self> {
+        use ftui::KeyCode as F;
+
+        let mods = key.modifiers;
+        let base = KeyModifiers {
+            ctrl: mods.contains(ftui::Modifiers::CTRL),
+            alt: mods.contains(ftui::Modifiers::ALT),
+            shift: mods.contains(ftui::Modifiers::SHIFT),
+        };
+
+        let key_name: String = match key.code {
+            F::Char(' ') => "space".to_string(),
+            F::Char(c) => {
+                // Match the bubbletea Runes path: chars are lowercased and
+                // shift is not reported as a separate modifier.
+                return Some(Self {
+                    key: c.to_lowercase().to_string(),
+                    modifiers: KeyModifiers {
+                        shift: false,
+                        ..base
+                    },
+                });
+            }
+            F::Enter => "enter".to_string(),
+            F::Escape => "escape".to_string(),
+            F::Backspace => "backspace".to_string(),
+            F::Tab => "tab".to_string(),
+            F::BackTab => {
+                // bubbletea reports back-tab as shift+tab.
+                return Some(Self {
+                    key: "tab".to_string(),
+                    modifiers: KeyModifiers {
+                        shift: true,
+                        ..base
+                    },
+                });
+            }
+            F::Delete => "delete".to_string(),
+            F::Insert => "insert".to_string(),
+            F::Home => "home".to_string(),
+            F::End => "end".to_string(),
+            F::PageUp => "pageup".to_string(),
+            F::PageDown => "pagedown".to_string(),
+            F::Up => "up".to_string(),
+            F::Down => "down".to_string(),
+            F::Left => "left".to_string(),
+            F::Right => "right".to_string(),
+            F::F(n) => format!("f{n}"),
+            F::Null => {
+                // Ctrl+Space / Ctrl+@ maps to ctrl+@ like bubbletea's Null.
+                return Some(Self {
+                    key: "@".to_string(),
+                    modifiers: KeyModifiers { ctrl: true, ..base },
+                });
+            }
+            // Media/IME/other keys have no catalog entries.
+            _ => return None,
+        };
+
+        Some(Self {
+            key: key_name,
+            modifiers: base,
+        })
+    }
 }
 
 impl fmt::Display for KeyBinding {
@@ -2685,6 +2757,94 @@ mod tests {
                     "function key '{key}' should be invalid"
                 );
             }
+        }
+    }
+
+    // ========================================================================
+    // ftui KeyEvent → KeyBinding conversion (bd-cv653.9.1)
+    // ========================================================================
+    //
+    // Parity cases against `from_bubbletea_key`: both converters must resolve
+    // the same catalog entries for the same physical chords.
+    #[cfg(feature = "ftui")]
+    mod ftui_conversion {
+        use super::*;
+
+        fn fkey(code: ftui::KeyCode, modifiers: ftui::Modifiers) -> ftui::KeyEvent {
+            ftui::KeyEvent {
+                code,
+                modifiers,
+                kind: ftui::KeyEventKind::Press,
+            }
+        }
+
+        #[test]
+        fn chars_lowercase_and_drop_shift() {
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Char('A'), ftui::Modifiers::SHIFT))
+                    .unwrap();
+            assert_eq!(b.key, "a");
+            assert_eq!(b.modifiers, KeyModifiers::NONE);
+        }
+
+        #[test]
+        fn ctrl_char_and_named_keys() {
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Char('r'), ftui::Modifiers::CTRL))
+                    .unwrap();
+            assert_eq!((b.key.as_str(), b.modifiers), ("r", KeyModifiers::CTRL));
+
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Enter, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!(b.key, "enter");
+
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Escape, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!(b.key, "escape");
+
+            let b = KeyBinding::from_ftui_key(&fkey(
+                ftui::KeyCode::Char(' '),
+                ftui::Modifiers::empty(),
+            ))
+            .unwrap();
+            assert_eq!(b.key, "space");
+        }
+
+        #[test]
+        fn shifted_navigation_and_backtab() {
+            let b = KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Up, ftui::Modifiers::SHIFT))
+                .unwrap();
+            assert_eq!((b.key.as_str(), b.modifiers), ("up", KeyModifiers::SHIFT));
+
+            let b =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::BackTab, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!((b.key.as_str(), b.modifiers), ("tab", KeyModifiers::SHIFT));
+        }
+
+        #[test]
+        fn function_keys_and_default_catalog_resolution() {
+            let b = KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::F(5), ftui::Modifiers::empty()))
+                .unwrap();
+            assert_eq!(b.key, "f5");
+
+            // End-to-end: default catalog resolves the same actions the
+            // bubbletea stack sees for these chords.
+            let bindings = KeyBindings::default();
+            let submit =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Enter, ftui::Modifiers::empty()))
+                    .unwrap();
+            assert_eq!(bindings.lookup(&submit), Some(AppAction::Submit));
+            let newline =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Enter, ftui::Modifiers::SHIFT))
+                    .unwrap();
+            assert_eq!(bindings.lookup(&newline), Some(AppAction::NewLine));
+            let page_up =
+                KeyBinding::from_ftui_key(&fkey(ftui::KeyCode::Up, ftui::Modifiers::SHIFT))
+                    .unwrap();
+            assert_eq!(bindings.lookup(&page_up), Some(AppAction::PageUp));
         }
     }
 }
