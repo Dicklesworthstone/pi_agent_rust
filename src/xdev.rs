@@ -68,6 +68,8 @@ const ESSENTIAL_DEFAULTS: &[&str] = &[
     "ask",
     "todo",
     "xdev",
+    // Daily-driver research tool (bd-cv653.2.1).
+    "web_search",
     // Tiny schema, required the moment plan mode activates (bd-cv653.3.5).
     "submit_plan",
 ];
@@ -117,6 +119,7 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
         "find",
         "ls",
         "hashline_edit",
+        "web_search",
         "ast_grep",
         "ast_edit",
         "ask",
@@ -141,6 +144,7 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "hashline_edit" => {
             "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true"
         }
+        "web_search" => "Search the web across a ranked provider chain with automatic fallback",
         "ast_grep" => "Structural code search using tree-sitter AST patterns (ast-grep syntax)",
         "ast_edit" => {
             "Staged structural code rewrite using tree-sitter AST patterns (ast-grep syntax)"

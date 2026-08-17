@@ -248,6 +248,7 @@ pub mod tools;
 #[doc(hidden)]
 pub mod tui;
 pub mod url_read;
+pub mod web_search;
 #[doc(hidden)]
 pub mod validation_broker;
 #[doc(hidden)]
