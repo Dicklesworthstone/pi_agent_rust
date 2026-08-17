@@ -138,6 +138,139 @@ fn e2e_ftui_launch_help_bash_quit() {
     session.write_artifacts();
 }
 
+/// Signal-teardown terminal-state proofs (acceptance #1 hard part).
+///
+/// SIGTERM: ftui's runtime intercepts termination signals, drops the program
+/// (RAII terminal restore), and exits 128+sig — so after SIGTERM the wrapper
+/// shell's typed probe MUST echo (appear twice in the pane: echoed input +
+/// output). This is the same restore path a panic takes.
+///
+/// SIGKILL: no process can restore a tty it was KILLed on (POSIX), and the
+/// pane capture demonstrably shows raw-mode staircase output. What we prove
+/// instead: the wrapping shell is alive and a blind `stty sane` recovers the
+/// terminal — the user-visible recovery story.
+///
+/// Gap vs the bead's wording: the signal lands while the UI is live but idle
+/// (no fake provider streams in this lane yet); raw mode + mouse capture +
+/// alt-screen are all active at signal time, which is the terminal state
+/// that matters.
+fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool) {
+    use std::fmt::Write as _;
+
+    let Some((_lock, session)) = new_locked_session(name) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let Some(binary) = std::env::var_os("CARGO_BIN_EXE_pi") else {
+        eprintln!("Skipping: CARGO_BIN_EXE_pi not set");
+        return;
+    };
+    let binary = std::path::PathBuf::from(binary);
+
+    // ubs:ignore-next-line expect in test setup — failures here are immediate test failures, same convention as tests/common/tmux.rs
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let pid_file = session.harness.temp_path("pi.pid");
+
+    // Custom wrapper: pi runs in the FOREGROUND (it needs the tty for raw
+    // mode) inside an inner `sh -c 'echo $$ > pid; exec pi ...'` — the exec
+    // makes the recorded pid become pi's. After the kill the outer script
+    // continues to the marker and hands the pane to an interactive shell.
+    let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    for (key, sub) in [
+        ("PI_CODING_AGENT_DIR", "agent"),
+        ("PI_CONFIG_PATH", "config.toml"),
+        ("PI_SESSIONS_DIR", "sessions"),
+        ("PI_PACKAGE_DIR", "packages"),
+    ] {
+        let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
+    }
+    script.push_str("export PI_TEST_MODE=1\nexport OPENAI_API_KEY=pi-e2e-sigkill-dummy\n");
+    let _ = writeln!(
+        script,
+        "/bin/sh -c 'echo $$ > {pid}; exec {bin} --ftui --no-session \
+         --provider openai --model gpt-4o-mini --no-skills \
+         --no-prompt-templates --no-extensions --no-themes'",
+        pid = pid_file.display(),
+        bin = binary.display()
+    );
+    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i\n");
+
+    let script_path = session.harness.temp_path("sigkill-run.sh");
+    std::fs::write(&script_path, &script).expect("write sigkill script"); // ubs:ignore test setup expect
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // ubs:ignore test setup expect — chmod failure is an immediate test failure
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat sigkill script") // ubs:ignore test setup expect
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod sigkill script"); // ubs:ignore test setup expect
+    }
+
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+
+    // Full launch: the banner proves raw mode/alt-screen/mouse are active.
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+
+    // An unreadable/unparseable pid file is an immediate test failure.
+    let pid_text = std::fs::read_to_string(&pid_file).expect("read pi pid"); // ubs:ignore test assertion expect
+    let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
+    // Literal /bin/kill path is deliberate: portable signal delivery without
+    // libc in a unix-only test; a spawn failure is an immediate test failure.
+    let mut kill_cmd = std::process::Command::new("/bin/kill"); // ubs:ignore unix-only test helper path
+    kill_cmd.args([signal, &pid.to_string()]);
+    let status = kill_cmd.status().expect("run kill"); // ubs:ignore test assertion expect
+    assert!(status.success(), "kill {signal} {pid} failed");
+
+    // The wrapper shell takes over the pane once pi dies.
+    session
+        .tmux
+        .wait_for_pane_contains("PI-WAIT-DONE", COMMAND_TIMEOUT);
+
+    if blind_stty_sane {
+        // SIGKILL path: the tty is expected to still be raw here; a blind
+        // `stty sane` (typed without echo) must recover it.
+        session.tmux.send_literal("stty sane");
+        session.tmux.send_key("Enter");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+
+    // Post-signal probe: typed input must echo AND execute.
+    session.tmux.send_literal("echo POST-KILL-OK");
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("POST-KILL-OK", COMMAND_TIMEOUT);
+    let occurrences = pane.matches("POST-KILL-OK").count();
+    assert!(
+        occurrences >= 2,
+        "typed probe did not echo (terminal left in raw/no-echo state?); \
+         occurrences={occurrences}, pane:\n{pane}"
+    );
+
+    session.tmux.kill_server();
+}
+
+/// SIGTERM must restore the terminal via RAII before exiting.
+#[test]
+fn e2e_ftui_sigterm_restores_terminal() {
+    run_signal_teardown("e2e_ftui_sigterm_restores_terminal", "-TERM", false);
+}
+
+/// SIGKILL cannot restore (POSIX); the shell must survive and `stty sane`
+/// must recover the pane.
+#[test]
+fn e2e_ftui_sigkill_recoverable_with_stty_sane() {
+    run_signal_teardown("e2e_ftui_sigkill_recoverable_with_stty_sane", "-9", true);
+}
+
 /// Acceptance #2 lane: the inline (scrollback-preserving) runtime path boots,
 /// renders, and quits cleanly. Scrollback-content preservation itself is
 /// asserted by the doctor capture follow-up; this pins the mode end to end.
