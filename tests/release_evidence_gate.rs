@@ -5910,6 +5910,8 @@ fn release_gate_embedded_e2e_validator_rejects_failed_runner_outcome() {
     );
 }
 
+// POSIX-only: marks the embedded validator executable through the Unix mode bits.
+#[cfg(unix)]
 #[test]
 fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
     use std::os::unix::fs::PermissionsExt;

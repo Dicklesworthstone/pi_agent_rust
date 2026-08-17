@@ -1,3 +1,9 @@
+//! POSIX-only. Every case builds a mock `rch` as an executable shell script
+//! (`set_mode(0o755)`) under a `/tmp` case directory and admits it through
+//! `PATH`, so there is nothing here for Windows to assert; `--all-targets` on a
+//! Windows host only needs the file to compile away.
+#![cfg(unix)]
+
 use serde::Deserialize;
 use serde_json::Value;
 use std::os::unix::fs::PermissionsExt as _;
