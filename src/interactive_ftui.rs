@@ -102,6 +102,9 @@ const AGENT_EVENT_POLL: Duration = Duration::from_millis(50);
 /// Spinner animation cadence while the agent works.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
 
+/// Key hint shown in the footer while a picker overlay is open.
+const PICKER_HINT: &str = "↑/↓ j/k navigate · Enter apply · Esc close";
+
 /// Drain loop shared by [`Subscription::run`] and unit tests. `stopped` is
 /// polled between receives; `StopSignal` has no public constructor, so tests
 /// pass a plain closure and terminate via channel disconnect instead.
@@ -247,6 +250,23 @@ pub struct AskUiReply {
     pub response: AskResponse,
 }
 
+/// Modal list picker rendered over the conversation body. All pickers of the
+/// bubbletea stack (theme, model, session, branch) share this shape; while
+/// open it captures every key (Up/Down/j/k navigate, Enter confirms, Esc
+/// closes), matching the modal-capture chain in `update_inner`.
+struct PickerOverlay {
+    title: String,
+    items: Vec<String>,
+    selected: usize,
+    kind: PickerKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PickerKind {
+    /// Built-in theme picker (`/theme`): applies the palette UI-side.
+    Theme,
+}
+
 /// Command from the UI to the agent driver.
 ///
 /// The seed of the bubbletea stack's input-routing chain: prompts run agent
@@ -302,6 +322,8 @@ pub struct PiFtuiModel {
     usage_line: Option<String>,
     /// Theme-derived colors for chrome and role styling.
     palette: FtuiPalette,
+    /// Modal picker overlay; captures all keys while open.
+    picker: Option<PickerOverlay>,
     /// Keybinding catalog (defaults now; user config once the launch path
     /// wires `KeyBindings::load_from_user_config`). Shared naming with the
     /// bubbletea stack via `KeyBinding::from_ftui_key`.
@@ -380,6 +402,7 @@ impl PiFtuiModel {
             spinner: SpinnerState::default(),
             usage_line: None,
             palette: FtuiPalette::default(),
+            picker: None,
             keybindings: KeyBindings::default(),
             active_ask: None,
             ask_reply_tx: None,
@@ -665,11 +688,20 @@ impl PiFtuiModel {
             }
             return;
         }
+        if clean == "/theme" {
+            self.picker = Some(PickerOverlay {
+                title: String::from("Theme (Enter to apply, Esc to close)"),
+                items: vec![String::from("dark"), String::from("light")],
+                selected: 0,
+                kind: PickerKind::Theme,
+            });
+            return;
+        }
         if clean == "/help" {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model <provider>/<model>, /help — \
+                    "ftui preview commands: /model <provider>/<model>, /theme, /help — \
                      everything else is still on the charmed stack",
                 ),
             );
@@ -685,6 +717,46 @@ impl PiFtuiModel {
         }
 
         self.send_command(UiCommand::Prompt(clean));
+    }
+
+    fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                picker.selected = (picker.selected + 1).min(picker.items.len().saturating_sub(1));
+            }
+            KeyCode::Escape => {
+                self.picker = None;
+            }
+            KeyCode::Enter => {
+                let Some(mut picker) = self.picker.take() else {
+                    return;
+                };
+                let choice = picker.items.swap_remove(picker.selected);
+                self.apply_picker_choice(picker.kind, &choice);
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_picker_choice(&mut self, kind: PickerKind, choice: &str) {
+        match kind {
+            PickerKind::Theme => {
+                let theme = if choice == "light" {
+                    crate::theme::Theme::light()
+                } else {
+                    crate::theme::Theme::dark()
+                };
+                self.palette = FtuiPalette::from_theme(&theme);
+                self.push_entry(EntryRole::System, format!("theme set to {choice}"));
+                self.scroll_from_tail = 0;
+            }
+        }
     }
 
     fn send_command(&self, command: UiCommand) {
@@ -715,6 +787,13 @@ impl PiFtuiModel {
                     key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
                 if ctrl_c {
                     return Cmd::quit();
+                }
+
+                // Modal picker captures all input while open (same precedence
+                // as the bubbletea modal-capture chain).
+                if self.picker.is_some() {
+                    self.handle_picker_key(key);
+                    return Cmd::none();
                 }
 
                 // Resolve through the shared keybinding catalog so user
@@ -888,6 +967,34 @@ impl Model for PiFtuiModel {
             header_style,
         )]))
         .render(regions.header, frame);
+
+        // Modal picker takes over the conversation body while open. Lines
+        // borrow the picker's strings — no per-frame allocation.
+        if let Some(picker) = &self.picker {
+            let mut lines = vec![ftui::text::Line::styled(
+                picker.title.as_str(),
+                ftui::Style::new().bold().fg(self.palette.accent),
+            )];
+            for (i, item) in picker.items.iter().enumerate() {
+                let (marker, style) = if i == picker.selected {
+                    ("▸ ", ftui::Style::new().bold().fg(self.palette.accent))
+                } else {
+                    ("  ", ftui::Style::new())
+                };
+                lines.push(ftui::text::Line::from_spans([
+                    ftui::text::Span::styled(marker, style),
+                    ftui::text::Span::styled(item.as_str(), style),
+                ]));
+            }
+            Paragraph::new(Text::from_lines(lines)).render(regions.body, frame);
+            let footer_style = ftui::Style::new().dim().fg(self.palette.muted);
+            Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+                PICKER_HINT,
+                footer_style,
+            )]))
+            .render(regions.footer, frame);
+            return;
+        }
 
         // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
         // sticks to the bottom; scrolling up pins an offset measured from the
@@ -1856,6 +1963,55 @@ mod tests {
             rendered.contains("plain body"),
             "body missing: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn theme_picker_opens_navigates_applies_and_captures_keys() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let dark_accent = sim.model().palette.accent;
+        type_str(&mut sim, "/theme");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_some(), "picker did not open");
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("Theme"),
+            "picker title missing: {rendered:?}"
+        );
+        assert!(rendered.contains("▸ dark"), "selection marker missing");
+        // Keys go to the picker, not the editor.
+        sim.inject_event(key(KeyCode::Char('j'), Modifiers::empty()));
+        assert!(sim.model().input.is_empty(), "picker leaked keys to editor");
+        assert_eq!(sim.model().picker.as_ref().unwrap().selected, 1);
+        // Enter applies light and closes.
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().picker.is_none(), "picker did not close");
+        assert_ne!(
+            sim.model().palette.accent,
+            dark_accent,
+            "palette unchanged after applying light theme"
+        );
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("theme set to light")),
+            "confirmation note missing"
+        );
+    }
+
+    #[test]
+    fn theme_picker_escape_closes_without_change() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        let accent_before = sim.model().palette.accent;
+        type_str(&mut sim, "/theme");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        assert!(sim.model().picker.is_none());
+        assert_eq!(sim.model().palette.accent, accent_before);
     }
 
     #[test]
