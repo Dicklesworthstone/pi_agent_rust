@@ -174,17 +174,29 @@ def parse_ubs_output(root: Path, output: str) -> tuple[list[Finding], dict[str, 
         if location and severity:
             rel_path = normalize_path(root, location.group("path"))
             if rel_path is not None:
+                # Prefer the description on the SAME line as the location
+                # ("file.rs:42:5 – Issue description"). Only fall back to the
+                # carried category/context line when the location line has no
+                # trailing text, and consume the carried message either way so
+                # a previous finding's snippet or fix text never attaches to a
+                # later finding in a different file (bd-gel2u class 2).
+                remainder = re.sub(r"^:\d+", "", raw_line[location.end() :].strip())
+                remainder = remainder.strip().lstrip("–—-:· ").strip()
                 findings.append(
                     Finding(
                         severity=severity,
                         path=rel_path,
                         line=int(location.group("line")),
-                        message=message,
+                        message=remainder or message,
                     )
                 )
+            message = ""
             continue
 
-        if severity and stripped and not stripped.startswith(("✓", "▓", "─", "╔", "║", "╚")):
+        # 💡 lines are fix suggestions for the PREVIOUS finding; code-snippet
+        # and box-drawing lines are context — none of them may become the
+        # message of the NEXT finding.
+        if severity and stripped and not stripped.startswith(("✓", "▓", "─", "╔", "║", "╚", "💡")):
             message = stripped
 
     return findings, totals
