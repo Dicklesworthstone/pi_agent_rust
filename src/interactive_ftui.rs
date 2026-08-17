@@ -709,12 +709,28 @@ impl PiFtuiModel {
         Cmd::none()
     }
 
-    /// Build the styled conversation: each entry gets its role prefix on the
-    /// first line, matching indent on continuation lines, and the role style.
+    /// Build the styled conversation. Assistant content renders as markdown
+    /// (auto-detected; plain text stays plain); other roles get their prefix
+    /// on the first line, matching indent on continuations, and role style.
+    ///
+    /// Note: markdown rendering can change line counts vs the raw text, so
+    /// `conversation_line_count()` is an approximation for scroll clamping in
+    /// `update()`; the view recomputes offsets against the rendered total.
     fn conversation_text(&self) -> Text<'static> {
+        // Assistant output always renders as markdown, matching the glamour
+        // treatment in the bubbletea stack (auto-detection would leave short
+        // or mostly-plain replies unstyled).
+        let md = ftui_extras::markdown::MarkdownRenderer::new(
+            ftui_extras::markdown::MarkdownTheme::default(),
+        );
         let mut lines: Vec<ftui::text::Line<'static>> =
             Vec::with_capacity(self.conversation_line_count());
         let mut push_block = |role: EntryRole, content: &str| {
+            if role == EntryRole::Assistant {
+                let rendered = md.render(content);
+                lines.extend(rendered.lines().iter().cloned());
+                return;
+            }
             let style = role.style();
             let prefix = role.prefix();
             let indent = " ".repeat(prefix.chars().count());
@@ -733,7 +749,10 @@ impl PiFtuiModel {
             push_block(entry.role, &entry.text);
         }
         if !self.streaming.is_empty() {
-            push_block(EntryRole::Assistant, &self.streaming);
+            // Streaming fragments may end mid-construct; the streaming
+            // renderer is tolerant of unterminated markdown.
+            let rendered = md.render_streaming(&self.streaming);
+            lines.extend(rendered.lines().iter().cloned());
         }
         Text::from_lines(lines)
     }
@@ -1603,6 +1622,35 @@ mod tests {
             // ubs:ignore panic in #[cfg(test)] match-else is an assertion failure, not library code
             other => panic!("unexpected translation: {other:?}"),
         }
+    }
+
+    #[test]
+    fn assistant_markdown_renders_without_markers() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta(
+            "# Release Notes\n\nplain body".into(),
+        )));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        let rendered = buffer_text(sim.capture_frame(50, 10), 50, 10);
+        assert!(
+            rendered.contains("Release Notes"),
+            "heading text missing: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("# Release Notes"),
+            "markdown marker leaked into frame: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("plain body"),
+            "body missing: {rendered:?}"
+        );
     }
 
     #[test]

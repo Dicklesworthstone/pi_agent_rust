@@ -217,6 +217,10 @@ arboard = { version = "3.6.1", optional = true }
 # crossterm backend for now (pi already ships crossterm via `tui`); the Unix
 # native-backend (ftui-tty) switch is a later rollout step per the bead.
 ftui = { version = "0.5", default-features = false, features = ["runtime", "crossterm"], optional = true }
+# Markdown rendering for the ftui conversation view. Direct dep because the
+# facade's `extras` feature enables no ftui-extras features (markdown stays
+# off); default-features off keeps the heavy extras (charts, doom, ...) out.
+ftui-extras = { version = "0.5", default-features = false, features = ["markdown"], optional = true }
 
 # Filesystem
 dirs = "6"
@@ -402,7 +406,7 @@ tui = [
 # FrankenTUI migration stack (bd-cv653.9.1): default-OFF while the interactive
 # runtime is ported. Requires `tui` because the bridge reuses PiMsg and the
 # existing agent-event plumbing during coexistence.
-ftui = ["dep:ftui", "tui"]
+ftui = ["dep:ftui", "dep:ftui-extras", "tui"]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]
