@@ -37,6 +37,7 @@ use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
 use ftui::text::Text;
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
+use ftui::widgets::spinner::{DOTS, SpinnerState};
 use ftui::widgets::textarea::TextArea;
 use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
@@ -95,6 +96,9 @@ impl AgentEventSubscription {
 }
 
 const AGENT_EVENT_POLL: Duration = Duration::from_millis(50);
+
+/// Spinner animation cadence while the agent works.
+const SPINNER_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Drain loop shared by [`Subscription::run`] and unit tests. `stopped` is
 /// polled between receives; `StopSignal` has no public constructor, so tests
@@ -175,6 +179,12 @@ pub struct PiFtuiModel {
     current_tool: Option<String>,
     /// Compact todo footer summary (`settled/total · current task`).
     todo_summary: Option<String>,
+    /// Sanitized in-flight thinking text (drives the `thinking…` status).
+    thinking: String,
+    /// Spinner animation state; advanced by `Event::Tick` while working.
+    spinner: SpinnerState,
+    /// Usage summary from the last completed turn, shown in the footer.
+    usage_line: Option<String>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
     term: (u16, u16),
     /// Conversation scroll, measured in lines UP from the tail. 0 means
@@ -241,6 +251,9 @@ impl PiFtuiModel {
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
+            thinking: String::new(),
+            spinner: SpinnerState::default(),
+            usage_line: None,
             term: (80, 24),
             scroll_from_tail: 0,
             input: TextArea::new()
@@ -318,11 +331,18 @@ impl PiFtuiModel {
         match msg {
             PiMsg::AgentStart => {
                 self.state = AgentUiState::Working;
+                // Start the spinner tick chain; it dies naturally once the
+                // agent goes idle (Tick reschedules only while Working —
+                // same self-limiting pattern as the bubbletea spinner gate).
+                return Cmd::tick(SPINNER_INTERVAL);
             }
             PiMsg::TextDelta(delta) => {
                 // Adversarial-content safety: agent/tool text is sanitized
                 // before it can ever reach a frame.
                 self.streaming.push_str(&sanitize(&delta));
+            }
+            PiMsg::ThinkingDelta(delta) => {
+                self.thinking.push_str(&sanitize(&delta));
             }
             PiMsg::ToolStart { name, .. } => {
                 self.current_tool = Some(sanitize(&name).into_owned());
@@ -333,20 +353,32 @@ impl PiFtuiModel {
             PiMsg::TodoSummary { summary } => {
                 self.todo_summary = summary.map(|s| sanitize(&s).into_owned());
             }
-            PiMsg::AgentDone { error_message, .. } => {
+            PiMsg::AgentDone {
+                usage,
+                error_message,
+                ..
+            } => {
                 if !self.streaming.is_empty() {
                     self.transcript.push(std::mem::take(&mut self.streaming));
                 }
                 if let Some(err) = error_message {
                     self.transcript.push(format!("error: {}", sanitize(&err)));
                 }
+                if let Some(usage) = usage {
+                    self.usage_line = Some(format!(
+                        "tokens {}↑ {}↓ · total {}",
+                        usage.input, usage.output, usage.total_tokens
+                    ));
+                }
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
+                self.thinking.clear();
             }
             PiMsg::AgentError(err) => {
                 self.transcript.push(format!("error: {}", sanitize(&err)));
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
+                self.thinking.clear();
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
                 self.transcript.push(sanitize(&text).into_owned());
@@ -382,6 +414,15 @@ impl PiFtuiModel {
 
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
         match event {
+            Event::Tick => {
+                // Spinner heartbeat: advance and reschedule only while the
+                // agent is working, so idle sessions stay fully parked.
+                if self.state == AgentUiState::Working {
+                    self.spinner.tick();
+                    return Cmd::tick(SPINNER_INTERVAL);
+                }
+                return Cmd::none();
+            }
             Event::Key(key) => {
                 let ctrl_c =
                     key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
@@ -497,15 +538,26 @@ impl Model for PiFtuiModel {
             .scroll((offset_u16, 0))
             .render(regions.body, frame);
 
-        // Status region: running tool takes precedence, then todo summary.
-        let status_line = self.current_tool.as_ref().map_or_else(
-            || {
-                self.todo_summary
-                    .as_ref()
-                    .map_or_else(String::new, |todo| format!("todo {todo}"))
-            },
-            |tool| format!("running {tool} ..."),
-        );
+        // Status region. While working: spinner + activity (tool > thinking >
+        // responding). While idle: the todo summary.
+        let status_line = if self.state == AgentUiState::Working {
+            let spin = DOTS[self.spinner.current_frame % DOTS.len()];
+            let activity = self.current_tool.as_ref().map_or_else(
+                || {
+                    if self.streaming.is_empty() && !self.thinking.is_empty() {
+                        String::from("thinking ...")
+                    } else {
+                        String::from("responding ...")
+                    }
+                },
+                |tool| format!("running {tool} ..."),
+            );
+            format!("{spin} {activity}")
+        } else {
+            self.todo_summary
+                .as_ref()
+                .map_or_else(String::new, |todo| format!("todo {todo}"))
+        };
         if !status_line.is_empty() {
             Paragraph::new(Text::raw(&status_line)).render(regions.status, frame);
         }
@@ -517,9 +569,11 @@ impl Model for PiFtuiModel {
             Paragraph::new(Text::raw("… processing (ctrl+c to quit)")).render(regions.input, frame);
         }
 
-        // Footer: scroll position indicator until the usage footer ports.
+        // Footer: scroll indicator wins; otherwise last-turn usage stats.
         let footer = if from_tail > 0 {
             format!("[{from_tail} lines up] End to follow")
+        } else if let Some(usage) = &self.usage_line {
+            usage.clone()
         } else {
             String::from("pi — ftui preview")
         };
@@ -716,6 +770,7 @@ mod tests {
         let (_tx, model) = new_model();
         let mut sim = ProgramSimulator::new(model);
         sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
         sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
             name: "bash".into(),
             tool_id: "t1".into(),
@@ -833,6 +888,80 @@ mod tests {
         let (msg_tx, _msg_rx) = mpsc::channel::<PiFtuiMsg>();
         // stop=true up front: must return immediately without receiving.
         drain_agent_events(&agent_rx, &msg_tx, || true);
+    }
+
+    #[test]
+    fn spinner_ticks_while_working_and_stops_when_idle() {
+        use ftui::runtime::simulator::CmdRecord;
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // AgentStart schedules the first tick.
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        assert!(
+            matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))),
+            "AgentStart did not schedule a tick: {:?}",
+            sim.command_log().last()
+        );
+        // Ticks advance the spinner and re-arm while working...
+        let frame_before = sim.model().spinner.current_frame;
+        sim.inject_event(Event::Tick);
+        assert_eq!(sim.model().spinner.current_frame, frame_before + 1);
+        assert!(matches!(sim.command_log().last(), Some(CmdRecord::Tick(_))));
+        let spin = DOTS[sim.model().spinner.current_frame % DOTS.len()];
+        let rendered = buffer_text(sim.capture_frame(40, 8), 40, 8);
+        assert!(
+            rendered.contains(spin),
+            "status missing spinner frame {spin:?}: {rendered:?}"
+        );
+        // ...but the chain dies once the agent is idle.
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: None,
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        let frame_after_done = sim.model().spinner.current_frame;
+        sim.inject_event(Event::Tick);
+        assert_eq!(sim.model().spinner.current_frame, frame_after_done);
+        assert!(matches!(sim.command_log().last(), Some(CmdRecord::None)));
+    }
+
+    #[test]
+    fn thinking_status_then_responding_then_usage_footer() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ThinkingDelta(
+            "mull it over".into(),
+        )));
+        let rendered = buffer_text(sim.capture_frame(44, 8), 44, 8);
+        assert!(
+            rendered.contains("thinking ..."),
+            "missing thinking: {rendered:?}"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::TextDelta("answer".into())));
+        let rendered = buffer_text(sim.capture_frame(44, 8), 44, 8);
+        assert!(
+            rendered.contains("responding ..."),
+            "missing responding: {rendered:?}"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentDone {
+            usage: Some(crate::model::Usage {
+                input: 120,
+                output: 45,
+                total_tokens: 165,
+                ..Default::default()
+            }),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+        }));
+        let rendered = buffer_text(sim.capture_frame(44, 8), 44, 8);
+        assert!(
+            rendered.contains("tokens 120↑ 45↓ · total 165"),
+            "missing usage footer: {rendered:?}"
+        );
+        assert!(sim.model().thinking.is_empty(), "thinking not cleared");
     }
 
     #[test]
