@@ -144,7 +144,7 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "hashline_edit" => {
             "Apply precise file edits using LINE#HASH tags from a prior read with hashline=true"
         }
-        "web_search" => "Search the web across a ranked provider chain with automatic fallback",
+        "web_search" => "Search the web",
         "ast_grep" => "Structural code search using tree-sitter AST patterns (ast-grep syntax)",
         "ast_edit" => {
             "Staged structural code rewrite using tree-sitter AST patterns (ast-grep syntax)"
@@ -374,6 +374,7 @@ mod tests {
         assert_eq!(default_tier("xdev"), LoadMode::Essential);
         assert_eq!(default_tier("ask"), LoadMode::Essential);
         assert_eq!(default_tier("subagent"), LoadMode::Off);
+        assert_eq!(default_tier("web_search"), LoadMode::Essential);
         assert_eq!(default_tier("ast_grep"), LoadMode::Discoverable);
         assert_eq!(default_tier("lsp"), LoadMode::Discoverable);
         assert_eq!(default_tier("web_search"), LoadMode::Discoverable);

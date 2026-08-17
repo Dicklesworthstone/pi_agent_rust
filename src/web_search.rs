@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// A ranked search result.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SearchResult {
     pub title: String,
     pub url: String,
@@ -94,20 +94,51 @@ pub const DEFAULT_CHAIN: &[&str] = &[
 
 fn env_key(keys: &[&str]) -> Option<String> {
     keys.iter().find_map(|var| {
-        std::env::var(var).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+        std::env::var(var)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
     })
 }
 
 /// Base-URL override per rung (bd-cv653.2.1): `PI_WEBSEARCH_BASE_<NAME>`
 /// redirects a provider's endpoint — used by the e2e harness to point rungs
-/// at a loopback mock, and by operators routing through a proxy.
+/// at a loopback mock, and by operators routing through a proxy. In-process
+/// callers (SDK, tests) use the override map, which wins over the env var.
 fn base_url_for(name: &str, default: &str) -> String {
+    if let Some(override_url) = base_url_overrides()
+        .read()
+        .ok()
+        .and_then(|map| map.get(name).cloned())
+    {
+        return override_url;
+    }
     let var = format!("PI_WEBSEARCH_BASE_{}", name.to_ascii_uppercase());
     std::env::var(var)
         .ok()
         .map(|v| v.trim().trim_end_matches('/').to_string())
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| default.to_string())
+}
+
+fn base_url_overrides() -> &'static std::sync::RwLock<HashMap<&'static str, String>> {
+    static OVERRIDES: std::sync::LazyLock<std::sync::RwLock<HashMap<&'static str, String>>> =
+        std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+    &OVERRIDES
+}
+
+/// Redirect a provider rung's base URL (SDK/e2e seam; process-global).
+pub fn set_base_url_override(name: &'static str, base_url: &str) {
+    if let Ok(mut map) = base_url_overrides().write() {
+        map.insert(name, base_url.trim_end_matches('/').to_string());
+    }
+}
+
+/// Clear all base-url overrides (tests).
+pub fn clear_base_url_overrides() {
+    if let Ok(mut map) = base_url_overrides().write() {
+        map.clear();
+    }
 }
 
 // === Paid/keyed rungs ===
@@ -125,7 +156,9 @@ fn perplexity_run<'a>(
     });
     let key = key.map(str::to_string);
     Box::pin(async move {
-        let Some(key) = key else { return Err(RungError::NoKey) };
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
         let response = client
             .post("https://api.perplexity.ai/chat/completions")
             .header("Authorization", format!("Bearer {key}"))
@@ -133,15 +166,19 @@ fn perplexity_run<'a>(
             .map_err(|e| RungError::Http(e.to_string()))?
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() == 429 {
             return Err(RungError::RateLimited);
         }
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let text = response.text_limited(512 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let text = response
+            .text_limited(512 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
         let mut results = Vec::new();
         if let Some(citations) = value.get("citations").and_then(Value::as_array) {
             for (index, citation) in citations.iter().enumerate() {
@@ -192,22 +229,28 @@ fn brave_run<'a>(
         filters.limit.min(20)
     );
     Box::pin(async move {
-        let Some(key) = key else { return Err(RungError::NoKey) };
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
         let response = client
             .get(&url)
             .header("X-Subscription-Token", key)
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() == 429 {
             return Err(RungError::RateLimited);
         }
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let text = response.text_limited(1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let text = response
+            .text_limited(1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
         let mut results = Vec::new();
         if let Some(items) = value.pointer("/web/results").and_then(Value::as_array) {
             for item in items {
@@ -252,7 +295,9 @@ fn tavily_run<'a>(
         "search_depth": "basic",
     });
     Box::pin(async move {
-        let Some(key) = key else { return Err(RungError::NoKey) };
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
         let response = client
             .post("https://api.tavily.com/search")
             .header("Authorization", format!("Bearer {key}"))
@@ -260,15 +305,19 @@ fn tavily_run<'a>(
             .map_err(|e| RungError::Http(e.to_string()))?
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() == 429 {
             return Err(RungError::RateLimited);
         }
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let text = response.text_limited(1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let text = response
+            .text_limited(1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
         let mut results = Vec::new();
         if let Some(items) = value.get("results").and_then(Value::as_array) {
             for item in items {
@@ -314,7 +363,9 @@ fn exa_run<'a>(
         "numResults": limit,
     });
     Box::pin(async move {
-        let Some(key) = key else { return Err(RungError::NoKey) };
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
         let response = client
             .post("https://api.exa.ai/search")
             .header("x-api-key", key)
@@ -322,15 +373,19 @@ fn exa_run<'a>(
             .map_err(|e| RungError::Http(e.to_string()))?
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() == 429 {
             return Err(RungError::RateLimited);
         }
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let text = response.text_limited(1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let text = response
+            .text_limited(1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
         let mut results = Vec::new();
         if let Some(items) = value.get("results").and_then(Value::as_array) {
             for item in items {
@@ -376,22 +431,28 @@ fn jina_run<'a>(
         urlencoded(&with_site(query, filters))
     );
     Box::pin(async move {
-        let Some(key) = key else { return Err(RungError::NoKey) };
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
         let response = client
             .get(&url)
             .header("Authorization", format!("Bearer {key}"))
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() == 429 {
             return Err(RungError::RateLimited);
         }
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let text = response.text_limited(1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let text = response
+            .text_limited(1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
         let mut results = Vec::new();
         if let Some(items) = value.get("data").and_then(Value::as_array) {
             for item in items {
@@ -436,21 +497,27 @@ fn kagi_run<'a>(
         filters.limit.min(25)
     );
     Box::pin(async move {
-        let Some(key) = key else { return Err(RungError::NoKey) };
+        let Some(key) = key else {
+            return Err(RungError::NoKey);
+        };
         let response = client
             .get(&url)
             .header("Authorization", format!("Bot {key}"))
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() == 429 {
             return Err(RungError::RateLimited);
         }
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let text = response.text_limited(1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
-        let value: Value = serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
+        let text = response
+            .text_limited(1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|e| RungError::Parse(e.to_string()))?;
         let mut results = Vec::new();
         if let Some(items) = value.get("data").and_then(Value::as_array) {
             for item in items {
@@ -503,21 +570,30 @@ fn duckduckgo_run<'a>(
             .header("User-Agent", "Mozilla/5.0 (compatible; pi-agent)")
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let html = response.text_limited(2 * 1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
+        let html = response
+            .text_limited(2 * 1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
         let mut results = Vec::new();
         // result rows: <a class="result__a" href="//duckduckgo.com/l/?uddg=ENCODED">
         let mut rest = html.as_str();
         while let Some(pos) = rest.find("result__a") {
             rest = &rest[pos..];
-            let Some(href_start) = rest.find("href=\"") else { break };
+            let Some(href_start) = rest.find("href=\"") else {
+                break;
+            };
             let after_href = &rest[href_start + 6..];
-            let Some(href_end) = after_href.find('"') else { break };
+            let Some(href_end) = after_href.find('"') else {
+                break;
+            };
             let raw_href = &after_href[..href_end];
-            let Some(title_end) = after_href.find("</a>") else { break };
+            let Some(title_end) = after_href.find("</a>") else {
+                break;
+            };
             let title_html = &after_href[href_end + 1..title_end];
             let title = strip_tags(title_html);
             let url = decode_ddg_redirect(raw_href);
@@ -558,21 +634,30 @@ fn startpage_run<'a>(
             .header("User-Agent", "Mozilla/5.0 (compatible; pi-agent)")
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let html = response.text_limited(2 * 1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
+        let html = response
+            .text_limited(2 * 1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
         let mut results = Vec::new();
         // result links carry class="result-link"
         let mut rest = html.as_str();
         while let Some(pos) = rest.find("result-link") {
             rest = &rest[pos..];
-            let Some(href_start) = rest.find("href=\"") else { break };
+            let Some(href_start) = rest.find("href=\"") else {
+                break;
+            };
             let after_href = &rest[href_start + 6..];
-            let Some(href_end) = after_href.find('"') else { break };
+            let Some(href_end) = after_href.find('"') else {
+                break;
+            };
             let link = &after_href[..href_end];
-            let Some(title_end) = after_href.find("</a>") else { break };
+            let Some(title_end) = after_href.find("</a>") else {
+                break;
+            };
             let title = strip_tags(&after_href[href_end + 1..title_end]);
             if link.starts_with("http") {
                 results.push(SearchResult {
@@ -611,21 +696,30 @@ fn mojeek_run<'a>(
             .header("User-Agent", "Mozilla/5.0 (compatible; pi-agent)")
             .send()
             .await
-            .map_err(|e| rung_http_error(e))?;
+            .map_err(|e| rung_http_error(&e))?;
         if response.status() != 200 {
             return Err(RungError::Http(format!("status {}", response.status())));
         }
-        let html = response.text_limited(2 * 1024 * 1024).await.map_err(|e| RungError::Http(e.to_string()))?;
+        let html = response
+            .text_limited(2 * 1024 * 1024)
+            .await
+            .map_err(|e| RungError::Http(e.to_string()))?;
         let mut results = Vec::new();
         // result titles: <a class="title" href="https://...">
         let mut rest = html.as_str();
         while let Some(pos) = rest.find("class=\"title\"") {
             rest = &rest[pos..];
-            let Some(href_start) = rest.find("href=\"") else { break };
+            let Some(href_start) = rest.find("href=\"") else {
+                break;
+            };
             let after_href = &rest[href_start + 6..];
-            let Some(href_end) = after_href.find('"') else { break };
+            let Some(href_end) = after_href.find('"') else {
+                break;
+            };
             let link = &after_href[..href_end];
-            let Some(title_end) = after_href.find("</a>") else { break };
+            let Some(title_end) = after_href.find("</a>") else {
+                break;
+            };
             let title = strip_tags(&after_href[href_end + 1..title_end]);
             if link.starts_with("http") {
                 results.push(SearchResult {
@@ -723,7 +817,15 @@ const fn rung(
         Option<&'a str>,
     ) -> RungFuture<'a>,
 ) -> (&'static str, ProviderRung) {
-    (name, ProviderRung { name, env_keys, keyless, run })
+    (
+        name,
+        ProviderRung {
+            name,
+            env_keys,
+            keyless,
+            run,
+        },
+    )
 }
 
 // === Chain orchestration ===
@@ -736,7 +838,9 @@ static CIRCUIT_FAILURES: std::sync::LazyLock<
 const CIRCUIT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn rung_available(name: &str) -> bool {
-    let Ok(map) = CIRCUIT_FAILURES.lock() else { return true };
+    let Ok(map) = CIRCUIT_FAILURES.lock() else {
+        return true;
+    };
     match map.get(name) {
         Some((count, since)) if *count >= 2 => since.elapsed() >= CIRCUIT_COOLDOWN,
         _ => true,
@@ -745,7 +849,9 @@ fn rung_available(name: &str) -> bool {
 
 fn rung_report_failure(name: &str) {
     if let Ok(mut map) = CIRCUIT_FAILURES.lock() {
-        let entry = map.entry(name.to_string()).or_insert((0, std::time::Instant::now()));
+        let entry = map
+            .entry(name.to_string())
+            .or_insert_with(|| (0, std::time::Instant::now()));
         entry.0 += 1;
         entry.1 = std::time::Instant::now();
     }
@@ -786,10 +892,19 @@ pub async fn search(
         }
         let key = env_key(rung.env_keys);
         if key.is_none() && !rung.keyless {
-            notes.push(format!("{name}: no key (set {})", rung.env_keys.join(" or ")));
+            notes.push(format!(
+                "{name}: no key (set {})",
+                rung.env_keys.join(" or ")
+            ));
             continue;
         }
-        let outcome = (rung.run)(&crate::http::client::Client::new(), query, filters, key.as_deref()).await;
+        let outcome = (rung.run)(
+            &crate::http::client::Client::new(),
+            query,
+            filters,
+            key.as_deref(),
+        )
+        .await;
         match outcome {
             Ok(mut results) => {
                 rung_report_success(name);
@@ -843,11 +958,7 @@ fn canonical_url(url: &str) -> String {
 
 fn url_domain(url: &str) -> String {
     let canonical = canonical_url(url);
-    canonical
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .to_string()
+    canonical.split('/').next().unwrap_or_default().to_string()
 }
 
 fn with_site(query: &str, filters: &SearchFilters) -> String {
@@ -861,9 +972,13 @@ fn urlencoded(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
             b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{byte:02X}")),
+            _ => {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{byte:02X}"));
+            }
         }
     }
     out
@@ -900,7 +1015,7 @@ fn decode_ddg_redirect(href: &str) -> String {
     href.to_string()
 }
 
-fn rung_http_error(err: Error) -> RungError {
+fn rung_http_error(err: &Error) -> RungError {
     let text = err.to_string();
     if text.contains("429") {
         RungError::RateLimited
@@ -923,7 +1038,7 @@ fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The `web_search` tool (bd-cv653.2.1): one query across the configured
 /// provider chain; results ranked, deduped, and provider-attributed.
@@ -933,6 +1048,12 @@ impl WebSearchTool {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+}
+
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -989,7 +1110,9 @@ impl crate::tools::Tool for WebSearchTool {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|q| !q.is_empty())
-            .ok_or_else(|| Error::validation("web_search requires a non-empty `query`".to_string()))?
+            .ok_or_else(|| {
+                Error::validation("web_search requires a non-empty `query`".to_string())
+            })?
             .to_string();
         let provider = input
             .get("provider")
@@ -1021,9 +1144,9 @@ impl crate::tools::Tool for WebSearchTool {
             "results": results,
         });
         Ok(crate::tools::ToolOutput {
-            content: vec![crate::model::ContentBlock::Text(crate::model::TextContent::new(
-                payload.to_string(),
-            ))],
+            content: vec![crate::model::ContentBlock::Text(
+                crate::model::TextContent::new(payload.to_string()),
+            )],
             details: Some(json!({"answeredBy": answered_by, "count": results.len()})),
             is_error: false,
         })
@@ -1043,14 +1166,51 @@ mod tests {
     #[test]
     fn post_process_dedupes_and_caps_domains() {
         let mut results = vec![
-            SearchResult { title: "a".into(), url: "https://x.io/1".into(), snippet: String::new(), source: "t".into() },
-            SearchResult { title: "b".into(), url: "https://x.io/1/".into(), snippet: String::new(), source: "t".into() },
-            SearchResult { title: "c".into(), url: "https://x.io/2".into(), snippet: String::new(), source: "t".into() },
-            SearchResult { title: "d".into(), url: "https://x.io/3".into(), snippet: String::new(), source: "t".into() },
-            SearchResult { title: "e".into(), url: "https://x.io/4".into(), snippet: String::new(), source: "t".into() },
-            SearchResult { title: "f".into(), url: "https://y.io/1".into(), snippet: String::new(), source: "t".into() },
+            SearchResult {
+                title: "a".into(),
+                url: "https://x.io/1".into(),
+                snippet: String::new(),
+                source: "t".into(),
+            },
+            SearchResult {
+                title: "b".into(),
+                url: "https://x.io/1/".into(),
+                snippet: String::new(),
+                source: "t".into(),
+            },
+            SearchResult {
+                title: "c".into(),
+                url: "https://x.io/2".into(),
+                snippet: String::new(),
+                source: "t".into(),
+            },
+            SearchResult {
+                title: "d".into(),
+                url: "https://x.io/3".into(),
+                snippet: String::new(),
+                source: "t".into(),
+            },
+            SearchResult {
+                title: "e".into(),
+                url: "https://x.io/4".into(),
+                snippet: String::new(),
+                source: "t".into(),
+            },
+            SearchResult {
+                title: "f".into(),
+                url: "https://y.io/1".into(),
+                snippet: String::new(),
+                source: "t".into(),
+            },
         ];
-        post_process(&mut results, &SearchFilters { site: None, after: None, limit: 10 });
+        post_process(
+            &mut results,
+            &SearchFilters {
+                site: None,
+                after: None,
+                limit: 10,
+            },
+        );
         // /1 deduped against /1/, and the 4th same-domain result dropped.
         let urls: Vec<&str> = results.iter().map(|r| r.url.as_str()).collect();
         assert_eq!(urls.len(), 4, "dedupe + domain cap: {urls:?}");
@@ -1060,8 +1220,15 @@ mod tests {
 
     #[test]
     fn site_filter_prepends_operator() {
-        let filters = SearchFilters { site: Some("docs.rs".into()), after: None, limit: 10 };
-        assert_eq!(with_site("tokio spawn", &filters), "site:docs.rs tokio spawn");
+        let filters = SearchFilters {
+            site: Some("docs.rs".into()),
+            after: None,
+            limit: 10,
+        };
+        assert_eq!(
+            with_site("tokio spawn", &filters),
+            "site:docs.rs tokio spawn"
+        );
     }
 
     #[test]

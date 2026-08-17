@@ -68,6 +68,11 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "refresh-models"
         | "persist-models"
         | "trust"
+        // ftui migration flags (bd-cv653.9.1). Listed unconditionally: on
+        // non-ftui builds clap still rejects them with a proper error instead
+        // of the pre-parser silently diverting them to extension flags.
+        | "ftui"
+        | "inline"
         | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"

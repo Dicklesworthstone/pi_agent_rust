@@ -58,6 +58,7 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "hashline_edit" => Box::new(pi::tools::HashlineEditTool::new(temp_dir.path())),
         "ast_grep" => Box::new(pi::ast_tools::AstGrepTool::new(temp_dir.path())),
         "ast_edit" => Box::new(pi::ast_tools::AstEditTool::new(temp_dir.path())),
+        "web_search" => Box::new(pi::web_search::WebSearchTool::new()),
         "xdev" => {
             // The dispatcher's snapshot is built from the real discoverable
             // tools so fixtures exercise the genuine contract (bd-cv653.1.6).

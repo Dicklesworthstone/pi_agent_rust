@@ -1,0 +1,43 @@
+{
+  "version": "1.0",
+  "tool": "web_search",
+  "description": "web_search tool contract (bd-cv653.2.1): schema validation and named errors without network. Chain behavior is covered by tests/web_search_rungs.rs adapter tests and tests/e2e_web_search.rs.",
+  "cases": [
+    {
+      "name": "web_search_requires_query",
+      "description": "empty query is a named validation error",
+      "requirement_ids": ["WS-1"],
+      "expect_error": true,
+      "error_contains": "query",
+      "input": {"query": ""},
+      "expected": {}
+    },
+    {
+      "name": "web_search_missing_query_is_validation_error",
+      "description": "absent query is a named validation error",
+      "requirement_ids": ["WS-2"],
+      "expect_error": true,
+      "error_contains": "query",
+      "input": {},
+      "expected": {}
+    },
+    {
+      "name": "web_search_unknown_provider_named_error",
+      "description": "an unknown pinned provider errors with the known-provider list, before any network",
+      "requirement_ids": ["WS-3"],
+      "expect_error": true,
+      "error_contains": "nosuch",
+      "input": {"query": "rust async", "provider": "nosuch"},
+      "expected": {}
+    },
+    {
+      "name": "web_search_limit_clamps_to_fifty",
+      "description": "limit above the hard cap clamps (schema-level contract; verified via details in rungs tests)",
+      "requirement_ids": ["WS-4"],
+      "expect_error": true,
+      "error_contains": "web_search",
+      "input": {"query": "rust", "limit": 500, "provider": "nosuch"},
+      "expected": {}
+    }
+  ]
+}

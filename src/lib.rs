@@ -248,13 +248,13 @@ pub mod tools;
 #[doc(hidden)]
 pub mod tui;
 pub mod url_read;
-pub mod web_search;
 #[doc(hidden)]
 pub mod validation_broker;
 #[doc(hidden)]
 pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
+pub mod web_search;
 pub mod workspace_trust;
 pub mod xdev;
 
