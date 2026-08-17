@@ -1162,9 +1162,15 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 ///
 /// Not yet at parity with the bubbletea stack (slash commands, bash `!`,
 /// pickers, extension UIs, ask respond_ui wiring); tracked on the bead.
+/// Inline-mode UI height bounds: enough rows for chrome + a few conversation
+/// lines at minimum, capped so the shell above stays visible.
+const INLINE_MIN_HEIGHT: u16 = 10;
+const INLINE_MAX_HEIGHT: u16 = 24;
+
 pub fn run(
     session_options: crate::sdk::SessionOptions,
     theme: &crate::theme::Theme,
+    inline: bool,
 ) -> std::io::Result<()> {
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
@@ -1264,7 +1270,15 @@ pub fn run(
         .with_submit_channel(submit_tx)
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme));
-    let result = ftui::App::fullscreen(model).with_mouse().run();
+    // Inline mode preserves shell scrollback (bead acceptance #2): the UI
+    // anchors at the bottom, auto-sized to content within bounds; alt-screen
+    // remains the default.
+    let app = if inline {
+        ftui::App::inline_auto(model, INLINE_MIN_HEIGHT, INLINE_MAX_HEIGHT)
+    } else {
+        ftui::App::fullscreen(model)
+    };
+    let result = app.with_mouse().run();
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
     // sees Disconnected and unwinds. Join briefly so session teardown (saves)

@@ -2035,7 +2035,7 @@ async fn run(
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
-            pi::interactive_ftui::run(options, &theme).map_err(Into::into)
+            pi::interactive_ftui::run(options, &theme, cli.inline).map_err(Into::into)
         }
         #[cfg(not(feature = "ftui"))]
         unreachable!("ftui_requested is false without the ftui feature")

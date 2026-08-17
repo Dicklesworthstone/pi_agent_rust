@@ -379,12 +379,18 @@ pub struct Cli {
     #[arg(long)]
     pub no_session: bool,
 
-    /// Launch the experimental FrankenTUI interactive stack (ephemeral
-    /// session; bd-cv653.9.1 migration preview). Only present when pi is
-    /// built with the `ftui` feature.
+    /// Launch the experimental FrankenTUI interactive stack (bd-cv653.9.1
+    /// migration preview). Only present when pi is built with the `ftui`
+    /// feature.
     #[cfg(feature = "ftui")]
     #[arg(long)]
     pub ftui: bool,
+
+    /// With --ftui: run inline (UI at the bottom, shell scrollback
+    /// preserved) instead of the alternate screen.
+    #[cfg(feature = "ftui")]
+    #[arg(long, requires = "ftui")]
+    pub inline: bool,
 
     /// Session durability mode: strict, balanced, or throughput
     #[arg(
