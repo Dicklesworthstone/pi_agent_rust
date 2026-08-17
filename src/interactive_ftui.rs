@@ -37,7 +37,7 @@ use ftui::runtime::subscription::{StopSignal, SubId, Subscription};
 use ftui::text::Text;
 use ftui::widgets::Widget;
 use ftui::widgets::paragraph::Paragraph;
-use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers};
+use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::interactive::PiMsg;
 
@@ -152,10 +152,57 @@ pub struct PiFtuiModel {
     transcript: Vec<String>,
     /// Sanitized in-flight assistant text (streaming deltas accumulate here).
     streaming: String,
+    /// Running tool (name shown in the status region while active).
+    current_tool: Option<String>,
+    /// Compact todo footer summary (`settled/total · current task`).
+    todo_summary: Option<String>,
+    /// Terminal size, tracked from `Event::Resize` (cols, rows).
+    term: (u16, u16),
+    /// Conversation scroll, measured in lines UP from the tail. 0 means
+    /// follow-the-stream (stick to bottom as new content arrives) — the same
+    /// semantics as `follow_stream_tail` in the bubbletea stack, but derived
+    /// instead of stored so update() never needs the rendered line count.
+    scroll_from_tail: usize,
     /// Shared slot for the agent-event receiver: `subscriptions()` re-declares
     /// the bridge each cycle, and the one instance the runtime actually starts
     /// takes the receiver out of this slot (see [`AgentEventSubscription`]).
     agent_rx: Arc<Mutex<Option<Receiver<PiMsg>>>>,
+}
+
+/// Vertical frame regions, top to bottom. The clamp/normalize string hacks of
+/// the bubbletea view are gone: the render kernel owns the cell grid, so the
+/// layout solver is the only place heights are decided.
+struct Regions {
+    header: Rect,
+    body: Rect,
+    status: Rect,
+    input: Rect,
+    footer: Rect,
+}
+
+/// Rows of fixed chrome around the conversation body: header, status, input,
+/// footer. Used to derive the body height for scroll math in `update()`
+/// (where no `Frame` exists yet).
+const FIXED_CHROME_ROWS: u16 = 4;
+
+fn layout_regions(area: Rect) -> Regions {
+    use ftui::layout::{Constraint, Flex};
+    let rects = Flex::vertical()
+        .constraints([
+            Constraint::Fixed(1), // header
+            Constraint::Fill,     // conversation body
+            Constraint::Fixed(1), // status line (tool/todo/messages)
+            Constraint::Fixed(1), // input (placeholder until the editor port)
+            Constraint::Fixed(1), // footer (usage)
+        ])
+        .split(area);
+    Regions {
+        header: rects[0],
+        body: rects[1],
+        status: rects[2],
+        input: rects[3],
+        footer: rects[4],
+    }
 }
 
 impl PiFtuiModel {
@@ -164,8 +211,49 @@ impl PiFtuiModel {
             status: String::from("ready"),
             transcript: Vec::new(),
             streaming: String::new(),
+            current_tool: None,
+            todo_summary: None,
+            term: (80, 24),
+            scroll_from_tail: 0,
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
         }
+    }
+
+    /// Visible conversation rows given the tracked terminal size.
+    fn body_height(&self) -> usize {
+        usize::from(self.term.1.saturating_sub(FIXED_CHROME_ROWS)).max(1)
+    }
+
+    /// Total rendered conversation lines (transcript + in-flight stream).
+    fn conversation_line_count(&self) -> usize {
+        let transcript: usize = self
+            .transcript
+            .iter()
+            .map(|e| e.lines().count().max(1))
+            .sum();
+        let streaming = if self.streaming.is_empty() {
+            0
+        } else {
+            self.streaming.lines().count().max(1)
+        };
+        transcript + streaming
+    }
+
+    /// Cap for `scroll_from_tail`: can't scroll further up than the content.
+    fn max_scroll_from_tail(&self) -> usize {
+        self.conversation_line_count()
+            .saturating_sub(self.body_height())
+    }
+
+    fn scroll_up(&mut self, lines: usize) {
+        self.scroll_from_tail = self
+            .scroll_from_tail
+            .saturating_add(lines)
+            .min(self.max_scroll_from_tail());
+    }
+
+    const fn scroll_down(&mut self, lines: usize) {
+        self.scroll_from_tail = self.scroll_from_tail.saturating_sub(lines);
     }
 
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
@@ -178,6 +266,15 @@ impl PiFtuiModel {
                 // before it can ever reach a frame.
                 self.streaming.push_str(&sanitize(&delta));
             }
+            PiMsg::ToolStart { name, .. } => {
+                self.current_tool = Some(sanitize(&name).into_owned());
+            }
+            PiMsg::ToolEnd { .. } => {
+                self.current_tool = None;
+            }
+            PiMsg::TodoSummary { summary } => {
+                self.todo_summary = summary.map(|s| sanitize(&s).into_owned());
+            }
             PiMsg::AgentDone { error_message, .. } => {
                 if !self.streaming.is_empty() {
                     self.transcript.push(std::mem::take(&mut self.streaming));
@@ -186,48 +283,58 @@ impl PiFtuiModel {
                     self.transcript.push(format!("error: {}", sanitize(&err)));
                 }
                 self.status = String::from("ready");
+                self.current_tool = None;
             }
             PiMsg::AgentError(err) => {
                 self.transcript.push(format!("error: {}", sanitize(&err)));
                 self.status = String::from("ready");
+                self.current_tool = None;
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
                 self.transcript.push(sanitize(&text).into_owned());
             }
             PiMsg::UiShutdown => return Cmd::quit(),
             // Remaining variants are wired up as their owning surfaces are
-            // ported (tools panel, todo footer, ask cards, OAuth flows, ...).
+            // ported (tools panel, ask cards, OAuth flows, pickers, ...).
             _ => {}
         }
         Cmd::none()
     }
 
-    fn handle_term(event: &Event) -> Cmd<PiFtuiMsg> {
-        if let Event::Key(key) = event {
-            let ctrl_c =
-                key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
-            if ctrl_c {
-                return Cmd::quit();
+    fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
+        match event {
+            Event::Key(key) => {
+                let ctrl_c =
+                    key.code == KeyCode::Char('c') && key.modifiers.contains(Modifiers::CTRL);
+                if ctrl_c {
+                    return Cmd::quit();
+                }
+                let page = self.body_height().saturating_sub(1).max(1);
+                match key.code {
+                    KeyCode::Up => self.scroll_up(1),
+                    KeyCode::Down => self.scroll_down(1),
+                    KeyCode::PageUp => self.scroll_up(page),
+                    KeyCode::PageDown => self.scroll_down(page),
+                    KeyCode::End => self.scroll_from_tail = 0,
+                    _ => {}
+                }
             }
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp => self.scroll_up(3),
+                MouseEventKind::ScrollDown => self.scroll_down(3),
+                _ => {}
+            },
+            Event::Resize { width, height } => {
+                self.term = (*width, *height);
+                // Re-clamp: a taller window may make the old offset overshoot.
+                self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
+            }
+            _ => {}
         }
         Cmd::none()
     }
-}
 
-impl Model for PiFtuiModel {
-    type Message = PiFtuiMsg;
-
-    fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
-        match msg {
-            PiFtuiMsg::Term(event) => Self::handle_term(&event),
-            PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
-        }
-    }
-
-    fn view(&self, frame: &mut Frame) {
-        // Minimal placeholder view: transcript tail + streaming text + status.
-        // The real port replaces this with the conversation/editor/footer
-        // layout; this exists so simulator tests exercise a full frame pass.
+    fn conversation_text(&self) -> String {
         let mut body = String::new();
         for line in &self.transcript {
             body.push_str(line);
@@ -237,9 +344,70 @@ impl Model for PiFtuiModel {
             body.push_str(&self.streaming);
             body.push('\n');
         }
-        body.push_str(&self.status);
+        body
+    }
+}
+
+impl Model for PiFtuiModel {
+    type Message = PiFtuiMsg;
+
+    fn update(&mut self, msg: PiFtuiMsg) -> Cmd<PiFtuiMsg> {
+        match msg {
+            PiFtuiMsg::Term(event) => self.handle_term(&event),
+            PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
+        }
+    }
+
+    fn view(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        Paragraph::new(Text::raw(&body)).render(area, frame);
+        let regions = layout_regions(area);
+
+        // Header: identity + agent state.
+        let header = format!("pi · {}", self.status);
+        Paragraph::new(Text::raw(&header)).render(regions.header, frame);
+
+        // Conversation body with tail-follow scroll. `scroll_from_tail == 0`
+        // sticks to the bottom; scrolling up pins an offset measured from the
+        // tail so streaming appends don't yank the view.
+        let body_text = self.conversation_text();
+        let total_lines = if body_text.is_empty() {
+            0
+        } else {
+            body_text.lines().count()
+        };
+        let visible = usize::from(regions.body.height).max(1);
+        let from_tail = self
+            .scroll_from_tail
+            .min(total_lines.saturating_sub(visible));
+        let offset = total_lines.saturating_sub(visible + from_tail);
+        let offset_u16 = u16::try_from(offset).unwrap_or(u16::MAX);
+        Paragraph::new(Text::raw(&body_text))
+            .scroll((offset_u16, 0))
+            .render(regions.body, frame);
+
+        // Status region: running tool takes precedence, then todo summary.
+        let status_line = self.current_tool.as_ref().map_or_else(
+            || {
+                self.todo_summary
+                    .as_ref()
+                    .map_or_else(String::new, |todo| format!("todo {todo}"))
+            },
+            |tool| format!("running {tool} ..."),
+        );
+        if !status_line.is_empty() {
+            Paragraph::new(Text::raw(&status_line)).render(regions.status, frame);
+        }
+
+        // Input placeholder: the textarea port (P2) replaces this row.
+        Paragraph::new(Text::raw("› ")).render(regions.input, frame);
+
+        // Footer: scroll position indicator until the usage footer ports.
+        let footer = if from_tail > 0 {
+            format!("[{from_tail} lines up] End to follow")
+        } else {
+            String::from("pi — ftui preview")
+        };
+        Paragraph::new(Text::raw(&footer)).render(regions.footer, frame);
     }
 
     fn subscriptions(&self) -> Vec<Box<dyn Subscription<PiFtuiMsg>>> {
@@ -342,12 +510,111 @@ mod tests {
         let mut sim = ProgramSimulator::new(model);
         sim.init();
         sim.send(PiFtuiMsg::Agent(PiMsg::System("session restored".into())));
-        let rendered = buffer_text(sim.capture_frame(40, 6), 40, 6);
+        let rendered = buffer_text(sim.capture_frame(40, 8), 40, 8);
         assert!(
             rendered.contains("session restored"),
             "frame missing transcript line: {rendered:?}"
         );
-        assert!(rendered.contains("ready"), "frame missing status");
+        assert!(rendered.contains("pi · ready"), "frame missing header");
+        assert!(rendered.contains("› "), "frame missing input placeholder");
+    }
+
+    #[test]
+    fn tool_status_renders_while_running() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+        }));
+        let rendered = buffer_text(sim.capture_frame(40, 8), 40, 8);
+        assert!(
+            rendered.contains("running bash"),
+            "missing tool status: {rendered:?}"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+            is_error: false,
+        }));
+        let rendered = buffer_text(sim.capture_frame(40, 8), 40, 8);
+        assert!(
+            !rendered.contains("running bash"),
+            "tool status not cleared"
+        );
+    }
+
+    #[test]
+    fn scroll_pins_view_and_end_resumes_tail_follow() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // 12x24-line transcript on a 10-row terminal: only the tail visible.
+        sim.inject_event(Event::Resize {
+            width: 30,
+            height: 10,
+        });
+        for i in 0..20 {
+            sim.send(PiFtuiMsg::Agent(PiMsg::System(format!("line-{i}"))));
+        }
+        // Following the tail: newest line visible, oldest not.
+        let rendered = buffer_text(sim.capture_frame(30, 10), 30, 10);
+        assert!(
+            rendered.contains("line-19"),
+            "tail not followed: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("line-0 "),
+            "oldest line unexpectedly visible"
+        );
+
+        // Page up: view pins away from the tail.
+        sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
+        let rendered = buffer_text(sim.capture_frame(30, 10), 30, 10);
+        assert!(!rendered.contains("line-19"), "still at tail after PageUp");
+        assert!(
+            rendered.contains("lines up"),
+            "footer missing scroll indicator"
+        );
+
+        // New content while pinned must not yank the view back to the tail.
+        sim.send(PiFtuiMsg::Agent(PiMsg::System("line-20".into())));
+        let rendered = buffer_text(sim.capture_frame(30, 10), 30, 10);
+        assert!(
+            !rendered.contains("line-20"),
+            "pinned view was yanked to tail"
+        );
+
+        // End: back to following the stream.
+        sim.inject_event(key(KeyCode::End, Modifiers::empty()));
+        let rendered = buffer_text(sim.capture_frame(30, 10), 30, 10);
+        assert!(
+            rendered.contains("line-20"),
+            "End did not resume tail follow"
+        );
+    }
+
+    #[test]
+    fn resize_reclamps_scroll_offset() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.inject_event(Event::Resize {
+            width: 30,
+            height: 10,
+        });
+        for i in 0..12 {
+            sim.send(PiFtuiMsg::Agent(PiMsg::System(format!("line-{i}"))));
+        }
+        sim.inject_event(key(KeyCode::PageUp, Modifiers::empty()));
+        assert!(sim.model().scroll_from_tail > 0);
+        // Grow the window taller than the content: offset must re-clamp to 0.
+        sim.inject_event(Event::Resize {
+            width: 30,
+            height: 40,
+        });
+        assert_eq!(sim.model().scroll_from_tail, 0);
     }
 
     #[test]
