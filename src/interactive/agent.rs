@@ -414,8 +414,23 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             tool_name,
             tool_call_id,
             is_error,
-            ..
+            result,
         } => {
+            // Todo footer (bd-cv653.3.9): state-driven off the tool result's
+            // todo_list.v1 details, never a side channel.
+            if tool_name == "todo"
+                && !is_error
+                && let Some(details) = &result.details
+                && details.get("schema").and_then(serde_json::Value::as_str)
+                    == Some(crate::todo::TODO_LIST_SCHEMA)
+            {
+                batcher.send_immediate(PiMsg::TodoSummary {
+                    summary: details
+                        .get("summary")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                });
+            }
             batcher.send_immediate(PiMsg::ToolEnd {
                 name: tool_name.clone(),
                 tool_id: tool_call_id.clone(),
@@ -533,6 +548,9 @@ impl PiApp {
                     self.messages.push(ConversationMessage::tool(output));
                     self.scroll_to_bottom();
                 }
+            }
+            PiMsg::TodoSummary { summary } => {
+                self.todo_summary = summary;
             }
             PiMsg::AgentDone {
                 usage,

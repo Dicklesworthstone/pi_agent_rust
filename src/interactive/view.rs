@@ -514,6 +514,17 @@ impl PiApp {
             let _ = write!(output, "\n  {}\n", status_style.render(status));
         }
 
+        // Todo footer (bd-cv653.3.9): compact `settled/total · current task`
+        // line, state-driven from the todo tool's todo_list.v1 details.
+        if let Some(todo) = &self.todo_summary {
+            let _ = write!(
+                output,
+                "\n  {} {}\n",
+                self.styles.muted.render("todo"),
+                self.styles.accent.render(todo),
+            );
+        }
+
         // Session picker overlay (if open)
         if let Some(ref picker) = self.session_picker {
             output.push_str(&self.render_session_picker(picker));

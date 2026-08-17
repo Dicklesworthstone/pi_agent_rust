@@ -1214,6 +1214,11 @@ impl PiApp {
             chrome += 2;
         }
 
+        // Todo footer summary: "\n  todo {summary}\n" = 2 rows.
+        if self.todo_summary.is_some() {
+            chrome += 2;
+        }
+
         // Capability prompt overlay: ~8 lines (title, ext name, desc, blank, buttons, timer, help, blank).
         if self.capability_prompt.is_some() {
             chrome += 8;
@@ -1822,6 +1827,9 @@ pub enum PiMsg {
         tool_id: String,
         is_error: bool,
     },
+    /// Session todo list changed (bd-cv653.3.9). Carries the compact
+    /// `todo_list.v1` summary line for the footer; `None` clears it.
+    TodoSummary { summary: Option<String> },
     /// Agent finished with final message.
     AgentDone {
         usage: Option<Usage>,
@@ -2311,6 +2319,9 @@ pub struct PiApp {
     current_tool: Option<String>,
     tool_progress: Option<ToolProgress>,
     pending_tool_output: Option<String>,
+    /// Compact `todo_list.v1` footer summary (bd-cv653.3.9), state-driven
+    /// from the todo tool's result details.
+    todo_summary: Option<String>,
 
     // Session and config
     session: Arc<Mutex<Session>>,
@@ -2646,6 +2657,7 @@ impl PiApp {
             current_tool: None,
             tool_progress: None,
             pending_tool_output: None,
+            todo_summary: None,
             session,
             config,
             theme,

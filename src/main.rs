@@ -1678,6 +1678,14 @@ async fn run(
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
     }
+    // The todo tool needs the live session for todo_list.v1 persistence, so
+    // it joins after construction (opt-in via --tools ...todo, like subagent).
+    if enabled_tools.contains(&"todo") {
+        let todo_session = Arc::clone(&agent_session.session);
+        agent_session.agent.extend_tools(vec![
+            Box::new(pi::todo::TodoTool::new(todo_session)) as Box<dyn pi::tools::Tool>
+        ]);
+    }
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {

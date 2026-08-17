@@ -370,6 +370,7 @@ Watch the response appear incrementally, with thinking blocks shown inline.
 | `find` | Discover files by pattern | Find all *.rs files |
 | `ls` | List directory contents | What's in src/? |
 | `subagent` | Delegate isolated work to a named Rust Pi child agent | Ask a scout to inspect a provider |
+| `todo` | Session task list with phases and auto-promotion (opt-in) | Track a multi-step refactor |
 
 All tools include:
 - Automatic truncation for large outputs (2000 lines / 1MB)
@@ -377,7 +378,11 @@ All tools include:
 - Process tree cleanup for bash (no orphaned processes)
 
 `subagent` is intentionally opt-in because it can start additional coding-agent
-processes. Enable it explicitly with `--tools` (or in the tools setting):
+processes. `todo` is opt-in during its rollout; enable either explicitly with
+`--tools` (or in the tools setting) — e.g. `--tools ...,todo` gives the model
+a session task list (ops: init/start/done/drop/block/unblock/rm/append/view)
+that persists across `--continue`, forks with session branches, and shows a
+compact progress line in the TUI footer:
 
 ```bash
 pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \

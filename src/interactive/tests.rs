@@ -649,3 +649,34 @@ fn slash_model_role_assignment_and_query() {
         "non-role first token must not assign"
     );
 }
+
+/// bd-cv653.3.9: the todo footer is state-driven — a TodoSummary message
+/// renders the compact line in the next frame's view; `None` clears it and
+/// the chrome height accounting tracks both states.
+#[test]
+fn todo_summary_message_drives_footer_line() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+
+    let base_height = app.view_effective_conversation_height();
+    assert!(app.todo_summary.is_none());
+    assert!(!app.view().contains("1/2 · implement"));
+
+    app.handle_pi_message(PiMsg::TodoSummary {
+        summary: Some("1/2 · implement".to_string()),
+    });
+    let view = app.view();
+    assert!(view.contains("todo"), "footer label rendered");
+    assert!(view.contains("1/2 · implement"), "summary rendered");
+    assert_eq!(
+        app.view_effective_conversation_height(),
+        base_height.saturating_sub(2),
+        "todo footer consumes two chrome rows"
+    );
+
+    app.handle_pi_message(PiMsg::TodoSummary { summary: None });
+    assert!(app.todo_summary.is_none());
+    assert!(!app.view().contains("1/2 · implement"));
+    assert_eq!(app.view_effective_conversation_height(), base_height);
+}

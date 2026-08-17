@@ -1864,6 +1864,14 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             .agent
             .set_foreign_scoped_rules(foreign_rules.rules.clone(), cwd.clone());
     }
+    // Session-coupled todo tool joins after construction (opt-in), matching
+    // the CLI wiring in main.rs.
+    if enabled_tools.contains(&"todo") {
+        let todo_session = Arc::clone(&agent_session.session);
+        agent_session.agent.extend_tools(vec![
+            Box::new(crate::todo::TodoTool::new(todo_session)) as Box<dyn crate::tools::Tool>
+        ]);
+    }
 
     if !options.extension_paths.is_empty() {
         let extension_paths = options
