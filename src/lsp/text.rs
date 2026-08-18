@@ -33,7 +33,7 @@ pub fn byte_col_to_utf16(line: &str, byte_col: usize) -> Option<u32> {
     }
     let mut units = 0u32;
     for ch in line[..byte_col].chars() {
-        units = units.saturating_add(ch.len_utf16() as u32);
+        units = units.saturating_add(u32::try_from(ch.len_utf16()).unwrap_or(2));
     }
     Some(units)
 }
@@ -50,7 +50,7 @@ pub fn utf16_col_to_byte(line: &str, utf16_col: u32) -> usize {
         if units >= utf16_col {
             return byte_idx;
         }
-        units = units.saturating_add(ch.len_utf16() as u32);
+        units = units.saturating_add(u32::try_from(ch.len_utf16()).unwrap_or(2));
         if units > utf16_col {
             // Column landed inside this scalar's surrogate pair; the
             // half-open edit boundary goes after the scalar.
@@ -107,7 +107,8 @@ fn line_start_offset(content: &str, line: u32) -> Option<usize> {
 /// Total number of lines in `content` (at least 1).
 #[must_use]
 pub fn line_count(content: &str) -> u32 {
-    content.bytes().filter(|b| *b == b'\n').count() as u32 + 1
+    let newlines = content.bytes().filter(|b| *b == b'\n').count();
+    u32::try_from(newlines).unwrap_or(u32::MAX).saturating_add(1)
 }
 
 /// Map an LSP position to a UTF-8 byte offset in `content`.
@@ -137,7 +138,8 @@ pub fn offset_to_position(content: &str, offset: usize) -> Option<Position> {
     if offset > content.len() || !content.is_char_boundary(offset) {
         return None;
     }
-    let line = content[..offset].bytes().filter(|b| *b == b'\n').count() as u32;
+    let newline_count = content[..offset].bytes().filter(|b| *b == b'\n').count();
+    let line = u32::try_from(newline_count).unwrap_or(u32::MAX);
     let line_start = line_start_offset(content, line)?;
     let line_text_end = content[line_start..]
         .find('\n')

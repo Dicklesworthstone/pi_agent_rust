@@ -87,7 +87,7 @@ impl LspCallError {
 
 impl From<LspCallError> for Error {
     fn from(err: LspCallError) -> Self {
-        Error::tool("lsp", format!("[{}] {}", err.code(), err.message()))
+        Self::tool("lsp", format!("[{}] {}", err.code(), err.message()))
     }
 }
 
@@ -107,8 +107,9 @@ pub fn path_to_uri(path: &Path) -> String {
                 out.push(byte as char);
             }
             _ => {
+                use std::fmt::Write as _;
                 out.push('%');
-                out.push_str(&format!("{byte:02X}"));
+                let _ = write!(out, "{byte:02X}");
             }
         }
     }
@@ -274,15 +275,12 @@ impl LspClient {
         let will_rename = caps
             .pointer("/workspace/fileOperations/willRenameFiles")
             .is_some();
-        let sync_kind = caps
-            .get("textDocumentSync")
-            .map(|sync| {
-                sync.get("change")
-                    .and_then(Value::as_u64)
-                    .or_else(|| sync.as_u64())
-                    .unwrap_or(1)
-            })
-            .unwrap_or(1);
+        let sync_kind = caps.get("textDocumentSync").map_or(1, |sync| {
+            sync.get("change")
+                .and_then(Value::as_u64)
+                .or_else(|| sync.as_u64())
+                .unwrap_or(1)
+        });
         let server_name = result
             .get("serverInfo")
             .and_then(|info| info.get("name"))
@@ -302,7 +300,7 @@ impl LspClient {
         Ok(client)
     }
 
-    fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         mutex
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -355,25 +353,24 @@ impl LspClient {
     /// server quiescence (`experimental/serverStatus`).
     pub fn poll_notifications(&self) {
         for notification in self.rpc.drain_notifications() {
-            if notification.method == "textDocument/publishDiagnostics" {
-                if let (Some(uri), Some(diags)) = (
+            if notification.method == "textDocument/publishDiagnostics"
+                && let (Some(uri), Some(diags)) = (
                     notification.params.get("uri").and_then(Value::as_str),
                     notification
                         .params
                         .get("diagnostics")
                         .and_then(Value::as_array),
-                ) {
-                    Self::lock(&self.diagnostics).insert(uri.to_string(), diags.clone());
-                }
-            } else if notification.method == "experimental/serverStatus" {
-                if let Some(quiescent) = notification
+                )
+            {
+                Self::lock(&self.diagnostics).insert(uri.to_string(), diags.clone());
+            } else if notification.method == "experimental/serverStatus"
+                && let Some(quiescent) = notification
                     .params
                     .get("quiescent")
                     .and_then(Value::as_bool)
-                {
-                    self.quiescent
-                        .store(quiescent, std::sync::atomic::Ordering::SeqCst);
-                }
+            {
+                self.quiescent
+                    .store(quiescent, std::sync::atomic::Ordering::SeqCst);
             }
         }
     }
@@ -660,7 +657,6 @@ impl LspClient {
 pub fn parse_locations(result: &Value) -> Vec<(String, super::text::Range)> {
     let mut out = Vec::new();
     let items: Vec<&Value> = match result {
-        Value::Null => return out,
         Value::Array(items) => items.iter().collect(),
         single @ Value::Object(_) => vec![single],
         _ => return out,
@@ -685,17 +681,20 @@ pub fn parse_locations(result: &Value) -> Vec<(String, super::text::Range)> {
     out
 }
 
+/// Extract text from a `MarkedString` (`"..."` or `{language, value}`) or
+/// `MarkupContent` (`{kind, value}`).
+fn marked_string_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(map) => map.get("value").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
 /// Extract displayable text from a hover result.
 #[must_use]
 pub fn hover_to_text(result: &Value) -> Option<String> {
     let contents = result.get("contents")?;
-    fn marked_string_text(value: &Value) -> Option<String> {
-        match value {
-            Value::String(text) => Some(text.clone()),
-            Value::Object(map) => map.get("value").and_then(Value::as_str).map(str::to_string),
-            _ => None,
-        }
-    }
     match contents {
         Value::Array(items) => {
             let parts: Vec<String> = items.iter().filter_map(marked_string_text).collect();
