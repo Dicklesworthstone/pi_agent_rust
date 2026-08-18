@@ -1,6 +1,6 @@
-//! E2E (bd-cv653.2.1): web_search provider chain over real processes with
+//! E2E (bd-cv653.2.1): `web_search` provider chain over real processes with
 //! loopback mocks (per-provider base-url overrides). JSONL logs per
-//! tests/common/logging.rs.
+//! `tests/common/logging.rs`.
 
 mod common;
 
@@ -233,8 +233,7 @@ fn e2e_chain_falls_through_failing_provider_to_next() {
     let model_bound = server
         .requests()
         .into_iter()
-        .filter(|r| r.path == "/v1/chat/completions")
-        .last()
+        .rfind(|r| r.path == "/v1/chat/completions")
         .expect("final model call");
     let body = String::from_utf8_lossy(&model_bound.body);
     assert!(
@@ -294,8 +293,7 @@ fn e2e_keyless_path_with_no_keys() {
     let model_bound = server
         .requests()
         .into_iter()
-        .filter(|r| r.path == "/v1/chat/completions")
-        .last()
+        .rfind(|r| r.path == "/v1/chat/completions")
         .expect("final model call");
     let body = String::from_utf8_lossy(&model_bound.body);
     assert!(

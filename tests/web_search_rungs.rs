@@ -26,7 +26,7 @@ fn html_response(body: &str) -> MockHttpResponse {
     }
 }
 
-fn filters() -> SearchFilters {
+const fn filters() -> SearchFilters {
     SearchFilters {
         site: None,
         after: None,

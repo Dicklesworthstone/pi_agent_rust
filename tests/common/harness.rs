@@ -824,13 +824,33 @@ fn handle_connection(
         }
     });
 
-    let route_key = RouteKey { method, path };
+    let route_key = RouteKey {
+        method: method.clone(),
+        path: path.clone(),
+    };
     let response = route_queues
         .lock()
         .unwrap()
         .get_mut(&route_key)
         .and_then(std::collections::VecDeque::pop_front)
         .or_else(|| routes.lock().unwrap().get(&route_key).cloned())
+        .or_else(|| {
+            // Fallback: match on the bare path when the request carries a
+            // query string. Exact matches (above) always win; no registered
+            // route contains a query, so this only widens.
+            path.split_once('?').and_then(|(bare, _)| {
+                let bare_key = RouteKey {
+                    method: method.clone(),
+                    path: bare.to_string(),
+                };
+                route_queues
+                    .lock()
+                    .unwrap()
+                    .get_mut(&bare_key)
+                    .and_then(std::collections::VecDeque::pop_front)
+                    .or_else(|| routes.lock().unwrap().get(&bare_key).cloned())
+            })
+        })
         .unwrap_or_else(|| MockHttpResponse::text(404, "not found"));
 
     write_response(stream, &response)?;

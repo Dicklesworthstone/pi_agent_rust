@@ -298,8 +298,12 @@ fn tavily_run<'a>(
         let Some(key) = key else {
             return Err(RungError::NoKey);
         };
+        let url = format!(
+            "{}/search",
+            base_url_for("tavily", "https://api.tavily.com")
+        );
         let response = client
-            .post("https://api.tavily.com/search")
+            .post(&url)
             .header("Authorization", format!("Bearer {key}"))
             .json(&body)
             .map_err(|e| RungError::Http(e.to_string()))?
@@ -366,8 +370,9 @@ fn exa_run<'a>(
         let Some(key) = key else {
             return Err(RungError::NoKey);
         };
+        let url = format!("{}/search", base_url_for("exa", "https://api.exa.ai"));
         let response = client
-            .post("https://api.exa.ai/search")
+            .post(&url)
             .header("x-api-key", key)
             .json(&body)
             .map_err(|e| RungError::Http(e.to_string()))?
