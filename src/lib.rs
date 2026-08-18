@@ -85,6 +85,7 @@ pub mod ask;
 pub mod ast_tools;
 #[doc(hidden)]
 pub mod auth;
+pub mod advisor;
 #[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]

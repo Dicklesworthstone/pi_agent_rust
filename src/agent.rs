@@ -3858,6 +3858,9 @@ pub struct AgentSession {
     extension_ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
     compaction_settings: ResolvedCompactionSettings,
     compaction_runtime: Option<Runtime>,
+    /// The advisor runtime (bd-cv653.3.3): Some only when the advisor role
+    /// resolved a model. None = zero-overhead path (no digest is built).
+    pub advisor: Option<crate::advisor::AdvisorRuntime>,
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
@@ -8916,6 +8919,7 @@ impl AgentSession {
             extension_ai_completion,
             compaction_settings,
             compaction_runtime: None,
+            advisor: None,
             runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
@@ -10221,6 +10225,61 @@ impl AgentSession {
         }
     }
 
+    /// Advisor hook (bd-cv653.3.3): after a completed turn, if the advisor
+    /// role resolved a model, review a compact digest and inject the verdict
+    /// into the next turn via the steering queue. Zero-overhead gate: no
+    /// advisor configured → no digest built. Failures are isolated inside
+    /// the runtime and never fail the run.
+    async fn maybe_advise_turn(&mut self) {
+        if self.advisor.is_none() {
+            return;
+        }
+        let digest = crate::advisor::build_digest(self.agent.messages());
+        if digest.is_trivial() {
+            return;
+        }
+        let turn_index = self.agent.messages().len() as u64;
+        let Some(runtime) = self.advisor.as_mut() else {
+            return;
+        };
+        let outcome = runtime.review_turn(&digest, turn_index).await;
+        let verdict = match outcome {
+            crate::advisor::AdvisorOutcome::Inject(verdict) => verdict,
+            crate::advisor::AdvisorOutcome::Quiet => return,
+            crate::advisor::AdvisorOutcome::Failed => {
+                // Surface the one-time disable notice if the watchdog fired.
+                if let Some(notice) = runtime.disabled_notice.clone() {
+                    let msg = crate::model::Message::User(crate::model::UserMessage {
+                        content: crate::model::UserContent::Text(format!(
+                            "[advisor disabled: {notice}]"
+                        )),
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                    });
+                    self.agent.queue_steering(msg);
+                }
+                return;
+            }
+        };
+        let level_str = verdict.level.as_str().to_string();
+        let injection = crate::advisor::format_injection(&verdict);
+        let message = crate::model::Message::User(crate::model::UserMessage {
+            content: crate::model::UserContent::Text(injection.clone()),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        });
+        self.agent.queue_steering(message);
+        // Session audit entry (replayable advisor trail).
+        let cx = pi::agent_cx::AgentCx::for_request();
+        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
+            inner.append_custom_entry(
+                "advisor_note".to_string(),
+                Some(serde_json::json!({
+                    "level": level_str,
+                    "rationale": verdict.rationale,
+                })),
+            );
+        }
+    }
+
     pub async fn run_text_with_abort(
         &mut self,
         input: String,
@@ -10266,6 +10325,7 @@ impl AgentSession {
 
             self.agent.set_system_prompt(base_system_prompt);
             self.persist_repair_ledger().await;
+            self.maybe_advise_turn().await;
             result
         }
         .await;
