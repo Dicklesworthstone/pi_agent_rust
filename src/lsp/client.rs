@@ -26,10 +26,13 @@ const WARMUP_RETRY_CADENCE: Duration = Duration::from_millis(250);
 /// the server still indexing rather than a truthful "not found".
 const WARMUP_EMPTY_RESULT_WINDOW: Duration = Duration::from_secs(60);
 
-/// Position-lookup methods whose empty result during warmup may be indexing
-/// lag rather than truth. Narrow on purpose: symbols/diagnostics are never
-/// retried (an empty symbol list is a legitimate answer).
-fn is_position_lookup(method: &str) -> bool {
+/// Methods whose empty result during warmup may be indexing lag rather than
+/// truth. Narrow on purpose: symbols/diagnostics are never retried (an
+/// empty symbol list is a legitimate answer). `rename` is included because
+/// rust-analyzer answers valid positions with a null/empty edit while the
+/// crate graph is still loading; retrying only ever DELAYS an empty answer,
+/// never fabricates one.
+fn is_warmup_empty_retryable(method: &str) -> bool {
     matches!(
         method,
         "textDocument/definition"
@@ -37,12 +40,32 @@ fn is_position_lookup(method: &str) -> bool {
             | "textDocument/implementation"
             | "textDocument/references"
             | "textDocument/hover"
+            | "textDocument/rename"
     )
 }
 
-/// Whether a result is "empty" in the not-found sense (null or `[]`).
+/// Whether a result is "empty" in the not-found sense: null, `[]`, `{}`, or
+/// a WorkspaceEdit with no changes.
 fn is_empty_result(value: &Value) -> bool {
-    value.is_null() || matches!(value, Value::Array(items) if items.is_empty())
+    if value.is_null() {
+        return true;
+    }
+    match value {
+        Value::Array(items) => items.is_empty(),
+        Value::Object(map) => {
+            map.is_empty()
+                || ((map.contains_key("changes") || map.contains_key("documentChanges"))
+                    && map
+                        .get("changes")
+                        .and_then(Value::as_object)
+                        .is_none_or(serde_json::Map::is_empty)
+                    && map
+                        .get("documentChanges")
+                        .and_then(Value::as_array)
+                        .is_none_or(Vec::is_empty))
+        }
+        _ => false,
+    }
 }
 /// Default per-request timeout.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -458,7 +481,7 @@ impl LspClient {
             // indexing lag; retrying only ever DELAYS an empty answer, it
             // can never fabricate a result.
             let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
-                && is_position_lookup(method)
+                && is_warmup_empty_retryable(method)
                 && self.connected_at.elapsed() < WARMUP_EMPTY_RESULT_WINDOW;
             if !retryable && !empty_during_warmup {
                 return attempt;

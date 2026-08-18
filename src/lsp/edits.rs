@@ -190,68 +190,10 @@ fn parse_text_edit_array(raw: &Value) -> Result<Vec<TextEdit>, crate::error::Err
     Ok(out)
 }
 
-/// Outcome of an atomic apply.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ApplyOutcome {
-    /// Files whose text content changed.
-    pub files_changed: Vec<PathBuf>,
-    /// File operations performed, in order.
-    pub file_ops_applied: Vec<String>,
-}
-
-/// Apply a parsed WorkspaceEdit atomically.
-///
-/// Phase 1 (validate + compute): read every target file, apply its text
-/// edits in memory. Any failure (unreadable file, out-of-range position,
-/// overlap, drift when `expected_hashes` are provided) aborts with zero
-/// writes.
-///
-/// Phase 2 (commit): write each file via temp-file + rename in the same
-/// directory, then perform file operations. A mid-commit failure rolls back
-/// already-written files from staged originals and un-applies file ops on a
-/// best-effort basis.
-///
-/// # Errors
-///
-/// Returns `[LSP_EDIT_CONFLICT]` for drift/overlap/range failures and
-/// `[LSP_EDIT_APPLY]` for I/O failures during commit (after rollback).
-pub fn apply_workspace_edit(
-    plan: &WorkspaceEditPlan,
-    expected_hashes: Option<&HashMap<PathBuf, u64>>,
-) -> Result<ApplyOutcome, crate::error::Error> {
-    // ── Phase 1: validate + compute ─────────────────────────────────────
-    let mut planned: Vec<PlannedWrite> = Vec::with_capacity(plan.text_edits.len());
-    for (path, edits) in &plan.text_edits {
-        let original = std::fs::read_to_string(path).map_err(|err| {
-            plan_error(
-                "LSP_EDIT_CONFLICT",
-                format!("cannot read {}: {err}", path.display()),
-            )
-        })?;
-        if let Some(expected) = expected_hashes.and_then(|hashes| hashes.get(path)) {
-            let actual = content_hash_for_drift(&original);
-            if actual != *expected {
-                return Err(plan_error(
-                    "LSP_EDIT_CONFLICT",
-                    format!(
-                        "{} changed on disk since the edit was computed; re-run the request",
-                        path.display()
-                    ),
-                ));
-            }
-        }
-        let updated = apply_text_edits(&original, edits)
-            .map_err(|err| plan_error("LSP_EDIT_CONFLICT", format!("{}: {err}", path.display())))?;
-        planned.push(PlannedWrite {
-            path: path.clone(),
-            original,
-            updated,
-        });
-    }
-
-    // Validate file ops before committing anything.
-    for op in &plan.file_ops {
+/// Validate file operations against the current filesystem before any
+/// write happens (fail-closed, zero side effects).
+fn validate_file_ops(ops: &[FileOp]) -> Result<(), crate::error::Error> {
+    for op in ops {
         match op {
             FileOp::Create { path, overwrite } => {
                 if path.exists() && !overwrite {
@@ -289,6 +231,72 @@ pub fn apply_workspace_edit(
             }
         }
     }
+    Ok(())
+}
+
+/// Outcome of an atomic apply.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyOutcome {
+    /// Files whose text content changed.
+    pub files_changed: Vec<PathBuf>,
+    /// File operations performed, in order.
+    pub file_ops_applied: Vec<String>,
+}
+
+/// Apply a parsed WorkspaceEdit atomically.
+///
+/// Phase 1 (validate + compute): read every target file, apply its text
+/// edits in memory. Any failure (unreadable file, out-of-range position,
+/// overlap, drift when `expected_hashes` are provided) aborts with zero
+/// writes.
+///
+/// Phase 2 (commit): write each file via temp-file + rename in the same
+/// directory, then perform file operations. A mid-commit failure rolls back
+/// already-written files from staged originals and un-applies file ops on a
+/// best-effort basis.
+///
+/// # Errors
+///
+/// Returns `[LSP_EDIT_CONFLICT]` for drift/overlap/range failures and
+/// `[LSP_EDIT_APPLY]` for I/O failures during commit (after rollback).
+#[allow(clippy::implicit_hasher)] // concrete RandomState keeps `None` call sites inference-free
+pub fn apply_workspace_edit(
+    plan: &WorkspaceEditPlan,
+    expected_hashes: Option<&HashMap<PathBuf, u64>>,
+) -> Result<ApplyOutcome, crate::error::Error> {
+    // ── Phase 1: validate + compute ─────────────────────────────────────
+    let mut planned: Vec<PlannedWrite> = Vec::with_capacity(plan.text_edits.len());
+    for (path, edits) in &plan.text_edits {
+        let original = std::fs::read_to_string(path).map_err(|err| {
+            plan_error(
+                "LSP_EDIT_CONFLICT",
+                format!("cannot read {}: {err}", path.display()),
+            )
+        })?;
+        if let Some(expected) = expected_hashes.and_then(|hashes| hashes.get(path)) {
+            let actual = content_hash_for_drift(&original);
+            if actual != *expected {
+                return Err(plan_error(
+                    "LSP_EDIT_CONFLICT",
+                    format!(
+                        "{} changed on disk since the edit was computed; re-run the request",
+                        path.display()
+                    ),
+                ));
+            }
+        }
+        let updated = apply_text_edits(&original, edits)
+            .map_err(|err| plan_error("LSP_EDIT_CONFLICT", format!("{}: {err}", path.display())))?;
+        planned.push(PlannedWrite {
+            path: path.clone(),
+            original,
+            updated,
+        });
+    }
+
+    // Validate file ops before committing anything.
+    validate_file_ops(&plan.file_ops)?;
 
     // ── Phase 2: commit with rollback ───────────────────────────────────
     let mut written: Vec<PathBuf> = Vec::new();
@@ -554,7 +562,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&a).expect("a"), "XXcdef\n");
         assert!(!old.exists());
         assert_eq!(std::fs::read_to_string(&new).expect("new"), "payload\n");
-        assert_eq!(outcome.files_changed, vec![a.clone()]);
+        assert_eq!(outcome.files_changed, vec![a]);
         assert_eq!(outcome.file_ops_applied.len(), 1);
     }
 

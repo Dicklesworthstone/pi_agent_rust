@@ -1,13 +1,13 @@
 //! Integration tests for the `lsp` tool (bd-cv653.1.1).
 //!
 //! Two lanes:
-//! - Server-free cases: registry gating, usage errors, status/diagnostics
-//!   surfaces that never spawn, and a never-answers fixture server (`cat`)
+//! - Server-free cases: registry gating, usage errors, `status`/diagnostics
+//!   surfaces that never spawn, and a never-answers fixture server (`sleep`)
 //!   proving the timeout path sends `$/cancelRequest` and fails with
-//!   [LSP_TIMEOUT].
+//!   `[LSP_TIMEOUT]`.
 //! - Live rust-analyzer cases (skip honestly when the binary is absent):
 //!   definition/references/hover, diagnostics, multi-file atomic rename, and
-//!   rename_file with willRenameFiles import updates.
+//!   `rename_file` with `willRenameFiles` import updates.
 //!
 //! Logging: every case emits structured JSONL per the repo harness pattern
 //! (tests/common/logging.rs) — per-case events, tool inputs, decisions, and
@@ -172,11 +172,11 @@ edition = "2021"
     write_file(
         harness,
         "src/lib.rs",
-        r#"pub mod util;
+        r"pub mod util;
 pub mod driver;
 
 pub use driver::run;
-"#,
+",
     );
     write_file(
         harness,
@@ -197,14 +197,14 @@ pub fn format_answer(value: u64) -> String {
     write_file(
         harness,
         "src/driver.rs",
-        r#"use crate::util::{compute_answer, format_answer};
+        r"use crate::util::{compute_answer, format_answer};
 
 pub fn run() -> String {
     let value = compute_answer(1);
     let doubled = compute_answer(value);
     format_answer(doubled)
 }
-"#,
+",
     );
 }
 
@@ -691,10 +691,7 @@ fn rust_analyzer_rename_file_updates_module_declaration() {
     if payload["willRenameFiles"].as_bool() == Some(true) {
         let lib = read_file(&harness, "src/lib.rs");
         let driver = read_file(&harness, "src/driver.rs");
-        let updates = payload["importUpdates"]
-            .as_array()
-            .map(Vec::len)
-            .unwrap_or(0);
+        let updates = payload["importUpdates"].as_array().map_or(0, Vec::len);
         harness.log().info(
             "verify",
             format!("willRenameFiles advertised; {updates} files updated; lib.rs={lib} driver.rs={driver}"),

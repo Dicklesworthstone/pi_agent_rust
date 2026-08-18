@@ -177,25 +177,27 @@ fn merge_servers(config: Option<&Config>) -> Vec<ServerSpec> {
     for (name, entry) in overrides {
         if let Some(existing) = servers.iter_mut().find(|s| &s.name == name) {
             if let Some(command) = &entry.command {
-                existing.command = command.clone();
+                existing.command.clone_from(command);
             }
             if let Some(args) = &entry.args {
-                existing.args = args.clone();
+                existing.args.clone_from(args);
             }
             if let Some(env) = &entry.env {
                 existing.env = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             }
             if let Some(languages) = &entry.languages {
-                existing.languages = languages.clone();
+                existing.languages.clone_from(languages);
             }
             if let Some(extensions) = &entry.extensions {
-                existing.extensions = extensions.clone();
+                existing.extensions.clone_from(extensions);
             }
             if let Some(markers) = &entry.root_markers {
-                existing.root_markers = markers.clone();
+                existing.root_markers.clone_from(markers);
             }
             if entry.initialization_options.is_some() {
-                existing.initialization_options = entry.initialization_options.clone();
+                existing
+                    .initialization_options
+                    .clone_from(&entry.initialization_options);
             }
         } else if let Some(command) = &entry.command {
             servers.push(ServerSpec {
@@ -324,7 +326,7 @@ impl LspRegistry {
     /// registry access so shutdown is deterministic without a background
     /// task.
     fn sweep_idle(&self) {
-        let stale: Vec<(String, Arc<ServerEntry>)> = {
+        let stale: Vec<Arc<ServerEntry>> = {
             let mut entries = self.lock_entries();
             let stale_keys: Vec<String> = entries
                 .iter()
@@ -333,12 +335,15 @@ impl LspRegistry {
                 })
                 .map(|(key, _)| key.clone())
                 .collect();
-            stale_keys
+            let stale: Vec<Arc<ServerEntry>> = stale_keys
                 .into_iter()
-                .filter_map(|key| entries.remove(&key).map(|entry| (key, entry)))
-                .collect()
+                .filter_map(|key| entries.remove(&key))
+                .collect();
+            // Release the registry lock before killing servers.
+            drop(entries);
+            stale
         };
-        for (_, entry) in stale {
+        for entry in stale {
             entry.client.kill();
         }
     }
@@ -368,11 +373,11 @@ impl LspRegistry {
         })?;
         let root = spec.workspace_root_for(&self.cwd, path);
         let key = format!("{}\n{}", spec.name, root.display());
-        if let Some(entry) = self.lock_entries().get(&key) {
-            if entry.client.is_alive() {
-                entry.touch();
-                return Ok(Arc::clone(entry));
-            }
+        if let Some(entry) = self.lock_entries().get(&key)
+            && entry.client.is_alive()
+        {
+            entry.touch();
+            return Ok(Arc::clone(entry));
         }
         // Serialize spawns so concurrent first-use cannot double-spawn.
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
@@ -381,11 +386,11 @@ impl LspRegistry {
                 .await
                 .map_err(|_| Error::tool("lsp", "[LSP_CANCELLED] cancelled by ambient context"))?;
         // Re-check after acquiring the lane.
-        if let Some(entry) = self.lock_entries().get(&key) {
-            if entry.client.is_alive() {
-                entry.touch();
-                return Ok(Arc::clone(entry));
-            }
+        if let Some(entry) = self.lock_entries().get(&key)
+            && entry.client.is_alive()
+        {
+            entry.touch();
+            return Ok(Arc::clone(entry));
         }
         let client = LspClient::connect(
             &spec.command,

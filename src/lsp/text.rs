@@ -108,7 +108,9 @@ fn line_start_offset(content: &str, line: u32) -> Option<usize> {
 #[must_use]
 pub fn line_count(content: &str) -> u32 {
     let newlines = content.bytes().filter(|b| *b == b'\n').count();
-    u32::try_from(newlines).unwrap_or(u32::MAX).saturating_add(1)
+    u32::try_from(newlines)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
 }
 
 /// Map an LSP position to a UTF-8 byte offset in `content`.

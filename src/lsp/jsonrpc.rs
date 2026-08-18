@@ -416,7 +416,8 @@ impl JsonRpcClient {
     /// Whether the child process has exited (reaps the exit status if so).
     #[must_use]
     pub fn child_exited(&self) -> bool {
-        matches!(lock(&self.child).try_wait_child(), Ok(Some(_)))
+        let status = lock(&self.child).try_wait_child();
+        matches!(status, Ok(Some(_)))
     }
 
     /// Graceful stop: best-effort `shutdown` + `exit`, then kill.

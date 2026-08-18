@@ -110,7 +110,7 @@ impl LspTool {
     }
 
     /// Language id for a file under a given server spec.
-    fn language_id_for(&self, path: &Path, spec: &registry::ServerSpec) -> String {
+    fn language_id_for(path: &Path, spec: &registry::ServerSpec) -> String {
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
@@ -133,13 +133,13 @@ impl LspTool {
         let spec = self.registry.spec_for_file(path).ok_or_else(|| {
             tool_err("LSP_NO_SERVER", format!("no server for {}", path.display()))
         })?;
-        let language_id = self.language_id_for(path, spec);
+        let language_id = Self::language_id_for(path, spec);
         let uri = entry.client.ensure_synced(path, &language_id)?;
         Ok((uri, entry))
     }
 
     /// Resolve a position from file + line + symbol selector.
-    fn resolve_position(&self, path: &Path, line: Option<u32>, symbol: &str) -> Result<Position> {
+    fn resolve_position(path: &Path, line: Option<u32>, symbol: &str) -> Result<Position> {
         let content = std::fs::read_to_string(path).map_err(|err| {
             tool_err(
                 "LSP_FILE_UNREADABLE",
@@ -214,9 +214,8 @@ impl LspTool {
     ) -> ToolOutput {
         let mut entries = Vec::new();
         for (uri, range) in locations.iter().take(limit) {
-            let path = uri_to_path(uri)
-                .map(|p| display_path(&p, &self.cwd))
-                .unwrap_or_else(|| uri.clone());
+            let path =
+                uri_to_path(uri).map_or_else(|| uri.clone(), |p| display_path(&p, &self.cwd));
             entries.push(json!({
                 "file": path,
                 "line": range.start.line + 1,
@@ -318,38 +317,33 @@ impl LspTool {
             .call(method, params, self.request_timeout(input))
             .await
             .map_err(Error::from)?;
-        match action {
-            "hover" => {
-                let text =
-                    hover_to_text(&result).unwrap_or_else(|| "no hover information".to_string());
-                let payload = json!({
-                    "action": "hover",
-                    "file": display_path(&path, &self.cwd),
-                    "line": position.line + 1,
-                    "hover": text,
-                });
-                Ok(text_output(payload.to_string(), payload))
-            }
-            _ => {
-                let locations = parse_locations(&result);
-                let limit = input
-                    .limit
-                    .unwrap_or(DEFAULT_LOCATION_LIMIT)
-                    .min(HARD_LOCATION_LIMIT);
-                if locations.is_empty() {
-                    let payload = json!({
-                        "action": action,
-                        "file": display_path(&path, &self.cwd),
-                        "line": position.line + 1,
-                        "count": 0,
-                        "locations": [],
-                        "note": format!("no {action} found at that position"),
-                    });
-                    return Ok(text_output(payload.to_string(), payload));
-                }
-                Ok(self.locations_output(action, &locations, limit))
-            }
+        if action == "hover" {
+            let text = hover_to_text(&result).unwrap_or_else(|| "no hover information".to_string());
+            let payload = json!({
+                "action": "hover",
+                "file": display_path(&path, &self.cwd),
+                "line": position.line + 1,
+                "hover": text,
+            });
+            return Ok(text_output(payload.to_string(), payload));
         }
+        let locations = parse_locations(&result);
+        let limit = input
+            .limit
+            .unwrap_or(DEFAULT_LOCATION_LIMIT)
+            .min(HARD_LOCATION_LIMIT);
+        if locations.is_empty() {
+            let payload = json!({
+                "action": action,
+                "file": display_path(&path, &self.cwd),
+                "line": position.line + 1,
+                "count": 0,
+                "locations": [],
+                "note": format!("no {action} found at that position"),
+            });
+            return Ok(text_output(payload.to_string(), payload));
+        }
+        Ok(self.locations_output(action, &locations, limit))
     }
 
     fn require_position(&self, input: &LspInput) -> Result<(PathBuf, Position)> {
@@ -366,7 +360,7 @@ impl LspTool {
             )
         })?;
         let path = resolve_tool_path(file, &self.cwd);
-        let position = self.resolve_position(&path, input.line, symbol)?;
+        let position = Self::resolve_position(&path, input.line, symbol)?;
         Ok((path, position))
     }
 
@@ -582,6 +576,26 @@ impl LspTool {
         Ok(text_output(payload.to_string(), payload))
     }
 
+    /// Code-action range: symbol+line resolves a point; otherwise the whole
+    /// document.
+    fn code_action_range(input: &LspInput, path: &Path) -> Result<Value> {
+        if let Some(symbol) = input.symbol.as_deref() {
+            let position = Self::resolve_position(path, input.line, symbol)?;
+            return Ok(json!({ "start": position, "end": position }));
+        }
+        let content = std::fs::read_to_string(path).map_err(|err| {
+            tool_err(
+                "LSP_FILE_UNREADABLE",
+                format!("cannot read {}: {err}", path.display()),
+            )
+        })?;
+        let last_line = line_count(&content).saturating_sub(1);
+        Ok(json!({
+            "start": Position { line: 0, character: 0 },
+            "end": Position { line: last_line, character: 0 },
+        }))
+    }
+
     async fn run_code_actions(&self, input: &LspInput) -> Result<ToolOutput> {
         let file = input
             .file
@@ -590,26 +604,7 @@ impl LspTool {
         let path = resolve_tool_path(file, &self.cwd);
         let (uri, entry) = self.synced(&path).await?;
 
-        // Range: symbol+line resolves a point; otherwise the whole document.
-        let range = match input.symbol.as_deref() {
-            Some(symbol) => {
-                let position = self.resolve_position(&path, input.line, symbol)?;
-                json!({ "start": position, "end": position })
-            }
-            None => {
-                let content = std::fs::read_to_string(&path).map_err(|err| {
-                    tool_err(
-                        "LSP_FILE_UNREADABLE",
-                        format!("cannot read {}: {err}", path.display()),
-                    )
-                })?;
-                let last_line = line_count(&content).saturating_sub(1);
-                json!({
-                    "start": Position { line: 0, character: 0 },
-                    "end": Position { line: last_line, character: 0 },
-                })
-            }
-        };
+        let range = Self::code_action_range(input, &path)?;
         let diagnostics = entry
             .client
             .diagnostics_snapshot()
@@ -663,6 +658,19 @@ impl LspTool {
             )
         })?;
         let selected = select_code_action(&actions, query)?;
+        self.apply_code_action(input, &entry, &selected).await
+    }
+
+    /// Apply one selected code action: edit-bearing actions apply atomically
+    /// through the WorkspaceEdit machinery; command-only actions go through
+    /// `workspace/executeCommand` (server `workspace/applyEdit` requests are
+    /// applied by the installed handler).
+    async fn apply_code_action(
+        &self,
+        input: &LspInput,
+        entry: &Arc<ServerEntry>,
+        selected: &Value,
+    ) -> Result<ToolOutput> {
         let title = selected
             .get("title")
             .and_then(Value::as_str)
@@ -1132,12 +1140,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let file = temp.path().join("a.rs");
         std::fs::write(&file, "fn alpha() {}\nfn beta() { alpha(); }\n").expect("file");
-        let tool = LspTool::new(temp.path(), None);
 
         // Unique on a line.
-        let pos = tool
-            .resolve_position(&file, Some(1), "alpha")
-            .expect("line 1");
+        let pos = LspTool::resolve_position(&file, Some(1), "alpha").expect("line 1");
         assert_eq!(
             pos,
             Position {
@@ -1147,24 +1152,18 @@ mod tests {
         );
 
         // Ambiguous across file without line.
-        let err = tool
-            .resolve_position(&file, None, "alpha")
-            .expect_err("ambiguous");
+        let err = LspTool::resolve_position(&file, None, "alpha").expect_err("ambiguous");
         assert!(err.to_string().contains("LSP_SYMBOL_AMBIGUOUS"), "{err}");
 
         // #N selects.
-        let pos = tool
-            .resolve_position(&file, None, "alpha#2")
-            .expect("second occurrence");
+        let pos = LspTool::resolve_position(&file, None, "alpha#2").expect("second occurrence");
         assert_eq!(pos.line, 1);
 
         // Out-of-range #N errors.
-        assert!(tool.resolve_position(&file, None, "alpha#9").is_err());
+        assert!(LspTool::resolve_position(&file, None, "alpha#9").is_err());
 
         // Missing symbol errors.
-        let err = tool
-            .resolve_position(&file, None, "gamma")
-            .expect_err("missing");
+        let err = LspTool::resolve_position(&file, None, "gamma").expect_err("missing");
         assert!(err.to_string().contains("LSP_NO_SYMBOL"), "{err}");
     }
 

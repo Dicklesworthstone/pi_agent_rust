@@ -22,6 +22,7 @@ use common::logging::validate_jsonl_v2_only;
 use pi::model::ContentBlock;
 use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
+use std::path::Path;
 use std::process::Command;
 
 const CASE: &str = "e2e_lsp_rename_compile_proof";
@@ -120,46 +121,8 @@ fn execute_lsp(registry: &ToolRegistry, input: Value) -> Result<ToolOutput, pi::
     block_on_local(tool.execute("e2e-call", input, None))
 }
 
-#[test]
-fn e2e_lsp_rename_compile_proof() {
-    let harness = TestHarness::new(CASE);
-    harness
-        .log()
-        .info("setup", "staging dependency-free fixture crate");
-
-    if !rust_analyzer_available() {
-        let path = std::env::var("PATH").unwrap_or_else(|_| "<unset>".to_string());
-        let home = std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_string());
-        let path_probe = probe_rust_analyzer("rust-analyzer");
-        let cargo_bin_probe = std::env::var_os("HOME").is_some_and(|home| {
-            probe_rust_analyzer(
-                &std::path::PathBuf::from(home)
-                    .join(".cargo/bin/rust-analyzer")
-                    .to_string_lossy(),
-            )
-        });
-        assert!(
-            !rust_analyzer_required(),
-            "PI_LSP_TEST_REQUIRE_RA is set but rust-analyzer is not installed; \
-             refusing to let the e2e lane skip its proof. \
-             Diagnostics: PATH={path} HOME={home} probe(PATH)={path_probe} probe(cargo-bin)={cargo_bin_probe}"
-        );
-        harness.log().info(
-            "skip",
-            "rust-analyzer not installed; skipping honestly (install: rustup component add rust-analyzer)",
-        );
-        let path = harness.temp_path(format!("{CASE}.jsonl"));
-        harness
-            .write_jsonl_logs(&path)
-            .expect("write JSONL test logs");
-        let payload = std::fs::read_to_string(&path).expect("read JSONL test logs");
-        assert!(validate_jsonl_v2_only(&payload).is_empty());
-        harness.record_artifact(format!("{CASE}.jsonl"), &path);
-        return;
-    }
-
-    let root = harness.temp_path(".");
-    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+/// Stage the dependency-free fixture crate under `root`.
+fn stage_fixture_crate(root: &Path) {
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"lsp_e2e_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
@@ -177,6 +140,51 @@ fn e2e_lsp_rename_compile_proof() {
         "use crate::engine::thrust_level;\n\npub fn report() -> String {\n    let base = thrust_level(100);\n    let idle = thrust_level(0);\n    format!(\"base={base} idle={idle}\")\n}\n",
     )
     .expect("cli.rs");
+}
+
+/// Handle the no-rust-analyzer case: fail loudly when the lane is required,
+/// else log the honest skip and record the JSONL artifact. Returns true when
+/// the caller must return early.
+fn skip_without_rust_analyzer(harness: &TestHarness) -> bool {
+    if rust_analyzer_available() {
+        return false;
+    }
+    let path_env = std::env::var("PATH").unwrap_or_else(|_| "<unset>".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_string());
+    assert!(
+        !rust_analyzer_required(),
+        "PI_LSP_TEST_REQUIRE_RA is set but rust-analyzer is not installed; \
+         refusing to let the e2e lane skip its proof. \
+         Diagnostics: PATH={path_env} HOME={home}"
+    );
+    harness.log().info(
+        "skip",
+        "rust-analyzer not installed; skipping honestly (install: rustup component add rust-analyzer)",
+    );
+    let path = harness.temp_path(format!("{CASE}.jsonl"));
+    harness
+        .write_jsonl_logs(&path)
+        .expect("write JSONL test logs");
+    let payload = std::fs::read_to_string(&path).expect("read JSONL test logs");
+    assert!(validate_jsonl_v2_only(&payload).is_empty());
+    harness.record_artifact(format!("{CASE}.jsonl"), &path);
+    true
+}
+
+#[test]
+fn e2e_lsp_rename_compile_proof() {
+    let harness = TestHarness::new(CASE);
+    harness
+        .log()
+        .info("setup", "staging dependency-free fixture crate");
+
+    if skip_without_rust_analyzer(&harness) {
+        return;
+    }
+
+    let root = harness.temp_path(".");
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+    stage_fixture_crate(&root);
     harness.log().info("setup", "fixture crate staged");
 
     let registry = ToolRegistry::new(&["lsp"], &root, Some(&config));
@@ -252,10 +260,28 @@ fn e2e_lsp_rename_compile_proof() {
     );
 
     // ── Phase 4: surface-agnostic parity ────────────────────────────────
-    // Interactive, print, RPC, and ACP hosts all construct their tool
-    // registries through ToolRegistry::new; two independent registries must
-    // execute the same call identically.
-    let second = ToolRegistry::new(&["lsp"], &root, Some(&config));
+    prove_surface_parity(&root, &config, &registry);
+    harness
+        .log()
+        .info("verify", "surface-agnostic parity proven across registries");
+
+    // ── Structured logs ─────────────────────────────────────────────────
+    let path = harness.temp_path(format!("{CASE}.jsonl"));
+    harness
+        .write_jsonl_logs(&path)
+        .expect("write JSONL test logs");
+    let logs = std::fs::read_to_string(&path).expect("read JSONL test logs");
+    let errors = validate_jsonl_v2_only(&logs);
+    assert!(errors.is_empty(), "JSONL schema violations: {errors:?}");
+    harness.record_artifact(format!("{CASE}.jsonl"), &path);
+    harness.log().info("verify", "e2e case complete");
+}
+
+/// Phase 4: surface-agnostic parity. Interactive, print, RPC, and ACP hosts
+/// all construct their tool registries through `ToolRegistry::new`; two
+/// independent registries must execute the same call identically.
+fn prove_surface_parity(root: &Path, config: &pi::config::Config, registry: &ToolRegistry) {
+    let second = ToolRegistry::new(&["lsp"], root, Some(config));
     let input = json!({
         "action": "definition",
         "file": "src/cli.rs",
@@ -263,7 +289,7 @@ fn e2e_lsp_rename_compile_proof() {
         "symbol": "thrust_output",
         "timeout": 90,
     });
-    let first = output_json(&execute_lsp(&registry, input.clone()).expect("definition 1"));
+    let first = output_json(&execute_lsp(registry, input.clone()).expect("definition 1"));
     let repeated = output_json(&execute_lsp(&second, input).expect("definition 2"));
     assert_eq!(
         first["locations"], repeated["locations"],
@@ -279,18 +305,4 @@ fn e2e_lsp_rename_compile_proof() {
                 .is_some_and(|f| f.ends_with("engine.rs"))),
         "definition of thrust_output must land in engine.rs: {first}"
     );
-    harness
-        .log()
-        .info("verify", "surface-agnostic parity proven across registries");
-
-    // ── Structured logs ─────────────────────────────────────────────────
-    let path = harness.temp_path(format!("{CASE}.jsonl"));
-    harness
-        .write_jsonl_logs(&path)
-        .expect("write JSONL test logs");
-    let logs = std::fs::read_to_string(&path).expect("read JSONL test logs");
-    let errors = validate_jsonl_v2_only(&logs);
-    assert!(errors.is_empty(), "JSONL schema violations: {errors:?}");
-    harness.record_artifact(format!("{CASE}.jsonl"), &path);
-    harness.log().info("verify", "e2e case complete");
 }
