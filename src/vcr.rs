@@ -179,24 +179,50 @@ pub struct RecordedResponse {
     pub body_chunks_base64: Option<Vec<String>>,
 }
 
+/// Playback pacing knob: sleep this long before yielding each body chunk.
+///
+/// Deterministic harnesses set this env so a replayed stream takes real
+/// wall-clock time — required by tests that must act MID-STREAM (e.g.
+/// signal-teardown while a reply is streaming, bd-pb4fw). Unset/zero/invalid
+/// preserves the historical instant playback.
+pub const VCR_ENV_CHUNK_DELAY_MS: &str = "VCR_CHUNK_DELAY_MS";
+
+fn playback_chunk_delay() -> Option<std::time::Duration> {
+    std::env::var(VCR_ENV_CHUNK_DELAY_MS)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+}
+
 impl RecordedResponse {
     pub fn into_byte_stream(
         self,
     ) -> BoxStream<'static, std::result::Result<Vec<u8>, std::io::Error>> {
-        if let Some(chunks) = self.body_chunks_base64 {
-            stream::iter(chunks.into_iter().map(|chunk| {
-                STANDARD
-                    .decode(chunk)
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
-            }))
-            .boxed()
-        } else {
-            stream::iter(
+        let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
+            if let Some(chunks) = self.body_chunks_base64 {
+                chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        STANDARD.decode(chunk).map_err(|err| {
+                            std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+                        })
+                    })
+                    .collect()
+            } else {
                 self.body_chunks
                     .into_iter()
-                    .map(|chunk| Ok(chunk.into_bytes())),
-            )
-            .boxed()
+                    .map(|chunk| Ok(chunk.into_bytes()))
+                    .collect()
+            };
+        match playback_chunk_delay() {
+            Some(pause) => stream::iter(chunks)
+                .then(move |item| async move {
+                    asupersync::time::sleep(asupersync::time::wall_now(), pause).await;
+                    item
+                })
+                .boxed(),
+            None => stream::iter(chunks).boxed(),
         }
     }
 }

@@ -230,8 +230,13 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
             .wait_for_pane_contains("running bash", COMMAND_TIMEOUT);
     }
 
-    // An unreadable/unparseable pid file is an immediate test failure.
-    let pid_text = std::fs::read_to_string(&pid_file).expect("read pi pid"); // ubs:ignore test assertion expect
+    // An unreadable/unparseable pid file is an immediate test failure; on
+    // that failure the pane + stderr are the diagnostics.
+    let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
+        let pane = session.tmux.capture_pane();
+        let stderr_tail = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+        panic!("read pi pid failed: {err}\npane:\n{pane}\nstderr:\n{stderr_tail}");
+    });
     let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
     // Literal /bin/kill path is deliberate: portable signal delivery without
     // libc in a unix-only test; a spawn failure is an immediate test failure.
@@ -558,11 +563,16 @@ fn ftui_vcr_system_prompt(workdir: &std::path::Path, env_root: &std::path::Path)
     .expect("build ftui vcr system prompt") // ubs:ignore test setup expect
 }
 
-fn write_ftui_vcr_cassette(dir: &std::path::Path, system_prompt: &str) -> std::path::PathBuf {
+fn write_ftui_vcr_cassette(
+    dir: &std::path::Path,
+    system_prompt: &str,
+    test_name: &str,
+    response_text: &str,
+) -> std::path::PathBuf {
     use pi::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse};
     use serde_json::json;
 
-    let cassette_path = dir.join(format!("{FTUI_VCR_TEST_NAME}.json"));
+    let cassette_path = dir.join(format!("{test_name}.json"));
     // The SDK path enables prompt caching: text blocks carry
     // cache_control and `system` is an array of blocks, not a string.
     let request = json!({
@@ -598,7 +608,7 @@ fn write_ftui_vcr_cassette(dir: &std::path::Path, system_prompt: &str) -> std::p
             json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
         ),
     ];
-    for word in FTUI_VCR_RESPONSE.split_inclusive(' ') {
+    for word in response_text.split_inclusive(' ') {
         body_chunks.push(sse_chunk(
             "content_block_delta",
             json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": word}}),
@@ -616,7 +626,7 @@ fn write_ftui_vcr_cassette(dir: &std::path::Path, system_prompt: &str) -> std::p
 
     let cassette = Cassette {
         version: "1.0".to_string(),
-        test_name: FTUI_VCR_TEST_NAME.to_string(),
+        test_name: test_name.to_string(),
         recorded_at: "1970-01-01T00:00:00Z".to_string(),
         interactions: vec![Interaction {
             request: RecordedRequest {
@@ -657,7 +667,8 @@ fn e2e_ftui_vcr_streamed_turn() {
     std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
     let system_prompt = ftui_vcr_system_prompt(session.harness.temp_dir(), &env_root);
     let cassette_dir = session.harness.temp_dir().join("cassettes");
-    let cassette_path = write_ftui_vcr_cassette(&cassette_dir, &system_prompt);
+    let cassette_path =
+        write_ftui_vcr_cassette(&cassette_dir, &system_prompt, FTUI_VCR_TEST_NAME, FTUI_VCR_RESPONSE);
     session
         .harness
         .record_artifact("ftui-vcr-cassette.json", &cassette_path);
@@ -733,4 +744,132 @@ fn e2e_ftui_vcr_streamed_turn() {
 
     quit_and_assert_clean(&session);
     session.write_artifacts();
+}
+
+// ── Mid-STREAM SIGTERM (bd-pb4fw follow-through via VCR chunk pacing) ───────
+
+const FTUI_VCR_KILL_TEST_NAME: &str = "e2e_ftui_vcr_midstream_kill";
+
+/// The bead's literal acceptance case: SIGTERM lands while a provider reply
+/// is STREAMING (VCR playback paced at 150ms/chunk gives a multi-second
+/// window), and the RAII restore must still leave the wrapper shell's
+/// terminal echoing.
+#[test]
+fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
+    use std::fmt::Write as _;
+
+    let Some((_lock, session)) = new_locked_session(FTUI_VCR_KILL_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let Some(binary) = std::env::var_os("CARGO_BIN_EXE_pi") else {
+        eprintln!("Skipping: CARGO_BIN_EXE_pi not set");
+        return;
+    };
+    let binary = std::path::PathBuf::from(binary);
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let system_prompt = ftui_vcr_system_prompt(session.harness.temp_dir(), &env_root);
+    // A long response (80 words) at 150ms/chunk ≈ 12s of streaming: plenty
+    // of window to observe the first words and land the signal mid-stream.
+    let mut long_response = String::from("midstream-first-marker ");
+    for i in 0..78 {
+        let _ = write!(long_response, "word{i} ");
+    }
+    long_response.push_str("midstream-last-marker");
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_VCR_KILL_TEST_NAME,
+        &long_response,
+    );
+
+    let pid_file = session.harness.temp_path("pi.pid");
+    let stderr_log = session.harness.temp_path("pi-stderr.log");
+    let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    for (key, sub) in [
+        ("PI_CODING_AGENT_DIR", "agent"),
+        ("PI_CONFIG_PATH", "config.toml"),
+        ("PI_SESSIONS_DIR", "sessions"),
+        ("PI_PACKAGE_DIR", "packages"),
+    ] {
+        let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
+    }
+    script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
+    let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
+    let _ = writeln!(script, "export {}={}", pi::vcr::VCR_ENV_DIR, cassette_dir.display());
+    let _ = writeln!(script, "export PI_VCR_TEST_NAME={FTUI_VCR_KILL_TEST_NAME}");
+    let _ = writeln!(script, "export {}=150", pi::vcr::VCR_ENV_CHUNK_DELAY_MS);
+    let _ = write!(
+        script,
+        "/bin/sh -c 'echo $$ > {pid}; exec {bin}",
+        pid = pid_file.display(),
+        bin = binary.display()
+    );
+    for arg in ftui_vcr_args() {
+        let _ = write!(script, " \"{arg}\"");
+    }
+    let _ = writeln!(script, " 2>{}'", stderr_log.display());
+    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i\n");
+
+    let script_path = session.harness.temp_path("midstream-run.sh");
+    std::fs::write(&script_path, &script).expect("write midstream script"); // ubs:ignore test setup expect
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat midstream script") // ubs:ignore test setup expect
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod midstream script"); // ubs:ignore test setup expect
+    }
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+
+    // First words visible = the reply is actively streaming; the tail marker
+    // must NOT be there yet, or the kill wouldn't be mid-stream.
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("midstream-first-marker", COMMAND_TIMEOUT);
+    assert!(
+        !pane.contains("midstream-last-marker"),
+        "stream already finished — pacing window too small; pane:\n{pane}"
+    );
+
+    // An unreadable/unparseable pid file is an immediate test failure; on
+    // that failure the pane + stderr are the diagnostics.
+    let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
+        let pane = session.tmux.capture_pane();
+        let stderr_tail = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+        panic!("read pi pid failed: {err}\npane:\n{pane}\nstderr:\n{stderr_tail}");
+    });
+    let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
+    let mut kill_cmd = std::process::Command::new("/bin/kill"); // ubs:ignore unix-only test helper path
+    kill_cmd.args(["-TERM", &pid.to_string()]);
+    let status = kill_cmd.status().expect("run kill"); // ubs:ignore test assertion expect
+    assert!(status.success(), "kill -TERM {pid} failed");
+
+    session
+        .tmux
+        .wait_for_pane_contains("PI-WAIT-DONE", COMMAND_TIMEOUT);
+    session.tmux.send_literal("echo POST-KILL-OK");
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("POST-KILL-OK", COMMAND_TIMEOUT);
+    let occurrences = pane.matches("POST-KILL-OK").count();
+    assert!(
+        occurrences >= 2,
+        "typed probe did not echo after mid-stream SIGTERM; occurrences={occurrences}, pane:\n{pane}"
+    );
+    session.tmux.kill_server();
 }
