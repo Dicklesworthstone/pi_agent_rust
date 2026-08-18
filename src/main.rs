@@ -2075,10 +2075,14 @@ async fn run(
                 // Explicit -e extension files load with UI prompts bridged
                 // (bd-1eoh4). Workspace/package-discovered extensions are a
                 // ResourceLoader integration follow-up.
+                // Extensions load with UI prompts bridged (bd-1eoh4): the
+                // ResourceLoader's discovered set (workspace/package/global)
+                // — which already folds in explicit -e paths and honors
+                // trust/policy filtering — plus nothing else.
                 extension_paths: if cli.no_extensions {
                     Vec::new()
                 } else {
-                    cli.extension.iter().map(PathBuf::from).collect()
+                    resources.extensions().to_vec()
                 },
                 extension_policy: cli.extension_policy.clone(),
                 // Prompt/tool/thinking flags flow through so deterministic
