@@ -81,6 +81,42 @@ pub struct ServerNotification {
     pub params: Value,
 }
 
+/// How a spawned server's environment is composed.
+///
+/// Language servers are first-party dev tools: they inherit the ambient
+/// environment (toolchains need HOME/PATH), with build-redirecting vars
+/// scrubbed. MCP servers are third-party code: they get an explicit
+/// allowlist plus their config `env` (never ambient inheritance), per the
+/// MCP client's security posture (bd-cv653.6.1).
+#[derive(Debug, Clone)]
+pub enum EnvPolicy {
+    /// Inherit the ambient environment, then remove the named vars.
+    InheritAndScrub(&'static [&'static str]),
+    /// Start empty, copy only the named ambient vars, then apply `env`.
+    Allowlist(&'static [&'static str]),
+}
+
+/// Ambient vars copied to MCP server processes (no secrets: paths, locale,
+/// terminal, and temp dirs only).
+pub const MCP_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "NO_COLOR",
+    "TERM",
+    "SystemRoot",
+    "SYSTEMROOT",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "COMSPEC",
+];
+
 /// Shared writer: frames are written atomically under one mutex.
 type SharedWriter = Mutex<ChildStdin>;
 
@@ -173,6 +209,57 @@ impl TailBuffer {
     }
 }
 
+/// Poll a request-completion receiver with a tick loop until it resolves,
+/// the deadline passes, or the ambient context cancels. On timeout/cancel
+/// the caller-provided `on_abandon` runs (used to send `$/cancelRequest`).
+///
+/// This is the shared wait discipline used by both the LSP client and the
+/// MCP stdio transport (bd-cv653.1.1 / bd-cv653.6.1).
+pub async fn await_completion<T>(
+    rx: &StdReceiver<T>,
+    timeout: std::time::Duration,
+    on_abandon: impl FnOnce(),
+) -> std::result::Result<T, CompletionWaitError> {
+    let cx = crate::agent_cx::AgentCx::for_current_or_request();
+    let start = cx
+        .cx()
+        .timer_driver()
+        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+    loop {
+        match rx.try_recv() {
+            Ok(value) => return Ok(value),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(CompletionWaitError::Closed);
+            }
+        }
+        let now = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        if std::time::Duration::from_nanos(now.duration_since(start)) >= timeout {
+            on_abandon();
+            return Err(CompletionWaitError::Timeout);
+        }
+        if cx.checkpoint().is_err() {
+            on_abandon();
+            return Err(CompletionWaitError::Cancelled);
+        }
+        asupersync::time::sleep(now, std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// Why a completion wait ended without a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionWaitError {
+    /// Deadline exceeded.
+    Timeout,
+    /// Ambient cancellation fired.
+    Cancelled,
+    /// The sender dropped without sending.
+    Closed,
+}
+
 /// One JSON-RPC connection to a language-server child process.
 pub struct JsonRpcClient {
     child: Mutex<ProcessGuard>,
@@ -200,22 +287,66 @@ impl JsonRpcClient {
         env: &[(String, String)],
         cwd: &Path,
     ) -> Result<Self> {
-        let mut cmd = Command::new(command); // ubs:ignore configured language-server spawn — command from defaults table or operator settings.json (bash-tool trust domain)
+        Self::spawn_with_policy(
+            command,
+            args,
+            env,
+            cwd,
+            &EnvPolicy::InheritAndScrub(&["CARGO_TARGET_DIR"]),
+            "lsp",
+        )
+    }
+
+    /// Spawn with an explicit environment policy. `flavor` tags spawn errors
+    /// (`lsp` vs `mcp`) so failures name the right subsystem.
+    ///
+    /// # Errors
+    ///
+    /// Same spawn failures as [`Self::spawn`].
+    pub fn spawn_with_policy(
+        command: &str,
+        args: &[String],
+        env: &[(String, String)],
+        cwd: &Path,
+        policy: &EnvPolicy,
+        flavor: &'static str,
+    ) -> Result<Self> {
+        let mut cmd = Command::new(command);
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Language servers must not inherit our stdin/terminal.
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            // Servers embed their own build runs (rust-analyzer's flycheck,
-            // `cargo metadata`): a redirected target dir would point those
-            // at a foreign, possibly lock-contended, shared target pool.
-            .env_remove("CARGO_TARGET_DIR");
+            .stderr(Stdio::piped());
+        match policy {
+            EnvPolicy::InheritAndScrub(scrub) => {
+                // Ambient inheritance minus the scrubbed vars. The
+                // CARGO_TARGET_DIR scrub keeps server-embedded build runs
+                // (rust-analyzer flycheck, cargo metadata) out of foreign,
+                // possibly lock-contended, shared target pools.
+                for var in *scrub {
+                    cmd.env_remove(var);
+                }
+            }
+            EnvPolicy::Allowlist(allowlist) => {
+                // No ambient inheritance: only allowlisted vars plus the
+                // caller's (secret-resolved) env entries.
+                cmd.env_clear();
+                for var in *allowlist {
+                    if let Some(value) = std::env::var_os(var) {
+                        cmd.env(var, value);
+                    }
+                }
+            }
+        }
+        // The caller's env applies last in both policies (overrides).
+        cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         let mut child: Child = cmd.spawn().map_err(|err| {
             Error::tool(
-                "lsp",
-                format!("[LSP_SERVER_MISSING] failed to spawn {command:?}: {err}"),
+                flavor,
+                format!(
+                    "[{}_SERVER_MISSING] failed to spawn {command:?}: {err}",
+                    flavor.to_ascii_uppercase()
+                ),
             )
         })?;
         let stdin = child
