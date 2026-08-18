@@ -792,7 +792,15 @@ impl PiFtuiModel {
     /// input was consumed as a command (including local errors).
     fn route_slash_command(&mut self, clean: &str) -> bool {
         if let Some(rest) = clean.strip_prefix("/model") {
-            let spec = rest.trim();
+            self.route_model_command(rest.trim());
+            return true;
+        }
+        self.route_slash_command_tail(clean)
+    }
+
+    /// `/model` handling: bare opens the picker, `provider/model` switches.
+    fn route_model_command(&mut self, spec: &str) {
+        {
             if spec.is_empty() {
                 // Bare /model opens the picker over the registry list.
                 if self.available_models.is_empty() {
@@ -824,8 +832,11 @@ impl PiFtuiModel {
                     String::from("usage: /model <provider>/<model>"),
                 );
             }
-            return true;
         }
+    }
+
+    /// Remaining slash routing after `/model`.
+    fn route_slash_command_tail(&mut self, clean: &str) -> bool {
         if clean == "/exit" || clean == "/quit" {
             self.pending_quit = true;
             return true;
@@ -1611,6 +1622,23 @@ fn spawn_ext_reply_pump(
     });
 }
 
+/// Install the ask bridge pair for a fresh driver: per-handle forwarder plus
+/// the long-lived reply pump against the CURRENT tool (same shape as the RPC
+/// host), so `/resume` handle swaps keep replies pairable.
+fn install_ask_bridges(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+    ask_reply_rx: Receiver<AskUiReply>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> CurrentAsk {
+    let current_ask: CurrentAsk = Arc::new(Mutex::new(handle.ask_tool()));
+    if let Some(ask) = handle.ask_tool() {
+        install_ask_forwarder(&ask, agent_tx, runtime_handle);
+    }
+    spawn_ask_reply_pump(Arc::clone(&current_ask), ask_reply_rx, runtime_handle);
+    current_ask
+}
+
 /// Shared slot for the CURRENT ask tool: `/resume` swaps the session handle
 /// (and with it the ask tool), so the long-lived reply pump resolves against
 /// whatever tool is current when the reply arrives.
@@ -1965,14 +1993,8 @@ pub fn run(
                         return;
                     }
                 };
-                // Ask tool bridge (same shape as the RPC host): per-handle
-                // forwarder + a long-lived reply pump against the CURRENT
-                // tool, so /resume handle swaps keep replies pairable.
-                let current_ask: CurrentAsk = Arc::new(Mutex::new(handle.ask_tool()));
-                if let Some(ask) = handle.ask_tool() {
-                    install_ask_forwarder(&ask, &agent_tx, &runtime_handle);
-                }
-                spawn_ask_reply_pump(Arc::clone(&current_ask), ask_reply_rx, &runtime_handle);
+                let current_ask =
+                    install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
                 let _ = agent_tx.send(PiMsg::System(String::from(
                     "ftui preview stack — experimental (bd-cv653.9.1)",
                 )));
