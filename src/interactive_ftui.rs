@@ -1430,6 +1430,20 @@ async fn run_prompt_turn(
     }
 }
 
+/// Template for `/resume`: a resumed session keeps the launch selection
+/// (provider/model/key/cwd) but swaps the session file.
+fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::SessionOptions {
+    crate::sdk::SessionOptions {
+        provider: options.provider.clone(),
+        model: options.model.clone(),
+        api_key: options.api_key.clone(),
+        working_directory: options.working_directory.clone(),
+        session_dir: options.session_dir.clone(),
+        no_session: false,
+        ..Default::default()
+    }
+}
+
 /// Handle `/compact` in the driver: run compaction with events translated to
 /// the UI, then replay the rewritten history into the transcript.
 async fn run_compact_command(
@@ -1581,17 +1595,7 @@ pub fn run(
         .clone()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
-    // Template for /resume: a resumed session keeps the launch selection
-    // (provider/model/key/cwd) but swaps the session file.
-    let resume_template = crate::sdk::SessionOptions {
-        provider: session_options.provider.clone(),
-        model: session_options.model.clone(),
-        api_key: session_options.api_key.clone(),
-        working_directory: session_options.working_directory.clone(),
-        session_dir: session_options.session_dir.clone(),
-        no_session: false,
-        ..Default::default()
-    };
+    let resume_template = resume_template_from(&session_options);
 
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
