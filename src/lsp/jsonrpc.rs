@@ -91,7 +91,7 @@ type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, Tr
 /// `Some(result)` overrides the default null response.
 pub type ServerRequestHandler = std::sync::Arc<dyn Fn(&str, &Value) -> Option<Value> + Send + Sync>;
 
-fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -347,12 +347,13 @@ impl JsonRpcClient {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         lock(&self.pending).insert(id, tx);
-        let frame = encode_frame(&serde_json::json!({
+        let mut frame_value = serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
-            "params": params,
-        }));
+        });
+        frame_value["params"] = params;
+        let frame = encode_frame(&frame_value);
         let write_result = {
             let mut guard = lock(&self.writer);
             guard.write_all(&frame).and_then(|()| guard.flush())
@@ -370,11 +371,12 @@ impl JsonRpcClient {
     ///
     /// Returns an error when the write fails.
     pub fn notify(&self, method: &str, params: Value) -> std::result::Result<(), TransportError> {
-        let frame = encode_frame(&serde_json::json!({
+        let mut frame_value = serde_json::json!({
             "jsonrpc": "2.0",
             "method": method,
-            "params": params,
-        }));
+        });
+        frame_value["params"] = params;
+        let frame = encode_frame(&frame_value);
         let mut guard = lock(&self.writer);
         guard
             .write_all(&frame)
@@ -441,6 +443,7 @@ impl Drop for JsonRpcClient {
 }
 
 /// Route one decoded message to its destination.
+#[allow(clippy::option_if_let_else)] // let-else is clearer than map_or_else with early returns
 fn handle_message<W: Write>(
     message: &Value,
     pending: &PendingMap,
