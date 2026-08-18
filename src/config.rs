@@ -769,6 +769,7 @@ impl Config {
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
             advisor: merge_advisor(base.advisor, other.advisor),
+            lsp: merge_lsp(base.lsp, other.lsp),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -1529,6 +1530,31 @@ fn merge_advisor(
             enabled: other.enabled.or(base.enabled),
             timeout_secs: other.timeout_secs.or(base.timeout_secs),
         }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge LSP settings: server maps union (other wins per server name),
+/// scalars prefer `other` (bd-cv653.1.1).
+fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<LspSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut servers = base.servers.unwrap_or_default();
+            if let Some(other_servers) = other.servers {
+                servers.extend(other_servers);
+            }
+            Some(LspSettings {
+                servers: if servers.is_empty() {
+                    None
+                } else {
+                    Some(servers)
+                },
+                request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
+                idle_shutdown_secs: other.idle_shutdown_secs.or(base.idle_shutdown_secs),
+            })
+        }
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
         (None, None) => None,

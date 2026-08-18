@@ -153,6 +153,7 @@ const fn event_label(event: &AgentEvent) -> &'static str {
         AgentEvent::FailoverStart { .. } => "failover_start",
         AgentEvent::FailoverEnd { .. } => "failover_end",
         AgentEvent::ExtensionError { .. } => "extension_error",
+        AgentEvent::AdvisorNote { .. } => "advisor_note",
     }
 }
 

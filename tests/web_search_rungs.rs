@@ -6,7 +6,7 @@
 mod common;
 
 use common::TestHarness;
-use common::harness::{MockHttpResponse, MockHttpServer};
+use common::harness::MockHttpResponse;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_search::{RungError, SearchFilters, SearchResult, all_rungs};
 
@@ -44,7 +44,7 @@ fn env_lock() -> &'static std::sync::Mutex<()> {
 /// (the crate forbids unsafe, so tests never mutate process env; the map is
 /// the in-process seam, the env var is the process-level seam).
 fn run_rung(
-    rung_name: &str,
+    rung_name: &'static str,
     key: Option<&str>,
     mock_path: &str,
     mock_method: &str,
@@ -57,17 +57,20 @@ fn run_rung(
     pi::web_search::set_base_url_override(rung_name, &server.base_url());
     let rungs = all_rungs();
     let rung = &rungs[rung_name];
-    let result = asupersync::test_utils::run_test(|| async {
-        (rung.run)(
-            &pi::http::client::Client::new(),
-            "rust async runtime",
-            &filters(),
-            key,
-        )
-        .await
+    let mut result = None;
+    asupersync::test_utils::run_test(|| async {
+        result = Some(
+            (rung.run)(
+                &pi::http::client::Client::new(),
+                "rust async runtime",
+                &filters(),
+                key,
+            )
+            .await,
+        );
     });
     pi::web_search::clear_base_url_overrides();
-    result
+    result.expect("rung future ran to completion")
 }
 
 #[test]
@@ -153,9 +156,12 @@ fn keyed_rung_without_key_is_no_key_error() {
     // rung must fail with NoKey BEFORE any network call.
     let rungs = all_rungs();
     let rung = &rungs["tavily"];
-    let result = asupersync::test_utils::run_test(|| async {
-        (rung.run)(&pi::http::client::Client::new(), "query", &filters(), None).await
+    let mut result = None;
+    asupersync::test_utils::run_test(|| async {
+        result =
+            Some((rung.run)(&pi::http::client::Client::new(), "query", &filters(), None).await);
     });
+    let result = result.expect("rung future ran to completion");
     let err = result.expect_err("no key must error before any request");
     assert!(err.to_string().contains("no API key"), "error: {err}");
     let path = harness.temp_path("no_key.jsonl");

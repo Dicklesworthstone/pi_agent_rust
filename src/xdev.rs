@@ -150,7 +150,9 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "ast_edit" => {
             "Staged structural code rewrite using tree-sitter AST patterns (ast-grep syntax)"
         }
-        "lsp" => "IDE-grade code intelligence (definition, references, rename) via language servers",
+        "lsp" => {
+            "IDE-grade code intelligence (definition, references, rename) via language servers"
+        }
         "subagent" => "Delegate an isolated task to a named Pi child agent",
         "ask" => "Ask the user structured questions mid-turn instead of guessing",
         "todo" => "Maintain the session task list",

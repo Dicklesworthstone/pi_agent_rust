@@ -20,6 +20,30 @@ use crate::error::{Error, Result};
 
 /// Poll tick for request completion waits (matches the bash tool's cadence).
 const WAIT_TICK: Duration = Duration::from_millis(10);
+/// Cadence for retrying the server-warmup error signature.
+const WARMUP_RETRY_CADENCE: Duration = Duration::from_millis(250);
+/// Window after connect during which empty position-lookup results may be
+/// the server still indexing rather than a truthful "not found".
+const WARMUP_EMPTY_RESULT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Position-lookup methods whose empty result during warmup may be indexing
+/// lag rather than truth. Narrow on purpose: symbols/diagnostics are never
+/// retried (an empty symbol list is a legitimate answer).
+fn is_position_lookup(method: &str) -> bool {
+    matches!(
+        method,
+        "textDocument/definition"
+            | "textDocument/typeDefinition"
+            | "textDocument/implementation"
+            | "textDocument/references"
+            | "textDocument/hover"
+    )
+}
+
+/// Whether a result is "empty" in the not-found sense (null or `[]`).
+fn is_empty_result(value: &Value) -> bool {
+    value.is_null() || matches!(value, Value::Array(items) if items.is_empty())
+}
 /// Default per-request timeout.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Timeout for the graceful `shutdown` request during stop.
@@ -146,8 +170,13 @@ pub struct LspClient {
     root_uri: String,
     open_docs: Mutex<HashMap<String, OpenDoc>>,
     diagnostics: Mutex<HashMap<String, Vec<Value>>>,
-    request_lane: asupersync::sync::Mutex<()>,
+    request_lane: std::sync::Arc<asupersync::sync::Mutex<()>>,
     capabilities: Mutex<ServerCapabilities>,
+    connected_at: std::time::Instant,
+    /// rust-analyzer's `experimental/serverStatus` quiescent flag (true when
+    /// the server reports no pending work). Stays false for servers that
+    /// never send the notification.
+    quiescent: std::sync::atomic::AtomicBool,
 }
 
 impl LspClient {
@@ -178,8 +207,10 @@ impl LspClient {
             root_uri: root_uri.clone(),
             open_docs: Mutex::new(HashMap::new()),
             diagnostics: Mutex::new(HashMap::new()),
-            request_lane: asupersync::sync::Mutex::new(()),
+            request_lane: std::sync::Arc::new(asupersync::sync::Mutex::new(())),
             capabilities: Mutex::new(ServerCapabilities::default()),
+            connected_at: std::time::Instant::now(),
+            quiescent: std::sync::atomic::AtomicBool::new(false),
         };
 
         let mut initialize_params = serde_json::json!({
@@ -272,7 +303,9 @@ impl LspClient {
     }
 
     fn lock<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
-        mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Server capabilities from the initialize handshake.
@@ -318,7 +351,8 @@ impl LspClient {
         Self::lock(&self.open_docs).len()
     }
 
-    /// Merge queued notifications into the diagnostics cache.
+    /// Merge queued notifications into the diagnostics cache and track
+    /// server quiescence (`experimental/serverStatus`).
     pub fn poll_notifications(&self) {
         for notification in self.rpc.drain_notifications() {
             if notification.method == "textDocument/publishDiagnostics" {
@@ -329,15 +363,31 @@ impl LspClient {
                         .get("diagnostics")
                         .and_then(Value::as_array),
                 ) {
-                    Self::lock(&self.diagnostics)
-                        .insert(uri.to_string(), diags.clone());
+                    Self::lock(&self.diagnostics).insert(uri.to_string(), diags.clone());
+                }
+            } else if notification.method == "experimental/serverStatus" {
+                if let Some(quiescent) = notification
+                    .params
+                    .get("quiescent")
+                    .and_then(Value::as_bool)
+                {
+                    self.quiescent
+                        .store(quiescent, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
     }
 
-    /// Block (async, tick-polled) until a `publishDiagnostics` for `uri`
-    /// arrives or `wait` elapses. Returns true when a publish arrived.
+    /// Block (async, tick-polled) until diagnostics for `uri` are fresh
+    /// enough to trust, or `wait` elapses. Returns true when a publish
+    /// arrived.
+    ///
+    /// "Fresh enough" means a publish for `uri` arrived AND at least one of:
+    /// the publish was non-empty, the server reported quiescence
+    /// (rust-analyzer's `experimental/serverStatus`), or the warmup window
+    /// has passed. An EMPTY publish inside the warmup window keeps waiting —
+    /// rust-analyzer publishes empty diagnostics for freshly opened files
+    /// before its first analysis completes.
     pub async fn wait_for_diagnostics(&self, uri: &str, wait: Duration) -> bool {
         let cx = AgentCx::for_current_or_request();
         let start = cx
@@ -346,21 +396,35 @@ impl LspClient {
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
         loop {
             self.poll_notifications();
-            if Self::lock(&self.diagnostics).contains_key(uri) {
-                return true;
+            {
+                let cache = Self::lock(&self.diagnostics);
+                if let Some(diags) = cache.get(uri) {
+                    let settled = !diags.is_empty()
+                        || self.quiescent.load(std::sync::atomic::Ordering::SeqCst)
+                        || self.connected_at.elapsed() >= WARMUP_EMPTY_RESULT_WINDOW;
+                    if settled {
+                        return true;
+                    }
+                }
             }
             let now = cx
                 .cx()
                 .timer_driver()
                 .map_or_else(asupersync::time::wall_now, |timer| timer.now());
             if std::time::Duration::from_nanos(now.duration_since(start)) >= wait {
-                return false;
+                return Self::lock(&self.diagnostics).contains_key(uri);
             }
             asupersync::time::sleep(now, WAIT_TICK).await;
         }
     }
 
     /// Serialized, timeout- and cancellation-aware request.
+    ///
+    /// Retries the narrow "server still warming up" signature (rust-analyzer
+    /// answers `-32602 No references found` for valid positions while it is
+    /// still indexing) on a 250 ms cadence within the caller's timeout; all
+    /// other errors return immediately. The match is message-specific so
+    /// real usage errors are never retried away.
     ///
     /// # Errors
     ///
@@ -374,12 +438,68 @@ impl LspClient {
         timeout: Duration,
     ) -> std::result::Result<Value, LspCallError> {
         let cx = AgentCx::for_current_or_request();
-        // Serialize requests per server (spec). The guard releases on drop.
-        let _lane = self
-            .request_lane
-            .lock(cx.cx())
-            .await
-            .map_err(|_| LspCallError::Cancelled)?;
+        let start = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+        let mut attempt = self.call_once(method, params.clone(), timeout).await;
+        loop {
+            // Retryable warmup/transient signatures:
+            // - `-32602 No references found`: rust-analyzer answers valid
+            //   positions with this while still indexing.
+            // - `-32801 ContentModified`: the LSP spec's designated
+            //   retryable error; here it is the same warmup race (the doc
+            //   was synced from disk milliseconds earlier, so genuine drift
+            //   is impossible inside one tool call).
+            let retryable = matches!(
+                &attempt,
+                Err(LspCallError::Transport(TransportError::Server(err)))
+                    if (err.code == -32602 && err.message.contains("No references found"))
+                        || err.code == -32801
+            );
+            // Empty position-lookup results inside the warmup window may be
+            // indexing lag; retrying only ever DELAYS an empty answer, it
+            // can never fabricate a result.
+            let empty_during_warmup = matches!(&attempt, Ok(value) if is_empty_result(value))
+                && is_position_lookup(method)
+                && self.connected_at.elapsed() < WARMUP_EMPTY_RESULT_WINDOW;
+            if !retryable && !empty_during_warmup {
+                return attempt;
+            }
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(asupersync::time::wall_now, |timer| timer.now());
+            let elapsed = std::time::Duration::from_nanos(now.duration_since(start));
+            let remaining = timeout.saturating_sub(elapsed);
+            if remaining < WARMUP_RETRY_CADENCE * 2 {
+                return attempt;
+            }
+            asupersync::time::sleep(now, WARMUP_RETRY_CADENCE).await;
+            if cx.checkpoint().is_err() {
+                return Err(LspCallError::Cancelled);
+            }
+            attempt = self.call_once(method, params.clone(), remaining).await;
+        }
+    }
+
+    /// One serialized request round-trip.
+    async fn call_once(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> std::result::Result<Value, LspCallError> {
+        let cx = AgentCx::for_current_or_request();
+        // Serialize requests per server (spec). The owned guard is Send, so
+        // the wait loop below can await while holding it; the guard releases
+        // on drop.
+        let _lane = asupersync::sync::OwnedMutexGuard::lock(
+            std::sync::Arc::clone(&self.request_lane),
+            cx.cx(),
+        )
+        .await
+        .map_err(|_| LspCallError::Cancelled)?;
         let (id, rx) = self
             .rpc
             .request(method, params)
@@ -508,9 +628,7 @@ impl LspClient {
     /// Graceful stop: `shutdown` request, `exit` notification, then kill if
     /// the process does not exit within a short grace window.
     pub async fn stop(&self) {
-        let _ = self
-            .call("shutdown", Value::Null, SHUTDOWN_TIMEOUT)
-            .await;
+        let _ = self.call("shutdown", Value::Null, SHUTDOWN_TIMEOUT).await;
         self.rpc.shutdown();
     }
 
@@ -527,7 +645,11 @@ impl LspClient {
 
     /// Fire-and-forget notification wrapper (errors intentionally dropped by
     /// callers on best-effort paths like `didRenameFiles`).
-    pub fn call_no_wait_notify(&self, method: &str, params: Value) -> std::result::Result<(), TransportError> {
+    pub fn call_no_wait_notify(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> std::result::Result<(), TransportError> {
         self.rpc.notify(method, params)
     }
 }
@@ -570,10 +692,7 @@ pub fn hover_to_text(result: &Value) -> Option<String> {
     fn marked_string_text(value: &Value) -> Option<String> {
         match value {
             Value::String(text) => Some(text.clone()),
-            Value::Object(map) => map
-                .get("value")
-                .and_then(Value::as_str)
-                .map(str::to_string),
+            Value::Object(map) => map.get("value").and_then(Value::as_str).map(str::to_string),
             _ => None,
         }
     }

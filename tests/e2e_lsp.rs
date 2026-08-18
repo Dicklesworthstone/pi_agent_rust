@@ -41,13 +41,65 @@ fn output_json(output: &ToolOutput) -> Value {
     serde_json::from_str(first_text(output)).expect("tool output must be a JSON payload")
 }
 
-fn rust_analyzer_available() -> bool {
-    Command::new("rust-analyzer")
+/// Probe one candidate binary; returns true when `--version` succeeds.
+fn probe_rust_analyzer(command: &str) -> bool {
+    Command::new(command)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Discover a working rust-analyzer command. Order: `PI_LSP_RUST_ANALYZER`
+/// override, `rust-analyzer` on PATH, `$HOME/.cargo/bin/rust-analyzer` (the
+/// rustup default — job environments with a minimal PATH still find it).
+fn rust_analyzer_command() -> Option<String> {
+    if let Ok(override_cmd) = std::env::var("PI_LSP_RUST_ANALYZER") {
+        return probe_rust_analyzer(&override_cmd).then_some(override_cmd);
+    }
+    if probe_rust_analyzer("rust-analyzer") {
+        return Some("rust-analyzer".to_string());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = std::path::PathBuf::from(home).join(".cargo/bin/rust-analyzer");
+        let candidate_str = candidate.to_string_lossy().into_owned();
+        if probe_rust_analyzer(&candidate_str) {
+            return Some(candidate_str);
+        }
+    }
+    None
+}
+
+fn rust_analyzer_available() -> bool {
+    rust_analyzer_command().is_some()
+}
+
+/// Whether the live lane must run (skip becomes a loud failure). Set
+/// `PI_LSP_TEST_REQUIRE_RA=1` in environments that guarantee the binary.
+fn rust_analyzer_required() -> bool {
+    std::env::var("PI_LSP_TEST_REQUIRE_RA")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Config with the discovered rust-analyzer command injected (spawn must
+/// use the same binary the probe found, even on minimal-PATH job runners).
+fn ra_config(command: &str) -> pi::config::Config {
+    let mut servers = std::collections::HashMap::new();
+    servers.insert(
+        "rust-analyzer".to_string(),
+        pi::config::LspServerSettings {
+            command: Some(command.to_string()),
+            ..Default::default()
+        },
+    );
+    pi::config::Config {
+        lsp: Some(pi::config::LspSettings {
+            servers: Some(servers),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 /// Drive a borrowed tool future to completion on a fresh current-thread
@@ -71,9 +123,27 @@ fn execute_lsp(registry: &ToolRegistry, input: Value) -> Result<ToolOutput, pi::
 #[test]
 fn e2e_lsp_rename_compile_proof() {
     let harness = TestHarness::new(CASE);
-    harness.log().info("setup", "staging dependency-free fixture crate");
+    harness
+        .log()
+        .info("setup", "staging dependency-free fixture crate");
 
     if !rust_analyzer_available() {
+        let path = std::env::var("PATH").unwrap_or_else(|_| "<unset>".to_string());
+        let home = std::env::var("HOME").unwrap_or_else(|_| "<unset>".to_string());
+        let path_probe = probe_rust_analyzer("rust-analyzer");
+        let cargo_bin_probe = std::env::var_os("HOME").is_some_and(|home| {
+            probe_rust_analyzer(
+                &std::path::PathBuf::from(home)
+                    .join(".cargo/bin/rust-analyzer")
+                    .to_string_lossy(),
+            )
+        });
+        assert!(
+            !rust_analyzer_required(),
+            "PI_LSP_TEST_REQUIRE_RA is set but rust-analyzer is not installed; \
+             refusing to let the e2e lane skip its proof. \
+             Diagnostics: PATH={path} HOME={home} probe(PATH)={path_probe} probe(cargo-bin)={cargo_bin_probe}"
+        );
         harness.log().info(
             "skip",
             "rust-analyzer not installed; skipping honestly (install: rustup component add rust-analyzer)",
@@ -89,17 +159,14 @@ fn e2e_lsp_rename_compile_proof() {
     }
 
     let root = harness.temp_path(".");
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
     std::fs::write(
         root.join("Cargo.toml"),
         "[package]\nname = \"lsp_e2e_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
     )
     .expect("manifest");
     std::fs::create_dir_all(root.join("src")).expect("src dir");
-    std::fs::write(
-        root.join("src/lib.rs"),
-        "pub mod engine;\npub mod cli;\n",
-    )
-    .expect("lib.rs");
+    std::fs::write(root.join("src/lib.rs"), "pub mod engine;\npub mod cli;\n").expect("lib.rs");
     std::fs::write(
         root.join("src/engine.rs"),
         "//! Engine internals.\n\n/// Compute a thrust value.\npub fn thrust_level(throttle: u64) -> u64 {\n    throttle * 9 / 10\n}\n",
@@ -112,12 +179,13 @@ fn e2e_lsp_rename_compile_proof() {
     .expect("cli.rs");
     harness.log().info("setup", "fixture crate staged");
 
-    let registry = ToolRegistry::new(&["lsp"], &root, None);
+    let registry = ToolRegistry::new(&["lsp"], &root, Some(&config));
 
     // ── Phase 1: rename thrust_level -> thrust_output from a call site ──
-    harness
-        .log()
-        .info("action", "rename thrust_level -> thrust_output via lsp tool");
+    harness.log().info(
+        "action",
+        "rename thrust_level -> thrust_output via lsp tool",
+    );
     let out = execute_lsp(
         &registry,
         json!({
@@ -152,7 +220,10 @@ fn e2e_lsp_rename_compile_proof() {
     // ── Phase 2: grep proof — no dangling references ────────────────────
     let engine = std::fs::read_to_string(root.join("src/engine.rs")).expect("engine.rs");
     let cli = std::fs::read_to_string(root.join("src/cli.rs")).expect("cli.rs");
-    assert!(engine.contains("pub fn thrust_output"), "engine.rs: {engine}");
+    assert!(
+        engine.contains("pub fn thrust_output"),
+        "engine.rs: {engine}"
+    );
     assert!(cli.contains("thrust_output(100)"), "cli.rs: {cli}");
     for (name, content) in [("engine.rs", &engine), ("cli.rs", &cli)] {
         assert!(
@@ -184,7 +255,7 @@ fn e2e_lsp_rename_compile_proof() {
     // Interactive, print, RPC, and ACP hosts all construct their tool
     // registries through ToolRegistry::new; two independent registries must
     // execute the same call identically.
-    let second = ToolRegistry::new(&["lsp"], &root, None);
+    let second = ToolRegistry::new(&["lsp"], &root, Some(&config));
     let input = json!({
         "action": "definition",
         "file": "src/cli.rs",
@@ -203,7 +274,9 @@ fn e2e_lsp_rename_compile_proof() {
             .as_array()
             .expect("locations")
             .iter()
-            .any(|loc| loc["file"].as_str().is_some_and(|f| f.ends_with("engine.rs"))),
+            .any(|loc| loc["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("engine.rs"))),
         "definition of thrust_output must land in engine.rs: {first}"
     );
     harness

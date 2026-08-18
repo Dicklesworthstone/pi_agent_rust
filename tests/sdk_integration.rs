@@ -856,6 +856,7 @@ fn sdk_conformance_event_ordering() {
             AgentEvent::FailoverStart { .. } => "FailoverStart",
             AgentEvent::FailoverEnd { .. } => "FailoverEnd",
             AgentEvent::ExtensionError { .. } => "ExtensionError",
+            AgentEvent::AdvisorNote { .. } => "AdvisorNote",
         })
         .collect();
 

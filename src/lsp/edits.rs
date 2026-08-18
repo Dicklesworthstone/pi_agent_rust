@@ -173,16 +173,15 @@ fn parse_text_edit_array(raw: &Value) -> Result<Vec<TextEdit>, crate::error::Err
     for edit in edits {
         // AnnotatedTextEdit wraps the edit under `textEdit` + annotationId.
         let edit = edit.get("textEdit").unwrap_or(edit);
-        let range = edit.get("range").ok_or_else(|| {
-            plan_error("LSP_EDIT_MALFORMED", "TextEdit missing range")
-        })?;
+        let range = edit
+            .get("range")
+            .ok_or_else(|| plan_error("LSP_EDIT_MALFORMED", "TextEdit missing range"))?;
         let new_text = edit
             .get("newText")
             .and_then(Value::as_str)
             .ok_or_else(|| plan_error("LSP_EDIT_MALFORMED", "TextEdit missing newText"))?;
-        let range = serde_json::from_value(range.clone()).map_err(|err| {
-            plan_error("LSP_EDIT_MALFORMED", format!("bad range: {err}"))
-        })?;
+        let range = serde_json::from_value(range.clone())
+            .map_err(|err| plan_error("LSP_EDIT_MALFORMED", format!("bad range: {err}")))?;
         out.push(TextEdit {
             range,
             new_text: new_text.to_string(),
@@ -242,12 +241,8 @@ pub fn apply_workspace_edit(
                 ));
             }
         }
-        let updated = apply_text_edits(&original, edits).map_err(|err| {
-            plan_error(
-                "LSP_EDIT_CONFLICT",
-                format!("{}: {err}", path.display()),
-            )
-        })?;
+        let updated = apply_text_edits(&original, edits)
+            .map_err(|err| plan_error("LSP_EDIT_CONFLICT", format!("{}: {err}", path.display())))?;
         planned.push(PlannedWrite {
             path: path.clone(),
             original,
@@ -467,7 +462,13 @@ mod tests {
         assert_eq!(plan.text_edits.len(), 1);
         assert_eq!(plan.file_ops.len(), 3);
         assert!(matches!(plan.file_ops[0], FileOp::Rename { .. }));
-        assert!(matches!(plan.file_ops[1], FileOp::Create { overwrite: true, .. }));
+        assert!(matches!(
+            plan.file_ops[1],
+            FileOp::Create {
+                overwrite: true,
+                ..
+            }
+        ));
         assert!(matches!(plan.file_ops[2], FileOp::Delete { .. }));
     }
 
@@ -487,7 +488,10 @@ mod tests {
             ]
         });
         let plan = parse_workspace_edit(&raw).expect("parse");
-        assert_eq!(plan.text_edits[&PathBuf::from("/tmp/a.rs")][0].new_text, "Z");
+        assert_eq!(
+            plan.text_edits[&PathBuf::from("/tmp/a.rs")][0].new_text,
+            "Z"
+        );
     }
 
     #[test]
@@ -506,13 +510,10 @@ mod tests {
         std::fs::write(&b, "012345\n").expect("b");
 
         let mut plan = WorkspaceEditPlan::default();
-        plan.text_edits
-            .insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
+        plan.text_edits.insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
         // Overlapping edits in b: apply must fail with zero writes.
-        plan.text_edits.insert(
-            b.clone(),
-            vec![edit(0, 1, 4, "Y"), edit(0, 2, 5, "Z")],
-        );
+        plan.text_edits
+            .insert(b.clone(), vec![edit(0, 1, 4, "Y"), edit(0, 2, 5, "Z")]);
         let err = apply_workspace_edit(&plan, None).expect_err("overlap fails");
         assert!(err.to_string().contains("LSP_EDIT_CONFLICT"), "{err}");
         assert_eq!(std::fs::read_to_string(&a).expect("a"), "abcdef\n");
@@ -525,8 +526,7 @@ mod tests {
         let a = temp.path().join("a.txt");
         std::fs::write(&a, "abcdef\n").expect("a");
         let mut plan = WorkspaceEditPlan::default();
-        plan.text_edits
-            .insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
+        plan.text_edits.insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
         let mut hashes = HashMap::new();
         hashes.insert(a.clone(), 0xdead_beef_u64); // wrong hash => drift
         let err = apply_workspace_edit(&plan, Some(&hashes)).expect_err("drift fails");
@@ -544,8 +544,7 @@ mod tests {
         std::fs::write(&old, "payload\n").expect("old");
 
         let mut plan = WorkspaceEditPlan::default();
-        plan.text_edits
-            .insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
+        plan.text_edits.insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
         plan.file_ops.push(FileOp::Rename {
             old_path: old.clone(),
             new_path: new.clone(),
@@ -565,8 +564,7 @@ mod tests {
         let a = temp.path().join("a.txt");
         std::fs::write(&a, "abcdef\n").expect("a");
         let mut plan = WorkspaceEditPlan::default();
-        plan.text_edits
-            .insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
+        plan.text_edits.insert(a.clone(), vec![edit(0, 0, 2, "XX")]);
         plan.file_ops.push(FileOp::Rename {
             old_path: temp.path().join("missing.txt"),
             new_path: temp.path().join("new.txt"),

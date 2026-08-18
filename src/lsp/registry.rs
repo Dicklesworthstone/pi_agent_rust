@@ -183,10 +183,7 @@ fn merge_servers(config: Option<&Config>) -> Vec<ServerSpec> {
                 existing.args = args.clone();
             }
             if let Some(env) = &entry.env {
-                existing.env = env
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
+                existing.env = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             }
             if let Some(languages) = &entry.languages {
                 existing.languages = languages.clone();
@@ -238,8 +235,10 @@ pub struct ServerEntry {
 
 impl ServerEntry {
     fn touch(&self) {
-        *self.last_used.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Instant::now();
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
     }
 
     fn idle_for(&self) -> Duration {
@@ -270,7 +269,7 @@ pub struct LspRegistry {
     request_timeout: Duration,
     idle_shutdown: Duration,
     entries: Mutex<HashMap<String, Arc<ServerEntry>>>,
-    spawn_lane: asupersync::sync::Mutex<()>,
+    spawn_lane: Arc<asupersync::sync::Mutex<()>>,
 }
 
 impl LspRegistry {
@@ -288,7 +287,7 @@ impl LspRegistry {
                 .and_then(|l| l.idle_shutdown_secs)
                 .map_or(DEFAULT_IDLE_SHUTDOWN, Duration::from_secs),
             entries: Mutex::new(HashMap::new()),
-            spawn_lane: asupersync::sync::Mutex::new(()),
+            spawn_lane: Arc::new(asupersync::sync::Mutex::new(())),
         }
     }
 
@@ -329,7 +328,9 @@ impl LspRegistry {
             let mut entries = self.lock_entries();
             let stale_keys: Vec<String> = entries
                 .iter()
-                .filter(|(_, entry)| entry.idle_for() > self.idle_shutdown || !entry.client.is_alive())
+                .filter(|(_, entry)| {
+                    entry.idle_for() > self.idle_shutdown || !entry.client.is_alive()
+                })
                 .map(|(key, _)| key.clone())
                 .collect();
             stale_keys
@@ -375,11 +376,10 @@ impl LspRegistry {
         }
         // Serialize spawns so concurrent first-use cannot double-spawn.
         let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let _spawn_guard = self
-            .spawn_lane
-            .lock(cx.cx())
-            .await
-            .map_err(|_| Error::tool("lsp", "[LSP_CANCELLED] cancelled by ambient context"))?;
+        let _spawn_guard =
+            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.spawn_lane), cx.cx())
+                .await
+                .map_err(|_| Error::tool("lsp", "[LSP_CANCELLED] cancelled by ambient context"))?;
         // Re-check after acquiring the lane.
         if let Some(entry) = self.lock_entries().get(&key) {
             if entry.client.is_alive() {
@@ -399,10 +399,7 @@ impl LspRegistry {
         .map_err(|err| {
             let message = err.to_string();
             if message.contains("[LSP_SERVER_MISSING]") {
-                Error::tool(
-                    "lsp",
-                    format!("{message}\nhint: {}", spec.install_hint),
-                )
+                Error::tool("lsp", format!("{message}\nhint: {}", spec.install_hint))
             } else {
                 err
             }
@@ -414,8 +411,7 @@ impl LspRegistry {
             handler_installed: std::sync::atomic::AtomicBool::new(false),
             last_used: Mutex::new(Instant::now()),
         });
-        self.lock_entries()
-            .insert(key, Arc::clone(&entry));
+        self.lock_entries().insert(key, Arc::clone(&entry));
         Ok(entry)
     }
 
@@ -572,10 +568,7 @@ mod tests {
     #[test]
     fn merge_skips_commandless_new_server() {
         let mut overrides = HashMap::new();
-        overrides.insert(
-            "mystery".to_string(),
-            LspServerSettings::default(),
-        );
+        overrides.insert("mystery".to_string(), LspServerSettings::default());
         let config = Config {
             lsp: Some(LspSettings {
                 servers: Some(overrides),
@@ -607,13 +600,26 @@ mod tests {
 
     #[test]
     fn root_detection_falls_back_to_cwd() {
+        // The fallback only triggers when NO ancestor holds a marker — on
+        // this machine the temp dir can sit under the repo (rch), so use a
+        // spec whose marker exists nowhere.
         let temp = tempfile::tempdir().expect("tempdir");
         let other = tempfile::tempdir().expect("other");
         let file = other.path().join("lonely.rs");
         std::fs::write(&file, "fn x() {}\n").expect("file");
         let registry = LspRegistry::new(temp.path(), None);
-        let spec = registry.spec_for_file(&file).expect("spec");
-        assert_eq!(registry.workspace_root(&file, spec), temp.path());
+        let spec = ServerSpec {
+            name: "marker-free".to_string(),
+            command: "marker-free-ls".to_string(),
+            args: vec![],
+            env: vec![],
+            languages: vec!["rust".to_string()],
+            extensions: vec![".rs".to_string()],
+            root_markers: vec!["definitely-not-present-9f3k.marker".to_string()],
+            initialization_options: None,
+            install_hint: "n/a".to_string(),
+        };
+        assert_eq!(registry.workspace_root(&file, &spec), temp.path());
     }
 
     #[test]

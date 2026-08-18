@@ -74,7 +74,7 @@ fn resolve_tool_path(path: &str, cwd: &Path) -> PathBuf {
 /// Display path relative to the working directory when possible.
 fn display_path(path: &Path, cwd: &Path) -> String {
     path.strip_prefix(cwd).map_or_else(
-        || path.display().to_string(),
+        |_| path.display().to_string(),
         |rel| rel.display().to_string(),
     )
 }
@@ -114,9 +114,7 @@ impl LspTool {
         path.extension()
             .and_then(|ext| ext.to_str())
             .map(|ext| format!(".{}", ext.to_ascii_lowercase()))
-            .and_then(|dotted| {
-                registry::language_id_for_extension(&dotted).map(str::to_string)
-            })
+            .and_then(|dotted| registry::language_id_for_extension(&dotted).map(str::to_string))
             .or_else(|| spec.languages.first().cloned())
             .unwrap_or_else(|| "plaintext".to_string())
     }
@@ -132,22 +130,16 @@ impl LspTool {
     /// Sync the document and return `(uri, server entry)`.
     async fn synced(&self, path: &Path) -> Result<(String, Arc<ServerEntry>)> {
         let entry = self.client_for(path).await?;
-        let spec = self
-            .registry
-            .spec_for_file(path)
-            .ok_or_else(|| tool_err("LSP_NO_SERVER", format!("no server for {}", path.display())))?;
+        let spec = self.registry.spec_for_file(path).ok_or_else(|| {
+            tool_err("LSP_NO_SERVER", format!("no server for {}", path.display()))
+        })?;
         let language_id = self.language_id_for(path, spec);
         let uri = entry.client.ensure_synced(path, &language_id)?;
         Ok((uri, entry))
     }
 
     /// Resolve a position from file + line + symbol selector.
-    fn resolve_position(
-        &self,
-        path: &Path,
-        line: Option<u32>,
-        symbol: &str,
-    ) -> Result<Position> {
+    fn resolve_position(&self, path: &Path, line: Option<u32>, symbol: &str) -> Result<Position> {
         let content = std::fs::read_to_string(path).map_err(|err| {
             tool_err(
                 "LSP_FILE_UNREADABLE",
@@ -163,7 +155,10 @@ impl LspTool {
             let scope = line.map_or_else(|| "file".to_string(), |l| format!("line {l}"));
             return Err(tool_err(
                 "LSP_NO_SYMBOL",
-                format!("no occurrence of {needle:?} in {scope} of {}", path.display()),
+                format!(
+                    "no occurrence of {needle:?} in {scope} of {}",
+                    path.display()
+                ),
             ));
         }
         let selected = match (nth, occurrences.len()) {
@@ -171,7 +166,9 @@ impl LspTool {
             (Some(n), len) => {
                 return Err(tool_err(
                     "LSP_SYMBOL_AMBIGUOUS",
-                    format!("selector asked for occurrence #{n} but only {len} match(es) of {needle:?} exist"),
+                    format!(
+                        "selector asked for occurrence #{n} but only {len} match(es) of {needle:?} exist"
+                    ),
                 ));
             }
             (None, 1) => occurrences[0],
@@ -180,12 +177,16 @@ impl LspTool {
                     // Within one line, multiple matches: require #N.
                     return Err(tool_err(
                         "LSP_SYMBOL_AMBIGUOUS",
-                        format!("{len} matches of {needle:?} on that line; disambiguate with {needle}#N"),
+                        format!(
+                            "{len} matches of {needle:?} on that line; disambiguate with {needle}#N"
+                        ),
                     ));
                 }
                 return Err(tool_err(
                     "LSP_SYMBOL_AMBIGUOUS",
-                    format!("{len} matches of {needle:?} in file; narrow with `line` or {needle}#N"),
+                    format!(
+                        "{len} matches of {needle:?} in file; narrow with `line` or {needle}#N"
+                    ),
                 ));
             }
         };
@@ -249,7 +250,7 @@ impl LspTool {
                     for (uri, diags) in entry.client.diagnostics_snapshot() {
                         if let Some(path) = uri_to_path(&uri) {
                             let rel = path.strip_prefix(&self.cwd).unwrap_or(&path);
-                            if override_filter.matched(rel, false).is_match() {
+                            if override_filter.matched(rel, false).is_ignore() {
                                 matched.push(json!({
                                     "file": display_path(&path, &self.cwd),
                                     "server": status.name,
@@ -271,11 +272,17 @@ impl LspTool {
 
         let path = resolve_tool_path(file, &self.cwd);
         let (uri, entry) = self.synced(&path).await?;
-        // Give the server a bounded window to publish fresh diagnostics.
-        entry
-            .client
-            .wait_for_diagnostics(&uri, client::DEFAULT_DIAGNOSTICS_WAIT)
-            .await;
+        // Give the server a bounded window to publish fresh diagnostics:
+        // the caller's timeout when provided (capped), else the default.
+        // Cold servers publish only after indexing, so callers on a fresh
+        // spawn should pass a generous timeout.
+        let wait = input
+            .timeout
+            .filter(|secs| *secs > 0)
+            .map_or(client::DEFAULT_DIAGNOSTICS_WAIT, |secs| {
+                Duration::from_secs(secs).min(Duration::from_secs(60))
+            });
+        entry.client.wait_for_diagnostics(&uri, wait).await;
         let snapshot = entry.client.diagnostics_snapshot();
         let diags = snapshot.get(&uri).cloned().unwrap_or_default();
         let payload = json!({
@@ -313,8 +320,8 @@ impl LspTool {
             .map_err(Error::from)?;
         match action {
             "hover" => {
-                let text = hover_to_text(&result)
-                    .unwrap_or_else(|| "no hover information".to_string());
+                let text =
+                    hover_to_text(&result).unwrap_or_else(|| "no hover information".to_string());
                 let payload = json!({
                     "action": "hover",
                     "file": display_path(&path, &self.cwd),
@@ -347,10 +354,7 @@ impl LspTool {
 
     fn require_position(&self, input: &LspInput) -> Result<(PathBuf, Position)> {
         let file = input.file.as_deref().ok_or_else(|| {
-            tool_err(
-                "LSP_USAGE",
-                format!("lsp {} requires `file`", input.action),
-            )
+            tool_err("LSP_USAGE", format!("lsp {} requires `file`", input.action))
         })?;
         let symbol = input.symbol.as_deref().ok_or_else(|| {
             tool_err(
@@ -386,7 +390,10 @@ impl LspTool {
                     "server": entry.spec_name,
                     "symbols": result,
                 }));
-                Ok(text_output(payload.to_string(), json!({"truncated": truncated, "payload": payload})))
+                Ok(text_output(
+                    payload.to_string(),
+                    json!({"truncated": truncated, "payload": payload}),
+                ))
             }
             (None, Some(query)) => {
                 // Workspace symbols need *a* server; route via the cwd so the
@@ -416,7 +423,10 @@ impl LspTool {
                     "server": entry.spec_name,
                     "symbols": result,
                 }));
-                Ok(text_output(payload.to_string(), json!({"truncated": truncated, "payload": payload})))
+                Ok(text_output(
+                    payload.to_string(),
+                    json!({"truncated": truncated, "payload": payload}),
+                ))
             }
             (None, None) => Ok(usage_error(
                 "lsp symbols requires `file` (document symbols) or `query` (workspace symbols)",
@@ -425,9 +435,10 @@ impl LspTool {
     }
 
     async fn run_rename(&self, input: &LspInput) -> Result<ToolOutput> {
-        let new_name = input.new_name.as_deref().ok_or_else(|| {
-            tool_err("LSP_USAGE", "lsp rename requires `newName`")
-        })?;
+        let new_name = input
+            .new_name
+            .as_deref()
+            .ok_or_else(|| tool_err("LSP_USAGE", "lsp rename requires `newName`"))?;
         if new_name.is_empty() {
             return Ok(usage_error("lsp rename requires a non-empty `newName`"));
         }
@@ -471,9 +482,7 @@ impl LspTool {
     async fn run_rename_file(&self, input: &LspInput) -> Result<ToolOutput> {
         let (Some(file), Some(new_file)) = (input.file.as_deref(), input.new_file.as_deref())
         else {
-            return Ok(usage_error(
-                "lsp rename_file requires `file` and `newFile`",
-            ));
+            return Ok(usage_error("lsp rename_file requires `file` and `newFile`"));
         };
         let old_path = resolve_tool_path(file, &self.cwd);
         let new_path = resolve_tool_path(new_file, &self.cwd);
@@ -495,11 +504,7 @@ impl LspTool {
         let canonical_new = new_path
             .parent()
             .and_then(|parent| parent.canonicalize().ok())
-            .and_then(|parent| {
-                new_path
-                    .file_name()
-                    .map(|name| parent.join(name))
-            })
+            .and_then(|parent| new_path.file_name().map(|name| parent.join(name)))
             .unwrap_or_else(|| new_path.clone());
         let new_uri = path_to_uri(&canonical_new);
         let mut edits_applied: Vec<String> = Vec::new();
@@ -515,7 +520,7 @@ impl LspTool {
                         "files": [{ "oldUri": old_uri, "newUri": new_uri }]
                     }),
                     self.request_timeout(input),
-                    )
+                )
                 .await;
             match result {
                 Ok(edit) if !edit.is_null() => {
@@ -578,9 +583,10 @@ impl LspTool {
     }
 
     async fn run_code_actions(&self, input: &LspInput) -> Result<ToolOutput> {
-        let file = input.file.as_deref().ok_or_else(|| {
-            tool_err("LSP_USAGE", "lsp code_actions requires `file`")
-        })?;
+        let file = input
+            .file
+            .as_deref()
+            .ok_or_else(|| tool_err("LSP_USAGE", "lsp code_actions requires `file`"))?;
         let path = resolve_tool_path(file, &self.cwd);
         let (uri, entry) = self.synced(&path).await?;
 
@@ -685,7 +691,10 @@ impl LspTool {
 
         if let Some(command) = selected.get("command") {
             let (command_name, arguments) = if let Some(name) = command.as_str() {
-                (name.to_string(), selected.get("arguments").cloned().unwrap_or(Value::Null))
+                (
+                    name.to_string(),
+                    selected.get("arguments").cloned().unwrap_or(Value::Null),
+                )
             } else {
                 let name = command
                     .get("command")
@@ -758,7 +767,10 @@ impl LspTool {
     }
 
     async fn run_reload(&self, input: &LspInput) -> Result<ToolOutput> {
-        let path = input.file.as_deref().map(|f| resolve_tool_path(f, &self.cwd));
+        let path = input
+            .file
+            .as_deref()
+            .map(|f| resolve_tool_path(f, &self.cwd));
         let killed = self.registry.kill_matching(path.as_deref()).await;
         let payload = json!({
             "action": "reload",
@@ -811,7 +823,10 @@ impl LspTool {
             "server": entry.spec_name,
             "result": result,
         }));
-        Ok(text_output(payload.to_string(), json!({"truncated": truncated, "payload": payload})))
+        Ok(text_output(
+            payload.to_string(),
+            json!({"truncated": truncated, "payload": payload}),
+        ))
     }
 }
 
@@ -833,8 +848,8 @@ fn install_apply_edit_handler(entry: &Arc<ServerEntry>) {
             let Some(edit) = params.get("edit") else {
                 return Some(json!({ "applied": false, "failureReason": "missing edit" }));
             };
-            let outcome = parse_workspace_edit(edit)
-                .and_then(|plan| apply_workspace_edit(&plan, None));
+            let outcome =
+                parse_workspace_edit(edit).and_then(|plan| apply_workspace_edit(&plan, None));
             match outcome {
                 Ok(outcome) => {
                     for changed in &outcome.files_changed {
@@ -860,7 +875,10 @@ fn select_code_action(actions: &[Value], query: &str) -> Result<Value> {
             .ok_or_else(|| {
                 tool_err(
                     "LSP_USAGE",
-                    format!("code action index {index} out of range ({} actions)", actions.len()),
+                    format!(
+                        "code action index {index} out of range ({} actions)",
+                        actions.len()
+                    ),
                 )
             });
     }
@@ -1035,8 +1053,13 @@ impl Tool for LspTool {
         match input.action.as_str() {
             "diagnostics" => self.run_diagnostics(&input).await,
             "definition" => {
-                self.run_position_request(&input, "definition", "textDocument/definition", json!({}))
-                    .await
+                self.run_position_request(
+                    &input,
+                    "definition",
+                    "textDocument/definition",
+                    json!({}),
+                )
+                .await
             }
             "references" => {
                 self.run_position_request(
@@ -1099,15 +1122,9 @@ mod tests {
             ("render".to_string(), None)
         );
         // Trailing # without digits is part of the name.
-        assert_eq!(
-            parse_symbol_selector("c#"),
-            ("c#".to_string(), None)
-        );
+        assert_eq!(parse_symbol_selector("c#"), ("c#".to_string(), None));
         // #0 is invalid as an index and stays part of the name.
-        assert_eq!(
-            parse_symbol_selector("x#0"),
-            ("x#0".to_string(), None)
-        );
+        assert_eq!(parse_symbol_selector("x#0"), ("x#0".to_string(), None));
     }
 
     #[test]
@@ -1121,7 +1138,13 @@ mod tests {
         let pos = tool
             .resolve_position(&file, Some(1), "alpha")
             .expect("line 1");
-        assert_eq!(pos, Position { line: 0, character: 3 });
+        assert_eq!(
+            pos,
+            Position {
+                line: 0,
+                character: 3
+            }
+        );
 
         // Ambiguous across file without line.
         let err = tool
@@ -1136,9 +1159,7 @@ mod tests {
         assert_eq!(pos.line, 1);
 
         // Out-of-range #N errors.
-        assert!(
-            tool.resolve_position(&file, None, "alpha#9").is_err()
-        );
+        assert!(tool.resolve_position(&file, None, "alpha#9").is_err());
 
         // Missing symbol errors.
         let err = tool
@@ -1175,10 +1196,7 @@ mod tests {
         );
         assert!(select_code_action(&actions, "9").is_err());
         assert!(select_code_action(&actions, "nope").is_err());
-        let both = vec![
-            json!({"title": "Fix all"}),
-            json!({"title": "Fix this"}),
-        ];
+        let both = vec![json!({"title": "Fix all"}), json!({"title": "Fix this"})];
         assert!(select_code_action(&both, "fix").is_err());
     }
 }

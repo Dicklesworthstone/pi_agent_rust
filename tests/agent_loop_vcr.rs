@@ -149,6 +149,7 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
             "hookEvent": event,
             "error": error,
         }),
+        AgentEvent::AdvisorNote { .. } => json!({ "event": "advisor_note" }),
     }
 }
 

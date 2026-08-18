@@ -19,7 +19,7 @@ use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::config::{Config, LspServerSettings, LspSettings};
 use pi::model::ContentBlock;
-use pi::tools::{Tool, ToolOutput, ToolRegistry};
+use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::Path;
@@ -72,9 +72,9 @@ fn finish_case(harness: &TestHarness, case: &str) {
     harness.record_artifact(format!("{case}.jsonl"), &path);
 }
 
-/// Whether a rust-analyzer binary is available for live lanes.
-fn rust_analyzer_available() -> bool {
-    std::process::Command::new("rust-analyzer")
+/// Probe one candidate binary; returns true when `--version` succeeds.
+fn probe_rust_analyzer(command: &str) -> bool {
+    std::process::Command::new(command)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -82,8 +82,79 @@ fn rust_analyzer_available() -> bool {
         .is_ok_and(|status| status.success())
 }
 
+/// Discover a working rust-analyzer command. Order: `PI_LSP_RUST_ANALYZER`
+/// override, `rust-analyzer` on PATH, `$HOME/.cargo/bin/rust-analyzer` (the
+/// rustup default — job environments with a minimal PATH still find it).
+fn rust_analyzer_command() -> Option<String> {
+    if let Ok(override_cmd) = std::env::var("PI_LSP_RUST_ANALYZER") {
+        return probe_rust_analyzer(&override_cmd).then_some(override_cmd);
+    }
+    if probe_rust_analyzer("rust-analyzer") {
+        return Some("rust-analyzer".to_string());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = std::path::PathBuf::from(home).join(".cargo/bin/rust-analyzer");
+        let candidate_str = candidate.to_string_lossy().into_owned();
+        if probe_rust_analyzer(&candidate_str) {
+            return Some(candidate_str);
+        }
+    }
+    None
+}
+
+/// Whether a rust-analyzer binary is available for live lanes.
+fn rust_analyzer_available() -> bool {
+    rust_analyzer_command().is_some()
+}
+
+/// Config with the discovered rust-analyzer command injected (spawn must
+/// use the same binary the probe found, even on minimal-PATH job runners).
+fn ra_config(command: &str) -> Config {
+    let mut servers = HashMap::new();
+    servers.insert(
+        "rust-analyzer".to_string(),
+        LspServerSettings {
+            command: Some(command.to_string()),
+            ..Default::default()
+        },
+    );
+    Config {
+        lsp: Some(LspSettings {
+            servers: Some(servers),
+            ..Default::default()
+        }),
+        ..Config::default()
+    }
+}
+
+/// Whether the live lane must run (skip becomes a loud failure). Set
+/// `PI_LSP_TEST_REQUIRE_RA=1` in environments that guarantee the binary —
+/// a skip there would mean the lane silently lost its proof.
+fn rust_analyzer_required() -> bool {
+    std::env::var("PI_LSP_TEST_REQUIRE_RA")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Live-lane gate: returns true when the lane should run. Skips honestly
+/// when the binary is absent, unless the lane is required — then fails
+/// loudly so a missing binary can never launder a skipped proof.
+fn live_lane_or_skip(harness: &TestHarness, case: &str) -> bool {
+    if rust_analyzer_available() {
+        return true;
+    }
+    assert!(
+        !rust_analyzer_required(),
+        "PI_LSP_TEST_REQUIRE_RA is set but rust-analyzer is not installed; \
+         refusing to let case '{case}' skip its proof"
+    );
+    harness.log().info("skip", skip_reason(case));
+    false
+}
+
 fn skip_reason(case: &str) -> String {
-    format!("case '{case}' skipped: rust-analyzer not installed (install with: rustup component add rust-analyzer)")
+    format!(
+        "case '{case}' skipped: rust-analyzer not installed (install with: rustup component add rust-analyzer)"
+    )
 }
 
 /// A minimal dependency-free fixture crate.
@@ -167,14 +238,16 @@ fn execute_lsp(registry: &ToolRegistry, input: Value) -> Result<ToolOutput, pi::
 #[test]
 fn lsp_registered_and_gated_by_tools() {
     let harness = TestHarness::new("lsp_registered_and_gated_by_tools");
-    harness.log().info("setup", "building registries with/without lsp");
+    harness
+        .log()
+        .info("setup", "building registries with/without lsp");
 
-    let with = ToolRegistry::new(&["lsp"], harness.temp_path("."), None);
+    let with = ToolRegistry::new(&["lsp"], &harness.temp_path("."), None);
     assert!(
         with.tools().iter().any(|tool| tool.name() == "lsp"),
         "lsp must register when enabled"
     );
-    let without = ToolRegistry::new(&["read"], harness.temp_path("."), None);
+    let without = ToolRegistry::new(&["read"], &harness.temp_path("."), None);
     assert!(
         !without.tools().iter().any(|tool| tool.name() == "lsp"),
         "lsp must stay out when not enabled"
@@ -184,7 +257,7 @@ fn lsp_registered_and_gated_by_tools() {
     // schema until promoted), which is the --tools gate.
     let default = ToolRegistry::new(
         &pi::xdev::default_enabled_tools(),
-        harness.temp_path("."),
+        &harness.temp_path("."),
         None,
     );
     assert!(
@@ -214,7 +287,7 @@ fn lsp_registered_and_gated_by_tools() {
 #[test]
 fn lsp_usage_errors_are_named() {
     let harness = TestHarness::new("lsp_usage_errors_are_named");
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let registry = lsp_tool(&harness.temp_path("."), None);
 
     // Unknown action -> is_error output.
     let out = execute_lsp(&registry, json!({"action": "frobnicate"})).expect("execute");
@@ -243,7 +316,7 @@ fn lsp_usage_errors_are_named() {
 fn lsp_status_and_glob_diagnostics_never_spawn() {
     let harness = TestHarness::new("lsp_status_and_glob_diagnostics_never_spawn");
     write_file(&harness, "src/lib.rs", "fn x() {}\n");
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let registry = lsp_tool(&harness.temp_path("."), None);
 
     // status: no live servers, configured defaults listed.
     let out = execute_lsp(&registry, json!({"action": "status"})).expect("execute");
@@ -294,7 +367,7 @@ fn lsp_missing_server_reports_install_hint() {
         }),
         ..Config::default()
     };
-    let registry = lsp_tool(harness.temp_path("."), Some(&config));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
 
     let err = execute_lsp(
         &registry,
@@ -311,7 +384,10 @@ fn lsp_missing_server_reports_install_hint() {
         message.contains("[LSP_SERVER_MISSING]"),
         "expected server-missing taxonomy, got: {message}"
     );
-    assert!(message.contains("hint:"), "expected install hint: {message}");
+    assert!(
+        message.contains("hint:"),
+        "expected install hint: {message}"
+    );
 
     finish_case(&harness, "lsp_missing_server_reports_install_hint");
 }
@@ -321,13 +397,16 @@ fn lsp_timeout_sends_cancel_and_fails_closed() {
     let harness = TestHarness::new("lsp_timeout_sends_cancel_and_fails_closed");
     write_file(&harness, "src/lib.rs", "fn x() {}\n");
 
-    // `cat` echoes frames back without ever answering a request: the
-    // initialize handshake can only time out.
+    // `sleep` never writes a single byte: the initialize handshake can only
+    // time out. (An echo fixture like `cat` is NOT a valid never-answers
+    // server: the echoed request trips the server-request auto-responder,
+    // which would answer our own request with null.)
     let mut servers = HashMap::new();
     servers.insert(
         "rust-analyzer".to_string(),
         LspServerSettings {
-            command: Some("cat".to_string()),
+            command: Some("sleep".to_string()),
+            args: Some(vec!["3600".to_string()]),
             ..Default::default()
         },
     );
@@ -339,7 +418,7 @@ fn lsp_timeout_sends_cancel_and_fails_closed() {
         }),
         ..Config::default()
     };
-    let registry = lsp_tool(harness.temp_path("."), Some(&config));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
 
     let err = execute_lsp(
         &registry,
@@ -364,7 +443,7 @@ fn lsp_timeout_sends_cancel_and_fails_closed() {
 fn lsp_no_server_for_extension() {
     let harness = TestHarness::new("lsp_no_server_for_extension");
     write_file(&harness, "notes.xyz", "hello\n");
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let registry = lsp_tool(&harness.temp_path("."), None);
 
     let err = execute_lsp(
         &registry,
@@ -393,14 +472,16 @@ fn lsp_no_server_for_extension() {
 fn rust_analyzer_definition_references_hover() {
     let case = "rust_analyzer_definition_references_hover";
     let harness = TestHarness::new(case);
-    if !rust_analyzer_available() {
-        harness.log().info("skip", skip_reason(case));
+    if !live_lane_or_skip(&harness, case) {
         finish_case(&harness, case);
         return;
     }
     stage_fixture_crate(&harness);
-    let registry = lsp_tool(harness.temp_path("."), None);
-    harness.log().info("action", "definition of compute_answer call site");
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
+    harness
+        .log()
+        .info("action", "definition of compute_answer call site");
 
     // definition from the call in driver.rs line 4 -> util.rs definition.
     let out = execute_lsp(
@@ -420,7 +501,9 @@ fn rust_analyzer_definition_references_hover() {
     let locations = payload["locations"].as_array().expect("locations");
     assert!(
         locations.iter().any(|loc| {
-            loc["file"].as_str().is_some_and(|f| f.ends_with("src/util.rs"))
+            loc["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("src/util.rs"))
         }),
         "definition must land in util.rs: {locations:?}"
     );
@@ -448,7 +531,9 @@ fn rust_analyzer_definition_references_hover() {
     );
     assert!(
         locations.iter().any(|loc| {
-            loc["file"].as_str().is_some_and(|f| f.ends_with("src/driver.rs"))
+            loc["file"]
+                .as_str()
+                .is_some_and(|f| f.ends_with("src/driver.rs"))
         }),
         "references must include the driver.rs call sites: {locations:?}"
     );
@@ -479,24 +564,26 @@ fn rust_analyzer_definition_references_hover() {
 fn rust_analyzer_diagnostics_reports_type_error() {
     let case = "rust_analyzer_diagnostics_reports_type_error";
     let harness = TestHarness::new(case);
-    if !rust_analyzer_available() {
-        harness.log().info("skip", skip_reason(case));
+    if !live_lane_or_skip(&harness, case) {
         finish_case(&harness, case);
         return;
     }
     stage_fixture_crate(&harness);
-    // Plant a type error in driver.rs.
+    // Plant a syntax error: rust-analyzer reports syntax errors natively on
+    // first analysis (type-mismatch diagnostics ride the flycheck cargo
+    // lane, which is environment-fragile and out of this lane's contract).
     write_file(
         &harness,
         "src/broken.rs",
-        "pub fn broken() -> u64 {\n    \"not a number\"\n}\n",
+        "pub fn broken() -> u64 {\n    let value: u64 = 1\n}\n",
     );
     write_file(
         &harness,
         "src/lib.rs",
         "pub mod util;\npub mod driver;\npub mod broken;\n",
     );
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
 
     let out = execute_lsp(
         &registry,
@@ -510,7 +597,7 @@ fn rust_analyzer_diagnostics_reports_type_error() {
     let diagnostics = payload["diagnostics"].as_array().expect("diagnostics");
     assert!(
         !diagnostics.is_empty(),
-        "rust-analyzer must report the planted type error: {payload}"
+        "rust-analyzer must report the planted syntax error: {payload}"
     );
 
     finish_case(&harness, case);
@@ -520,13 +607,13 @@ fn rust_analyzer_diagnostics_reports_type_error() {
 fn rust_analyzer_rename_updates_callers_atomically() {
     let case = "rust_analyzer_rename_updates_callers_atomically";
     let harness = TestHarness::new(case);
-    if !rust_analyzer_available() {
-        harness.log().info("skip", skip_reason(case));
+    if !live_lane_or_skip(&harness, case) {
         finish_case(&harness, case);
         return;
     }
     stage_fixture_crate(&harness);
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
 
     let out = execute_lsp(
         &registry,
@@ -544,9 +631,7 @@ fn rust_analyzer_rename_updates_callers_atomically() {
     harness
         .log()
         .info("verify", format!("rename payload: {payload}"));
-    let files_changed = payload["filesChanged"]
-        .as_array()
-        .expect("filesChanged");
+    let files_changed = payload["filesChanged"].as_array().expect("filesChanged");
     let changed: Vec<&str> = files_changed.iter().filter_map(Value::as_str).collect();
     assert!(
         changed.iter().any(|f| f.ends_with("util.rs")),
@@ -574,13 +659,13 @@ fn rust_analyzer_rename_updates_callers_atomically() {
 fn rust_analyzer_rename_file_updates_module_declaration() {
     let case = "rust_analyzer_rename_file_updates_module_declaration";
     let harness = TestHarness::new(case);
-    if !rust_analyzer_available() {
-        harness.log().info("skip", skip_reason(case));
+    if !live_lane_or_skip(&harness, case) {
         finish_case(&harness, case);
         return;
     }
     stage_fixture_crate(&harness);
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
 
     let out = execute_lsp(
         &registry,
@@ -606,7 +691,10 @@ fn rust_analyzer_rename_file_updates_module_declaration() {
     if payload["willRenameFiles"].as_bool() == Some(true) {
         let lib = read_file(&harness, "src/lib.rs");
         let driver = read_file(&harness, "src/driver.rs");
-        let updates = payload["importUpdates"].as_array().map(Vec::len).unwrap_or(0);
+        let updates = payload["importUpdates"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
         harness.log().info(
             "verify",
             format!("willRenameFiles advertised; {updates} files updated; lib.rs={lib} driver.rs={driver}"),
@@ -624,13 +712,13 @@ fn rust_analyzer_rename_file_updates_module_declaration() {
 fn rust_analyzer_ambiguous_symbol_is_named_error() {
     let case = "rust_analyzer_ambiguous_symbol_is_named_error";
     let harness = TestHarness::new(case);
-    if !rust_analyzer_available() {
-        harness.log().info("skip", skip_reason(case));
+    if !live_lane_or_skip(&harness, case) {
         finish_case(&harness, case);
         return;
     }
     stage_fixture_crate(&harness);
-    let registry = lsp_tool(harness.temp_path("."), None);
+    let config = ra_config(&rust_analyzer_command().expect("rust-analyzer discovered"));
+    let registry = lsp_tool(&harness.temp_path("."), Some(&config));
 
     // "answer" appears in multiple symbols across driver.rs; without a line
     // or #N the lookup must fail closed with [LSP_SYMBOL_AMBIGUOUS]... but

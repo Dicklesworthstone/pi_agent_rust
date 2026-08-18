@@ -89,11 +89,12 @@ type PendingMap = Mutex<HashMap<u64, StdSyncSender<std::result::Result<Value, Tr
 
 /// Hook for server→client requests (e.g. `workspace/applyEdit`). Returning
 /// `Some(result)` overrides the default null response.
-pub type ServerRequestHandler =
-    std::sync::Arc<dyn Fn(&str, &Value) -> Option<Value> + Send + Sync>;
+pub type ServerRequestHandler = std::sync::Arc<dyn Fn(&str, &Value) -> Option<Value> + Send + Sync>;
 
 fn lock<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
-    mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Encode one JSON-RPC message as a `Content-Length` framed payload.
@@ -132,7 +133,10 @@ fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value
         }
     }
     let length = content_length.ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, "missing Content-Length header")
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing Content-Length header",
+        )
     })?;
     if length > MAX_FRAME_BYTES {
         return Err(std::io::Error::new(
@@ -143,7 +147,10 @@ fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body)?;
     let value = serde_json::from_slice(&body).map_err(|err| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("invalid JSON body: {err}"))
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid JSON body: {err}"),
+        )
     })?;
     Ok(Some(value))
 }
@@ -174,7 +181,7 @@ pub struct JsonRpcClient {
     next_id: AtomicU64,
     alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stderr_tail: std::sync::Arc<Mutex<TailBuffer>>,
-    notification_rx: StdReceiver<ServerNotification>,
+    notification_rx: Mutex<StdReceiver<ServerNotification>>,
     dropped_notifications: std::sync::Arc<AtomicU64>,
     server_request_handler: std::sync::Arc<Mutex<Option<ServerRequestHandler>>>,
 }
@@ -200,7 +207,11 @@ impl JsonRpcClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Language servers must not inherit our stdin/terminal.
-            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            // Servers embed their own build runs (rust-analyzer's flycheck,
+            // `cargo metadata`): a redirected target dir would point those
+            // at a foreign, possibly lock-contended, shared target pool.
+            .env_remove("CARGO_TARGET_DIR");
         let mut child: Child = cmd.spawn().map_err(|err| {
             Error::tool(
                 "lsp",
@@ -295,7 +306,7 @@ impl JsonRpcClient {
             next_id: AtomicU64::new(1),
             alive,
             stderr_tail,
-            notification_rx,
+            notification_rx: Mutex::new(notification_rx),
             dropped_notifications,
             server_request_handler,
         })
@@ -324,8 +335,10 @@ impl JsonRpcClient {
         &self,
         method: &str,
         params: Value,
-    ) -> std::result::Result<(u64, StdReceiver<std::result::Result<Value, TransportError>>), TransportError>
-    {
+    ) -> std::result::Result<
+        (u64, StdReceiver<std::result::Result<Value, TransportError>>),
+        TransportError,
+    > {
         if !self.is_alive() {
             return Err(TransportError::Closed(
                 "server transport is not alive".to_string(),
@@ -340,9 +353,10 @@ impl JsonRpcClient {
             "method": method,
             "params": params,
         }));
-        let write_result = lock(&self.writer)
-            .write_all(&frame)
-            .and_then(|()| lock(&self.writer).flush());
+        let write_result = {
+            let mut guard = lock(&self.writer);
+            guard.write_all(&frame).and_then(|()| guard.flush())
+        };
         if let Err(err) = write_result {
             lock(&self.pending).remove(&id);
             return Err(TransportError::Io(format!("request write failed: {err}")));
@@ -361,9 +375,10 @@ impl JsonRpcClient {
             "method": method,
             "params": params,
         }));
-        lock(&self.writer)
+        let mut guard = lock(&self.writer);
+        guard
             .write_all(&frame)
-            .and_then(|()| lock(&self.writer).flush())
+            .and_then(|()| guard.flush())
             .map_err(|err| TransportError::Io(format!("notification write failed: {err}")))
     }
 
@@ -377,7 +392,8 @@ impl JsonRpcClient {
     /// Drain queued server notifications (non-blocking).
     pub fn drain_notifications(&self) -> Vec<ServerNotification> {
         let mut out = Vec::new();
-        while let Ok(notification) = self.notification_rx.try_recv() {
+        let rx = lock(&self.notification_rx);
+        while let Ok(notification) = rx.try_recv() {
             out.push(notification);
         }
         out
@@ -398,10 +414,7 @@ impl JsonRpcClient {
     /// Whether the child process has exited (reaps the exit status if so).
     #[must_use]
     pub fn child_exited(&self) -> bool {
-        matches!(
-            lock(&self.child).try_wait_child(),
-            Ok(Some(_))
-        )
+        matches!(lock(&self.child).try_wait_child(), Ok(Some(_)))
     }
 
     /// Graceful stop: best-effort `shutdown` + `exit`, then kill.
@@ -428,10 +441,10 @@ impl Drop for JsonRpcClient {
 }
 
 /// Route one decoded message to its destination.
-fn handle_message(
+fn handle_message<W: Write>(
     message: &Value,
     pending: &PendingMap,
-    writer: &SharedWriter,
+    writer: &Mutex<W>,
     notification_tx: &StdSyncSender<ServerNotification>,
     dropped: &AtomicU64,
     stderr_tail: &Mutex<TailBuffer>,
@@ -473,17 +486,21 @@ fn handle_message(
         // result so the server never blocks on us (workspace/configuration,
         // registerCapability, workDoneProgress/create, showMessageRequest).
         // The id is echoed verbatim (servers may use string ids).
-        let custom = lock(handler)
-            .as_ref()
-            .and_then(|handler| handler(method, &message.get("params").cloned().unwrap_or(Value::Null)));
+        let custom = lock(handler).as_ref().and_then(|handler| {
+            handler(
+                method,
+                &message.get("params").cloned().unwrap_or(Value::Null),
+            )
+        });
         let frame = encode_frame(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
             "result": custom.unwrap_or(Value::Null),
         }));
-        let _ = lock(writer)
-            .write_all(&frame)
-            .and_then(|()| lock(writer).flush());
+        {
+            let mut guard = lock(writer);
+            let _ = guard.write_all(&frame).and_then(|()| guard.flush());
+        }
         return;
     }
 
@@ -597,7 +614,10 @@ mod tests {
             &Mutex::new(None),
         );
         let got = rx.try_recv().expect("completed");
-        assert_eq!(got.ok().map(|v| v["value"].clone()), Some(serde_json::json!(1)));
+        assert_eq!(
+            got.ok().map(|v| v["value"].clone()),
+            Some(serde_json::json!(1))
+        );
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -608,7 +628,7 @@ mod tests {
         let (notification_tx, _rx) = std::sync::mpsc::sync_channel(8);
         let dropped = AtomicU64::new(0);
         let stderr_tail = Mutex::new(TailBuffer::default());
-        let (mut reader, writer_end) = std::io::pipe().expect("pipe");
+        let (reader, writer_end) = std::io::pipe().expect("pipe");
         let writer = Mutex::new(writer_end);
 
         handle_message(
@@ -620,9 +640,29 @@ mod tests {
             &stderr_tail,
             &Mutex::new(None),
         );
-        let frame = read_frame(&mut reader).expect("read").expect("some");
+        let frame = read_frame(&mut BufReader::new(reader))
+            .expect("read")
+            .expect("some");
         assert_eq!(frame["id"], 9);
         assert!(frame.get("result").is_some());
+    }
+
+    #[test]
+    fn request_and_notify_writes_do_not_deadlock() {
+        // Regression guard: the writer mutex must be acquired once per frame
+        // write (a lock-then-lock self-deadlock shipped in the first draft
+        // and hung every request).
+        let temp = tempfile::tempdir().expect("tempdir");
+        let client = JsonRpcClient::spawn("cat", &[], &[], temp.path()).expect("spawn cat");
+        let (id, _rx) = client
+            .request("initialize", serde_json::json!({}))
+            .expect("request write must succeed");
+        client
+            .notify("initialized", serde_json::json!({}))
+            .expect("notify write must succeed");
+        client.cancel_request(id);
+        client.kill();
+        assert!(!client.is_alive());
     }
 
     #[test]
