@@ -298,6 +298,9 @@ pub enum UiCommand {
     /// Resume a saved session (`/resume` picker): the driver swaps its
     /// session handle and replays the conversation into the transcript.
     ResumeSession { path: String },
+    /// Compact the conversation (`/compact`): the driver runs compaction and
+    /// replays the rewritten history into the transcript.
+    Compact,
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -812,6 +815,14 @@ impl PiFtuiModel {
             self.pending_quit = true;
             return true;
         }
+        if clean == "/compact" {
+            self.push_entry(
+                EntryRole::System,
+                String::from("compacting conversation ..."),
+            );
+            self.send_command(UiCommand::Compact);
+            return true;
+        }
         if clean == "/theme" {
             self.picker = Some(PickerOverlay {
                 title: String::from("Theme (Enter to apply, Esc to close)"),
@@ -845,8 +856,8 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model [provider/model], /resume, /theme, \
-                     /exit, /help, !<cmd> (runs + sends output to the agent), \
+                    "ftui preview commands: /model [provider/model], /resume, /compact, \
+                     /theme, /exit, /help, !<cmd> (runs + sends output to the agent), \
                      !!<cmd> (display-only) — everything else is still on the \
                      charmed stack",
                 ),
@@ -1419,6 +1430,31 @@ async fn run_prompt_turn(
     }
 }
 
+/// Handle `/compact` in the driver: run compaction with events translated to
+/// the UI, then replay the rewritten history into the transcript.
+async fn run_compact_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    // ubs:ignore Sender clone per command — the event callback must own its sender
+    let tx = agent_tx.clone();
+    let result = handle
+        .compact(move |event| {
+            for msg in agent_event_to_pi_msgs(&event) {
+                let _ = tx.send(msg);
+            }
+        })
+        .await;
+    match result {
+        Ok(()) => {
+            send_conversation_reset(handle, agent_tx, "conversation compacted").await;
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("compact: {err}")));
+        }
+    }
+}
+
 /// Handle `/resume` in the driver: open the chosen session file with the
 /// launch selection preserved, rewire the ask bridge to the new handle, and
 /// replay the conversation into the UI. Returns the replacement handle on
@@ -1608,6 +1644,9 @@ pub fn run(
                             {
                                 run_prompt_turn(&mut handle, output, &agent_tx).await;
                             }
+                        }
+                        Ok(UiCommand::Compact) => {
+                            run_compact_command(&mut handle, &agent_tx).await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
                             if let Some(new_handle) = resume_session_command(
@@ -2431,6 +2470,25 @@ mod tests {
             }
         );
         assert!(sim.model().picker.is_none());
+    }
+
+    #[test]
+    fn slash_compact_routes_command() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/compact");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("routed"), UiCommand::Compact);
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("compacting")),
+            "compact note missing"
+        );
     }
 
     #[test]
