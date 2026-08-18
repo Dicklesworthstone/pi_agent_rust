@@ -1600,12 +1600,10 @@ pub fn run(
                             let _ = agent_tx.send(msg);
                         }
                         Ok(UiCommand::Bash { command, exclude }) => {
-                            let output =
-                                run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx)
-                                    .await;
-                            // `!` semantics: the output becomes the next turn's
-                            // user content (bubbletea's submit_content path).
-                            if let Some(output) = output
+                            // `!` semantics: the output becomes the next
+                            // turn's user content (submit_content parity).
+                            if let Some(output) =
+                                run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx).await
                                 && !exclude
                             {
                                 run_prompt_turn(&mut handle, output, &agent_tx).await;

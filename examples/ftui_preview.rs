@@ -45,9 +45,9 @@ fn main() -> std::io::Result<()> {
                     continue;
                 }
                 UiCommand::ResumeSession { path } => {
-                    let _ = agent_tx.send(PiMsg::System(format!(
-                        "(fake agent) would resume: {path}"
-                    )));
+                    let mut note = String::from("(fake agent) would resume: "); // ubs:ignore demo loop paced by human input — one allocation per typed command
+                    note.push_str(&path);
+                    let _ = agent_tx.send(PiMsg::System(note));
                     continue;
                 }
             };
