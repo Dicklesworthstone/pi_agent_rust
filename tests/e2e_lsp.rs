@@ -44,7 +44,7 @@ fn output_json(output: &ToolOutput) -> Value {
 
 /// Probe one candidate binary; returns true when `--version` succeeds.
 fn probe_rust_analyzer(command: &str) -> bool {
-    Command::new(command)
+    Command::new(command) // ubs:ignore test probe of fixed candidates (PATH name or ~/.cargo/bin path)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

@@ -74,7 +74,7 @@ fn finish_case(harness: &TestHarness, case: &str) {
 
 /// Probe one candidate binary; returns true when `--version` succeeds.
 fn probe_rust_analyzer(command: &str) -> bool {
-    std::process::Command::new(command)
+    std::process::Command::new(command) // ubs:ignore test probe of fixed candidates (PATH name or ~/.cargo/bin path)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

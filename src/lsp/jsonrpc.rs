@@ -200,7 +200,7 @@ impl JsonRpcClient {
         env: &[(String, String)],
         cwd: &Path,
     ) -> Result<Self> {
-        let mut cmd = Command::new(command);
+        let mut cmd = Command::new(command); // ubs:ignore configured language-server spawn — command from defaults table or operator settings.json (bash-tool trust domain)
         cmd.args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
@@ -253,7 +253,7 @@ impl JsonRpcClient {
             let stderr_tail = std::sync::Arc::clone(&stderr_tail);
             let dropped = std::sync::Arc::clone(&dropped_notifications);
             let handler = std::sync::Arc::clone(&server_request_handler);
-            std::thread::spawn(move || {
+            let reader_body = move || {
                 let mut reader = BufReader::new(stdout);
                 let close_reason = loop {
                     match read_frame(&mut reader) {
@@ -278,13 +278,15 @@ impl JsonRpcClient {
                 for (_, sender) in pending.drain() {
                     let _ = sender.send(Err(TransportError::Closed(close_reason.clone())));
                 }
-            });
+            };
+            // Intentional detach: the reader exits on pipe EOF when the child dies.
+            std::thread::spawn(reader_body); // ubs:ignore intentional detach (EOF-exit)
         }
 
         // Stderr pump: retain a bounded tail for diagnostics surfacing.
         {
             let stderr_tail = std::sync::Arc::clone(&stderr_tail);
-            std::thread::spawn(move || {
+            let pump_body = move || {
                 let mut reader = BufReader::new(stderr);
                 let mut buf = [0u8; 4096];
                 loop {
@@ -296,7 +298,9 @@ impl JsonRpcClient {
                         }
                     }
                 }
-            });
+            };
+            // Intentional detach: the pump exits on pipe EOF when the child dies.
+            std::thread::spawn(pump_body); // ubs:ignore intentional detach (EOF-exit)
         }
 
         Ok(Self {
