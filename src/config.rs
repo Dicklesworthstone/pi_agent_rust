@@ -68,6 +68,8 @@ pub struct Config {
     pub read: Option<ReadSettings>,
     /// Advisor settings (bd-cv653.3.3).
     pub advisor: Option<AdvisorSettings>,
+    /// LSP tool settings (bd-cv653.1.1).
+    pub lsp: Option<LspSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -444,6 +446,45 @@ pub struct AdvisorSettings {
     /// Hard timeout per advisor call in seconds (default 15).
     #[serde(alias = "timeoutSecs")]
     pub timeout_secs: Option<u64>,
+}
+
+/// LSP tool configuration (bd-cv653.1.1).
+///
+/// `servers` merges over the built-in defaults table per server name
+/// (set fields win); unknown names add new servers and require `command`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspSettings {
+    /// Per-server overrides/extensions, keyed by server name.
+    pub servers: Option<std::collections::HashMap<String, LspServerSettings>>,
+    /// Default per-request timeout in seconds (default 120).
+    #[serde(alias = "requestTimeoutSecs")]
+    pub request_timeout_secs: Option<u64>,
+    /// Idle shutdown TTL in seconds (default 300).
+    #[serde(alias = "idleShutdownSecs")]
+    pub idle_shutdown_secs: Option<u64>,
+}
+
+/// One `lsp.servers.<name>` entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LspServerSettings {
+    /// Executable (required for new servers).
+    pub command: Option<String>,
+    /// argv after the executable.
+    pub args: Option<Vec<String>>,
+    /// Extra environment overrides.
+    pub env: Option<std::collections::HashMap<String, String>>,
+    /// LSP language ids served.
+    pub languages: Option<Vec<String>>,
+    /// File extensions routed to this server (with leading dot).
+    pub extensions: Option<Vec<String>>,
+    /// Workspace root marker filenames.
+    #[serde(alias = "rootMarkers")]
+    pub root_markers: Option<Vec<String>>,
+    /// `initializationOptions` payload for the handshake.
+    #[serde(alias = "initializationOptions")]
+    pub initialization_options: Option<serde_json::Value>,
 }
 
 /// Read-tool configuration (bd-cv653.2.2).
