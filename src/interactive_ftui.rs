@@ -633,24 +633,7 @@ impl PiFtuiModel {
             PiMsg::ConversationReset {
                 messages, status, ..
             } => {
-                // Rebuild the transcript from the resumed/forked session.
-                self.transcript.clear();
-                self.streaming.clear();
-                for message in messages {
-                    let role = match message.role {
-                        crate::interactive::MessageRole::User => EntryRole::User,
-                        crate::interactive::MessageRole::Assistant => EntryRole::Assistant,
-                        crate::interactive::MessageRole::Tool
-                        | crate::interactive::MessageRole::System => EntryRole::System,
-                    };
-                    let text = sanitize(&message.content).into_owned();
-                    self.push_entry(role, text);
-                }
-                if let Some(status) = status {
-                    let text = sanitize(&status).into_owned();
-                    self.push_entry(EntryRole::System, text);
-                }
-                self.scroll_from_tail = 0;
+                self.apply_conversation_reset(messages, status);
             }
             PiMsg::BashResult { display, .. } => {
                 let text = sanitize(&display).into_owned();
@@ -1113,6 +1096,32 @@ impl PiFtuiModel {
         self.state == AgentUiState::Ready || self.active_ask.is_some() || self.active_ext.is_some()
     }
 
+    /// Rebuild the transcript from a resumed/forked/compacted session.
+    fn apply_conversation_reset(
+        &mut self,
+        messages: Vec<crate::interactive::ConversationMessage>,
+        status: Option<String>,
+    ) {
+        self.transcript.clear();
+        self.streaming.clear();
+        for message in messages {
+            let role = match message.role {
+                crate::interactive::MessageRole::User => EntryRole::User,
+                crate::interactive::MessageRole::Assistant => EntryRole::Assistant,
+                crate::interactive::MessageRole::Tool | crate::interactive::MessageRole::System => {
+                    EntryRole::System
+                }
+            };
+            let text = sanitize(&message.content).into_owned();
+            self.push_entry(role, text);
+        }
+        if let Some(status) = status {
+            let text = sanitize(&status).into_owned();
+            self.push_entry(EntryRole::System, text);
+        }
+        self.scroll_from_tail = 0;
+    }
+
     /// Render an extension UI prompt into the transcript and make it the
     /// active reply target.
     fn activate_ext_request(&mut self, request: ExtensionUiRequest) {
@@ -1163,10 +1172,11 @@ impl PiFtuiModel {
     /// Activate a queued extension prompt once no ask card or prompt is
     /// holding the input line.
     fn maybe_activate_queued_ext(&mut self) {
-        if self.active_ask.is_none() && self.active_ext.is_none() {
-            if let Some(next) = self.ext_queue.pop_front() {
-                self.activate_ext_request(next);
-            }
+        if self.active_ask.is_none()
+            && self.active_ext.is_none()
+            && let Some(next) = self.ext_queue.pop_front()
+        {
+            self.activate_ext_request(next);
         }
     }
 
@@ -1556,18 +1566,17 @@ impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
             reply_rx.recv(cx.cx()),
         )
         .await;
-        match waited {
-            Ok(Ok(response)) => Ok(Some(response)),
-            Ok(Err(_)) | Err(_) => {
-                // UI gone or user never answered: report a cancel so the
-                // extension gets a definitive answer instead of hanging.
-                self.drop_pending(&id);
-                Ok(Some(ExtensionUiResponse {
-                    id,
-                    value: None,
-                    cancelled: true,
-                }))
-            }
+        if let Ok(Ok(response)) = waited {
+            Ok(Some(response))
+        } else {
+            // UI gone or user never answered: report a cancel so the
+            // extension gets a definitive answer instead of hanging.
+            self.drop_pending(&id);
+            Ok(Some(ExtensionUiResponse {
+                id,
+                value: None,
+                cancelled: true,
+            }))
         }
     }
 }
@@ -1680,6 +1689,20 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
         no_session: false,
         ..Default::default()
     }
+}
+
+/// Handle a model switch in the driver, reporting the outcome to the UI.
+async fn run_set_model_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    provider: &str,
+    model: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match handle.set_model(provider, model).await {
+        Ok(()) => PiMsg::System(format!("model set to {provider}/{model}")),
+        Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
+    };
+    let _ = agent_tx.send(msg);
 }
 
 /// Handle `/compact` in the driver: run compaction with events translated to
@@ -1885,11 +1908,7 @@ pub fn run(
                             run_prompt_turn(&mut handle, prompt, &agent_tx).await;
                         }
                         Ok(UiCommand::SetModel { provider, model }) => {
-                            let msg = match handle.set_model(&provider, &model).await {
-                                Ok(()) => PiMsg::System(format!("model set to {provider}/{model}")),
-                                Err(err) => PiMsg::AgentError(format!("model switch: {err}")),
-                            };
-                            let _ = agent_tx.send(msg);
+                            run_set_model_command(&mut handle, &provider, &model, &agent_tx).await;
                         }
                         Ok(UiCommand::Bash { command, exclude }) => {
                             // `!` semantics: the output becomes the next
