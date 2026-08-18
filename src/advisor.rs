@@ -58,7 +58,7 @@ impl TurnDigest {
     /// A turn is trivial when no tools ran and the reply is short — nothing
     /// worth an advisor's attention (or tokens).
     #[must_use]
-    pub fn is_trivial(&self) -> bool {
+    pub const fn is_trivial(&self) -> bool {
         self.is_trivial
     }
 }
@@ -89,10 +89,8 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
                             digest.tool_call_count += 1;
                             match call.name.as_str() {
                                 "write" | "edit" | "hashline_edit" | "ast_edit" => {
-                                    if let Some(path) = call
-                                        .arguments
-                                        .get("path")
-                                        .and_then(Value::as_str)
+                                    if let Some(path) =
+                                        call.arguments.get("path").and_then(Value::as_str)
                                         && digest.files_touched.len() < MAX_DIGEST_FILES
                                         && !digest.files_touched.iter().any(|p| p == path)
                                     {
@@ -100,46 +98,39 @@ pub fn build_digest(messages: &[Message]) -> TurnDigest {
                                     }
                                 }
                                 "bash" => {
-                                    if let Some(command) = call
-                                        .arguments
-                                        .get("command")
-                                        .and_then(Value::as_str)
+                                    if let Some(command) =
+                                        call.arguments.get("command").and_then(Value::as_str)
                                         && digest.commands_run.len() < MAX_DIGEST_COMMANDS
                                     {
-                                        digest.commands_run.push(
-                                            command.chars().take(200).collect(),
-                                        );
+                                        digest
+                                            .commands_run
+                                            .push(command.chars().take(200).collect());
                                     }
                                 }
                                 _ => {}
                             }
                         }
                         crate::model::ContentBlock::Text(text) => {
-                            digest.final_text = text
-                                .text
-                                .chars()
-                                .take(MAX_FINAL_TEXT_CHARS)
-                                .collect();
+                            digest.final_text =
+                                text.text.chars().take(MAX_FINAL_TEXT_CHARS).collect();
                         }
                         _ => {}
                     }
                 }
             }
-            Message::ToolResult(result) => {
-                if result.is_error
-                    && digest.tool_errors.len() < MAX_DIGEST_ERRORS
-                {
-                    let text = result
-                        .content
-                        .iter()
-                        .filter_map(|block| match block {
-                            crate::model::ContentBlock::Text(t) => Some(t.text.clone()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    digest.tool_errors.push(text.chars().take(200).collect());
-                }
+            Message::ToolResult(result)
+                if result.is_error && digest.tool_errors.len() < MAX_DIGEST_ERRORS =>
+            {
+                let text = result
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        crate::model::ContentBlock::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                digest.tool_errors.push(text.chars().take(200).collect());
             }
             _ => {}
         }
@@ -196,7 +187,10 @@ pub fn digest_prompt(digest: &TurnDigest) -> String {
 pub fn parse_verdict(reply: &str) -> AdvisorVerdict {
     let trimmed = reply.trim();
     let first_line = trimmed.lines().next().unwrap_or("");
-    let upper = first_line.trim().trim_matches([':', '.', '*', '#', ' ']).to_ascii_uppercase();
+    let upper = first_line
+        .trim()
+        .trim_matches([':', '.', '*', '#', ' '])
+        .to_ascii_uppercase();
     let level = if upper.starts_with("BLOCKER") {
         VerdictLevel::Blocker
     } else if upper.starts_with("CONCERN") {
@@ -221,7 +215,13 @@ pub fn parse_verdict(reply: &str) -> AdvisorVerdict {
     AdvisorVerdict {
         level,
         rationale: if rationale.is_empty() {
-            first_line.trim().trim_start_matches(|c: char| c.is_ascii_uppercase() || c == ' ').trim_start_matches([':', '-', ' ']).chars().take(600).collect()
+            first_line
+                .trim()
+                .trim_start_matches(|c: char| c.is_ascii_uppercase() || c == ' ')
+                .trim_start_matches([':', '-', ' '])
+                .chars()
+                .take(600)
+                .collect()
         } else {
             rationale
         },
@@ -296,7 +296,8 @@ pub fn format_injection(verdict: &AdvisorVerdict) -> String {
 
 /// Process-global advisor pause flag (bd-cv653.3.3): pi runs one session per
 /// process, so /advisor pause|resume flips this single flag.
-pub static ADVISOR_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub static ADVISOR_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// The advisor runtime: owns the second provider, the guard, and failure
 /// isolation state.
@@ -337,7 +338,7 @@ impl AdvisorRuntime {
     }
 
     #[must_use]
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
@@ -349,7 +350,7 @@ impl AdvisorRuntime {
     }
 
     #[must_use]
-    pub fn is_disabled(&self) -> bool {
+    pub const fn is_disabled(&self) -> bool {
         self.disabled_notice.is_some()
     }
 
@@ -362,18 +363,15 @@ impl AdvisorRuntime {
             return AdvisorOutcome::Quiet;
         }
         let call = self.call_advisor(digest);
-        let reply = match with_timeout(self.timeout, call).await {
-            Some(Ok(text)) => text,
-            Some(Err(_)) | None => {
-                self.consecutive_failures += 1;
-                if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                    self.disabled_notice = Some(format!(
-                        "advisor ({}) disabled after {} consecutive failures",
-                        self.label, self.consecutive_failures
-                    ));
-                }
-                return AdvisorOutcome::Failed;
+        let Some(Ok(reply)) = with_timeout(self.timeout, call).await else {
+            self.consecutive_failures += 1;
+            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                self.disabled_notice = Some(format!(
+                    "advisor ({}) disabled after {} consecutive failures",
+                    self.label, self.consecutive_failures
+                ));
             }
+            return AdvisorOutcome::Failed;
         };
         self.consecutive_failures = 0;
         let verdict = parse_verdict(&reply);
@@ -387,6 +385,7 @@ impl AdvisorRuntime {
     }
 
     async fn call_advisor(&self, digest: &TurnDigest) -> crate::error::Result<String> {
+        use futures::StreamExt;
         let context = crate::provider::Context {
             system_prompt: Some(REVIEW_SYSTEM_PROMPT.to_string().into()),
             messages: vec![crate::model::Message::User(crate::model::UserMessage {
@@ -402,7 +401,6 @@ impl AdvisorRuntime {
         };
         let mut stream = self.provider.stream(&context, &options).await?;
         let mut text = String::new();
-        use futures::StreamExt;
         while let Some(event) = stream.next().await {
             match event {
                 Ok(crate::model::StreamEvent::TextDelta { delta, .. }) => text.push_str(&delta),
@@ -446,7 +444,8 @@ mod tests {
 
     #[test]
     fn parse_verdict_levels() {
-        let blocker = parse_verdict("BLOCKER: the edit deletes the migration\nIt removes drop columns.");
+        let blocker =
+            parse_verdict("BLOCKER: the edit deletes the migration\nIt removes drop columns.");
         assert_eq!(blocker.level, VerdictLevel::Blocker);
         assert!(blocker.rationale.contains("drop columns"));
         let concern = parse_verdict("CONCERN: broad catch\nThis swallows IO errors.");
@@ -468,7 +467,10 @@ mod tests {
             rationale: "same concern".to_string(),
         };
         assert!(guard.allow(&concern(), 0));
-        assert!(!guard.allow(&concern(), 1), "dedupe: same rationale blocked");
+        assert!(
+            !guard.allow(&concern(), 1),
+            "dedupe: same rationale blocked"
+        );
         let other = AdvisorVerdict {
             level: VerdictLevel::Concern,
             rationale: "different concern".to_string(),
@@ -524,9 +526,9 @@ mod tests {
             Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
                 tool_call_id: "2".to_string(),
                 tool_name: "bash".to_string(),
-                content: vec![crate::model::ContentBlock::Text(crate::model::TextContent::new(
-                    "permission denied",
-                ))],
+                content: vec![crate::model::ContentBlock::Text(
+                    crate::model::TextContent::new("permission denied"),
+                )],
                 is_error: true,
                 details: None,
                 timestamp: 0,
@@ -565,7 +567,8 @@ mod tests {
     fn timeout_returns_none_on_slow_future() {
         asupersync::test_utils::run_test(|| async {
             let outcome = with_timeout(Duration::from_millis(30), async {
-                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_secs(60)).await;
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_secs(60))
+                    .await;
                 42
             })
             .await;

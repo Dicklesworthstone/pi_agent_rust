@@ -1091,10 +1091,7 @@ pub enum AgentEvent {
         restored_primary: bool,
     },
     /// Advisor verdict delivered into the session (bd-cv653.3.3).
-    AdvisorNote {
-        level: String,
-        rationale: String,
-    },
+    AdvisorNote { level: String, rationale: String },
     /// Extension error during event dispatch or execution.
     ExtensionError {
         #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
@@ -10268,7 +10265,8 @@ impl AgentSession {
                 digest.tool_call_count,
                 digest.is_trivial(),
                 match &outcome {
-                    crate::advisor::AdvisorOutcome::Inject(v) => format!("inject:{}", v.level.as_str()),
+                    crate::advisor::AdvisorOutcome::Inject(v) =>
+                        format!("inject:{}", v.level.as_str()),
                     crate::advisor::AdvisorOutcome::Quiet => "quiet".to_string(),
                     crate::advisor::AdvisorOutcome::Failed => "failed".to_string(),
                 }
@@ -14559,10 +14557,10 @@ mod tests {
                         crate::model::UserContent::Blocks(blocks) => blocks.clone(),
                     },
                     crate::model::Message::ToolResult(r) => r.content.clone(),
-                    _ => Vec::new(),
+                    crate::model::Message::Custom(_) => Vec::new(),
                 })
                 .filter_map(|b| match b {
-                    ContentBlock::Text(t) => Some(t.text.clone()),
+                    ContentBlock::Text(t) => Some(t.text),
                     _ => None,
                 })
                 .collect();
@@ -14752,22 +14750,24 @@ mod tests {
                 .filter_map(|m| match m {
                     crate::model::Message::User(u) => match &u.content {
                         crate::model::UserContent::Text(t) => Some(t.clone()),
-                        _ => None,
+                        crate::model::UserContent::Blocks(_) => None,
                     },
                     _ => None,
                 })
                 .any(|text| text.contains("ADVISOR:CONCERN"));
-            assert!(steered, "advisor concern must be delivered into the next turn");
+            assert!(
+                steered,
+                "advisor concern must be delivered into the next turn"
+            );
             let has_entry = {
                 let cx = asupersync::Cx::for_request();
                 let inner = agent_session.session.lock(&cx).await.expect("session lock");
-                inner
-                    .entries_for_current_path()
-                    .iter()
-                    .any(|e| matches!(
+                inner.entries_for_current_path().iter().any(|e| {
+                    matches!(
                         e,
                         crate::session::SessionEntry::Custom(c) if c.custom_type == "advisor_note"
-                    ))
+                    )
+                })
             };
             assert!(has_entry, "advisor_note session entry recorded");
         });

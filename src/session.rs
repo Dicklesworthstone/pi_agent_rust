@@ -3055,7 +3055,7 @@ impl Session {
         #[cfg(feature = "tui")]
         if picker_input_override.is_none()
             && is_interactive
-            && let Some(session) = crate::session_picker::pick_session(override_dir).await
+            && let Some(session) = Box::pin(crate::session_picker::pick_session(override_dir)).await
         {
             return Ok(session);
         }

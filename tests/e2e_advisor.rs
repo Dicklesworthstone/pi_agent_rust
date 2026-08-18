@@ -57,7 +57,12 @@ struct PiEnv {
 }
 
 impl PiEnv {
-    fn new(harness: &TestHarness, advisor_base: &str, doer_base: &str, extra_settings: &str) -> Self {
+    fn new(
+        harness: &TestHarness,
+        advisor_base: &str,
+        doer_base: &str,
+        extra_settings: &str,
+    ) -> Self {
         let root = harness.temp_path("pi-env-advisor");
         std::fs::create_dir_all(root.join("agent")).expect("mkdir agent");
         std::fs::create_dir_all(root.join("home")).expect("mkdir home");
@@ -110,7 +115,9 @@ impl PiEnv {
 #[test]
 fn e2e_advisor_concern_injected_into_next_turn() {
     let harness = TestHarness::new("e2e_advisor_concern_injected_into_next_turn");
-    harness.log().info("setup", "doer risky turn; advisor returns CONCERN");
+    harness
+        .log()
+        .info("setup", "doer risky turn; advisor returns CONCERN");
     let server = harness.start_mock_http_server();
     // Doer: one read call, then text.
     server.add_route_queue(
@@ -126,10 +133,17 @@ fn e2e_advisor_concern_injected_into_next_turn() {
     server.add_route(
         "POST",
         "/advisor/v1/chat/completions",
-        sse_response(text_sse_body("CONCERN: swept the whole tree\nScope the read to the target directory.")),
+        sse_response(text_sse_body(
+            "CONCERN: swept the whole tree\nScope the read to the target directory.",
+        )),
     );
 
-    let env = PiEnv::new(&harness, &format!("{}/advisor", server.base_url()), &format!("{}/doer", server.base_url()), "");
+    let env = PiEnv::new(
+        &harness,
+        &format!("{}/advisor", server.base_url()),
+        &format!("{}/doer", server.base_url()),
+        "",
+    );
     let binary = build_binary(&harness);
     let mut command = env.command(&binary);
     command.args([
@@ -145,7 +159,7 @@ fn e2e_advisor_concern_injected_into_next_turn() {
     ]);
     let mut child = command.spawn().expect("spawn pi");
     let start = Instant::now();
-    let (stdout, stderr) = loop {
+    let (_stdout, _stderr) = loop {
         match child.try_wait() {
             Ok(Some(_)) => {
                 let out = child.wait_with_output().expect("output");
@@ -173,8 +187,7 @@ fn e2e_advisor_concern_injected_into_next_turn() {
     let final_request = server
         .requests()
         .into_iter()
-        .filter(|r| r.path == "/doer/v1/chat/completions")
-        .last()
+        .rfind(|r| r.path == "/doer/v1/chat/completions")
         .expect("final doer request");
     let body = String::from_utf8_lossy(&final_request.body);
     assert!(
@@ -192,13 +205,17 @@ fn e2e_advisor_concern_injected_into_next_turn() {
     let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_advisor_concern.jsonl", &path);
-    harness.log().info("done", "advisor injection verified over the wire");
+    harness
+        .log()
+        .info("done", "advisor injection verified over the wire");
 }
 
 #[test]
 fn e2e_advisor_failure_isolated_from_main_turn() {
     let harness = TestHarness::new("e2e_advisor_failure_isolated_from_main_turn");
-    harness.log().info("setup", "advisor 500s; doer must complete anyway");
+    harness
+        .log()
+        .info("setup", "advisor 500s; doer must complete anyway");
     let server = harness.start_mock_http_server();
     server.add_route_queue(
         "POST",
@@ -218,7 +235,12 @@ fn e2e_advisor_failure_isolated_from_main_turn() {
         },
     );
 
-    let env = PiEnv::new(&harness, &format!("{}/advisor", server.base_url()), &format!("{}/doer", server.base_url()), "");
+    let env = PiEnv::new(
+        &harness,
+        &format!("{}/advisor", server.base_url()),
+        &format!("{}/doer", server.base_url()),
+        "",
+    );
     let binary = build_binary(&harness);
     let mut command = env.command(&binary);
     command.args([

@@ -758,7 +758,7 @@ pub fn role_spec_from_settings(
 
 /// The spec string configured for a role via CLI flag (`--smol`/`--slow`/
 /// `--plan`; other roles have no CLI flags), if any.
-fn role_spec_from_cli<'a>(cli: &'a cli::Cli, role: ModelRole) -> Option<&'a str> {
+fn role_spec_from_cli(cli: &cli::Cli, role: ModelRole) -> Option<&str> {
     let spec = match role {
         ModelRole::Smol => cli.smol.as_deref(),
         ModelRole::Slow => cli.slow.as_deref(),
