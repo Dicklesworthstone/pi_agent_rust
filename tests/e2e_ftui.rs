@@ -666,8 +666,12 @@ fn e2e_ftui_vcr_streamed_turn() {
     std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
     let system_prompt = ftui_vcr_system_prompt(session.harness.temp_dir(), &env_root);
     let cassette_dir = session.harness.temp_dir().join("cassettes");
-    let cassette_path =
-        write_ftui_vcr_cassette(&cassette_dir, &system_prompt, FTUI_VCR_TEST_NAME, FTUI_VCR_RESPONSE);
+    let cassette_path = write_ftui_vcr_cassette(
+        &cassette_dir,
+        &system_prompt,
+        FTUI_VCR_TEST_NAME,
+        FTUI_VCR_RESPONSE,
+    );
     session
         .harness
         .record_artifact("ftui-vcr-cassette.json", &cassette_path);
@@ -802,7 +806,12 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
     }
     script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
     let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
-    let _ = writeln!(script, "export {}={}", pi::vcr::VCR_ENV_DIR, cassette_dir.display());
+    let _ = writeln!(
+        script,
+        "export {}={}",
+        pi::vcr::VCR_ENV_DIR,
+        cassette_dir.display()
+    );
     let _ = writeln!(script, "export PI_VCR_TEST_NAME={FTUI_VCR_KILL_TEST_NAME}");
     let _ = writeln!(script, "export {}=150", pi::vcr::VCR_ENV_CHUNK_DELAY_MS);
     let _ = write!(
@@ -815,7 +824,11 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
         let _ = write!(script, " \"{arg}\"");
     }
     let _ = writeln!(script, " 2>{}'", stderr_log.display());
-    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i\n");
+    // Give the post-kill shell its tty stderr back: the wrapper's xtrace
+    // redirect would otherwise make `sh -i` decide it is non-interactive
+    // (POSIX sh checks stdin AND stderr), which suppresses the prompt and
+    // confounds the echo probe.
+    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i 2>/dev/tty\n");
 
     let script_path = session.harness.temp_path("midstream-run.sh");
     std::fs::write(&script_path, &script).expect("write midstream script"); // ubs:ignore test setup expect
