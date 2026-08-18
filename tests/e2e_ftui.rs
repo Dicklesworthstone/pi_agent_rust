@@ -230,12 +230,11 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
             .wait_for_pane_contains("running bash", COMMAND_TIMEOUT);
     }
 
-    // An unreadable/unparseable pid file is an immediate test failure; on
-    // that failure the pane + stderr are the diagnostics.
+    // An unreadable/unparseable pid file is an immediate test failure; the
+    // pane is the diagnostic.
     let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
         let pane = session.tmux.capture_pane();
-        let stderr_tail = std::fs::read_to_string(&stderr_log).unwrap_or_default();
-        panic!("read pi pid failed: {err}\npane:\n{pane}\nstderr:\n{stderr_tail}");
+        panic!("read pi pid failed: {err}\npane:\n{pane}");
     });
     let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
     // Literal /bin/kill path is deliberate: portable signal delivery without
@@ -788,7 +787,11 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
 
     let pid_file = session.harness.temp_path("pi.pid");
     let stderr_log = session.harness.temp_path("pi-stderr.log");
+    let trace_log = session.harness.temp_path("wrapper-trace.log");
     let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    // Outer-script xtrace to a file: the definitive diagnostic when the
+    // wrapper dies before pi draws anything.
+    let _ = write!(script, "exec 2>{}\nset -x\n", trace_log.display());
     for (key, sub) in [
         ("PI_CODING_AGENT_DIR", "agent"),
         ("PI_CONFIG_PATH", "config.toml"),
@@ -850,7 +853,10 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
     let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
         let pane = session.tmux.capture_pane();
         let stderr_tail = std::fs::read_to_string(&stderr_log).unwrap_or_default();
-        panic!("read pi pid failed: {err}\npane:\n{pane}\nstderr:\n{stderr_tail}");
+        let trace = std::fs::read_to_string(&trace_log).unwrap_or_default();
+        panic!(
+            "read pi pid failed: {err}\npane:\n{pane}\nstderr:\n{stderr_tail}\nwrapper trace:\n{trace}"
+        );
     });
     let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
     let mut kill_cmd = std::process::Command::new("/bin/kill"); // ubs:ignore unix-only test helper path
