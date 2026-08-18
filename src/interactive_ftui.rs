@@ -45,8 +45,11 @@ use ftui::widgets::textarea::TextArea;
 use ftui::{Cmd, Event, Frame, KeyCode, Model, Modifiers, MouseEventKind};
 
 use crate::ask::{AskAnswer, AskResponse, AskUiRequest, QuestionReply};
+use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse};
 use crate::interactive::PiMsg;
+use crate::interactive::{format_extension_ui_prompt, parse_extension_ui_response};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
+use std::collections::VecDeque;
 
 /// Typed message for the ftui model: terminal events plus bridged agent events.
 ///
@@ -360,6 +363,13 @@ pub struct PiFtuiModel {
     keybindings: KeyBindings,
     /// Ask-tool card currently collecting answers via the editor.
     active_ask: Option<ActiveAsk>,
+    /// Extension UI prompt currently collecting a reply (bd-1eoh4); extras
+    /// queue behind it, mirroring the bubbletea active/queue pair.
+    active_ext: Option<ExtensionUiRequest>,
+    ext_queue: VecDeque<ExtensionUiRequest>,
+    /// Where completed extension UI replies go (driver pairs them back to the
+    /// pending request via `FtuiExtensionUiHandler::resolve`).
+    ext_reply_tx: Option<Sender<ExtensionUiResponse>>,
     /// Where completed ask interactions go (launch path calls respond_ui).
     ask_reply_tx: Option<Sender<AskUiReply>>,
     /// Terminal size, tracked from `Event::Resize` (cols, rows).
@@ -438,6 +448,9 @@ impl PiFtuiModel {
             available_sessions: Vec::new(),
             keybindings: KeyBindings::default(),
             active_ask: None,
+            active_ext: None,
+            ext_queue: VecDeque::new(),
+            ext_reply_tx: None,
             ask_reply_tx: None,
             term: (80, 24),
             scroll_from_tail: 0,
@@ -463,6 +476,13 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_ask_reply_channel(mut self, tx: Sender<AskUiReply>) -> Self {
         self.ask_reply_tx = Some(tx);
+        self
+    }
+
+    /// Route completed extension UI replies to the driver (bd-1eoh4).
+    #[must_use]
+    pub fn with_ext_reply_channel(mut self, tx: Sender<ExtensionUiResponse>) -> Self {
+        self.ext_reply_tx = Some(tx);
         self
     }
 
@@ -652,6 +672,13 @@ impl PiFtuiModel {
                     });
                 }
             }
+            PiMsg::ExtensionUiRequest(request) => {
+                if self.active_ext.is_none() && self.active_ask.is_none() {
+                    self.activate_ext_request(request);
+                } else {
+                    self.ext_queue.push_back(request);
+                }
+            }
             PiMsg::UiShutdown => return Cmd::quit(),
             // Remaining variants are wired up as their owning surfaces are
             // ported (tools panel, ask cards, OAuth flows, pickers, ...).
@@ -700,6 +727,7 @@ impl PiFtuiModel {
                 self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
                 self.scroll_from_tail = 0;
                 self.send_ask_reply(ask.request.id, Vec::new(), true);
+                self.maybe_activate_queued_ext();
             }
             Ok(reply) => {
                 let (selected, other) = match reply {
@@ -727,6 +755,7 @@ impl PiFtuiModel {
                 } else {
                     self.scroll_from_tail = 0;
                     self.send_ask_reply(ask.request.id, ask.answers, false);
+                    self.maybe_activate_queued_ext();
                 }
             }
         }
@@ -1017,12 +1046,20 @@ impl PiFtuiModel {
                             self.push_entry(EntryRole::Ask, String::from("  (dismissed)"));
                             self.scroll_from_tail = 0;
                             self.send_ask_reply(ask.request.id, Vec::new(), true);
+                            self.maybe_activate_queued_ext();
                         }
+                        return Cmd::none();
+                    }
+                    Some(AppAction::Interrupt) if self.active_ext.is_some() => {
+                        // Escape cancels the pending extension prompt.
+                        self.cancel_active_ext();
                         return Cmd::none();
                     }
                     Some(AppAction::Submit) if self.input_active() => {
                         if self.active_ask.is_some() {
                             self.submit_ask_answer();
+                        } else if self.active_ext.is_some() {
+                            self.submit_ext_answer();
                         } else {
                             self.submit_input();
                             if self.pending_quit {
@@ -1071,9 +1108,82 @@ impl PiFtuiModel {
 
     /// Editor accepts input while the agent is idle (matching
     /// `editor_input_is_available()` in the bubbletea stack) or while an
-    /// ask card is collecting its reply mid-turn.
+    /// ask card / extension UI prompt is collecting its reply mid-turn.
     fn input_active(&self) -> bool {
-        self.state == AgentUiState::Ready || self.active_ask.is_some()
+        self.state == AgentUiState::Ready || self.active_ask.is_some() || self.active_ext.is_some()
+    }
+
+    /// Render an extension UI prompt into the transcript and make it the
+    /// active reply target.
+    fn activate_ext_request(&mut self, request: ExtensionUiRequest) {
+        let card = format_extension_ui_prompt(&request);
+        let text = sanitize(card.trim_end()).into_owned();
+        self.push_entry(EntryRole::Ask, text);
+        self.scroll_from_tail = 0;
+        self.active_ext = Some(request);
+    }
+
+    fn send_ext_reply(&self, response: ExtensionUiResponse) {
+        if let Some(tx) = &self.ext_reply_tx {
+            let _ = tx.send(response);
+        }
+    }
+
+    /// Consume the editor content as the reply to the active extension UI
+    /// prompt; parse errors re-prompt, `cancel` dismisses.
+    fn submit_ext_answer(&mut self) {
+        let Some(request) = self.active_ext.take() else {
+            return;
+        };
+        let raw = self.input.text();
+        self.input.set_text("");
+        match parse_extension_ui_response(&request, &raw) {
+            Err(err) => {
+                let text = format!("  ! {}", sanitize(&err));
+                self.push_entry(EntryRole::Ask, text);
+                self.scroll_from_tail = 0;
+                self.active_ext = Some(request);
+            }
+            Ok(response) => {
+                let echo = if response.cancelled {
+                    String::from("  (cancelled)")
+                } else {
+                    format!("  → {}", sanitize(raw.trim()))
+                };
+                self.push_entry(EntryRole::Ask, echo);
+                self.scroll_from_tail = 0;
+                self.send_ext_reply(response);
+                if let Some(next) = self.ext_queue.pop_front() {
+                    self.activate_ext_request(next);
+                }
+            }
+        }
+    }
+
+    /// Activate a queued extension prompt once no ask card or prompt is
+    /// holding the input line.
+    fn maybe_activate_queued_ext(&mut self) {
+        if self.active_ask.is_none() && self.active_ext.is_none() {
+            if let Some(next) = self.ext_queue.pop_front() {
+                self.activate_ext_request(next);
+            }
+        }
+    }
+
+    /// Cancel the active extension prompt (escape path).
+    fn cancel_active_ext(&mut self) {
+        if let Some(request) = self.active_ext.take() {
+            self.push_entry(EntryRole::Ask, String::from("  (cancelled)"));
+            self.scroll_from_tail = 0;
+            self.send_ext_reply(ExtensionUiResponse {
+                id: request.id,
+                value: None,
+                cancelled: true,
+            });
+            if let Some(next) = self.ext_queue.pop_front() {
+                self.activate_ext_request(next);
+            }
+        }
     }
 
     fn consume_scroll(&mut self, scroll: impl FnOnce(&mut Self)) -> Cmd<PiFtuiMsg> {
@@ -1373,6 +1483,115 @@ const SUBMIT_POLL: Duration = Duration::from_millis(50);
 const INLINE_MIN_HEIGHT: u16 = 10;
 const INLINE_MAX_HEIGHT: u16 = 15;
 
+/// Default budget for an extension UI prompt when the request carries none.
+const EXT_UI_TIMEOUT_MS: u64 = 300_000;
+
+/// Driver-side extension UI surface (bd-1eoh4): forwards requests to the UI
+/// as `PiMsg::ExtensionUiRequest` and awaits the typed reply routed back over
+/// the extension reply channel — the same oneshot-pending shape as
+/// `AskTool::install_channel_ui`.
+struct FtuiExtensionUiHandler {
+    agent_tx: Sender<PiMsg>,
+    pending: Mutex<
+        std::collections::HashMap<
+            String,
+            asupersync::channel::oneshot::Sender<ExtensionUiResponse>,
+        >,
+    >,
+}
+
+impl FtuiExtensionUiHandler {
+    fn new(agent_tx: Sender<PiMsg>) -> Self {
+        Self {
+            agent_tx,
+            pending: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn resolve(&self, response: ExtensionUiResponse) {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let sender = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&response.id);
+        if let Some(sender) = sender {
+            let _ = sender.send(cx.cx(), response);
+        }
+    }
+
+    fn drop_pending(&self, id: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::sdk::ExtensionUiHandler for FtuiExtensionUiHandler {
+    async fn request_ui(
+        &self,
+        request: ExtensionUiRequest,
+    ) -> crate::error::Result<Option<ExtensionUiResponse>> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let id = request.id.clone();
+        let timeout_ms = request.timeout_ms.unwrap_or(EXT_UI_TIMEOUT_MS);
+        let (reply_tx, mut reply_rx) = asupersync::channel::oneshot::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id.clone(), reply_tx);
+        if self
+            .agent_tx
+            .send(PiMsg::ExtensionUiRequest(request))
+            .is_err()
+        {
+            self.drop_pending(&id);
+            return Ok(None);
+        }
+        let waited = asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            std::time::Duration::from_millis(timeout_ms),
+            reply_rx.recv(cx.cx()),
+        )
+        .await;
+        match waited {
+            Ok(Ok(response)) => Ok(Some(response)),
+            Ok(Err(_)) | Err(_) => {
+                // UI gone or user never answered: report a cancel so the
+                // extension gets a definitive answer instead of hanging.
+                self.drop_pending(&id);
+                Ok(Some(ExtensionUiResponse {
+                    id,
+                    value: None,
+                    cancelled: true,
+                }))
+            }
+        }
+    }
+}
+
+/// Long-lived pump pairing UI extension replies back to their pending
+/// requests (same spawned-task rationale as the ask reply pump).
+fn spawn_ext_reply_pump(
+    handler: Arc<FtuiExtensionUiHandler>,
+    ext_reply_rx: Receiver<ExtensionUiResponse>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) {
+    runtime_handle.spawn(async move {
+        loop {
+            match ext_reply_rx.try_recv() {
+                Ok(response) => handler.resolve(response),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL).await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+    });
+}
+
 /// Shared slot for the CURRENT ask tool: `/resume` swaps the session handle
 /// (and with it the ask tool), so the long-lived reply pump resolves against
 /// whatever tool is current when the reply arrives.
@@ -1456,6 +1675,8 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
         api_key: options.api_key.clone(),
         working_directory: options.working_directory.clone(),
         session_dir: options.session_dir.clone(),
+        extension_paths: options.extension_paths.clone(),
+        extension_policy: options.extension_policy.clone(),
         no_session: false,
         ..Default::default()
     }
@@ -1495,6 +1716,7 @@ async fn resume_session_command(
     path: &str,
     template: &crate::sdk::SessionOptions,
     current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
     agent_tx: &Sender<PiMsg>,
     runtime_handle: &asupersync::runtime::RuntimeHandle,
 ) -> Option<crate::sdk::AgentSessionHandle> {
@@ -1505,6 +1727,11 @@ async fn resume_session_command(
         api_key: template.api_key.clone(),
         working_directory: template.working_directory.clone(),
         session_dir: template.session_dir.clone(),
+        extension_paths: template.extension_paths.clone(),
+        extension_policy: template.extension_policy.clone(),
+        extension_ui_handler: Some(
+            Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>
+        ),
         no_session: false,
         ..Default::default()
     };
@@ -1607,6 +1834,7 @@ pub fn run(
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
+    let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
     let bash_cwd = session_options
         .working_directory
         .clone()
@@ -1626,6 +1854,13 @@ pub fn run(
             };
             let runtime_handle = runtime.handle();
             runtime.block_on(async move {
+                // Extension UI surface (bd-1eoh4): installed on the session
+                // options BEFORE creation so extension init prompts work too.
+                let mut session_options = session_options;
+                let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+                session_options.extension_ui_handler =
+                    Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+                spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, &runtime_handle);
                 let mut handle = match crate::sdk::create_agent_session(session_options).await {
                     Ok(handle) => handle,
                     Err(err) => {
@@ -1674,6 +1909,7 @@ pub fn run(
                                 &path,
                                 &resume_template,
                                 &current_ask,
+                                &ext_handler,
                                 &agent_tx,
                                 &runtime_handle,
                             )
@@ -1697,7 +1933,8 @@ pub fn run(
         .with_ask_reply_channel(ask_reply_tx)
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
-        .with_available_sessions(available_sessions);
+        .with_available_sessions(available_sessions)
+        .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
     // remains the default.
@@ -2315,6 +2552,105 @@ mod tests {
         sim.model_mut().input.set_text("");
         sim.inject_event(key(KeyCode::Char('d'), Modifiers::CTRL));
         assert!(!sim.is_running(), "ctrl+d on empty editor did not exit");
+    }
+
+    fn ext_request(id: &str, method: &str, payload: serde_json::Value) -> ExtensionUiRequest {
+        ExtensionUiRequest {
+            id: id.to_string(),
+            method: method.to_string(),
+            payload,
+            timeout_ms: None,
+            extension_id: Some(String::from("demo-ext")),
+        }
+    }
+
+    #[test]
+    fn extension_confirm_prompt_renders_and_reply_routes() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-1",
+            "confirm",
+            serde_json::json!({"title": "Deploy?", "message": "Ship to prod?"}),
+        ))));
+        let rendered = buffer_text(sim.capture_frame(50, 12), 50, 12);
+        assert!(rendered.contains("Deploy?"), "prompt missing: {rendered:?}");
+        assert!(
+            rendered.contains("demo-ext"),
+            "provenance missing: {rendered:?}"
+        );
+        // Mid-turn input works for the reply; 'yes' confirms.
+        type_str(&mut sim, "yes");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let reply = ext_rx.try_recv().expect("reply routed");
+        assert_eq!(reply.id, "ext-1");
+        assert!(!reply.cancelled);
+        assert_eq!(reply.value, Some(serde_json::Value::Bool(true)));
+        assert!(sim.model().active_ext.is_none());
+    }
+
+    #[test]
+    fn extension_prompt_escape_cancels_and_queue_advances() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ext_tx, ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx).with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-a",
+            "confirm",
+            serde_json::json!({"title": "First?"}),
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-b",
+            "confirm",
+            serde_json::json!({"title": "Second?"}),
+        ))));
+        assert_eq!(sim.model().ext_queue.len(), 1, "second request not queued");
+        sim.inject_event(key(KeyCode::Escape, Modifiers::empty()));
+        let reply = ext_rx.try_recv().expect("cancel routed");
+        assert_eq!(reply.id, "ext-a");
+        assert!(reply.cancelled);
+        // Queue advanced: the second prompt is now active.
+        assert_eq!(
+            sim.model().active_ext.as_ref().map(|r| r.id.as_str()),
+            Some("ext-b")
+        );
+    }
+
+    #[test]
+    fn extension_prompt_queues_behind_active_ask() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (ask_tx, _ask_rx) = mpsc::channel::<AskUiReply>();
+        let (ext_tx, _ext_rx) = mpsc::channel::<ExtensionUiResponse>();
+        let model = PiFtuiModel::new(rx)
+            .with_ask_reply_channel(ask_tx)
+            .with_ext_reply_channel(ext_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::AskUiRequest(ask_request(
+            "ask-hold",
+            vec![question("Pick?", &["a", "b"], false)],
+        ))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ExtensionUiRequest(ext_request(
+            "ext-waiting",
+            "confirm",
+            serde_json::json!({"title": "Later?"}),
+        ))));
+        assert!(sim.model().active_ext.is_none(), "ext jumped the ask");
+        assert_eq!(sim.model().ext_queue.len(), 1);
+        // Answer the ask; the queued extension prompt activates.
+        type_str(&mut sim, "1");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            sim.model().active_ext.as_ref().map(|r| r.id.as_str()),
+            Some("ext-waiting")
+        );
     }
 
     #[test]

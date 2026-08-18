@@ -1741,17 +1741,16 @@ async fn run(
     {
         let entry = resolution.model_entry;
         let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
-        let credentialed = !pi::models::model_requires_configured_credential(&entry)
-            || key.is_some();
+        let credentialed =
+            !pi::models::model_requires_configured_credential(&entry) || key.is_some();
         if credentialed {
             let label = format!("{}/{}", entry.model.provider, entry.model.id);
             match pi::providers::create_provider(&entry, None) {
                 Ok(advisor_provider) => {
                     agent_session.advisor = Some(
-                        pi::advisor::AdvisorRuntime::new(advisor_provider, label)
-                            .with_timeout(std::time::Duration::from_secs(
-                                config.advisor_timeout_secs(),
-                            )),
+                        pi::advisor::AdvisorRuntime::new(advisor_provider, label).with_timeout(
+                            std::time::Duration::from_secs(config.advisor_timeout_secs()),
+                        ),
                     );
                 }
                 Err(err) => {
@@ -2073,6 +2072,15 @@ async fn run(
                 no_session: cli.no_session,
                 session_path: cli.session.as_ref().map(PathBuf::from),
                 session_dir: cli.session_dir.as_ref().map(PathBuf::from),
+                // Explicit -e extension files load with UI prompts bridged
+                // (bd-1eoh4). Workspace/package-discovered extensions are a
+                // ResourceLoader integration follow-up.
+                extension_paths: if cli.no_extensions {
+                    Vec::new()
+                } else {
+                    cli.extension.iter().map(PathBuf::from).collect()
+                },
+                extension_policy: cli.extension_policy.clone(),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);

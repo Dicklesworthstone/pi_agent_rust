@@ -1,7 +1,7 @@
-//! FrankenTUI preview stack E2E via tmux (bd-cv653.9.1, acceptance lane T8).
+//! `FrankenTUI` preview stack E2E via `tmux` (bd-cv653.9.1, acceptance lane T8).
 //!
 //! Launches `pi --ftui` in a real PTY (tmux pane), drives the ported surfaces
-//! (banner, /help, display-only `!` bash, quit), and proves the session tears
+//! (banner, `/help`, display-only `!` bash, quit), and proves the session tears
 //! down cleanly. The inline-mode smoke covers the scrollback-preserving
 //! runtime path end to end.
 //!
