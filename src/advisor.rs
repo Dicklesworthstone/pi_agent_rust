@@ -294,6 +294,10 @@ pub fn format_injection(verdict: &AdvisorVerdict) -> String {
     format!("[{tag}] {}", verdict.rationale)
 }
 
+/// Process-global advisor pause flag (bd-cv653.3.3): pi runs one session per
+/// process, so /advisor pause|resume flips this single flag.
+pub static ADVISOR_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The advisor runtime: owns the second provider, the guard, and failure
 /// isolation state.
 pub struct AdvisorRuntime {
@@ -351,7 +355,7 @@ impl AdvisorRuntime {
 
     /// Review one turn. Never fails the caller.
     pub async fn review_turn(&mut self, digest: &TurnDigest, turn_index: u64) -> AdvisorOutcome {
-        if self.is_disabled() {
+        if self.is_disabled() || ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
             return AdvisorOutcome::Quiet;
         }
         if digest.is_trivial() {
@@ -518,13 +522,13 @@ mod tests {
                 timestamp: 0,
             })),
             Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
-                tool_use_id: "2".to_string(),
+                tool_call_id: "2".to_string(),
                 tool_name: "bash".to_string(),
                 content: vec![crate::model::ContentBlock::Text(crate::model::TextContent::new(
                     "permission denied",
                 ))],
                 is_error: true,
-                tool_call: None,
+                details: None,
                 timestamp: 0,
             })),
         ];
@@ -559,13 +563,13 @@ mod tests {
 
     #[test]
     fn timeout_returns_none_on_slow_future() {
-        let outcome = asupersync::test_utils::run_test(|| async {
-            with_timeout(Duration::from_millis(30), async {
+        asupersync::test_utils::run_test(|| async {
+            let outcome = with_timeout(Duration::from_millis(30), async {
                 asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_secs(60)).await;
                 42
             })
-            .await
+            .await;
+            assert!(outcome.is_none(), "slow advisor call must time out");
         });
-        assert!(outcome.is_none(), "slow advisor call must time out");
     }
 }

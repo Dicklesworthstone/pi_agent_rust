@@ -19368,6 +19368,7 @@ pub fn extension_event_from_agent(
         | AgentEvent::AutoRetryEnd { .. }
         | AgentEvent::FailoverStart { .. }
         | AgentEvent::FailoverEnd { .. }
+        | AgentEvent::AdvisorNote { .. }
         | AgentEvent::ExtensionError { .. } => return None,
     };
 
@@ -19396,6 +19397,7 @@ pub const fn extension_event_name_from_agent(event: &AgentEvent) -> Option<Exten
         | AgentEvent::AutoRetryEnd { .. }
         | AgentEvent::FailoverStart { .. }
         | AgentEvent::FailoverEnd { .. }
+        | AgentEvent::AdvisorNote { .. }
         | AgentEvent::ExtensionError { .. } => None,
     }
 }

@@ -1090,6 +1090,11 @@ pub enum AgentEvent {
         #[serde(rename = "restoredPrimary")]
         restored_primary: bool,
     },
+    /// Advisor verdict delivered into the session (bd-cv653.3.3).
+    AdvisorNote {
+        level: String,
+        rationale: String,
+    },
     /// Extension error during event dispatch or execution.
     ExtensionError {
         #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
@@ -1799,6 +1804,19 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
+                    // Advisor notes get a dedicated event on delivery
+                    // (bd-cv653.3.3) so RPC/ACP surfaces can render them.
+                    if let Message::User(user) = &message
+                        && let crate::model::UserContent::Text(text) = &user.content
+                        && let Some(rest) = text.strip_prefix("[ADVISOR:")
+                    {
+                        let level = rest.split(']').next().unwrap_or("NOTE").to_string();
+                        let rationale = rest
+                            .split_once(']')
+                            .map(|(_, tail)| tail.trim().to_string())
+                            .unwrap_or_default();
+                        on_event(AgentEvent::AdvisorNote { level, rationale });
+                    }
                     self.messages.push(message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: message.clone(),
@@ -7572,6 +7590,7 @@ mod abort_tests {
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
             AgentEvent::FailoverStart { .. } => "failover_start",
             AgentEvent::FailoverEnd { .. } => "failover_end",
+            AgentEvent::AdvisorNote { .. } => "advisor_note",
             AgentEvent::ExtensionError { .. } => "extension_error",
         }
     }
@@ -10243,6 +10262,18 @@ impl AgentSession {
             return;
         };
         let outcome = runtime.review_turn(&digest, turn_index).await;
+        if std::env::var_os("PI_DEBUG_ADVISOR").is_some() {
+            eprintln!(
+                "[advisor] digest tools={} trivial={} outcome={}",
+                digest.tool_call_count,
+                digest.is_trivial(),
+                match &outcome {
+                    crate::advisor::AdvisorOutcome::Inject(v) => format!("inject:{}", v.level.as_str()),
+                    crate::advisor::AdvisorOutcome::Quiet => "quiet".to_string(),
+                    crate::advisor::AdvisorOutcome::Failed => "failed".to_string(),
+                }
+            );
+        }
         let verdict = match outcome {
             crate::advisor::AdvisorOutcome::Inject(verdict) => verdict,
             crate::advisor::AdvisorOutcome::Quiet => return,
@@ -14571,6 +14602,200 @@ mod tests {
                     .and_then(Value::as_str),
                 Some("read")
             );
+        });
+    }
+
+    // === Advisor turn review (bd-cv653.3.3) ===
+
+    /// Doer: issues one structured read call, then finishes with text.
+    struct ScriptedDoerProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ScriptedDoerProvider {
+        fn name(&self) -> &str {
+            "doer"
+        }
+        fn api(&self) -> &str {
+            "test-api"
+        }
+        fn model_id(&self) -> &str {
+            "doer-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let make = |content: Vec<ContentBlock>| AssistantMessage {
+                content,
+                api: "test-api".to_string(),
+                provider: "doer".to_string(),
+                model: "doer-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            };
+            let events: Vec<Result<StreamEvent>> = if call_number == 0 {
+                vec![Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: make(vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: json!({"path": "fixture.txt"}),
+                        thought_signature: None,
+                    })]),
+                })]
+            } else {
+                vec![Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: make(vec![ContentBlock::Text(TextContent::new("all fixed"))]),
+                })]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// Advisor: returns a CONCERN verdict.
+    struct ScriptedAdvisorProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ScriptedAdvisorProvider {
+        fn name(&self) -> &str {
+            "advisor"
+        }
+        fn api(&self) -> &str {
+            "test-api"
+        }
+        fn model_id(&self) -> &str {
+            "advisor-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
+            let events: Vec<Result<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "CONCERN: the read covers the whole tree".to_string(),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text(TextContent::new(
+                            "CONCERN: the read covers the whole tree",
+                        ))],
+                        api: "test-api".to_string(),
+                        provider: "advisor".to_string(),
+                        model: "advisor-model".to_string(),
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        stop_details: None,
+                        error_message: None,
+                        timestamp: chrono::Utc::now().timestamp_millis(),
+                    },
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn advisor_review_injects_concern_into_steering_queue() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("fixture.txt"), "x").expect("fixture");
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let agent = Agent::new(
+                Arc::new(ScriptedDoerProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                tools,
+                AgentConfig::default(),
+            );
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+            agent_session.advisor = Some(crate::advisor::AdvisorRuntime::new(
+                Arc::new(ScriptedAdvisorProvider),
+                "advisor/advisor-model".to_string(),
+            ));
+
+            let _ = agent_session
+                .run_text_with_abort("check the fixture".to_string(), None, |_| {})
+                .await
+                .expect("turn 1 completes");
+
+            // Turn 2 delivers the queued advisor note into the session
+            // context (the next-turn injection is the acceptance behavior).
+            let _ = agent_session
+                .run_text_with_abort("continue".to_string(), None, |_| {})
+                .await
+                .expect("turn 2 completes");
+
+            let steered = agent_session
+                .agent
+                .messages()
+                .iter()
+                .filter_map(|m| match m {
+                    crate::model::Message::User(u) => match &u.content {
+                        crate::model::UserContent::Text(t) => Some(t.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .any(|text| text.contains("ADVISOR:CONCERN"));
+            assert!(steered, "advisor concern must be delivered into the next turn");
+            let has_entry = {
+                let cx = asupersync::Cx::for_request();
+                let inner = agent_session.session.lock(&cx).await.expect("session lock");
+                inner
+                    .entries_for_current_path()
+                    .iter()
+                    .any(|e| matches!(
+                        e,
+                        crate::session::SessionEntry::Custom(c) if c.custom_type == "advisor_note"
+                    ))
+            };
+            assert!(has_entry, "advisor_note session entry recorded");
+        });
+    }
+
+    #[test]
+    fn advisor_absent_means_zero_overhead() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let agent = Agent::new(
+                Arc::new(ScriptedDoerProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                tools,
+                AgentConfig::default(),
+            );
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+            assert!(agent_session.advisor.is_none());
+            let result = agent_session
+                .run_text_with_abort("work".to_string(), None, |_| {})
+                .await;
+            assert!(result.is_ok(), "no advisor → turn unaffected");
         });
     }
 }

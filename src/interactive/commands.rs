@@ -41,6 +41,7 @@ pub enum SlashCommand {
     Share,
     Mcp,
     Plan,
+    Advisor,
 }
 
 impl SlashCommand {
@@ -81,6 +82,7 @@ impl SlashCommand {
             "/share" => Self::Share,
             "/mcp" => Self::Mcp,
             "/plan" => Self::Plan,
+            "/advisor" => Self::Advisor,
             _ => return None,
         };
 
@@ -116,6 +118,7 @@ impl SlashCommand {
   /share             - Upload session HTML to a secret GitHub gist and show URL
   /mcp               - Show MCP server status (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /advisor [status|pause|resume] - Manage the turn-review advisor model
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2275,6 +2278,7 @@ impl PiApp {
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Mcp => self.handle_slash_mcp(args),
             SlashCommand::Plan => self.handle_slash_plan(args),
+            SlashCommand::Advisor => self.handle_slash_advisor(args),
         }
     }
 
@@ -2918,6 +2922,43 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.status_message = Some("No submitted plan to approve".to_string());
             }
         }
+    }
+
+    /// `/advisor` (bd-cv653.3.3): status + pause/resume for the turn-review
+    /// second model.
+    fn handle_slash_advisor(&mut self, args: &str) -> Option<Cmd> {
+        let sub = args.trim().to_ascii_lowercase();
+        let configured = self
+            .config
+            .model_roles
+            .as_ref()
+            .and_then(|roles| crate::app::role_spec_from_settings(roles, ModelRole::Advisor))
+            .map(str::to_string);
+        match sub.as_str() {
+            "" | "status" => {
+                let paused = crate::advisor::ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst);
+                let state = match (&configured, paused) {
+                    (Some(spec), false) => format!("active on {spec}"),
+                    (Some(spec), true) => format!("configured ({spec}) but paused"),
+                    (None, _) => "not configured (set modelRoles.advisor or --advisor)".to_string(),
+                };
+                self.status_message = Some(format!("Advisor: {state}"));
+            }
+            "pause" => {
+                crate::advisor::ADVISOR_PAUSED.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.status_message = Some("Advisor paused".to_string());
+            }
+            "resume" => {
+                crate::advisor::ADVISOR_PAUSED.store(false, std::sync::atomic::Ordering::SeqCst);
+                self.status_message = Some("Advisor resumed".to_string());
+            }
+            other => {
+                self.status_message = Some(format!(
+                    "Unknown /advisor subcommand {other:?}: use /advisor [status|pause|resume]"
+                ));
+            }
+        }
+        None
     }
 
     pub(super) fn handle_slash_thinking(&mut self, args: &str) -> Option<Cmd> {

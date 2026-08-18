@@ -291,10 +291,10 @@ pub enum UiCommand {
     Prompt(String),
     /// Switch the session's active model (`/model provider/model`).
     SetModel { provider: String, model: String },
-    /// Run a shell command (`!cmd`). Display-only in the preview: output is
-    /// not injected into the agent context yet (the bubbletea stack's `!`
-    /// context-inclusion arrives with session-append support).
-    Bash { command: String },
+    /// Run a shell command. `!cmd` (exclude=false) shows the output AND
+    /// submits it to the agent as a turn — the bubbletea semantics; `!!cmd`
+    /// (exclude=true) is display-only.
+    Bash { command: String, exclude: bool },
     /// Resume a saved session (`/resume` picker): the driver swaps its
     /// session handle and replays the conversation into the transcript.
     ResumeSession { path: String },
@@ -744,19 +744,19 @@ impl PiFtuiModel {
         self.scroll_from_tail = 0;
         self.push_entry(EntryRole::User, clean.clone());
 
-        // Bash routing comes before slash commands, matching submit_message.
-        // `!` and `!!` both run display-only here (context inclusion is a
-        // launch-path follow-up), so the prefixes collapse.
+        // Bash routing comes before slash commands, matching submit_message:
+        // `!cmd` shows output and submits it to the agent, `!!cmd` shows only.
         let bang = clean
             .strip_prefix("!!")
-            .or_else(|| clean.strip_prefix('!'))
-            .map(str::trim);
-        if let Some(command) = bang {
+            .map(|rest| (rest.trim(), true))
+            .or_else(|| clean.strip_prefix('!').map(|rest| (rest.trim(), false)));
+        if let Some((command, exclude)) = bang {
             if command.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("usage: !<command>"));
             } else {
                 self.send_command(UiCommand::Bash {
                     command: command.to_string(),
+                    exclude,
                 });
             }
             return;
@@ -845,9 +845,10 @@ impl PiFtuiModel {
             self.push_entry(
                 EntryRole::System,
                 String::from(
-                    "ftui preview commands: /model [provider/model], /theme, /exit, \
-                     /help, !<command> (display-only) — everything else is still on \
-                     the charmed stack",
+                    "ftui preview commands: /model [provider/model], /resume, /theme, \
+                     /exit, /help, !<cmd> (runs + sends output to the agent), \
+                     !!<cmd> (display-only) — everything else is still on the \
+                     charmed stack",
                 ),
             );
             return true;
@@ -1482,33 +1483,51 @@ async fn send_conversation_reset(
 }
 
 /// Run a `!command` for the driver loop: tool-status blips around the shared
-/// bash runner, result rendered via the session display formatter.
-async fn run_bash_ui_command(cwd: &std::path::Path, command: &str, agent_tx: &Sender<PiMsg>) {
+/// bash runner, result rendered via the session display formatter. Returns
+/// the display text on success so the caller can submit it as a turn
+/// (`!` context-inclusion); `!!` gets the exclusion note appended.
+async fn run_bash_ui_command(
+    cwd: &std::path::Path,
+    command: &str,
+    exclude: bool,
+    agent_tx: &Sender<PiMsg>,
+) -> Option<String> {
     let _ = agent_tx.send(PiMsg::ToolStart {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
     });
     let result = crate::tools::run_bash_command(cwd, None, None, command, None, None).await;
-    let msg = match result {
-        Ok(result) => PiMsg::BashResult {
-            display: crate::session::bash_execution_to_text(
+    let output = match result {
+        Ok(result) => {
+            let display = crate::session::bash_execution_to_text(
                 command,
                 &result.output,
                 result.exit_code,
                 result.cancelled,
                 result.truncated,
                 result.full_output_path.as_deref(),
-            ),
-            content_for_agent: None,
-        },
-        Err(err) => PiMsg::AgentError(format!("bash: {err}")),
+            );
+            let mut shown = display.clone();
+            if exclude {
+                shown.push_str("\n\n[Output excluded from model context]");
+            }
+            let _ = agent_tx.send(PiMsg::BashResult {
+                display: shown,
+                content_for_agent: None,
+            });
+            Some(display)
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("bash: {err}")));
+            None
+        }
     };
-    let _ = agent_tx.send(msg);
     let _ = agent_tx.send(PiMsg::ToolEnd {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
         is_error: false,
     });
+    output
 }
 
 pub fn run(
@@ -1580,8 +1599,17 @@ pub fn run(
                             };
                             let _ = agent_tx.send(msg);
                         }
-                        Ok(UiCommand::Bash { command }) => {
-                            run_bash_ui_command(&bash_cwd, &command, &agent_tx).await;
+                        Ok(UiCommand::Bash { command, exclude }) => {
+                            let output =
+                                run_bash_ui_command(&bash_cwd, &command, exclude, &agent_tx)
+                                    .await;
+                            // `!` semantics: the output becomes the next turn's
+                            // user content (bubbletea's submit_content path).
+                            if let Some(output) = output
+                                && !exclude
+                            {
+                                run_prompt_turn(&mut handle, output, &agent_tx).await;
+                            }
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
                             if let Some(new_handle) = resume_session_command(
@@ -2546,16 +2574,18 @@ mod tests {
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
             UiCommand::Bash {
-                command: "echo hi".into()
+                command: "echo hi".into(),
+                exclude: false,
             }
         );
-        // `!!` collapses to the same display-only path.
+        // `!!` runs display-only (excluded from model context).
         type_str(&mut sim, "!!ls");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
             UiCommand::Bash {
-                command: "ls".into()
+                command: "ls".into(),
+                exclude: true,
             }
         );
         // Bare `!` errors locally.

@@ -66,6 +66,8 @@ pub struct Config {
     pub plan: Option<PlanSettings>,
     /// Read-tool settings (bd-cv653.2.2 URL reads).
     pub read: Option<ReadSettings>,
+    /// Advisor settings (bd-cv653.3.3).
+    pub advisor: Option<AdvisorSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -433,6 +435,17 @@ pub struct PlanSettings {
     pub auto_approve: Option<bool>,
 }
 
+/// Advisor configuration (bd-cv653.3.5 -> .3.3).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdvisorSettings {
+    /// Master switch when the advisor role is configured (default: true).
+    pub enabled: Option<bool>,
+    /// Hard timeout per advisor call in seconds (default 15).
+    #[serde(alias = "timeoutSecs")]
+    pub timeout_secs: Option<u64>,
+}
+
 /// Read-tool configuration (bd-cv653.2.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -714,6 +727,7 @@ impl Config {
             tools: merge_tools(base.tools, other.tools),
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
+            advisor: merge_advisor(base.advisor, other.advisor),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -835,6 +849,23 @@ impl Config {
             .as_ref()
             .and_then(|p| p.auto_approve)
             .unwrap_or(false)
+    }
+
+    /// Whether the advisor is enabled when its role resolves (bd-cv653.3.3).
+    /// Default: true.
+    pub fn advisor_enabled(&self) -> bool {
+        self.advisor
+            .as_ref()
+            .and_then(|a| a.enabled)
+            .unwrap_or(true)
+    }
+
+    /// Advisor per-call timeout in seconds (bd-cv653.3.3). Default: 15.
+    pub fn advisor_timeout_secs(&self) -> u64 {
+        self.advisor
+            .as_ref()
+            .and_then(|a| a.timeout_secs)
+            .unwrap_or(15)
     }
 
     pub fn steering_queue_mode(&self) -> QueueMode {
@@ -1440,6 +1471,22 @@ fn merge_titling(
     match (base, other) {
         (Some(base), Some(other)) => Some(TitlingSettings {
             auto_title: other.auto_title.or(base.auto_title),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge advisor settings (other wins).
+fn merge_advisor(
+    base: Option<AdvisorSettings>,
+    other: Option<AdvisorSettings>,
+) -> Option<AdvisorSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(AdvisorSettings {
+            enabled: other.enabled.or(base.enabled),
+            timeout_secs: other.timeout_secs.or(base.timeout_secs),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

@@ -326,6 +326,10 @@ pub struct Cli {
     #[arg(long, value_name = "PROVIDER/MODEL")]
     pub plan: Option<String>,
 
+    /// Model spec for the `advisor` role (turn-review second model).
+    #[arg(long, value_name = "PROVIDER/MODEL")]
+    pub advisor: Option<String>,
+
     /// Start in plan mode: read-only planning until a plan is approved
     /// (bd-cv653.3.5).
     #[arg(long)]

@@ -37,9 +37,17 @@ fn main() -> std::io::Result<()> {
                     )));
                     continue;
                 }
-                UiCommand::Bash { command } => {
-                    let _ =
-                        agent_tx.send(PiMsg::System(format!("(fake agent) would run: {command}")));
+                UiCommand::Bash { command, exclude } => {
+                    let note = if exclude { " (display-only)" } else { "" };
+                    let _ = agent_tx.send(PiMsg::System(format!(
+                        "(fake agent) would run{note}: {command}"
+                    )));
+                    continue;
+                }
+                UiCommand::ResumeSession { path } => {
+                    let _ = agent_tx.send(PiMsg::System(format!(
+                        "(fake agent) would resume: {path}"
+                    )));
                     continue;
                 }
             };

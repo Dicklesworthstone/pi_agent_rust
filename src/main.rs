@@ -1728,6 +1728,47 @@ async fn run(
             }
         }
     }
+    // The advisor (bd-cv653.3.3): build the runtime only when the advisor
+    // role resolves a model AND its credentials exist — otherwise the session
+    // carries None and the hook never runs (zero-overhead rule).
+    if let Some(resolution) = pi::app::resolve_role_model(
+        pi::models::ModelRole::Advisor,
+        &cli,
+        &config,
+        &model_registry,
+    )
+    .filter(|_| config.advisor_enabled())
+    {
+        let entry = resolution.model_entry;
+        let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
+        let credentialed = !pi::models::model_requires_configured_credential(&entry)
+            || key.is_some();
+        if credentialed {
+            let label = format!("{}/{}", entry.model.provider, entry.model.id);
+            match pi::providers::create_provider(&entry, None) {
+                Ok(advisor_provider) => {
+                    agent_session.advisor = Some(
+                        pi::advisor::AdvisorRuntime::new(advisor_provider, label)
+                            .with_timeout(std::time::Duration::from_secs(
+                                config.advisor_timeout_secs(),
+                            )),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        event = "pi.advisor.provider_failed",
+                        error = %err,
+                        "advisor provider construction failed; advisor disabled"
+                    );
+                }
+            }
+        } else {
+            tracing::info!(
+                event = "pi.advisor.no_credentials",
+                "advisor role configured but credentials missing; advisor disabled"
+            );
+        }
+    }
     // The ask tool's picker handler is installed by the interactive host
     // below; non-interactive sessions resolve via ask_policy (bd-cv653.3.8).
     let ask_tool = enabled_tools.contains(&"ask").then(|| {
