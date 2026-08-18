@@ -892,3 +892,66 @@ fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
     );
     session.tmux.kill_server();
 }
+
+// ── Wheel passthrough inside tmux (bd-bi0qc) ────────────────────────────────
+
+/// bd-bi0qc: mouse wheel works when pi runs INSIDE tmux — SGR wheel-up
+/// sequences injected into the pane (what tmux passthrough delivers) must
+/// scroll the conversation (the footer pins the scroll indicator).
+#[test]
+fn e2e_ftui_wheel_scroll_inside_tmux() {
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_wheel_scroll_inside_tmux") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&ftui_args());
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+
+    // Fill the transcript well past one screen.
+    session.send_text_and_wait("fill", "!!seq 1 120", "120", COMMAND_TIMEOUT);
+
+    // Inject SGR mouse wheel-up (button 64) at col 10, row 5 — the byte
+    // sequence a wheel event delivers under SGR 1006 mouse reporting:
+    // ESC [ < 6 4 ; 1 0 ; 5 M
+    for _ in 0..5 {
+        let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
+        let status = cmd
+            .args([
+                "-L",
+                &session.tmux.socket_name,
+                "send-keys",
+                "-t",
+                &session.tmux.session_name,
+                "-H",
+                "1b",
+                "5b",
+                "3c",
+                "36",
+                "34",
+                "3b",
+                "31",
+                "30",
+                "3b",
+                "35",
+                "4d",
+            ])
+            .status()
+            .expect("tmux send-keys -H"); // ubs:ignore test assertion expect
+        assert!(status.success(), "wheel injection failed");
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("lines up] End to follow", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains("lines up] End to follow"),
+        "wheel-up did not scroll the conversation; pane:\n{pane}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
