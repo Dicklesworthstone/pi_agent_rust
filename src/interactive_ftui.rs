@@ -304,6 +304,9 @@ pub enum UiCommand {
     /// Compact the conversation (`/compact`): the driver runs compaction and
     /// replays the rewritten history into the transcript.
     Compact,
+    /// Dispatch a non-built-in slash command to the extension runtime; the
+    /// driver checks registration and reports unknown commands.
+    ExtensionCommand { name: String, args: String },
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -877,11 +880,18 @@ impl PiFtuiModel {
             return true;
         }
         if !clean.starts_with("/skill:") {
-            let command = clean.split_whitespace().next().unwrap_or(clean);
-            self.push_entry(
-                EntryRole::Error,
-                format!("Unknown command in ftui preview: {command} (try /help)"),
-            );
+            // Anything else may be an extension-registered command; the
+            // driver checks registration and reports unknown ones.
+            let body = clean.trim_start_matches('/');
+            let (name, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+            if name.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("Unknown command: /"));
+            } else {
+                self.send_command(UiCommand::ExtensionCommand {
+                    name: name.to_string(),
+                    args: args.trim().to_string(),
+                });
+            }
             return true;
         }
         // /skill: inputs flow through to the agent as prompts.
@@ -1691,6 +1701,70 @@ fn resume_template_from(options: &crate::sdk::SessionOptions) -> crate::sdk::Ses
     }
 }
 
+/// Match the bubbletea stack's interactive extension-command budget.
+const EXT_COMMAND_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Dispatch a slash command to the extension runtime (bd-1eoh4): unknown or
+/// unavailable commands report the same way the bubbletea stack does.
+async fn run_extension_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    cwd: &std::path::Path,
+    name: &str,
+    args: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let manager = handle
+        .session()
+        .extensions
+        .as_ref()
+        .map(|region| region.manager().clone());
+    let Some(manager) = manager else {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Unknown command: /{name} (extensions disabled; try /help)"
+        )));
+        return;
+    };
+    if !manager.has_command(name) {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Unknown command: /{name} (try /help)"
+        )));
+        return;
+    }
+    let Some(runtime) = manager.runtime() else {
+        let _ = agent_tx.send(PiMsg::System(format!(
+            "Extension command '/{name}' is not available (runtime not enabled)"
+        )));
+        return;
+    };
+    let _ = agent_tx.send(PiMsg::ToolStart {
+        name: format!("/{name}"),
+        tool_id: String::from("ftui-ext-command"),
+    });
+    let ctx_payload = serde_json::json!({
+        "cwd": cwd.display().to_string(),
+        "hasUI": true,
+    });
+    let result = runtime
+        .execute_command(
+            name.to_string(),
+            args.to_string(),
+            Arc::new(ctx_payload),
+            EXT_COMMAND_TIMEOUT_MS,
+        )
+        .await;
+    let msg = match result {
+        Ok(value) if value.is_null() => PiMsg::SystemNote(format!("/{name} done")),
+        Ok(value) => PiMsg::SystemNote(format!("/{name} → {value}")),
+        Err(err) => PiMsg::AgentError(format!("/{name}: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+    let _ = agent_tx.send(PiMsg::ToolEnd {
+        name: format!("/{name}"),
+        tool_id: String::from("ftui-ext-command"),
+        is_error: false,
+    });
+}
+
 /// Handle a model switch in the driver, reporting the outcome to the UI.
 async fn run_set_model_command(
     handle: &mut crate::sdk::AgentSessionHandle,
@@ -1922,6 +1996,10 @@ pub fn run(
                         }
                         Ok(UiCommand::Compact) => {
                             run_compact_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::ExtensionCommand { name, args }) => {
+                            run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
+                                .await;
                         }
                         Ok(UiCommand::ResumeSession { path }) => {
                             if let Some(new_handle) = resume_session_command(
@@ -2187,26 +2265,24 @@ mod tests {
     }
 
     #[test]
-    fn unknown_slash_command_errors_locally() {
+    fn non_builtin_slash_commands_route_to_extension_dispatch() {
         let (_agent_tx, rx) = mpsc::channel();
         let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
         let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
         let mut sim = ProgramSimulator::new(model);
         sim.init();
-        type_str(&mut sim, "/tree");
+        // Non-built-in commands go to the driver, which checks extension
+        // registration and reports unknown ones (submit_message parity).
+        type_str(&mut sim, "/tree deep --all");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            submit_rx.try_recv().is_err(),
-            "unknown command reached driver"
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::ExtensionCommand {
+                name: "tree".into(),
+                args: "deep --all".into(),
+            }
         );
-        assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .any(|e| e.role == EntryRole::Error && e.text.contains("/tree")),
-            "unknown-command error missing"
-        );
-        // /help stays local too.
+        // /help stays local.
         type_str(&mut sim, "/help");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert!(submit_rx.try_recv().is_err());
