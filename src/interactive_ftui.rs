@@ -1326,6 +1326,23 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         } => vec![PiMsg::SystemNote(format!(
             "retry {attempt}/{max_attempts}: {error_message}"
         ))],
+        E::AutoCompactionStart { reason } => {
+            vec![PiMsg::SystemNote(format!("compacting context: {reason}"))]
+        }
+        E::AutoCompactionEnd {
+            aborted,
+            error_message,
+            ..
+        } => {
+            let note = if *aborted {
+                String::from("compaction aborted")
+            } else if let Some(err) = error_message {
+                format!("compaction failed: {err}")
+            } else {
+                String::from("compaction complete")
+            };
+            vec![PiMsg::SystemNote(note)]
+        }
         E::ExtensionError { event, error, .. } => {
             vec![PiMsg::System(format!("extension error ({event}): {error}"))]
         }
