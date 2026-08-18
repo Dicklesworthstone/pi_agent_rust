@@ -658,10 +658,9 @@ fn e2e_ftui_vcr_streamed_turn() {
     let system_prompt = ftui_vcr_system_prompt(session.harness.temp_dir(), &env_root);
     let cassette_dir = session.harness.temp_dir().join("cassettes");
     let cassette_path = write_ftui_vcr_cassette(&cassette_dir, &system_prompt);
-    session.harness.record_artifact(
-        "ftui-vcr-cassette.json",
-        &cassette_path,
-    );
+    session
+        .harness
+        .record_artifact("ftui-vcr-cassette.json", &cassette_path);
 
     // Launch via a wrapper that redirects stderr to a file: tracing output
     // otherwise interleaves with the pane, and on failure the log is the
@@ -692,7 +691,11 @@ fn e2e_ftui_vcr_streamed_turn() {
         // debug bodies are exactly what we need after a failure.
         script.push_str("export VCR_DEBUG_BODY_FILE=/private/tmp/pi-tests/ftui-vcr-bodies.txt\n");
         let binary = std::env::var_os("CARGO_BIN_EXE_pi").expect("CARGO_BIN_EXE_pi"); // ubs:ignore test setup expect
-        let _ = write!(script, "exec {}", std::path::PathBuf::from(binary).display());
+        let _ = write!(
+            script,
+            "exec {}",
+            std::path::PathBuf::from(binary).display()
+        );
         for arg in ftui_vcr_args() {
             let _ = write!(script, " '{arg}'");
         }
