@@ -502,3 +502,232 @@ fn e2e_ftui_inline_smoke() {
     quit_and_assert_clean(&session);
     session.write_artifacts();
 }
+
+// ── VCR streamed-turn lane (bd-pb4fw) ───────────────────────────────────────
+
+const FTUI_VCR_TEST_NAME: &str = "e2e_ftui_vcr_streamed_turn";
+const FTUI_VCR_MODEL: &str = "claude-sonnet-4-20250514";
+const FTUI_VCR_MAX_TOKENS: u32 = 64_000;
+const FTUI_VCR_PROMPT: &str = "ftui vcr prompt: say the marker";
+const FTUI_VCR_RESPONSE: &str = "ftui-vcr-response-marker alpha beta gamma";
+const FTUI_VCR_SYSTEM_PROMPT_ARG: &str = "pi e2e ftui vcr harness";
+
+fn ftui_vcr_args() -> Vec<&'static str> {
+    vec![
+        "--ftui",
+        "--no-session",
+        "--provider",
+        "anthropic",
+        "--model",
+        FTUI_VCR_MODEL,
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        FTUI_VCR_SYSTEM_PROMPT_ARG,
+    ]
+}
+
+/// Effective system prompt for the ftui VCR args, computed with the same
+/// builder the session uses (mirrors build_vcr_system_prompt_for_args in
+/// tests/e2e_tui.rs).
+fn ftui_vcr_system_prompt(workdir: &std::path::Path, env_root: &std::path::Path) -> String {
+    use clap::Parser as _;
+    let mut args: Vec<&str> = vec!["pi"];
+    args.extend(ftui_vcr_args());
+    let cli = pi::cli::Cli::try_parse_from(args).expect("parse ftui vcr args"); // ubs:ignore test setup expect
+    let enabled_tools = cli.enabled_tools();
+    let global_dir = env_root.join("agent");
+    let package_dir = env_root.join("packages");
+    pi::app::build_system_prompt(
+        &cli,
+        workdir,
+        &enabled_tools,
+        None,
+        &global_dir,
+        &package_dir,
+        true,
+        true,
+        None,
+        &pi::config::Config::default(),
+    )
+    .expect("build ftui vcr system prompt") // ubs:ignore test setup expect
+}
+
+fn write_ftui_vcr_cassette(dir: &std::path::Path, system_prompt: &str) -> std::path::PathBuf {
+    use pi::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse};
+    use serde_json::json;
+
+    let cassette_path = dir.join(format!("{FTUI_VCR_TEST_NAME}.json"));
+    // The SDK path enables prompt caching: text blocks carry
+    // cache_control and `system` is an array of blocks, not a string.
+    let request = json!({
+        "model": FTUI_VCR_MODEL,
+        "messages": [
+            { "role": "user", "content": [ {
+                "type": "text",
+                "text": FTUI_VCR_PROMPT,
+                "cache_control": { "type": "ephemeral" }
+            } ] }
+        ],
+        "system": [ {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": { "type": "ephemeral" }
+        } ],
+        "max_tokens": FTUI_VCR_MAX_TOKENS,
+        "stream": true,
+    });
+    let sse_chunk = |event: &str, data: serde_json::Value| -> String {
+        let payload = serde_json::to_string(&data).expect("serialize sse payload"); // ubs:ignore test setup expect
+        format!("event: {event}\ndata: {payload}\n\n")
+    };
+    // The response streams word by word so the lane exercises progressive
+    // markdown rendering, not just a single-delta append.
+    let mut body_chunks = vec![
+        sse_chunk(
+            "message_start",
+            json!({"type": "message_start", "message": {"usage": {"input_tokens": 12}}}),
+        ),
+        sse_chunk(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text"}}),
+        ),
+    ];
+    for word in FTUI_VCR_RESPONSE.split_inclusive(' ') {
+        body_chunks.push(sse_chunk(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": word}}),
+        ));
+    }
+    body_chunks.push(sse_chunk(
+        "content_block_stop",
+        json!({"type": "content_block_stop", "index": 0}),
+    ));
+    body_chunks.push(sse_chunk(
+        "message_delta",
+        json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 9}}),
+    ));
+    body_chunks.push(sse_chunk("message_stop", json!({"type": "message_stop"})));
+
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: FTUI_VCR_TEST_NAME.to_string(),
+        recorded_at: "1970-01-01T00:00:00Z".to_string(),
+        interactions: vec![Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Accept".to_string(), "text/event-stream".to_string()),
+                ],
+                body: Some(request),
+                body_text: None,
+            },
+            response: RecordedResponse {
+                status: 200,
+                headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+                body_chunks,
+                body_chunks_base64: None,
+            },
+        }],
+    };
+    std::fs::create_dir_all(dir).expect("create cassette dir"); // ubs:ignore test setup expect
+    let json = serde_json::to_string_pretty(&cassette).expect("serialize cassette"); // ubs:ignore test setup expect
+    std::fs::write(&cassette_path, json).expect("write cassette"); // ubs:ignore test setup expect
+    cassette_path
+}
+
+/// bd-pb4fw: a REAL streamed provider turn through the preview stack — the
+/// VCR cassette plays an SSE stream back word by word, and the pane must show
+/// the full assistant reply (progressive streaming render + finalization).
+#[test]
+fn e2e_ftui_vcr_streamed_turn() {
+    let Some((_lock, mut session)) = new_locked_session(FTUI_VCR_TEST_NAME) else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let env_root = session.harness.temp_dir().join("env");
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let system_prompt = ftui_vcr_system_prompt(session.harness.temp_dir(), &env_root);
+    let cassette_dir = session.harness.temp_dir().join("cassettes");
+    let cassette_path = write_ftui_vcr_cassette(&cassette_dir, &system_prompt);
+    session.harness.record_artifact(
+        "ftui-vcr-cassette.json",
+        &cassette_path,
+    );
+
+    // Launch via a wrapper that redirects stderr to a file: tracing output
+    // otherwise interleaves with the pane, and on failure the log is the
+    // diagnostic.
+    let stderr_log = session.harness.temp_path("pi-stderr.log");
+    {
+        use std::fmt::Write as _;
+        let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+        for (key, sub) in [
+            ("PI_CODING_AGENT_DIR", "agent"),
+            ("PI_CONFIG_PATH", "config.toml"),
+            ("PI_SESSIONS_DIR", "sessions"),
+            ("PI_PACKAGE_DIR", "packages"),
+        ] {
+            let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
+        }
+        script.push_str("export PI_TEST_MODE=1\nexport ANTHROPIC_API_KEY=pi-e2e-vcr-dummy\n");
+        let _ = writeln!(script, "export {}=playback", pi::vcr::VCR_ENV_MODE);
+        let _ = writeln!(
+            script,
+            "export {}={}",
+            pi::vcr::VCR_ENV_DIR,
+            cassette_dir.display()
+        );
+        let _ = writeln!(script, "export PI_VCR_TEST_NAME={FTUI_VCR_TEST_NAME}");
+        script.push_str("export VCR_DEBUG_BODY=1\n");
+        // Stable path: the harness temp dir is deleted on drop, and the
+        // debug bodies are exactly what we need after a failure.
+        script.push_str("export VCR_DEBUG_BODY_FILE=/private/tmp/pi-tests/ftui-vcr-bodies.txt\n");
+        let binary = std::env::var_os("CARGO_BIN_EXE_pi").expect("CARGO_BIN_EXE_pi"); // ubs:ignore test setup expect
+        let _ = write!(script, "exec {}", std::path::PathBuf::from(binary).display());
+        for arg in ftui_vcr_args() {
+            let _ = write!(script, " '{arg}'");
+        }
+        let _ = writeln!(script, " 2>{}", stderr_log.display());
+        let script_path = session.harness.temp_path("vcr-run.sh");
+        std::fs::write(&script_path, &script).expect("write vcr script"); // ubs:ignore test setup expect
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script_path)
+                .expect("stat vcr script") // ubs:ignore test setup expect
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script_path, perms).expect("chmod vcr script"); // ubs:ignore test setup expect
+        }
+        session
+            .tmux
+            .start_session(session.harness.temp_dir(), &script_path);
+    }
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+
+    session.tmux.send_literal(FTUI_VCR_PROMPT);
+    session.tmux.send_key("Enter");
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("ftui-vcr-response-marker", COMMAND_TIMEOUT);
+    let stderr_tail = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+    assert!(
+        pane.contains("alpha beta gamma"),
+        "full streamed response missing; pane:\n{pane}\nstderr tail:\n{}",
+        &stderr_tail[stderr_tail.len().saturating_sub(2000)..]
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}

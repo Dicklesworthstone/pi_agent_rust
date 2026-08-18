@@ -2081,6 +2081,17 @@ async fn run(
                     cli.extension.iter().map(PathBuf::from).collect()
                 },
                 extension_policy: cli.extension_policy.clone(),
+                // Prompt/tool/thinking flags flow through so deterministic
+                // harnesses (VCR body matching) and users get the same
+                // behavior as the default stack.
+                system_prompt: cli.system_prompt.clone(),
+                append_system_prompt: cli.append_system_prompt.clone(),
+                enabled_tools: if cli.no_tools {
+                    Some(Vec::new())
+                } else {
+                    None
+                },
+                thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
                 ..Default::default()
             };
             let theme = pi::theme::Theme::resolve(&config, &cwd);
