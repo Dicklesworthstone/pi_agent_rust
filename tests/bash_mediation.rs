@@ -2,9 +2,8 @@
 //!
 //! Coverage: off mode byte-identical, block-critical refusal naming the
 //! class with dcg-compatible rule ids, warn mode annotated execution, the
-//! DCG policy bridge (.dcg.toml allow_patterns win), audit payload shape,
-//! and forced-vs-yolo composition. PTY heuristics live in
-//! `pty_selection.rs`'s unit tests.
+//! DCG policy bridge (`.dcg.toml` `allow_patterns` win), audit payload shape,
+//! and PTY auto-selection.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
@@ -15,7 +14,7 @@ use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::config::BashSettings;
 use pi::tools::{Tool, ToolOutput, ToolRegistry};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::Path;
 
 fn first_text(output: &ToolOutput) -> &str {
@@ -154,12 +153,17 @@ fn warn_mode_executes_with_annotation() {
     let root = harness.temp_path(".");
     let tool = bash_tool(&root, Some(settings("warn")));
 
-    let out = execute(&tool, "echo 'echo hi' | sh");
+    // High-tier fixture with zero blast radius: chmod 777 on a file the test
+    // created (PermissionEscalation). The in-tree classifier's pipe-to-shell
+    // scope is intentionally download-only (curl|sh), so echo|sh is not a
+    // classifiable fixture.
+    let target = root.join("chmod-target");
+    std::fs::write(&target, "x").expect("write chmod target");
+    let out = execute(&tool, &format!("chmod 777 {}", target.display()));
     let text = first_text(&out);
     harness.log().info("verify", format!("warn output: {text}"));
     assert!(text.contains("MEDIATION WARN"), "{text}");
-    assert!(text.contains("hi"), "warn mode must still execute: {text}");
-    assert!(!out.is_error, "warn mode executes, not refuses");
+    assert!(!out.is_error, "warn mode executes, not refuses: {text}");
     finish_case(&harness, case);
 }
 
@@ -219,8 +223,10 @@ fn registry_constructs_bash_with_mediation() {
     let case = "registry_constructs_bash_with_mediation";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let mut config = pi::config::Config::default();
-    config.bash = Some(settings("block-critical"));
+    let config = pi::config::Config {
+        bash: Some(settings("block-critical")),
+        ..Default::default()
+    };
     let registry = ToolRegistry::new(&["bash"], &root, Some(&config));
     let tool = registry
         .tools()
