@@ -66,6 +66,8 @@ pub struct Config {
     pub plan: Option<PlanSettings>,
     /// Read-tool settings (bd-cv653.2.2 URL reads).
     pub read: Option<ReadSettings>,
+    /// Bash-tool mediation settings (bd-cv653.1.7).
+    pub bash: Option<BashSettings>,
     /// Advisor settings (bd-cv653.3.3).
     pub advisor: Option<AdvisorSettings>,
     /// LSP tool settings (bd-cv653.1.1).
@@ -497,6 +499,29 @@ pub struct ReadSettings {
     pub url_allow_private_targets: Option<bool>,
 }
 
+/// Bash-tool mediation configuration (bd-cv653.1.7).
+///
+/// `bash.mediation`: `off` (default) | `warn` | `block-critical` | `block-high`.
+/// `bash.mediationForced`: when true, mediation applies even under yolo-style
+/// approval overrides (forced beats yolo). `bash.mediationDcg`: use a `dcg`
+/// binary on PATH as the authoritative verdict source when present
+/// (default true); the in-tree classifier is the fallback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BashSettings {
+    /// Mediation mode: off | warn | block-critical | block-high.
+    pub mediation: Option<String>,
+    /// Forced mediation: applies regardless of yolo/approval overrides.
+    #[serde(alias = "mediationForced")]
+    pub mediation_forced: Option<bool>,
+    /// Prefer the `dcg` binary's verdicts when available (default true).
+    #[serde(alias = "mediationDcg")]
+    pub mediation_dcg: Option<bool>,
+    /// PTY allocation for isatty-requiring commands: `off`, `auto`
+    /// (default), or `always` (bd-cv653.1.7).
+    pub pty: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -768,6 +793,7 @@ impl Config {
             tools: merge_tools(base.tools, other.tools),
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
+            bash: merge_bash(base.bash, other.bash),
             advisor: merge_advisor(base.advisor, other.advisor),
             lsp: merge_lsp(base.lsp, other.lsp),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
@@ -1529,6 +1555,21 @@ fn merge_advisor(
         (Some(base), Some(other)) => Some(AdvisorSettings {
             enabled: other.enabled.or(base.enabled),
             timeout_secs: other.timeout_secs.or(base.timeout_secs),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge bash mediation settings field-wise (bd-cv653.1.7).
+fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option<BashSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(BashSettings {
+            mediation: other.mediation.or(base.mediation),
+            mediation_forced: other.mediation_forced.or(base.mediation_forced),
+            mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
+            pty: other.pty.or(base.pty),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

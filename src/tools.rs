@@ -5201,11 +5201,10 @@ impl ToolRegistry {
                             .unwrap_or(false),
                     ),
                 )),
-                "bash" => tools.push(Box::new(BashTool::with_shell(
-                    cwd,
-                    shell_path.clone(),
-                    shell_command_prefix.clone(),
-                ))),
+                "bash" => tools.push(Box::new(
+                    BashTool::with_shell(cwd, shell_path.clone(), shell_command_prefix.clone())
+                        .with_mediation(config.and_then(|c| c.bash.clone())),
+                )),
                 "edit" => tools.push(Box::new(EditTool::new(cwd))),
                 "write" => tools.push(Box::new(WriteTool::new(cwd))),
                 "grep" => tools.push(Box::new(GrepTool::with_backend(
@@ -6062,6 +6061,8 @@ pub struct BashTool {
     shell_path: Option<String>,
     command_prefix: Option<String>,
     artifact_root: Option<PathBuf>,
+    /// Mediation settings (`bash.mediation*`, bd-cv653.1.7).
+    mediation: Option<crate::config::BashSettings>,
 }
 
 #[derive(Debug, Clone)]
@@ -6450,6 +6451,7 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: None,
+            mediation: None,
         }
     }
 
@@ -6463,7 +6465,15 @@ impl BashTool {
             shell_path,
             command_prefix,
             artifact_root: None,
+            mediation: None,
         }
+    }
+
+    /// Attach mediation settings (`bash.mediation*`, bd-cv653.1.7).
+    #[must_use]
+    pub fn with_mediation(mut self, mediation: Option<crate::config::BashSettings>) -> Self {
+        self.mediation = mediation;
+        self
     }
 
     #[cfg(test)]
@@ -6473,6 +6483,7 @@ impl BashTool {
             shell_path: None,
             command_prefix: None,
             artifact_root: Some(artifact_root.to_path_buf()),
+            mediation: None,
         }
     }
 }
@@ -6520,6 +6531,126 @@ impl Tool for BashTool {
     ) -> Result<ToolOutput> {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+
+        // Mediation gate (bd-cv653.1.7): classify before spawn against
+        // `bash.mediation`. `forced` beats any approval override; off mode
+        // is byte-identical to the pre-mediation path.
+        if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
+            eprintln!(
+                "[mediation-gate] self.mediation present={} command={}",
+                self.mediation.is_some(),
+                input.command
+            );
+        }
+        if let Some(mediation) = &self.mediation {
+            let mode =
+                crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());
+            if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
+                eprintln!("[mediation-gate] mode={}", mode.as_str());
+            }
+            if mode != crate::bash_mediation::MediationMode::Off {
+                // DCG policy bridge: imported allow_patterns from .dcg.toml
+                // (project + global) win over every classifier hit — users
+                // maintain ONE rule set.
+                let allows = crate::bash_mediation::import_dcg_overrides(
+                    &self.cwd,
+                    &crate::config::Config::global_dir(),
+                );
+                if crate::bash_mediation::covered_by_allow(&input.command, &allows) {
+                    let verdict = crate::bash_mediation::MediationVerdict::Allow { hits: vec![] };
+                    let _ = verdict;
+                } else {
+                    let verdict =
+                        crate::bash_mediation::assess(&input.command, mediation, mode, &self.cwd);
+                    if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
+                        eprintln!("[mediation-gate] verdict allows={}", verdict.allows());
+                    }
+                    match verdict {
+                        crate::bash_mediation::MediationVerdict::Allow { hits } => {
+                            if !hits.is_empty() {
+                                let payload =
+                                    crate::bash_mediation::MediationVerdict::Allow { hits }
+                                        .audit_payload(mode, &input.command);
+                                tracing::info!(
+                                    event = "pi.bash.mediation",
+                                    payload = %payload,
+                                    "bash mediation allow with hits"
+                                );
+                            }
+                        }
+                        crate::bash_mediation::MediationVerdict::Warn { hits } => {
+                            let payload = crate::bash_mediation::MediationVerdict::Warn { hits }
+                                .audit_payload(mode, &input.command);
+                            tracing::info!(
+                                event = "pi.bash.mediation",
+                                payload = %payload,
+                                "bash mediation warn"
+                            );
+                            let mut result = run_bash_command(
+                                &self.cwd,
+                                self.shell_path.as_deref(),
+                                self.command_prefix.as_deref(),
+                                &input.command,
+                                input.timeout,
+                                on_update.as_deref(),
+                            )
+                            .await?;
+                            result.output = format!(
+                                "[MEDIATION WARN: {}]\n\n{}",
+                                payload["hits"]
+                                    .as_array()
+                                    .map(|hits| hits
+                                        .iter()
+                                        .filter_map(|hit| hit["ruleId"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", "))
+                                    .unwrap_or_default(),
+                                result.output
+                            );
+                            return Ok(ToolOutput {
+                                content: vec![ContentBlock::Text(TextContent::new(result.output))],
+                                details: Some(payload),
+                                is_error: false,
+                            });
+                        }
+                        crate::bash_mediation::MediationVerdict::Block { hits } => {
+                            let payload = crate::bash_mediation::MediationVerdict::Block { hits }
+                                .audit_payload(mode, &input.command);
+                            tracing::info!(
+                                event = "pi.bash.mediation",
+                                payload = %payload,
+                                "bash mediation block"
+                            );
+                            let reasons = payload["hits"]
+                                .as_array()
+                                .map(|hits| {
+                                    hits.iter()
+                                        .map(|hit| {
+                                            format!(
+                                                "- {} [{}]: {}",
+                                                hit["ruleId"].as_str().unwrap_or("?"),
+                                                hit["tier"].as_str().unwrap_or("?"),
+                                                hit["reason"].as_str().unwrap_or("?"),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                })
+                                .unwrap_or_default();
+                            return Ok(ToolOutput {
+                                content: vec![ContentBlock::Text(TextContent::new(format!(
+                                    "[MEDIATION BLOCK] command refused by bash.mediation mode '{}':\n{reasons}\n\nCommand: {}",
+                                    mode.as_str(),
+                                    input.command
+                                )))],
+                                details: Some(payload),
+                                is_error: true,
+                            });
+                        }
+                    }
+                }
+            }
+        }
 
         let result = run_bash_command(
             &self.cwd,

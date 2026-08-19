@@ -87,6 +87,8 @@ pub mod ast_tools;
 #[doc(hidden)]
 pub mod auth;
 #[doc(hidden)]
+pub mod bash_mediation;
+#[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]
 pub mod buffer_shim;
