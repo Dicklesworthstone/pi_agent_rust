@@ -6113,6 +6113,40 @@ fn bash_cancellation_details(
     })
 }
 
+/// Dispatch to the pipe or PTY spawn path (bd-cv653.1.7) with an identical
+/// call shape, so the mediation gate's arms don't duplicate the branch.
+async fn execute_bash_spawn(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+    use_pty: bool,
+) -> Result<BashRunResult> {
+    if use_pty {
+        run_bash_command_pty(
+            cwd,
+            shell_path,
+            command_prefix,
+            command,
+            timeout_secs,
+            on_update,
+        )
+        .await
+    } else {
+        run_bash_command(
+            cwd,
+            shell_path,
+            command_prefix,
+            command,
+            timeout_secs,
+            on_update,
+        )
+        .await
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
@@ -6341,6 +6375,27 @@ pub(crate) async fn run_bash_command(
         exit_code.get_or_insert_with(|| exit_status_code(status));
     }
 
+    Ok(assemble_bash_run_result(
+        bash_output,
+        exit_code,
+        timed_out,
+        cancelled,
+        cancellation_reason,
+        timeout_secs,
+    ))
+}
+
+/// Shared bash result assembly for the pipe and PTY spawn paths
+/// (bd-cv653.1.7): truncation annotation, timeout suffix, and the
+/// `BashRunResult` shape are identical across both.
+fn assemble_bash_run_result(
+    mut bash_output: BashOutputState,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    mut cancelled: bool,
+    cancellation_reason: Option<BashCancellationReason>,
+    timeout_secs: Option<u64>,
+) -> BashRunResult {
     drop(bash_output.temp_file.take());
 
     let raw_output = concat_chunks(&bash_output.chunks);
@@ -6428,7 +6483,7 @@ pub(crate) async fn run_bash_command(
         let _ = write!(output_text, "\n\nCommand exited with code {exit_code}");
     }
 
-    Ok(BashRunResult {
+    BashRunResult {
         output: output_text,
         exit_code,
         cancelled,
@@ -6441,7 +6496,219 @@ pub(crate) async fn run_bash_command(
         } else {
             None
         },
-    })
+    }
+}
+
+/// Run a bash command under a pseudo-terminal (bd-cv653.1.7). Selected for
+/// isatty-requiring commands (`ssh`, `top`, `vim`, `python -i`, …) when
+/// `bash.pty` is `auto`/`always`. The child sees a real controlling terminal,
+/// so programs that probe `isatty(3)` behave exactly as they do in an
+/// interactive shell. The observable tool contract — output truncation,
+/// timeout/tree-kill, cancellation, streaming updates, `BashRunResult` — is
+/// identical to the pipe path.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_bash_command_pty(
+    cwd: &Path,
+    shell_path: Option<&str>,
+    command_prefix: Option<&str>,
+    command: &str,
+    timeout_secs: Option<u64>,
+    on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
+) -> Result<BashRunResult> {
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let timeout_secs = match timeout_secs {
+        None => Some(DEFAULT_BASH_TIMEOUT_SECS),
+        Some(0) => None,
+        Some(value) => Some(value),
+    };
+    let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
+        || command.to_string(),
+        |prefix| format!("{prefix}\n{command}"),
+    );
+    let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
+
+    if !cwd.exists() {
+        return Err(Error::tool(
+            "bash",
+            format!(
+                "Working directory does not exist: {}\nCannot execute bash commands.",
+                cwd.display()
+            ),
+        ));
+    }
+
+    let shell = shell_path.unwrap_or_else(|| {
+        for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+            if Path::new(path).exists() {
+                return path;
+            }
+        }
+        "sh"
+    });
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| Error::tool("bash", format!("Failed to allocate PTY: {e}")))?;
+
+    let mut pty_cmd = CommandBuilder::new(shell);
+    pty_cmd.arg("-c");
+    pty_cmd.arg(&command);
+    pty_cmd.cwd(cwd);
+
+    // portable-pty puts the child in its own session (setsid) on unix, so the
+    // child pid is its process-group id and the shared tree-kill helpers work
+    // exactly as they do for the pipe path's isolated process group.
+    let mut child = pair
+        .slave
+        .spawn_command(pty_cmd)
+        .map_err(|e| Error::tool("bash", format!("Failed to spawn shell on PTY: {e}")))?;
+    // Drop our handle to the slave side so the master sees EOF when the child
+    // exits; otherwise the pump thread would block forever.
+    drop(pair.slave);
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| Error::tool("bash", format!("Failed to clone PTY reader: {e}")))?;
+
+    let (tx, rx) = mpsc::sync_channel::<BashPipeFrame>(1024);
+    let pty_thread = thread::spawn(move || pump_stream(reader, "pty", &tx));
+
+    let max_chunks_bytes = DEFAULT_MAX_BYTES.saturating_mul(2);
+    let mut bash_output = BashOutputState::new(max_chunks_bytes);
+    bash_output.timeout_ms = timeout_secs.map(|s| s.saturating_mul(1000));
+
+    let cx = AgentCx::for_current_or_request();
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut cancellation_reason: Option<BashCancellationReason> = None;
+    let mut exit_code: Option<i32> = None;
+    let start = cx
+        .cx()
+        .timer_driver()
+        .map_or_else(wall_now, |timer| timer.now());
+    let timeout = timeout_secs.map(Duration::from_secs);
+    let mut terminate_deadline: Option<asupersync::Time> = None;
+
+    let tick = Duration::from_millis(10);
+    loop {
+        let mut updated = false;
+        while let Ok(frame) = rx.try_recv() {
+            if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+                let _ = child.kill();
+                return Err(err);
+            }
+            updated = true;
+        }
+
+        if updated {
+            emit_bash_update(&bash_output, on_update)?;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(-1));
+                break;
+            }
+            Ok(None) => {}
+            Err(err) => return Err(Error::tool("bash", err.to_string())),
+        }
+
+        let now = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(wall_now, |timer| timer.now());
+
+        if let Some(deadline) = terminate_deadline {
+            if now >= deadline {
+                let _ = child.kill();
+                if let Ok(status) = child.wait() {
+                    exit_code = Some(i32::try_from(status.exit_code()).unwrap_or(-1));
+                }
+                break;
+            }
+        } else if let Some(timeout) = timeout {
+            let elapsed = std::time::Duration::from_nanos(now.duration_since(start));
+            if elapsed >= timeout {
+                timed_out = true;
+                cancellation_reason = Some(BashCancellationReason::Timeout);
+                terminate_process_group_tree(child.process_id());
+                terminate_deadline = Some(now + Duration::from_secs(BASH_TERMINATE_GRACE_SECS));
+            }
+        }
+
+        if terminate_deadline.is_none() && cx.checkpoint().is_err() {
+            cancelled = true;
+            cancellation_reason = Some(BashCancellationReason::AmbientCancellation);
+            let _ = child.kill();
+            exit_code = Some(-1);
+            break;
+        }
+
+        sleep(now, tick).await;
+    }
+
+    // Drain remaining frames while the pump observes EOF (same 5s safety cap
+    // as the pipe path for fd-inheriting grandchildren).
+    {
+        let drain_start = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(wall_now, |timer| timer.now());
+        let drain_deadline = drain_start + Duration::from_secs(5);
+        loop {
+            let mut got_data = false;
+            while let Ok(frame) = rx.try_recv() {
+                if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+                    let _ = child.kill();
+                    return Err(err);
+                }
+                got_data = true;
+            }
+            if got_data {
+                emit_bash_update(&bash_output, on_update)?;
+            }
+
+            if pty_thread.is_finished() {
+                while let Ok(frame) = rx.try_recv() {
+                    if let Err(err) = ingest_bash_pipe_frame(frame, &mut bash_output).await {
+                        let _ = child.kill();
+                        return Err(err);
+                    }
+                }
+                break;
+            }
+
+            let now = cx
+                .cx()
+                .timer_driver()
+                .map_or_else(wall_now, |timer| timer.now());
+            if now >= drain_deadline {
+                break;
+            }
+            sleep(now, tick).await;
+        }
+    }
+
+    // Reap the child to avoid zombies (belt-and-suspenders with try_wait).
+    if let Ok(status) = child.wait() {
+        exit_code.get_or_insert_with(|| i32::try_from(status.exit_code()).unwrap_or(-1));
+    }
+
+    Ok(assemble_bash_run_result(
+        bash_output,
+        exit_code,
+        timed_out,
+        cancelled,
+        cancellation_reason,
+        timeout_secs,
+    ))
 }
 
 impl BashTool {
@@ -6532,22 +6799,25 @@ impl Tool for BashTool {
         let input: BashInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
+        // PTY auto-selection (bd-cv653.1.7): isatty-requiring commands get a
+        // real pseudo-terminal when `bash.pty` is auto/always; the tool
+        // contract is identical either way.
+        let use_pty = match crate::bash_mediation::PtyMode::from_setting(
+            self.mediation.as_ref().and_then(|s| s.pty.as_deref()),
+        ) {
+            crate::bash_mediation::PtyMode::Off => false,
+            crate::bash_mediation::PtyMode::Always => true,
+            crate::bash_mediation::PtyMode::Auto => {
+                crate::bash_mediation::pty_required(&input.command)
+            }
+        };
+
         // Mediation gate (bd-cv653.1.7): classify before spawn against
         // `bash.mediation`. `forced` beats any approval override; off mode
         // is byte-identical to the pre-mediation path.
-        if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
-            eprintln!(
-                "[mediation-gate] self.mediation present={} command={}",
-                self.mediation.is_some(),
-                input.command
-            );
-        }
         if let Some(mediation) = &self.mediation {
             let mode =
                 crate::bash_mediation::MediationMode::from_setting(mediation.mediation.as_deref());
-            if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
-                eprintln!("[mediation-gate] mode={}", mode.as_str());
-            }
             if mode != crate::bash_mediation::MediationMode::Off {
                 // DCG policy bridge: imported allow_patterns from .dcg.toml
                 // (project + global) win over every classifier hit — users
@@ -6562,9 +6832,6 @@ impl Tool for BashTool {
                 } else {
                     let verdict =
                         crate::bash_mediation::assess(&input.command, mediation, mode, &self.cwd);
-                    if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
-                        eprintln!("[mediation-gate] verdict allows={}", verdict.allows());
-                    }
                     match verdict {
                         crate::bash_mediation::MediationVerdict::Allow { hits } => {
                             if !hits.is_empty() {
@@ -6586,13 +6853,14 @@ impl Tool for BashTool {
                                 payload = %payload,
                                 "bash mediation warn"
                             );
-                            let mut result = run_bash_command(
+                            let mut result = execute_bash_spawn(
                                 &self.cwd,
                                 self.shell_path.as_deref(),
                                 self.command_prefix.as_deref(),
                                 &input.command,
                                 input.timeout,
                                 on_update.as_deref(),
+                                use_pty,
                             )
                             .await?;
                             result.output = format!(
@@ -6652,13 +6920,14 @@ impl Tool for BashTool {
             }
         }
 
-        let result = run_bash_command(
+        let result = execute_bash_spawn(
             &self.cwd,
             self.shell_path.as_deref(),
             self.command_prefix.as_deref(),
             &input.command,
             input.timeout,
             on_update.as_deref(),
+            use_pty,
         )
         .await?;
 

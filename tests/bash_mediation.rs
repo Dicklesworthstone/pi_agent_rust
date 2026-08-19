@@ -232,3 +232,101 @@ fn registry_constructs_bash_with_mediation() {
     assert!(out.is_error, "registry must plumb mediation through config");
     finish_case(&harness, case);
 }
+
+// ---------------------------------------------------------------------------
+// PTY auto-selection (bd-cv653.1.7, acceptance #4)
+// ---------------------------------------------------------------------------
+
+fn pty_settings(mode: &str) -> BashSettings {
+    BashSettings {
+        pty: Some(mode.to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn pty_always_grants_a_tty() {
+    let case = "pty_always_grants_a_tty";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let tool = bash_tool(&root, Some(pty_settings("always")));
+    let out = execute(&tool, "test -t 1 && echo TTY || echo PIPE");
+    let text = first_text(&out);
+    harness.log().info("verify", format!("pty output: {text}"));
+    assert!(
+        text.contains("TTY"),
+        "pty=always must give the child a controlling terminal: {text}"
+    );
+    assert!(!out.is_error);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn pty_off_keeps_pipes() {
+    let case = "pty_off_keeps_pipes";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let tool = bash_tool(&root, Some(pty_settings("off")));
+    let out = execute(&tool, "test -t 1 && echo TTY || echo PIPE");
+    let text = first_text(&out);
+    assert!(
+        text.contains("PIPE"),
+        "pty=off must keep the plain pipe path: {text}"
+    );
+    assert!(!out.is_error);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn pty_auto_detects_interactive_flag() {
+    let case = "pty_auto_detects_interactive_flag";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    // Default (unset) pty mode is auto; `bash -i` is in the interactive set.
+    let tool = bash_tool(&root, None);
+    let out = execute(
+        &tool,
+        "bash -i -c 'test -t 1 && echo TTY || echo PIPE' 2>/dev/null",
+    );
+    let text = first_text(&out);
+    harness.log().info("verify", format!("auto output: {text}"));
+    assert!(
+        text.contains("TTY"),
+        "auto mode must allocate a PTY for bash -i: {text}"
+    );
+    assert!(!out.is_error);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn pty_auto_leaves_plain_commands_on_pipes() {
+    let case = "pty_auto_leaves_plain_commands_on_pipes";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let tool = bash_tool(&root, None);
+    let out = execute(&tool, "test -t 1 && echo TTY || echo PIPE");
+    let text = first_text(&out);
+    assert!(
+        text.contains("PIPE"),
+        "auto mode must leave plain commands on the pipe path: {text}"
+    );
+    assert!(!out.is_error);
+    finish_case(&harness, case);
+}
+
+#[test]
+fn pty_timeout_still_kills() {
+    let case = "pty_timeout_still_kills";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let tool = bash_tool(&root, Some(pty_settings("always")));
+    let out =
+        block_on_local(tool.execute("call-1", json!({"command": "sleep 30", "timeout": 1}), None))
+            .expect("execute");
+    let text = first_text(&out);
+    assert!(
+        text.contains("timed out after 1 seconds"),
+        "pty path must honor the timeout/kill discipline: {text}"
+    );
+    finish_case(&harness, case);
+}

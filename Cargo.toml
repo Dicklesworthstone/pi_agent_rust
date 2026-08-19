@@ -196,6 +196,9 @@ url = "2"
 # Signals
 ctrlc = "3.5.2"
 
+# PTY allocation for isatty-requiring bash commands (bd-cv653.1.7)
+portable-pty = "0.9"
+
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }

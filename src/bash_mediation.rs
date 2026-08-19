@@ -1,4 +1,12 @@
 //! Main-bash command mediation (bd-cv653.1.7).
+//!
+//! Pi's internal equivalent of the operator's DCG (destructive-command
+//! guard): every bash command is classified before spawn, against the
+//! `bash.mediation` mode. When a `dcg` binary is on PATH it is the
+//! authoritative verdict source (the user's ONE rule set, with their packs);
+//! the in-tree exec_mediation classifier is the fallback when `dcg` is
+//! absent, times out, or errors. Audit payloads carry dcg-compatible rule
+//! ids either way.
 
 /// PTY allocation mode for the bash tool (bd-cv653.1.7): `off` never
 /// allocates a pseudo-terminal, `always` forces one, and `auto` (default)
@@ -18,12 +26,7 @@ pub enum PtyMode {
 impl PtyMode {
     #[must_use]
     pub fn from_setting(raw: Option<&str>) -> Self {
-        match raw
-            .unwrap_or("auto")
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
+        match raw.unwrap_or("auto").trim().to_ascii_lowercase().as_str() {
             "off" | "false" | "disabled" => Self::Off,
             "always" | "force" | "on" | "true" => Self::Always,
             _ => Self::Auto,
@@ -35,10 +38,41 @@ impl PtyMode {
 /// Exact argv0-basename match against this set, plus the `python -i` /
 /// `node -i`-style interactive flags handled below.
 const PTY_REQUIRED_BASENAMES: &[&str] = &[
-    "ssh", "sftp", "ssh-add", "top", "htop", "btop", "vim", "nvim", "vi", "nano", "emacs",
-    "less", "more", "man", "watch", "tmux", "screen", "irb", "pry", "psql", "mysql",
-    "sqlite3", "redis-cli", "gdb", "lldb", "ftp", "telnet", "passwd", "su", "sudo", "ranger",
-    "mc", "alsamixer", "nmtui", "fzf",
+    "ssh",
+    "sftp",
+    "ssh-add",
+    "top",
+    "htop",
+    "btop",
+    "vim",
+    "nvim",
+    "vi",
+    "nano",
+    "emacs",
+    "less",
+    "more",
+    "man",
+    "watch",
+    "tmux",
+    "screen",
+    "irb",
+    "pry",
+    "psql",
+    "mysql",
+    "sqlite3",
+    "redis-cli",
+    "gdb",
+    "lldb",
+    "ftp",
+    "telnet",
+    "passwd",
+    "su",
+    "sudo",
+    "ranger",
+    "mc",
+    "alsamixer",
+    "nmtui",
+    "fzf",
 ];
 
 /// Classify whether a command is an isatty-requiring interactive program
@@ -75,15 +109,6 @@ pub fn pty_required(command: &str) -> bool {
     }
     false
 }
-
-//!
-//! Pi's internal equivalent of the operator's DCG (destructive-command
-//! guard): every bash command is classified before spawn, against the
-//! `bash.mediation` mode. When a `dcg` binary is on PATH it is the
-//! authoritative verdict source (the user's ONE rule set, with their packs);
-//! the in-tree exec_mediation classifier is the fallback when `dcg` is
-//! absent, times out, or errors. Audit payloads carry dcg-compatible rule
-//! ids either way.
 
 use std::path::Path;
 
@@ -296,13 +321,6 @@ fn dcg_verdict(command: &str, cwd: &Path) -> Option<Vec<RuleHit>> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let combined = format!("{stdout}\n{stderr}");
-    if std::env::var_os("PI_MEDIATION_TRACE").is_some() {
-        eprintln!(
-            "[mediation-dcg] status={} out={}",
-            output.status,
-            &combined[..combined.len().min(400)]
-        );
-    }
     parse_dcg_output(&combined)
 }
 
@@ -483,5 +501,42 @@ mod tests {
             "core.filesystem:rm-rf-root-home"
         );
         assert_eq!(payload["schema"], "pi.bash.mediation.v1");
+    }
+
+    #[test]
+    fn assess_flags_pipe_to_shell_under_warn() {
+        let settings = BashSettings {
+            mediation: Some("warn".to_string()),
+            mediation_dcg: Some(false),
+            ..Default::default()
+        };
+        let verdict = assess(
+            "echo 'echo hi' | sh",
+            &settings,
+            MediationMode::Warn,
+            std::path::Path::new("."),
+        );
+        assert!(
+            matches!(verdict, MediationVerdict::Warn { .. }),
+            "warn mode must annotate pipe-to-shell via the fallback classifier: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn pty_classifier_flags_interactive_programs() {
+        assert!(pty_required("ssh example.com"));
+        assert!(pty_required("sudo -v"));
+        assert!(pty_required("top"));
+        assert!(pty_required("vim src/main.rs"));
+        assert!(pty_required("/usr/bin/htop"));
+        assert!(pty_required("python3 -i script.py"));
+        assert!(pty_required("node -it"));
+        assert!(pty_required("FOO=bar exec tmux attach"));
+        assert!(!pty_required("echo hello"));
+        assert!(!pty_required("python3 script.py"));
+        assert!(!pty_required("grep -n foo bar.txt"));
+        assert!(!pty_required(""));
+        assert!(!pty_required("FOO=bar echo hello"));
+        assert!(!pty_required("git -C repo status"));
     }
 }
