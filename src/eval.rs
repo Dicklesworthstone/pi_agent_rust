@@ -14,7 +14,7 @@ use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,10 @@ const DEFAULT_CELL_TIMEOUT_SECS: u64 = 30;
 struct PyKernel {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines from the kernel's stdout, streamed by a dedicated reader thread
+    /// (a cell may emit several bridge-request lines before its final
+    /// response). `None` = EOF (kernel exited).
+    lines: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
     next_id: u64,
     cells_run: u64,
 }
@@ -62,13 +65,59 @@ impl PyKernel {
             .stdout
             .take()
             .ok_or_else(|| Error::tool("eval", "EVAL_SPAWN: no stdout pipe"))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("eval-py-read".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) | Err(_) => {
+                            let _ = tx.send(None);
+                            return;
+                        }
+                        Ok(_) => {
+                            if tx.send(Some(line)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?;
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            lines: std::sync::Mutex::new(rx),
             next_id: 1,
             cells_run: 0,
         })
+    }
+
+    /// Await the next stdout line under a budget. Ok(None) = EOF.
+    async fn next_line(&self, deadline: Instant) -> Result<Option<String>> {
+        loop {
+            let received = self
+                .lines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .try_recv();
+            match received {
+                Ok(line) => return Ok(line),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if Instant::now() > deadline {
+                        return Err(Error::tool("eval", "EVAL_DEADLINE"));
+                    }
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(25),
+                    )
+                    .await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return Ok(None),
+            }
+        }
     }
 
     fn kill(&mut self) {
@@ -141,63 +190,52 @@ impl EvalTool {
             restarted = true;
         }
 
-        // Blocking read on a thread; poll the channel under the cell budget.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut line = String::new();
-        let mut reader_kernel = kernel;
-        let reader = std::thread::Builder::new()
-            .name("eval-py-read".into())
-            .spawn(move || {
-                let result = reader_kernel.stdout.read_line(&mut line).map(|_| line);
-                let _ = tx.send((reader_kernel, result));
-            })
-            .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
-        drop(reader);
-
-        let started = Instant::now();
-        let (mut kernel, read) = loop {
-            match rx.try_recv() {
-                Ok(pair) => break pair,
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if started.elapsed() > timeout {
-                        // The reader thread still owns the kernel; killing via
-                        // the child is impossible from here, so poison the
-                        // slot: next cell spawns fresh. The reader thread
-                        // exits when the killed... — we cannot kill without
-                        // the handle, so instead leave a tombstone and let
-                        // the OS process be reaped when the thread's owner
-                        // drops (kernel Drop kills the child).
-                        return Err(Error::tool(
-                            "eval",
-                            format!(
-                                "EVAL_TIMEOUT: cell exceeded {}s; kernel discarded — \
-                                 state was lost, next cell starts fresh",
-                                timeout.as_secs()
-                            ),
-                        ));
-                    }
-                    asupersync::time::sleep(
-                        asupersync::time::wall_now(),
-                        Duration::from_millis(25),
-                    )
-                    .await;
+        // Read lines until the final cell response; bridge requests re-enter
+        // pi tools mid-cell and their results resume the kernel.
+        let deadline = Instant::now() + timeout;
+        let final_line = loop {
+            let line = match kernel.next_line(deadline).await {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    // EOF: crashed mid-cell (e.g. os._exit). State lost.
+                    kernel.kill();
+                    return Err(Error::tool(
+                        "eval",
+                        "EVAL_KERNEL_CRASH: the Python kernel exited mid-cell — state \
+                         was lost, next cell starts fresh",
+                    ));
                 }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(Error::tool("eval", "EVAL_IO: reader thread vanished"));
+                Err(_) => {
+                    // Budget exhausted: kill and report state loss.
+                    kernel.kill();
+                    return Err(Error::tool(
+                        "eval",
+                        format!(
+                            "EVAL_TIMEOUT: cell exceeded {}s; kernel discarded — \
+                             state was lost, next cell starts fresh",
+                            timeout.as_secs()
+                        ),
+                    ));
                 }
+            };
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
             }
+            let parsed: Value = serde_json::from_str(trimmed)
+                .map_err(|err| Error::tool("eval", format!("EVAL_PROTOCOL: {err}")))?;
+            if let Some(bridge) = parsed.get("bridge") {
+                let reply = self.run_bridge_call(bridge).await;
+                let line = json!({"bridge_result": reply}).to_string();
+                kernel
+                    .stdin
+                    .write_all(format!("{line}\n").as_bytes())
+                    .and_then(|()| kernel.stdin.flush())
+                    .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
+                continue;
+            }
+            break trimmed.to_string();
         };
-        let line = read.map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
-        if line.is_empty() {
-            // EOF: the kernel crashed mid-cell (e.g. os._exit). Report state
-            // loss; leave the slot empty so the next cell restarts fresh.
-            kernel.kill();
-            return Err(Error::tool(
-                "eval",
-                "EVAL_KERNEL_CRASH: the Python kernel exited mid-cell — state was \
-                 lost, next cell starts fresh",
-            ));
-        }
         kernel.cells_run += 1;
         let cells_run = kernel.cells_run;
 
@@ -210,7 +248,44 @@ impl EvalTool {
             *slot = Some(kernel);
         }
 
-        format_cell_response(line.trim(), restarted, cells_run)
+        format_cell_response(&final_line, restarted, cells_run)
+    }
+
+    /// Execute one whitelisted bridge call through the SAME tool
+    /// implementations a direct call uses — identical path policy.
+    async fn run_bridge_call(&self, bridge: &Value) -> Value {
+        let call = bridge.get("call").cloned().unwrap_or(Value::Null);
+        let tool_name = bridge.get("tool").and_then(Value::as_str).unwrap_or("");
+        let input = bridge.get("input").cloned().unwrap_or_else(|| json!({}));
+        let tool: Box<dyn Tool> = match tool_name {
+            "read" => Box::new(crate::tools::ReadTool::new(&self.cwd)),
+            "grep" => Box::new(crate::tools::GrepTool::new(&self.cwd)),
+            "find" => Box::new(crate::tools::FindTool::new(&self.cwd)),
+            "ls" => Box::new(crate::tools::LsTool::new(&self.cwd)),
+            other => {
+                return json!({
+                    "call": call,
+                    "ok": false,
+                    "error": format!("EVAL_BRIDGE_DENIED: tool `{other}` is not on the bridge whitelist (read|grep|find|ls)"),
+                });
+            }
+        };
+        match tool.execute("eval-bridge", input, None).await {
+            Ok(output) => {
+                let mut text = String::new();
+                for block in &output.content {
+                    if let ContentBlock::Text(t) = block {
+                        text.push_str(&t.text);
+                    }
+                }
+                if output.is_error {
+                    json!({"call": call, "ok": false, "error": text})
+                } else {
+                    json!({"call": call, "ok": true, "content": text})
+                }
+            }
+            Err(err) => json!({"call": call, "ok": false, "error": err.to_string()}),
+        }
     }
 }
 
@@ -367,7 +442,8 @@ mod tests {
     }
 
     fn output_text(output: &ToolOutput) -> &str {
-        match &output.content[0] { // ubs:ignore test index — single-block output is the assertion
+        match &output.content[0] {
+            // ubs:ignore test index — single-block output is the assertion
             ContentBlock::Text(text) => &text.text,
             other => panic!("unexpected block: {other:?}"), // ubs:ignore test assertion panic
         }
@@ -438,6 +514,83 @@ mod tests {
             output_text(&out).contains("False"),
             "state leaked: {}",
             output_text(&out)
+        );
+    }
+
+    #[test]
+    fn bridge_read_returns_file_content_and_denies_unknown_tools() {
+        if !python_available() {
+            eprintln!("Skipping: python3 not available");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("data.txt"), "bridge-payload-77\n").expect("write fixture");
+        let tool = EvalTool::new(dir.path());
+        // tool.read from INSIDE Python returns the file content.
+        let out = run_cell_sync(
+            &tool,
+            "content = tool.read('data.txt')\n'bridge-payload-77' in content",
+        )
+        .expect("bridge read");
+        assert!(!out.is_error, "bridge read failed: {}", output_text(&out));
+        assert!(
+            output_text(&out).contains("True"),
+            "got: {}",
+            output_text(&out)
+        );
+        // Off-whitelist tools are denied host-side with the named taxonomy —
+        // probed via the bridge internals (cells cannot spoof the bridge by
+        // printing: cell stdout is captured, only the real stdout reaches
+        // the host).
+        let probe = concat!(
+            "bridge = tool.read.__globals__['_bridge_call']\n",
+            "try:\n",
+            "    bridge('bash', {'command': 'true'})\n",
+            "    verdict = 'allowed'\n",
+            "except Exception as e:\n",
+            "    verdict = str(e)\n",
+            "verdict",
+        );
+        let out = run_cell_sync(&tool, probe).expect("denial probe");
+        assert!(
+            output_text(&out).contains("EVAL_BRIDGE_DENIED"),
+            "bash escaped the whitelist: {}",
+            output_text(&out)
+        );
+    }
+
+    #[test]
+    fn bridge_denies_paths_outside_workspace_like_direct_reads() {
+        if !python_available() {
+            eprintln!("Skipping: python3 not available");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = EvalTool::new(dir.path());
+        // A path-escape read through the bridge must fail the same way a
+        // direct ReadTool call would (same implementation = same policy).
+        let out = run_cell_sync(
+            &tool,
+            "try:\n    tool.read('../../../../etc/hosts')\n    verdict = 'allowed'\nexcept Exception as e:\n    verdict = 'denied: ' + str(e)[:60]\nverdict",
+        )
+        .expect("escape probe");
+        let text = output_text(&out);
+        // ReadTool resolves relative paths against cwd; traversal outside is
+        // permitted only if the direct tool permits it — assert parity by
+        // running the direct tool and comparing verdicts.
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        let direct = runtime.block_on(crate::tools::ReadTool::new(dir.path()).execute(
+            "t",
+            json!({"path": "../../../../etc/hosts"}),
+            None,
+        ));
+        let direct_allowed = direct.is_ok_and(|o| !o.is_error);
+        let bridge_allowed = text.contains("allowed");
+        assert_eq!(
+            bridge_allowed, direct_allowed,
+            "bridge/direct policy divergence: bridge={text}"
         );
     }
 

@@ -8,6 +8,13 @@ JSON-lines protocol over stdio:
 One persistent namespace across cells. The last statement of a cell, when it
 is an expression, is evaluated separately and its repr returned (Jupyter-like
 display semantics). The host owns timeouts by killing this process.
+
+Tool re-entry bridge: cell code can call `tool.read(path)`, `tool.grep(...)`,
+`tool.find(...)`, `tool.ls(...)` — the kernel emits a
+{"bridge": {"call": m, "tool": ..., "input": {...}}} line on the REAL stdout
+and blocks reading the host's {"bridge_result": ...} line from stdin before
+resuming the cell. Policy identical to direct tool calls (the host executes
+the same tool implementations).
 """
 
 import ast
@@ -17,6 +24,65 @@ import sys
 import traceback
 
 NAMESPACE = {"__name__": "__main__"}
+_REAL_STDOUT = sys.stdout
+_BRIDGE_CALL = 0
+
+
+class ToolBridgeError(RuntimeError):
+    pass
+
+
+def _bridge_call(tool_name, tool_input):
+    global _BRIDGE_CALL
+    _BRIDGE_CALL += 1
+    call_id = _BRIDGE_CALL
+    _REAL_STDOUT.write(
+        json.dumps({"bridge": {"call": call_id, "tool": tool_name, "input": tool_input}}) + "\n"
+    )
+    _REAL_STDOUT.flush()
+    line = sys.stdin.readline()
+    if not line:
+        raise ToolBridgeError("bridge closed")
+    reply = json.loads(line)
+    result = reply.get("bridge_result", {})
+    if result.get("call") != call_id:
+        raise ToolBridgeError("bridge call id mismatch")
+    if not result.get("ok", False):
+        raise ToolBridgeError(result.get("error", "tool call failed"))
+    return result.get("content", "")
+
+
+class _PiTools:
+    """`tool` object exposed to cells: whitelisted re-entry into pi tools."""
+
+    @staticmethod
+    def read(path, **kwargs):
+        payload = {"path": path}
+        payload.update(kwargs)
+        return _bridge_call("read", payload)
+
+    @staticmethod
+    def grep(pattern, path=None, **kwargs):
+        payload = {"pattern": pattern}
+        if path is not None:
+            payload["path"] = path
+        payload.update(kwargs)
+        return _bridge_call("grep", payload)
+
+    @staticmethod
+    def find(pattern, **kwargs):
+        payload = {"pattern": pattern}
+        payload.update(kwargs)
+        return _bridge_call("find", payload)
+
+    @staticmethod
+    def ls(path=".", **kwargs):
+        payload = {"path": path}
+        payload.update(kwargs)
+        return _bridge_call("ls", payload)
+
+
+NAMESPACE["tool"] = _PiTools()
 
 
 def run_cell(code):
@@ -45,7 +111,10 @@ def run_cell(code):
 
 
 def main():
-    for line in sys.stdin:
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
         line = line.strip()
         if not line:
             continue
