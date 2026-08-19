@@ -793,7 +793,8 @@ mod tests {
                 .await
                 .expect("execute");
             assert!(!output.is_error);
-            let text = match &output.content[0] { // ubs:ignore test index — single-block output is the assertion
+            let text = match &output.content[0] {
+                // ubs:ignore test index — single-block output is the assertion
                 ContentBlock::Text(text) => &text.text,
                 other => panic!("unexpected block: {other:?}"), // ubs:ignore test assertion panic
             };
