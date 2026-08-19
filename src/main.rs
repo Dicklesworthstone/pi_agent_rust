@@ -1779,6 +1779,24 @@ async fn run(
             .extend_tools(vec![Box::new(tool.clone()) as Box<dyn pi::tools::Tool>]);
         tool
     });
+
+    // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
+    // .agents > global > foreign), eagerly connect already-acknowledged
+    // servers under a bounded global budget, and mount their tools as
+    // first-class mcp__<server>__<tool> tools. Pending/denied servers are
+    // never spawned; /mcp shows provenance + health for everything.
+    let mcp_manager = std::sync::Arc::new(pi::mcp::McpManager::bootstrap(
+        &cwd,
+        &pi::config::Config::global_dir(),
+        &cli.mcp_config,
+    )?);
+    mcp_manager.connect_trusted().await;
+    {
+        let mcp_wrappers = pi::mcp::mount_tools(&mcp_manager);
+        if !mcp_wrappers.is_empty() {
+            agent_session.agent.extend_tools(mcp_wrappers);
+        }
+    }
     let mut extension_model_entries = Vec::new();
 
     if !resources.extensions().is_empty() {
@@ -1857,6 +1875,19 @@ async fn run(
 
         // Merge extension-registered providers into the model registry.
         if let Some(region) = &agent_session.extensions {
+            // Bridge extension-registered MCP servers into the unified MCP
+            // client registry (bd-cv653.6.1): same spawn path, same trust
+            // gate, provenance=extension in /mcp.
+            for spec in region.manager().extension_mcp_servers() {
+                let name = spec
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    mcp_manager.register_extension_server(&name, &spec);
+                }
+            }
             extension_model_entries = region.manager().extension_model_entries();
             if !extension_model_entries.is_empty() {
                 // Build OAuth configs map from model entries before merging.
@@ -2090,11 +2121,7 @@ async fn run(
                 // behavior as the default stack.
                 system_prompt: cli.system_prompt.clone(),
                 append_system_prompt: cli.append_system_prompt.clone(),
-                enabled_tools: if cli.no_tools {
-                    Some(Vec::new())
-                } else {
-                    None
-                },
+                enabled_tools: if cli.no_tools { Some(Vec::new()) } else { None },
                 thinking: cli.thinking.as_deref().and_then(|t| t.parse().ok()),
                 ..Default::default()
             };
@@ -2158,6 +2185,7 @@ async fn run(
             cwd.clone(),
             runtime_handle.clone(),
             ask_tool,
+            Some(mcp_manager),
         )
         .await
     } else {
@@ -7908,6 +7936,7 @@ async fn run_interactive_mode(
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     ask_tool: Option<pi::ask::AskTool>,
+    mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(initial) = initial {
@@ -7944,6 +7973,7 @@ async fn run_interactive_mode(
         cwd,
         runtime_handle,
         ask_tool,
+        mcp_manager,
     )
     .await;
     // Explicitly shut down extension runtimes so the QuickJS GC can

@@ -63,6 +63,13 @@ impl TransportError {
         }
     }
 
+    /// Taxonomy code for the MCP flavor of this transport (same classes,
+    /// MCP_ prefix so failures name the right subsystem).
+    #[must_use]
+    pub fn mcp_code(&self) -> String {
+        self.code().replace("LSP_", "MCP_")
+    }
+
     /// Human-readable summary.
     #[must_use]
     pub fn message(&self) -> String {
@@ -83,11 +90,10 @@ pub struct ServerNotification {
 
 /// How a spawned server's environment is composed.
 ///
-/// Language servers are first-party dev tools: they inherit the ambient
-/// environment (toolchains need HOME/PATH), with build-redirecting vars
-/// scrubbed. MCP servers are third-party code: they get an explicit
-/// allowlist plus their config `env` (never ambient inheritance), per the
-/// MCP client's security posture (bd-cv653.6.1).
+/// Language servers inherit the ambient environment minus scrubbed vars
+/// (toolchains need HOME/PATH). MCP servers are third-party code: an
+/// explicit allowlist plus their config `env`, never ambient inheritance
+/// (bd-cv653.6.1).
 #[derive(Debug, Clone)]
 pub enum EnvPolicy {
     /// Inherit the ambient environment, then remove the named vars.
@@ -209,14 +215,16 @@ impl TailBuffer {
     }
 }
 
-/// Poll a request-completion receiver with a tick loop until it resolves,
-/// the deadline passes, or the ambient context cancels. On timeout/cancel
-/// the caller-provided `on_abandon` runs (used to send `$/cancelRequest`).
+/// Poll a request-completion receiver until it resolves, the deadline
+/// passes, or the ambient context cancels.
 ///
-/// This is the shared wait discipline used by both the LSP client and the
-/// MCP stdio transport (bd-cv653.1.1 / bd-cv653.6.1).
+/// On timeout/cancel the caller-provided `on_abandon` runs (used to send
+/// `$/cancelRequest`). The receiver is taken by value: `Receiver<T>` is
+/// `Send` but not `Sync`, so a by-reference wait would make the caller's
+/// future non-`Send`. Shared by the LSP client and the MCP stdio transport
+/// (bd-cv653.1.1 / bd-cv653.6.1).
 pub async fn await_completion<T>(
-    rx: &StdReceiver<T>,
+    rx: StdReceiver<T>,
     timeout: std::time::Duration,
     on_abandon: impl FnOnce(),
 ) -> std::result::Result<T, CompletionWaitError> {
@@ -258,6 +266,75 @@ pub enum CompletionWaitError {
     Cancelled,
     /// The sender dropped without sending.
     Closed,
+}
+
+/// Apply the environment policy and the caller's env entries to a command.
+fn apply_env_policy(cmd: &mut Command, policy: &EnvPolicy, env: &[(String, String)]) {
+    match policy {
+        EnvPolicy::InheritAndScrub(scrub) => {
+            // Ambient inheritance minus the scrubbed vars. The
+            // CARGO_TARGET_DIR scrub keeps server-embedded build runs
+            // (rust-analyzer flycheck, cargo metadata) out of foreign,
+            // possibly lock-contended, shared target pools.
+            for var in *scrub {
+                cmd.env_remove(var);
+            }
+        }
+        EnvPolicy::Allowlist(allowlist) => {
+            // No ambient inheritance: only allowlisted vars plus the
+            // caller's (secret-resolved) env entries.
+            cmd.env_clear();
+            for var in *allowlist {
+                if let Some(value) = std::env::var_os(var) {
+                    cmd.env(var, value);
+                }
+            }
+        }
+    }
+    // The caller's env applies last in both policies (overrides).
+    cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+}
+
+/// Build the reader-thread body: parse frames, complete pending requests,
+/// queue notifications, answer server→client requests. On exit the
+/// transport flips dead and every pending request fails fast.
+#[allow(clippy::too_many_arguments)]
+fn reader_loop(
+    stdout: std::process::ChildStdout,
+    pending: std::sync::Arc<PendingMap>,
+    alive: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    writer: std::sync::Arc<SharedWriter>,
+    stderr_tail: std::sync::Arc<Mutex<TailBuffer>>,
+    notification_tx: StdSyncSender<ServerNotification>,
+    dropped: std::sync::Arc<AtomicU64>,
+    handler: std::sync::Arc<Mutex<Option<ServerRequestHandler>>>,
+) -> impl FnOnce() + Send + 'static {
+    move || {
+        let mut reader = BufReader::new(stdout);
+        let close_reason = loop {
+            match read_frame(&mut reader) {
+                Ok(Some(message)) => {
+                    handle_message(
+                        &message,
+                        &pending,
+                        &writer,
+                        &notification_tx,
+                        &dropped,
+                        &stderr_tail,
+                        &handler,
+                    );
+                }
+                Ok(None) => break "server closed stdout (EOF)".to_string(),
+                Err(err) => break format!("frame read error: {err}"),
+            }
+        };
+        alive.store(false, Ordering::SeqCst);
+        // Fail every outstanding request so waiters wake immediately.
+        let mut pending = lock(&pending);
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(TransportError::Closed(close_reason.clone())));
+        }
+    }
 }
 
 /// One JSON-RPC connection to a language-server child process.
@@ -317,29 +394,7 @@ impl JsonRpcClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        match policy {
-            EnvPolicy::InheritAndScrub(scrub) => {
-                // Ambient inheritance minus the scrubbed vars. The
-                // CARGO_TARGET_DIR scrub keeps server-embedded build runs
-                // (rust-analyzer flycheck, cargo metadata) out of foreign,
-                // possibly lock-contended, shared target pools.
-                for var in *scrub {
-                    cmd.env_remove(var);
-                }
-            }
-            EnvPolicy::Allowlist(allowlist) => {
-                // No ambient inheritance: only allowlisted vars plus the
-                // caller's (secret-resolved) env entries.
-                cmd.env_clear();
-                for var in *allowlist {
-                    if let Some(value) = std::env::var_os(var) {
-                        cmd.env(var, value);
-                    }
-                }
-            }
-        }
-        // The caller's env applies last in both policies (overrides).
-        cmd.envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        apply_env_policy(&mut cmd, policy, env);
         let mut child: Child = cmd.spawn().map_err(|err| {
             Error::tool(
                 flavor,
@@ -378,38 +433,16 @@ impl JsonRpcClient {
         // Reader thread: parse frames, complete pending requests, queue
         // notifications, answer server->client requests with null.
         {
-            let pending = std::sync::Arc::clone(&pending);
-            let alive = std::sync::Arc::clone(&alive);
-            let writer = std::sync::Arc::clone(&writer);
-            let stderr_tail = std::sync::Arc::clone(&stderr_tail);
-            let dropped = std::sync::Arc::clone(&dropped_notifications);
-            let handler = std::sync::Arc::clone(&server_request_handler);
-            let reader_body = move || {
-                let mut reader = BufReader::new(stdout);
-                let close_reason = loop {
-                    match read_frame(&mut reader) {
-                        Ok(Some(message)) => {
-                            handle_message(
-                                &message,
-                                &pending,
-                                &writer,
-                                &notification_tx,
-                                &dropped,
-                                &stderr_tail,
-                                &handler,
-                            );
-                        }
-                        Ok(None) => break "server closed stdout (EOF)".to_string(),
-                        Err(err) => break format!("frame read error: {err}"),
-                    }
-                };
-                alive.store(false, Ordering::SeqCst);
-                // Fail every outstanding request so waiters wake immediately.
-                let mut pending = lock(&pending);
-                for (_, sender) in pending.drain() {
-                    let _ = sender.send(Err(TransportError::Closed(close_reason.clone())));
-                }
-            };
+            let reader_body = reader_loop(
+                stdout,
+                std::sync::Arc::clone(&pending),
+                std::sync::Arc::clone(&alive),
+                std::sync::Arc::clone(&writer),
+                std::sync::Arc::clone(&stderr_tail),
+                notification_tx,
+                std::sync::Arc::clone(&dropped_notifications),
+                std::sync::Arc::clone(&server_request_handler),
+            );
             // Intentional detach: the reader exits on pipe EOF when the child dies.
             std::thread::spawn(reader_body); // ubs:ignore intentional detach (EOF-exit)
         }

@@ -1969,6 +1969,16 @@ impl AuthStorage {
 }
 
 /// Resolve an API key string that may contain a `$ENV:VAR_NAME` or
+/// `$CMD:shell command` prefix (crate-internal: MCP server env/header
+/// resolution reuses this — bd-cv653.6.1).
+///
+/// Returns `None` when the reference points at an unset/empty value.
+/// Returns `Err` for malformed references or command failures.
+pub(crate) fn resolve_secret_reference(raw: &str) -> std::result::Result<Option<String>, String> {
+    resolve_api_key_source(raw)
+}
+
+/// Resolve an API key string that may contain a `$ENV:VAR_NAME` or
 /// `$CMD:shell command` prefix.
 ///
 /// - Plain string → returned as-is (backward compatible literal key)

@@ -227,7 +227,7 @@ impl TrustStore {
             .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] serialize failed: {err}")))?;
         // Atomic write: temp + rename in the same directory.
         let mut temp =
-            tempfile::NamedTempFile::new_in(self.path.parent().unwrap_or(Path::new(".")))
+            tempfile::NamedTempFile::new_in(self.path.parent().unwrap_or_else(|| Path::new(".")))
                 .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] temp file: {err}")))?;
         std::io::Write::write_all(&mut temp, rendered.as_bytes())
             .map_err(|err| Error::tool("mcp", format!("[MCP_TRUST_IO] write: {err}")))?;
@@ -238,7 +238,7 @@ impl TrustStore {
 
     /// Read-only view of all records (for `/mcp` listing).
     #[must_use]
-    pub fn records(&self) -> &HashMap<String, TrustRecord> {
+    pub const fn records(&self) -> &HashMap<String, TrustRecord> {
         &self.servers
     }
 }

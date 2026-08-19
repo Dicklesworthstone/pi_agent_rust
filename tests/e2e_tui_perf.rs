@@ -151,6 +151,7 @@ fn build_perf_app(harness: &TestHarness, messages: Vec<ConversationMessage>) -> 
         Some(KeyBindings::new()),
         messages,
         Usage::default(),
+        None,
     );
     app.set_terminal_size(120, 40);
     app

@@ -190,6 +190,7 @@ fn build_app_with_session_and_config(
         Some(KeyBindings::new()),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     app
@@ -274,6 +275,7 @@ fn build_app_with_session_and_events_and_extension(
         Some(KeyBindings::new()),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     (app, event_rx)
@@ -328,6 +330,7 @@ fn build_app_with_models(
         Some(keybindings),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     app
@@ -403,6 +406,7 @@ fn build_app_with_session_and_events_and_config(
         Some(KeyBindings::new()),
         messages,
         usage,
+        None,
     );
     app.set_terminal_size(80, 24);
     (app, event_rx)

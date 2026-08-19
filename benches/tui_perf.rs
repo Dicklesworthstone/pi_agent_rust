@@ -163,6 +163,7 @@ fn create_bench_app() -> PiApp {
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     );
     app.set_terminal_size(120, 40);
     app

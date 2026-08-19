@@ -63,6 +63,13 @@ name = "pi_legacy_capture"
 path = "src/bin/pi_legacy_capture.rs"
 required-features = ["internal-legacy-capture"]
 
+# DEV-ONLY MCP fixture server (bd-cv653.6.1): speaks the MCP stdio handshake
+# with canned tools for the mcp e2e lanes. Never shipped to end users.
+[[bin]]
+name = "pi_mcp_fixture"
+path = "src/bin/pi_mcp_fixture.rs"
+required-features = ["internal-mcp-fixture"]
+
 # Examples (moved from src/bin/ to examples/)
 # These binaries are accessible via: cargo run --example <name>
 
@@ -433,6 +440,10 @@ fuzzing = []
 # single integration test that executes it is gated at the test-function level
 # so the rest of that target remains in ordinary test runs.
 internal-legacy-capture = []
+# Internal-only MCP fixture server (bd-cv653.6.1): a tiny stdio JSON-RPC
+# binary used by the MCP client e2e lanes. Non-default so end-user installs
+# only get `pi`.
+internal-mcp-fixture = []
 # Opt-in loom model-checking lane. These tests are excluded from default
 # all-target gates because loom explores scheduler interleavings aggressively.
 loom-tests = []

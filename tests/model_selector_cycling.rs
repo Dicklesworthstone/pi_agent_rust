@@ -158,6 +158,7 @@ fn build_app_with_models_and_config(
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     );
     app.set_terminal_size(80, 24);
     app

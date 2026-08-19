@@ -116,7 +116,7 @@ impl SlashCommand {
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload session HTML to a secret GitHub gist and show URL
-  /mcp               - Show MCP server status (Model Context Protocol)
+  /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /exit, /quit, /q   - Exit Pi
@@ -2936,7 +2936,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             .map(str::to_string);
         match sub.as_str() {
             "" | "status" => {
-                let paused = crate::advisor::ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst);
+                let paused =
+                    crate::advisor::ADVISOR_PAUSED.load(std::sync::atomic::Ordering::SeqCst);
                 let state = match (&configured, paused) {
                     (Some(spec), false) => format!("active on {spec}"),
                     (Some(spec), true) => format!("configured ({spec}) but paused"),
@@ -3208,54 +3209,77 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
-    /// Show MCP (Model Context Protocol) server status.
+    /// MCP (Model Context Protocol) server management: list, add, remove,
+    /// test, trust lifecycle (bd-cv653.6.1).
     ///
-    /// Pi connects to MCP servers only when an installed extension registers
-    /// them via `registerMcpServer`. It does *not* read standalone MCP config
-    /// files such as `.agents/mcp.json`, `.pi/mcp.json`, or
-    /// `~/.pi/agent/mcp.json` (those are honored by other agents, not Pi), so
-    /// this command makes the current state explicit instead of leaving
-    /// `/mcp` as an "unknown command" (pi_agent_rust#112).
-    pub(super) fn handle_slash_mcp(&mut self, _args: &str) -> Option<Cmd> {
-        let servers = self
-            .extensions
-            .as_ref()
-            .map(crate::extensions::ExtensionManager::extension_mcp_servers)
-            .unwrap_or_default();
-
-        let mut content = String::from("MCP servers (Model Context Protocol)\n");
-        if servers.is_empty() {
-            content.push_str("\n  No MCP servers are currently registered.\n");
-        } else {
-            let _ = writeln!(content, "\n  {} registered:", servers.len());
-            for server in &servers {
-                let name = server
-                    .get("name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("<unnamed>");
-                let target = server
-                    .get("url")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| {
-                        server
-                            .get("command")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| "<no url/command>".to_string());
-                let _ = writeln!(content, "    • {name} — {target}");
+    /// One client registry unifies three config sources: native files
+    /// (`.pi/mcp.json`, `.agents/mcp.json`, `~/.pi/agent/mcp.json`,
+    /// `--mcp-config`), foreign files (`.claude/`, `.cursor/`, ...), and
+    /// extension-registered specs. Server processes are capability-equivalent
+    /// to `exec`: they never spawn until acknowledged via `/mcp trust`.
+    pub(super) fn handle_slash_mcp(&mut self, args: &str) -> Option<Cmd> {
+        let Some(manager) = self.mcp_manager.clone() else {
+            self.messages.push(ConversationMessage {
+                role: MessageRole::System,
+                content: "MCP client is unavailable (bootstrap failed at startup).".to_string(),
+                thinking: None,
+                collapsed: false,
+            });
+            return None;
+        };
+        let mut parts = args.split_whitespace();
+        let subcommand = parts.next().unwrap_or("list");
+        let rest: Vec<&str> = parts.collect();
+        match subcommand {
+            "list" => self.mcp_handle_list(&manager),
+            "add" => self.mcp_handle_add(&rest),
+            "remove" => self.mcp_handle_remove(&rest),
+            "trust" | "deny" | "test" => self.mcp_handle_action(&manager, subcommand, &rest),
+            other => {
+                self.status_message = Some(format!(
+                    "unknown /mcp subcommand {other:?}; expected list|add|remove|test|trust|deny"
+                ));
+                None
             }
         }
+    }
 
-        content.push_str(
-            "\nNote: Pi only loads MCP servers that an installed extension registers via\n\
-             registerMcpServer. It does not read standalone MCP config files\n\
-             (.agents/mcp.json, .pi/mcp.json, ~/.pi/agent/mcp.json) — those are used by\n\
-             other agents, not Pi. To expose an MCP server to Pi, install an extension\n\
-             that registers it.",
-        );
-
+    /// `/mcp list`: every server with provenance, trust state, and health.
+    fn mcp_handle_list(&mut self, manager: &crate::mcp::McpManager) -> Option<Cmd> {
+        let rows = manager.list();
+        let mut content = String::from("MCP servers (Model Context Protocol)\n");
+        if rows.is_empty() {
+            content.push_str(
+                "\n  No MCP servers configured. Add one with:\n\
+                 \x20   /mcp add <name> <command> [args...]     (stdio server)\n\
+                 \x20   /mcp add <name> --url <https://...>     (HTTP server)\n\
+                 or create .pi/mcp.json. Foreign configs (.claude/mcp.json,\n\
+                 .cursor/mcp.json, ...) are discovered automatically.\n",
+            );
+        } else {
+            let _ = writeln!(content, "\n  {} configured:", rows.len());
+            for row in &rows {
+                let _ = writeln!(
+                    content,
+                    "    • {} — {} [{}; trust: {}; {}]",
+                    row.name, row.target, row.provenance, row.trust, row.health
+                );
+            }
+            if rows.iter().any(|row| row.trust == "pending") {
+                content.push_str(
+                    "\nPending servers never spawn. Acknowledge one with /mcp trust <name>.\n",
+                );
+            }
+        }
+        for warning in manager.warnings() {
+            let _ = writeln!(
+                content,
+                "  ⚠ {}: {} ({})",
+                warning.source_file.display(),
+                warning.entry,
+                warning.reason
+            );
+        }
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
             content,
@@ -3263,6 +3287,163 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             collapsed: false,
         });
         self.scroll_to_last_match("MCP servers");
+        None
+    }
+
+    /// `/mcp add <name> <command...>` or `/mcp add <name> --url <url>`.
+    fn mcp_handle_add(&mut self, rest: &[&str]) -> Option<Cmd> {
+        let Some(name) = rest.first() else {
+            self.status_message = Some(
+                "usage: /mcp add <name> <command...> | /mcp add <name> --url <url>".to_string(),
+            );
+            return None;
+        };
+        let name = (*name).to_string();
+        let entry_value = if rest.get(1) == Some(&"--url") {
+            let Some(url) = rest.get(2) else {
+                self.status_message = Some("/mcp add --url requires a URL".to_string());
+                return None;
+            };
+            serde_json::json!({ "url": url })
+        } else {
+            match rest.get(1) {
+                Some(command) if !command.is_empty() => {
+                    let args: Vec<&str> = rest.iter().skip(2).copied().collect();
+                    serde_json::json!({ "command": command, "args": args })
+                }
+                _ => {
+                    self.status_message = Some("/mcp add requires a command or --url".to_string());
+                    return None;
+                }
+            }
+        };
+        let path = self.cwd.join(".pi/mcp.json");
+        let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
+            value["mcpServers"][&name] = entry_value;
+            crate::mcp::config::write_project_config(&path, &value)
+        });
+        match result {
+            Ok(()) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "Added MCP server {name:?} to {}. It is pending trust — run /mcp trust {name} to allow spawning it (takes effect next session for tool mounting).",
+                        path.display()
+                    ),
+                    thinking: None,
+                    collapsed: false,
+                });
+            }
+            Err(err) => {
+                self.status_message = Some(format!("/mcp add failed: {err}"));
+            }
+        }
+        None
+    }
+
+    /// `/mcp remove <name>`.
+    fn mcp_handle_remove(&mut self, rest: &[&str]) -> Option<Cmd> {
+        let Some(name) = rest.first() else {
+            self.status_message = Some("usage: /mcp remove <name>".to_string());
+            return None;
+        };
+        let name = (*name).to_string();
+        let path = self.cwd.join(".pi/mcp.json");
+        let result = crate::mcp::config::read_project_config(&path).and_then(|mut value| {
+            if let Some(servers) = value["mcpServers"].as_object_mut()
+                && servers.remove(&name).is_none()
+            {
+                return Err(crate::error::Error::tool(
+                    "mcp",
+                    format!("[MCP_UNKNOWN_SERVER] {name:?} is not in {}", path.display()),
+                ));
+            }
+            crate::mcp::config::write_project_config(&path, &value)
+        });
+        match result {
+            Ok(()) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "Removed MCP server {name:?} from {} (takes effect next session).",
+                        path.display()
+                    ),
+                    thinking: None,
+                    collapsed: false,
+                });
+            }
+            Err(err) => self.status_message = Some(format!("/mcp remove failed: {err}")),
+        }
+        None
+    }
+
+    /// `/mcp trust|deny|test <name>` — async via the runtime, reporting back
+    /// as a system message; newly available tools mount into the live agent.
+    fn mcp_handle_action(
+        &mut self,
+        manager: &std::sync::Arc<crate::mcp::McpManager>,
+        subcommand: &str,
+        rest: &[&str],
+    ) -> Option<Cmd> {
+        let Some(name) = rest.first() else {
+            self.status_message = Some(format!("usage: /mcp {subcommand} <name>"));
+            return None;
+        };
+        let name = (*name).to_string();
+        let status_label = name.clone();
+        let subcommand = subcommand.to_string();
+        let status_verb = subcommand.clone();
+        let runtime_handle = self.runtime_handle.clone();
+        let event_tx = self.event_tx.clone();
+        let agent = Arc::clone(&self.agent);
+        let manager = manager.clone();
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        runtime_handle.spawn(async move {
+            let outcome = match subcommand.as_str() {
+                "deny" => manager.deny(&name).await.map(|()| Vec::new()),
+                "test" => manager.test(&name).await,
+                _ => manager.trust(&name).await,
+            };
+            let message = match outcome {
+                Ok(_) if subcommand == "deny" => format!("MCP server {name:?} denied and stopped."),
+                Ok(tools) => {
+                    // Mount any newly available tools into the live agent
+                    // (extend_tools invalidates the def cache).
+                    let wrappers = crate::mcp::mount_tools(&manager);
+                    let mounted = wrappers.len();
+                    if mounted > 0
+                        && let Ok(mut agent) = agent.lock(&task_cx).await
+                    {
+                        agent.extend_tools(wrappers);
+                    }
+                    let verb = if subcommand == "test" {
+                        "tested"
+                    } else {
+                        "trusted"
+                    };
+                    let mut line = format!(
+                        "MCP server {name:?} {verb}: {} tool(s) available.",
+                        tools.len()
+                    );
+                    for tool in tools.iter().take(12) {
+                        let _ = writeln!(line, "  • {} — {}", tool.name, tool.description);
+                    }
+                    if tools.len() > 12 {
+                        let _ = writeln!(line, "  … and {} more", tools.len() - 12);
+                    }
+                    if mounted > 0 {
+                        let _ = writeln!(
+                            line,
+                            "Mounted {mounted} mcp__* tool(s) into the live session."
+                        );
+                    }
+                    line
+                }
+                Err(err) => format!("MCP {name:?}: {err}"),
+            };
+            let _ = enqueue_pi_event(&event_tx, &task_cx, PiMsg::System(message)).await;
+        });
+        self.status_message = Some(format!("MCP {status_verb} {status_label:?} started…"));
         None
     }
 

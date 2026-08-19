@@ -1667,6 +1667,7 @@ pub async fn run_interactive(
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     ask_tool: Option<crate::ask::AskTool>,
+    mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
 ) -> anyhow::Result<()> {
     let should_check_for_updates = config.should_check_for_updates();
     let show_hardware_cursor = config
@@ -1786,6 +1787,7 @@ pub async fn run_interactive(
             None,
             messages,
             usage,
+            mcp_manager,
         ));
         app.ask_tool = ask_tool;
         let mut program = Program::new(app)
@@ -2405,6 +2407,9 @@ pub struct PiApp {
     // Extension system
     extensions: Option<ExtensionManager>,
 
+    // MCP client registry (bd-cv653.6.1); None when bootstrap failed.
+    mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
+
     // Keybindings for action dispatch
     keybindings: crate::keybindings::KeyBindings,
 
@@ -2539,6 +2544,7 @@ impl PiApp {
         keybindings_override: Option<KeyBindings>,
         messages: Vec<ConversationMessage>,
         total_usage: Usage,
+        mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
     ) -> Self {
         // Get terminal size
         let (term_width, term_height) =
@@ -2729,6 +2735,7 @@ impl PiApp {
             bash_running: false,
             pending_oauth: None,
             extensions,
+            mcp_manager,
             keybindings,
             role_model_overrides: std::collections::HashMap::new(),
             title_model_entry,

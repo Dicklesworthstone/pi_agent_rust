@@ -17,6 +17,7 @@ files = [
     "algorithms",
     "ast_tools",
     "lsp",
+    "mcp",
     "bench_schema",
     "branch_edge_failure_coverage",
     "ci_artifact_retention",

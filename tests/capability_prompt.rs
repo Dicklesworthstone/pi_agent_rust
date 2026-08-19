@@ -148,6 +148,7 @@ fn build_app(harness: &TestHarness, extensions: Option<ExtensionManager>) -> PiA
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     );
     app.set_terminal_size(80, 24);
     app

@@ -3,6 +3,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionCliFlag {
@@ -473,6 +474,12 @@ pub struct Cli {
     /// Load extension file (can use multiple times)
     #[arg(short = 'e', long, action = clap::ArgAction::Append)]
     pub extension: Vec<String>,
+
+    /// Extra MCP server config file (can be repeated; highest precedence
+    /// over .pi/mcp.json, .agents/mcp.json, ~/.pi/agent/mcp.json, and
+    /// discovered foreign configs)
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+    pub mcp_config: Vec<PathBuf>,
 
     /// Disable extension discovery
     #[arg(long)]
