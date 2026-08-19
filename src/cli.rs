@@ -1178,6 +1178,7 @@ mod tests {
                 "ask",
                 "todo",
                 "submit_plan",
+                "jobs",
             ]
         );
     }

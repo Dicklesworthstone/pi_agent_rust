@@ -6961,14 +6961,25 @@ impl Tool for BashTool {
         // already classified the command; detached jobs run under the same
         // timeout/tree-kill discipline via the jobs registry.
         if input.background.unwrap_or(false) {
-            let job = crate::jobs::spawn_background(
+            let job = match crate::jobs::spawn_background(
                 &self.cwd,
                 self.shell_path.as_deref(),
                 self.command_prefix.as_deref(),
                 &input.command,
                 input.timeout,
                 self.artifact_root.as_deref(),
-            )?;
+            ) {
+                Ok(job) => job,
+                Err(err) => {
+                    // Named refusals (PI_JOBS_AT_CAPACITY, …) surface as a
+                    // tool result the model can read, not a transport error.
+                    return Ok(ToolOutput {
+                        content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
+                        details: None,
+                        is_error: true,
+                    });
+                }
+            };
             let details = serde_json::to_value(&job)?;
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(format!(
@@ -7066,6 +7077,7 @@ struct JobsInput {
 pub struct JobsTool;
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for JobsTool {
     fn name(&self) -> &str {
         "jobs"

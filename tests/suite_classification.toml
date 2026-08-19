@@ -111,6 +111,8 @@ files = [
     "incident_evidence_bundle_sec53",
     "install_time_security_scanner",
     "interactive_commands_unit",
+    "jobs",
+    "bash_mediation",
     "json_mode_parity",
     "ledger_calibration_sec35",
     "policy_profile_hardening",

@@ -171,8 +171,7 @@ fn registry() -> &'static Mutex<JobRegistry> {
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
 fn running_count(reg: &JobRegistry) -> usize {
@@ -188,6 +187,7 @@ fn running_count(reg: &JobRegistry) -> usize {
 /// # Errors
 /// Named `PI_JOBS_AT_CAPACITY` when 8 jobs are already running; tool errors
 /// for spawn/artifact failures.
+#[allow(clippy::too_many_lines)]
 pub fn spawn_background(
     cwd: &Path,
     shell_path: Option<&str>,
@@ -259,7 +259,9 @@ pub fn spawn_background(
             ));
         }
         reg.next_id = reg.next_id.saturating_add(1);
-        format!("job-{}", reg.next_id)
+        let next = reg.next_id;
+        drop(reg);
+        format!("job-{next}")
     };
 
     let mut child = cmd
@@ -288,12 +290,12 @@ pub fn spawn_background(
             id.clone(),
             JobEntry {
                 id: id.clone(),
-                command: command.clone(),
+                command,
                 started_at_ms: now_ms(),
                 status: JobStatus::Running,
                 exit_code: None,
                 pid: Some(pid),
-                artifact_path: artifact_path.clone(),
+                artifact_path,
                 tail: std::sync::Arc::clone(&tail),
                 cancel_requested: false,
             },
@@ -314,7 +316,7 @@ pub fn spawn_background(
     // Monitor thread: wait with the timeout/kill escalation, then record the
     // final status and push a completion notice for the follow-up queue.
     let monitor_id = id.clone();
-    std::thread::spawn(move || monitor_job(monitor_id, child, timeout_secs));
+    std::thread::spawn(move || monitor_job(&monitor_id, child, timeout_secs));
 
     let snapshot = {
         let reg = registry()
@@ -344,7 +346,7 @@ fn pump_job_stream<R: Read>(mut reader: R, mut artifact: std::fs::File, tail: &M
     }
 }
 
-fn monitor_job(id: String, mut child: std::process::Child, timeout_secs: Option<u64>) {
+fn monitor_job(id: &str, mut child: std::process::Child, timeout_secs: Option<u64>) {
     let start = Instant::now();
     let timeout = timeout_secs.map(Duration::from_secs);
     let mut terminate_at: Option<Instant> = None;
@@ -370,7 +372,7 @@ fn monitor_job(id: String, mut child: std::process::Child, timeout_secs: Option<
             // TERM first, KILL after the grace window (same escalation as
             // the foreground bash path).
             crate::tools::terminate_process_group_tree(Some(child.id()));
-            mark_status(&id, JobStatus::TimedOut, None);
+            mark_status(id, JobStatus::TimedOut, None);
             terminate_at = Some(now + TERMINATE_GRACE);
         }
 
@@ -382,14 +384,14 @@ fn monitor_job(id: String, mut child: std::process::Child, timeout_secs: Option<
         let cancelled = registry()
             .lock()
             .ok()
-            .and_then(|reg| reg.jobs.get(&id).map(|job| job.cancel_requested))
+            .and_then(|reg| reg.jobs.get(id).map(|job| job.cancel_requested))
             .unwrap_or(false);
         let timed_out = registry()
             .lock()
             .ok()
             .and_then(|reg| {
                 reg.jobs
-                    .get(&id)
+                    .get(id)
                     .map(|job| job.status == JobStatus::TimedOut)
             })
             .unwrap_or(false);
@@ -408,14 +410,14 @@ fn monitor_job(id: String, mut child: std::process::Child, timeout_secs: Option<
             )
         }
     };
-    mark_status(&id, status, code);
+    mark_status(id, status, code);
 
     // Completion notice → follow-up queue (agent sees it next turn boundary).
     let notice = {
         let Ok(reg) = registry().lock() else {
             return;
         };
-        reg.jobs.get(&id).map(|job| {
+        reg.jobs.get(id).map(|job| {
             let snapshot = JobSnapshot::from_entry(job);
             let tail_excerpt: String = snapshot.output_tail.chars().take(4096).collect();
             format!(
@@ -472,10 +474,11 @@ pub fn list() -> Result<Vec<JobSnapshot>> {
 ///
 /// # Errors
 /// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids.
+#[allow(clippy::significant_drop_tightening)]
 pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
     let deadline = Instant::now() + timeout;
     loop {
-        {
+        let settled_snapshot = {
             let reg = registry()
                 .lock()
                 .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
@@ -486,18 +489,26 @@ pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
                 ));
             };
             if job.status.settled() {
-                return Ok(JobSnapshot::from_entry(job));
+                Some(JobSnapshot::from_entry(job))
+            } else {
+                None
             }
+        };
+        if let Some(snapshot) = settled_snapshot {
+            return Ok(snapshot);
         }
         if Instant::now() >= deadline {
-            let reg = registry()
-                .lock()
-                .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
-            let job = reg
-                .jobs
-                .get(id)
-                .ok_or_else(|| Error::tool("jobs", "job vanished".to_string()))?;
-            return Ok(JobSnapshot::from_entry(job));
+            let snapshot = {
+                let reg = registry()
+                    .lock()
+                    .map_err(|_| Error::tool("jobs", "jobs registry poisoned".to_string()))?;
+                let job = reg
+                    .jobs
+                    .get(id)
+                    .ok_or_else(|| Error::tool("jobs", "job vanished".to_string()))?;
+                JobSnapshot::from_entry(job)
+            };
+            return Ok(snapshot);
         }
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -509,6 +520,7 @@ pub fn wait(id: &str, timeout: Duration) -> Result<JobSnapshot> {
 /// # Errors
 /// Named `PI_JOBS_UNKNOWN_ID` for unknown job ids; `PI_JOBS_NOT_RUNNING`
 /// when the job already settled.
+#[allow(clippy::significant_drop_tightening)]
 pub fn cancel(id: &str) -> Result<JobSnapshot> {
     let pid = {
         let mut reg = registry()
