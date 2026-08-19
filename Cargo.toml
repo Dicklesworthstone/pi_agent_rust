@@ -263,7 +263,7 @@ crossbeam-queue = "0.3"
 # decoupling reclaimed ~nothing (lto=true had already dead-stripped them);
 # the 26 MiB budget (src/perf_build.rs BINARY_SIZE_RELEASE_BUDGET_MB) stands
 # with darwin-arm64 release at 24.59 MiB (bd-2ohw2).
-fsqlite = { version = "0.3.5", default-features = false, features = ["native"] }
+fsqlite = { version = "0.3.5", default-features = false, features = ["native", "fts5"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
