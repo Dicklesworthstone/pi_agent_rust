@@ -152,59 +152,60 @@ fn install_globals(
 
     // console.log / console.error append to the per-cell buffer.
     let sink = Rc::clone(console);
-    let log = Func::from(move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
-        let mut buffer = sink.borrow_mut();
-        let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
-        buffer.push_str(&parts.join(" "));
-        buffer.push('\n');
-    });
+    let log = Func::from(
+        move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
+            let mut buffer = sink.borrow_mut();
+            let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
+            buffer.push_str(&parts.join(" "));
+            buffer.push('\n');
+        },
+    );
     let console_obj = rquickjs::Object::new(ctx.clone()).expect("console object");
     console_obj.set("log", log).expect("console.log");
     let sink = Rc::clone(console);
-    let error = Func::from(move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
-        let mut buffer = sink.borrow_mut();
-        let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
-        buffer.push_str(&parts.join(" "));
-        buffer.push('\n');
-    });
+    let error = Func::from(
+        move |value: rquickjs::function::Rest<rquickjs::Coerced<String>>| {
+            let mut buffer = sink.borrow_mut();
+            let parts: Vec<String> = value.0.into_iter().map(|part| part.0).collect();
+            buffer.push_str(&parts.join(" "));
+            buffer.push('\n');
+        },
+    );
     console_obj.set("error", error).expect("console.error");
     globals.set("console", console_obj).expect("console global");
 
-    // tool.<name>(input?) — blocking bridge round-trip to the host.
-    let tool_obj = rquickjs::Object::new(ctx.clone()).expect("tool object");
-    for name in ["read", "grep", "find", "ls"] {
-        let tx = bridge_tx.clone();
-        let func = Func::from(move |ctx: rquickjs::Ctx<'_>, input: rquickjs::function::Opt<rquickjs::Value<'_>>| {
-            let payload = input
-                .0
-                .map(|value| {
-                    let json: Option<String> = ctx
-                        .json_stringify(value)
-                        .ok()
-                        .flatten()
-                        .and_then(|s| s.to_string().ok());
-                    json.and_then(|s| serde_json::from_str(&s).ok())
-                        .unwrap_or_else(|| json!({}))
-                })
-                .unwrap_or_else(|| json!({}));
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx.send(JsBridgeRequest {
-                tool: name.to_string(),
-                input: payload,
-                reply: reply_tx,
-            });
-            match reply_rx.recv_timeout(Duration::from_secs(120)) {
-                Ok(Ok(content)) => Ok(content),
-                Ok(Err(err)) => Err(rquickjs::Exception::throw_message(&ctx, &err)),
-                Err(_) => Err(rquickjs::Exception::throw_message(
-                    &ctx,
-                    "EVAL_BRIDGE_TIMEOUT: host did not answer",
-                )),
-            }
+    // Low-level bridge: (tool, payloadJson) -> content string. Typed as
+    // plain Strings so no JS value lifetimes couple into the closure; the
+    // ergonomic `tool.*` API wraps it in JS below.
+    let tx = bridge_tx.clone();
+    let bridge_fn = Func::from(move |ctx: rquickjs::Ctx<'_>, tool: String, payload: String| {
+        let input: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let _ = tx.send(JsBridgeRequest {
+            tool,
+            input,
+            reply: reply_tx,
         });
-        tool_obj.set(name, func).expect("tool fn");
-    }
-    globals.set("tool", tool_obj).expect("tool global");
+        match reply_rx.recv_timeout(Duration::from_secs(120)) {
+            Ok(Ok(content)) => Ok(content),
+            Ok(Err(err)) => Err(rquickjs::Exception::throw_message(&ctx, &err)),
+            Err(_) => Err(rquickjs::Exception::throw_message(
+                &ctx,
+                "EVAL_BRIDGE_TIMEOUT: host did not answer",
+            )),
+        }
+    });
+    globals.set("__pi_bridge", bridge_fn).expect("bridge fn");
+    let _: () = ctx
+        .eval(
+            r#"globalThis.tool = {
+                read: (path, extra) => __pi_bridge('read', JSON.stringify({ path, ...(extra || {}) })),
+                grep: (pattern, extra) => __pi_bridge('grep', JSON.stringify({ pattern, ...(extra || {}) })),
+                find: (pattern, extra) => __pi_bridge('find', JSON.stringify({ pattern, ...(extra || {}) })),
+                ls: (path, extra) => __pi_bridge('ls', JSON.stringify({ path: path || '.', ...(extra || {}) })),
+            };"#,
+        )
+        .expect("tool wrapper");
 }
 
 fn run_cell(
@@ -221,9 +222,7 @@ fn run_cell(
     };
 
     // Settle a top-level promise by pumping jobs under the same deadline.
-    let value = if let Some(promise) = value.as_object().and_then(|obj| {
-        rquickjs::Promise::from_object(obj.clone()).ok()
-    }) {
+    let value = if let Ok(promise) = rquickjs::Promise::from_value(value.clone()) {
         loop {
             match promise.state() {
                 rquickjs::promise::PromiseState::Pending => {
