@@ -9,7 +9,7 @@
 //! cancellation stay responsive without blocking the runtime (bd-cv653.1.1).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,21 +151,45 @@ pub fn encode_frame(body: &Value) -> Vec<u8> {
 
 /// Read one framed message from `reader`. Returns `Ok(None)` on clean EOF
 /// before any header byte.
-fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value>> {
-    let mut content_length: Option<usize> = None;
-    let mut header_line = Vec::new();
-    loop {
-        header_line.clear();
-        let read = reader.read_until(b'\n', &mut header_line)?;
+/// Read one framed message from `reader`. Returns `Ok(None)` on clean EOF
+/// before any header byte. Crate-public: the DAP transport uses the same
+/// framing (bd-cv653.1.2).
+pub(crate) fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value>> {
+    read_frame_with_scratch(reader, &mut Vec::new())
+}
+
+/// Read one framed message, carrying leftover bytes in `scratch` between
+/// calls. `scratch` holds any over-read bytes from the previous frame.
+pub(crate) fn read_frame_with_scratch(
+    reader: &mut BufReader<impl Read>,
+    scratch: &mut Vec<u8>,
+) -> std::io::Result<Option<Value>> {
+    let trace = std::env::var_os("PI_DAP_TRACE").is_some();
+    let mut chunk = [0u8; 8192];
+    // Phase 1: headers (scratch may already hold some).
+    let body_start = loop {
+        if let Some(pos) = find_subslice(scratch, b"\r\n\r\n") {
+            break pos + 4;
+        }
+        let read = reader.read(&mut chunk)?;
         if read == 0 {
             return Ok(None); // EOF
         }
-        let line = String::from_utf8_lossy(&header_line);
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break; // end of headers
+        scratch.extend_from_slice(&chunk[..read]);
+        if scratch.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headers exceed 64 KiB",
+            ));
         }
-        if let Some(value) = trimmed
+    };
+    let headers = String::from_utf8_lossy(&scratch[..body_start]);
+    if trace {
+        eprintln!("[dap-frame] headers: {headers:?}");
+    }
+    let mut content_length: Option<usize> = None;
+    for line in headers.split("\r\n") {
+        if let Some(value) = line
             .split_once(':')
             .map(|(k, v)| (k.trim(), v.trim()))
             .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
@@ -186,8 +210,28 @@ fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value
             format!("frame body {length} bytes exceeds cap {MAX_FRAME_BYTES}"),
         ));
     }
-    let mut body = vec![0u8; length];
-    reader.read_exact(&mut body)?;
+    // Phase 2: body (scratch already holds the first bytes after headers).
+    let mut body: Vec<u8> = scratch.split_off(body_start);
+    while body.len() < length {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF mid-body",
+            ));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    // Preserve over-read bytes for the next frame.
+    let leftover = body.split_off(length);
+    *scratch = leftover;
+    if trace {
+        eprintln!(
+            "[dap-frame] body {} bytes: {:?}",
+            length,
+            String::from_utf8_lossy(&body[..length.min(120)])
+        );
+    }
     let value = serde_json::from_slice(&body).map_err(|err| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -195,6 +239,14 @@ fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value
         )
     })?;
     Ok(Some(value))
+}
+
+/// Find the first occurrence of `needle` in `hay`.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Bounded tail buffer for server stderr.
@@ -212,6 +264,37 @@ impl TailBuffer {
             let boundary = self.data.ceil_char_boundary(keep_from);
             self.data.drain(..boundary);
         }
+    }
+}
+
+/// Crate-shared bounded tail buffer (the DAP transport reuses it for
+/// adapter stderr and process output — bd-cv653.1.2).
+#[derive(Debug)]
+pub(crate) struct PublicTailBuffer {
+    inner: TailBuffer,
+}
+
+impl PublicTailBuffer {
+    /// A 32 KiB tail buffer.
+    #[must_use]
+    pub(crate) const fn new() -> Self {
+        Self {
+            inner: TailBuffer {
+                data: String::new(),
+                cap: 32 * 1024,
+            },
+        }
+    }
+
+    /// Append, discarding the oldest content past the cap.
+    pub(crate) fn push(&mut self, chunk: &str) {
+        self.inner.push(chunk);
+    }
+
+    /// The retained tail.
+    #[must_use]
+    pub(crate) fn tail(&self) -> String {
+        self.inner.data.clone()
     }
 }
 
@@ -311,8 +394,9 @@ fn reader_loop(
 ) -> impl FnOnce() + Send + 'static {
     move || {
         let mut reader = BufReader::new(stdout);
+        let mut scratch = Vec::new();
         let close_reason = loop {
-            match read_frame(&mut reader) {
+            match read_frame_with_scratch(&mut reader, &mut scratch) {
                 Ok(Some(message)) => {
                     handle_message(
                         &message,

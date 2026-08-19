@@ -106,7 +106,12 @@ fn ra_config(command: &str) -> pi::config::Config {
 /// Drive a borrowed tool future to completion on a fresh current-thread
 /// runtime (no `'static` bound, unlike the shared runtime helper).
 fn block_on_local<Fut: Future>(future: Fut) -> Fut::Output {
-    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+    // enable_parking(false): works around the asupersync scheduler parking
+    // bug that can livelock sleep() wakeups (see tests/common/mod.rs).
+    let runtime = asupersync::runtime::RuntimeBuilder::new()
+        .enable_parking(false)
+        .worker_threads(1)
+        .blocking_threads(1, 8)
         .build()
         .expect("failed to build test runtime");
     runtime.block_on(future)

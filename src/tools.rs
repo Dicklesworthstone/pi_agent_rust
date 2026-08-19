@@ -5230,6 +5230,7 @@ impl ToolRegistry {
                 "ast_grep" => tools.push(Box::new(crate::ast_tools::AstGrepTool::new(cwd))),
                 "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
                 "lsp" => tools.push(Box::new(crate::lsp::LspTool::new(cwd, config))),
+                "debug" => tools.push(Box::new(crate::debug::DebugTool::new(cwd, config))),
                 "subagent" => {
                     let structured_results = config
                         .and_then(|c| c.subagent_structured_results)

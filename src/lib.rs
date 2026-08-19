@@ -97,6 +97,8 @@ pub mod compaction;
 #[doc(hidden)]
 pub mod compaction_worker;
 #[doc(hidden)]
+pub mod debug;
+#[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
 pub mod conformance;

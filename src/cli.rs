@@ -466,7 +466,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "TOOLS",
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,ask,todo,submit_plan"
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan"
     )]
     pub tools: String,
 
@@ -1174,6 +1174,7 @@ mod tests {
                 "ast_grep",
                 "ast_edit",
                 "lsp",
+                "debug",
                 "ask",
                 "todo",
                 "submit_plan",
@@ -1550,7 +1551,7 @@ mod tests {
         assert!(cli.args.is_empty());
         assert_eq!(
             cli.tools,
-            "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,ask,todo,submit_plan"
+            "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan"
         );
     }
 

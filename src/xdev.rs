@@ -123,6 +123,7 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
         "ast_grep",
         "ast_edit",
         "lsp",
+        "debug",
         "ask",
         "todo",
         "submit_plan",
@@ -153,6 +154,7 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "lsp" => {
             "IDE-grade code intelligence (definition, references, rename) via language servers"
         }
+        "debug" => "Drive a real debugger (DAP): launch/attach, breakpoints, step, evaluate",
         "subagent" => "Delegate an isolated task to a named Pi child agent",
         "ask" => "Ask the user structured questions mid-turn instead of guessing",
         "todo" => "Maintain the session task list",
