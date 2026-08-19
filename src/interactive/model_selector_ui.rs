@@ -459,6 +459,7 @@ mod tests {
             Some(KeyBindings::new()),
             Vec::new(),
             Usage::default(),
+            None,
         )
     }
 

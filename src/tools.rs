@@ -5219,6 +5219,10 @@ impl ToolRegistry {
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
+                "github" => tools.push(Box::new(crate::github::GithubTool::new(
+                    cwd,
+                    config.and_then(|c| c.gh_path.as_deref()),
+                ))),
                 // "ask" is session-host-coupled (its picker handler is
                 // installed by the interactive host) and joins via
                 // extend_tools in main.rs/sdk.rs, like "todo".

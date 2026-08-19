@@ -2659,6 +2659,7 @@ mod stream_delta_batcher_tests {
                 Some(KeyBindings::new()),
                 Vec::new(),
                 Usage::default(),
+                None,
             ),
             event_rx,
         )

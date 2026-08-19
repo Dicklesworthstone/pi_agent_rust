@@ -120,6 +120,7 @@ fn build_test_app(cwd: PathBuf) -> PiApp {
         Some(KeyBindings::new()),
         Vec::new(),
         Usage::default(),
+        None,
     )
 }
 

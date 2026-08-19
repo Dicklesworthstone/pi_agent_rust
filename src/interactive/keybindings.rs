@@ -1169,6 +1169,7 @@ mod tests {
                 Some(KeyBindings::new()),
                 Vec::new(),
                 Usage::default(),
+                None,
             ),
             event_rx,
         )

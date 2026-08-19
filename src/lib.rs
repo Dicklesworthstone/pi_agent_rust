@@ -74,6 +74,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
 
 #[doc(hidden)]
 pub mod acp;
+pub mod advisor;
 #[doc(hidden)]
 pub mod agent;
 #[doc(hidden)]
@@ -85,7 +86,6 @@ pub mod ask;
 pub mod ast_tools;
 #[doc(hidden)]
 pub mod auth;
-pub mod advisor;
 #[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]
@@ -150,6 +150,8 @@ pub mod file_lock;
 #[doc(hidden)]
 pub mod flake_classifier;
 #[doc(hidden)]
+pub mod github;
+#[doc(hidden)]
 pub mod hostcall_amac;
 #[doc(hidden)]
 pub mod hostcall_io_uring_lane;
@@ -177,6 +179,8 @@ pub mod interactive_ftui;
 pub mod keybindings;
 #[doc(hidden)]
 pub mod lsp;
+#[doc(hidden)]
+pub mod mcp;
 #[doc(hidden)]
 pub mod migrations;
 #[doc(hidden)]
