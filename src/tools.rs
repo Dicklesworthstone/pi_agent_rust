@@ -5219,6 +5219,7 @@ impl ToolRegistry {
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
+                "eval" => tools.push(Box::new(crate::eval::EvalTool::new(cwd))),
                 "github" => tools.push(Box::new(crate::github::GithubTool::new(
                     cwd,
                     config.and_then(|c| c.gh_path.as_deref()),

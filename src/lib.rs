@@ -117,6 +117,8 @@ pub mod error;
 #[doc(hidden)]
 pub mod error_hints;
 #[doc(hidden)]
+pub mod eval;
+#[doc(hidden)]
 pub mod extension_conformance_matrix;
 #[doc(hidden)]
 pub mod extension_dispatcher;
