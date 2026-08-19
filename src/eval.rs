@@ -18,6 +18,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+mod js_kernel;
+
 /// The kernel server script, shipped inside the binary.
 const PY_KERNEL_SERVER: &str = include_str!("eval/py_kernel_server.py");
 
@@ -141,6 +143,7 @@ pub struct EvalTool {
     cwd: PathBuf,
     python_path: String,
     kernel: Mutex<Option<PyKernel>>,
+    js: Mutex<Option<js_kernel::JsKernel>>,
 }
 
 impl EvalTool {
@@ -151,6 +154,149 @@ impl EvalTool {
             cwd: cwd.to_path_buf(),
             python_path,
             kernel: Mutex::new(None),
+            js: Mutex::new(None),
+        }
+    }
+
+    /// Run one JavaScript cell on the persistent QuickJS kernel. Bridge
+    /// requests re-enter pi tools exactly like the Python path.
+    async fn run_js_cell(&self, code: &str, timeout: Duration) -> Result<ToolOutput> {
+        let kernel = {
+            let mut slot = self
+                .js
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            ;
+            slot.take()
+        };
+        let mut restarted = false;
+        let mut kernel = match kernel {
+            Some(kernel) => kernel,
+            None => {
+                restarted = true;
+                js_kernel::JsKernel::spawn()
+                    .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        let reply_rx = kernel
+            .submit(code.to_string(), deadline)
+            .map_err(|err| Error::tool("eval", format!("EVAL_IO: {err}")))?;
+
+        // Poll for the cell response, servicing bridge requests as they come.
+        let response = loop {
+            if let Ok(bridge) = kernel.bridge.try_recv() {
+                let reply = self.run_bridge_call_parts(&bridge.tool, bridge.input).await;
+                let _ = bridge.reply.send(reply);
+                continue;
+            }
+            match reply_rx.try_recv() {
+                Ok(response) => break response,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // The interrupt handler aborts the CELL at the deadline
+                    // (kernel survives); allow slack, then declare it wedged.
+                    if Instant::now() > deadline + Duration::from_secs(5) {
+                        return Err(Error::tool(
+                            "eval",
+                            "EVAL_TIMEOUT: js kernel wedged past its budget; kernel \
+                             discarded — state was lost, next cell starts fresh",
+                        ));
+                    }
+                    asupersync::time::sleep(
+                        asupersync::time::wall_now(),
+                        Duration::from_millis(15),
+                    )
+                    .await;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(Error::tool(
+                        "eval",
+                        "EVAL_KERNEL_CRASH: the js kernel exited mid-cell — state was \
+                         lost, next cell starts fresh",
+                    ));
+                }
+            }
+        };
+        kernel.cells_run += 1;
+        let cells_run = kernel.cells_run;
+        {
+            let mut slot = self
+                .js
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some(kernel);
+        }
+
+        let mut text = String::new();
+        if restarted && cells_run == 1 {
+            text.push_str("(js kernel started)\n");
+        }
+        if !response.console.is_empty() {
+            text.push_str(&response.console);
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        if response.ok {
+            if let Some(result) = &response.result {
+                text.push_str(result);
+                text.push('\n');
+            }
+            if text.is_empty() {
+                text.push_str("(no output)\n");
+            }
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: Some(json!({
+                    "kernel": "js",
+                    "cell": cells_run,
+                    "restarted": restarted,
+                })),
+                is_error: false,
+            })
+        } else {
+            text.push_str(response.error.as_deref().unwrap_or("?"));
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: Some(json!({
+                    "kernel": "js",
+                    "cell": cells_run,
+                    "restarted": restarted,
+                    "errorKind": "exception",
+                })),
+                is_error: true,
+            })
+        }
+    }
+
+    /// Bridge dispatch shared by both kernels.
+    async fn run_bridge_call_parts(
+        &self,
+        tool_name: &str,
+        input: Value,
+    ) -> std::result::Result<String, String> {
+        let tool: Box<dyn Tool> = match tool_name {
+            "read" => Box::new(crate::tools::ReadTool::new(&self.cwd)),
+            "grep" => Box::new(crate::tools::GrepTool::new(&self.cwd)),
+            "find" => Box::new(crate::tools::FindTool::new(&self.cwd)),
+            "ls" => Box::new(crate::tools::LsTool::new(&self.cwd)),
+            other => {
+                return Err(format!(
+                    "EVAL_BRIDGE_DENIED: tool `{other}` is not on the bridge whitelist (read|grep|find|ls)"
+                ));
+            }
+        };
+        match tool.execute("eval-bridge", input, None).await {
+            Ok(output) => {
+                let mut text = String::new();
+                for block in &output.content {
+                    if let ContentBlock::Text(t) = block {
+                        text.push_str(&t.text);
+                    }
+                }
+                if output.is_error { Err(text) } else { Ok(text) }
+            }
+            Err(err) => Err(err.to_string()),
         }
     }
 
@@ -261,34 +407,9 @@ impl EvalTool {
         let call = bridge.get("call").cloned().unwrap_or(Value::Null);
         let tool_name = bridge.get("tool").and_then(Value::as_str).unwrap_or("");
         let input = bridge.get("input").cloned().unwrap_or_else(|| json!({}));
-        let tool: Box<dyn Tool> = match tool_name {
-            "read" => Box::new(crate::tools::ReadTool::new(&self.cwd)),
-            "grep" => Box::new(crate::tools::GrepTool::new(&self.cwd)),
-            "find" => Box::new(crate::tools::FindTool::new(&self.cwd)),
-            "ls" => Box::new(crate::tools::LsTool::new(&self.cwd)),
-            other => {
-                return json!({
-                    "call": call,
-                    "ok": false,
-                    "error": format!("EVAL_BRIDGE_DENIED: tool `{other}` is not on the bridge whitelist (read|grep|find|ls)"),
-                });
-            }
-        };
-        match tool.execute("eval-bridge", input, None).await {
-            Ok(output) => {
-                let mut text = String::new();
-                for block in &output.content {
-                    if let ContentBlock::Text(t) = block {
-                        text.push_str(&t.text);
-                    }
-                }
-                if output.is_error {
-                    json!({"call": call, "ok": false, "error": text})
-                } else {
-                    json!({"call": call, "ok": true, "content": text})
-                }
-            }
-            Err(err) => json!({"call": call, "ok": false, "error": err.to_string()}),
+        match self.run_bridge_call_parts(tool_name, input).await {
+            Ok(content) => json!({"call": call, "ok": true, "content": content}),
+            Err(error) => json!({"call": call, "ok": false, "error": error}),
         }
     }
 }
@@ -377,8 +498,8 @@ impl Tool for EvalTool {
                 },
                 "kernel": {
                     "type": "string",
-                    "enum": ["python"],
-                    "description": "Kernel to use (python only for now)"
+                    "enum": ["python", "js"],
+                    "description": "Kernel to use (default python)"
                 },
                 "timeout_secs": {
                     "type": "integer",
@@ -403,12 +524,6 @@ impl Tool for EvalTool {
             .get("kernel")
             .and_then(Value::as_str)
             .unwrap_or("python");
-        if kernel != "python" {
-            return Err(Error::tool(
-                "eval",
-                format!("unknown kernel: {kernel} (python only for now; js is tracked)"),
-            ));
-        }
         let timeout = Duration::from_secs(
             input
                 .get("timeout_secs")
@@ -416,7 +531,14 @@ impl Tool for EvalTool {
                 .unwrap_or(DEFAULT_CELL_TIMEOUT_SECS)
                 .clamp(1, 600),
         );
-        self.run_py_cell(code, timeout).await
+        match kernel {
+            "python" => self.run_py_cell(code, timeout).await,
+            "js" => self.run_js_cell(code, timeout).await,
+            other => Err(Error::tool(
+                "eval",
+                format!("unknown kernel: {other} (python|js)"),
+            )),
+        }
     }
 
     fn effects(&self) -> ToolEffects {
