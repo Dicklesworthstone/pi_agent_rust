@@ -112,6 +112,7 @@ files = [
     "install_time_security_scanner",
     "interactive_commands_unit",
     "jobs",
+    "hub",
     "bash_mediation",
     "json_mode_parity",
     "ledger_calibration_sec35",

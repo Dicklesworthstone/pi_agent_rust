@@ -175,6 +175,8 @@ pub mod hostcall_trace_jit;
 pub mod http;
 #[doc(hidden)]
 pub mod http_shim;
+#[doc(hidden)]
+pub mod hub;
 #[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod interactive;

@@ -725,6 +725,8 @@ fn main_impl() -> Result<()> {
     // Background bash jobs are session-scoped (bd-cv653.3.10): kill any
     // survivors so no orphan daemons outlive the session.
     pi::jobs::kill_all();
+    // Non-detached hub services are session-scoped too (bd-cv653.5.4).
+    pi::hub::kill_session_services();
     match result {
         Ok(()) => std::process::exit(0),
         Err(err) => {

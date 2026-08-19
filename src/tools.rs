@@ -5218,6 +5218,7 @@ impl ToolRegistry {
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
                 "jobs" => tools.push(Box::new(JobsTool)),
+                "hub" => tools.push(Box::new(HubTool::new(cwd))),
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
                 "eval" => tools.push(Box::new(crate::eval::EvalTool::new(cwd))),
                 "github" => tools.push(Box::new(crate::github::GithubTool::new(
@@ -7207,6 +7208,418 @@ impl Tool for JobsTool {
             details: Some(payload),
             is_error: false,
         })
+    }
+}
+
+// ============================================================================
+// Hub Tool (bd-cv653.5.4)
+// ============================================================================
+
+/// Input parameters for the hub tool (omp hub parity).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubInput {
+    /// `start` | `ps` | `logs` | `stop` | `restart` | `describe` | `send` |
+    /// `jobs`.
+    op: String,
+    /// Service name (start/ps target). Unique per project directory.
+    name: Option<String>,
+    /// Program to spawn for `start` (omp parity: `application`).
+    application: Option<String>,
+    /// Program arguments for `start`.
+    args: Option<Vec<String>>,
+    /// Working directory for `start` (default: tool cwd).
+    cwd: Option<String>,
+    /// Extra environment for `start` (`{"KEY": "value"}`).
+    env: Option<std::collections::HashMap<String, String>>,
+    /// Readiness gates: log regex AND/OR TCP port, plus timeout seconds.
+    ready: Option<HubReadyInput>,
+    /// Survive session exit (state file re-discovery).
+    detached: Option<bool>,
+    /// `logs`: opaque cursor from a previous page (incremental read).
+    cursor: Option<u64>,
+    /// `logs`: last N lines (snapshot read).
+    tail: Option<usize>,
+    /// `logs`: substring filter.
+    grep: Option<String>,
+    /// `logs`: bounded wait for matching/new lines in milliseconds.
+    wait_ms: Option<u64>,
+    /// `send`: literal text to write to the service's PTY stdin.
+    text: Option<String>,
+    /// `send`: append ENTER after `text` (default true).
+    enter: Option<bool>,
+    /// `send`: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, arrows).
+    keys: Option<Vec<String>>,
+    /// `send`: signal name (SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGKILL).
+    signal: Option<String>,
+    /// `jobs`: list | wait | cancel.
+    action: Option<String>,
+    /// `jobs`: job id for wait/cancel.
+    job_id: Option<String>,
+    /// `jobs`: wait budget in milliseconds.
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HubReadyInput {
+    log: Option<String>,
+    port: Option<u16>,
+    timeout_secs: Option<u64>,
+}
+
+/// Supervise long-running processes (bd-cv653.5.4) and manage background
+/// jobs (bd-cv653.3.10) from one surface. The `messaging` action group
+/// lands with the agent-hub registry (bd-cv653.5.3).
+pub struct HubTool {
+    cwd: PathBuf,
+}
+
+impl HubTool {
+    pub fn new(cwd: &Path) -> Self {
+        Self {
+            cwd: cwd.to_path_buf(),
+        }
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for HubTool {
+    fn name(&self) -> &str {
+        "hub"
+    }
+
+    fn label(&self) -> &str {
+        "hub"
+    }
+
+    fn description(&self) -> &str {
+        "Supervise long-running processes and manage background jobs. A dev \
+         server, watcher, debugger, REPL, or any process needing later input \
+         MUST use hub, not bash. Ops: `start` (spawn with optional readiness \
+         gates: ready.log regex AND ready.port TCP accept, both must pass \
+         within ready.timeoutSecs — start returns only after readiness is \
+         observed), `ps` (list services), `logs` (tail/grep/incremental \
+         cursor reads with bounded wait), `send` (PTY stdin: text, named \
+         keys, signals), `stop` (graceful tree termination), `restart` \
+         (retained launch spec), `describe` (full descriptor), `jobs` \
+         (background bash jobs: list/wait/cancel)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs"],
+                    "description": "Operation"
+                },
+                "name": { "type": "string", "description": "Service name (unique per project)" },
+                "application": { "type": "string", "description": "Program to spawn (start)" },
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (start)" },
+                "cwd": { "type": "string", "description": "Working directory (start; default: session cwd)" },
+                "env": { "type": "object", "description": "Extra environment (start)" },
+                "ready": {
+                    "type": "object",
+                    "properties": {
+                        "log": { "type": "string", "description": "Regex that must match service output" },
+                        "port": { "type": "integer", "description": "TCP port on 127.0.0.1 that must accept" },
+                        "timeoutSecs": { "type": "integer", "description": "Readiness budget (default 30)" }
+                    },
+                    "description": "Readiness gates; all supplied gates must pass"
+                },
+                "detached": { "type": "boolean", "description": "Survive session exit (default false)" },
+                "cursor": { "type": "integer", "description": "logs: opaque cursor for incremental reads" },
+                "tail": { "type": "integer", "description": "logs: last N lines" },
+                "grep": { "type": "string", "description": "logs: substring filter" },
+                "waitMs": { "type": "integer", "description": "logs: bounded wait in ms (max 60000)" },
+                "text": { "type": "string", "description": "send: text for PTY stdin" },
+                "enter": { "type": "boolean", "description": "send: append ENTER after text (default true)" },
+                "keys": { "type": "array", "items": { "type": "string" }, "description": "send: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT)" },
+                "signal": { "type": "string", "description": "send: SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL" },
+                "action": { "type": "string", "enum": ["list", "wait", "cancel"], "description": "jobs: action" },
+                "jobId": { "type": "string", "description": "jobs: job id for wait/cancel" },
+                "timeoutMs": { "type": "integer", "description": "jobs: wait budget in ms" }
+            },
+            "required": ["op"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::process()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: HubInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let op = input.op.trim().to_ascii_lowercase();
+        let dispatched = self.dispatch(&op, &input);
+        let (text, details, is_error) = match dispatched {
+            Ok((text, details)) => (text, details, false),
+            Err(err) => {
+                // Domain refusals (PI_HUB_*) surface as tool results the
+                // model can read, matching the jobs capacity contract.
+                (
+                    err.to_string(),
+                    serde_json::json!({ "error": err.to_string() }),
+                    true,
+                )
+            }
+        };
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(details),
+            is_error,
+        })
+    }
+}
+
+impl HubTool {
+    #[allow(clippy::too_many_lines)]
+    fn dispatch(&self, op: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
+        let name_required = |op: &str| -> Result<String> {
+            input
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| Error::validation(format!("hub {op} requires name")))
+        };
+        let (text, details) = match op {
+            "start" => {
+                let name = name_required("start")?;
+                let application = input
+                    .application
+                    .clone()
+                    .filter(|app| !app.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::validation("hub start requires application".to_string())
+                    })?;
+                let cwd = input
+                    .cwd
+                    .as_deref()
+                    .map_or_else(|| self.cwd.clone(), PathBuf::from);
+                let ready = input.ready.as_ref().map(|ready| crate::hub::ReadySpec {
+                    log: ready.log.clone(),
+                    port: ready.port,
+                    timeout_secs: ready.timeout_secs,
+                });
+                let spec = crate::hub::LaunchSpec {
+                    name: name.clone(),
+                    program: application,
+                    args: input.args.clone().unwrap_or_default(),
+                    cwd,
+                    env: input.env.clone().unwrap_or_default().into_iter().collect(),
+                    ready,
+                    detached: input.detached.unwrap_or(false),
+                };
+                let snapshot = crate::hub::start(&spec)?;
+                let details = serde_json::to_value(&snapshot)?;
+                let text = format!(
+                    "Service '{name}' is running (pid {}, log: {}).",
+                    snapshot
+                        .pid
+                        .map_or_else(|| "?".to_string(), |pid| pid.to_string()),
+                    snapshot.log_path
+                );
+                (text, details)
+            }
+            "ps" => {
+                let services = crate::hub::ps()?;
+                let details = serde_json::json!({
+                    "schema": crate::hub::SERVICE_SCHEMA,
+                    "services": services,
+                });
+                let text = if services.is_empty() {
+                    "No supervised services this session.".to_string()
+                } else {
+                    let lines: Vec<String> = services
+                        .iter()
+                        .map(|svc| {
+                            format!(
+                                "{}: {} (pid {}, command `{}`, log {})",
+                                svc.name,
+                                svc.status,
+                                svc.pid
+                                    .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
+                                svc.command,
+                                svc.log_path
+                            )
+                        })
+                        .collect();
+                    format!("{} service(s):\n{}", services.len(), lines.join("\n"))
+                };
+                (text, details)
+            }
+            "logs" => {
+                let name = name_required("logs")?;
+                let page = crate::hub::logs(
+                    &name,
+                    input.cursor,
+                    input.tail,
+                    input.grep.as_deref(),
+                    input.wait_ms.unwrap_or(0),
+                )?;
+                let details = serde_json::to_value(&page)?;
+                let mut text = page.lines.join("\n");
+                if text.is_empty() {
+                    text = "(no new lines)".to_string();
+                }
+                (text, details)
+            }
+            "stop" => {
+                let name = name_required("stop")?;
+                let snapshot = crate::hub::stop(&name)?;
+                let details = serde_json::to_value(&snapshot)?;
+                (
+                    format!("Service '{name}' stopped (status: {}).", snapshot.status),
+                    details,
+                )
+            }
+            "restart" => {
+                let name = name_required("restart")?;
+                let snapshot = crate::hub::restart(&name)?;
+                let details = serde_json::to_value(&snapshot)?;
+                (
+                    format!("Service '{name}' restarted (status: {}).", snapshot.status),
+                    details,
+                )
+            }
+            "describe" => {
+                let name = name_required("describe")?;
+                let snapshot = crate::hub::describe(&name)?;
+                let details = serde_json::to_value(&snapshot)?;
+                (
+                    serde_json::to_string_pretty(&snapshot).unwrap_or_default(),
+                    details,
+                )
+            }
+            "send" => {
+                let name = name_required("send")?;
+                let mut actions = Vec::new();
+                if let Some(text) = input.text.as_deref() {
+                    crate::hub::send_text(&name, text, input.enter.unwrap_or(true))?;
+                    actions.push(format!("sent {} byte(s) of text", text.len()));
+                }
+                if let Some(keys) = input.keys.as_ref()
+                    && !keys.is_empty()
+                {
+                    crate::hub::send_keys(&name, keys)?;
+                    actions.push(format!("sent keys: {}", keys.join(", ")));
+                }
+                if let Some(signal) = input.signal.as_deref() {
+                    let mapped = match signal.to_ascii_uppercase().as_str() {
+                        "SIGINT" => sysinfo::Signal::Interrupt,
+                        "SIGTERM" => sysinfo::Signal::Term,
+                        "SIGHUP" => sysinfo::Signal::Hangup,
+                        "SIGQUIT" => sysinfo::Signal::Quit,
+                        "SIGKILL" => sysinfo::Signal::Kill,
+                        other => {
+                            return Err(Error::validation(format!(
+                                "Unknown signal '{other}'; expected SIGINT, SIGTERM, SIGHUP, \
+                                 SIGQUIT, or SIGKILL"
+                            )));
+                        }
+                    };
+                    crate::hub::send_signal(&name, mapped)?;
+                    actions.push(format!("sent {}", signal.to_ascii_uppercase()));
+                }
+                if actions.is_empty() {
+                    return Err(Error::validation(
+                        "hub send requires text, keys, or signal".to_string(),
+                    ));
+                }
+                let details = serde_json::json!({
+                    "schema": "pi.hub.send.v1",
+                    "name": name,
+                    "actions": actions,
+                });
+                (format!("To '{name}': {}", actions.join("; ")), details)
+            }
+            "jobs" => {
+                let action = input
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| "list".to_string())
+                    .to_ascii_lowercase();
+                match action.as_str() {
+                    "list" => {
+                        let jobs = crate::jobs::list()?;
+                        let details = serde_json::json!({
+                            "schema": crate::jobs::JOB_SCHEMA,
+                            "jobs": jobs,
+                        });
+                        let text = if jobs.is_empty() {
+                            "No background jobs this session.".to_string()
+                        } else {
+                            let lines: Vec<String> = jobs
+                                .iter()
+                                .map(|job| {
+                                    format!(
+                                        "{}: {} (exit {})",
+                                        job.id,
+                                        job.status,
+                                        job.exit_code.map_or_else(
+                                            || "n/a".to_string(),
+                                            |code| code.to_string()
+                                        )
+                                    )
+                                })
+                                .collect();
+                            format!("{} background job(s):\n{}", jobs.len(), lines.join("\n"))
+                        };
+                        (text, details)
+                    }
+                    "wait" => {
+                        let job_id = input.job_id.clone().ok_or_else(|| {
+                            Error::validation("hub jobs wait requires jobId".to_string())
+                        })?;
+                        let budget = input.timeout_ms.unwrap_or(30_000).min(600_000);
+                        let snapshot =
+                            crate::jobs::wait(&job_id, std::time::Duration::from_millis(budget))?;
+                        let details = serde_json::to_value(&snapshot)?;
+                        (
+                            format!(
+                                "job {}: {} (exit {})",
+                                snapshot.id,
+                                snapshot.status,
+                                snapshot
+                                    .exit_code
+                                    .map_or_else(|| "n/a".to_string(), |code| code.to_string())
+                            ),
+                            details,
+                        )
+                    }
+                    "cancel" => {
+                        let job_id = input.job_id.clone().ok_or_else(|| {
+                            Error::validation("hub jobs cancel requires jobId".to_string())
+                        })?;
+                        let snapshot = crate::jobs::cancel(&job_id)?;
+                        let details = serde_json::to_value(&snapshot)?;
+                        (format!("job {}: {}", snapshot.id, snapshot.status), details)
+                    }
+                    other => {
+                        return Err(Error::validation(format!(
+                            "Unknown jobs action '{other}'; expected list, wait, or cancel"
+                        )));
+                    }
+                }
+            }
+            other => {
+                return Err(Error::validation(format!(
+                    "Unknown hub op '{other}'; expected start, ps, logs, stop, restart, \
+                     describe, send, or jobs"
+                )));
+            }
+        };
+        Ok((text, details))
     }
 }
 
