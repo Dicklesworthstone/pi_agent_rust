@@ -720,6 +720,91 @@ mod tests {
         );
     }
 
+    fn run_js_cell_sync(tool: &EvalTool, code: &str) -> Result<ToolOutput> {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(tool.execute("t", json!({"code": code, "kernel": "js"}), None))
+    }
+
+    #[test]
+    fn js_state_persists_and_top_level_await_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = EvalTool::new(dir.path());
+        let out = run_js_cell_sync(&tool, "const base = 40; let acc = base;").expect("cell 1");
+        assert!(!out.is_error, "cell 1: {}", output_text(&out));
+        let out = run_js_cell_sync(&tool, "acc += 2; acc").expect("cell 2");
+        assert!(output_text(&out).contains("42"), "got: {}", output_text(&out));
+        // Top-level await settles via the job pump.
+        let out = run_js_cell_sync(&tool, "await Promise.resolve(base + acc)").expect("await cell");
+        assert!(!out.is_error, "await: {}", output_text(&out));
+        assert!(output_text(&out).contains("82"), "got: {}", output_text(&out));
+    }
+
+    #[test]
+    fn js_console_capture_and_exception_survival() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = EvalTool::new(dir.path());
+        let out = run_js_cell_sync(&tool, "console.log('js-hello', 1 + 1); 'done'")
+            .expect("console cell");
+        assert!(output_text(&out).contains("js-hello 2"), "got: {}", output_text(&out));
+        let out = run_js_cell_sync(&tool, "throw new Error('boom-js')").expect("throw cell");
+        assert!(out.is_error);
+        assert!(output_text(&out).contains("boom-js"));
+        // Kernel (and state) survive the exception.
+        let out = run_js_cell_sync(&tool, "globalThis.z = 9; z").expect("after throw");
+        assert!(!out.is_error);
+        assert!(output_text(&out).contains('9'));
+    }
+
+    #[test]
+    fn js_bridge_read_and_whitelist_denial() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("data.txt"), "js-bridge-payload-88\n")
+            .expect("write fixture");
+        let tool = EvalTool::new(dir.path());
+        let out = run_js_cell_sync(
+            &tool,
+            "const c = tool.read('data.txt'); c.includes('js-bridge-payload-88')",
+        )
+        .expect("bridge read");
+        assert!(!out.is_error, "bridge: {}", output_text(&out));
+        assert!(output_text(&out).contains("true"), "got: {}", output_text(&out));
+        let out = run_js_cell_sync(
+            &tool,
+            "try { __pi_bridge('bash', '{}'); 'allowed' } catch (e) { String(e) }",
+        )
+        .expect("denial probe");
+        assert!(
+            output_text(&out).contains("EVAL_BRIDGE_DENIED"),
+            "bash escaped: {}",
+            output_text(&out)
+        );
+    }
+
+    #[test]
+    fn js_infinite_loop_times_out_and_kernel_state_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tool = EvalTool::new(dir.path());
+        let out = run_js_cell_sync(&tool, "globalThis.keep = 5").expect("seed");
+        assert!(!out.is_error);
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .build()
+            .expect("runtime build");
+        let out = runtime
+            .block_on(tool.execute(
+                "t",
+                json!({"code": "for(;;){}", "kernel": "js", "timeout_secs": 2}),
+                None,
+            ))
+            .expect("interrupted cell returns");
+        assert!(out.is_error, "loop should abort: {}", output_text(&out));
+        // The interrupt aborts the CELL, not the kernel: state survives.
+        let out = run_js_cell_sync(&tool, "keep").expect("post-timeout");
+        assert!(!out.is_error, "kernel died: {}", output_text(&out));
+        assert!(output_text(&out).contains('5'), "state lost: {}", output_text(&out));
+    }
+
     #[test]
     fn missing_python_is_named_error() {
         let dir = tempfile::tempdir().expect("tempdir");
