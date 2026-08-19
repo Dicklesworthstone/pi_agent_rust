@@ -131,7 +131,7 @@ fn kernel_thread(requests: &Receiver<JsCellRequest>, bridge_tx: &Sender<JsBridge
     while let Ok(request) = requests.recv() {
         deadline.set(request.deadline, origin);
         console.borrow_mut().clear();
-        let response = context.with(|ctx| run_cell(&ctx, &runtime, &request, &deadline, origin));
+        let response = run_cell(&context, &runtime, &request, &deadline, origin);
         deadline.clear();
         let response = JsCellResponse {
             console: std::mem::take(&mut *console.borrow_mut()),
@@ -178,23 +178,25 @@ fn install_globals(
     // plain Strings so no JS value lifetimes couple into the closure; the
     // ergonomic `tool.*` API wraps it in JS below.
     let tx = bridge_tx.clone();
-    let bridge_fn = Func::from(move |ctx: rquickjs::Ctx<'_>, tool: String, payload: String| {
-        let input: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        let _ = tx.send(JsBridgeRequest {
-            tool,
-            input,
-            reply: reply_tx,
-        });
-        match reply_rx.recv_timeout(Duration::from_secs(120)) {
-            Ok(Ok(content)) => Ok(content),
-            Ok(Err(err)) => Err(rquickjs::Exception::throw_message(&ctx, &err)),
-            Err(_) => Err(rquickjs::Exception::throw_message(
-                &ctx,
-                "EVAL_BRIDGE_TIMEOUT: host did not answer",
-            )),
-        }
-    });
+    let bridge_fn = Func::from(
+        move |ctx: rquickjs::Ctx<'_>, tool: String, payload: String| {
+            let input: Value = serde_json::from_str(&payload).unwrap_or_else(|_| json!({}));
+            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+            let _ = tx.send(JsBridgeRequest {
+                tool,
+                input,
+                reply: reply_tx,
+            });
+            match reply_rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(Ok(content)) => Ok(content),
+                Ok(Err(err)) => Err(rquickjs::Exception::throw_message(&ctx, &err)),
+                Err(_) => Err(rquickjs::Exception::throw_message(
+                    &ctx,
+                    "EVAL_BRIDGE_TIMEOUT: host did not answer",
+                )),
+            }
+        },
+    );
     globals.set("__pi_bridge", bridge_fn).expect("bridge fn");
     let _: () = ctx
         .eval(
@@ -209,80 +211,115 @@ fn install_globals(
 }
 
 fn run_cell(
-    ctx: &rquickjs::Ctx<'_>,
+    context: &rquickjs::Context,
     runtime: &rquickjs::Runtime,
     request: &JsCellRequest,
     deadline: &DeadlineCell,
     origin: Instant,
 ) -> JsCellResponse {
-    let evaluated: rquickjs::Result<rquickjs::Value<'_>> = ctx.eval(request.code.as_bytes());
-    let value = match evaluated {
-        Ok(value) => value,
-        Err(err) => return error_response(ctx, &err),
+    // Phase 1: evaluate. A returned promise is saved as a Persistent so job
+    // pumping can happen OUTSIDE Context::with (execute_pending_job inside
+    // with() double-borrows the runtime's inner RefCell).
+    enum Phase1 {
+        Done(JsCellResponse),
+        Pending(rquickjs::Persistent<rquickjs::Promise<'static>>),
+    }
+    let phase1 = context.with(|ctx| {
+        let evaluated: rquickjs::Result<rquickjs::Value<'_>> = ctx.eval(request.code.as_bytes());
+        match evaluated {
+            Err(err) => Phase1::Done(error_response(&ctx, &err)),
+            Ok(value) => match rquickjs::Promise::from_value(value.clone()) {
+                Ok(promise) => Phase1::Pending(rquickjs::Persistent::save(&ctx, promise)),
+                Err(_) => Phase1::Done(extract_result(&ctx, &value)),
+            },
+        }
+    });
+
+    let saved = match phase1 {
+        Phase1::Done(response) => {
+            // Drain microtasks the cell queued (outside with()).
+            while matches!(runtime.execute_pending_job(), Ok(true)) {}
+            return response;
+        }
+        Phase1::Pending(saved) => saved,
     };
 
-    // Settle a top-level promise by pumping jobs under the same deadline.
-    let value = if let Ok(promise) = rquickjs::Promise::from_value(value.clone()) {
-        loop {
-            match promise.state() {
-                rquickjs::promise::PromiseState::Pending => {
-                    if deadline.expired(origin) {
-                        return JsCellResponse {
-                            ok: false,
-                            console: String::new(),
-                            result: None,
-                            error: Some(String::from(
-                                "EVAL_TIMEOUT: promise still pending at the cell budget \
-                                 (kernel state preserved)",
-                            )),
-                        };
-                    }
-                    match runtime.execute_pending_job() {
-                        Ok(true) => {}
-                        Ok(false) => std::thread::sleep(Duration::from_millis(5)),
-                        Err(_) => break promise.result::<rquickjs::Value<'_>>(),
-                    }
+    // Phase 2: pump jobs until the promise settles or the budget expires.
+    loop {
+        let state = context.with(|ctx| {
+            let promise = saved.clone().restore(&ctx).ok();
+            promise.map(|p| p.state())
+        });
+        match state {
+            Some(rquickjs::promise::PromiseState::Pending) => {
+                if deadline.expired(origin) {
+                    return JsCellResponse {
+                        ok: false,
+                        console: String::new(),
+                        result: None,
+                        error: Some(String::from(
+                            "EVAL_TIMEOUT: promise still pending at the cell budget \
+                             (kernel state preserved)",
+                        )),
+                    };
                 }
-                _ => break promise.result::<rquickjs::Value<'_>>(),
+                match runtime.execute_pending_job() {
+                    Ok(true) => {}
+                    Ok(false) => std::thread::sleep(Duration::from_millis(5)),
+                    Err(_) => break,
+                }
             }
+            _ => break,
         }
-        .map_or_else(
-            || Ok(rquickjs::Value::new_undefined(ctx.clone())),
-            |result| result,
-        )
-    } else {
-        Ok(value)
-    };
-    // Drain any remaining microtasks queued by the cell.
+    }
     while matches!(runtime.execute_pending_job(), Ok(true)) {}
 
-    match value {
-        Ok(value) => {
-            let result = if value.is_undefined() || value.is_null() {
-                None
-            } else {
-                ctx.json_stringify_replacer_space(
-                    value.clone(),
-                    rquickjs::Value::new_undefined(ctx.clone()),
-                    rquickjs::Value::new_undefined(ctx.clone()),
-                )
-                .ok()
-                .flatten()
-                .and_then(|s| s.to_string().ok())
-                .or_else(|| {
-                    rquickjs::Coerced::<String>::from_js(ctx, value)
-                        .ok()
-                        .map(|coerced| coerced.0)
-                })
-            };
-            JsCellResponse {
-                ok: true,
+    // Phase 3: extract the settled value.
+    context.with(|ctx| {
+        let Some(promise) = saved.clone().restore(&ctx).ok() else {
+            return JsCellResponse {
+                ok: false,
                 console: String::new(),
-                result,
-                error: None,
-            }
+                result: None,
+                error: Some(String::from("EVAL_PROTOCOL: promise restore failed")),
+            };
+        };
+        match promise.result::<rquickjs::Value<'_>>() {
+            Some(Ok(value)) => extract_result(&ctx, &value),
+            Some(Err(err)) => error_response(&ctx, &err),
+            None => JsCellResponse {
+                ok: false,
+                console: String::new(),
+                result: None,
+                error: Some(String::from("EVAL_PROTOCOL: promise never settled")),
+            },
         }
-        Err(err) => error_response(ctx, &err),
+    })
+}
+
+fn extract_result<'js>(ctx: &rquickjs::Ctx<'js>, value: &rquickjs::Value<'js>) -> JsCellResponse {
+    let result = if value.is_undefined() || value.is_null() {
+        None
+    } else {
+        ctx.json_stringify_replacer_space(
+            value.clone(),
+            rquickjs::Value::new_undefined(ctx.clone()),
+            rquickjs::Value::new_undefined(ctx.clone()),
+        )
+        .ok()
+        .flatten()
+        .and_then(|s| s.to_string().ok())
+        .or_else(|| {
+            rquickjs::Coerced::<String>::from_js(ctx, value.clone())
+                .ok()
+                .map(|coerced| coerced.0)
+        })
+    };
+    JsCellResponse {
+        ok: true,
+        console: String::new(),
+        result,
+        error: None,
     }
 }
 

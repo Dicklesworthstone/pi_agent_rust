@@ -165,8 +165,7 @@ impl EvalTool {
             let mut slot = self
                 .js
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-            ;
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             slot.take()
         };
         let mut restarted = false;
@@ -734,11 +733,19 @@ mod tests {
         let out = run_js_cell_sync(&tool, "const base = 40; let acc = base;").expect("cell 1");
         assert!(!out.is_error, "cell 1: {}", output_text(&out));
         let out = run_js_cell_sync(&tool, "acc += 2; acc").expect("cell 2");
-        assert!(output_text(&out).contains("42"), "got: {}", output_text(&out));
+        assert!(
+            output_text(&out).contains("42"),
+            "got: {}",
+            output_text(&out)
+        );
         // Top-level await settles via the job pump.
         let out = run_js_cell_sync(&tool, "await Promise.resolve(base + acc)").expect("await cell");
         assert!(!out.is_error, "await: {}", output_text(&out));
-        assert!(output_text(&out).contains("82"), "got: {}", output_text(&out));
+        assert!(
+            output_text(&out).contains("82"),
+            "got: {}",
+            output_text(&out)
+        );
     }
 
     #[test]
@@ -747,7 +754,11 @@ mod tests {
         let tool = EvalTool::new(dir.path());
         let out = run_js_cell_sync(&tool, "console.log('js-hello', 1 + 1); 'done'")
             .expect("console cell");
-        assert!(output_text(&out).contains("js-hello 2"), "got: {}", output_text(&out));
+        assert!(
+            output_text(&out).contains("js-hello 2"),
+            "got: {}",
+            output_text(&out)
+        );
         let out = run_js_cell_sync(&tool, "throw new Error('boom-js')").expect("throw cell");
         assert!(out.is_error);
         assert!(output_text(&out).contains("boom-js"));
@@ -769,7 +780,11 @@ mod tests {
         )
         .expect("bridge read");
         assert!(!out.is_error, "bridge: {}", output_text(&out));
-        assert!(output_text(&out).contains("true"), "got: {}", output_text(&out));
+        assert!(
+            output_text(&out).contains("true"),
+            "got: {}",
+            output_text(&out)
+        );
         let out = run_js_cell_sync(
             &tool,
             "try { __pi_bridge('bash', '{}'); 'allowed' } catch (e) { String(e) }",
@@ -802,7 +817,11 @@ mod tests {
         // The interrupt aborts the CELL, not the kernel: state survives.
         let out = run_js_cell_sync(&tool, "keep").expect("post-timeout");
         assert!(!out.is_error, "kernel died: {}", output_text(&out));
-        assert!(output_text(&out).contains('5'), "state lost: {}", output_text(&out));
+        assert!(
+            output_text(&out).contains('5'),
+            "state lost: {}",
+            output_text(&out)
+        );
     }
 
     #[test]
