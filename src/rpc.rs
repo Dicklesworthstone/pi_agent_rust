@@ -656,6 +656,10 @@ pub async fn run(
             Some(Arc::new(steering_fetcher)),
             Some(Arc::new(follow_fetcher)),
         );
+        // Background job completion notices (bd-cv653.3.10).
+        guard
+            .agent
+            .register_message_fetchers(None, Some(crate::jobs::follow_up_fetcher()));
     }
 
     // Set up extension UI channel for RPC mode.

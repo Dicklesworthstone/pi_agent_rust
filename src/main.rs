@@ -722,6 +722,9 @@ fn main_impl() -> Result<()> {
     let result = runtime.block_on(run(cli, extension_flags, handle));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
     // runtime-owned background tasks after the CLI/TUI has already finished.
+    // Background bash jobs are session-scoped (bd-cv653.3.10): kill any
+    // survivors so no orphan daemons outlive the session.
+    pi::jobs::kill_all();
     match result {
         Ok(()) => std::process::exit(0),
         Err(err) => {

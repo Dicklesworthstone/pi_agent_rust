@@ -5217,6 +5217,7 @@ impl ToolRegistry {
                 ))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "jobs" => tools.push(Box::new(JobsTool)),
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
                 "eval" => tools.push(Box::new(crate::eval::EvalTool::new(cwd))),
                 "github" => tools.push(Box::new(crate::github::GithubTool::new(
@@ -6054,6 +6055,9 @@ impl Tool for ReadTool {
 struct BashInput {
     command: String,
     timeout: Option<u64>,
+    /// Run detached as a background job (bd-cv653.3.10): returns a job id
+    /// immediately; completion arrives as a follow-up message.
+    background: Option<bool>,
 }
 
 pub struct BashTool {
@@ -6779,6 +6783,10 @@ impl Tool for BashTool {
                 "timeout": {
                     "type": "integer",
                     "description": "Timeout in seconds (default 120; set 0 to disable)"
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run detached as a background job: returns a job id immediately; output streams to an artifact file and a completion notice arrives as a follow-up message. Manage with the jobs tool (list/wait/cancel)."
                 }
             },
             "required": ["command"]
@@ -6853,6 +6861,45 @@ impl Tool for BashTool {
                                 payload = %payload,
                                 "bash mediation warn"
                             );
+                            let rules = payload["hits"]
+                                .as_array()
+                                .map(|hits| {
+                                    hits.iter()
+                                        .filter_map(|hit| hit["ruleId"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_default();
+                            if input.background.unwrap_or(false) {
+                                // Warn + background: annotate the job-start
+                                // result instead of blocking on foreground
+                                // output.
+                                let job = crate::jobs::spawn_background(
+                                    &self.cwd,
+                                    self.shell_path.as_deref(),
+                                    self.command_prefix.as_deref(),
+                                    &input.command,
+                                    input.timeout,
+                                    self.artifact_root.as_deref(),
+                                )?;
+                                let mut details = serde_json::to_value(&job)?;
+                                details["mediation"] = payload;
+                                return Ok(ToolOutput {
+                                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                                        "[MEDIATION WARN: {rules}]\n\nBackground job {} started \
+                                         (pid {}). Output streams to {}. A completion notice \
+                                         will arrive as a follow-up message.",
+                                        job.id,
+                                        job.pid.map_or_else(
+                                            || "unknown".to_string(),
+                                            |pid| pid.to_string()
+                                        ),
+                                        job.artifact_path
+                                    )))],
+                                    details: Some(details),
+                                    is_error: false,
+                                });
+                            }
                             let mut result = execute_bash_spawn(
                                 &self.cwd,
                                 self.shell_path.as_deref(),
@@ -6863,18 +6910,8 @@ impl Tool for BashTool {
                                 use_pty,
                             )
                             .await?;
-                            result.output = format!(
-                                "[MEDIATION WARN: {}]\n\n{}",
-                                payload["hits"]
-                                    .as_array()
-                                    .map(|hits| hits
-                                        .iter()
-                                        .filter_map(|hit| hit["ruleId"].as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(", "))
-                                    .unwrap_or_default(),
-                                result.output
-                            );
+                            result.output =
+                                format!("[MEDIATION WARN: {rules}]\n\n{}", result.output);
                             return Ok(ToolOutput {
                                 content: vec![ContentBlock::Text(TextContent::new(result.output))],
                                 details: Some(payload),
@@ -6918,6 +6955,34 @@ impl Tool for BashTool {
                     }
                 }
             }
+        }
+
+        // Background dispatch (bd-cv653.3.10): the mediation gate above has
+        // already classified the command; detached jobs run under the same
+        // timeout/tree-kill discipline via the jobs registry.
+        if input.background.unwrap_or(false) {
+            let job = crate::jobs::spawn_background(
+                &self.cwd,
+                self.shell_path.as_deref(),
+                self.command_prefix.as_deref(),
+                &input.command,
+                input.timeout,
+                self.artifact_root.as_deref(),
+            )?;
+            let details = serde_json::to_value(&job)?;
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Background job {} started (pid {}). Output streams to {}. \
+                     A completion notice will arrive as a follow-up message; \
+                     manage it with the jobs tool (list/wait/cancel).",
+                    job.id,
+                    job.pid
+                        .map_or_else(|| "unknown".to_string(), |pid| pid.to_string()),
+                    job.artifact_path
+                )))],
+                details: Some(details),
+                is_error: false,
+            });
         }
 
         let result = execute_bash_spawn(
@@ -6979,8 +7044,159 @@ impl Tool for BashTool {
 }
 
 // ============================================================================
-// Edit Tool
+// Jobs Tool (bd-cv653.3.10)
 // ============================================================================
+
+/// Input parameters for the jobs tool.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobsInput {
+    /// `list` (all jobs), `wait` (block until settle or budget), or
+    /// `cancel` (TERM → grace → KILL + tree walk).
+    action: String,
+    /// Job id for `wait`/`cancel` (from the bash background start result).
+    job_id: Option<String>,
+    /// Wait budget in milliseconds for `wait` (default 30000, max 600000).
+    timeout_ms: Option<u64>,
+}
+
+/// Manage background bash jobs spawned with `bash {background: true}`
+/// (bd-cv653.3.10). The future hub tool's jobs action group wraps the same
+/// registry (bd-cv653.5.4).
+pub struct JobsTool;
+
+#[async_trait]
+impl Tool for JobsTool {
+    fn name(&self) -> &str {
+        "jobs"
+    }
+
+    fn label(&self) -> &str {
+        "jobs"
+    }
+
+    fn description(&self) -> &str {
+        "Manage background bash jobs started with `bash {background: true}`. \
+         Actions: `list` (every job with status/pid/artifact), `wait` (block \
+         until the job settles, bounded), `cancel` (kill the whole process \
+         tree). Completion notices also arrive automatically as follow-up \
+         messages."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "wait", "cancel"],
+                    "description": "list | wait | cancel"
+                },
+                "jobId": {
+                    "type": "string",
+                    "description": "Job id (required for wait and cancel)"
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "description": "Wait budget in milliseconds for wait (default 30000, max 600000)"
+                }
+            },
+            "required": ["action"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::process()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: JobsInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let action = input.action.trim().to_ascii_lowercase();
+        let payload = match action.as_str() {
+            "list" => {
+                let jobs = crate::jobs::list()?;
+                serde_json::json!({ "schema": crate::jobs::JOB_SCHEMA, "jobs": jobs })
+            }
+            "wait" => {
+                let job_id = input
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| Error::validation("jobs wait requires jobId".to_string()))?;
+                let budget_ms = input.timeout_ms.unwrap_or(30_000).min(600_000);
+                let snapshot =
+                    crate::jobs::wait(job_id, std::time::Duration::from_millis(budget_ms))?;
+                serde_json::to_value(&snapshot)?
+            }
+            "cancel" => {
+                let job_id = input
+                    .job_id
+                    .as_deref()
+                    .ok_or_else(|| Error::validation("jobs cancel requires jobId".to_string()))?;
+                let snapshot = crate::jobs::cancel(job_id)?;
+                serde_json::to_value(&snapshot)?
+            }
+            other => {
+                return Err(Error::validation(format!(
+                    "Unknown jobs action '{other}'; expected list, wait, or cancel"
+                )));
+            }
+        };
+        let text = match action.as_str() {
+            "list" => {
+                let count = payload["jobs"].as_array().map_or(0, Vec::len);
+                if count == 0 {
+                    "No background jobs this session.".to_string()
+                } else {
+                    let lines: Vec<String> = payload["jobs"]
+                        .as_array()
+                        .map(|jobs| {
+                            jobs.iter()
+                                .map(|job| {
+                                    format!(
+                                        "{}: {} (pid {}, exit {}, artifact {})",
+                                        job["id"].as_str().unwrap_or("?"),
+                                        job["status"].as_str().unwrap_or("?"),
+                                        job["pid"].as_i64().map_or_else(
+                                            || "n/a".to_string(),
+                                            |pid| pid.to_string()
+                                        ),
+                                        job["exitCode"].as_i64().map_or_else(
+                                            || "n/a".to_string(),
+                                            |code| code.to_string()
+                                        ),
+                                        job["artifactPath"].as_str().unwrap_or("?")
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    format!("{count} background job(s):\n{}", lines.join("\n"))
+                }
+            }
+            "wait" | "cancel" => format!(
+                "job {}: {} (exit {})\noutput tail:\n{}",
+                payload["id"].as_str().unwrap_or("?"),
+                payload["status"].as_str().unwrap_or("?"),
+                payload["exitCode"]
+                    .as_i64()
+                    .map_or_else(|| "n/a".to_string(), |code| code.to_string()),
+                payload["outputTail"].as_str().unwrap_or("")
+            ),
+            _ => String::new(),
+        };
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(text))],
+            details: Some(payload),
+            is_error: false,
+        })
+    }
+}
 
 /// Input parameters for the edit tool.
 #[derive(Debug, Deserialize)]
@@ -10999,7 +11215,7 @@ pub(crate) fn kill_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, true);
 }
 
-fn terminate_process_group_tree(pid: Option<u32>) {
+pub(crate) fn terminate_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Term, true);
 }
 

@@ -87,9 +87,9 @@ pub mod ast_tools;
 #[doc(hidden)]
 pub mod auth;
 #[doc(hidden)]
-pub mod bash_mediation;
-#[doc(hidden)]
 pub mod autocomplete;
+#[doc(hidden)]
+pub mod bash_mediation;
 #[doc(hidden)]
 pub mod buffer_shim;
 #[doc(hidden)]
@@ -98,8 +98,6 @@ pub mod cli;
 pub mod compaction;
 #[doc(hidden)]
 pub mod compaction_worker;
-#[doc(hidden)]
-pub mod debug;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
@@ -111,6 +109,8 @@ pub mod connectors;
 pub mod context_files;
 #[doc(hidden)]
 pub mod crypto_shim;
+#[doc(hidden)]
+pub mod debug;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
@@ -181,6 +181,8 @@ pub mod interactive;
 #[cfg(feature = "ftui")]
 #[doc(hidden)]
 pub mod interactive_ftui;
+#[doc(hidden)]
+pub mod jobs;
 #[doc(hidden)]
 pub mod keybindings;
 #[doc(hidden)]

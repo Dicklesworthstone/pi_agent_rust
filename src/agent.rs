@@ -10119,6 +10119,10 @@ impl AgentSession {
                 Some(Arc::new(follow_up_fetcher)),
             );
         }
+        // Background job completion notices (bd-cv653.3.10): additive
+        // follow-up source drained from the jobs registry.
+        self.agent
+            .register_message_fetchers(None, Some(crate::jobs::follow_up_fetcher()));
 
         if !js_specs.is_empty() {
             manager.load_js_extensions(js_specs).await?;

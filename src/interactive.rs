@@ -2641,6 +2641,8 @@ impl PiApp {
                 Some(Arc::new(follow_up_fetcher)),
             );
         }
+        // Background job completion notices (bd-cv653.3.10).
+        agent.register_message_fetchers(None, Some(crate::jobs::follow_up_fetcher()));
 
         let keybindings = keybindings_override.unwrap_or_else(|| {
             // Load keybindings from user config (with defaults as fallback).
