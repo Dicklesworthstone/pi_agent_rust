@@ -96,7 +96,11 @@ impl PyKernel {
     }
 
     /// Await the next stdout line under a budget. Ok(None) = EOF.
-    async fn next_line(&self, deadline: Instant) -> Result<Option<String>> {
+    ///
+    /// Takes `&mut self` deliberately: `mpsc::Receiver` is `!Sync`, so a
+    /// shared borrow held across the await would make the future `!Send`.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    async fn next_line(&mut self, deadline: Instant) -> Result<Option<String>> {
         loop {
             let received = self
                 .lines
