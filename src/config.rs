@@ -68,6 +68,8 @@ pub struct Config {
     pub read: Option<ReadSettings>,
     /// Bash-tool mediation settings (bd-cv653.1.7).
     pub bash: Option<BashSettings>,
+    /// Memory-bank settings (bd-cv653.4.1).
+    pub memory: Option<MemorySettings>,
     /// Advisor settings (bd-cv653.3.3).
     pub advisor: Option<AdvisorSettings>,
     /// LSP tool settings (bd-cv653.1.1).
@@ -522,6 +524,17 @@ pub struct BashSettings {
     pub pty: Option<String>,
 }
 
+/// `memory.backend` (bd-cv653.4.1): `off` (default while experimental,
+/// omp's setting-gated posture) | `local` (per-project SQLite+FTS5 bank
+/// with retain/recall/reflect/memory_edit tools and a mental-model block
+/// on the first turn) | `cass` (reserved, not yet implemented).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Memory backend: off | local | cass.
+    pub backend: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ImageSettings {
@@ -794,6 +807,7 @@ impl Config {
             plan: merge_plan(base.plan, other.plan),
             read: merge_read(base.read, other.read),
             bash: merge_bash(base.bash, other.bash),
+            memory: merge_memory(base.memory, other.memory),
             advisor: merge_advisor(base.advisor, other.advisor),
             lsp: merge_lsp(base.lsp, other.lsp),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
@@ -926,6 +940,21 @@ impl Config {
             .as_ref()
             .and_then(|a| a.enabled)
             .unwrap_or(true)
+    }
+
+    /// Memory backend (bd-cv653.4.1): `off` (default while experimental) |
+    /// `local` | `cass` (reserved). Unknown values degrade to off.
+    pub fn memory_backend(&self) -> &str {
+        match self
+            .memory
+            .as_ref()
+            .and_then(|m| m.backend.as_deref())
+            .map(str::trim)
+        {
+            Some("local") => "local",
+            Some("cass") => "cass",
+            _ => "off",
+        }
     }
 
     /// Advisor per-call timeout in seconds (bd-cv653.3.3). Default: 15.
@@ -1570,6 +1599,21 @@ fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option
             mediation_forced: other.mediation_forced.or(base.mediation_forced),
             mediation_dcg: other.mediation_dcg.or(base.mediation_dcg),
             pty: other.pty.or(base.pty),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge memory settings field-wise (bd-cv653.4.1).
+fn merge_memory(
+    base: Option<MemorySettings>,
+    other: Option<MemorySettings>,
+) -> Option<MemorySettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(MemorySettings {
+            backend: other.backend.or(base.backend),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

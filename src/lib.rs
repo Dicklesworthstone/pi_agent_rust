@@ -192,6 +192,8 @@ pub mod lsp;
 #[doc(hidden)]
 pub mod mcp;
 #[doc(hidden)]
+pub mod memory;
+#[doc(hidden)]
 pub mod migrations;
 #[doc(hidden)]
 pub mod model;

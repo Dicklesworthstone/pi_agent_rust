@@ -5247,6 +5247,25 @@ impl ToolRegistry {
             }
         }
 
+        // Memory bank (bd-cv653.4.1): retain/recall/reflect/memory_edit join
+        // the active set only when `memory.backend: local`; off (default)
+        // keeps them absent from the model's tool list entirely.
+        if config.is_some_and(|cfg| cfg.memory_backend() == "local")
+            && let Ok(store) = crate::memory::MemoryStore::open(cwd)
+        {
+            let store = std::sync::Arc::new(store);
+            tools.push(Box::new(crate::memory::RetainTool::new(
+                std::sync::Arc::clone(&store),
+            )));
+            tools.push(Box::new(crate::memory::RecallTool::new(
+                std::sync::Arc::clone(&store),
+            )));
+            tools.push(Box::new(crate::memory::ReflectTool::new(
+                std::sync::Arc::clone(&store),
+            )));
+            tools.push(Box::new(crate::memory::MemoryEditTool::new(store)));
+        }
+
         // Tool load modes (bd-cv653.1.6): register the xdev dispatcher when
         // the enabled set contains discoverable-tier tools and `xdev` itself
         // is not turned off. The dispatcher's snapshot powers list/describe;
