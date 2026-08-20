@@ -2789,6 +2789,19 @@ mod tests {
             vec!["openai/gpt-4o-mini", "openrouter/auto"]
         );
 
+        assert_eq!(
+            normalize_model_ids(
+                "orcarouter",
+                [
+                    "AUTO".to_string(),
+                    "orcarouter/auto".to_string(),
+                    "deepseek/deepseek-v4-pro".to_string(),
+                ],
+            )
+            .expect("normalize OrcaRouter aliases"),
+            vec!["deepseek/deepseek-v4-pro", "orcarouter/auto"]
+        );
+
         for invalid in [
             "bad model".to_string(),
             "bad\nmodel".to_string(),

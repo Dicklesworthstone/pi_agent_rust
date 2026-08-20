@@ -19,7 +19,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const LIVE_TARGETS: [LiveProviderTarget; 6] = [
+const LIVE_TARGETS: [LiveProviderTarget; 7] = [
     LiveProviderTarget::new(
         "anthropic",
         "ANTHROPIC_TEST_MODEL",
@@ -45,6 +45,12 @@ const LIVE_TARGETS: [LiveProviderTarget; 6] = [
     LiveProviderTarget::new(
         "openrouter",
         "OPENROUTER_TEST_MODEL",
+        &[],
+        LIVE_SHORT_PROMPT,
+    ),
+    LiveProviderTarget::new(
+        "orcarouter",
+        "ORCAROUTER_TEST_MODEL",
         &[],
         LIVE_SHORT_PROMPT,
     ),

@@ -8852,6 +8852,7 @@ mod tests {
             ("deepinfra", "DEEPINFRA_API_KEY"),
             ("cerebras", "CEREBRAS_API_KEY"),
             ("openrouter", "OPENROUTER_API_KEY"),
+            ("orcarouter", "ORCAROUTER_API_KEY"),
             ("mistral", "MISTRAL_API_KEY"),
             ("cohere", "COHERE_API_KEY"),
             ("perplexity", "PERPLEXITY_API_KEY"),

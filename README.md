@@ -945,6 +945,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 | `DEEPINFRA_API_KEY` | DeepInfra API key (OpenAI-compatible) |
 | `CEREBRAS_API_KEY` | Cerebras API key (OpenAI-compatible) |
 | `OPENROUTER_API_KEY` | OpenRouter API key (OpenAI-compatible) |
+| `ORCAROUTER_API_KEY` | [OrcaRouter](https://www.orcarouter.ai) API key (OpenAI-compatible) |
 | `MISTRAL_API_KEY` | Mistral API key (OpenAI-compatible) |
 | `MOONSHOT_API_KEY` | Moonshot/Kimi API key (OpenAI-compatible) |
 | `DASHSCOPE_API_KEY` | DashScope/Qwen API key (OpenAI-compatible) |
@@ -2704,7 +2705,7 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 A: Startup time matters when you're in a terminal all day. Rust provides a native single-binary deployment without a managed application runtime. Fresh comparative measurements are required before this release makes a speed claim.
 
 **Q: Can I use providers beyond Anthropic (OpenAI/Gemini/Cohere/Azure/Bedrock/Vertex/Copilot/GitLab/Cursor/Codex)?**
-A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
+A: Yes. Pi has 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini (native + Gemini CLI + Antigravity routes), Cohere, Azure OpenAI, Amazon Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor. Pi also supports many OpenAI-compatible presets (for example Groq, OpenRouter, OrcaRouter, Mistral, Together, DeepSeek, Cerebras, DeepInfra, Alibaba/Qwen, and Moonshot/Kimi). Provider IDs and aliases are case-insensitive. Set credentials and choose via `--provider`/`--model`; run `pi --list-providers` to see canonical IDs, aliases, and env keys.
 
 **Q: How do sessions work?**
 A: By default, each session is a JSONL v3 file with message entries, parent references for branching, and compaction metadata. Builds include `sqlite-sessions` support by default, so configured deployments can use SQLite-backed session storage too; JSONL remains the default store unless configuration selects SQLite.

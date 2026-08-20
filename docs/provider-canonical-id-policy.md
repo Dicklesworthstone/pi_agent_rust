@@ -151,6 +151,7 @@ policy JSON mirrors the same 94 IDs and 51 aliases.
 | openai-codex | yes (codex, chatgpt-codex) | Pi runtime |
 | opencode | no | models.dev + opencode |
 | openrouter | yes (open-router) | models.dev + opencode |
+| orcarouter | yes (orca) | Pi runtime |
 | ovhcloud | no | models.dev |
 | perplexity | yes (pplx) | models.dev |
 | poe | no | models.dev |

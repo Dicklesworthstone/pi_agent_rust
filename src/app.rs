@@ -1066,6 +1066,7 @@ const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("google-vertex", "gemini-3-pro-preview"),
     ("github-copilot", "gpt-4o"),
     ("openrouter", "openai/gpt-5.1-codex"),
+    ("orcarouter", "orcarouter/auto"),
     ("vercel-ai-gateway", "anthropic/claude-opus-4.5"),
     ("xai", "grok-4-fast-non-reasoning"),
     ("groq", "openai/gpt-oss-120b"),

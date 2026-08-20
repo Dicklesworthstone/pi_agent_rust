@@ -193,6 +193,23 @@
     },
     {
       "aliases": [
+        "orca"
+      ],
+      "auth_env_keys": [
+        "ORCAROUTER_API_KEY"
+      ],
+      "canonical_id": "orcarouter",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://api.orcarouter.ai/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
         "mistralai"
       ],
       "auth_env_keys": [
@@ -1589,6 +1606,6 @@
     }
   ],
   "schema_version": "1.0",
-  "total_aliases": 61,
-  "total_providers": 102
+  "total_aliases": 62,
+  "total_providers": 103
 }

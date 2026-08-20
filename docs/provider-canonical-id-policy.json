@@ -445,6 +445,13 @@
         "source": "models.dev+opencode"
       },
       {
+        "canonical_id": "orcarouter",
+        "aliases": [
+          "orca"
+        ],
+        "source": "pi-runtime"
+      },
+      {
         "canonical_id": "ovhcloud",
         "aliases": [],
         "source": "models.dev"

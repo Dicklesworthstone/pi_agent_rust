@@ -14,7 +14,7 @@ Generated: 2026-02-13
 | Fast inference | groq, cerebras | Hardware-accelerated, low latency |
 | Cost-optimized | deepinfra, togetherai | Competitive pricing for open models |
 | Open models | huggingface, nvidia, togetherai | Access to Llama, Mistral, etc. |
-| Model aggregation | openrouter | Single API key for multiple providers |
+| Model aggregation | openrouter, orcarouter | Single API key for multiple providers |
 | EU data residency | stackit | EU-hosted endpoints |
 | Chinese models | alibaba (qwen), moonshotai (kimi) | Access to Qwen, Kimi models |
 | Self-hosted | ollama (local) | Private, no data leaves your machine |

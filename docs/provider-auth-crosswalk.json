@@ -55,7 +55,7 @@
   "request_auth_methods": {
     "bearer_token": {
       "header": "Authorization: Bearer {API_KEY}",
-      "providers_count": 91,
+      "providers_count": 92,
       "description": "Bearer value on the inference request. How the value was acquired (direct key, OAuth, device flow, external CLI, Bedrock override, or SAP exchange) is modeled separately."
     },
     "x_api_key": {
@@ -169,7 +169,7 @@
     },
     "methods": {
       "direct_api_key": {
-        "providers_count": 94,
+        "providers_count": 95,
         "description": "Complete API key supplied explicitly, through a provider API-key environment variable, or from stored ApiKey auth."
       },
       "oauth_login": {
@@ -585,6 +585,18 @@
       ],
       "auth_method": "bearer_token",
       "base_url": "https://openrouter.ai/api/v1",
+      "tier": "oai_compat"
+    },
+    {
+      "canonical_id": "orcarouter",
+      "aliases": [
+        "orca"
+      ],
+      "env_keys": [
+        "ORCAROUTER_API_KEY"
+      ],
+      "auth_method": "bearer_token",
+      "base_url": "https://api.orcarouter.ai/v1",
       "tier": "oai_compat"
     },
     {

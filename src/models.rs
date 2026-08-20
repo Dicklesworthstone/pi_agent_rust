@@ -888,11 +888,20 @@ fn canonicalize_openrouter_model_id(model_id: &str) -> String {
     }
 }
 
-pub(crate) fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String {
-    if canonical_provider_id(provider).is_some_and(|canonical| canonical == "openrouter") {
-        return canonicalize_openrouter_model_id(model_id);
+fn canonicalize_orcarouter_model_id(model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    match trimmed.to_ascii_lowercase().as_str() {
+        "auto" => "orcarouter/auto".to_string(),
+        _ => trimmed.to_string(),
     }
-    model_id.trim().to_string()
+}
+
+pub(crate) fn canonicalize_model_id_for_provider(provider: &str, model_id: &str) -> String {
+    match canonical_provider_id(provider) {
+        Some("openrouter") => canonicalize_openrouter_model_id(model_id),
+        Some("orcarouter") => canonicalize_orcarouter_model_id(model_id),
+        _ => model_id.trim().to_string(),
+    }
 }
 
 pub(crate) fn normalized_registry_key(provider: &str, model_id: &str) -> (String, String) {
@@ -908,6 +917,16 @@ pub(crate) fn normalized_registry_key(provider: &str, model_id: &str) -> (String
 fn openrouter_model_lookup_ids(model_id: &str) -> Vec<String> {
     let raw = model_id.trim().to_string();
     let canonical = canonicalize_openrouter_model_id(model_id);
+    if canonical.eq_ignore_ascii_case(&raw) {
+        vec![canonical]
+    } else {
+        vec![raw, canonical]
+    }
+}
+
+fn orcarouter_model_lookup_ids(model_id: &str) -> Vec<String> {
+    let raw = model_id.trim().to_string();
+    let canonical = canonicalize_orcarouter_model_id(model_id);
     if canonical.eq_ignore_ascii_case(&raw) {
         vec![canonical]
     } else {
@@ -1545,9 +1564,12 @@ impl ModelRegistry {
         let provider = provider.trim();
         let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
         let is_openrouter = canonical_provider.eq_ignore_ascii_case("openrouter");
-        // Avoid Vec + String allocation for the common (non-OpenRouter) path.
-        let openrouter_ids = if is_openrouter {
+        let is_orcarouter = canonical_provider.eq_ignore_ascii_case("orcarouter");
+        // Avoid Vec + String allocation for the common (non-gateway) path.
+        let gateway_ids = if is_openrouter {
             openrouter_model_lookup_ids(id)
+        } else if is_orcarouter {
+            orcarouter_model_lookup_ids(id)
         } else {
             Vec::new()
         };
@@ -1564,8 +1586,8 @@ impl ModelRegistry {
                     || model_provider_canonical.eq_ignore_ascii_case(provider)
                     || model_provider_canonical.eq_ignore_ascii_case(canonical_provider);
                 provider_matches
-                    && if is_openrouter {
-                        openrouter_ids
+                    && if is_openrouter || is_orcarouter {
+                        gateway_ids
                             .iter()
                             .any(|lookup_id| m.model.id.eq_ignore_ascii_case(lookup_id))
                     } else {
@@ -2941,13 +2963,13 @@ fn apply_custom_models_with_provider_headers(
                 continue;
             }
 
-            if canonical_provider == "openrouter"
+            if (canonical_provider == "openrouter" || canonical_provider == "orcarouter")
                 && !normalized_provider_ids.insert(normalized_model_id.to_ascii_lowercase())
             {
                 tracing::warn!(
                     provider = %provider_id,
                     model_id = %normalized_model_id,
-                    "Skipping duplicate OpenRouter model id after alias normalization"
+                    "Skipping duplicate gateway model id after alias normalization"
                 );
                 continue;
             }
@@ -4634,6 +4656,11 @@ mod tests {
                 .iter()
                 .any(|m| m.model.provider == "openrouter" && m.model.id == "openrouter/auto")
         );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.model.provider == "orcarouter" && m.model.id == "orcarouter/auto")
+        );
 
         let anthropic = models
             .iter()
@@ -5443,6 +5470,30 @@ mod tests {
             .expect("open-router provider alias should resolve");
         assert_eq!(provider_alias.model.provider, "openrouter");
         assert_eq!(provider_alias.model.id, "openai/gpt-4o-mini");
+    }
+
+    #[test]
+    fn model_registry_find_normalizes_orcarouter_model_aliases() {
+        let (_dir, auth) = test_auth_storage();
+        let registry = ModelRegistry::load(&auth, None);
+
+        let auto = registry
+            .find("orcarouter", "auto")
+            .expect("orcarouter auto alias should resolve");
+        assert_eq!(auto.model.provider, "orcarouter");
+        assert_eq!(auto.model.id, "orcarouter/auto");
+
+        let provider_alias = registry
+            .find("orca", "auto")
+            .expect("orca provider alias should resolve");
+        assert_eq!(provider_alias.model.provider, "orcarouter");
+        assert_eq!(provider_alias.model.id, "orcarouter/auto");
+    }
+
+    #[test]
+    fn ad_hoc_model_entry_normalizes_orcarouter_aliases() {
+        let auto = ad_hoc_model_entry("orcarouter", "auto").expect("orcarouter auto ad-hoc");
+        assert_eq!(auto.model.id, "orcarouter/auto");
     }
 
     #[test]
@@ -8774,6 +8825,29 @@ mod tests {
             fn openrouter_lookup_includes_canonical(id in "[a-z\\-0-9]{1,20}") {
                 let ids = openrouter_model_lookup_ids(&id);
                 let canonical = canonicalize_openrouter_model_id(&id);
+                assert!(ids.contains(&canonical));
+            }
+
+            /// `canonicalize_orcarouter_model_id` maps the `auto` alias.
+            #[test]
+            fn orcarouter_known_aliases(idx in 0..2usize) {
+                let pairs = [("auto", "orcarouter/auto"), ("AUTO", "orcarouter/auto")];
+                let (input, expected) = pairs[idx];
+                assert_eq!(canonicalize_orcarouter_model_id(input), expected);
+            }
+
+            /// `canonicalize_orcarouter_model_id` passes unknown IDs through.
+            #[test]
+            fn orcarouter_passthrough(id in "[a-z]/[a-z]{5,15}") {
+                let result = canonicalize_orcarouter_model_id(&id);
+                assert_eq!(result, id);
+            }
+
+            /// `orcarouter_model_lookup_ids` always includes the canonical form.
+            #[test]
+            fn orcarouter_lookup_includes_canonical(id in "[a-z\\-0-9]{1,20}") {
+                let ids = orcarouter_model_lookup_ids(&id);
+                let canonical = canonicalize_orcarouter_model_id(&id);
                 assert!(ids.contains(&canonical));
             }
 

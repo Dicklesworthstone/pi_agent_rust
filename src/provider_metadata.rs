@@ -259,6 +259,23 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        canonical_id: "orcarouter",
+        display_name: Some("OrcaRouter"),
+        aliases: &["orca"],
+        auth_env_keys: &["ORCAROUTER_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.orcarouter.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "mistral",
         display_name: Some("Mistral AI"),
         aliases: &["mistralai"],
@@ -1947,6 +1964,8 @@ mod tests {
         let openrouter_alias =
             provider_metadata("open-router").expect("open-router alias metadata");
         assert_eq!(openrouter_alias.canonical_id, "openrouter");
+        let orcarouter_alias = provider_metadata("orca").expect("orca alias metadata");
+        assert_eq!(orcarouter_alias.canonical_id, "orcarouter");
         let vercel_gateway_alias =
             provider_metadata("vercel-ai-gateway").expect("vercel alias metadata");
         assert_eq!(vercel_gateway_alias.canonical_id, "vercel");

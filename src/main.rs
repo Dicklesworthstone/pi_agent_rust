@@ -6473,6 +6473,12 @@ const PROVIDER_CHOICES: &[ProviderChoice] = &[
         env: "OPENROUTER_API_KEY",
     },
     ProviderChoice {
+        provider: "orcarouter",
+        label: "OrcaRouter",
+        kind: SetupCredentialKind::ApiKey,
+        env: "ORCAROUTER_API_KEY",
+    },
+    ProviderChoice {
         provider: "cohere",
         label: "Cohere",
         kind: SetupCredentialKind::ApiKey,

@@ -65,12 +65,13 @@ macro_rules! skip_unless_e2e {
     };
 }
 
-const LIVE_PROVIDER_ORDER: [&str; 7] = [
+const LIVE_PROVIDER_ORDER: [&str; 8] = [
     "anthropic",
     "openai",
     "azure-openai",
     "google",
     "openrouter",
+    "orcarouter",
     "xai",
     "deepseek",
 ];
@@ -473,6 +474,7 @@ fn provider_model_override_var(provider: &str) -> Option<&'static str> {
         "azure-openai" | "azure" | "azure-cognitive-services" => Some("AZURE_OPENAI_DEPLOYMENT"),
         "google" => Some("GOOGLE_TEST_MODEL"),
         "openrouter" => Some("OPENROUTER_TEST_MODEL"),
+        "orcarouter" => Some("ORCAROUTER_TEST_MODEL"),
         "xai" => Some("XAI_TEST_MODEL"),
         "deepseek" => Some("DEEPSEEK_TEST_MODEL"),
         _ => None,
@@ -489,6 +491,7 @@ fn provider_preferred_models(provider: &str) -> &'static [&'static str] {
         "openai" => &["gpt-4o-mini", "gpt-4o", "gpt-5.1-codex"],
         "google" => &["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"],
         "openrouter" => &["anthropic/claude-sonnet-4", "deepseek/deepseek-chat"],
+        "orcarouter" => &["orcarouter/auto", "deepseek/deepseek-v4-pro"],
         "xai" => &["grok-3-mini", "grok-2-1212"],
         "deepseek" => &["deepseek-chat", "deepseek-coder"],
         _ => &[],

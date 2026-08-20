@@ -19,7 +19,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Instant;
 
-const PARITY_TARGETS: [LiveProviderTarget; 10] = [
+const PARITY_TARGETS: [LiveProviderTarget; 11] = [
     LiveProviderTarget::new(
         "anthropic",
         "ANTHROPIC_TEST_MODEL",
@@ -45,6 +45,12 @@ const PARITY_TARGETS: [LiveProviderTarget; 10] = [
     LiveProviderTarget::new(
         "openrouter",
         "OPENROUTER_TEST_MODEL",
+        &[],
+        LIVE_SHORT_PROMPT,
+    ),
+    LiveProviderTarget::new(
+        "orcarouter",
+        "ORCAROUTER_TEST_MODEL",
         &[],
         LIVE_SHORT_PROMPT,
     ),

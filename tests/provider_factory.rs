@@ -165,12 +165,13 @@ fn expect_provider_stream_start_error(
     })
 }
 
-const WAVE_A_PRESET_CASES: [(&str, &str); 14] = [
+const WAVE_A_PRESET_CASES: [(&str, &str); 15] = [
     ("groq", "https://api.groq.com/openai/v1"),
     ("deepinfra", "https://api.deepinfra.com/v1/openai"),
     ("cerebras", "https://api.cerebras.ai/v1"),
     ("atlascloud", "https://api.atlascloud.ai/v1"),
     ("openrouter", "https://openrouter.ai/api/v1"),
+    ("orcarouter", "https://api.orcarouter.ai/v1"),
     ("mistral", "https://api.mistral.ai/v1"),
     ("moonshotai", "https://api.moonshot.ai/v1"),
     (

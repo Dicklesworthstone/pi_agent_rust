@@ -298,6 +298,26 @@ pi --provider openrouter --model meta-llama/llama-3.3-70b-instruct
 - Mid-stream errors use HTTP 200 + SSE error payload (not standard error codes)
 - Serving model may differ from requested (fallback routing)
 
+### OrcaRouter
+
+```bash
+export ORCAROUTER_API_KEY="sk-orca-..."
+
+pi --provider orcarouter --model orcarouter/auto
+```
+
+**Endpoint**: `https://api.orcarouter.ai/v1/chat/completions`
+
+**Advanced**: Access any model via `provider/model` format:
+```bash
+pi --provider orcarouter --model deepseek/deepseek-v4-pro
+pi --provider orcarouter --model openai/gpt-4o-mini
+```
+
+**Caveats**:
+- Model IDs use `org/model` format; `orcarouter/auto` routes to the gateway's default model
+- Get an API key at [orcarouter.ai](https://www.orcarouter.ai)
+
 ### Mistral
 
 ```bash

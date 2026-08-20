@@ -363,6 +363,29 @@
           ]
         },
         {
+          "provider_id": "orcarouter",
+          "display_name": "OrcaRouter (Gateway)",
+          "aliases": ["orca"],
+          "api_family": "openai-completions",
+          "base_url": "https://api.orcarouter.ai/v1/chat/completions",
+          "env_required": { "ORCAROUTER_API_KEY": "sk-orca-..." },
+          "env_optional": {},
+          "minimal_cli": "pi --provider orcarouter --model orcarouter/auto",
+          "advanced_cli": [
+            "pi --provider orcarouter --model deepseek/deepseek-v4-pro",
+            "pi --provider orcarouter --model openai/gpt-4o-mini"
+          ],
+          "expected_behavior": {
+            "auth_success": "200 OK with streaming SSE",
+            "auth_failure": "401 with error.message",
+            "rate_limit": "429 with error.code"
+          },
+          "key_caveats": [
+            "Model IDs use org/model format (e.g., orcarouter/auto)",
+            "orcarouter/auto routes to the gateway's default model"
+          ]
+        },
+        {
           "provider_id": "mistral",
           "display_name": "Mistral",
           "aliases": [],
@@ -583,6 +606,7 @@
       {"var": "DEEPSEEK_API_KEY", "provider": "deepseek", "format": "sk-...", "source": "https://platform.deepseek.com/api_keys"},
       {"var": "CEREBRAS_API_KEY", "provider": "cerebras", "format": "csk-...", "source": "https://cloud.cerebras.ai/"},
       {"var": "OPENROUTER_API_KEY", "provider": "openrouter", "format": "sk-or-v1-...", "source": "https://openrouter.ai/settings/keys"},
+      {"var": "ORCAROUTER_API_KEY", "provider": "orcarouter", "format": "sk-orca-...", "source": "https://www.orcarouter.ai"},
       {"var": "MISTRAL_API_KEY", "provider": "mistral", "source": "https://console.mistral.ai/api-keys/"},
       {"var": "MOONSHOT_API_KEY", "provider": "moonshotai", "format": "sk-...", "source": "https://platform.moonshot.cn/console/api-keys"},
       {"var": "DASHSCOPE_API_KEY", "provider": "alibaba", "format": "sk-...", "source": "https://dashscope.console.aliyun.com/apiKey"},

@@ -362,6 +362,7 @@ pub enum KnownProvider {
     Cerebras,
     OpenRouter,
     Mistral,
+    OrcaRouter,
     Custom(String),
 }
 
@@ -380,6 +381,7 @@ impl std::fmt::Display for KnownProvider {
             Self::Cerebras => write!(f, "cerebras"),
             Self::OpenRouter => write!(f, "openrouter"),
             Self::Mistral => write!(f, "mistral"),
+            Self::OrcaRouter => write!(f, "orcarouter"),
             Self::Custom(s) => write!(f, "{s}"),
         }
     }
@@ -402,6 +404,7 @@ impl std::str::FromStr for KnownProvider {
             "cerebras" => Ok(Self::Cerebras),
             "openrouter" => Ok(Self::OpenRouter),
             "mistral" => Ok(Self::Mistral),
+            "orcarouter" | "orca" => Ok(Self::OrcaRouter),
             other if !other.is_empty() => Ok(Self::Custom(other.to_string())),
             _ => Err("Provider identifier cannot be empty".to_string()),
         }
@@ -508,6 +511,8 @@ mod tests {
             ("cerebras", KnownProvider::Cerebras),
             ("openrouter", KnownProvider::OpenRouter),
             ("mistral", KnownProvider::Mistral),
+            ("orcarouter", KnownProvider::OrcaRouter),
+            ("orca", KnownProvider::OrcaRouter),
         ];
         for (input, expected) in &cases {
             let parsed: KnownProvider = input.parse().unwrap();
@@ -530,6 +535,7 @@ mod tests {
             (KnownProvider::Cerebras, "cerebras"),
             (KnownProvider::OpenRouter, "openrouter"),
             (KnownProvider::Mistral, "mistral"),
+            (KnownProvider::OrcaRouter, "orcarouter"),
         ];
         for (variant, expected) in &cases {
             assert_eq!(&variant.to_string(), expected, "display for {variant:?}");
@@ -551,6 +557,7 @@ mod tests {
             KnownProvider::Cerebras,
             KnownProvider::OpenRouter,
             KnownProvider::Mistral,
+            KnownProvider::OrcaRouter,
         ];
         for variant in &variants {
             let s = variant.to_string();
@@ -855,7 +862,7 @@ mod tests {
                     "anthropic", "openai", "google", "google-vertex",
                     "amazon-bedrock", "azure-openai", "azure",
                     "azure-cognitive-services", "github-copilot", "xai",
-                    "groq", "cerebras", "openrouter", "mistral",
+                    "groq", "cerebras", "openrouter", "mistral", "orcarouter", "orca",
                 ];
                 if !known.contains(&s.as_str()) {
                     let parsed: KnownProvider = s.parse().unwrap();
