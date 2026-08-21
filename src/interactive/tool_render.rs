@@ -108,7 +108,7 @@ const DIFF_TRUNCATE_HEAD: usize = 20;
 /// Lines to show at the end of a truncated diff.
 const DIFF_TRUNCATE_TAIL: usize = 10;
 
-pub(super) fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
+pub(super) fn render_tool_message(text: &str, styles: &TuiStyles, max_width: usize) -> String {
     let mut out = String::new();
     let mut diff_lines: Vec<&str> = Vec::new();
 
@@ -125,12 +125,17 @@ pub(super) fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
         }
     }
 
-    // Render pre-diff content (tool name, success message, etc.)
-    for (idx, line) in pre_diff_lines.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
+    // Render pre-diff content (tool name, success message, etc.), hard-
+    // wrapped so logical rows match physical rows (bd-06s4y).
+    let mut emitted = false;
+    for line in &pre_diff_lines {
+        for segment in super::view::wrapped_line_segments(line, max_width.max(10)) {
+            if emitted {
+                out.push('\n');
+            }
+            emitted = true;
+            out.push_str(&styles.muted.render(segment));
         }
-        out.push_str(&styles.muted.render(line));
     }
 
     if !found_diff_header {
@@ -177,10 +182,33 @@ pub(super) fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
         diff_lines
     };
 
-    // Collect diff lines for word-level highlighting.
-    render_diff_lines(&visible_lines, truncated, styles, &mut out);
+    // Collect diff lines for word-level highlighting. Long diff lines are
+    // clamped (not wrapped) so pairing and highlighting stay line-aligned
+    // while one logical line still occupies exactly one physical row.
+    let clamped: Vec<String> = visible_lines
+        .iter()
+        .map(|line| clamp_display_width(line, max_width.max(10)))
+        .collect();
+    let clamped_refs: Vec<&str> = clamped.iter().map(String::as_str).collect();
+    render_diff_lines(&clamped_refs, truncated, styles, &mut out);
 
     out
+}
+
+/// Clamp a line to `max_width` display cells, appending `…` when cut.
+fn clamp_display_width(line: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0usize;
+    for (idx, ch) in line.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width.saturating_sub(1) {
+            let mut clipped = line[..idx].to_string();
+            clipped.push('\u{2026}');
+            return clipped;
+        }
+        width += ch_width;
+    }
+    line.to_string()
 }
 
 /// Render diff lines with word-level highlighting for paired -/+ lines.
@@ -314,6 +342,76 @@ pub(super) fn pretty_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::model::TextContent;
+
+    // ── width wrapping / clamping (bd-06s4y) ───────────────────────────
+
+    fn strip_ansi(text: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for ch in text.chars() {
+            if in_escape {
+                if ch.is_ascii_alphabetic() {
+                    in_escape = false;
+                }
+            } else if ch == '\u{1b}' {
+                in_escape = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn max_visible_line_width(rendered: &str) -> usize {
+        strip_ansi(rendered)
+            .lines()
+            .map(|line| {
+                line.chars()
+                    .map(|ch| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn tool_pre_diff_lines_wrap_to_width() {
+        let styles = crate::theme::Theme::dark().tui_styles();
+        let long = format!("Tool ran with a very long single line {}", "x".repeat(400));
+        let rendered = render_tool_message(&long, &styles, 40);
+        assert!(
+            max_visible_line_width(&rendered) <= 40,
+            "line overflows: {}",
+            max_visible_line_width(&rendered)
+        );
+        // Nothing lost: total visible chars preserved (wrap, not clamp).
+        assert!(strip_ansi(&rendered).replace('\n', "").contains(&"x".repeat(100)));
+    }
+
+    #[test]
+    fn tool_diff_lines_clamp_to_width_with_ellipsis() {
+        let styles = crate::theme::Theme::dark().tui_styles();
+        let text = format!(
+            "Successfully replaced text in src/foo.rs.\nDiff:\n-{}\n+{}",
+            "old ".repeat(200),
+            "new ".repeat(200)
+        );
+        let rendered = render_tool_message(&text, &styles, 50);
+        assert!(
+            max_visible_line_width(&rendered) <= 50,
+            "diff line overflows: {}",
+            max_visible_line_width(&rendered)
+        );
+        assert!(strip_ansi(&rendered).contains('\u{2026}'), "no ellipsis marker");
+    }
+
+    #[test]
+    fn clamp_display_width_boundaries() {
+        assert_eq!(clamp_display_width("short", 40), "short");
+        let clamped = clamp_display_width(&"a".repeat(100), 10);
+        assert!(clamped.ends_with('\u{2026}'));
+        assert!(clamped.chars().count() <= 10);
+    }
 
     // ── sanitize_terminal_text (bd-p45xh) ───────────────────────────────
 
