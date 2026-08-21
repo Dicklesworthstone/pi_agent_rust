@@ -610,12 +610,12 @@ impl Provider for BedrockProvider {
         let body = rewritten_body
             .as_ref()
             .map_or_else(|| serde_json::to_vec(&request_body), serde_json::to_vec)
-        .map_err(|err| {
-            Error::provider(
-                "amazon-bedrock",
-                format!("Failed to serialize request body: {err}"),
-            )
-        })?;
+            .map_err(|err| {
+                Error::provider(
+                    "amazon-bedrock",
+                    format!("Failed to serialize request body: {err}"),
+                )
+            })?;
         let (request, response_secrets) =
             self.authenticated_request(&url, &body, auth_context, options)?;
 

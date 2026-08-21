@@ -278,7 +278,7 @@ impl Provider for GitLabProvider {
         let body_bytes = rewritten_body
             .as_ref()
             .map_or_else(|| serde_json::to_vec(&request_body), serde_json::to_vec)
-        .map_err(|e| Error::provider("gitlab", format!("Failed to serialize request: {e}")))?;
+            .map_err(|e| Error::provider("gitlab", format!("Failed to serialize request: {e}")))?;
 
         let mut request = self
             .client

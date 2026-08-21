@@ -1546,6 +1546,13 @@ impl Agent {
         Arc::clone(&self.provider)
     }
 
+    /// The session undo recorder attached to the tool registry, if any
+    /// (bd-cv653.3.13).
+    #[must_use]
+    pub fn mutation_recorder(&self) -> Option<Arc<crate::undo::FileMutationRecorder>> {
+        self.tools.mutation_recorder()
+    }
+
     pub const fn stream_options(&self) -> &StreamOptions {
         &self.config.stream_options
     }

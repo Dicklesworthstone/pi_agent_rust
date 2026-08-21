@@ -788,6 +788,122 @@ impl PiApp {
         None
     }
 
+    /// `/undo [n] [force]` (bd-cv653.3.13): roll back the last n tool-path
+    /// file mutations. `force` overrides the external-change guard.
+    pub(super) fn handle_slash_undo(&mut self, args: &str) -> Option<Cmd> {
+        self.apply_undo_redo(args, false)
+    }
+
+    /// `/redo [n] [force]` (bd-cv653.3.13): re-apply undone file mutations.
+    pub(super) fn handle_slash_redo(&mut self, args: &str) -> Option<Cmd> {
+        self.apply_undo_redo(args, true)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_undo_redo(&mut self, args: &str, redo: bool) -> Option<Cmd> {
+        let verb = if redo { "redo" } else { "undo" };
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some(format!("Cannot {verb} while processing"));
+            return None;
+        }
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let recorder = agent_guard.mutation_recorder();
+        drop(agent_guard);
+        let Some(recorder) = recorder else {
+            self.status_message = Some(format!(
+                "/{verb} unavailable: no mutation recorder in this session"
+            ));
+            return None;
+        };
+
+        let mut count = 1_usize;
+        let mut force = false;
+        for token in args.split_whitespace() {
+            if token.eq_ignore_ascii_case("force") {
+                force = true;
+            } else if let Ok(n) = token.parse::<usize>() {
+                count = n.max(1);
+            } else {
+                self.status_message = Some(format!("Usage: /{verb} [n] [force]"));
+                return None;
+            }
+        }
+
+        let outcome = if redo {
+            recorder.redo(count, force)
+        } else {
+            recorder.undo(count, force)
+        };
+
+        let mut lines: Vec<String> = Vec::new();
+        for unit in &outcome.applied {
+            for file in &unit.files {
+                lines.push(format!(
+                    "  {} {} (+{} -{}) [{}]",
+                    file.action, file.path, file.lines_added, file.lines_removed, unit.tool_name
+                ));
+            }
+        }
+        let headline = match (outcome.applied.len(), redo) {
+            (0, _) => String::new(),
+            (n, false) => format!("Undid {n} edit(s):"),
+            (n, true) => format!("Redid {n} edit(s):"),
+        };
+        let stop_note = outcome.stopped.as_ref().map(|stop| match stop {
+            crate::undo::UndoStop::Exhausted => {
+                format!("Nothing to {verb}.")
+            }
+            crate::undo::UndoStop::ExternalChange { paths } => format!(
+                "Stopped: file(s) changed outside the agent since the recorded state: {}. \
+                 Re-run `/{verb} {count} force` to override.",
+                paths.join(", ")
+            ),
+            crate::undo::UndoStop::SnapshotOmitted { paths } => format!(
+                "Stopped: snapshot was not recorded for {} (file too large or unreadable); \
+                 use git to roll further back.",
+                paths.join(", ")
+            ),
+            crate::undo::UndoStop::RestoreFailed { path, error } => {
+                format!("Stopped: failed to restore {path}: {error}")
+            }
+        });
+
+        let mut message = headline;
+        if !lines.is_empty() {
+            message.push('\n');
+            message.push_str(&lines.join("\n"));
+        }
+        if let Some(note) = stop_note {
+            if !message.is_empty() {
+                message.push('\n');
+            }
+            message.push_str(&note);
+        }
+
+        // Audit trail: record the applied operation as a session Custom entry
+        // (mirrors checkpoint/rewind), then surface the report.
+        let record = serde_json::json!({
+            "schema": crate::undo::UNDO_SCHEMA,
+            "action": verb,
+            "outcome": outcome,
+        });
+        let applied_any = !outcome.applied.is_empty();
+        let cx = asupersync::Cx::for_request();
+        let session = Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            if applied_any && let Ok(mut guard) = OwnedMutexGuard::lock(session, &cx).await {
+                guard.append_custom_entry("undo".to_string(), Some(record));
+            }
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &cx, PiMsg::System(message)).await;
+        });
+        None
+    }
+
     /// `/fresh` (bd-cv653.3.7): reset provider stream state; transcript
     /// untouched.
     pub(super) fn handle_slash_fresh(&mut self) -> Option<Cmd> {

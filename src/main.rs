@@ -1688,7 +1688,14 @@ async fn run(
         max_time: cli.max_time.map(std::time::Duration::from_secs),
     };
 
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit
+    // snapshot file content through it so /undo and /redo can roll back.
+    let tools = ToolRegistry::with_mutation_recorder(
+        &enabled_tools,
+        &cwd,
+        Some(&config),
+        Some(Arc::new(pi::undo::FileMutationRecorder::default())),
+    );
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
         enabled: config.compaction_enabled(),

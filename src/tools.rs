@@ -5178,12 +5178,32 @@ pub struct ToolRegistry {
     /// schema until promoted via `xdev promote`. Everything not in this set
     /// is in the schema (essential tier).
     discoverable: std::collections::HashSet<String>,
+    /// Session undo recorder shared with write/edit/hashline_edit
+    /// (bd-cv653.3.13); the interactive host reads it back for /undo //redo.
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 }
 
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
-    #[allow(clippy::too_many_lines)]
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
+        Self::with_mutation_recorder(enabled, cwd, config, None)
+    }
+
+    /// The undo recorder attached at construction, if any.
+    #[must_use]
+    pub fn mutation_recorder(&self) -> Option<Arc<crate::undo::FileMutationRecorder>> {
+        self.mutation_recorder.clone()
+    }
+
+    /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
+    /// mutating file tools (bd-cv653.3.13).
+    #[allow(clippy::too_many_lines)]
+    pub fn with_mutation_recorder(
+        enabled: &[&str],
+        cwd: &Path,
+        config: Option<&Config>,
+        mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
@@ -5206,8 +5226,12 @@ impl ToolRegistry {
                     BashTool::with_shell(cwd, shell_path.clone(), shell_command_prefix.clone())
                         .with_mediation(config.and_then(|c| c.bash.clone())),
                 )),
-                "edit" => tools.push(Box::new(EditTool::new(cwd))),
-                "write" => tools.push(Box::new(WriteTool::new(cwd))),
+                "edit" => tools.push(Box::new(
+                    EditTool::new(cwd).with_mutation_recorder(mutation_recorder.clone()),
+                )),
+                "write" => tools.push(Box::new(
+                    WriteTool::new(cwd).with_mutation_recorder(mutation_recorder.clone()),
+                )),
                 "grep" => tools.push(Box::new(GrepTool::with_backend(
                     cwd,
                     search_backend_from_config(config),
@@ -5217,7 +5241,9 @@ impl ToolRegistry {
                     search_backend_from_config(config),
                 ))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
-                "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "hashline_edit" => tools.push(Box::new(
+                    HashlineEditTool::new(cwd).with_mutation_recorder(mutation_recorder.clone()),
+                )),
                 "jobs" => tools.push(Box::new(JobsTool)),
                 "hub" => tools.push(Box::new(HubTool::new(cwd))),
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
@@ -5304,6 +5330,7 @@ impl ToolRegistry {
         Self {
             tools,
             discoverable: discoverable_names,
+            mutation_recorder,
         }
     }
 
@@ -5312,6 +5339,7 @@ impl ToolRegistry {
         Self {
             tools,
             discoverable: std::collections::HashSet::new(),
+            mutation_recorder: None,
         }
     }
 
@@ -8070,6 +8098,7 @@ struct EditInput {
 pub struct EditTool {
     cwd: PathBuf,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 }
 
 impl EditTool {
@@ -8077,7 +8106,18 @@ impl EditTool {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: None,
+            mutation_recorder: None,
         }
+    }
+
+    /// Attach the session's undo recorder (bd-cv653.3.13).
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
     }
 
     #[cfg(test)]
@@ -8085,6 +8125,7 @@ impl EditTool {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: Some(Arc::new(hook)),
+            mutation_recorder: None,
         }
     }
 }
@@ -8690,7 +8731,7 @@ impl Tool for EditTool {
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -8939,7 +8980,10 @@ impl Tool for EditTool {
         let cwd_clone = self.cwd.clone();
         let final_content_bytes = final_content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
-        asupersync::runtime::spawn_blocking_io(move || {
+        if let Some(recorder) = &self.mutation_recorder {
+            recorder.begin_file(tool_call_id, "edit", &absolute_path);
+        }
+        let persisted = asupersync::runtime::spawn_blocking_io(move || {
             before_persist_hook.map_or_else(
                 || {
                     atomic_replace_file_if_unchanged(
@@ -8961,7 +9005,15 @@ impl Tool for EditTool {
             )
         })
         .await
-        .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")))?;
+        .map_err(|e| Error::tool("edit", format!("Failed to write file: {e}")));
+        if let Some(recorder) = &self.mutation_recorder {
+            if persisted.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        persisted?;
 
         let (diff, first_changed_line) =
             generate_diff_string(&normalized_content, &new_content_for_diff);
@@ -9000,6 +9052,7 @@ struct WriteInput {
 pub struct WriteTool {
     cwd: PathBuf,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 }
 
 impl WriteTool {
@@ -9007,7 +9060,18 @@ impl WriteTool {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: None,
+            mutation_recorder: None,
         }
+    }
+
+    /// Attach the session's undo recorder (bd-cv653.3.13).
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
     }
 
     #[cfg(test)]
@@ -9015,6 +9079,7 @@ impl WriteTool {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: Some(Arc::new(hook)),
+            mutation_recorder: None,
         }
     }
 }
@@ -9052,7 +9117,7 @@ impl Tool for WriteTool {
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -9135,7 +9200,10 @@ impl Tool for WriteTool {
         let cwd_clone = self.cwd.clone();
         let content_bytes = input.content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
-        asupersync::runtime::spawn_blocking_io(move || {
+        if let Some(recorder) = &self.mutation_recorder {
+            recorder.begin_file(tool_call_id, "write", &path);
+        }
+        let persisted = asupersync::runtime::spawn_blocking_io(move || {
             before_persist_hook.map_or_else(
                 || atomic_replace_file(&path_clone, &cwd_clone, &content_bytes),
                 |hook| {
@@ -9150,7 +9218,15 @@ impl Tool for WriteTool {
             )
         })
         .await
-        .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")))?;
+        .map_err(|e| Error::tool("write", format!("Failed to write file: {e}")));
+        if let Some(recorder) = &self.mutation_recorder {
+            if persisted.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        persisted?;
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
@@ -12644,6 +12720,7 @@ struct ResolvedEdit<'a> {
 pub struct HashlineEditTool {
     cwd: PathBuf,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
 }
 
 impl HashlineEditTool {
@@ -12651,7 +12728,18 @@ impl HashlineEditTool {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: None,
+            mutation_recorder: None,
         }
+    }
+
+    /// Attach the session's undo recorder (bd-cv653.3.13).
+    #[must_use]
+    pub fn with_mutation_recorder(
+        mut self,
+        recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    ) -> Self {
+        self.mutation_recorder = recorder;
+        self
     }
 
     #[cfg(test)]
@@ -12659,6 +12747,7 @@ impl HashlineEditTool {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: Some(Arc::new(hook)),
+            mutation_recorder: None,
         }
     }
 }
@@ -12830,7 +12919,7 @@ impl Tool for HashlineEditTool {
     #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
-        _tool_call_id: &str,
+        tool_call_id: &str,
         input: serde_json::Value,
         _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
     ) -> Result<ToolOutput> {
@@ -13144,7 +13233,10 @@ impl Tool for HashlineEditTool {
         let cwd_clone = self.cwd.clone();
         let final_content_bytes = final_content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
-        asupersync::runtime::spawn_blocking_io(move || {
+        if let Some(recorder) = &self.mutation_recorder {
+            recorder.begin_file(tool_call_id, "hashline_edit", &absolute_path);
+        }
+        let persisted = asupersync::runtime::spawn_blocking_io(move || {
             before_persist_hook.map_or_else(
                 || {
                     atomic_replace_file_if_unchanged(
@@ -13166,7 +13258,15 @@ impl Tool for HashlineEditTool {
             )
         })
         .await
-        .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")))?;
+        .map_err(|e| Error::tool("hashline_edit", format!("Failed to write file: {e}")));
+        if let Some(recorder) = &self.mutation_recorder {
+            if persisted.is_ok() {
+                recorder.commit(tool_call_id);
+            } else {
+                recorder.abort(tool_call_id);
+            }
+        }
+        persisted?;
 
         // Generate diff
         let (diff, first_changed_line) = generate_diff_string(&normalized, &new_normalized);
@@ -16181,6 +16281,91 @@ mod tests {
             assert!(!out.is_error);
             let contents = std::fs::read_to_string(tmp.path().join("new.txt")).unwrap();
             assert_eq!(contents, "hello world");
+        });
+    }
+
+    /// bd-cv653.3.13: a recorder attached via the builder observes write
+    /// and edit persistence, and /undo semantics restore prior content.
+    #[test]
+    fn test_mutation_recorder_records_write_and_edit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let recorder = std::sync::Arc::new(crate::undo::FileMutationRecorder::default());
+            let file = tmp.path().join("tracked.txt");
+
+            let write_tool =
+                WriteTool::new(tmp.path()).with_mutation_recorder(Some(recorder.clone()));
+            write_tool
+                .execute(
+                    "w1",
+                    serde_json::json!({
+                        "path": file.to_string_lossy(),
+                        "content": "first\n"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let edit_tool =
+                EditTool::new(tmp.path()).with_mutation_recorder(Some(recorder.clone()));
+            edit_tool
+                .execute(
+                    "e1",
+                    serde_json::json!({
+                        "path": file.to_string_lossy(),
+                        "oldText": "first",
+                        "newText": "second"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(recorder.stats().undo_depth, 2);
+
+            let outcome = recorder.undo(1, false);
+            assert_eq!(outcome.applied.len(), 1, "{outcome:?}");
+            assert_eq!(
+                std::fs::read_to_string(&file).unwrap(),
+                "first\n",
+                "undo must restore the pre-edit content"
+            );
+
+            let outcome = recorder.undo(1, false);
+            assert_eq!(outcome.applied.len(), 1, "{outcome:?}");
+            assert!(
+                !file.exists(),
+                "undoing the creating write removes the file"
+            );
+        });
+    }
+
+    /// bd-cv653.3.13: a failed persist aborts the pending unit instead of
+    /// recording a phantom mutation.
+    #[test]
+    fn test_mutation_recorder_skips_failed_edit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let recorder = std::sync::Arc::new(crate::undo::FileMutationRecorder::default());
+            let file = tmp.path().join("tracked.txt");
+            std::fs::write(&file, "content\n").unwrap();
+
+            let edit_tool =
+                EditTool::new(tmp.path()).with_mutation_recorder(Some(recorder.clone()));
+            let result = edit_tool
+                .execute(
+                    "e1",
+                    serde_json::json!({
+                        "path": file.to_string_lossy(),
+                        "oldText": "no such text",
+                        "newText": "irrelevant"
+                    }),
+                    None,
+                )
+                .await;
+            assert!(result.is_err(), "edit with missing oldText must fail");
+            assert_eq!(recorder.stats().undo_depth, 0, "no unit for a failed edit");
         });
     }
 

@@ -46,6 +46,8 @@ pub enum SlashCommand {
     Rewind,
     Fresh,
     Retry,
+    Undo,
+    Redo,
 }
 
 impl SlashCommand {
@@ -91,6 +93,8 @@ impl SlashCommand {
             "/rewind" => Self::Rewind,
             "/fresh" => Self::Fresh,
             "/retry" => Self::Retry,
+            "/undo" => Self::Undo,
+            "/redo" => Self::Redo,
             _ => return None,
         };
 
@@ -127,6 +131,8 @@ impl SlashCommand {
   /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /advisor [status|pause|resume] - Manage the turn-review advisor model
+  /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
+  /redo [n] [force]  - Re-apply previously undone file edits
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2291,6 +2297,8 @@ impl PiApp {
             SlashCommand::Rewind => self.handle_slash_rewind(args),
             SlashCommand::Fresh => self.handle_slash_fresh(),
             SlashCommand::Retry => self.handle_slash_retry(),
+            SlashCommand::Undo => self.handle_slash_undo(args),
+            SlashCommand::Redo => self.handle_slash_redo(args),
         }
     }
 
@@ -3673,6 +3681,14 @@ mod tests {
         assert!(parse_extension_command("/model").is_none());
         assert!(parse_extension_command("/exit").is_none());
         assert!(parse_extension_command("/compact").is_none());
+        assert!(matches!(
+            super::SlashCommand::parse("/undo 3 force"),
+            Some((super::SlashCommand::Undo, "3 force"))
+        ));
+        assert!(matches!(
+            super::SlashCommand::parse("/redo"),
+            Some((super::SlashCommand::Redo, ""))
+        ));
     }
 
     #[test]
