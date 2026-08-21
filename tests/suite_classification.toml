@@ -158,6 +158,7 @@ files = [
     "session_import",
     "self_update",
     "review",
+    "gc",
     "sdk_api",
     "sdk_unit",
 ]

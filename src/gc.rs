@@ -363,11 +363,7 @@ impl GarbageCollector {
                 BTreeMap::new();
             let mut all_session_stems = HashSet::new();
 
-            Self::scan_session_files(
-                &sessions_dir,
-                &mut project_sessions,
-                &mut all_session_stems,
-            )?;
+            Self::scan_session_files(&sessions_dir, &mut project_sessions, &mut all_session_stems)?;
 
             for (proj_dir, mut session_files) in project_sessions {
                 // Sort descending by modified time (newest first)
@@ -385,14 +381,14 @@ impl GarbageCollector {
                         let reason = if is_named_or_pinned {
                             "Named or pinned session preserved".to_string()
                         } else {
-                            format!("Preserved under keep-last {} quota (rank {})", options.keep_last, idx + 1)
+                            format!(
+                                "Preserved under keep-last {} quota (rank {})",
+                                options.keep_last,
+                                idx + 1
+                            )
                         };
                         items_protected.push(make_session_gc_item(
-                            file_path,
-                            size,
-                            age_secs,
-                            reason,
-                            true,
+                            file_path, size, age_secs, reason, true,
                         ));
                     } else if age >= max_age_duration {
                         let reason = format!(
@@ -401,11 +397,7 @@ impl GarbageCollector {
                             options.older_than_days
                         );
                         items_to_prune.push(make_session_gc_item(
-                            file_path,
-                            size,
-                            age_secs,
-                            reason,
-                            false,
+                            file_path, size, age_secs, reason, false,
                         ));
                     } else {
                         let reason = format!(
@@ -414,11 +406,7 @@ impl GarbageCollector {
                             options.older_than_days
                         );
                         items_protected.push(make_session_gc_item(
-                            file_path,
-                            size,
-                            age_secs,
-                            reason,
-                            true,
+                            file_path, size, age_secs, reason, true,
                         ));
                     }
                 }
@@ -653,11 +641,7 @@ impl GarbageCollector {
         })
     }
 
-    fn restore_session(
-        target: &str,
-        trash_dir: &Path,
-        options: &GcOptions,
-    ) -> Result<GcResult> {
+    fn restore_session(target: &str, trash_dir: &Path, options: &GcOptions) -> Result<GcResult> {
         let sessions_dir = options
             .custom_sessions_dir
             .clone()
@@ -753,11 +737,7 @@ impl GarbageCollector {
         }
     }
 
-    fn empty_trash(
-        trash_dir: &Path,
-        ledger_path: &Path,
-        options: &GcOptions,
-    ) -> Result<GcResult> {
+    fn empty_trash(trash_dir: &Path, ledger_path: &Path, options: &GcOptions) -> Result<GcResult> {
         let mut pruned_items = 0;
         let mut pruned_bytes = 0;
         let mut errors = Vec::new();
@@ -900,7 +880,8 @@ pub fn check_storage_pressure(sessions_dir: &Path, older_than_days: u64) -> Stor
     const STORAGE_THRESHOLD_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
     const STALE_SESSIONS_THRESHOLD: usize = 50;
 
-    let is_elevated = total_bytes > STORAGE_THRESHOLD_BYTES || stale_count > STALE_SESSIONS_THRESHOLD;
+    let is_elevated =
+        total_bytes > STORAGE_THRESHOLD_BYTES || stale_count > STALE_SESSIONS_THRESHOLD;
 
     let recommendation = if is_elevated {
         Some(format!(

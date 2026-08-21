@@ -2353,6 +2353,27 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 out,
             )?;
         }
+        cli::Commands::Gc {
+            older_than,
+            keep_last,
+            caches,
+            dry_run,
+            yes,
+            empty_trash,
+            restore,
+            format,
+        } => {
+            handle_gc(
+                &older_than,
+                keep_last,
+                caches,
+                dry_run,
+                yes,
+                empty_trash,
+                restore.as_deref(),
+                &format,
+            )?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4936,6 +4957,61 @@ fn handle_review(
             return Err(Error::Other(format!(
                 "Review failed: findings met or exceeded severity threshold {threshold_sev}"
             )));
+        }
+    }
+
+    Ok(())
+}
+
+/// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.
+#[allow(clippy::too_many_arguments)]
+fn handle_gc(
+    older_than: &str,
+    keep_last: usize,
+    caches: bool,
+    dry_run: bool,
+    yes: bool,
+    empty_trash: bool,
+    restore: Option<&str>,
+    format: &str,
+) -> Result<()> {
+    let days = pi::gc::parse_retention_days(older_than).ok_or_else(|| {
+        Error::Validation(format!(
+            "Invalid retention window format '{older_than}'. Expected e.g. 30d, 7d, 24h, 14."
+        ))
+    })?;
+
+    let effective_dry_run = if empty_trash || restore.is_some() {
+        false
+    } else {
+        dry_run || !yes
+    };
+
+    let options = pi::gc::GcOptions {
+        older_than_days: days,
+        keep_last,
+        prune_caches: caches,
+        dry_run: effective_dry_run,
+        empty_trash,
+        restore_target: restore.map(ToString::to_string),
+        custom_sessions_dir: None,
+        custom_trash_dir: None,
+        custom_ledger_path: None,
+    };
+
+    let result = pi::gc::GarbageCollector::run(&options)?;
+
+    match format {
+        "json" => {
+            println!("{}", result.format_json()?);
+        }
+        _ => {
+            if effective_dry_run {
+                println!("{}", result.plan.format_text());
+                println!("Pass `--yes` / `-y` to apply these pruning actions.");
+            } else {
+                println!("{}", result.format_text());
+            }
         }
     }
 
