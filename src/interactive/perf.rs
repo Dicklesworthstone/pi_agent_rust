@@ -436,7 +436,16 @@ impl RssReader for ProcSelfRssReader {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            None
+            // macOS (and other non-Linux) has no /proc; ask sysinfo for our
+            // own RSS. Without this the memory tiers never sample and the
+            // progressive-degradation path is inert off Linux (bd-1h9dp).
+            // Sampling is interval-gated by MemoryMonitor, so the refresh
+            // cost stays off the hot path.
+            let pid = sysinfo::Pid::from_u32(std::process::id());
+            let mut system = sysinfo::System::new();
+            system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+            let rss = system.process(pid)?.memory();
+            usize::try_from(rss).ok()
         }
     }
 }
