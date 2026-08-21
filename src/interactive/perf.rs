@@ -1740,6 +1740,18 @@ mod tests {
         assert!(summary.contains("Warning"));
     }
 
+    /// bd-1h9dp: the RSS reader must work on every supported host platform
+    /// (Linux via /proc, macOS/others via sysinfo). If it returns None, the
+    /// entire memory-pressure degradation path is silently inert.
+    #[test]
+    fn proc_self_rss_reader_reports_rss_on_this_platform() {
+        let rss = ProcSelfRssReader.read_rss_bytes();
+        assert!(
+            rss.is_some_and(|bytes| bytes > 1_000_000),
+            "expected a plausible RSS reading for the test process, got {rss:?}"
+        );
+    }
+
     #[test]
     fn memory_monitor_should_force_degraded_only_at_critical() {
         let (mut monitor, shared) = make_memory_monitor(10_000_000);

@@ -385,7 +385,11 @@ mod tests {
             max_visible_line_width(&rendered)
         );
         // Nothing lost: total visible chars preserved (wrap, not clamp).
-        assert!(strip_ansi(&rendered).replace('\n', "").contains(&"x".repeat(100)));
+        assert!(
+            strip_ansi(&rendered)
+                .replace('\n', "")
+                .contains(&"x".repeat(100))
+        );
     }
 
     #[test]
@@ -402,7 +406,10 @@ mod tests {
             "diff line overflows: {}",
             max_visible_line_width(&rendered)
         );
-        assert!(strip_ansi(&rendered).contains('\u{2026}'), "no ellipsis marker");
+        assert!(
+            strip_ansi(&rendered).contains('\u{2026}'),
+            "no ellipsis marker"
+        );
     }
 
     #[test]
