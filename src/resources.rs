@@ -971,6 +971,18 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
             &mut diagnostics,
             &mut collisions,
         );
+
+        // Legacy footgun (bd-3znxm): users coming from upstream pi docs put
+        // skills in `~/.pi/skills`, which Pi never loads — previously a
+        // silent no-op. Surface a diagnostic pointing at the real roots.
+        // Only when loading the real global dir: hermetic tests point
+        // agent_dir at temp roots and must not see host-dependent warnings.
+        if options.agent_dir == Config::global_dir()
+            && let Some(diagnostic) =
+                legacy_skills_dir_diagnostic(dirs::home_dir().as_deref(), &options.agent_dir)
+        {
+            diagnostics.push(diagnostic);
+        }
     }
 
     for resolved in options.skill_paths {
@@ -2014,6 +2026,41 @@ fn module_cache_dir() -> Option<PathBuf> {
         };
     }
     dirs::home_dir().map(|home| home.join(".pi").join("agent").join("cache").join("modules"))
+}
+
+/// Warn when a non-empty legacy `~/.pi/skills` directory exists (bd-3znxm):
+/// Pi only loads `<agent_dir>/skills` and project `.pi/skills`, so skills
+/// placed there following upstream pi docs silently never load.
+fn legacy_skills_dir_diagnostic(
+    home_dir: Option<&Path>,
+    agent_dir: &Path,
+) -> Option<ResourceDiagnostic> {
+    let legacy_dir = home_dir?.join(".pi").join("skills");
+    let loaded_user_dir = agent_dir.join("skills");
+    let is_same_dir = match (legacy_dir.canonicalize(), loaded_user_dir.canonicalize()) {
+        (Ok(legacy), Ok(user)) => legacy == user,
+        _ => legacy_dir == loaded_user_dir,
+    };
+    if is_same_dir {
+        return None;
+    }
+    let has_entries = fs::read_dir(&legacy_dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if !has_entries {
+        return None;
+    }
+    Some(ResourceDiagnostic {
+        kind: DiagnosticKind::Warning,
+        message: format!(
+            "skills found in {} are never loaded; move them to {} (global) or \
+             .pi/skills/ (project)",
+            legacy_dir.display(),
+            loaded_user_dir.display()
+        ),
+        path: legacy_dir,
+        collision: None,
+    })
 }
 
 fn is_cache_module_path_with_cache_dir(path: &Path, cache_dir: Option<&Path>) -> bool {
@@ -3307,6 +3354,47 @@ still frontmatter",
     }
 
     // ── expand_skill_command ───────────────────────────────────────────
+
+    #[test]
+    fn legacy_skills_dir_diag_warns_for_nonempty_misplaced_dir() {
+        let home = tempfile::tempdir().expect("home dir");
+        let agent_dir = home.path().join(".pi").join("agent");
+        let legacy = home.path().join(".pi").join("skills");
+        std::fs::create_dir_all(legacy.join("my-skill")).expect("legacy skill dir");
+
+        let diagnostic = legacy_skills_dir_diagnostic(Some(home.path()), &agent_dir)
+            .expect("expected a warning for misplaced skills");
+        assert_eq!(diagnostic.kind, DiagnosticKind::Warning);
+        assert!(diagnostic.message.contains("never loaded"));
+        assert!(
+            diagnostic
+                .message
+                .contains(&agent_dir.join("skills").display().to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_skills_dir_diag_silent_when_empty_or_missing_or_same() {
+        let home = tempfile::tempdir().expect("home dir");
+        let agent_dir = home.path().join(".pi").join("agent");
+
+        // Missing legacy dir: silent.
+        assert!(legacy_skills_dir_diagnostic(Some(home.path()), &agent_dir).is_none());
+
+        // Empty legacy dir: silent.
+        let legacy = home.path().join(".pi").join("skills");
+        std::fs::create_dir_all(&legacy).expect("legacy dir");
+        assert!(legacy_skills_dir_diagnostic(Some(home.path()), &agent_dir).is_none());
+
+        // agent_dir == ~/.pi (so its skills dir IS the legacy dir): silent
+        // even when non-empty.
+        std::fs::create_dir_all(legacy.join("my-skill")).expect("skill entry");
+        let pi_as_agent_dir = home.path().join(".pi");
+        assert!(legacy_skills_dir_diagnostic(Some(home.path()), &pi_as_agent_dir).is_none());
+
+        // No home dir at all: silent.
+        assert!(legacy_skills_dir_diagnostic(None, &agent_dir).is_none());
+    }
 
     #[test]
     fn test_expand_skill_command_with_matching_skill() {
