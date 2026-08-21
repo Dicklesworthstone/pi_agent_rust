@@ -20232,4 +20232,57 @@ mod tests {
             assert_eq!(content, "line1\nchanged\n");
         });
     }
+
+    #[test]
+    fn hub_agent_requires_name_for_child_ops() {
+        // bd-cv653.5.3: child-targeting actions must refuse without a run id.
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({ "op": "agent", "action": "transcript" });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("requires name"));
+        });
+    }
+
+    #[test]
+    fn hub_agent_unknown_child_is_named_refusal() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({
+                "op": "agent",
+                "action": "transcript",
+                "name": "no-such-child-zzz"
+            });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("unknown child"));
+        });
+    }
+
+    #[test]
+    fn hub_agent_steer_requires_text() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({
+                "op": "agent",
+                "action": "steer",
+                "name": "any-child"
+            });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("requires text"));
+        });
+    }
+
+    #[test]
+    fn hub_agent_rejects_unknown_action() {
+        asupersync::test_utils::run_test(|| async {
+            let tool = HubTool::new(Path::new("."));
+            let input = serde_json::json!({ "op": "agent", "action": "frobnicate" });
+            let out = tool.execute("t", input, None).await.unwrap();
+            assert!(out.is_error);
+            assert!(get_text(&out.content).contains("Unknown agent action"));
+        });
+    }
 }
