@@ -260,7 +260,7 @@ impl ReviewReport {
     /// Format report as JSON string.
     pub fn format_json(&self) -> Result<String> {
         serde_json::to_string_pretty(self)
-            .map_err(|e| Error::Other(format!("Failed to serialize review report: {e}")))
+            .map_err(|e| Error::Validation(format!("Failed to serialize review report: {e}")))
     }
 }
 
@@ -529,9 +529,11 @@ impl CodeReviewer {
         }
         cmd.current_dir(cwd);
 
-        let output = cmd
-            .output()
-            .map_err(|e| Error::Io(format!("Failed to execute git diff for review: {e}")))?;
+        let output = cmd.output().map_err(|e| {
+            Error::Io(Box::new(std::io::Error::other(format!(
+                "Failed to execute git diff for review: {e}"
+            ))))
+        })?;
 
         let diff_str = String::from_utf8_lossy(&output.stdout).to_string();
         let all_hunks = DiffParser::parse_unified_diff(&diff_str).unwrap_or_default();
@@ -636,8 +638,11 @@ impl CodeReviewer {
                 "markdown" => report.format_markdown(),
                 _ => report.format_text(),
             };
-            fs::write(out_path, content)
-                .map_err(|e| Error::Io(format!("Failed to write review report: {e}")))?;
+            fs::write(out_path, content).map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to write review report: {e}"
+                ))))
+            })?;
         }
 
         Ok(report)
