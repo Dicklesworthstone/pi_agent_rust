@@ -95,7 +95,9 @@ impl PiEnv {
             .env("PI_SESSIONS_DIR", self.root.join("sessions"))
             .env("PI_PACKAGE_DIR", self.root.join("packages"))
             .env("PI_NO_AUTO_UPDATE_CHECK", "1")
-            .stdin(Stdio::piped())
+            // --print mode drains piped stdin to EOF before starting the turn;
+            // nothing writes to it here, so a piped-but-open stdin deadlocks.
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for key in [
@@ -133,8 +135,10 @@ fn e2e_advisor_concern_injected_into_next_turn() {
     server.add_route(
         "POST",
         "/advisor/v1/chat/completions",
+        // The newline must stay JSON-escaped inside the SSE data line; a raw
+        // newline would split the data line and produce invalid JSON.
         sse_response(text_sse_body(
-            "CONCERN: swept the whole tree\nScope the read to the target directory.",
+            "CONCERN: swept the whole tree\\nScope the read to the target directory.",
         )),
     );
 
@@ -156,6 +160,9 @@ fn e2e_advisor_concern_injected_into_next_turn() {
         "--tools",
         "read,ls",
         "sweep it",
+        // A second turn: the advisor reviews after turn one and queues its
+        // CONCERN as steering, which is delivered into this next turn.
+        "continue",
     ]);
     let mut child = command.spawn().expect("spawn pi");
     let start = Instant::now();

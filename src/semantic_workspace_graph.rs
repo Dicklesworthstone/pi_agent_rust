@@ -2278,7 +2278,7 @@ const DROPIN_VERDICT_REQUIRED_FIELDS: &[&str] = &[
     "evidence_index",
 ];
 const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a";
+    "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
     "generated_at",

@@ -2709,7 +2709,7 @@ fn failure_count_within_release_threshold() {
 
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a";
+    "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
     "generated_at",
@@ -4117,6 +4117,11 @@ fn retained_performance_binding_fixture(packaged_evidence: bool) -> (PathBuf, St
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("pi-release-evidence-gate-fixtures");
     std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    // On macOS the default TMPDIR lives behind trusted OS symlinks
+    // (/var -> /private/var, /tmp -> /private/tmp). The embedded validators
+    // canonicalize the repository root strictly, so hand them a fixture root
+    // whose supplied path already equals its canonical form.
+    let base = std::fs::canonicalize(&base).expect("canonicalize release-gate fixture base");
     let root = base.join(format!("fixture-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("src")).expect("create fixture source directory");
     std::fs::create_dir_all(root.join("tests/perf/reports"))
@@ -4209,6 +4214,11 @@ fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("pi-release-evidence-gate-fixtures");
     std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    // On macOS the default TMPDIR lives behind trusted OS symlinks
+    // (/var -> /private/var, /tmp -> /private/tmp). The embedded validators
+    // canonicalize the repository root strictly, so hand them a fixture root
+    // whose supplied path already equals its canonical form.
+    let base = std::fs::canonicalize(&base).expect("canonicalize release-gate fixture base");
     let root = base.join(format!("e2e-fixture-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(root.join("src")).expect("create E2E fixture source directory");
     std::fs::write(
@@ -4758,6 +4768,11 @@ fn retained_conformance_evidence_fixture() -> (PathBuf, PathBuf, String) {
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("pi-release-evidence-gate-fixtures");
     std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    // On macOS the default TMPDIR lives behind trusted OS symlinks
+    // (/var -> /private/var, /tmp -> /private/tmp). The embedded validators
+    // canonicalize the repository root strictly, so hand them a fixture root
+    // whose supplied path already equals its canonical form.
+    let base = std::fs::canonicalize(&base).expect("canonicalize release-gate fixture base");
     let root = base.join(format!(
         "conformance-binding-fixture-{}",
         uuid::Uuid::new_v4()
@@ -5433,6 +5448,11 @@ fn retained_dropin_evidence_fixture() -> (PathBuf, PathBuf, PathBuf) {
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("pi-release-evidence-gate-fixtures");
     std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    // On macOS the default TMPDIR lives behind trusted OS symlinks
+    // (/var -> /private/var, /tmp -> /private/tmp). The embedded validators
+    // canonicalize the repository root strictly, so hand them a fixture root
+    // whose supplied path already equals its canonical form.
+    let base = std::fs::canonicalize(&base).expect("canonicalize release-gate fixture base");
     let root = base.join(format!("dropin-binding-fixture-{}", uuid::Uuid::new_v4()));
     let contract_path = root.join("docs/contracts/dropin-certification-contract.json");
     let verdict_path = root.join("docs/evidence/dropin-certification-verdict.json");
@@ -5496,6 +5516,11 @@ fn retained_certified_dropin_lane_fixture(
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("pi-release-evidence-gate-fixtures");
     std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    // On macOS the default TMPDIR lives behind trusted OS symlinks
+    // (/var -> /private/var, /tmp -> /private/tmp). The embedded validators
+    // canonicalize the repository root strictly, so hand them a fixture root
+    // whose supplied path already equals its canonical form.
+    let base = std::fs::canonicalize(&base).expect("canonicalize release-gate fixture base");
     let root = base.join(format!(
         "certified-dropin-lane-fixture-{}",
         uuid::Uuid::new_v4()
@@ -6912,6 +6937,11 @@ fn release_gate_embedded_dropin_validator_rejects_future_and_stale_evidence() {
     let base = std::env::var_os("TMPDIR")
         .map_or_else(std::env::temp_dir, PathBuf::from)
         .join("pi-release-evidence-gate-fixtures");
+    std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    // See retained_performance_binding_fixture: keep the supplied fixture root
+    // equal to its canonical form so macOS TMPDIR symlinks do not trip the
+    // embedded validators' strict path binding.
+    let base = std::fs::canonicalize(&base).expect("canonicalize release-gate fixture base");
     let root = base.join(format!("dropin-fixture-{}", uuid::Uuid::new_v4()));
     let contract_path = root.join("docs/contracts/dropin-certification-contract.json");
     let verdict_path = root.join("docs/evidence/dropin-certification-verdict.json");

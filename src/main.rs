@@ -1820,9 +1820,11 @@ async fn run(
             match pi::providers::create_provider(&entry, None) {
                 Ok(advisor_provider) => {
                     agent_session.advisor = Some(
-                        pi::advisor::AdvisorRuntime::new(advisor_provider, label).with_timeout(
-                            std::time::Duration::from_secs(config.advisor_timeout_secs()),
-                        ),
+                        pi::advisor::AdvisorRuntime::new(advisor_provider, label)
+                            .with_timeout(std::time::Duration::from_secs(
+                                config.advisor_timeout_secs(),
+                            ))
+                            .with_api_key(key.clone()),
                     );
                 }
                 Err(err) => {

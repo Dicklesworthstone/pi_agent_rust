@@ -8,10 +8,22 @@
       "source_tier": "agents-mikeastock",
       "capabilities": {
         "registers_tools": true,
-        "registers_commands": false,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "SIGINT",
+          "SIGTERM",
+          "agent_end",
+          "agent_start",
+          "close",
+          "connect",
+          "data",
+          "error",
+          "exit",
+          "session_shutdown",
+          "tool_call"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -25,11 +37,26 @@
       ],
       "registrations": {
         "tools": [
-          "AskUserQuestion"
+          "AskUserQuestion",
+          "session_query"
         ],
-        "commands": [],
+        "commands": [
+          "handoff"
+        ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "SIGINT",
+          "SIGTERM",
+          "agent_end",
+          "agent_start",
+          "close",
+          "connect",
+          "data",
+          "error",
+          "exit",
+          "session_shutdown",
+          "tool_call"
+        ]
       }
     },
     {
@@ -151,9 +178,7 @@
       "conformance_tier": 1,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "bash"
-        ],
+        "tools": [],
         "commands": [],
         "flags": [],
         "event_handlers": []
@@ -527,9 +552,7 @@
         "commands": [
           "plan"
         ],
-        "flags": [
-          "plan"
-        ],
+        "flags": [],
         "event_handlers": [
           "before_agent_start",
           "session_start",
@@ -717,6 +740,9 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "data",
+          "error",
           "session_start"
         ],
         "uses_exec": true,
@@ -741,6 +767,9 @@
         ],
         "flags": [],
         "event_handlers": [
+          "close",
+          "data",
+          "error",
           "session_start"
         ]
       }
@@ -783,6 +812,9 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
+          "connect",
+          "data",
+          "error",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -805,10 +837,11 @@
         "commands": [
           "control-sessions"
         ],
-        "flags": [
-          "session-control"
-        ],
+        "flags": [],
         "event_handlers": [
+          "connect",
+          "data",
+          "error",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -1043,9 +1076,7 @@
       "conformance_tier": 2,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "bash"
-        ],
+        "tools": [],
         "commands": [],
         "flags": [],
         "event_handlers": [
@@ -1109,9 +1140,7 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "interactive_shell"
-        ],
+        "tools": [],
         "commands": [
           "attach",
           "dismiss"
@@ -1133,7 +1162,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "data",
+          "end",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": true,
@@ -1152,7 +1185,11 @@
         ],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "data",
+          "end",
+          "error"
+        ]
       }
     },
     {
@@ -1165,6 +1202,8 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "error",
           "session_shutdown",
           "session_start"
         ],
@@ -1187,10 +1226,10 @@
           "mcp",
           "mcp-auth"
         ],
-        "flags": [
-          "mcp-config"
-        ],
+        "flags": [],
         "event_handlers": [
+          "close",
+          "error",
           "session_shutdown",
           "session_start"
         ]
@@ -1209,6 +1248,9 @@
           "agent_end",
           "agent_start",
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start",
           "tool_call",
           "tool_result",
@@ -1237,6 +1279,9 @@
           "agent_end",
           "agent_start",
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start",
           "tool_call",
           "tool_result",
@@ -1297,12 +1342,18 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "async_subagent:complete",
+          "close",
+          "data",
+          "end",
+          "error",
           "session_branch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "subagent:complete",
           "subagent:started",
+          "subagent_enhanced:complete",
           "tool_result"
         ],
         "uses_exec": true,
@@ -1317,19 +1368,22 @@
         "exec"
       ],
       "registrations": {
-        "tools": [
-          "subagent",
-          "subagent_status"
-        ],
+        "tools": [],
         "commands": [],
         "flags": [],
         "event_handlers": [
+          "async_subagent:complete",
+          "close",
+          "data",
+          "end",
+          "error",
           "session_branch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "subagent:complete",
           "subagent:started",
+          "subagent_enhanced:complete",
           "tool_result"
         ]
       }
@@ -1376,6 +1430,9 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "data",
+          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -1399,6 +1456,9 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
+          "close",
+          "data",
+          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -1414,10 +1474,23 @@
       "source_tier": "community",
       "capabilities": {
         "registers_tools": true,
-        "registers_commands": false,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "data",
+          "error",
+          "exit",
+          "session_fork",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree",
+          "tool_call",
+          "tool_result"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1433,9 +1506,24 @@
         "tools": [
           "lsp"
         ],
-        "commands": [],
+        "commands": [
+          "lsp"
+        ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "data",
+          "error",
+          "exit",
+          "session_fork",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree",
+          "tool_call",
+          "tool_result"
+        ]
       }
     },
     {
@@ -1484,7 +1572,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -1510,7 +1602,11 @@
           "ralph-stop"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data",
+          "error"
+        ]
       }
     },
     {
@@ -1669,6 +1765,9 @@
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start"
         ],
         "uses_exec": true,
@@ -1695,6 +1794,9 @@
         "flags": [],
         "event_handlers": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start"
         ]
       }
@@ -1782,6 +1884,7 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "resize",
           "session_start",
           "session_switch"
         ],
@@ -1805,6 +1908,7 @@
         ],
         "flags": [],
         "event_handlers": [
+          "resize",
           "session_start",
           "session_switch"
         ]
@@ -2172,17 +2276,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "tool_call",
-          "tool_result",
-          "turn_start"
-        ],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -2196,17 +2290,7 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": [
-          "agent_end",
-          "agent_start",
-          "before_agent_start",
-          "session_shutdown",
-          "session_start",
-          "session_switch",
-          "tool_call",
-          "tool_result",
-          "turn_start"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -3061,7 +3145,7 @@
       "entry_path": "npm/aliou-pi-extension-dev/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3076,12 +3160,7 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "detect_package_manager",
-          "pi_changelog",
-          "pi_docs",
-          "pi_version"
-        ],
+        "tools": [],
         "commands": [
           "extensions:update"
         ],
@@ -3130,7 +3209,9 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "session_start"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3150,7 +3231,9 @@
           "linkup:balance"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "session_start"
+        ]
       }
     },
     {
@@ -3158,11 +3241,15 @@
       "entry_path": "npm/aliou-pi-processes/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "data",
+          "error",
+          "event",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -3181,14 +3268,16 @@
         "exec"
       ],
       "registrations": {
-        "tools": [
-          "processes"
-        ],
+        "tools": [],
         "commands": [
           "processes"
         ],
         "flags": [],
         "event_handlers": [
+          "close",
+          "data",
+          "error",
+          "event",
           "session_shutdown",
           "session_start",
           "session_switch",
@@ -3238,7 +3327,9 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "tool_call"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3249,12 +3340,12 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "bash"
-        ],
+        "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "tool_call"
+        ]
       }
     },
     {
@@ -3266,9 +3357,7 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "resources_discover"
-        ],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3282,9 +3371,7 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": [
-          "resources_discover"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -3360,6 +3447,9 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "data",
+          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -3383,6 +3473,9 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
+          "close",
+          "data",
+          "error",
           "session_before_fork",
           "session_before_tree",
           "session_fork",
@@ -3434,12 +3527,10 @@
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,
-        "registers_commands": true,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "pi-extension-settings:register"
-        ],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3451,13 +3542,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [
-          "extension-settings"
-        ],
+        "commands": [],
         "flags": [],
-        "event_handlers": [
-          "pi-extension-settings:register"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -3466,14 +3553,10 @@
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,
-        "registers_commands": true,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "session_start",
-          "session_switch",
-          "tool_call"
-        ],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3485,15 +3568,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [
-          "files"
-        ],
+        "commands": [],
         "flags": [],
-        "event_handlers": [
-          "session_start",
-          "session_switch",
-          "tool_call"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -3502,13 +3579,10 @@
       "source_tier": "npm-registry",
       "capabilities": {
         "registers_tools": false,
-        "registers_commands": true,
+        "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "session_shutdown",
-          "session_start"
-        ],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3520,14 +3594,9 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [
-          "gob"
-        ],
+        "commands": [],
         "flags": [],
-        "event_handlers": [
-          "session_shutdown",
-          "session_start"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -3542,13 +3611,17 @@
         "subscribes_events": [
           "agent_end",
           "agent_start",
+          "data",
+          "error",
+          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
           "session_switch",
           "session_tree",
           "tool_call",
-          "tool_result"
+          "tool_result",
+          "uncaughtException"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -3572,13 +3645,17 @@
         "event_handlers": [
           "agent_end",
           "agent_start",
+          "data",
+          "error",
+          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
           "session_switch",
           "session_tree",
           "tool_call",
-          "tool_result"
+          "tool_result",
+          "uncaughtException"
         ]
       }
     },
@@ -3634,7 +3711,7 @@
       "entry_path": "npm/marckrenn-pi-sub-core/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -3758,7 +3835,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "data",
+          "end",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -3776,7 +3857,11 @@
           "sketch"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "data",
+          "end",
+          "error"
+        ]
       }
     },
     {
@@ -3923,7 +4008,12 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "connect",
+          "data",
+          "error"
+        ],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -3941,7 +4031,12 @@
           "annotate"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "connect",
+          "data",
+          "error"
+        ]
       }
     },
     {
@@ -3954,7 +4049,11 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "data",
+          "end",
+          "error",
           "session_start",
+          "timeout",
           "tool_call"
         ],
         "uses_exec": false,
@@ -3969,11 +4068,20 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "bash-confirm"
+          "bash-confirm",
+          "demo-bash-confirm",
+          "test-bash-confirm",
+          "test-edit-mode",
+          "test-safe-patterns",
+          "test-unsafe-patterns"
         ],
         "flags": [],
         "event_handlers": [
+          "data",
+          "end",
+          "error",
           "session_start",
+          "timeout",
           "tool_call"
         ]
       }
@@ -4222,7 +4330,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "data",
+          "end",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": true,
@@ -4241,7 +4353,11 @@
         ],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "data",
+          "end",
+          "error"
+        ]
       }
     },
     {
@@ -4362,6 +4478,9 @@
         "registers_providers": false,
         "subscribes_events": [
           "agent_end",
+          "close",
+          "data",
+          "error",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -4392,6 +4511,9 @@
         "flags": [],
         "event_handlers": [
           "agent_end",
+          "close",
+          "data",
+          "error",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -4679,9 +4801,7 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [],
-        "commands": [
-          "model-mode"
-        ],
+        "commands": [],
         "flags": [],
         "event_handlers": [
           "agent_end",
@@ -4824,7 +4944,12 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data",
+          "error",
+          "line"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -4847,7 +4972,12 @@
           "semantic"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data",
+          "error",
+          "line"
+        ]
       }
     },
     {
@@ -4897,8 +5027,13 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "agent_end",
           "session_shutdown",
-          "session_start"
+          "session_start",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -4921,8 +5056,13 @@
         ],
         "flags": [],
         "event_handlers": [
+          "agent_end",
           "session_shutdown",
-          "session_start"
+          "session_start",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start"
         ]
       }
     },
@@ -5228,10 +5368,15 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
+          "add",
           "agent_end",
           "agent_start",
+          "change",
+          "error",
+          "ready",
           "session_shutdown",
-          "session_start"
+          "session_start",
+          "unlink"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -5245,14 +5390,17 @@
       "registrations": {
         "tools": [],
         "commands": [],
-        "flags": [
-          "watch"
-        ],
+        "flags": [],
         "event_handlers": [
+          "add",
           "agent_end",
           "agent_start",
+          "change",
+          "error",
+          "ready",
           "session_shutdown",
-          "session_start"
+          "session_start",
+          "unlink"
         ]
       }
     },
@@ -5266,6 +5414,7 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -5294,6 +5443,7 @@
         ],
         "flags": [],
         "event_handlers": [
+          "exit",
           "session_fork",
           "session_shutdown",
           "session_start",
@@ -5307,14 +5457,11 @@
       "entry_path": "npm/qualisero-pi-agent-scip/dist/index.d.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [
-          "before_agent_start",
-          "session_start"
-        ],
+        "subscribes_events": [],
         "uses_exec": false,
         "uses_http": false,
         "uses_ui": false,
@@ -5325,20 +5472,10 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [
-          "scip_find_definition",
-          "scip_find_references",
-          "scip_list_symbols",
-          "scip_project_tree",
-          "scip_reindex",
-          "scip_search_symbols"
-        ],
+        "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": [
-          "before_agent_start",
-          "session_start"
-        ]
+        "event_handlers": []
       }
     },
     {
@@ -5350,7 +5487,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5376,7 +5517,11 @@
           "ralph-stop"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data",
+          "error"
+        ]
       }
     },
     {
@@ -5558,6 +5703,9 @@
         "subscribes_events": [
           "agent_end",
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "model_select",
           "session_shutdown",
           "session_start",
@@ -5592,6 +5740,9 @@
         "event_handlers": [
           "agent_end",
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "model_select",
           "session_shutdown",
           "session_start",
@@ -5652,6 +5803,9 @@
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start"
         ],
         "uses_exec": true,
@@ -5673,6 +5827,9 @@
         "flags": [],
         "event_handlers": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start"
         ]
       }
@@ -5741,7 +5898,10 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5759,7 +5919,10 @@
         ],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data"
+        ]
       }
     },
     {
@@ -5871,7 +6034,10 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -5898,7 +6064,10 @@
           "overlay-toggle"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data"
+        ]
       }
     },
     {
@@ -6079,9 +6248,7 @@
           "plan",
           "todos"
         ],
-        "flags": [
-          "plan"
-        ],
+        "flags": [],
         "event_handlers": [
           "agent_end",
           "before_agent_start",
@@ -6120,9 +6287,7 @@
         "commands": [
           "preset"
         ],
-        "flags": [
-          "preset"
-        ],
+        "flags": [],
         "event_handlers": [
           "before_agent_start",
           "session_start",
@@ -6392,6 +6557,9 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "data",
+          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -6408,16 +6576,15 @@
         "exec"
       ],
       "registrations": {
-        "tools": [
-          "bash"
-        ],
+        "tools": [],
         "commands": [
           "sandbox"
         ],
-        "flags": [
-          "no-sandbox"
-        ],
+        "flags": [],
         "event_handlers": [
+          "close",
+          "data",
+          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -6581,6 +6748,9 @@
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start",
           "user_bash"
         ],
@@ -6596,18 +6766,14 @@
         "exec"
       ],
       "registrations": {
-        "tools": [
-          "bash",
-          "edit",
-          "read",
-          "write"
-        ],
+        "tools": [],
         "commands": [],
-        "flags": [
-          "ssh"
-        ],
+        "flags": [],
         "event_handlers": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start",
           "user_bash"
         ]
@@ -6658,7 +6824,11 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -6676,7 +6846,11 @@
         ],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data",
+          "error"
+        ]
       }
     },
     {
@@ -6751,12 +6925,20 @@
         "subscribes_events": [
           "agent_end",
           "agent_start",
+          "before_agent_start",
+          "close",
+          "data",
+          "error",
+          "event",
+          "model_select",
+          "session_before_switch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "tool_call",
           "tool_result",
-          "turn_end"
+          "turn_end",
+          "turn_start"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -6771,11 +6953,19 @@
       ],
       "registrations": {
         "tools": [
-          "get_current_time",
-          "read"
+          "nvim_context"
         ],
         "commands": [
           "ad-name",
+          "dumb-zone-status",
+          "extensions:update",
+          "plan:list",
+          "plan:save",
+          "processes",
+          "providers:toggle-widget",
+          "providers:usage",
+          "session:copy-id",
+          "session:copy-path",
           "system-prompt",
           "theme"
         ],
@@ -6783,12 +6973,20 @@
         "event_handlers": [
           "agent_end",
           "agent_start",
+          "before_agent_start",
+          "close",
+          "data",
+          "error",
+          "event",
+          "model_select",
+          "session_before_switch",
           "session_shutdown",
           "session_start",
           "session_switch",
           "tool_call",
           "tool_result",
-          "turn_end"
+          "turn_end",
+          "turn_start"
         ]
       }
     },
@@ -6797,12 +6995,13 @@
       "entry_path": "third-party/ben-vargas-pi-packages/pi-ancestor-discovery/extensions/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
-        "registers_commands": false,
-        "registers_flags": false,
-        "registers_providers": false,
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
+        "registers_providers": true,
         "subscribes_events": [
-          "resources_discover"
+          "model_select",
+          "session_start"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -6814,11 +7013,19 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "generate_image",
+          "get_code_context_exa",
+          "image_quota",
+          "web_search_exa"
+        ],
+        "commands": [
+          "synthetic-models"
+        ],
         "flags": [],
         "event_handlers": [
-          "resources_discover"
+          "model_select",
+          "session_start"
         ]
       }
     },
@@ -6827,13 +7034,18 @@
       "entry_path": "third-party/charles-cooper-pi-extensions/per-model-system-prompt.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
-        "registers_commands": false,
+        "registers_tools": true,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "model_select",
+          "session_before_compact",
+          "session_compact",
           "session_start"
         ],
         "uses_exec": true,
@@ -6848,12 +7060,21 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "subagent"
+        ],
+        "commands": [
+          "subagent"
+        ],
         "flags": [],
         "event_handlers": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "model_select",
+          "session_before_compact",
+          "session_compact",
           "session_start"
         ]
       }
@@ -6887,15 +7108,7 @@
           "bash"
         ],
         "commands": [],
-        "flags": [
-          "ssh-command",
-          "ssh-cwd",
-          "ssh-host",
-          "ssh-no-mount",
-          "ssh-port",
-          "ssh-strict-host-key",
-          "ssh-timeout"
-        ],
+        "flags": [],
         "event_handlers": [
           "session_shutdown",
           "session_start"
@@ -7017,12 +7230,21 @@
       "source_tier": "third-party-github",
       "capabilities": {
         "registers_tools": true,
-        "registers_commands": false,
+        "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "SIGINT",
+          "SIGTERM",
           "before_agent_start",
-          "session_start"
+          "close",
+          "connection",
+          "data",
+          "end",
+          "error",
+          "session_start",
+          "tool_call",
+          "tool_result"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7039,11 +7261,24 @@
         "tools": [
           "apply_patch"
         ],
-        "commands": [],
+        "commands": [
+          "assistant",
+          "codemap",
+          "skill"
+        ],
         "flags": [],
         "event_handlers": [
+          "SIGINT",
+          "SIGTERM",
           "before_agent_start",
-          "session_start"
+          "close",
+          "connection",
+          "data",
+          "end",
+          "error",
+          "session_start",
+          "tool_call",
+          "tool_result"
         ]
       }
     },
@@ -7057,6 +7292,11 @@
         "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "close",
+          "data",
+          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -7073,16 +7313,17 @@
         "exec"
       ],
       "registrations": {
-        "tools": [
-          "bash"
-        ],
+        "tools": [],
         "commands": [
           "sandbox"
         ],
-        "flags": [
-          "sandbox"
-        ],
+        "flags": [],
         "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "close",
+          "data",
+          "error",
           "session_shutdown",
           "session_start",
           "user_bash"
@@ -7103,15 +7344,17 @@
           "session_before_compact",
           "session_start"
         ],
-        "uses_exec": false,
-        "uses_http": true,
-        "uses_ui": true,
-        "uses_session": true,
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
         "is_multi_file": true,
         "has_npm_deps": false
       },
       "conformance_tier": 3,
-      "mock_requirements": [],
+      "mock_requirements": [
+        "exec"
+      ],
       "registrations": {
         "tools": [],
         "commands": [],
@@ -7134,7 +7377,11 @@
         "registers_providers": false,
         "subscribes_events": [
           "agent_end",
-          "session_start"
+          "data",
+          "end",
+          "error",
+          "session_start",
+          "timeout"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7155,7 +7402,11 @@
         "flags": [],
         "event_handlers": [
           "agent_end",
-          "session_start"
+          "data",
+          "end",
+          "error",
+          "session_start",
+          "timeout"
         ]
       }
     },
@@ -7164,18 +7415,26 @@
       "entry_path": "third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
           "model_select",
+          "session_branch",
           "session_shutdown",
           "session_start",
+          "session_switch",
+          "sub-core:action",
           "sub-core:ready",
+          "sub-core:request",
+          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current"
+          "sub-core:update-current",
+          "tool_result",
+          "turn_end",
+          "turn_start"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7192,17 +7451,26 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings"
+          "sub-bar:settings",
+          "sub-core:settings"
         ],
         "flags": [],
         "event_handlers": [
           "model_select",
+          "session_branch",
           "session_shutdown",
           "session_start",
+          "session_switch",
+          "sub-core:action",
           "sub-core:ready",
+          "sub-core:request",
+          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current"
+          "sub-core:update-current",
+          "tool_result",
+          "turn_end",
+          "turn_start"
         ]
       }
     },
@@ -7216,7 +7484,11 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
-          "agent_end"
+          "agent_end",
+          "before_agent_start",
+          "session_start",
+          "tool_call",
+          "tool_result"
         ],
         "uses_exec": false,
         "uses_http": false,
@@ -7232,7 +7504,11 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
-          "agent_end"
+          "agent_end",
+          "before_agent_start",
+          "session_start",
+          "tool_call",
+          "tool_result"
         ]
       }
     },
@@ -7245,7 +7521,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "data",
+          "end",
+          "error"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -7263,7 +7543,11 @@
           "sketch"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "data",
+          "end",
+          "error"
+        ]
       }
     },
     {
@@ -7275,7 +7559,11 @@
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "before_agent_start",
+          "session_start",
+          "session_switch"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": false,
@@ -7290,10 +7578,16 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "diff"
+          "diff",
+          "files",
+          "tui"
         ],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "before_agent_start",
+          "session_start",
+          "session_switch"
+        ]
       }
     },
     {
@@ -7301,7 +7595,7 @@
       "entry_path": "third-party/pasky-pi-amplike/handoff.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -7316,7 +7610,9 @@
       "conformance_tier": 3,
       "mock_requirements": [],
       "registrations": {
-        "tools": [],
+        "tools": [
+          "session_query"
+        ],
         "commands": [
           "handoff"
         ],
@@ -7335,6 +7631,9 @@
         "registers_providers": false,
         "subscribes_events": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start"
         ],
         "uses_exec": true,
@@ -7361,6 +7660,9 @@
         "flags": [],
         "event_handlers": [
           "before_agent_start",
+          "close",
+          "data",
+          "error",
           "session_start"
         ]
       }
@@ -7405,6 +7707,9 @@
         "registers_flags": false,
         "registers_providers": false,
         "subscribes_events": [
+          "close",
+          "data",
+          "error",
           "session_start",
           "tool_result"
         ],
@@ -7424,6 +7729,9 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
+          "close",
+          "data",
+          "error",
           "session_start",
           "tool_result"
         ]
@@ -7500,7 +7808,12 @@
         "registers_commands": false,
         "registers_flags": false,
         "registers_providers": false,
-        "subscribes_events": [],
+        "subscribes_events": [
+          "close",
+          "data",
+          "error",
+          "tool_result"
+        ],
         "uses_exec": true,
         "uses_http": false,
         "uses_ui": true,
@@ -7517,7 +7830,12 @@
         "tools": [],
         "commands": [],
         "flags": [],
-        "event_handlers": []
+        "event_handlers": [
+          "close",
+          "data",
+          "error",
+          "tool_result"
+        ]
       }
     },
     {
@@ -7525,12 +7843,39 @@
       "entry_path": "third-party/w-winter-dot314/agentic-compaction/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
-        "registers_commands": false,
-        "registers_flags": false,
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
         "registers_providers": false,
         "subscribes_events": [
-          "session_before_compact"
+          "agent_end",
+          "agent_start",
+          "async_subagent:complete",
+          "before_agent_start",
+          "close",
+          "context",
+          "data",
+          "end",
+          "error",
+          "input",
+          "session_before_compact",
+          "session_before_fork",
+          "session_before_switch",
+          "session_before_tree",
+          "session_branch",
+          "session_fork",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree",
+          "subagent:complete",
+          "subagent:started",
+          "subagent_enhanced:complete",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start",
+          "user_bash"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7544,11 +7889,79 @@
         "exec"
       ],
       "registrations": {
-        "tools": [],
-        "commands": [],
+        "tools": [
+          "brave_grounding",
+          "brave_search",
+          "questionnaire",
+          "rp",
+          "rp_bind",
+          "rp_exec",
+          "session_ask",
+          "session_lineage",
+          "todo"
+        ],
+        "commands": [
+          "ask",
+          "askwith",
+          "branch",
+          "code",
+          "command-center",
+          "end-review",
+          "ephemeral",
+          "files",
+          "followup",
+          "md",
+          "model-sysprompt-appendix",
+          "notify",
+          "oracle",
+          "plan",
+          "preset",
+          "review",
+          "rp",
+          "rp-tools-lock",
+          "rpbind",
+          "sandbox",
+          "session-ask",
+          "skill",
+          "speedread",
+          "steer",
+          "todos",
+          "tools",
+          "ultrathink",
+          "usage",
+          "vog",
+          "ws"
+        ],
         "flags": [],
         "event_handlers": [
-          "session_before_compact"
+          "agent_end",
+          "agent_start",
+          "async_subagent:complete",
+          "before_agent_start",
+          "close",
+          "context",
+          "data",
+          "end",
+          "error",
+          "input",
+          "session_before_compact",
+          "session_before_fork",
+          "session_before_switch",
+          "session_before_tree",
+          "session_branch",
+          "session_fork",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree",
+          "subagent:complete",
+          "subagent:started",
+          "subagent_enhanced:complete",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start",
+          "user_bash"
         ]
       }
     },

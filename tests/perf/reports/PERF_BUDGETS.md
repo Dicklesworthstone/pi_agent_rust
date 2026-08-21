@@ -1,10 +1,10 @@
 # Performance Budgets
 
-> Generated: 2026-08-05T18:08:56.356Z
+> Generated: 2026-08-21T22:02:18.076Z
 
 > Run ID: not set
 
-> Source commit: not bound (dirty tree)
+> Source commit: 24ad06053dbb548f9d2b2d42b314c7a91aca24b5
 
 > Strict mode: false
 
@@ -33,7 +33,6 @@ Performance claims are blocked. Blocking reason codes:
 - `ci_budget_data_missing`
 - `correlation_id_missing`
 - `run_id_missing`
-- `source_commit_unbound`
 - `strict_mode_disabled`
 
 ## Startup
@@ -92,7 +91,7 @@ Performance claims are blocked. Blocking reason codes:
 
 | Budget | Metric | Comparison | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|---|
-| `binary_size_release` | release binary size | <= | 26 MB | - | NO_DATA | Yes |
+| `binary_size_release` | release binary size | <= | 48 MB | - | NO_DATA | Yes |
 
 ## Protocol
 

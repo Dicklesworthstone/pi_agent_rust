@@ -70,7 +70,7 @@ fn canonical_contract_bundle() -> Value {
                 "migrationLedgerPath": "migrations/ledger.jsonl"
             },
             "integrity": {
-                "chainHash": "f7a3b79f9d1b84444c34f6f1393ba55fba8c4d0868ac8f80a7b951907e8095",
+                "chainHash": "f7a3b79f9d1b84444c34f6f6f1393ba55fba8c4d0868ac8f80a7b951907e8095",
                 "manifestHash": "7d6cf8f3ad3f8bc9f5a4191efebda5b2236a3a4387fa31dd619f024997f30871",
                 "lastCrc32c": "1A2B3C4D"
             },

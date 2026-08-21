@@ -81,7 +81,12 @@
           ],
           "model": "claude-sonnet-4-20250514",
           "stream": true,
-          "system": "You are a test harness model. Follow instructions precisely and deterministically.",
+          "system": [
+            {
+              "text": "You are a test harness model. Follow instructions precisely and deterministically.",
+              "type": "text"
+            }
+          ],
           "temperature": 0.0,
           "tools": [
             {

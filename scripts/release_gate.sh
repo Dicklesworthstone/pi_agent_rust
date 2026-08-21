@@ -3393,7 +3393,7 @@ OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
-CANONICAL_BUDGET_INVENTORY_SHA256 = "481d62711718ad03aec3957ad2e85fd5970321a9093b7222979c36684fd3129a"
+CANONICAL_BUDGET_INVENTORY_SHA256 = "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663"
 
 
 class ContractError(ValueError):

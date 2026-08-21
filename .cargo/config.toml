@@ -22,3 +22,10 @@ rustflags = ["-L", "/usr/local/lib"]
 
 [env]
 PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
+
+# Windows MSVC linking must not depend on PATH resolution of link.exe:
+# build hosts with Git-for-Windows expose GNU coreutils `link` first, which
+# rustc then invokes as the linker and fails ("extra operand ... .rcgu.o").
+# rust-lld ships with the pinned toolchain and drives MSVC links natively.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

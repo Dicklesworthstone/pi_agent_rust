@@ -47,7 +47,9 @@ fn make_model_entry(provider: &str, model_id: &str, base_url: &str) -> ModelEntr
         },
         api_key: None,
         headers: HashMap::new(),
-        auth_header: false,
+        // Real registry entries for these providers derive auth_header=true from
+        // routing defaults, and create_provider honors the flag; mirror that.
+        auth_header: true,
         compat: None,
         oauth_config: None,
     }

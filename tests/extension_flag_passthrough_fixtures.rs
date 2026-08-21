@@ -57,11 +57,14 @@ fn get_extension_flag_fixtures() -> Vec<ExtensionFlagFixture> {
                 "--level=debug",
                 "--format=json",
                 "--continue",
-                "review",
+                // NOTE: the first positional must not collide with a root
+                // subcommand ("review" became `pi review`), or clap parses it
+                // as a subcommand invocation instead of message args.
+                "critique",
                 "this",
                 "code",
             ],
-            expected_message: &["review", "this", "code"],
+            expected_message: &["critique", "this", "code"],
         },
         ExtensionFlagFixture {
             name: "edge_case_flag_ordering",

@@ -3192,7 +3192,7 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
    (set -C; git show \
      "$expected_source_commit:.github/workflows/release.yml" > "$frozen_workflow")
    test "$(sha256sum "$frozen_workflow" | awk '{print $1}')" = \
-     df6b169fd80b34fb219154bb4255cf574b6a5130a504c60a1b192607aac3f2fd
+     1e2ff4411d519479077806c6059b8dfb58b20b0e08c7dff6154960d3ba600b20
    FROZEN_WORKFLOW="$frozen_workflow" PROVIDER_PATH="$provider" python3 - <<'PY'
    import os
    from pathlib import Path

@@ -95,8 +95,11 @@ fn e2e_rpc_plan_mode_blocks_approves_executes() {
         ),
     )
     .expect("write models.json");
-    std::fs::write(root.join("settings.json"), r#"{"checkForUpdates": false}"#)
-        .expect("write settings.json");
+    std::fs::write(
+        root.join("settings.json"),
+        r#"{"checkForUpdates": false, "approval": {"mode": "yolo"}}"#,
+    )
+    .expect("write settings.json");
     let workspace = harness.temp_path("workspace");
     std::fs::create_dir_all(&workspace).expect("mkdir workspace");
 

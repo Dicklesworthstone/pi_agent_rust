@@ -13,7 +13,7 @@ mod common;
 
 use common::harness::TestHarness;
 use pi::auth::AuthStorage;
-use pi::models::{ModelRegistry, default_models_path};
+use pi::models::{ModelRegistry, default_models_path, model_requires_configured_credential};
 
 // ============================================================================
 // Built-in Models Tests
@@ -58,12 +58,22 @@ fn test_built_in_models_without_api_keys() {
         "Should have Google built-in models"
     );
 
-    // No models should be available (no API keys)
+    // Without API keys, only models from providers that resolve credentials at
+    // request time (or need none at all — e.g. ollama/llamacpp/mistralrs,
+    // amazon-bedrock, sap-ai-core) should be available.
     let available = registry.get_available();
     assert!(
-        available.is_empty(),
-        "No models should be available without API keys"
+        available
+            .iter()
+            .all(|m| !model_requires_configured_credential(m)),
+        "Only keyless/request-time-credential models should be available without API keys"
     );
+    for provider in ["anthropic", "openai", "google"] {
+        assert!(
+            !available.iter().any(|m| m.model.provider == provider),
+            "No {provider} models should be available without API keys"
+        );
+    }
 
     // No errors should be reported
     assert!(registry.error().is_none(), "No error expected");
@@ -106,12 +116,23 @@ fn test_built_in_models_with_anthropic_key() {
         "OpenAI models should not have API key"
     );
 
-    // Available models should only be Anthropic
+    // Available models should be exactly: all Anthropic models plus the
+    // always-available keyless/request-time-credential providers.
     let available = registry.get_available();
+    let available_anthropic = available
+        .iter()
+        .filter(|m| m.model.provider == "anthropic")
+        .count();
     assert_eq!(
-        available.len(),
+        available_anthropic,
         anthropic_models.len(),
-        "Only Anthropic models should be available"
+        "All Anthropic models should be available"
+    );
+    assert!(
+        available
+            .iter()
+            .all(|m| m.model.provider == "anthropic" || !model_requires_configured_credential(m)),
+        "Only Anthropic and keyless models should be available"
     );
 }
 
@@ -670,12 +691,24 @@ fn test_get_available_filters_by_api_key() {
         }
     });
 
-    // Only OpenAI models should be available
+    // Only OpenAI models (plus always-available keyless/request-time-credential
+    // providers) should be available.
     assert!(
-        available.iter().all(|m| m.model.provider == "openai"),
-        "Only OpenAI models should be available"
+        available
+            .iter()
+            .all(|m| m.model.provider == "openai" || !model_requires_configured_credential(m)),
+        "Only OpenAI and keyless models should be available"
     );
-    assert!(!available.is_empty(), "Should have available models");
+    assert!(
+        available.iter().any(|m| m.model.provider == "openai"),
+        "OpenAI models should be available"
+    );
+    for provider in ["anthropic", "google"] {
+        assert!(
+            !available.iter().any(|m| m.model.provider == provider),
+            "No {provider} models should be available"
+        );
+    }
 }
 
 // ============================================================================

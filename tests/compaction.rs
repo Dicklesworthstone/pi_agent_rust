@@ -929,10 +929,13 @@ fn prepare_compaction_skips_tool_result_as_cut_point_and_marks_split_turn() {
     let prep = prepare_compaction(&entries, make_settings(2)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    assert_eq!(prep.first_kept_entry_id, "a1");
+    // Under BPE counting the keep-recent boundary lands on a2; the tool
+    // result (tr1) is still never chosen as the cut point, and cutting
+    // mid-turn marks the split with the full turn prefix (u1, a1, tr1).
+    assert_eq!(prep.first_kept_entry_id, "a2");
     assert!(prep.is_split_turn);
     assert!(prep.messages_to_summarize.is_empty());
-    assert_eq!(prep.turn_prefix_messages.len(), 1);
+    assert_eq!(prep.turn_prefix_messages.len(), 3);
 }
 
 #[test]
@@ -1301,7 +1304,9 @@ fn prepare_compaction_tokens_before_ignores_aborted_usage_but_counts_trailing_me
     let prep = prepare_compaction(&entries, make_settings(0)).expect("prep");
     log_preparation(&harness, &entries, &prep);
 
-    assert_eq!(prep.tokens_before, 101);
+    // 100 from the non-aborted usage plus the BPE estimate (2 tokens) of the
+    // aborted message's text; the aborted usage total (999) is ignored.
+    assert_eq!(prep.tokens_before, 102);
 }
 
 #[test]
@@ -1761,8 +1766,12 @@ fn compact_returns_error_when_provider_stops_with_error() {
         message_entry("u1", Some("u0"), user_text(text_of_tokens(1))),
     ];
 
-    let prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
+    let mut prep = prepare_compaction(&entries, make_settings(1)).expect("prep");
     log_preparation(&harness, &entries, &prep);
+    // Below the forced-local threshold (2x the context window) a provider
+    // failure must propagate so the caller can retry with the LLM later;
+    // only oversized sessions degrade to the deterministic local fallback.
+    prep.settings.context_window_tokens = 128_000;
 
     let provider_dyn: Arc<dyn Provider> = Arc::new(ErrorProvider);
     let err = run_async(async move { compact(prep, provider_dyn, "test-key", None).await })

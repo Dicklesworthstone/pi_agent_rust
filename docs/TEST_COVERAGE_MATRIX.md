@@ -1,23 +1,23 @@
 ## Test Coverage Matrix (Current Source Inventory)
 
-> Last regenerated: 2026-08-03
+> Last regenerated: 2026-08-21
 > Owner bead: `bd-8t27h.1`
 
 This document is the current source-file coverage inventory for `src/**/*.rs`. It is not a drop-in certification artifact and does not override `docs/evidence/dropin-certification-verdict.json`.
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 121 current source files.
-- `rg --files tests -g '*.rs' | wc -l` -> 327 Rust test files under `tests/`.
+- `rg --files src -g '*.rs' | sort` -> 202 current source files.
+- `rg --files tests -g '*.rs' | wc -l` -> 360 Rust test files under `tests/`.
 - `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
-- `python3 scripts/check_traceability_matrix.py` passes with 302/302 classified tests traced (100.00%) and 39/39 classified E2E suites covered (100.00%).
-- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 121-file current tree.
+- `python3 scripts/check_traceability_matrix.py` passes with 337/337 classified tests traced (100.00%) and 50/50 classified E2E suites covered (100.00%).
+- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 202-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
 
 ### Current Drift Check
 
-- Current `src/` inventory: 121 files.
-- Source-file rows below: 121.
+- Current `src/` inventory: 202 files.
+- Source-file rows below: 202.
 - Source files omitted from this document: 0.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -36,25 +36,43 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | Source file | Area | Coverage evidence / status |
 |---|---|---|
 | `src/acp.rs` | ACP protocol | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
+| `src/advisor.rs` | Advisor turns | `tests/e2e_advisor.rs` (concern injection, failure isolation). |
 | `src/agent.rs` | Agent loop | Unit; `tests/agent_loop_vcr.rs`, `tests/agent_loop_reliability.rs`, `tests/e2e_agent_loop.rs`, `tests/rpc_mode.rs`. |
 | `src/agent_cx.rs` | Agent context | Unit; covered through agent/RPC suites. |
 | `src/app.rs` | App orchestration | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`. |
+| `src/approval.rs` | Tool approval flow | `tests/e2e_plan_mode.rs`, `tests/e2e_rpc.rs` approval paths. |
+| `src/ask.rs` | Ask prompts | Interactive coverage via `tests/tui_state.rs` and RPC suites. |
+| `src/ast_tools.rs` | AST tools | `tests/ast_tools.rs`, `tests/e2e_ast_tools.rs`. |
 | `src/auth.rs` | Auth and OAuth | Unit; `tests/auth_oauth_refresh_vcr.rs`, `tests/extensions_provider_oauth.rs`. |
 | `src/autocomplete.rs` | Prompt autocomplete | Unit; interactive coverage via `tests/tui_state.rs`. |
+| `src/bash_mediation.rs` | Bash mediation | `tests/bash_mediation.rs`. |
 | `src/bin/pi_legacy_capture.rs` | Legacy capture utility | Unit; opt-in capture utility, not a default user path. |
+| `src/bin/pi_mcp_fixture.rs` | MCP test fixture binary | Waived glue; test-support binary driven by `tests/mcp.rs`. |
 | `src/buffer_shim.rs` | Node buffer shim | `tests/node_buffer_shim.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/checkpoint.rs` | Session checkpoints | `tests/checkpoint.rs` (checkpoint/rewind/fresh/retry). |
 | `src/cli.rs` | CLI parsing | Unit; `tests/main_cli_selection.rs`, `tests/cli_edge_cases.rs`, `tests/e2e_cli.rs`. |
+| `src/commit_split.rs` | Commit splitting | `tests/commit_split.rs`. |
 | `src/compaction.rs` | Session compaction | Unit; `tests/compaction.rs`, `tests/compaction_bug.rs`. |
 | `src/compaction_worker.rs` | Compaction worker | Unit; exercised by compaction suites. |
+| `src/completions.rs` | Shell completions | CLI coverage via `tests/main_cli_selection.rs`, `tests/cli_edge_cases.rs`. |
 | `src/config.rs` | Config loading | Unit; `tests/config_precedence.rs`, `tests/config_edge_cases.rs`. |
 | `src/conformance.rs` | Conformance runner | Unit; `tests/conformance_*.rs`, `tests/tools_conformance.rs`. |
 | `src/conformance_shapes.rs` | Conformance schemas | Unit; `tests/ext_conformance_shapes.rs`. |
 | `src/connectors/http.rs` | HTTP connector | `tests/pi_connector_shims.rs`; connector coverage still needs machine-readable trace expansion under `bd-8t27h.3`. |
 | `src/connectors/mod.rs` | Connector registry | Unit; `tests/rpc_session_connector.rs`, `tests/pi_connector_shims.rs`. |
+| `src/context_files.rs` | Context file loading | Covered through agent/session suites and `tests/config_precedence.rs`. |
 | `src/crypto_shim.rs` | Node crypto shim | Unit; `tests/node_crypto_shim.rs`. |
+| `src/debug.rs` | Debug (DAP) facade | `tests/debug.rs`. |
+| `src/debug/adapters.rs` | DAP adapters | `tests/debug.rs`. |
+| `src/debug/dap.rs` | DAP protocol | `tests/debug.rs`. |
+| `src/debug/session.rs` | DAP sessions | `tests/debug.rs`. |
+| `src/dialects.rs` | Provider dialects | Provider conformance suites; `tests/json_mode_parity.rs`. |
 | `src/doctor.rs` | Doctor and diagnostics | Unit; `tests/doctor_swarm_temp_dir_json.rs`, `tests/franken_node_compatibility_doctor_contract.rs`. |
+| `src/embedded_assets.rs` | Embedded assets | Waived glue; exercised implicitly by resource loading suites. |
 | `src/error.rs` | Error types | Unit; `tests/error_types.rs`, `tests/error_handling.rs`. |
 | `src/error_hints.rs` | Error remediation hints | Unit; `tests/error_handling.rs`. |
+| `src/eval.rs` | Eval harness | `tests/eval.rs`. |
+| `src/eval/js_kernel.rs` | Eval JS kernel | `tests/eval.rs`; in-source kernel tests. |
 | `src/extension_conformance_matrix.rs` | Extension matrix | Unit; `tests/ext_conformance_matrix.rs`. |
 | `src/extension_dispatcher.rs` | Extension dispatcher | Unit; `tests/event_dispatch_latency.rs`, `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`; timing ignored test owner `bd-8t27h.11`. |
 | `src/extension_events.rs` | Extension events | Unit; `tests/extensions_event_wiring.rs`, `tests/extensions_event_cancellation.rs`, `tests/extensions_repair_events.rs`. |
@@ -69,9 +87,38 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extension_validation.rs` | Extension validation | Unit; `tests/extension_validation.rs`, `tests/extension_lockfile_provenance.rs`, `tests/ext_provenance_verification.rs`. |
 | `src/extensions.rs` | Extension protocol/runtime | Unit; `tests/extensions_*.rs`, `tests/ext_conformance*.rs`, `tests/e2e_extension_registration.rs`. |
 | `src/extensions/compatibility.rs` | Extension compatibility contracts and scanner | Unit; compatibility scanner tests in this module plus `tests/ext_entry_scan.rs` and extension conformance suites. |
+| `src/extensions/event_coalescer_impl.rs` | Extension event coalescer | Extension event suites (`tests/extensions_event_wiring.rs`). |
+| `src/extensions/exec_mediation.rs` | Extension exec mediation | `tests/bash_mediation.rs`; in-source exec-security tests. |
+| `src/extensions/extension_manager_impl.rs` | Extension manager | Extension lifecycle suites (`tests/extensions_runtime_matrix.rs`). |
+| `src/extensions/fs_connector.rs` | Extension fs connector | `tests/extensions_fs_shim.rs`. |
+| `src/extensions/native_runtime_duplicate_scaffold.rs` | Native runtime scaffold | Waived glue; duplicate scaffold retained for migration parity. |
+| `src/extensions/native_runtime_experimental.rs` | Native runtime (experimental) | In-source runtime-parity tests. |
+| `src/extensions/permission_drift.rs` | Permission drift detection | In-source tests; policy suites. |
+| `src/extensions/policy_snapshot_tests.rs` | Policy snapshot tests | In-source test module (waived glue). |
+| `src/extensions/protocol.rs` | Extension protocol | Extension conformance suites. |
+| `src/extensions/tests.rs` | Extension test root | In-source test module (waived glue). |
+| `src/extensions/tests/baseline.rs` | Extension tests: baseline | In-source test module (waived glue). |
+| `src/extensions/tests/concurrency.rs` | Extension tests: concurrency | In-source test module (waived glue). |
+| `src/extensions/tests/core.rs` | Extension tests: core | In-source test module (waived glue). |
+| `src/extensions/tests/enforcement.rs` | Extension tests: enforcement | In-source test module (waived glue). |
+| `src/extensions/tests/event_timeouts.rs` | Extension tests: event timeouts | In-source test module (waived glue). |
+| `src/extensions/tests/exec_security.rs` | Extension tests: exec security | In-source test module (waived glue). |
+| `src/extensions/tests/policy_transition.rs` | Extension tests: policy transition | In-source test module (waived glue). |
+| `src/extensions/tests/reactor.rs` | Extension tests: reactor | In-source test module (waived glue). |
+| `src/extensions/tests/registration.rs` | Extension tests: registration | In-source test module (waived glue). |
+| `src/extensions/tests/risk_math.rs` | Extension tests: risk math | In-source test module (waived glue). |
+| `src/extensions/tests/runtime_parity.rs` | Extension tests: runtime parity | In-source test module (waived glue). |
+| `src/extensions/tests/security_alerts.rs` | Extension tests: security alerts | In-source test module (waived glue). |
+| `src/extensions/tests/shared_dispatch.rs` | Extension tests: shared dispatch | In-source test module (waived glue). |
+| `src/extensions/tests/ui_protocol.rs` | Extension tests: UI protocol | In-source test module (waived glue). |
+| `src/extensions/wasm_host.rs` | Wasm extension host | Extension runtime suites; in-source tests. |
 | `src/extensions_js.rs` | QuickJS bridge | Unit; `tests/event_loop_conformance.rs`, `tests/js_runtime_ordering.rs`, `tests/node_*_shim.rs`, `tests/e2e_ts_extension_loading.rs`. |
+| `src/failover.rs` | Provider failover | `tests/e2e_failover.rs`. |
 | `src/file_lock.rs` | Cross-process directory locking | Unit; session-index lock integration coverage in `tests/session_index_tests.rs` and RPC concurrency coverage in `tests/e2e_rpc.rs`. |
 | `src/flake_classifier.rs` | Flake classifier | Unit; patterns are mirrored by `scripts/ci_conformance_retry.sh`. |
+| `src/gc.rs` | Session GC | `tests/gc.rs`. |
+| `src/github.rs` | GitHub integration | `tests/hub.rs`; covered through hub/review suites. |
+| `src/handoff.rs` | Handoff generation | `tests/handoff_generator.rs`. |
 | `src/hostcall_amac.rs` | Hostcall AMAC | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_io_uring_lane.rs` | Hostcall io_uring lane | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_queue.rs` | Hostcall queue | Unit; `tests/hostcall_queue_ebr.rs`, `tests/hostcall_queue_loom.rs`; loom opt-in owner `bd-8t27h.6`. |
@@ -85,6 +132,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/http/test_api.rs` | HTTP test support | Waived test-only support module; compiled only for tests. |
 | `src/http/test_asupersync.rs` | HTTP test support | Waived test-only support module; compiled only for tests. |
 | `src/http_shim.rs` | Node HTTP shim | `tests/node_http_shim.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/hub.rs` | Hub | `tests/hub.rs`. |
 | `src/interactive.rs` | TUI root | Unit test module wiring; `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`. |
 | `src/interactive/agent.rs` | TUI agent lane | Unit; `tests/e2e_tui.rs`, `tests/tui_state.rs`. |
 | `src/interactive/commands.rs` | Interactive commands | Unit; `tests/interactive_commands_unit.rs`, `tests/interactive_extension_ui.rs`. |
@@ -102,9 +150,24 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/interactive/tree.rs` | Conversation tree | Covered through `tests/tui_state.rs` and session/navigation tests; direct trace should be expanded in `bd-8t27h.3`. |
 | `src/interactive/tree_ui.rs` | Tree UI | Covered through `tests/tui_snapshot.rs` and `tests/tui_state.rs`. |
 | `src/interactive/view.rs` | View rendering | Unit; `tests/tui_snapshot.rs`, `tests/e2e_tui.rs`. |
+| `src/interactive_ftui.rs` | FTUI interactive surface | `tests/e2e_ftui.rs`. |
+| `src/jobs.rs` | Background jobs | `tests/jobs.rs`. |
 | `src/keybindings.rs` | Keybinding config | Unit; interactive/TUI tests. |
 | `src/lib.rs` | Crate exports | Waived glue: exported module surface is compiled by all targets; no behavior-only row. |
+| `src/lsp.rs` | LSP facade | `tests/lsp.rs`, `tests/e2e_lsp.rs`. |
+| `src/lsp/client.rs` | LSP client | `tests/lsp.rs`. |
+| `src/lsp/edits.rs` | LSP edits | `tests/lsp.rs`. |
+| `src/lsp/jsonrpc.rs` | LSP JSON-RPC | `tests/lsp.rs`. |
+| `src/lsp/registry.rs` | LSP registry | `tests/lsp.rs`. |
+| `src/lsp/text.rs` | LSP text mapping | `tests/lsp.rs`. |
+| `src/magic_keywords.rs` | Magic keywords | `tests/magic_keywords.rs`. |
 | `src/main.rs` | CLI entry | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/mcp.rs` | MCP facade | `tests/mcp.rs`. |
+| `src/mcp/config.rs` | MCP config | `tests/mcp.rs`. |
+| `src/mcp/manager.rs` | MCP manager | `tests/mcp.rs`. |
+| `src/mcp/transport.rs` | MCP transport | `tests/mcp.rs`. |
+| `src/mcp/trust.rs` | MCP trust | `tests/mcp.rs`. |
+| `src/memory.rs` | Memory files | `tests/memory.rs`. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
 | `src/model_routing.rs` | Model-routing policy and evidence | Unit; model-routing tests in this module plus `tests/model_selector_cycling.rs`. |
@@ -114,6 +177,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/perf_build.rs` | Perf build metadata | Unit; `tests/perf_bench_harness.rs`, `tests/perf_budgets.rs`, `tests/perf_regression.rs`. |
 | `src/permissions.rs` | Capability permissions | Unit; `tests/capability_policy_model.rs`, `tests/capability_policy_scoped.rs`, `tests/capability_denial_matrix.rs`. |
 | `src/pi_wasm.rs` | PiWasm runtime | Unit; `tests/lab_runtime_extensions.rs`; unsupported imports fail closed, with bounded Emscripten compatibility stubs covered by source tests. |
+| `src/plan.rs` | Plan mode | `tests/e2e_plan_mode.rs`. |
 | `src/platform.rs` | Platform helpers | Unit. |
 | `src/provider.rs` | Provider trait/schema | Unit; `tests/provider_factory.rs`, `tests/provider_contract.rs`, `tests/provider_native_contract.rs`. |
 | `src/provider_metadata.rs` | Provider metadata | Unit; `tests/provider_metadata_comprehensive.rs`, `tests/provider_registry_guardrails.rs`. |
@@ -125,25 +189,31 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gitlab.rs` | GitLab Duo provider | Unit; provider native/contract suites. |
-| `src/providers/model_fetch.rs` | Live provider-model discovery and cache | Unit tests in this module; static-registry integration through `tests/model_registry.rs`. |
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
+| `src/providers/model_fetch.rs` | Live provider-model discovery and cache | Unit tests in this module; static-registry integration through `tests/model_registry.rs`. |
 | `src/providers/openai.rs` | OpenAI chat provider | Unit; `tests/provider_streaming/openai.rs`, provider error/path suites. |
 | `src/providers/openai_responses.rs` | OpenAI Responses provider | Unit; `tests/provider_streaming/openai_responses.rs`, provider error/path suites. |
 | `src/providers/vertex.rs` | Vertex provider | Unit; provider native/contract suites. |
 | `src/resource_governor.rs` | Resource governor | Unit; `tests/cargo_headroom_admission.rs`, `tests/resource_edge_cases.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/resources.rs` | Resource loading | Unit; `tests/resource_loader.rs`, `tests/resource_edge_cases.rs`; traceability lane `resource_scheduler_admission`. |
+| `src/review.rs` | Review workflow | `tests/review.rs`. |
 | `src/rpc.rs` | RPC/stdin mode | Unit; `tests/rpc_mode.rs`, `tests/rpc_protocol.rs`, `tests/rpc_edge_cases.rs`, `tests/e2e_rpc.rs`. |
 | `src/scheduler.rs` | Scheduler/admission | Unit; `tests/scheduler_repro.rs`, `tests/cargo_headroom_admission.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
+| `src/secrets.rs` | Secret handling | `tests/secrets.rs`. |
+| `src/self_update.rs` | Self-update | `tests/self_update.rs`. |
 | `src/semantic_workspace_graph.rs` | Semantic workspace graph and context bundles | Unit; `tests/semantic_workspace_graph_contract.rs`, `tests/semantic_workspace_graph_builder.rs`, and agent integration tests. |
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
+| `src/session_import.rs` | Session import | `tests/session_import.rs`. |
 | `src/session_index.rs` | Session index | Unit; `tests/session_index_tests.rs`, `tests/reproduce_index_gap.rs`. |
 | `src/session_metrics.rs` | Session metrics | Unit; `tests/provider_session_coverage.rs` and session evidence suites. |
 | `src/session_picker.rs` | Session picker UI | Unit; `tests/session_picker.rs`. |
 | `src/session_sqlite.rs` | SQLite session backend | Unit; `tests/session_sqlite.rs`, `tests/fault_injection_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_store_v2.rs` | Session store v2 | Unit; `tests/session_store_v2.rs`, `tests/session_store_v2_contract.rs`. |
 | `src/session_test.rs` | Session test helpers | Waived test-support module; compiled by session tests. |
+| `src/skills_managed.rs` | Managed skills | `tests/skills_managed.rs`. |
 | `src/sse.rs` | SSE parser | Unit; `tests/sse_strict_compliance.rs`, `tests/repro_sse_flush.rs`, `tests/repro_sse_newline.rs`. |
+| `src/stream_rules.rs` | Stream rules | `tests/stream_rules.rs`. |
 | `src/subagents.rs` | Native isolated child-agent tool | Unit tests in this module; opt-in registration coverage through built-in tool tests. |
 | `src/swarm_activity_ledger.rs` | Swarm activity ledger | Unit; evidence docs in `docs/swarm-activity-ledger.md`, CI evidence bundle tests. |
 | `src/swarm_flight_recorder.rs` | Swarm flight recorder | Unit and E2E; `tests/e2e_swarm_flight_recorder.rs` covers deterministic multi-agent replay artifacts. |
@@ -151,11 +221,22 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/swarm_replay.rs` | Swarm trace replay and policy comparison | Unit; `tests/swarm_replay_trace_contract.rs`, `tests/swarm_replay_ingestor.rs`, and `tests/swarm_replay_preview_cli.rs`. |
 | `src/terminal_images.rs` | Terminal images | Unit; interactive/TUI rendering tests. |
 | `src/theme.rs` | Theme loading | Unit; `tests/tui_snapshot.rs`, interactive UI tests. |
+| `src/todo.rs` | Todo tracking | Covered through TUI/session suites. |
+| `src/token_count.rs` | BPE token counting | In-source tests; `tests/compaction.rs` cut-point calibration. |
 | `src/tools.rs` | Built-in tools | Unit; `tests/tools_conformance.rs`, `tests/e2e_tools.rs`, `tests/tools_hardened.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/tui.rs` | Terminal renderer | Unit; `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`. |
+| `src/turn_recovery.rs` | Turn recovery | `tests/e2e_interruption_resume_replay.rs`; recovery suites. |
+| `src/undo.rs` | Undo | Covered through session/TUI suites. |
+| `src/url_read.rs` | URL read tool | `tests/e2e_url_read.rs`. |
+| `src/url_router.rs` | URL routing | `tests/url_router.rs`. |
+| `src/usage.rs` | Usage accounting | Covered through agent-loop and session suites. |
 | `src/validation_broker.rs` | Validation admission and slot broker | Unit; `tests/validation_broker_contract.rs`, `tests/validation_broker_store.rs`, `tests/validation_broker_cli.rs`, and `tests/validation_broker_e2e.rs`. |
 | `src/vcr.rs` | VCR playback/record | Unit; `tests/vcr_parity_validation.rs`, `tests/vcr_redaction_scan.rs`, provider/RPC VCR suites. |
 | `src/version_check.rs` | Version checks | Unit; cross-platform and release-readiness tests exercise the surrounding behavior. |
+| `src/web_search.rs` | Web search tool | `tests/e2e_web_search.rs`, `tests/web_search_rungs.rs`. |
+| `src/workspace_trust.rs` | Workspace trust | Covered through config/CLI suites. |
+| `src/worktree_iso.rs` | Worktree isolation | `tests/worktree_iso.rs`. |
+| `src/xdev.rs` | xdev tool development | `tests/e2e_xdev.rs`. |
 
 ---
 
