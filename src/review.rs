@@ -10,7 +10,7 @@
 //! - Strict schema-governed JSON (`pi.review.v1`), Markdown, and terminal formats
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -169,17 +169,15 @@ impl ReviewReport {
     /// Format report as Markdown.
     pub fn format_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "# Code Review Report: {}\n\n",
-            self.verdict.badge()
-        ));
-        out.push_str(&format!("**Target:** `{}`  \n", self.target));
-        out.push_str(&format!("**Verdict:** **{}**  \n", self.verdict.as_str()));
-        out.push_str(&format!("**Summary:** {}\n\n", self.summary));
+        let _ = writeln!(out, "# Code Review Report: {}\n", self.verdict.badge());
+        let _ = writeln!(out, "**Target:** `{}`  ", self.target);
+        let _ = writeln!(out, "**Verdict:** **{}**  ", self.verdict.as_str());
+        let _ = writeln!(out, "**Summary:** {}\n", self.summary);
 
-        out.push_str("### Metrics\n\n");
-        out.push_str(&format!(
-            "- Files Analyzed: {}\n- Hunks Evaluated: {}\n- Total Findings: {} (P0: {}, P1: {}, P2: {}, P3: {})\n- Duration: {}ms\n\n",
+        let _ = writeln!(out, "### Metrics\n");
+        let _ = writeln!(
+            out,
+            "- Files Analyzed: {}\n- Hunks Evaluated: {}\n- Total Findings: {} (P0: {}, P1: {}, P2: {}, P3: {})\n- Duration: {}ms\n",
             self.stats.files_analyzed,
             self.stats.hunks_analyzed,
             self.stats.findings_count,
@@ -188,7 +186,7 @@ impl ReviewReport {
             self.stats.p2_count,
             self.stats.p3_count,
             self.stats.duration_ms
-        ));
+        );
 
         if self.findings.is_empty() {
             out.push_str("### Findings\n\nNo issues found! Clean change.\n");
@@ -197,16 +195,17 @@ impl ReviewReport {
             for (idx, f) in self.findings.iter().enumerate() {
                 let loc = format_finding_loc(&f.file, f.line_start, f.line_end);
                 let conf_pct = (f.confidence * 100.0).round() as u32;
-                out.push_str(&format!(
-                    "{}. **[{}] {}** (`{loc}`) — Confidence: {conf_pct}%\n",
+                let _ = writeln!(
+                    out,
+                    "{}. **[{}] {}** (`{loc}`) — Confidence: {conf_pct}%",
                     idx + 1,
                     f.severity.as_str(),
                     f.title
-                ));
-                out.push_str(&format!("   - **Category:** {}\n", f.category));
-                out.push_str(&format!("   - **Rationale:** {}\n", f.rationale));
+                );
+                let _ = writeln!(out, "   - **Category:** {}", f.category);
+                let _ = writeln!(out, "   - **Rationale:** {}", f.rationale);
                 if let Some(sug) = &f.suggestion {
-                    out.push_str(&format!("   - **Suggestion:** {}\n", sug));
+                    let _ = writeln!(out, "   - **Suggestion:** {sug}");
                 }
                 out.push('\n');
             }
@@ -218,8 +217,9 @@ impl ReviewReport {
     /// Format report as clean terminal text table.
     pub fn format_text(&self) -> String {
         let mut out = String::new();
-        out.push_str(&format!(
-            "=== PI CODE REVIEW ===\nVerdict : {}\nTarget  : {}\nSummary : {}\nStats   : {} file(s), {} finding(s) (P0:{}, P1:{}, P2:{}, P3:{}) in {}ms\n\n",
+        let _ = writeln!(
+            out,
+            "=== PI CODE REVIEW ===\nVerdict : {}\nTarget  : {}\nSummary : {}\nStats   : {} file(s), {} finding(s) (P0:{}, P1:{}, P2:{}, P3:{}) in {}ms\n",
             self.verdict.badge(),
             self.target,
             self.summary,
@@ -230,7 +230,7 @@ impl ReviewReport {
             self.stats.p2_count,
             self.stats.p3_count,
             self.stats.duration_ms
-        ));
+        );
 
         if self.findings.is_empty() {
             out.push_str("No issues detected.\n");
@@ -238,17 +238,18 @@ impl ReviewReport {
             out.push_str("FINDINGS:\n");
             for (idx, f) in self.findings.iter().enumerate() {
                 let loc = format_finding_loc(&f.file, f.line_start, f.line_end);
-                out.push_str(&format!(
-                    " {:2}. [{}] {:<12} {:<30} {}\n     -> {}\n",
+                let _ = writeln!(
+                    out,
+                    " {:2}. [{}] {:<12} {:<30} {}\n     -> {}",
                     idx + 1,
                     f.severity.as_str(),
                     f.category,
                     loc,
                     f.title,
                     f.rationale
-                ));
+                );
                 if let Some(sug) = &f.suggestion {
-                    out.push_str(&format!("     💡 Suggestion: {sug}\n"));
+                    let _ = writeln!(out, "     💡 Suggestion: {sug}");
                 }
             }
         }
