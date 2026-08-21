@@ -654,6 +654,24 @@ mod tests {
             spawn_background(&root, None, None, "sleep 60", Some(120), Some(&root)).expect("spawn");
         let cancelled = cancel(&snapshot.id).expect("cancel");
         assert_eq!(cancelled.status, "killed");
+        // Drain the completion notice (pushed asynchronously by the monitor
+        // thread) so it cannot leak into concurrently running agent-loop
+        // tests through the process-global follow-up queue.
+        for _ in 0..200 {
+            let drained = take_completion_notices();
+            if drained.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text.contains(&snapshot.id)
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     #[test]

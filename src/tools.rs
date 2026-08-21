@@ -14507,8 +14507,14 @@ mod tests {
             .expect("first read");
         assert!(first_text(&first).contains("alpha"));
 
-        assert_eventual_cache_hit(&read_tool, "read-2", &read_input, &first_text(&first), "read")
-            .await;
+        assert_eventual_cache_hit(
+            &read_tool,
+            "read-2",
+            &read_input,
+            &first_text(&first),
+            "read",
+        )
+        .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(&note, "beta\n").expect("rewrite note");

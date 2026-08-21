@@ -9272,13 +9272,23 @@ export default function init(pi) {
             let (server_result, ()) =
                 futures::future::join(run(agent_session, options, in_rx, out_tx), client).await;
             assert!(server_result.is_ok(), "rpc server error: {server_result:?}");
-            assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+            // The jobs registry is process-global, so a background-job
+            // completion notice from a concurrently running test can inject an
+            // extra follow-up turn (and provider call) into this session. The
+            // contract under test is deadline inheritance, so require at least
+            // one call and that EVERY provider call observed the inherited
+            // deadline, rather than pinning the exact call count.
+            let calls = state.calls.load(Ordering::SeqCst);
+            assert!(calls >= 1, "provider was never called");
             let deadlines = state
                 .observed_deadlines
                 .lock()
                 .expect("lock rpc deadline probe")
                 .clone();
-            assert_eq!(deadlines.as_slice(), &[Some(expected_deadline)]);
+            assert_eq!(deadlines.len(), calls);
+            for deadline in deadlines {
+                assert_eq!(deadline, Some(expected_deadline));
+            }
         });
     }
 
