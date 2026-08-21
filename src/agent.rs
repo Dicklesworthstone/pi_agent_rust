@@ -1858,7 +1858,7 @@ impl Agent {
                         }
                     }
                 }
-                Message::Assistant(_) | Message::Custom(_) => {}
+                Message::Custom(_) => {}
             }
         }
         if total > 0 {
@@ -3711,7 +3711,7 @@ impl Agent {
 
     /// Inbound restore (bd-cv653.7.9): placeholders in tool-call arguments
     /// become real values before approval/execution.
-    fn restore_secrets_inbound(&self, mut tool_call: ToolCall) -> ToolCall {
+    pub fn restore_secrets_inbound(&self, mut tool_call: ToolCall) -> ToolCall {
         if crate::secrets::SecretsMode::from_setting(
             self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
         ) == crate::secrets::SecretsMode::Off
@@ -3745,7 +3745,7 @@ impl Agent {
 
     /// Echo hygiene (bd-cv653.7.9): restored real values in tool output are
     /// masked back to placeholders before the model sees the result.
-    fn mask_secrets_in_output(&self, output: &mut ToolOutput) {
+    pub fn mask_secrets_in_output(&self, output: &mut ToolOutput) {
         if crate::secrets::SecretsMode::from_setting(
             self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
         ) == crate::secrets::SecretsMode::Off
@@ -3767,6 +3767,20 @@ impl Agent {
                 *details = value;
             }
         }
+    }
+
+    /// Export hygiene (bd-cv653.7.9): mask known secret values in arbitrary
+    /// text (e.g. transcript exports or shares) back to their placeholders.
+    /// A no-op when the secrets vault is disabled or empty.
+    #[must_use]
+    pub fn mask_secrets_text(&self, text: &str) -> String {
+        if crate::secrets::SecretsMode::from_setting(
+            self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
+        ) == crate::secrets::SecretsMode::Off
+        {
+            return text.to_string();
+        }
+        self.secrets_vault.mask(text)
     }
 
     #[allow(clippy::too_many_lines)]
