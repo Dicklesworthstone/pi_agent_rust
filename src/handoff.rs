@@ -601,6 +601,50 @@ impl HandoffGenerator {
         }
     }
 
+    fn parse_structured_line(
+        trimmed: &str,
+        ref_str: &str,
+        decisions: &mut Vec<Decision>,
+        blockers: &mut Vec<String>,
+        open_threads: &mut Vec<String>,
+        next_steps: &mut Vec<String>,
+        lessons: &mut Vec<String>,
+    ) {
+        if trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]") {
+            let item = trimmed
+                .trim_start_matches("- [ ]")
+                .trim_start_matches("- [x]")
+                .trim();
+            if !item.is_empty() && !next_steps.iter().any(|s| s == item) {
+                next_steps.push(item.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Decision:") {
+            let dec = rest.trim();
+            if !dec.is_empty() {
+                decisions.push(Decision {
+                    decision: dec.to_string(),
+                    rationale: None,
+                    ref_point: Some(ref_str.to_string()),
+                });
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Blocker:") {
+            let b = rest.trim();
+            if !b.is_empty() && !blockers.iter().any(|s| s == b) {
+                blockers.push(b.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Lesson:") {
+            let l = rest.trim();
+            if !l.is_empty() && !lessons.iter().any(|s| s == l) {
+                lessons.push(l.to_string());
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Question:") {
+            let q = rest.trim();
+            if !q.is_empty() && !open_threads.iter().any(|s| s == q) {
+                open_threads.push(q.to_string());
+            }
+        }
+    }
+
     fn extract_structured_notes(
         text: &str,
         ref_str: &str,
@@ -611,39 +655,48 @@ impl HandoffGenerator {
         lessons: &mut Vec<String>,
     ) {
         for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("- [ ]") || trimmed.starts_with("- [x]") {
-                let item = trimmed
-                    .trim_start_matches("- [ ]")
-                    .trim_start_matches("- [x]")
-                    .trim();
-                if !item.is_empty() && !next_steps.contains(&item.to_string()) {
-                    next_steps.push(item.to_string());
-                }
-            } else if let Some(rest) = trimmed.strip_prefix("Decision:") {
-                let dec = rest.trim();
-                if !dec.is_empty() {
-                    decisions.push(Decision {
-                        decision: dec.to_string(),
-                        rationale: None,
-                        ref_point: Some(ref_str.to_string()),
-                    });
-                }
-            } else if let Some(rest) = trimmed.strip_prefix("Blocker:") {
-                let b = rest.trim();
-                if !b.is_empty() && !blockers.contains(&b.to_string()) {
-                    blockers.push(b.to_string());
-                }
-            } else if let Some(rest) = trimmed.strip_prefix("Lesson:") {
-                let l = rest.trim();
-                if !l.is_empty() && !lessons.contains(&l.to_string()) {
-                    lessons.push(l.to_string());
-                }
-            } else if let Some(rest) = trimmed.strip_prefix("Question:") {
-                let q = rest.trim();
-                if !q.is_empty() && !open_threads.contains(&q.to_string()) {
-                    open_threads.push(q.to_string());
-                }
+            Self::parse_structured_line(
+                line.trim(),
+                ref_str,
+                decisions,
+                blockers,
+                open_threads,
+                next_steps,
+                lessons,
+            );
+        }
+    }
+
+    fn parse_compaction_line(
+        trimmed: &str,
+        decisions: &mut Vec<Decision>,
+        failed_approaches: &mut Vec<FailedApproach>,
+        files_touched: &mut BTreeMap<String, (String, BTreeSet<String>)>,
+        lessons: &mut Vec<String>,
+    ) {
+        if let Some(rest) = trimmed.strip_prefix("Decision:") {
+            decisions.push(Decision {
+                decision: rest.trim().to_string(),
+                rationale: Some("Retained from compaction summary".to_string()),
+                ref_point: Some("compaction".to_string()),
+            });
+        } else if let Some(rest) = trimmed.strip_prefix("Failed approach:") {
+            failed_approaches.push(FailedApproach {
+                attempt: "Historical attempt (compacted)".to_string(),
+                reason: rest.trim().to_string(),
+                ref_point: Some("compaction".to_string()),
+            });
+        } else if let Some(rest) = trimmed.strip_prefix("File touched:") {
+            let path = rest.trim();
+            if !path.is_empty() {
+                files_touched
+                    .entry(path.to_string())
+                    .or_insert_with(|| ("compacted session access".to_string(), BTreeSet::new()));
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("Lesson:") {
+            let lesson_text = rest.trim();
+            if !lesson_text.is_empty() && !lessons.iter().any(|s| s == lesson_text) {
+                lessons.push(lesson_text.to_string());
             }
         }
     }
@@ -656,29 +709,13 @@ impl HandoffGenerator {
         lessons: &mut Vec<String>,
     ) {
         for line in summary.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("Decision:") {
-                decisions.push(Decision {
-                    decision: rest.trim().to_string(),
-                    rationale: Some("Retained from compaction summary".to_string()),
-                    ref_point: Some("compaction".to_string()),
-                });
-            } else if let Some(rest) = trimmed.strip_prefix("Failed approach:") {
-                failed_approaches.push(FailedApproach {
-                    attempt: "Historical attempt (compacted)".to_string(),
-                    reason: rest.trim().to_string(),
-                    ref_point: Some("compaction".to_string()),
-                });
-            } else if let Some(rest) = trimmed.strip_prefix("Lesson:") {
-                lessons.push(rest.trim().to_string());
-            } else if let Some(rest) = trimmed.strip_prefix("File touched:") {
-                let path = rest.trim();
-                if !path.is_empty() {
-                    files_touched
-                        .entry(path.to_string())
-                        .or_insert_with(|| ("modified (compacted)".to_string(), BTreeSet::new()));
-                }
-            }
+            Self::parse_compaction_line(
+                line.trim(),
+                decisions,
+                failed_approaches,
+                files_touched,
+                lessons,
+            );
         }
     }
 

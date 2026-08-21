@@ -517,8 +517,8 @@ impl MemoryStore {
 /// Well-known credential shapes screened out of retained content. Each
 /// entry: (regex, placeholder). TODO(.7.9): replace with the shared vault.
 const SECRET_PATTERNS: &[(&str, &str)] = &[
-    (r"sk-[A-Za-z0-9_\-]{16,}", "[REDACTED_OPENAI_KEY]"),
     (r"sk-ant-[A-Za-z0-9_\-]{16,}", "[REDACTED_ANTHROPIC_KEY]"),
+    (r"sk-[A-Za-z0-9_\-]{16,}", "[REDACTED_OPENAI_KEY]"),
     (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED_GITHUB_PAT]"),
     (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED_GITHUB_PAT]"),
     (r"AKIA[0-9A-Z]{16}", "[REDACTED_AWS_ACCESS_KEY]"),
