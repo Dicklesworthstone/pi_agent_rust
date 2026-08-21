@@ -481,10 +481,10 @@ impl StreamRuleStore {
         if let Some(ref path) = self.project_file_path {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
-                    Error::Io(format!(
+                    Error::Io(Box::new(std::io::Error::other(format!(
                         "Failed to create directory {}: {e}",
                         parent.display()
-                    ))
+                    ))))
                 })?;
             }
             let cfg = StreamRulesConfigFile {
@@ -507,10 +507,10 @@ impl StreamRuleStore {
         if let Some(ref path) = self.global_file_path {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).map_err(|e| {
-                    Error::Io(format!(
+                    Error::Io(Box::new(std::io::Error::other(format!(
                         "Failed to create directory {}: {e}",
                         parent.display()
-                    ))
+                    ))))
                 })?;
             }
             let cfg = StreamRulesConfigFile {

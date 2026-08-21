@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, Permissions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -172,14 +172,14 @@ impl ChecksumMap {
     /// Verify a byte slice against expected hash.
     pub fn verify_bytes(&self, asset_name: &str, bytes: &[u8]) -> Result<()> {
         let expected = self.get_hash(asset_name).ok_or_else(|| {
-            Error::Other(format!(
+            Error::Validation(format!(
                 "No checksum found for {asset_name} in SHA256SUMS (fail-closed)"
             ))
         })?;
 
         let actual_hash = crate::package_manager::hex_encode(&Sha256::digest(bytes)).to_lowercase();
         if actual_hash != expected {
-            return Err(Error::Other(format!(
+            return Err(Error::Validation(format!(
                 "Checksum mismatch for {asset_name}: expected {expected}, got {actual_hash} (fail-closed)"
             )));
         }
@@ -254,10 +254,10 @@ impl SelfUpdater {
             .header("Accept", "application/vnd.github.v3+json")
             .send()
             .await
-            .map_err(|e| Error::Other(format!("Failed to fetch release manifest: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Failed to fetch release manifest: {e}")))?;
 
-        if !response.status().is_success() {
-            return Err(Error::Other(format!(
+        if !(200..300).contains(&response.status()) {
+            return Err(Error::Validation(format!(
                 "Release manifest request failed with status: {}",
                 response.status()
             )));
@@ -266,15 +266,15 @@ impl SelfUpdater {
         let body = response
             .text()
             .await
-            .map_err(|e| Error::Other(format!("Failed to read release manifest body: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Failed to read release manifest body: {e}")))?;
 
         let val: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| Error::Other(format!("Invalid release JSON response: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Invalid release JSON response: {e}")))?;
 
         let tag = val
             .get("tag_name")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Other("tag_name missing in release response".to_string()))?;
+            .ok_or_else(|| Error::Validation("tag_name missing in release response".to_string()))?;
 
         Ok(tag.trim_start_matches('v').to_string())
     }
@@ -300,11 +300,11 @@ impl SelfUpdater {
             .send()
             .await
             .map_err(|e| {
-                Error::Other(format!("Failed to fetch SHA256SUMS from {sums_url}: {e}"))
+                Error::Validation(format!("Failed to fetch SHA256SUMS from {sums_url}: {e}"))
             })?;
 
-        if !response.status().is_success() {
-            return Err(Error::Other(format!(
+        if !(200..300).contains(&response.status()) {
+            return Err(Error::Validation(format!(
                 "SHA256SUMS download failed with HTTP status {}",
                 response.status()
             )));
@@ -313,7 +313,7 @@ impl SelfUpdater {
         let body = response
             .text()
             .await
-            .map_err(|e| Error::Other(format!("Failed to read SHA256SUMS: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Failed to read SHA256SUMS: {e}")))?;
 
         Ok(ChecksumMap::parse(&body))
     }
@@ -337,16 +337,16 @@ impl SelfUpdater {
             return Ok(None);
         };
 
-        if !res.status().is_success() {
+        if !(200..300).contains(&res.status()) {
             return Ok(None);
         }
 
-        let Ok(bytes) = res.bytes().await else {
+        let Ok(bytes) = res.bytes_limited(64 * 1024 * 1024).await else {
             return Ok(None);
         };
 
         checksums.verify_bytes(candidate, &bytes)?;
-        Ok(Some(bytes.to_vec()))
+        Ok(Some(bytes))
     }
 
     /// Download and verify binary artifact bytes.
@@ -375,7 +375,7 @@ impl SelfUpdater {
             }
         }
 
-        Err(Error::Other(format!(
+        Err(Error::Validation(format!(
             "No compatible binary candidate found for platform {} in release {tag}",
             platform.asset_platform
         )))
@@ -390,14 +390,21 @@ impl SelfUpdater {
 
         // 1. Write new binary to tmp file
         {
-            let mut tmp_file = File::create(&tmp_path)
-                .map_err(|e| Error::Io(format!("Failed to create temporary update file: {e}")))?;
-            tmp_file
-                .write_all(new_binary_bytes)
-                .map_err(|e| Error::Io(format!("Failed to write update bytes: {e}")))?;
-            tmp_file
-                .flush()
-                .map_err(|e| Error::Io(format!("Failed to flush update file: {e}")))?;
+            let mut tmp_file = File::create(&tmp_path).map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to create temporary update file: {e}"
+                ))))
+            })?;
+            tmp_file.write_all(new_binary_bytes).map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to write update bytes: {e}"
+                ))))
+            })?;
+            tmp_file.flush().map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to flush update file: {e}"
+                ))))
+            })?;
         }
 
         // Set executable permissions on Unix
@@ -411,10 +418,10 @@ impl SelfUpdater {
         // 2. Rename existing executable to backup
         if let Err(e) = fs::rename(exe_path, &backup_path) {
             let _ = fs::remove_file(&tmp_path);
-            return Err(Error::Io(format!(
+            return Err(Error::Io(Box::new(std::io::Error::other(format!(
                 "Failed to backup existing binary {}: {e}",
                 exe_path.display()
-            )));
+            )))));
         }
 
         // 3. Rename tmp to executable
@@ -422,10 +429,10 @@ impl SelfUpdater {
             // Restore backup
             let _ = fs::rename(&backup_path, exe_path);
             let _ = fs::remove_file(&tmp_path);
-            return Err(Error::Io(format!(
+            return Err(Error::Io(Box::new(std::io::Error::other(format!(
                 "Failed to install new binary {}: {e}",
                 exe_path.display()
-            )));
+            )))));
         }
 
         // 4. Run smoke test
@@ -438,7 +445,7 @@ impl SelfUpdater {
         if !smoke_ok {
             // Rollback immediately
             let _ = fs::rename(&backup_path, exe_path);
-            return Err(Error::Other(
+            return Err(Error::Validation(
                 "Post-update smoke test (--version) failed; rolled back to previous binary"
                     .to_string(),
             ));
@@ -449,8 +456,11 @@ impl SelfUpdater {
 
     /// Execute the complete self-update workflow.
     pub async fn run(&self, options: &SelfUpdateOptions) -> Result<SelfUpdateStatus> {
-        let current_exe = env::current_exe()
-            .map_err(|e| Error::Io(format!("Failed to locate current executable path: {e}")))?;
+        let current_exe = env::current_exe().map_err(|e| {
+            Error::Io(Box::new(std::io::Error::other(format!(
+                "Failed to locate current executable path: {e}"
+            ))))
+        })?;
 
         // Package manager check
         let manager = PackageManager::detect(&current_exe);
@@ -489,7 +499,7 @@ impl SelfUpdater {
         }
 
         let platform = PlatformInfo::current().ok_or_else(|| {
-            Error::Other(format!(
+            Error::Validation(format!(
                 "Unsupported operating system or architecture: {} {}",
                 env::consts::OS,
                 env::consts::ARCH
