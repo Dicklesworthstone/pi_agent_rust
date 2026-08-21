@@ -225,7 +225,28 @@ fn run_cell(
         Pending(rquickjs::Persistent<rquickjs::Promise<'static>>),
     }
     let phase1 = context.with(|ctx| {
+        // Script mode first: top-level `const`/`let` bindings persist in the
+        // shared script scope. Top-level await needs JS_EVAL_FLAG_ASYNC
+        // (rquickjs `EvalOptions.promise`) — retry with it on a syntax error
+        // (an `await ...` cell). Bindings made inside an async-mode cell do
+        // NOT persist (documented kernel limitation).
         let evaluated: rquickjs::Result<rquickjs::Value<'_>> = ctx.eval(request.code.as_bytes());
+        let evaluated = match evaluated {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                // Top-level await surfaces as a parse-time exception; retry
+                // with JS_EVAL_FLAG_ASYNC (EvalOptions.promise).
+                if matches!(&err, rquickjs::Error::Exception) {
+                    let mut options = rquickjs::context::EvalOptions::default();
+                    options.global = true;
+                    options.strict = true;
+                    options.promise = true;
+                    ctx.eval_with_options(request.code.as_bytes(), options)
+                } else {
+                    Err(err)
+                }
+            }
+        };
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),
             Ok(value) => match rquickjs::Promise::from_value(value.clone()) {
