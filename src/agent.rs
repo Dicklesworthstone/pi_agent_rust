@@ -680,6 +680,11 @@ pub struct AgentConfig {
     /// Magic-keyword settings (bd-cv653.3.6): per-keyword toggles plus
     /// custom words. None = all three built-ins enabled, no customs.
     pub keyword_settings: Option<crate::magic_keywords::KeywordSettings>,
+
+    /// Wall-clock cap for a run (bd-cv653.3.7): at the next turn boundary
+    /// after the deadline the agent stops with a 'time cap reached' marker
+    /// instead of starting another turn.
+    pub max_time: Option<std::time::Duration>,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -692,6 +697,7 @@ impl fmt::Debug for AgentConfig {
             .field("fail_closed_hooks", &self.fail_closed_hooks)
             .field("tool_approval", &self.tool_approval.is_some())
             .field("keyword_settings", &self.keyword_settings)
+            .field("max_time", &self.max_time)
             .finish()
     }
 }
@@ -733,6 +739,7 @@ impl Default for AgentConfig {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         }
     }
 }
@@ -1844,11 +1851,43 @@ impl Agent {
         // Delivery boundary: start of turn (steering messages queued while idle).
         let mut pending_messages = self.drain_steering_messages().await;
 
+        // Wall-clock run cap (bd-cv653.3.7, --max-time): checked at turn
+        // boundaries — never mid-tool-call. On expiry the run stops with a
+        // marker instead of starting another turn.
+        let run_started = std::time::Instant::now();
+        let max_time = self.config.max_time;
+
         loop {
             let mut has_more_tool_calls = true;
             let mut steering_after_tools: Option<Vec<Message>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
+                if let Some(cap) = max_time
+                    && run_started.elapsed() >= cap
+                {
+                    let marker = format!(
+                        "time cap reached after {}s (--max-time); stopping at the turn boundary",
+                        cap.as_secs()
+                    );
+                    tracing::info!("{marker}");
+                    let marker_message = Message::User(UserMessage {
+                        content: UserContent::Text(format!("[TIME CAP] {marker}")),
+                        timestamp: Utc::now().timestamp_millis(),
+                    });
+                    on_event(AgentEvent::MessageStart {
+                        message: marker_message.clone(),
+                    });
+                    on_event(AgentEvent::MessageEnd {
+                        message: marker_message,
+                    });
+                    return Ok(AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(TextContent::new(format!(
+                            "[time cap reached] {marker}"
+                        )))],
+                        ..AssistantMessage::default()
+                    });
+                }
+
                 let current_turn_index = turn_index;
                 let turn_latency = Arc::new(StdMutex::new(TurnLatencyAccumulator::started()));
                 let turn_start_event = AgentEvent::TurnStart {
@@ -12886,6 +12925,7 @@ mod tests {
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
+                max_time: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -12920,6 +12960,7 @@ mod tests {
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
+                max_time: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13115,6 +13156,7 @@ mod tests {
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
+                max_time: None,
             },
         );
 

@@ -2319,6 +2319,7 @@ dependencies = [
  "asupersync",
  "fsqlite-core",
  "fsqlite-error",
+ "fsqlite-ext-fts5",
  "fsqlite-parser",
  "fsqlite-types",
  "fsqlite-vfs",
@@ -2365,6 +2366,7 @@ dependencies = [
  "fsqlite-ast",
  "fsqlite-btree",
  "fsqlite-error",
+ "fsqlite-ext-fts5",
  "fsqlite-func",
  "fsqlite-mvcc",
  "fsqlite-observability",
@@ -2394,6 +2396,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85094652844f3aa3f262b617d7f5a924e2b55d1a859ae42bc018fb519f899690"
 dependencies = [
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "fsqlite-ext-fts5"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ceab418b2eb27716e4b5cdd2e3f682c24d66b581bb56c97b40f528f9c3ea98c4"
+dependencies = [
+ "fsqlite-error",
+ "fsqlite-func",
+ "fsqlite-types",
+ "smallvec",
+ "tracing",
 ]
 
 [[package]]

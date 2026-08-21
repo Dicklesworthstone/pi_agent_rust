@@ -1376,6 +1376,7 @@ fn handle_session_new(
         tool_approval: permission_client
             .map(|client| client.handler_for_session(session_id.clone())),
         keyword_settings: options.config.keywords.clone(),
+        max_time: None,
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
@@ -2446,6 +2447,7 @@ mod tests {
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
+                max_time: None,
             },
         );
 

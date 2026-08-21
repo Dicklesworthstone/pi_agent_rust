@@ -193,6 +193,7 @@ fn agent_loop_openai_vcr_basic() {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -377,6 +378,7 @@ fn agent_loop_anthropic_simple_text() {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -478,6 +480,7 @@ fn agent_loop_anthropic_error_stream() {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -562,6 +565,7 @@ fn agent_loop_anthropic_tool_call_stop() {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 

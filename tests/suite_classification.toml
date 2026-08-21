@@ -117,6 +117,7 @@ files = [
     "skills_managed",
     "magic_keywords",
     "worktree_iso",
+    "checkpoint",
     "fts5_spike",
     "bash_mediation",
     "json_mode_parity",

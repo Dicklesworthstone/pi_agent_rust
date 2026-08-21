@@ -4839,3 +4839,116 @@ fn rpc_extension_ui_notify_fire_and_forget() {
         let _ = server.await;
     });
 }
+
+// ---------------------------------------------------------------------------
+// Checkpoint / rewind / fresh / retry RPC commands (bd-cv653.3.7)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rpc_checkpoint_rewind_fresh_retry_cycle() {
+    let harness = TestHarness::new("rpc_checkpoint_rewind_fresh_retry_cycle");
+    let runtime = asupersync::runtime::RuntimeBuilder::multi_thread()
+        .blocking_threads(1, 8)
+        .enable_parking(false)
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let project_dir = harness.temp_path("project");
+        let sessions_root = harness.temp_path("sessions");
+        let auth_path = harness.temp_path("auth.json");
+        std::fs::create_dir_all(&project_dir).expect("create project dir");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions root");
+
+        let mut session = Session::create_with_dir(Some(sessions_root));
+        session.header.cwd = project_dir.display().to_string();
+        session.header.provider = Some("keyless-replay".to_string());
+        session.header.model_id = Some("keyless-rpc-replay".to_string());
+        session.header.thinking_level = Some("off".to_string());
+        let agent_session = build_persistent_keyless_agent_session(session, &project_dir);
+        let options = build_options(&handle, auth_path, vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        // A turn so there is something to checkpoint around.
+        let prompt = json!({
+            "id": "cp-prompt",
+            "type": "prompt",
+            "message": "first turn content",
+        })
+        .to_string();
+        let prompt_resp = send_recv(&in_tx, &out_rx, &prompt, "prompt(turn)").await;
+        assert_ok(&prompt_resp, "prompt");
+        let _idle = wait_for_non_streaming_state(&in_tx, &out_rx, "cp-idle-1", "idle after turn").await;
+
+        // Checkpoint at the current leaf.
+        let checkpoint = json!({
+            "id": "cp-mark",
+            "type": "checkpoint",
+            "name": "alpha",
+            "note": "before more work",
+        })
+        .to_string();
+        let checkpoint_resp = send_recv(&in_tx, &out_rx, &checkpoint, "checkpoint(mark)").await;
+        assert_ok(&checkpoint_resp, "checkpoint");
+        assert_eq!(
+            data_field(&checkpoint_resp, "name").and_then(Value::as_str),
+            Some("alpha")
+        );
+        let marked_count =
+            require_response_field_u64(&checkpoint_resp, "messageCount", "checkpoint mark");
+
+        // Another turn past the checkpoint.
+        let prompt2 = json!({
+            "id": "cp-prompt-2",
+            "type": "prompt",
+            "message": "second turn content after the checkpoint",
+        })
+        .to_string();
+        let prompt2_resp = send_recv(&in_tx, &out_rx, &prompt2, "prompt(turn 2)").await;
+        assert_ok(&prompt2_resp, "prompt");
+        let _idle2 = wait_for_non_streaming_state(&in_tx, &out_rx, "cp-idle-2", "idle after turn 2").await;
+
+        // Rewind to the checkpoint: the second turn collapses into a report.
+        let rewind = json!({
+            "id": "cp-rewind",
+            "type": "rewind",
+            "name": "alpha",
+        })
+        .to_string();
+        let rewind_resp = send_recv(&in_tx, &out_rx, &rewind, "rewind(to alpha)").await;
+        assert_ok(&rewind_resp, "rewind");
+        let collapsed =
+            require_response_field_u64(&rewind_resp, "collapsedMessages", "rewind");
+        assert!(
+            collapsed > 0,
+            "rewind must collapse the post-checkpoint span (marked at {marked_count}): {rewind_resp}"
+        );
+        assert_eq!(
+            data_field(&rewind_resp, "treePreserved").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        // Fresh: provider stream state rotates; transcript untouched.
+        let fresh = json!({ "id": "cp-fresh", "type": "fresh" }).to_string();
+        let fresh_resp = send_recv(&in_tx, &out_rx, &fresh, "fresh").await;
+        assert_ok(&fresh_resp, "fresh");
+        let new_id = require_response_field_str(&fresh_resp, "newSessionId", "fresh");
+        assert!(new_id.starts_with("fresh-"), "{new_id}");
+
+        // Retry: re-issues the last user turn through the steering queue.
+        let retry = json!({ "id": "cp-retry", "type": "retry" }).to_string();
+        let retry_resp = send_recv(&in_tx, &out_rx, &retry, "retry").await;
+        assert_ok(&retry_resp, "retry");
+        assert_eq!(
+            data_field(&retry_resp, "requeued").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        drop(in_tx);
+        let _ = server.await;
+    });
+}

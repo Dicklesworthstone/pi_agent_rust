@@ -560,6 +560,14 @@ pub struct Cli {
     #[arg(long, value_name = "N")]
     pub max_tool_iterations: Option<usize>,
 
+    /// Wall-clock cap for a run in seconds (bd-cv653.3.7): the agent pauses
+    /// politely at the NEXT TURN BOUNDARY with a 'time cap reached' marker
+    /// (never mid-tool-call), flushes session state, and exits 0 in print
+    /// mode. Distinct from --request-timeout (per-request) and
+    /// --max-tool-iterations (per-turn count).
+    #[arg(long, value_name = "SECONDS")]
+    pub max_time: Option<u64>,
+
     // === Export & Listing ===
     /// Export session file to HTML
     #[arg(long)]

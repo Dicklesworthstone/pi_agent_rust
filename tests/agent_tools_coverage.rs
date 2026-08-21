@@ -212,6 +212,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         fail_closed_hooks: false,
         tool_approval: None,
         keyword_settings: None,
+        max_time: None,
     };
     Agent::new(provider, tools, config)
 }
@@ -1185,6 +1186,7 @@ fn agent_tool_execution_error_wraps_in_output() {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         };
 
         let agent = Agent::new(provider, tools, config);
@@ -1257,6 +1259,7 @@ fn agent_queue_follow_up_only_at_idle() {
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
+            max_time: None,
         };
         let mut agent = Agent::new(provider, tools, config);
 

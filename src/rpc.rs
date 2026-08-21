@@ -1921,6 +1921,214 @@ pub async fn run(
                 }
             }
 
+            "checkpoint" => {
+                let name = parsed
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("checkpoint")
+                    .to_string();
+                let note = parsed
+                    .get("note")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let result: Result<Value> = async {
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let messages = guard.agent.messages().to_vec();
+                    let checkpoint_payload = {
+                        let mut inner = guard.session.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                        let checkpoint = crate::checkpoint::mark_checkpoint(
+                            &mut inner,
+                            &name,
+                            note.as_deref(),
+                            &messages,
+                        );
+                        serde_json::to_value(&checkpoint)?
+                    };
+                    guard.persist_session().await?;
+                    Ok(checkpoint_payload)
+                }
+                .await;
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "checkpoint", Some(data)));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "checkpoint", &err));
+                    }
+                }
+            }
+
+            "rewind" => {
+                let name = parsed
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let result: Result<Value> = async {
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let checkpoint = {
+                        let inner = guard.session.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                        crate::checkpoint::find_checkpoint(&inner, name.as_deref())
+                    };
+                    let Some(checkpoint) = checkpoint else {
+                        return Err(Error::validation(name.as_ref().map_or_else(
+                            || "No checkpoints yet".to_string(),
+                            |name| format!("No checkpoint named '{name}'"),
+                        )));
+                    };
+                    let messages = guard.agent.messages().to_vec();
+                    let span: Vec<Message> =
+                        messages[checkpoint.message_count.min(messages.len())..].to_vec();
+                    if span.is_empty() {
+                        return Ok(json!({
+                            "checkpoint": checkpoint.name,
+                            "collapsedMessages": 0,
+                            "note": "active context already at checkpoint"
+                        }));
+                    }
+                    let provider = guard.agent.provider();
+                    // Keyless providers (replay/test/local) summarize fine
+                    // without a key; credentialed ones carry theirs.
+                    let api_key = guard
+                        .agent
+                        .stream_options()
+                        .api_key
+                        .clone()
+                        .unwrap_or_default();
+                    let settings = crate::compaction::ResolvedCompactionSettings {
+                        enabled: true,
+                        ..Default::default()
+                    };
+                    let summary =
+                        crate::checkpoint::summarize_span(&span, provider, &api_key, &settings)
+                            .await
+                            .unwrap_or_else(|err| {
+                                format!("(summarization failed: {err}; collapsed without a report)")
+                            });
+                    let mut agent_messages = messages;
+                    agent_messages.truncate(checkpoint.message_count.min(agent_messages.len()));
+                    let collapsed = span.len();
+                    if !summary.is_empty() {
+                        agent_messages.push(Message::User(UserMessage {
+                            content: UserContent::Text(format!(
+                                "[REWIND REPORT: {}]\nThe span since this checkpoint was \
+                                 collapsed into this report. The full span remains in the \
+                                 session tree.\n\n{summary}",
+                                checkpoint.name
+                            )),
+                            timestamp: 0,
+                        }));
+                    }
+                    guard.agent.replace_messages(agent_messages);
+                    let outcome = crate::checkpoint::RewindOutcome {
+                        schema: crate::checkpoint::CHECKPOINT_SCHEMA.to_string(),
+                        checkpoint: checkpoint.name.clone(),
+                        collapsed_messages: collapsed,
+                        summary: summary.clone(),
+                        summary_tokens_estimate: (summary.len() / 4) as u64,
+                        tree_preserved: true,
+                    };
+                    {
+                        let mut inner = guard.session.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                        inner.append_custom_entry(
+                            "rewind".to_string(),
+                            Some(serde_json::to_value(&outcome).unwrap_or_default()),
+                        );
+                    }
+                    guard.persist_session().await?;
+                    Ok(serde_json::to_value(&outcome)?)
+                }
+                .await;
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "rewind", Some(data)));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "rewind", &err));
+                    }
+                }
+            }
+
+            "fresh" => {
+                let result: Result<Value> = async {
+                    let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let new_id = format!(
+                        "fresh-{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis())
+                    );
+                    guard.agent.stream_options_mut().session_id = Some(new_id.clone());
+                    {
+                        let mut inner = guard.session.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                        inner.append_custom_entry(
+                            "fresh".to_string(),
+                            Some(json!({
+                                "schema": "pi.fresh.v1",
+                                "newSessionId": new_id,
+                                "reason": "operator fresh: provider cache + stream bookkeeping reset",
+                            })),
+                        );
+                    }
+                    guard.persist_session().await?;
+                    Ok(json!({ "schema": "pi.fresh.v1", "newSessionId": new_id }))
+                }
+                .await;
+                match result {
+                    Ok(data) => {
+                        let _ = out_tx.send(response_ok(id, "fresh", Some(data)));
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "fresh", &err));
+                    }
+                }
+            }
+
+            "retry" => {
+                let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "retry",
+                        "session lock failed".to_string(),
+                    ));
+                    continue;
+                };
+                let Some(text) = crate::checkpoint::take_last_user_turn(&mut guard.agent) else {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "retry",
+                        "No user turn to retry".to_string(),
+                    ));
+                    continue;
+                };
+                guard.agent.queue_steering(Message::User(UserMessage {
+                    content: UserContent::Text(text.clone()),
+                    timestamp: 0,
+                }));
+                let _ = out_tx.send(response_ok(
+                    id,
+                    "retry",
+                    Some(json!({
+                        "schema": "pi.retry.v1",
+                        "requeued": true,
+                        "characters": text.len()
+                    })),
+                ));
+            }
+
             "new_session" => {
                 if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
                     .await

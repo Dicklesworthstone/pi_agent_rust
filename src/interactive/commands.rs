@@ -42,6 +42,10 @@ pub enum SlashCommand {
     Mcp,
     Plan,
     Advisor,
+    Checkpoint,
+    Rewind,
+    Fresh,
+    Retry,
 }
 
 impl SlashCommand {
@@ -83,6 +87,10 @@ impl SlashCommand {
             "/mcp" => Self::Mcp,
             "/plan" => Self::Plan,
             "/advisor" => Self::Advisor,
+            "/checkpoint" | "/cp2" => Self::Checkpoint,
+            "/rewind" => Self::Rewind,
+            "/fresh" => Self::Fresh,
+            "/retry" => Self::Retry,
             _ => return None,
         };
 
@@ -2279,6 +2287,10 @@ impl PiApp {
             SlashCommand::Mcp => self.handle_slash_mcp(args),
             SlashCommand::Plan => self.handle_slash_plan(args),
             SlashCommand::Advisor => self.handle_slash_advisor(args),
+            SlashCommand::Checkpoint => self.handle_slash_checkpoint(args),
+            SlashCommand::Rewind => self.handle_slash_rewind(args),
+            SlashCommand::Fresh => self.handle_slash_fresh(),
+            SlashCommand::Retry => self.handle_slash_retry(),
         }
     }
 

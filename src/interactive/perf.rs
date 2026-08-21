@@ -576,6 +576,286 @@ impl MemoryMonitor {
 
 impl PiApp {
     #[allow(clippy::too_many_lines)]
+    /// `/checkpoint [name] [note...]` (bd-cv653.3.7): cheap restore-point
+    /// marker on the current leaf.
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_slash_checkpoint(&mut self, args: &str) -> Option<Cmd> {
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let messages: Vec<crate::model::Message> = agent_guard.messages().to_vec();
+        drop(agent_guard);
+
+        let (name, note) = args
+            .split_once(char::is_whitespace)
+            .map_or((args, ""), |(name, note)| (name, note));
+        let cx = asupersync::Cx::for_request();
+        let session = Arc::clone(&self.session);
+        let note_owned = note.trim().to_string();
+        let name_owned = name.trim().to_string();
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            let Ok(mut guard) = OwnedMutexGuard::lock(session, &cx).await else {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::AgentError("Failed to lock session".to_string()),
+                )
+                .await;
+                return;
+            };
+            let checkpoint = crate::checkpoint::mark_checkpoint(
+                &mut guard,
+                &name_owned,
+                if note_owned.is_empty() {
+                    None
+                } else {
+                    Some(note_owned.as_str())
+                },
+                &messages,
+            );
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::System(format!(
+                    "Checkpoint '{}' marked ({} messages, ~{} tokens). Rewind with /rewind{}.",
+                    checkpoint.name,
+                    checkpoint.message_count,
+                    checkpoint.token_estimate,
+                    if checkpoint.name == "checkpoint" {
+                        String::new()
+                    } else {
+                        format!(" {}", checkpoint.name)
+                    }
+                )),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// `/rewind [name]` (bd-cv653.3.7): collapse the span from a checkpoint
+    /// to now into a concise report (tree keeps everything).
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn handle_slash_rewind(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot rewind while processing".to_string());
+            return None;
+        }
+        let Ok(agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let provider = agent_guard.provider();
+        // Keyless providers (replay/test/local) summarize fine without a
+        // key; credentialed ones carry theirs.
+        let api_key = agent_guard
+            .stream_options()
+            .api_key
+            .clone()
+            .unwrap_or_default();
+        drop(agent_guard);
+
+        let name = args.trim().to_string();
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+        self.agent_state = AgentState::Processing;
+        self.status_message = Some("Rewinding...".to_string());
+        runtime_handle.spawn(async move {
+            let cx = asupersync::Cx::for_request();
+            let checkpoint = {
+                let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock session".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                crate::checkpoint::find_checkpoint(
+                    &guard,
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some(name.as_str())
+                    },
+                )
+            };
+            let Some(checkpoint) = checkpoint else {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::System(if name.is_empty() {
+                        "No checkpoints yet — mark one with /checkpoint".to_string()
+                    } else {
+                        format!("No checkpoint named '{name}'")
+                    }),
+                )
+                .await;
+                return;
+            };
+
+            let span: Vec<crate::model::Message> = {
+                let Ok(agent_guard) = OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock agent".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                agent_guard.messages()
+                    [checkpoint.message_count.min(agent_guard.messages().len())..]
+                    .to_vec()
+            };
+            if span.is_empty() {
+                let _ = crate::interactive::enqueue_pi_event(
+                    &event_tx,
+                    &cx,
+                    PiMsg::System(format!(
+                        "Nothing to rewind — the active context is already at '{}'.",
+                        checkpoint.name
+                    )),
+                )
+                .await;
+                return;
+            }
+
+            let settings = crate::compaction::ResolvedCompactionSettings {
+                enabled: true,
+                ..Default::default()
+            };
+            let summary = crate::checkpoint::summarize_span(&span, provider, &api_key, &settings)
+                .await
+                .unwrap_or_else(|err| {
+                    format!(
+                        "(summarization failed: {err}; the span was collapsed without a report)"
+                    )
+                });
+
+            let outcome = {
+                let Ok(mut agent_guard) = OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await
+                else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock agent".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                crate::checkpoint::apply_rewind_to_active(&mut agent_guard, &checkpoint, summary)
+            };
+            {
+                let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError("Failed to lock session".to_string()),
+                    )
+                    .await;
+                    return;
+                };
+                guard.append_custom_entry(
+                    "rewind".to_string(),
+                    Some(serde_json::to_value(&outcome).unwrap_or_default()),
+                );
+            }
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::System(format!(
+                    "Rewound to '{}': {} messages collapsed into a report (~{} tokens). The tree kept everything.",
+                    outcome.checkpoint, outcome.collapsed_messages, outcome.summary_tokens_estimate
+                )),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// `/fresh` (bd-cv653.3.7): reset provider stream state; transcript
+    /// untouched.
+    pub(super) fn handle_slash_fresh(&mut self) -> Option<Cmd> {
+        let Ok(mut agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        // Agent-side reset is synchronous; only the session log spawns.
+        let new_id = format!(
+            "fresh-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis())
+        );
+        agent_guard.stream_options_mut().session_id = Some(new_id.clone());
+        let messages_len = agent_guard.messages().len();
+        drop(agent_guard);
+
+        let cx = asupersync::Cx::for_request();
+        let session = Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            {
+                let Ok(mut guard) = OwnedMutexGuard::lock(session, &cx).await else {
+                    return;
+                };
+                guard.append_custom_entry(
+                    "fresh".to_string(),
+                    Some(serde_json::json!({
+                        "schema": "pi.fresh.v1",
+                        "newSessionId": new_id,
+                        "reason": "operator /fresh: provider cache + stream bookkeeping reset",
+                    })),
+                );
+            }
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::System(format!(
+                    "Fresh stream state (session id {new_id}); transcript untouched ({messages_len} messages)."
+                )),
+            )
+            .await;
+        });
+        None
+    }
+
+    /// `/retry` (bd-cv653.3.7): re-issue the last user turn (the tree keeps
+    /// the original path).
+    pub(super) fn handle_slash_retry(&mut self) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot retry while processing".to_string());
+            return None;
+        }
+        let Ok(mut agent_guard) = self.agent.try_lock() else {
+            self.status_message = Some("Agent busy; try again".to_string());
+            return None;
+        };
+        let Some(text) = crate::checkpoint::take_last_user_turn(&mut agent_guard) else {
+            self.status_message = Some("No user turn to retry".to_string());
+            return None;
+        };
+        drop(agent_guard);
+        let cx = asupersync::Cx::for_request();
+        let event_tx = self.event_tx.clone();
+        self.runtime_handle.spawn(async move {
+            crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &cx,
+                PiMsg::EnqueuePendingInput(crate::interactive::PendingInput::Text(text)),
+            )
+            .await
+        });
+        None
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_compact(&mut self, args: &str) -> Option<Cmd> {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot compact while processing".to_string());
