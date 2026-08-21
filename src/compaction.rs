@@ -1039,26 +1039,40 @@ fn should_compact(
 }
 
 fn estimate_tokens(message: &SessionMessage) -> u64 {
-    let mut chars: usize = 0;
+    // BPE counting (bd-cv653.7.1): accumulate the countable text and count
+    // it with the active counter (real O200k/Cl100k-class tables when the
+    // `bpe-tokens` feature is on; chars/4 when off). Measured API usage
+    // still wins upstream; this replaces only the heuristic path. Images
+    // keep their flat estimate.
+    let mut text = String::new();
+    let mut flat_tokens: u64 = 0;
+    let mut assistant_provider: Option<&str> = None;
 
     match message {
         SessionMessage::User { content, .. } => match content {
-            UserContent::Text(text) => chars = text.len(),
+            UserContent::Text(t) => text.push_str(t),
             UserContent::Blocks(blocks) => {
                 for block in blocks {
                     match block {
-                        ContentBlock::Text(text) => {
-                            chars = chars.saturating_add(text.text.len());
+                        ContentBlock::Text(t) => {
+                            text.push_str(&t.text);
+                            text.push('\n');
                         }
                         ContentBlock::Image(_) => {
-                            chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
+                            flat_tokens = flat_tokens.saturating_add(
+                                (IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64,
+                            );
                         }
                         ContentBlock::Thinking(thinking) => {
-                            chars = chars.saturating_add(thinking.thinking.len());
+                            text.push_str(&thinking.thinking);
+                            text.push('\n');
                         }
                         ContentBlock::ToolCall(call) => {
-                            chars = chars.saturating_add(call.name.len());
-                            chars = chars.saturating_add(json_byte_len(&call.arguments));
+                            text.push_str(&call.name);
+                            text.push('\n');
+                            if let Ok(args) = serde_json::to_string(&call.arguments) {
+                                text.push_str(&args);
+                            }
                         }
                         // Opaque marker — the data field is never replayed to a model
                         // (see `convert_content_block_to_anthropic`), so it contributes
@@ -1069,20 +1083,28 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
             }
         },
         SessionMessage::Assistant { message } => {
+            assistant_provider = Some(message.provider.as_str());
             for block in &message.content {
                 match block {
-                    ContentBlock::Text(text) => {
-                        chars = chars.saturating_add(text.text.len());
+                    ContentBlock::Text(t) => {
+                        text.push_str(&t.text);
+                        text.push('\n');
                     }
                     ContentBlock::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len());
+                        text.push_str(&thinking.thinking);
+                        text.push('\n');
                     }
                     ContentBlock::Image(_) => {
-                        chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
+                        flat_tokens = flat_tokens.saturating_add(
+                            (IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64,
+                        );
                     }
                     ContentBlock::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len());
-                        chars = chars.saturating_add(json_byte_len(&call.arguments));
+                        text.push_str(&call.name);
+                        text.push('\n');
+                        if let Ok(args) = serde_json::to_string(&call.arguments) {
+                            text.push_str(&args);
+                        }
                     }
                     ContentBlock::RedactedThinking(_) => {}
                 }
@@ -1091,32 +1113,47 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
         SessionMessage::ToolResult { content, .. } => {
             for block in content {
                 match block {
-                    ContentBlock::Text(text) => {
-                        chars = chars.saturating_add(text.text.len());
+                    ContentBlock::Text(t) => {
+                        text.push_str(&t.text);
+                        text.push('\n');
                     }
                     ContentBlock::Thinking(thinking) => {
-                        chars = chars.saturating_add(thinking.thinking.len());
+                        text.push_str(&thinking.thinking);
+                        text.push('\n');
                     }
                     ContentBlock::Image(_) => {
-                        chars = chars.saturating_add(IMAGE_CHAR_ESTIMATE);
+                        flat_tokens = flat_tokens.saturating_add(
+                            (IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64,
+                        );
                     }
                     ContentBlock::ToolCall(call) => {
-                        chars = chars.saturating_add(call.name.len());
-                        chars = chars.saturating_add(json_byte_len(&call.arguments));
+                        text.push_str(&call.name);
+                        text.push('\n');
+                        if let Ok(args) = serde_json::to_string(&call.arguments) {
+                            text.push_str(&args);
+                        }
                     }
                     ContentBlock::RedactedThinking(_) => {}
                 }
             }
         }
-        SessionMessage::Custom { content, .. } => chars = content.len(),
+        SessionMessage::Custom { content, .. } => text.push_str(content),
         SessionMessage::BashExecution {
             command, output, ..
-        } => chars = command.len().saturating_add(output.len()),
+        } => {
+            text.push_str(command);
+            text.push('\n');
+            text.push_str(output);
+        }
         SessionMessage::BranchSummary { summary, .. }
-        | SessionMessage::CompactionSummary { summary, .. } => chars = summary.len(),
+        | SessionMessage::CompactionSummary { summary, .. } => text.push_str(summary),
     }
 
-    u64::try_from(chars.div_ceil(CHARS_PER_TOKEN_ESTIMATE)).unwrap_or(u64::MAX)
+    let table = assistant_provider.map_or(
+        crate::token_count::TokenTable::O200k,
+        crate::token_count::table_for_provider,
+    );
+    flat_tokens.saturating_add(crate::token_count::active_counter().count(&text, table))
 }
 
 // =============================================================================
@@ -2893,8 +2930,8 @@ mod tests {
 
     #[test]
     fn estimate_tokens_user_text() {
-        let msg = make_user_text("hello world"); // 11 chars => ceil(11/3) = 4
-        assert_eq!(estimate_tokens(&msg), 4);
+        let msg = make_user_text("hello world"); // BPE (o200k oracle): 2 tokens
+        assert_eq!(estimate_tokens(&msg), 2);
     }
 
     #[test]
@@ -2911,8 +2948,8 @@ mod tests {
 
     #[test]
     fn estimate_tokens_tool_result() {
-        let msg = make_tool_result("file contents here"); // 18 chars => ceil(18/3) = 6
-        assert_eq!(estimate_tokens(&msg), 6);
+        let msg = make_tool_result("file contents here"); // BPE oracle: 4 tokens
+        assert_eq!(estimate_tokens(&msg), 4);
     }
 
     #[test]
@@ -2924,8 +2961,8 @@ mod tests {
             details: None,
             timestamp: Some(0),
         };
-        // 19 chars => ceil(19/3) = 7
-        assert_eq!(estimate_tokens(&msg), 7);
+        // BPE oracle: 3 tokens
+        assert_eq!(estimate_tokens(&msg), 3);
     }
 
     // ── estimate_context_tokens ──────────────────────────────────────
@@ -2948,8 +2985,8 @@ mod tests {
     fn estimate_context_no_assistant() {
         let messages = vec![make_user_text("hello"), make_user_text("world")];
         let estimate = estimate_context_tokens(&messages);
-        // No assistant messages, so sum estimate_tokens for all: ceil(5/3)+ceil(5/3) = 2+2 = 4
-        assert_eq!(estimate.tokens, 4);
+        // No assistant messages, so sum BPE counts: 1+1 = 2
+        assert_eq!(estimate.tokens, 2);
         assert!(estimate.last_usage_index.is_none());
     }
 
@@ -3845,8 +3882,8 @@ mod tests {
             })]),
             timestamp: None,
         };
-        // 20 chars -> ceil(20/3) = 7
-        assert_eq!(estimate_tokens(&msg), 7);
+        // BPE oracle: 4 tokens ("a" * 20)
+        assert_eq!(estimate_tokens(&msg), 4);
     }
 
     #[test]
@@ -3861,8 +3898,8 @@ mod tests {
             timestamp: None,
             extra: HashMap::new(),
         };
-        // 7 + 3 = 10 chars -> ceil(10/3) = 4
-        assert_eq!(estimate_tokens(&msg), 4);
+        // BPE oracle: 5 tokens ("echo hi" + "hi\n")
+        assert_eq!(estimate_tokens(&msg), 5);
     }
 
     #[test]
@@ -3871,8 +3908,8 @@ mod tests {
             summary: "a".repeat(40),
             from_id: "id".to_string(),
         };
-        // 40 chars -> ceil(40/3) = 14
-        assert_eq!(estimate_tokens(&msg), 14);
+        // BPE oracle: 5 tokens ("a" * 40)
+        assert_eq!(estimate_tokens(&msg), 5);
     }
 
     #[test]
@@ -3881,8 +3918,8 @@ mod tests {
             summary: "a".repeat(80),
             tokens_before: 5000,
         };
-        // 80 chars -> ceil(80/3) = 27
-        assert_eq!(estimate_tokens(&msg), 27);
+        // BPE oracle: 10 tokens ("a" * 80)
+        assert_eq!(estimate_tokens(&msg), 10);
     }
 
     // ── prepare_compaction ──────────────────────────────────────────
