@@ -2894,12 +2894,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     fn handle_slash_approval(&mut self, args: &str) -> Option<Cmd> {
         let sub = args.trim().to_ascii_lowercase();
         let approval_state = {
-            let agent_guard = match self.agent.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    self.status_message = Some("Agent is busy".to_string());
-                    return None;
-                }
+            let Ok(agent_guard) = self.agent.try_lock() else {
+                self.status_message = Some("Agent is busy".to_string());
+                return None;
             };
             agent_guard.approval_state()
         };
@@ -3030,10 +3027,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     } else {
                         "⏸️ disabled"
                     };
-                    text.push_str(&format!(
-                        "- **{}** [{status}]: `/{}/`\n  {}\n",
+                    let _ = writeln!(
+                        text,
+                        "- **{}** [{status}]: `/{}/`\n  {}",
                         r.name, r.pattern, r.body
-                    ));
+                    );
                 }
             }
             self.messages.push(ConversationMessage {
@@ -3062,11 +3060,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 .list_all_rules()
                 .into_iter()
                 .find(|r| r.id == id)
-                .map(|r| r.enabled)
-                .unwrap_or(true);
+                .is_none_or(|r| r.enabled);
             match store.toggle_rule(id, !current) {
                 Ok(true) => {
-                    let st = if !current { "enabled" } else { "disabled" };
+                    let st = if current { "disabled" } else { "enabled" };
                     self.status_message = Some(format!("Stream rule '{id}' is now {st}"));
                 }
                 _ => {
@@ -3132,6 +3129,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_commit(&mut self, args: &str) -> Option<Cmd> {
         let args = args.trim();
         let dry_run = args.contains("--dry-run")
@@ -3205,9 +3203,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 let mut card = format!("### 📦 Planned Atomic Commits ({})\n\n", plan.units.len());
                 for (idx, unit) in plan.units.iter().enumerate() {
                     let msg = unit.formatted_message(None);
-                    card.push_str(&format!("{}. **{}** (`{}`)\n", idx + 1, msg, unit.scope));
+                    let _ = writeln!(card, "{}. **{}** (`{}`)", idx + 1, msg, unit.scope);
                     for f in &unit.files {
-                        card.push_str(&format!("   - `{f}`\n"));
+                        let _ = writeln!(card, "   - `{f}`");
                     }
                 }
 
@@ -3217,18 +3215,19 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     match crate::commit_split::CommitExecutor::execute(&self.cwd, &plan, &options) {
                         Ok(results) => {
                             let successful = results.iter().filter(|r| r.success).count();
-                            card.push_str(&format!(
-                                "\n\n**Committed {successful}/{} units successfully.**\n",
+                            let _ = writeln!(
+                                card,
+                                "\n\n**Committed {successful}/{} units successfully.**",
                                 plan.units.len()
-                            ));
+                            );
                             for res in results {
                                 if let Some(ref sha) = res.commit_sha {
-                                    card.push_str(&format!("- `[{sha}]` {}\n", res.message));
+                                    let _ = writeln!(card, "- `[{sha}]` {}", res.message);
                                 }
                             }
                         }
                         Err(e) => {
-                            card.push_str(&format!("\n\n**Error executing commits:** {e}"));
+                            let _ = write!(card, "\n\n**Error executing commits:** {e}");
                         }
                     }
                 }

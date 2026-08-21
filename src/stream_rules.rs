@@ -109,10 +109,7 @@ impl RollingStreamMatcher {
         let compiled = rules
             .iter()
             .filter(|r| r.enabled)
-            .filter_map(|r| match Regex::new(&r.pattern) {
-                Ok(re) => Some((r.clone(), re)),
-                Err(_) => None,
-            })
+            .filter_map(|r| Regex::new(&r.pattern).ok().map(|re| (r.clone(), re)))
             .collect();
 
         Self {
@@ -243,12 +240,11 @@ impl TtsrCoordinator {
         };
 
         // Check if rule is on cooldown from a previous turn
-        if let Some(cooldown) = rule.cooldown_turns {
-            if let Some(last_injected) = self.cooldown_history.get(&rule.id) {
-                if self.current_turn.saturating_sub(*last_injected) <= cooldown {
-                    return TtsrAction::Continue;
-                }
-            }
+        if let Some(cooldown) = rule.cooldown_turns
+            && let Some(last_injected) = self.cooldown_history.get(&rule.id)
+            && self.current_turn.saturating_sub(*last_injected) <= cooldown
+        {
+            return TtsrAction::Continue;
         }
 
         // Check turn injection cap
@@ -312,22 +308,19 @@ impl StreamRuleStore {
             global_file_path: global_path.clone(),
         };
 
-        if project_path.exists() {
-            if let Ok(content) = fs::read_to_string(&project_path) {
-                if let Ok(cfg) = serde_json::from_str::<StreamRulesConfigFile>(&content) {
-                    store.project_rules = cfg.rules;
-                }
-            }
+        if project_path.exists()
+            && let Ok(content) = fs::read_to_string(&project_path)
+            && let Ok(cfg) = serde_json::from_str::<StreamRulesConfigFile>(&content)
+        {
+            store.project_rules = cfg.rules;
         }
 
-        if let Some(ref gp) = global_path {
-            if gp.exists() {
-                if let Ok(content) = fs::read_to_string(gp) {
-                    if let Ok(cfg) = serde_json::from_str::<StreamRulesConfigFile>(&content) {
-                        store.global_rules = cfg.rules;
-                    }
-                }
-            }
+        if let Some(ref gp) = global_path
+            && gp.exists()
+            && let Ok(content) = fs::read_to_string(gp)
+            && let Ok(cfg) = serde_json::from_str::<StreamRulesConfigFile>(&content)
+        {
+            store.global_rules = cfg.rules;
         }
 
         store
@@ -447,11 +440,7 @@ impl StreamRuleStore {
         let regex = Regex::new(&pattern)
             .map_err(|e| Error::Validation(format!("Invalid regex pattern: {e}")))?;
 
-        if let Some(mat) = regex.find(sample_text) {
-            Ok(Some(mat.as_str().to_string()))
-        } else {
-            Ok(None)
-        }
+        Ok(regex.find(sample_text).map(|mat| mat.as_str().to_string()))
     }
 
     /// Export effective rules as pretty-printed JSON.
@@ -619,10 +608,10 @@ impl GrievancesLedger {
         let mut grievances = Vec::new();
         for line in content.lines() {
             let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                if let Ok(g) = serde_json::from_str::<Grievance>(trimmed) {
-                    grievances.push(g);
-                }
+            if !trimmed.is_empty()
+                && let Ok(g) = serde_json::from_str::<Grievance>(trimmed)
+            {
+                grievances.push(g);
             }
         }
         Ok(grievances)
@@ -639,7 +628,7 @@ impl GrievancesLedger {
             .collect::<String>()
             .to_ascii_lowercase();
 
-        let rule_id = format!("rule-{}", &grievance.id);
+        let rule_id = format!("rule-{}", grievance.id);
         let rule_name = if safe_name.is_empty() {
             format!("Rule from {}", grievance.id)
         } else {
@@ -803,7 +792,7 @@ mod tests {
             cooldown_turns: None,
         };
 
-        let Ok(()) = store.add_rule(rule.clone(), false) else {
+        let Ok(()) = store.add_rule(rule, false) else {
             assert!(false, "add_rule failed");
             return;
         };

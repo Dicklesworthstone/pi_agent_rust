@@ -3768,6 +3768,8 @@ impl Agent {
         }
     }
 
+
+    #[allow(clippy::too_many_lines)]
     async fn request_tool_approval(
         &self,
         tool_call: &ToolCall,
@@ -3794,10 +3796,7 @@ impl Agent {
                     let audit_details = crate::approval::ApprovalState::audit_payload(
                         &tool_call.id,
                         &tool_call.name,
-                        &crate::approval::ApprovalEvaluation::AutoApproved {
-                            mode,
-                            reason: reason.clone(),
-                        },
+                        &crate::approval::ApprovalEvaluation::AutoApproved { mode, reason },
                     );
                     on_event(AgentEvent::ToolExecutionUpdate {
                         tool_call_id: tool_call.id.clone(),
@@ -3855,11 +3854,10 @@ impl Agent {
                                 return Some(Self::tool_approval_denied_output(&reason));
                             }
                         }
-                    } else {
-                        return Some(Self::tool_approval_denied_output(&format!(
-                            "Approval required in {mode} mode: {reason}"
-                        )));
                     }
+                    return Some(Self::tool_approval_denied_output(&format!(
+                        "Approval required in {mode} mode: {reason}"
+                    )));
                 }
             }
         }
@@ -6956,7 +6954,7 @@ mod extensions_integration_tests {
             assert_eq!(final_message.stop_reason, StopReason::Stop);
             assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
 
-            let nudges: Vec<_> = agent
+            let nudges = agent
                 .messages()
                 .iter()
                 .filter(|message| {
@@ -6964,8 +6962,8 @@ mod extensions_integration_tests {
                         if matches!(&user.content, crate::model::UserContent::Text(text)
                             if text.contains("auto-continue")))
                 })
-                .collect();
-            assert_eq!(nudges.len(), 1, "exactly one nudge recorded");
+                .count();
+            assert_eq!(nudges, 1, "exactly one nudge recorded");
         });
     }
 

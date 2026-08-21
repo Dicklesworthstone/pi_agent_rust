@@ -4,8 +4,8 @@
 //! atomic units by topic and coupling, topologically sorts them by dependency graph,
 //! detects and breaks cycles, and plans/executes sequential atomic git commits.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::path::Path;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -48,23 +48,19 @@ impl FileCategory {
             return Self::Test;
         }
 
-        if lower.starts_with("docs/")
-            || lower.ends_with(".md")
-            || lower.ends_with(".rst")
-            || lower.ends_with(".adoc")
-            || lower.ends_with(".txt")
-        {
+        let extension = Path::new(&lower)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("");
+
+        if lower.starts_with("docs/") || matches!(extension, "md" | "rst" | "adoc" | "txt") {
             return Self::Documentation;
         }
 
-        if lower.ends_with(".toml")
-            || lower.ends_with(".json")
-            || lower.ends_with(".yaml")
-            || lower.ends_with(".yml")
-            || lower.ends_with(".lock")
-            || lower.ends_with(".ini")
-            || lower.ends_with(".cfg")
-            || lower.starts_with(".beads/")
+        if matches!(
+            extension,
+            "toml" | "json" | "yaml" | "yml" | "lock" | "ini" | "cfg"
+        ) || lower.starts_with(".beads/")
             || lower.starts_with(".github/")
         {
             return Self::Config;
@@ -191,15 +187,16 @@ impl ConflictScanner {
             }
         });
 
-        if let Some(line_no) = conflict_line {
+        conflict_line.map_or(Ok(()), |line_no| {
             Err(Error::Validation(format!(
                 "Unresolved merge conflict marker detected in {file_name}:L{line_no}"
             )))
-        } else {
-            Ok(())
-        }
+        })
     }
 }
+
+/// Hunk header bounds: `(old_start, old_lines, new_start, new_lines)`.
+type HunkBounds = (usize, usize, usize, usize);
 
 /// Hunk parser for raw `git diff` output.
 pub struct DiffParser;
@@ -208,7 +205,7 @@ impl DiffParser {
     fn parse_diff_line<'a>(
         line: &'a str,
         current_file: &mut &'a str,
-    ) -> Option<(&'a str, (usize, usize, usize, usize))> {
+    ) -> Option<(&'a str, HunkBounds)> {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             if let Some(b_part) = rest.split_whitespace().nth(1) {
                 *current_file = b_part.trim_start_matches("b/");
@@ -267,7 +264,7 @@ impl DiffParser {
         Ok(hunks)
     }
 
-    fn parse_hunk_header(header: &str) -> (usize, usize, usize, usize) {
+    fn parse_hunk_header(header: &str) -> HunkBounds {
         let mut old_start = 1;
         let mut old_lines = 1;
         let mut new_start = 1;
@@ -375,8 +372,7 @@ impl CommitPlanner {
             FileCategory::Source => "feat".to_string(),
             FileCategory::Test => "test".to_string(),
             FileCategory::Documentation => "docs".to_string(),
-            FileCategory::Config => "chore".to_string(),
-            FileCategory::Lockfile => "chore".to_string(),
+            FileCategory::Config | FileCategory::Lockfile => "chore".to_string(),
         };
 
         let summary = format!("update {group_key} implementation and assets");
@@ -490,16 +486,14 @@ impl CommitPlanner {
         let mut ordered = Vec::with_capacity(n);
 
         for idx in ordered_indices {
-            if let Some(slot) = unit_slots.get_mut(idx) {
-                if let Some(unit) = slot.take() {
-                    ordered.push(unit);
-                }
+            if let Some(unit) = unit_slots.get_mut(idx).and_then(Option::take) {
+                ordered.push(unit);
             }
         }
 
         // Remaining unvisited units (if cycles occurred)
         let mut remaining: Vec<CommitUnit> = unit_slots.into_iter().flatten().collect();
-        remaining.sort_by(|a, b| b.score.cmp(&a.score));
+        remaining.sort_by_key(|unit| std::cmp::Reverse(unit.score));
         ordered.extend(remaining);
 
         (ordered, cycles)
@@ -522,7 +516,7 @@ impl CommitExecutor {
         add_cmd.arg("add").args(&unit.files).current_dir(cwd);
 
         let add_res = add_cmd.status();
-        let add_ok = add_res.map(|s| s.success()).unwrap_or(false);
+        let add_ok = add_res.is_ok_and(|s| s.success());
 
         if !add_ok {
             return CommitExecutionResult {

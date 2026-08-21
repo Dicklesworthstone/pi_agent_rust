@@ -194,6 +194,8 @@ impl ReviewReport {
             out.push_str("### Prioritized Findings\n\n");
             for (idx, f) in self.findings.iter().enumerate() {
                 let loc = format_finding_loc(&f.file, f.line_start, f.line_end);
+                // Confidence is a ratio in [0.0, 1.0]; the rounded percentage fits u32.
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let conf_pct = (f.confidence * 100.0).round() as u32;
                 let _ = writeln!(
                     out,
@@ -302,21 +304,21 @@ pub struct ReviewDeduplicator;
 impl ReviewDeduplicator {
     /// Deduplicate findings and rank by severity (P0..P3) and confidence (descending).
     pub fn dedupe_and_rank(
-        mut findings: Vec<ReviewFinding>,
+        findings: Vec<ReviewFinding>,
         max_findings: usize,
     ) -> Vec<ReviewFinding> {
         let mut grouped: BTreeMap<(String, usize, String), ReviewFinding> = BTreeMap::new();
 
-        for finding in findings.drain(..) {
+        for finding in findings {
             let key = make_finding_key(&finding);
 
             match grouped.get_mut(&key) {
                 Some(existing) => {
-                    // Retain higher severity (lower enum value)
-                    if finding.severity < existing.severity {
-                        *existing = finding;
-                    } else if finding.severity == existing.severity
-                        && finding.confidence > existing.confidence
+                    // Retain higher severity (lower enum value); on a tie, keep the
+                    // higher-confidence finding.
+                    if finding.severity < existing.severity
+                        || (finding.severity == existing.severity
+                            && finding.confidence > existing.confidence)
                     {
                         *existing = finding;
                     }
@@ -378,6 +380,7 @@ impl ReviewRuleEngine {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn evaluate_line(file: &str, line_no: usize, text: &str, findings: &mut Vec<ReviewFinding>) {
         let trimmed = text.trim();
 
@@ -385,7 +388,7 @@ impl ReviewRuleEngine {
         if (trimmed.contains("sk_live_")
             || trimmed.contains("ghp_")
             || trimmed.contains("xoxb-")
-            || (trimmed.contains("api_key") && trimmed.contains("=") && trimmed.len() > 30))
+            || (trimmed.contains("api_key") && trimmed.contains('=') && trimmed.len() > 30))
             && !trimmed.contains("test")
             && !trimmed.contains("example")
             && !trimmed.contains("placeholder")
@@ -538,7 +541,9 @@ impl CodeReviewer {
         let diff_str = String::from_utf8_lossy(&output.stdout).to_string();
         let all_hunks = DiffParser::parse_unified_diff(&diff_str).unwrap_or_default();
 
-        // Exclude lockfiles and minified files
+        // Exclude lockfiles and minified files. Suffix matching is intentionally
+        // exact and case-sensitive; these are conventional literal file names.
+        #[allow(clippy::case_sensitive_file_extension_comparisons)]
         let filtered_hunks: Vec<DiffHunk> = all_hunks
             .into_iter()
             .filter(|h| {
@@ -601,8 +606,7 @@ impl CodeReviewer {
                 p2 + p3
             ),
             ReviewVerdict::Block => format!(
-                "Blocked by {} critical (P0) and/or {} major (P1) finding(s). Must resolve before shipping.",
-                p0, p1
+                "Blocked by {p0} critical (P0) and/or {p1} major (P1) finding(s). Must resolve before shipping."
             ),
         };
 
@@ -610,7 +614,7 @@ impl CodeReviewer {
             files_analyzed: files_set.len(),
             hunks_analyzed: hunks.len(),
             findings_count: ranked.len(),
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             p0_count: p0,
             p1_count: p1,
             p2_count: p2,
@@ -619,8 +623,7 @@ impl CodeReviewer {
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
 
         let report = ReviewReport {
             schema: REVIEW_SCHEMA.to_string(),

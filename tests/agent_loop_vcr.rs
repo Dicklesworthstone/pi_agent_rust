@@ -10,6 +10,7 @@ use pi::providers::anthropic::AnthropicProvider;
 use pi::providers::openai::OpenAIProvider;
 use pi::session::Session;
 use pi::tools::ToolRegistry;
+use pi::turn_recovery::TurnRecoveryMode;
 use pi::vcr::{VcrMode, VcrRecorder};
 use serde_json::json;
 use std::fs::File;
@@ -154,6 +155,7 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn agent_loop_openai_vcr_basic() {
     let test_name = "agent_loop_openai_basic";
     let harness = TestHarness::new(test_name);
@@ -194,7 +196,7 @@ fn agent_loop_openai_vcr_basic() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -383,7 +385,7 @@ fn agent_loop_anthropic_simple_text() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -489,7 +491,7 @@ fn agent_loop_anthropic_error_stream() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -578,7 +580,7 @@ fn agent_loop_anthropic_tool_call_stop() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,

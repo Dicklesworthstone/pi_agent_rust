@@ -91,6 +91,7 @@ pub struct GcPlan {
 
 impl GcPlan {
     /// Format the plan as a human-readable summary.
+    #[allow(clippy::cast_precision_loss)] // Byte counts within practical range won't lose precision
     pub fn format_text(&self) -> String {
         let mut out = String::new();
         let mb = (self.total_bytes_reclaimable as f64) / (1024.0 * 1024.0);
@@ -165,6 +166,7 @@ pub struct GcResult {
 }
 
 impl GcResult {
+    #[allow(clippy::cast_precision_loss)] // Byte counts within practical range won't lose precision
     pub fn format_text(&self) -> String {
         let mut out = String::new();
         let mode = if self.dry_run {
@@ -230,6 +232,7 @@ impl Default for GcOptions {
 }
 
 /// Format bytes into human-readable unit string.
+#[allow(clippy::cast_precision_loss)] // Byte counts within practical range won't lose precision
 pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
@@ -259,7 +262,7 @@ pub fn parse_retention_days(s: &str) -> Option<u64> {
     }
 }
 
-fn make_session_gc_item(
+const fn make_session_gc_item(
     path: PathBuf,
     size_bytes: u64,
     age_secs: u64,
@@ -327,17 +330,17 @@ impl GarbageCollector {
         }
 
         // Inspect session header (first line) for explicit name / pinned marker
-        if let Ok(content) = fs::read_to_string(path) {
-            if let Some(first_line) = content.lines().next() {
-                if first_line.contains("\"name\":")
-                    && !first_line.contains("\"name\":null")
-                    && !first_line.contains("\"name\":\"\"")
-                {
-                    return true;
-                }
-                if first_line.contains("\"pinned\":true") {
-                    return true;
-                }
+        if let Ok(content) = fs::read_to_string(path)
+            && let Some(first_line) = content.lines().next()
+        {
+            if first_line.contains("\"name\":")
+                && !first_line.contains("\"name\":null")
+                && !first_line.contains("\"name\":\"\"")
+            {
+                return true;
+            }
+            if first_line.contains("\"pinned\":true") {
+                return true;
             }
         }
 
@@ -365,9 +368,9 @@ impl GarbageCollector {
 
             Self::scan_session_files(&sessions_dir, &mut project_sessions, &mut all_session_stems)?;
 
-            for (proj_dir, mut session_files) in project_sessions {
+            for (_proj_dir, mut session_files) in project_sessions {
                 // Sort descending by modified time (newest first)
-                session_files.sort_by(|a, b| b.1.cmp(&a.1));
+                session_files.sort_by_key(|entry| std::cmp::Reverse(entry.1));
 
                 for (idx, (file_path, mtime, size)) in session_files.into_iter().enumerate() {
                     let age = now.duration_since(mtime).unwrap_or_default();
@@ -420,7 +423,7 @@ impl GarbageCollector {
         if options.prune_caches {
             let global_cache = Config::global_dir().join("cache");
             if global_cache.is_dir() {
-                Self::scan_caches(&global_cache, max_age_duration, now, &mut items_to_prune)?;
+                Self::scan_caches(&global_cache, max_age_duration, now, &mut items_to_prune);
             }
         }
 
@@ -443,9 +446,8 @@ impl GarbageCollector {
         project_sessions: &mut BTreeMap<PathBuf, Vec<(PathBuf, SystemTime, u64)>>,
         all_session_stems: &mut HashSet<String>,
     ) -> Result<()> {
-        let entries = match fs::read_dir(root) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(());
         };
 
         for entry in entries.flatten() {
@@ -453,9 +455,8 @@ impl GarbageCollector {
             if path.is_dir() {
                 Self::scan_session_files(&path, project_sessions, all_session_stems)?;
             } else if path.extension().is_some_and(|ext| ext == "jsonl") {
-                let meta = match fs::metadata(&path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Ok(meta) = fs::metadata(&path) else {
+                    continue;
                 };
                 let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
                 let size = meta.len();
@@ -480,30 +481,29 @@ impl GarbageCollector {
         live_stems: &HashSet<String>,
         items_to_prune: &mut Vec<GcItem>,
     ) -> Result<()> {
-        let entries = match fs::read_dir(root) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
+        let Ok(entries) = fs::read_dir(root) else {
+            return Ok(());
         };
 
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 Self::scan_sidecars(&path, live_stems, items_to_prune)?;
-            } else if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if file_name.ends_with(".meta.json") || file_name.ends_with(".sidecar") {
-                    let stem = file_name
-                        .trim_end_matches(".meta.json")
-                        .trim_end_matches(".sidecar");
-                    if !live_stems.contains(stem) {
-                        let meta = fs::metadata(&path).ok();
-                        let size = meta.as_ref().map_or(0, |m| m.len());
-                        let age_secs = meta
-                            .and_then(|m| m.modified().ok())
-                            .and_then(|t| SystemTime::now().duration_since(t).ok())
-                            .map_or(0, |d| d.as_secs());
+            } else if let Some(file_name) = path.file_name().and_then(|n| n.to_str())
+                && (file_name.ends_with(".meta.json") || file_name.ends_with(".sidecar"))
+            {
+                let stem = file_name
+                    .trim_end_matches(".meta.json")
+                    .trim_end_matches(".sidecar");
+                if !live_stems.contains(stem) {
+                    let meta = fs::metadata(&path).ok();
+                    let size = meta.as_ref().map_or(0, fs::Metadata::len);
+                    let age_secs = meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| SystemTime::now().duration_since(t).ok())
+                        .map_or(0, |d| d.as_secs());
 
-                        items_to_prune.push(make_sidecar_gc_item(path, size, age_secs));
-                    }
+                    items_to_prune.push(make_sidecar_gc_item(path, size, age_secs));
                 }
             }
         }
@@ -516,18 +516,16 @@ impl GarbageCollector {
         max_age: Duration,
         now: SystemTime,
         items_to_prune: &mut Vec<GcItem>,
-    ) -> Result<()> {
-        let entries = match fs::read_dir(cache_root) {
-            Ok(e) => e,
-            Err(_) => return Ok(()),
+    ) {
+        let Ok(entries) = fs::read_dir(cache_root) else {
+            return;
         };
 
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                let meta = match fs::metadata(&path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
+                let Ok(meta) = fs::metadata(&path) else {
+                    continue;
                 };
                 let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
                 let age = now.duration_since(mtime).unwrap_or_default();
@@ -536,8 +534,6 @@ impl GarbageCollector {
                 }
             }
         }
-
-        Ok(())
     }
 
     /// Execute garbage collection sweep.
@@ -614,7 +610,7 @@ impl GarbageCollector {
                             schema: GC_LEDGER_SCHEMA.to_string(),
                             timestamp_ms: SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
-                                .map_or(0, |d| d.as_millis() as i64),
+                                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
                             original_path: item.path.display().to_string(),
                             trash_path: Some(dest_path.display().to_string()),
                             store: item.store,
@@ -684,7 +680,7 @@ impl GarbageCollector {
                 schema: GC_LEDGER_SCHEMA.to_string(),
                 timestamp_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as i64),
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
                 original_path: trashed_path.display().to_string(),
                 trash_path: None,
                 store: GcStoreKind::Sessions,
@@ -719,20 +715,19 @@ impl GarbageCollector {
         if found.is_some() {
             return;
         }
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return,
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
         };
 
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 Self::find_in_trash(&path, target, found);
-            } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name == target || name.starts_with(target) || name.contains(target) {
-                    *found = Some(path);
-                    return;
-                }
+            } else if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && (name == target || name.starts_with(target) || name.contains(target))
+            {
+                *found = Some(path);
+                return;
             }
         }
     }
@@ -781,7 +776,7 @@ impl GarbageCollector {
                 schema: GC_LEDGER_SCHEMA.to_string(),
                 timestamp_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis() as i64),
+                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
                 original_path: trash_dir.display().to_string(),
                 trash_path: None,
                 store: GcStoreKind::Trash,
@@ -826,10 +821,9 @@ impl GarbageCollector {
             .create(true)
             .append(true)
             .open(ledger_path)
+            && let Ok(json) = serde_json::to_string(record)
         {
-            if let Ok(json) = serde_json::to_string(record) {
-                let _ = writeln!(file, "{json}");
-            }
+            let _ = writeln!(file, "{json}");
         }
     }
 }
@@ -846,6 +840,9 @@ pub struct StoragePressureStatus {
 
 /// Inspect store size and return a pressure diagnostic.
 pub fn check_storage_pressure(sessions_dir: &Path, older_than_days: u64) -> StoragePressureStatus {
+    const STORAGE_THRESHOLD_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
+    const STALE_SESSIONS_THRESHOLD: usize = 50;
+
     let options = GcOptions {
         older_than_days,
         keep_last: 5,
@@ -876,9 +873,6 @@ pub fn check_storage_pressure(sessions_dir: &Path, older_than_days: u64) -> Stor
             .iter()
             .map(|i| i.size_bytes)
             .sum::<u64>();
-
-    const STORAGE_THRESHOLD_BYTES: u64 = 250 * 1024 * 1024; // 250 MB
-    const STALE_SESSIONS_THRESHOLD: usize = 50;
 
     let is_elevated =
         total_bytes > STORAGE_THRESHOLD_BYTES || stale_count > STALE_SESSIONS_THRESHOLD;

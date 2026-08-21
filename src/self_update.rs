@@ -60,7 +60,7 @@ impl PackageManager {
     }
 
     /// Suggested upgrade command if managed externally.
-    pub fn upgrade_command(&self) -> Option<&'static str> {
+    pub const fn upgrade_command(&self) -> Option<&'static str> {
         match self {
             Self::Homebrew => Some("brew upgrade pi"),
             Self::Apt => Some("sudo apt update && sudo apt install --only-upgrade pi-agent-rust"),
@@ -464,13 +464,14 @@ impl SelfUpdater {
 
         // Package manager check
         let manager = PackageManager::detect(&current_exe);
-        if manager != PackageManager::Manual && !options.check {
-            if let Some(cmd) = manager.upgrade_command() {
-                return Ok(SelfUpdateStatus::ManagedExternally {
-                    manager,
-                    upgrade_command: cmd.to_string(),
-                });
-            }
+        if manager != PackageManager::Manual
+            && !options.check
+            && let Some(cmd) = manager.upgrade_command()
+        {
+            return Ok(SelfUpdateStatus::ManagedExternally {
+                manager,
+                upgrade_command: cmd.to_string(),
+            });
         }
 
         let target_version = match &options.version {
@@ -535,11 +536,11 @@ mod tests {
 
     #[test]
     fn test_checksum_map_parser_and_verifier() {
-        let sample_sums = r#"
+        let sample_sums = r"
 # SHA256SUMS for v0.2.0
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  pi-v0.2.0-x86_64-unknown-linux-gnu
 ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm64
-"#;
+";
         let map = ChecksumMap::parse(sample_sums);
         assert_eq!(
             map.get_hash("pi-v0.2.0-x86_64-unknown-linux-gnu"),

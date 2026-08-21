@@ -14511,7 +14511,7 @@ mod tests {
             &read_tool,
             "read-2",
             &read_input,
-            &first_text(&first),
+            first_text(&first),
             "read",
         )
         .await;
@@ -14893,7 +14893,7 @@ mod tests {
             .expect("first ls");
         assert!(first_text(&ls_first).contains("note.txt"));
 
-        assert_eventual_cache_hit(&ls_tool, "ls-2", &ls_input, &first_text(&ls_first), "ls").await;
+        assert_eventual_cache_hit(&ls_tool, "ls-2", &ls_input, first_text(&ls_first), "ls").await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("new.txt"), "new\n").expect("write new file");
@@ -14924,7 +14924,7 @@ mod tests {
             &grep_tool,
             "grep-2",
             &grep_input,
-            &first_text(&grep_first),
+            first_text(&grep_first),
             "grep",
         )
         .await;
@@ -14958,7 +14958,7 @@ mod tests {
             &find_tool,
             "find-2",
             &find_input,
-            &first_text(&find_first),
+            first_text(&find_first),
             "find",
         )
         .await;
@@ -15009,7 +15009,7 @@ mod tests {
                 &grep_tool,
                 "grep-parent-ignore-2",
                 &grep_input,
-                &first_text(&first),
+                first_text(&first),
                 "parent-ignore grep",
             )
             .await;
@@ -15030,7 +15030,7 @@ mod tests {
                 &find_tool,
                 "find-parent-ignore-2",
                 &find_input,
-                &first_text(&first),
+                first_text(&first),
                 "parent-ignore find",
             )
             .await;
@@ -15101,7 +15101,7 @@ mod tests {
                 &grep_tool,
                 "grep-symlink-ignore-2",
                 &grep_input,
-                &first_text(&first),
+                first_text(&first),
                 "symlink-ignore grep",
             )
             .await;
@@ -15122,7 +15122,7 @@ mod tests {
                 &find_tool,
                 "find-symlink-ignore-2",
                 &find_input,
-                &first_text(&first),
+                first_text(&first),
                 "symlink-ignore find",
             )
             .await;

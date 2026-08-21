@@ -37,21 +37,25 @@ impl HandoffTarget {
     #[must_use]
     pub fn parse(s: &str) -> Self {
         let trimmed = s.trim();
-        if let Some(rest) = trimmed.strip_prefix("bead:") {
-            Self::Bead(rest.trim().to_string())
-        } else if let Some(rest) = trimmed.strip_prefix("bead=") {
-            Self::Bead(rest.trim().to_string())
-        } else if trimmed.eq_ignore_ascii_case("bead") {
-            Self::Bead(String::new())
-        } else if let Some(rest) = trimmed.strip_prefix("agent:") {
-            Self::Agent(rest.trim().to_string())
-        } else if let Some(rest) = trimmed.strip_prefix("agent=") {
-            Self::Agent(rest.trim().to_string())
-        } else if trimmed.eq_ignore_ascii_case("agent") {
-            Self::Agent(String::new())
-        } else {
-            Self::Human
+        if let Some(rest) = trimmed
+            .strip_prefix("bead:")
+            .or_else(|| trimmed.strip_prefix("bead="))
+        {
+            return Self::Bead(rest.trim().to_string());
         }
+        if trimmed.eq_ignore_ascii_case("bead") {
+            return Self::Bead(String::new());
+        }
+        if let Some(rest) = trimmed
+            .strip_prefix("agent:")
+            .or_else(|| trimmed.strip_prefix("agent="))
+        {
+            return Self::Agent(rest.trim().to_string());
+        }
+        if trimmed.eq_ignore_ascii_case("agent") {
+            return Self::Agent(String::new());
+        }
+        Self::Human
     }
 }
 
@@ -134,6 +138,7 @@ pub struct HandoffDocument {
 impl HandoffDocument {
     /// Format the handoff as a structured Markdown document.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_markdown(&self) -> String {
         use std::fmt::Write as _;
         let mut md = String::new();
@@ -448,6 +453,7 @@ impl HandoffGenerator {
 
     /// Generate a structured handoff document from a list of `SessionEntry` records.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn generate_from_entries(session_id: &str, entries: &[SessionEntry]) -> HandoffDocument {
         let mut goal = String::new();
         let mut current_state = String::new();
@@ -506,16 +512,15 @@ impl HandoffGenerator {
         }
 
         if current_state.is_empty() {
-            if !last_assistant_text.is_empty() {
+            if last_assistant_text.is_empty() {
+                current_state = "Session active, awaiting next instructions.".to_string();
+            } else {
                 // Take the last few lines or first paragraph of last assistant message
-                let snippet = last_assistant_text
+                current_state = last_assistant_text
                     .lines()
                     .take(6)
                     .collect::<Vec<_>>()
                     .join("\n");
-                current_state = snippet;
-            } else {
-                current_state = "Session active, awaiting next instructions.".to_string();
             }
         }
 
@@ -593,8 +598,12 @@ impl HandoffGenerator {
                 entry.0 = role.to_string();
             }
 
-            if let Some(start_line) = arguments.get("StartLine").and_then(|v| v.as_u64()) {
-                if let Some(end_line) = arguments.get("EndLine").and_then(|v| v.as_u64()) {
+            if let Some(start_line) = arguments
+                .get("StartLine")
+                .and_then(serde_json::Value::as_u64)
+            {
+                if let Some(end_line) = arguments.get("EndLine").and_then(serde_json::Value::as_u64)
+                {
                     entry.1.insert(format!("L{start_line}-L{end_line}"));
                 } else {
                     entry.1.insert(format!("L{start_line}"));
@@ -739,23 +748,26 @@ impl HandoffGenerator {
         };
 
         // Determine destination paths
-        let (md_path, js_path) = if let Some(p) = out_path {
-            let md = p.to_path_buf();
-            let mut js = p.to_path_buf();
-            let stem = js
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            js.set_file_name(format!("{stem}.json"));
-            (md, js)
-        } else {
-            let base_name = format!("handoff_{}", handoff.session_id);
-            (
-                PathBuf::from(format!("{base_name}.md")),
-                PathBuf::from(format!("{base_name}.json")),
-            )
-        };
+        let (md_path, js_path) = out_path.map_or_else(
+            || {
+                let base_name = format!("handoff_{}", handoff.session_id);
+                (
+                    PathBuf::from(format!("{base_name}.md")),
+                    PathBuf::from(format!("{base_name}.json")),
+                )
+            },
+            |p| {
+                let md = p.to_path_buf();
+                let mut js = p.to_path_buf();
+                let stem = js
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                js.set_file_name(format!("{stem}.json"));
+                (md, js)
+            },
+        );
 
         // Always write to disk files
         if let Err(e) = fs::write(&md_path, &markdown) {

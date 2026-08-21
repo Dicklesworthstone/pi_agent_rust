@@ -10740,16 +10740,14 @@ fn check_sessions(findings: &mut Vec<Finding>) {
     }
 
     let pressure = crate::gc::check_storage_pressure(&sessions_dir, 30);
-    if pressure.is_elevated {
-        if let Some(rec) = pressure.recommendation {
-            findings.push(
-                Finding::warn(cat, "Storage pressure detected in sessions store")
-                    .with_detail(rec)
-                    .with_remediation(
-                        "Run `pi gc --yes` to prune aged sessions and free disk space",
-                    ),
-            );
-        }
+    if pressure.is_elevated
+        && let Some(rec) = pressure.recommendation
+    {
+        findings.push(
+            Finding::warn(cat, "Storage pressure detected in sessions store")
+                .with_detail(rec)
+                .with_remediation("Run `pi gc --yes` to prune aged sessions and free disk space"),
+        );
     }
 }
 

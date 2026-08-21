@@ -61,6 +61,7 @@ fn test_handoff_schema_and_metadata() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn test_handoff_generator_end_to_end_extraction() {
     let entries = vec![
         SessionEntry::Message(MessageEntry {
@@ -168,8 +169,7 @@ fn test_handoff_generator_end_to_end_extraction() {
         .iter()
         .find(|f| f.path == "src/auth.rs")
     else {
-        assert!(false, "src/auth.rs should exist");
-        return;
+        panic!("src/auth.rs should exist");
     };
     assert_eq!(file.role, "modified");
     assert!(file.line_refs.contains(&"L50-L75".to_string()));
@@ -237,7 +237,7 @@ fn test_handoff_compaction_rehydration() {
             base: EntryBase::new(None, "comp-1".to_string()),
             summary: "Compacted Session Summary:\nDecision: Adopted rich_rust markup\nFailed approach: Raw ANSI escape sequences broke Windows console\nFile touched: src/tui.rs\nLesson: Rely on platform-abstracted terminal backends".to_string(),
             first_kept_entry_id: "msg-post-1".to_string(),
-            tokens_before: 120000,
+            tokens_before: 120_000,
             details: None,
             from_hook: None,
         }),

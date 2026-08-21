@@ -284,6 +284,7 @@ impl ApprovalState {
 
     /// Evaluate whether a tool call is auto-approved, requires approval, or is hard-blocked.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn evaluate(
         &self,
         tool_name: &str,
@@ -303,29 +304,29 @@ impl ApprovalState {
                 .and_then(Value::as_str)
                 .unwrap_or("");
 
-            if !cmd.is_empty() {
-                if let Some(s) = bash_settings {
-                    let mode =
-                        crate::bash_mediation::MediationMode::from_setting(s.mediation.as_deref());
-                    if mode != crate::bash_mediation::MediationMode::Off {
-                        let cwd = std::env::current_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("."));
-                        let verdict = crate::bash_mediation::assess(cmd, s, mode, &cwd);
-                        if !verdict.allows() {
-                            let hits = match verdict {
-                                crate::bash_mediation::MediationVerdict::Block { hits } => hits,
-                                _ => Vec::new(),
-                            };
-                            let reasons: Vec<String> = hits.into_iter().map(|h| h.reason).collect();
-                            let reason_str = if reasons.is_empty() {
-                                "Refused by bash mediation policy".to_string()
-                            } else {
-                                reasons.join("; ")
-                            };
-                            return ApprovalEvaluation::HardBlocked {
-                                reason: format!("Hard policy gate: {reason_str}"),
-                            };
-                        }
+            if !cmd.is_empty()
+                && let Some(s) = bash_settings
+            {
+                let mode =
+                    crate::bash_mediation::MediationMode::from_setting(s.mediation.as_deref());
+                if mode != crate::bash_mediation::MediationMode::Off {
+                    let cwd =
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+                    let verdict = crate::bash_mediation::assess(cmd, s, mode, &cwd);
+                    if !verdict.allows() {
+                        let hits = match verdict {
+                            crate::bash_mediation::MediationVerdict::Block { hits } => hits,
+                            _ => Vec::new(),
+                        };
+                        let reasons: Vec<String> = hits.into_iter().map(|h| h.reason).collect();
+                        let reason_str = if reasons.is_empty() {
+                            "Refused by bash mediation policy".to_string()
+                        } else {
+                            reasons.join("; ")
+                        };
+                        return ApprovalEvaluation::HardBlocked {
+                            reason: format!("Hard policy gate: {reason_str}"),
+                        };
                     }
                 }
             }
@@ -377,18 +378,18 @@ impl ApprovalState {
 
         // 4. Plan-YOLO mode (--plan-yolo):
         // Auto-approve in-plan file writes, ask on process/network/bash execution.
-        if self.plan_yolo() {
-            if let Some(plan) = plan_state {
-                // If plan is approved, file mutations are auto-approved
-                if plan.mode() == crate::plan::PlanMode::Approved
-                    && (effects.writes() || effects.appends())
-                    && !effects.processes()
-                {
-                    return ApprovalEvaluation::AutoApproved {
-                        mode,
-                        reason: "Plan-YOLO auto-approves in-plan file mutations".to_string(),
-                    };
-                }
+        if self.plan_yolo()
+            && let Some(plan) = plan_state
+        {
+            // If plan is approved, file mutations are auto-approved
+            if plan.mode() == crate::plan::PlanMode::Approved
+                && (effects.writes() || effects.appends())
+                && !effects.processes()
+            {
+                return ApprovalEvaluation::AutoApproved {
+                    mode,
+                    reason: "Plan-YOLO auto-approves in-plan file mutations".to_string(),
+                };
             }
         }
 
