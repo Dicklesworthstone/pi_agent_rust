@@ -243,6 +243,8 @@ pub mod rpc;
 pub mod scheduler;
 pub mod sdk;
 #[doc(hidden)]
+pub mod secrets;
+#[doc(hidden)]
 pub mod self_update;
 #[doc(hidden)]
 pub mod semantic_workspace_graph;
