@@ -12970,7 +12970,8 @@ mod tests {
                 .is_symlink(),
             "backend selection must not replace the terminal symlink"
         );
-        assert_eq!(session.path.as_deref(), Some(target.as_path()));
+        let canonical_target = std::fs::canonicalize(&target).expect("canonical target");
+        assert_eq!(session.path.as_deref(), Some(canonical_target.as_path()));
         let signature = std::fs::read(&target).expect("read SQLite target");
         assert!(
             signature.starts_with(b"SQLite format 3\0"),

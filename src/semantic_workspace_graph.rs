@@ -3097,25 +3097,82 @@ fn canonical_real_directory(path: &Path) -> Option<PathBuf> {
         std::env::current_dir().ok()?.join(path)
     };
     let mut lexical = PathBuf::new();
+    let mut pending = std::collections::VecDeque::new();
     for component in absolute.components() {
         match component {
             Component::Prefix(prefix) => lexical.push(prefix.as_os_str()),
             Component::RootDir => lexical.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => {
-                // An absolute filesystem root is its own parent.
-                lexical.pop();
+            Component::ParentDir => pending.push_back(std::ffi::OsString::from("..")),
+            Component::Normal(segment) => pending.push_back(segment.to_os_string()),
+        }
+    }
+    // Bounded trusted-symlink expansion, in the spirit of SYMLOOP_MAX.
+    let mut symlink_budget: u8 = 8;
+    while let Some(segment) = pending.pop_front() {
+        if segment == ".." {
+            // An absolute filesystem root is its own parent.
+            lexical.pop();
+            continue;
+        }
+        lexical.push(&segment);
+        let metadata = fs::symlink_metadata(&lexical).ok()?;
+        if metadata.file_type().is_symlink() {
+            // A symlink ancestor stays fail-closed against planting, except
+            // trusted system symlinks such as macOS `/var -> private/var`:
+            // root-owned while this process is not root, with a target that
+            // never climbs upward. Expand those lexically and keep walking.
+            let (components, absolute_target) = trusted_symlink_ancestor_target(&lexical)?;
+            symlink_budget = symlink_budget.checked_sub(1)?;
+            for part in components.into_iter().rev() {
+                pending.push_front(part);
             }
-            Component::Normal(segment) => {
-                lexical.push(segment);
-                let metadata = fs::symlink_metadata(&lexical).ok()?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return None;
-                }
+            lexical.pop();
+            if absolute_target {
+                lexical = PathBuf::from("/");
             }
+            continue;
+        }
+        if !metadata.is_dir() {
+            return None;
         }
     }
     fs::canonicalize(lexical).ok()
+}
+
+/// Path-based analogue of `crate::platform::read_trusted_symlink_component`
+/// for the lexical directory walk above: expand a root-owned symlink (while
+/// this process is not root) into its target components, refusing targets
+/// with parent or prefix components.
+#[cfg(unix)]
+fn trusted_symlink_ancestor_target(link: &Path) -> Option<(Vec<std::ffi::OsString>, bool)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::symlink_metadata(link).ok()?;
+    if !metadata.file_type().is_symlink()
+        || metadata.uid() != 0
+        || rustix::process::geteuid().is_root()
+    {
+        return None;
+    }
+    let target = fs::read_link(link).ok()?;
+    let absolute = target.is_absolute();
+    let mut components = Vec::new();
+    for component in target.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => components.push(part.to_os_string()),
+            // A trusted symlink that climbs upward is outside this narrow
+            // allowance; keep the strict fail-closed behavior for it.
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some((components, absolute))
+}
+
+#[cfg(not(unix))]
+fn trusted_symlink_ancestor_target(_link: &Path) -> Option<(Vec<std::ffi::OsString>, bool)> {
+    None
 }
 
 fn repository_git_context(repository_root: &Path) -> Option<RepositoryGitContext> {

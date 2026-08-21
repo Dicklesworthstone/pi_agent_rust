@@ -923,13 +923,25 @@ fn catalog_target_parts(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr
 }
 
 #[cfg(unix)]
+enum CatalogChildOpen {
+    Directory(File),
+    /// A trusted root-owned symlink component (e.g. macOS `/var ->
+    /// private/var`): the target components to re-walk, plus whether the
+    /// target is absolute.
+    TrustedSymlink {
+        components: Vec<std::ffi::OsString>,
+        absolute: bool,
+    },
+}
+
+#[cfg(unix)]
 fn open_catalog_child_nofollow(
     directory: &File,
     name: &std::ffi::OsStr,
     display_path: &Path,
     create: bool,
     access_context: &crate::platform::EffectiveModeAccessContext,
-) -> std::io::Result<File> {
+) -> std::io::Result<CatalogChildOpen> {
     let flags = rustix::fs::OFlags::RDONLY
         | rustix::fs::OFlags::DIRECTORY
         | rustix::fs::OFlags::NOFOLLOW
@@ -956,17 +968,45 @@ fn open_catalog_child_nofollow(
             rustix::fs::openat(directory, name, flags, rustix::fs::Mode::empty())
                 .map_err(std::io::Error::from)?
         }
-        Err(rustix::io::Errno::LOOP) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "generated model catalog path traverses a symlink: {}",
-                    display_path.join(name).display()
-                ),
-            ));
+        // O_NOFOLLOW on a symlink surfaces as ELOOP (POSIX) or ENOTDIR
+        // (macOS with O_DIRECTORY). Expand trusted system symlinks such
+        // as macOS `/var -> private/var`; everything else stays closed.
+        Err(errno @ (rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR)) => {
+            if let Some((components, absolute)) =
+                crate::platform::read_trusted_symlink_component(directory, name)
+            {
+                return Ok(CatalogChildOpen::TrustedSymlink {
+                    components,
+                    absolute,
+                });
+            }
+            if errno == rustix::io::Errno::LOOP {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "generated model catalog path traverses a symlink: {}",
+                        display_path.join(name).display()
+                    ),
+                ));
+            }
+            return Err(std::io::Error::from(errno));
         }
         Err(error) => return Err(std::io::Error::from(error)),
     };
+    Ok(CatalogChildOpen::Directory(File::from(descriptor)))
+}
+
+#[cfg(unix)]
+fn open_catalog_walk_base(base: &str) -> std::io::Result<File> {
+    let descriptor = rustix::fs::open(
+        base,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
     Ok(File::from(descriptor))
 }
 
@@ -978,16 +1018,7 @@ fn open_catalog_directory_nofollow(
 ) -> std::io::Result<File> {
     use std::path::Component;
 
-    let descriptor = rustix::fs::open(
-        if path.is_absolute() { "/" } else { "." },
-        rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC,
-        rustix::fs::Mode::empty(),
-    )
-    .map_err(std::io::Error::from)?;
-    let mut directory = File::from(descriptor);
+    let mut directory = open_catalog_walk_base(if path.is_absolute() { "/" } else { "." })?;
     let mut display_path = if path.is_absolute() {
         PathBuf::from("/")
     } else {
@@ -1001,10 +1032,11 @@ fn open_catalog_directory_nofollow(
         "generated model catalog path traversal",
     )?;
 
+    let mut pending = std::collections::VecDeque::new();
     for component in path.components() {
-        let name = match component {
-            Component::RootDir | Component::CurDir => continue,
-            Component::Normal(name) => name,
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(name) => pending.push_back(name.to_os_string()),
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -1014,11 +1046,38 @@ fn open_catalog_directory_nofollow(
                     ),
                 ));
             }
-        };
+        }
+    }
 
-        let child =
-            open_catalog_child_nofollow(&directory, name, &display_path, create, access_context)?;
-        display_path.push(name);
+    // Bounded trusted-symlink expansion, in the spirit of SYMLOOP_MAX.
+    let mut symlink_budget: u8 = 8;
+    while let Some(name) = pending.pop_front() {
+        let child = match open_catalog_child_nofollow(
+            &directory,
+            &name,
+            &display_path,
+            create,
+            access_context,
+        )? {
+            CatalogChildOpen::Directory(child) => child,
+            CatalogChildOpen::TrustedSymlink {
+                components,
+                absolute,
+            } => {
+                symlink_budget = symlink_budget
+                    .checked_sub(1)
+                    .ok_or_else(|| std::io::Error::from(rustix::io::Errno::LOOP))?;
+                for part in components.into_iter().rev() {
+                    pending.push_front(part);
+                }
+                if absolute {
+                    directory = open_catalog_walk_base("/")?;
+                    display_path = PathBuf::from("/");
+                }
+                continue;
+            }
+        };
+        display_path.push(&name);
         directory = child;
         let metadata = directory.metadata()?;
         if !metadata.is_dir() {

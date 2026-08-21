@@ -40,6 +40,7 @@ use pi::session::Session;
 use pi::tools::{
     Tool, ToolOutput, ToolRegistry, ToolUpdate, TruncatedBy, truncate_head, truncate_tail,
 };
+use pi::turn_recovery::TurnRecoveryMode;
 use serde_json::json;
 use std::io::Write as _;
 use std::pin::Pin;
@@ -213,7 +214,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         tool_approval: None,
         keyword_settings: None,
         max_time: None,
-        turn_recovery: Default::default(),
+        turn_recovery: TurnRecoveryMode::default(),
         approval_state: None,
         bash_settings: None,
         secrets: None,
@@ -1191,7 +1192,7 @@ fn agent_tool_execution_error_wraps_in_output() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -1268,7 +1269,7 @@ fn agent_queue_follow_up_only_at_idle() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
