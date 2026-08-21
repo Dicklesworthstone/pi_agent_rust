@@ -7824,7 +7824,8 @@ impl Tool for HubTool {
          cursor reads with bounded wait), `send` (PTY stdin: text, named \
          keys, signals), `stop` (graceful tree termination), `restart` \
          (retained launch spec), `describe` (full descriptor), `jobs` \
-         (background bash jobs: list/wait/cancel)."
+         (background bash jobs: list/wait/cancel), `agent` (subagent children: \
+         roster/transcript/steer/kill/revive/send/inbox)."
     }
 
     fn parameters(&self) -> serde_json::Value {
