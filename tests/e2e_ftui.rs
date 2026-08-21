@@ -195,7 +195,12 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         pid = pid_file.display(),
         bin = binary.display()
     );
-    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i\n");
+    // `-m` gives the recovery shell JOB CONTROL: after SIGKILL the tty's
+    // foreground process group is stale, and a job-control-less shell never
+    // reclaims it — every later keystroke vanishes (observed on workers:
+    // prompt drawn, zero echo, zero execution). A real user's interactive
+    // shell has job control and recovers; model that.
+    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i -m\n");
 
     let script_path = session.harness.temp_path("sigkill-run.sh");
     std::fs::write(&script_path, &script).expect("write sigkill script"); // ubs:ignore test setup expect
@@ -215,9 +220,16 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         .start_session(session.harness.temp_dir(), &script_path);
 
     // Full launch: the banner proves raw mode/alt-screen/mouse are active.
-    session
+    // Every marker below asserts loudly: wait_for_pane_contains returns
+    // silently on timeout, and a silent miss cascades into an opaque probe
+    // failure many steps later.
+    let startup_pane = session
         .tmux
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+    assert!(
+        startup_pane.contains("ftui preview stack"),
+        "startup banner never appeared; pane:\n{startup_pane}"
+    );
 
     if mid_activity {
         // Land the signal while the UI is actively rendering: a long bash
@@ -225,9 +237,14 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         // spinner tick chain re-arming when the signal arrives.
         session.tmux.send_literal("!sleep 5");
         session.tmux.send_key("Enter");
-        session
+        let activity_pane = session
             .tmux
             .wait_for_pane_contains("running bash", COMMAND_TIMEOUT);
+        assert!(
+            activity_pane.contains("running bash"),
+            "'running bash' status never appeared (UI did not take the !command); \
+             pane:\n{activity_pane}"
+        );
     }
 
     // An unreadable/unparseable pid file is an immediate test failure; the
@@ -245,9 +262,14 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     assert!(status.success(), "kill {signal} {pid} failed");
 
     // The wrapper shell takes over the pane once pi dies.
-    session
+    let done_pane = session
         .tmux
         .wait_for_pane_contains("PI-WAIT-DONE", COMMAND_TIMEOUT);
+    assert!(
+        done_pane.contains("PI-WAIT-DONE"),
+        "wrapper never reached PI-WAIT-DONE (pi survived the signal or the \
+         wrapper died); pane:\n{done_pane}"
+    );
 
     if blind_stty_sane {
         // SIGKILL path: the tty is expected to still be raw here; a blind
@@ -267,10 +289,34 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     assert!(
         occurrences >= 2,
         "typed probe did not echo (terminal left in raw/no-echo state?); \
-         occurrences={occurrences}, pane:\n{pane}"
+         occurrences={occurrences}, pane:\n{pane}\nescaped pane:\n{}",
+        escaped_pane(&session.tmux)
     );
 
     session.tmux.kill_server();
+}
+
+/// Capture the pane WITH escape sequences (capture-pane -e) so failure
+/// payloads show the raw terminal state: alternate-buffer content, cursor
+/// position, and any sync-bracket residue the rendered view hides.
+fn escaped_pane(tmux: &crate::common::tmux::TmuxInstance) -> String {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "-L",
+            &tmux.socket_name,
+            "capture-pane",
+            "-t",
+            &format!("{}:0.0", tmux.session_name),
+            "-p",
+            "-e",
+            "-S",
+            "-2000",
+        ])
+        .output();
+    match output {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).to_string(),
+        Err(err) => format!("<capture-pane -e failed: {err}>"),
+    }
 }
 
 /// SIGTERM must restore the terminal via RAII before exiting.
