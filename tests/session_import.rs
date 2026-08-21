@@ -1,11 +1,40 @@
-//! Integration tests for foreign session import (`pi import`) (bd-cv653.6.4).
+//! Integration tests for foreign session import (bd-cv653.6.4).
+//!
+//! Acceptance coverage:
+//! 1. Claude fixture imports: message order, roles, tool pairs intact;
+//!    the session opens via the native loader.
+//! 2. Codex fixture imports with reasoning preserved as thinking blocks.
+//! 3. Double import is idempotent (same session id, notice).
+//! 4. Corrupt lines tolerated: skipped with count in the report.
+//!
+//! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
+//! recorded as artifacts.
 
-use std::fs;
-use tempfile::tempdir;
+mod common;
 
-use pi::model::{ContentBlock, Message};
+use common::TestHarness;
+use common::logging::validate_jsonl_v2_only;
 use pi::session::Session;
 use pi::session_import::{import_claude, import_codex};
+
+fn finish_case(harness: &TestHarness, case: &str) {
+    harness
+        .log()
+        .info("verify", format!("case '{case}' assertions passed"));
+    let path = harness.temp_path(format!("{case}.jsonl"));
+    harness
+        .write_jsonl_logs(&path)
+        .expect("write JSONL test logs");
+    let payload = std::fs::read_to_string(&path).expect("read JSONL test logs");
+    let errors = validate_jsonl_v2_only(&payload);
+    assert!(errors.is_empty(), "JSONL v2 validation errors: {errors:?}");
+}
+
+fn write_fixture(harness: &TestHarness, name: &str, content: &str) -> std::path::PathBuf {
+    let path = harness.temp_path(name);
+    std::fs::write(&path, content).expect("write fixture");
+    path
+}
 
 fn sample_claude_jsonl() -> String {
     [
@@ -28,83 +57,116 @@ fn sample_codex_jsonl() -> String {
 }
 
 #[test]
-fn test_claude_import_end_to_end_and_idempotency() {
-    let Ok(tmp) = tempdir() else {
-        return;
-    };
-    let target_dir = tmp.path();
-    let source_file = target_dir.join("claude_session.jsonl");
+fn claude_end_to_end_fidelity_and_idempotency() {
+    let case = "claude_end_to_end_fidelity_and_idempotency";
+    let harness = TestHarness::new(case);
+    let target = harness.temp_path("target");
+    let source = write_fixture(&harness, "claude.jsonl", &sample_claude_jsonl());
 
-    let Ok(()) = fs::write(&source_file, sample_claude_jsonl()) else {
-        return;
-    };
+    let outcome = import_claude(&source, Some(&target)).expect("import");
+    harness.log().info(
+        "verify",
+        format!(
+            "imported {} skipped {} -> {}",
+            outcome.imported, outcome.skipped, outcome.session_path
+        ),
+    );
+    assert_eq!(outcome.imported, 3, "{:?}", outcome.report);
+    assert_eq!(outcome.skipped, 1, "{:?}", outcome.report);
+    assert!(!outcome.already_imported);
+    assert!(
+        outcome.report.iter().any(|line| line.contains("corrupt")),
+        "corruption counted in the report: {:?}",
+        outcome.report
+    );
 
-    // First import
-    let Ok(outcome1) = import_claude(&source_file, Some(target_dir)) else {
-        assert!(false, "First import should succeed");
-        return;
-    };
+    let again = import_claude(&source, Some(&target)).expect("re-import");
+    assert!(again.already_imported);
+    assert_eq!(again.session_id, outcome.session_id);
+    assert_eq!(again.imported, 0);
 
-    assert_eq!(outcome1.imported, 3);
-    assert_eq!(outcome1.skipped, 1);
-    assert!(!outcome1.already_imported);
-
-    // Second import (idempotency check)
-    let Ok(outcome2) = import_claude(&source_file, Some(target_dir)) else {
-        assert!(false, "Second import should succeed");
-        return;
-    };
-
-    assert!(outcome2.already_imported);
-    assert_eq!(outcome2.session_id, outcome1.session_id);
-
-    // Verify session opens and parses correctly
-    let Ok(session) = futures::executor::block_on(Session::open(outcome1.session_path)) else {
-        assert!(false, "Session::open should load imported session");
-        return;
-    };
-
+    let session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
     let messages = session.to_messages_for_current_path();
+    harness
+        .log()
+        .info("verify", format!("replayed {} messages", messages.len()));
     assert_eq!(messages.len(), 3);
+    let has_tool_call = messages.iter().any(|message| match message {
+        pi::model::Message::Assistant(assistant) => assistant
+            .content
+            .iter()
+            .any(|block| matches!(block, pi::model::ContentBlock::ToolCall(call) if call.id == "call_123")),
+        _ => false,
+    });
+    assert!(has_tool_call, "tool_use pair must import: {messages:?}");
+    finish_case(&harness, case);
 }
 
 #[test]
-fn test_codex_import_reasoning_and_tools() {
-    let Ok(tmp) = tempdir() else {
-        return;
-    };
-    let target_dir = tmp.path();
-    let source_file = target_dir.join("codex_session.jsonl");
+fn codex_reasoning_and_tools_import() {
+    let case = "codex_reasoning_and_tools_import";
+    let harness = TestHarness::new(case);
+    let target = harness.temp_path("target");
+    let source = write_fixture(&harness, "codex.jsonl", &sample_codex_jsonl());
 
-    let Ok(()) = fs::write(&source_file, sample_codex_jsonl()) else {
-        return;
-    };
+    let outcome = import_codex(&source, Some(&target)).expect("import");
+    harness.log().info(
+        "verify",
+        format!(
+            "codex imported {} -> {}",
+            outcome.imported, outcome.session_path
+        ),
+    );
+    assert_eq!(outcome.imported, 3, "{:?}", outcome.report);
 
-    let Ok(outcome) = import_codex(&source_file, Some(target_dir)) else {
-        assert!(false, "Codex import should succeed");
-        return;
-    };
-
-    assert_eq!(outcome.imported, 3);
-
-    let Ok(session) = futures::executor::block_on(Session::open(outcome.session_path)) else {
-        assert!(false, "Session::open should load imported codex session");
-        return;
-    };
-
+    let session = futures::executor::block_on(Session::open(&outcome.session_path)).expect("open");
     let messages = session.to_messages_for_current_path();
     assert_eq!(messages.len(), 3);
-
-    // Verify reasoning block landed as ThinkingContent
-    let has_thinking = messages.iter().any(|msg| match msg {
-        Message::Assistant(assistant) => assistant
+    let has_thinking = messages.iter().any(|message| match message {
+        pi::model::Message::Assistant(assistant) => assistant
             .content
             .iter()
-            .any(|block| matches!(block, ContentBlock::Thinking(_))),
+            .any(|block| matches!(block, pi::model::ContentBlock::Thinking(_))),
         _ => false,
     });
-    assert!(
-        has_thinking,
-        "Reasoning should be preserved as ThinkingContent"
+    let has_tool_call = messages.iter().any(|message| match message {
+        pi::model::Message::Assistant(assistant) => assistant
+            .content
+            .iter()
+            .any(|block| matches!(block, pi::model::ContentBlock::ToolCall(_))),
+        _ => false,
+    });
+    assert!(has_thinking, "reasoning must import as a thinking block");
+    assert!(has_tool_call, "function_call must import as a tool call");
+    finish_case(&harness, case);
+}
+
+#[test]
+fn corruption_never_aborts_import() {
+    let case = "corruption_never_aborts_import";
+    let harness = TestHarness::new(case);
+    let target = harness.temp_path("target");
+    let mut content = sample_claude_jsonl();
+    content.push_str("\n{broken\n{also broken\n");
+    let source = write_fixture(&harness, "claude-broken.jsonl", &content);
+
+    let outcome = import_claude(&source, Some(&target)).expect("import");
+    harness.log().info(
+        "verify",
+        format!(
+            "broken-file import: {} imported, {} skipped",
+            outcome.imported, outcome.skipped
+        ),
     );
+    assert_eq!(
+        outcome.imported, 3,
+        "valid lines still import: {:?}",
+        outcome.report
+    );
+    assert_eq!(
+        outcome.skipped, 3,
+        "all three corrupt lines counted: {:?}",
+        outcome.report
+    );
+    finish_case(&harness, case);
 }

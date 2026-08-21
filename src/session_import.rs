@@ -155,6 +155,7 @@ fn import_bytes(
 
     let mut session = Session::create_with_dir(Some(target_root.clone()));
     session.header.id = id.clone();
+    session.path = Some(session_path.clone());
     session.header.provider = Some(source.as_str().to_string());
     session.header.model_id = Some(format!("foreign-{}", source.as_str()));
     session.header.cwd = std::env::current_dir()
@@ -413,6 +414,23 @@ fn convert_claude_content(role: &str, content: &serde_json::Value, ts: i64) -> O
 
 // -- Codex entry conversion --------------------------------------------------
 
+/// Extract text from codex content blocks (`text`/`input_text`/`output_text`
+/// shapes across rollout versions).
+fn extract_codex_text_blocks(blocks: &[serde_json::Value]) -> String {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            block
+                .get("text")
+                .and_then(|v| v.as_str())
+                .or_else(|| block.get("input_text").and_then(|v| v.as_str()))
+                .or_else(|| block.get("output_text").and_then(|v| v.as_str()))
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn convert_codex_entry(entry: &serde_json::Value) -> std::result::Result<Option<Message>, String> {
     let entry_type = entry.get("type").and_then(|v| v.as_str());
     match entry_type {
@@ -528,6 +546,7 @@ mod tests {
     #[test]
     fn claude_fixture_imports_with_corruption_tolerance() {
         let dir = std::env::temp_dir().join(format!("pi-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
         let source = dir.join("claude.jsonl");
         std::fs::write(&source, claude_fixture()).expect("write");
         let outcome = import_claude(&source, Some(&dir)).expect("import");
@@ -540,7 +559,7 @@ mod tests {
         assert_eq!(again.session_id, outcome.session_id);
         // The session opens and replays.
         let session =
-            futures::executor::block_on(Session::open(outcome.session_path.clone())).expect("load");
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("load");
         let messages = session.to_messages_for_current_path();
         assert_eq!(messages.len(), 3);
         let _ = std::fs::remove_dir_all(&dir);
@@ -549,12 +568,13 @@ mod tests {
     #[test]
     fn codex_fixture_imports_reasoning_as_thinking() {
         let dir = std::env::temp_dir().join(format!("pi-import-codex-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create dir");
         let source = dir.join("codex.jsonl");
         std::fs::write(&source, codex_fixture()).expect("write");
         let outcome = import_codex(&source, Some(&dir)).expect("import");
         assert_eq!(outcome.imported, 3, "{:?}", outcome.report);
         let session =
-            futures::executor::block_on(Session::open(outcome.session_path.clone())).expect("load");
+            futures::executor::block_on(Session::open(&outcome.session_path)).expect("load");
         let messages = session.to_messages_for_current_path();
         assert_eq!(messages.len(), 3);
         // The reasoning block landed as a thinking block.
