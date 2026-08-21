@@ -26,9 +26,11 @@
 //!   ([`agent_event_to_pi_msgs`] pins the translation), asks pair through
 //!   `respond_ui`, sessions persist per the usual CLI flags.
 //!
-//! Still on the bubbletea stack: remaining slash commands and pickers
-//! (session//tree/branch), bash context-inclusion, extension UIs, and the
-//! PTY/e2e acceptance lanes — tracked on the bead.
+//! Still on the bubbletea stack: the interactive tree/fork selector overlays
+//! (bd-cv653.9.8) and the command-palette composer (bd-cv653.9.3). Core
+//! session slash commands (/new, /clear, /session, /tree summary,
+//! /thinking, /name), bash context-inclusion, extension UIs, and the
+//! PTY/e2e acceptance lanes are ported here.
 
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -307,6 +309,23 @@ pub enum UiCommand {
     /// Dispatch a non-built-in slash command to the extension runtime; the
     /// driver checks registration and reports unknown commands.
     ExtensionCommand { name: String, args: String },
+    /// Start a fresh session (`/new`): the driver builds a new session from
+    /// the launch template with the current provider/model selection and a
+    /// reset thinking level, swaps it in, and replays the (empty) history.
+    NewSession,
+    /// Show session info (`/session`): file, id, name, model, thinking
+    /// level, and message count — a read-only snapshot of the live session.
+    SessionInfo,
+    /// Print a textual branch-tree summary (`/tree`). The interactive tree
+    /// selector overlay arrives with bd-cv653.9.8; until then /tree reports
+    /// branches/entries instead of falling through to extension dispatch.
+    TreeSummary,
+    /// Show (`None`) or set (`Some`) the thinking level (`/thinking`).
+    /// The UI validates the level against `ThinkingLevel::from_str` before
+    /// sending; invalid levels never reach the driver.
+    SetThinking(Option<crate::model::ThinkingLevel>),
+    /// Set the session display name (`/name <name>`).
+    SetName(String),
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -883,12 +902,62 @@ impl PiFtuiModel {
                 EntryRole::System,
                 String::from(
                     "ftui preview commands: /model [provider/model], /resume, /compact, \
-                     /theme, /exit, /help, !<cmd> (runs + sends output to the agent), \
-                     !!<cmd> (display-only) — everything else is still on the \
-                     charmed stack",
+                     /theme, /new, /clear, /session, /tree, /thinking [level], \
+                     /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
+                     agent), !!<cmd> (display-only)",
                 ),
             );
             return true;
+        }
+        let (cmd_name, cmd_args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        match cmd_name {
+            "/new" => {
+                self.send_command(UiCommand::NewSession);
+                return true;
+            }
+            "/clear" | "/cls" => {
+                // Display-only clear (SlashCommand::Clear parity): the
+                // session file and its history stay untouched. Unreachable
+                // mid-turn — the editor gate (`input_active`) already blocks
+                // input while the agent works.
+                self.transcript.clear();
+                self.streaming.clear();
+                self.thinking.clear();
+                self.current_tool = None;
+                self.scroll_from_tail = 0;
+                self.push_entry(EntryRole::System, String::from("Conversation cleared"));
+                return true;
+            }
+            "/session" | "/info" => {
+                self.send_command(UiCommand::SessionInfo);
+                return true;
+            }
+            "/tree" => {
+                self.send_command(UiCommand::TreeSummary);
+                return true;
+            }
+            "/thinking" | "/think" | "/t" => {
+                let value = cmd_args.trim();
+                if value.is_empty() {
+                    self.send_command(UiCommand::SetThinking(None));
+                    return true;
+                }
+                match value.parse::<crate::model::ThinkingLevel>() {
+                    Ok(level) => self.send_command(UiCommand::SetThinking(Some(level))),
+                    Err(err) => self.push_entry(EntryRole::Error, err),
+                }
+                return true;
+            }
+            "/name" => {
+                let name = cmd_args.trim();
+                if name.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("Usage: /name <name>"));
+                } else {
+                    self.send_command(UiCommand::SetName(name.to_string()));
+                }
+                return true;
+            }
+            _ => {}
         }
         if !clean.starts_with("/skill:") {
             // Anything else may be an extension-registered command; the
@@ -1832,6 +1901,178 @@ async fn run_compact_command(
     }
 }
 
+/// Handle `/new` in the driver: build a fresh session from the launch
+/// template with the CURRENT provider/model selection preserved and thinking
+/// reset to off (SlashCommand::New parity), then swap it in exactly like
+/// `/resume`. Returns the replacement handle on success; failures surface as
+/// UI errors and keep the current session.
+async fn new_session_command(
+    template: &crate::sdk::SessionOptions,
+    handle: &crate::sdk::AgentSessionHandle,
+    current_ask: &CurrentAsk,
+    ext_handler: &Arc<FtuiExtensionUiHandler>,
+    agent_tx: &Sender<PiMsg>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> Option<crate::sdk::AgentSessionHandle> {
+    let (provider, model_id) = handle.model();
+    let options = crate::sdk::SessionOptions {
+        provider: Some(provider.clone()),
+        model: Some(model_id.clone()),
+        api_key: template.api_key.clone(),
+        working_directory: template.working_directory.clone(),
+        session_dir: template.session_dir.clone(),
+        extension_paths: template.extension_paths.clone(),
+        extension_policy: template.extension_policy.clone(),
+        extension_ui_handler: Some(
+            Arc::clone(ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>
+        ),
+        thinking: Some(crate::model::ThinkingLevel::Off),
+        no_session: false,
+        ..Default::default()
+    };
+    match crate::sdk::create_agent_session(options).await {
+        Ok(new_handle) => {
+            *current_ask
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = new_handle.ask_tool();
+            if let Some(ask) = new_handle.ask_tool() {
+                install_ask_forwarder(&ask, agent_tx, runtime_handle);
+            }
+            send_conversation_reset(
+                &new_handle,
+                agent_tx,
+                &format!(
+                    "Started new session\nModel set to {provider}/{model_id}\nThinking level: off"
+                ),
+            )
+            .await;
+            Some(new_handle)
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("new session: {err}")));
+            None
+        }
+    }
+}
+
+/// Handle `/session`: report the live session's file/id/name/model/thinking/
+/// message count. Token/cost totals are omitted deliberately — the ftui
+/// stack tracks only last-turn usage today, and fabricated zeros would be
+/// worse than absent lines.
+async fn run_session_info_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let state = match handle.state().await {
+        Ok(state) => state,
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("session info: {err}")));
+            return;
+        }
+    };
+    let info = handle
+        .with_session(|session| {
+            let file = session.path.as_ref().map_or_else(
+                || String::from("(not saved yet)"),
+                |p| p.display().to_string(),
+            );
+            let name = session.get_name().unwrap_or_else(|| String::from("-"));
+            format!(
+                "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {provider}/{model_id}\n  thinking: {thinking}\n  messageCount: {message_count}",
+                id = state.session_id.as_deref().unwrap_or("-"),
+                provider = state.provider,
+                model_id = state.model_id,
+                thinking = state
+                    .thinking_level
+                    .as_ref()
+                    .map_or_else(|| String::from("off"), ToString::to_string),
+                message_count = state.message_count,
+            )
+        })
+        .await;
+    match info {
+        Ok(text) => {
+            let _ = agent_tx.send(PiMsg::System(text));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("session info: {err}")));
+        }
+    }
+}
+
+/// Handle `/tree`: print a textual branch-tree summary. The interactive
+/// tree selector overlay is bd-cv653.9.8 scope; this keeps `/tree`
+/// functional during the runtime-migration phase instead of letting it fall
+/// through to extension dispatch and report "Unknown command".
+async fn run_tree_summary_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let summary = handle.with_session(|session| {
+        let leaves = session.list_leaves();
+        let entry_count = session.entries.len();
+        if leaves.is_empty() {
+            return format!("Session tree: no branches, {entry_count} entries");
+        }
+        let rendered = leaves
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        format!(
+            "Session tree: {} branch(es), {entry_count} entries\nLeaves:\n  {rendered}",
+            leaves.len()
+        )
+    });
+    match summary.await {
+        Ok(text) => {
+            let _ = agent_tx.send(PiMsg::System(text));
+        }
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("tree: {err}")));
+        }
+    }
+}
+
+/// Handle `/thinking`: bare shows the effective level, a parsed level sets
+/// it on the live session (`set_thinking_level` persists the header change).
+async fn run_set_thinking_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    level: Option<crate::model::ThinkingLevel>,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match level {
+        None => match handle.state().await {
+            Ok(state) => PiMsg::System(format!(
+                "Thinking level: {}",
+                state
+                    .thinking_level
+                    .as_ref()
+                    .map_or_else(|| String::from("off"), ToString::to_string)
+            )),
+            Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
+        },
+        Some(level) => match handle.set_thinking_level(level).await {
+            Ok(()) => PiMsg::System(format!("Thinking level: {level}")),
+            Err(err) => PiMsg::AgentError(format!("thinking: {err}")),
+        },
+    };
+    let _ = agent_tx.send(msg);
+}
+
+/// Handle `/name <name>`: set the session display name.
+async fn run_set_name_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    name: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let msg = match handle.set_session_name(name).await {
+        Ok(()) => PiMsg::System(format!("Session name: {name}")),
+        Err(err) => PiMsg::AgentError(format!("name: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
 /// Handle `/resume` in the driver: open the chosen session file with the
 /// launch selection preserved, rewire the ask bridge to the new handle, and
 /// replay the conversation into the UI. Returns the replacement handle on
@@ -2036,6 +2277,32 @@ pub fn run(
                             {
                                 handle = new_handle;
                             }
+                        }
+                        Ok(UiCommand::NewSession) => {
+                            if let Some(new_handle) = new_session_command(
+                                &resume_template,
+                                &handle,
+                                &current_ask,
+                                &ext_handler,
+                                &agent_tx,
+                                &runtime_handle,
+                            )
+                            .await
+                            {
+                                handle = new_handle;
+                            }
+                        }
+                        Ok(UiCommand::SessionInfo) => {
+                            run_session_info_command(&handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::TreeSummary) => {
+                            run_tree_summary_command(&handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::SetThinking(level)) => {
+                            run_set_thinking_command(&mut handle, level, &agent_tx).await;
+                        }
+                        Ok(UiCommand::SetName(name)) => {
+                            run_set_name_command(&mut handle, &name, &agent_tx).await;
                         }
                         Err(std::sync::mpsc::TryRecvError::Empty) => {
                             asupersync::time::sleep(asupersync::time::wall_now(), SUBMIT_POLL)
@@ -2297,15 +2564,13 @@ mod tests {
         let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
         let mut sim = ProgramSimulator::new(model);
         sim.init();
-        // Non-built-in commands go to the driver, which checks extension
-        // registration and reports unknown ones (submit_message parity).
-        type_str(&mut sim, "/tree deep --all");
+        type_str(&mut sim, "/deploy --force");
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
             UiCommand::ExtensionCommand {
-                name: "tree".into(),
-                args: "deep --all".into(),
+                name: "deploy".into(),
+                args: "--force".into(),
             }
         );
         // /help stays local.
@@ -3150,5 +3415,104 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<PiMsg>();
         let sub = AgentEventSubscription::new(rx);
         assert_eq!(sub.id(), AGENT_EVENTS_SUB_ID);
+    }
+    #[test]
+    fn session_slash_commands_route_to_driver() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/new");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(submit_rx.try_recv().expect("routed"), UiCommand::NewSession);
+        type_str(&mut sim, "/session");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SessionInfo
+        );
+        type_str(&mut sim, "/tree deep --all");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::TreeSummary
+        );
+        type_str(&mut sim, "/thinking medium");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetThinking(Some(crate::model::ThinkingLevel::Medium))
+        );
+        // Numeric and abbreviated aliases parse like the bubbletea stack.
+        type_str(&mut sim, "/t 3");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetThinking(Some(crate::model::ThinkingLevel::High))
+        );
+        // Bare /thinking asks the driver for the current level.
+        type_str(&mut sim, "/think");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetThinking(None)
+        );
+        // Invalid levels error locally without reaching the driver.
+        type_str(&mut sim, "/thinking bogus");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.role == EntryRole::Error && e.text.contains("Invalid thinking level")),
+            "invalid-level error missing"
+        );
+        // /name requires an argument; a provided one routes through.
+        type_str(&mut sim, "/name");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        type_str(&mut sim, "/name ship-it");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::SetName(String::from("ship-it"))
+        );
+    }
+
+    #[test]
+    fn slash_input_is_gated_while_working() {
+        // The editor only accepts input while the agent is idle
+        // (`input_active` parity), so mid-turn /new and /tree neither reach
+        // the driver nor fabricate error entries — the gate IS the busy
+        // guard.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        type_str(&mut sim, "/new");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        type_str(&mut sim, "/tree");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err());
+        assert!(sim.model().transcript.is_empty());
+    }
+
+    #[test]
+    fn clear_resets_transcript_locally() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from(
+            "earlier note",
+        ))));
+        type_str(&mut sim, "/cls");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        let transcript = &sim.model().transcript;
+        assert!(!transcript.iter().any(|e| e.text.contains("earlier note")));
+        assert!(transcript.iter().any(|e| e.text == "Conversation cleared"));
     }
 }
