@@ -14507,13 +14507,8 @@ mod tests {
             .expect("first read");
         assert!(first_text(&first).contains("alpha"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let second = read_tool
-            .execute("read-2", read_input.clone(), None)
-            .await
-            .expect("cached read");
-        assert_eq!(first_text(&first), first_text(&second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        assert_eventual_cache_hit(&read_tool, "read-2", &read_input, &first_text(&first), "read")
+            .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(&note, "beta\n").expect("rewrite note");
@@ -14857,6 +14852,32 @@ mod tests {
         assert!(!text.contains("a-old-"), "{text}");
     }
 
+    /// Execute `tool` repeatedly until the process-global output cache reports
+    /// a hit. The cache is shared across the whole test binary with a bounded
+    /// LRU, so concurrently running tests can evict the freshly inserted entry
+    /// between two calls; a miss re-inserts the entry, so a bounded retry
+    /// converges unless caching is actually broken.
+    async fn assert_eventual_cache_hit(
+        tool: &dyn Tool,
+        tool_call_id: &str,
+        input: &serde_json::Value,
+        expected_text: &str,
+        label: &str,
+    ) {
+        for _attempt in 0..8 {
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let output = tool
+                .execute(tool_call_id, input.clone(), None)
+                .await
+                .unwrap_or_else(|err| panic!("{label}: cached execute failed: {err}"));
+            assert_eq!(expected_text, first_text(&output), "{label}");
+            if tool_output_cache_stats_for_tests().hits > hits_before {
+                return;
+            }
+        }
+        panic!("{label}: output was never served from the cache");
+    }
+
     async fn assert_ls_cache_hit_and_stale(tmp: &Path) {
         let ls_tool = LsTool::new(tmp);
         let ls_input = serde_json::json!({ "path": "." });
@@ -14866,23 +14887,7 @@ mod tests {
             .expect("first ls");
         assert!(first_text(&ls_first).contains("note.txt"));
 
-        // The cache is process-global and LRU-bounded, so parallel tests can
-        // evict the freshly inserted entry between two calls; a miss
-        // re-inserts, so retrying converges unless caching is actually broken.
-        let mut saw_hit = false;
-        for _attempt in 0..8 {
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let ls_second = ls_tool
-                .execute("ls-2", ls_input.clone(), None)
-                .await
-                .expect("cached ls");
-            assert_eq!(first_text(&ls_first), first_text(&ls_second));
-            if tool_output_cache_stats_for_tests().hits > hits_before {
-                saw_hit = true;
-                break;
-            }
-        }
-        assert!(saw_hit, "ls output was never served from the cache");
+        assert_eventual_cache_hit(&ls_tool, "ls-2", &ls_input, &first_text(&ls_first), "ls").await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("new.txt"), "new\n").expect("write new file");
@@ -14909,22 +14914,14 @@ mod tests {
             .expect("first grep");
         assert!(first_text(&grep_first).contains("a.txt"));
 
-        // See assert_ls_cache_hit_and_stale: bounded retry absorbs LRU
-        // eviction by concurrently running tests.
-        let mut saw_hit = false;
-        for _attempt in 0..8 {
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let grep_second = grep_tool
-                .execute("grep-2", grep_input.clone(), None)
-                .await
-                .expect("cached grep");
-            assert_eq!(first_text(&grep_first), first_text(&grep_second));
-            if tool_output_cache_stats_for_tests().hits > hits_before {
-                saw_hit = true;
-                break;
-            }
-        }
-        assert!(saw_hit, "grep output was never served from the cache");
+        assert_eventual_cache_hit(
+            &grep_tool,
+            "grep-2",
+            &grep_input,
+            &first_text(&grep_first),
+            "grep",
+        )
+        .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("b.txt"), "needle\n").expect("write new match");
@@ -14951,22 +14948,14 @@ mod tests {
             .expect("first find");
         assert!(first_text(&find_first).contains("find-a.txt"));
 
-        // See assert_ls_cache_hit_and_stale: bounded retry absorbs LRU
-        // eviction by concurrently running tests.
-        let mut saw_hit = false;
-        for _attempt in 0..8 {
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let find_second = find_tool
-                .execute("find-2", find_input.clone(), None)
-                .await
-                .expect("cached find");
-            assert_eq!(first_text(&find_first), first_text(&find_second));
-            if tool_output_cache_stats_for_tests().hits > hits_before {
-                saw_hit = true;
-                break;
-            }
-        }
-        assert!(saw_hit, "find output was never served from the cache");
+        assert_eventual_cache_hit(
+            &find_tool,
+            "find-2",
+            &find_input,
+            &first_text(&find_first),
+            "find",
+        )
+        .await;
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("find-b.txt"), "find\n").expect("write second find file");
@@ -15010,13 +14999,14 @@ mod tests {
                 .await
                 .expect("first parent-ignore grep");
             assert!(!first_text(&first).contains("parent-grep.txt"));
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let second = grep_tool
-                .execute("grep-parent-ignore-2", grep_input.clone(), None)
-                .await
-                .expect("cached parent-ignore grep");
-            assert_eq!(first_text(&first), first_text(&second));
-            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+            assert_eventual_cache_hit(
+                &grep_tool,
+                "grep-parent-ignore-2",
+                &grep_input,
+                &first_text(&first),
+                "parent-ignore grep",
+            )
+            .await;
         }
 
         let find_tool = FindTool::new(tmp);
@@ -15030,13 +15020,14 @@ mod tests {
                 .await
                 .expect("first parent-ignore find");
             assert!(!first_text(&first).contains("parent-find.txt"));
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let second = find_tool
-                .execute("find-parent-ignore-2", find_input.clone(), None)
-                .await
-                .expect("cached parent-ignore find");
-            assert_eq!(first_text(&first), first_text(&second));
-            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+            assert_eventual_cache_hit(
+                &find_tool,
+                "find-parent-ignore-2",
+                &find_input,
+                &first_text(&first),
+                "parent-ignore find",
+            )
+            .await;
         }
 
         std::fs::write(&parent_ignore, "").expect("clear parent ignore control");
@@ -15100,13 +15091,14 @@ mod tests {
                 .await
                 .expect("first symlink-ignore grep");
             assert!(!first_text(&first).contains("symlink-grep.txt"));
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let second = grep_tool
-                .execute("grep-symlink-ignore-2", grep_input.clone(), None)
-                .await
-                .expect("cached symlink-ignore grep");
-            assert_eq!(first_text(&first), first_text(&second));
-            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+            assert_eventual_cache_hit(
+                &grep_tool,
+                "grep-symlink-ignore-2",
+                &grep_input,
+                &first_text(&first),
+                "symlink-ignore grep",
+            )
+            .await;
         }
 
         let find_tool = FindTool::new(&workspace);
@@ -15120,13 +15112,14 @@ mod tests {
                 .await
                 .expect("first symlink-ignore find");
             assert!(!first_text(&first).contains("symlink-find.txt"));
-            let hits_before = tool_output_cache_stats_for_tests().hits;
-            let second = find_tool
-                .execute("find-symlink-ignore-2", find_input.clone(), None)
-                .await
-                .expect("cached symlink-ignore find");
-            assert_eq!(first_text(&first), first_text(&second));
-            assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+            assert_eventual_cache_hit(
+                &find_tool,
+                "find-symlink-ignore-2",
+                &find_input,
+                &first_text(&first),
+                "symlink-ignore find",
+            )
+            .await;
         }
 
         std::fs::write(&ignore_target, "").expect("clear symlinked ignore target");
