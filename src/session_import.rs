@@ -228,7 +228,7 @@ fn import_bytes(
         };
         let converted = match source {
             ImportSource::Claude => convert_claude_entry(&entry),
-            ImportSource::Codex => convert_codex_entry(&entry),
+            ImportSource::Codex => Ok(convert_codex_entry(&entry)),
         };
         match converted {
             Ok(Some(message)) => {
@@ -474,12 +474,12 @@ fn extract_codex_text_blocks(blocks: &[serde_json::Value]) -> String {
         .join("\n")
 }
 
-fn convert_codex_entry(entry: &serde_json::Value) -> std::result::Result<Option<Message>, String> {
+fn convert_codex_entry(entry: &serde_json::Value) -> Option<Message> {
     let entry_type = entry.get("type").and_then(|v| v.as_str());
     match entry_type {
         Some("session_meta") => {
             // Carry cwd from the meta envelope when present (provenance).
-            Ok(None)
+            None
         }
         Some("response_item") => {
             let payload = entry
@@ -487,9 +487,9 @@ fn convert_codex_entry(entry: &serde_json::Value) -> std::result::Result<Option<
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let ts = parse_ts_ms(entry.get("timestamp").and_then(|v| v.as_str()));
-            Ok(convert_codex_payload(&payload, ts))
+            convert_codex_payload(&payload, ts)
         }
-        _ => Ok(None),
+        _ => None,
     }
 }
 
