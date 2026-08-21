@@ -166,6 +166,8 @@ pub mod gc;
 pub mod github;
 pub mod handoff;
 #[doc(hidden)]
+pub mod agent_hub;
+#[doc(hidden)]
 pub mod hostcall_amac;
 #[doc(hidden)]
 pub mod hostcall_io_uring_lane;

@@ -7968,7 +7968,6 @@ async fn run_rpc_mode(
         },
         futures::future::Either::Right(((), _)) => {
             // Signal received, return Ok to trigger main_impl's shutdown flush
-            Ok(())
         }
     }
 }
@@ -8663,6 +8662,7 @@ async fn run_interactive_mode(
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
     workspace: pi::workspace::WorkspaceHandle,
+    ask_tool: Option<pi::ask::AskTool>,
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();

@@ -60,6 +60,7 @@ use crate::resources::{DiagnosticKind, ResourceCliOptions, ResourceDiagnostic, R
 use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
 use crate::theme::{Theme, TuiStyles};
 use crate::tools::{process_file_arguments, resolve_read_path};
+use crate::workspace::WorkspaceHandle;
 
 #[cfg(all(feature = "clipboard", feature = "image-resize"))]
 use arboard::Clipboard as ArboardClipboard;
@@ -1656,6 +1657,7 @@ pub async fn run_interactive(
     extensions: Option<ExtensionManager>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
+    workspace: WorkspaceHandle,
     ask_tool: Option<crate::ask::AskTool>,
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
 ) -> anyhow::Result<()> {
@@ -1780,6 +1782,7 @@ pub async fn run_interactive(
             mcp_manager,
         ));
         app.ask_tool = ask_tool;
+        app.set_workspace(workspace);
         let mut program = Program::new(app)
             .with_alt_screen()
             .with_input_receiver(ui_rx);
@@ -2320,7 +2323,8 @@ mod startup_changelog_tests {
 #[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
 pub struct PiApp {
-    // Input state
+    // Multi-root workspace state (bd-cv653.3.12); installed post-construction.
+    workspace: WorkspaceHandle,
     input: TextArea,
     history: HistoryList,
     input_mode: InputMode,
@@ -2497,6 +2501,17 @@ impl BubbleteaModel for Box<PiApp> {
 }
 
 impl PiApp {
+    /// Attach the session workspace root handle (bd-cv653.3.12). Installed
+    /// after construction by hosts that own the shared root set.
+    pub fn set_workspace(&mut self, workspace: WorkspaceHandle) {
+        self.workspace = workspace;
+    }
+
+    /// Live workspace root handle for @-file processing and /add-dir.
+    pub const fn workspace(&self) -> &WorkspaceHandle {
+        &self.workspace
+    }
+
     fn initial_window_size_cmd() -> Cmd {
         Cmd::new(|| {
             let (width, height) = terminal::size().unwrap_or((80, 24));
@@ -2685,6 +2700,7 @@ impl PiApp {
 
         let mut app = Self {
             input,
+            workspace: WorkspaceHandle::default(),
             history: HistoryList::new(),
             input_mode: InputMode::SingleLine,
             pending_inputs: VecDeque::from(pending_inputs),
