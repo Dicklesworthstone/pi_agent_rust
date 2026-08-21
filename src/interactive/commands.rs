@@ -54,6 +54,7 @@ pub enum SlashCommand {
     Rules,
     Omfg,
     Commit,
+    Review,
 }
 
 impl SlashCommand {
@@ -107,6 +108,7 @@ impl SlashCommand {
             "/rules" => Self::Rules,
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
+            "/review" => Self::Review,
             _ => return None,
         };
 
@@ -147,6 +149,7 @@ impl SlashCommand {
   /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
   /omfg <complaint>  - Record user grievance and draft a candidate stream rule
   /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
+  /review [target]   - Run prioritized code review on changes with ship verdict card
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
@@ -2323,6 +2326,7 @@ impl PiApp {
             SlashCommand::Rules => self.handle_slash_rules(args),
             SlashCommand::Omfg => self.handle_slash_omfg(args),
             SlashCommand::Commit => self.handle_slash_commit(args),
+            SlashCommand::Review => self.handle_slash_review(args),
         }
     }
 
@@ -3243,6 +3247,46 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             Err(e) => {
                 self.status_message = Some(format!("Failed to plan commits: {e}"));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
+        let args = args.trim();
+        let target = if args.is_empty() {
+            None
+        } else {
+            Some(args.to_string())
+        };
+
+        let options = crate::review::ReviewOptions {
+            target,
+            fail_on: None,
+            confidence_threshold: 0.70,
+            format: "markdown".to_string(),
+            max_findings: 15,
+            out_file: None,
+        };
+
+        match crate::review::CodeReviewer::review(&self.cwd, &options) {
+            Ok(report) => {
+                let badge = report.verdict.badge();
+                let summary = report.summary.clone();
+                let markdown = report.format_markdown();
+
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: markdown,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                self.status_message = Some(format!("{badge}: {summary}"));
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Review failed: {e}"));
             }
         }
 

@@ -157,6 +157,7 @@ files = [
     "commit_split",
     "session_import",
     "self_update",
+    "review",
     "sdk_api",
     "sdk_unit",
 ]

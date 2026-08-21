@@ -2335,6 +2335,24 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::SelfUpdate { version, check } => {
             handle_self_update(version.as_deref(), check).await?;
         }
+        cli::Commands::Review {
+            target,
+            fail_on,
+            format,
+            confidence_threshold,
+            max_findings,
+            out,
+        } => {
+            handle_review(
+                cwd,
+                target.as_deref(),
+                fail_on.as_deref(),
+                &format,
+                confidence_threshold,
+                max_findings,
+                out,
+            )?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4710,7 +4728,11 @@ fn handle_commit(
         .arg("--porcelain")
         .current_dir(cwd)
         .output()
-        .map_err(|e| Error::Io(format!("Failed to run git status: {e}")))?;
+        .map_err(|e| {
+            pi::error::Error::Io(Box::new(std::io::Error::other(format!(
+                "Failed to run git status: {e}"
+            ))))
+        })?;
 
     if !status_out.status.success() {
         bail!("Failed to get working tree status in {}", cwd.display());
@@ -4753,7 +4775,11 @@ fn handle_commit(
         .arg("HEAD")
         .current_dir(cwd)
         .output()
-        .map_err(|e| Error::Io(format!("Failed to run git diff: {e}")))?;
+        .map_err(|e| {
+            pi::error::Error::Io(Box::new(std::io::Error::other(format!(
+                "Failed to run git diff: {e}"
+            ))))
+        })?;
 
     let diff_str = String::from_utf8_lossy(&diff_out.stdout);
     let hunks = pi::commit_split::DiffParser::parse_unified_diff(&diff_str).unwrap_or_default();
@@ -4861,6 +4887,55 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
                 "Backup of previous binary saved at: {}",
                 backup_path.display()
             );
+        }
+    }
+
+    Ok(())
+}
+
+/// `pi review [TARGET]` (bd-cv653.3.11): prioritized code review with ship verdict.
+fn handle_review(
+    cwd: &Path,
+    target: Option<&str>,
+    fail_on: Option<&str>,
+    format: &str,
+    confidence_threshold: f64,
+    max_findings: usize,
+    out: Option<PathBuf>,
+) -> Result<()> {
+    let fail_severity = fail_on.and_then(pi::review::ReviewSeverity::parse);
+    let options = pi::review::ReviewOptions {
+        target: target.map(ToString::to_string),
+        fail_on: fail_severity,
+        confidence_threshold,
+        format: format.to_string(),
+        max_findings,
+        out_file: out,
+    };
+
+    let report = pi::review::CodeReviewer::review(cwd, &options)?;
+
+    match format {
+        "json" => {
+            println!("{}", report.format_json()?);
+        }
+        "markdown" => {
+            println!("{}", report.format_markdown());
+        }
+        _ => {
+            println!("{}", report.format_text());
+        }
+    }
+
+    if let Some(threshold_sev) = fail_severity {
+        let has_failing = report
+            .findings
+            .iter()
+            .any(|f| f.severity <= threshold_sev && f.confidence >= confidence_threshold);
+        if has_failing {
+            return Err(Error::Other(format!(
+                "Review failed: findings met or exceeded severity threshold {threshold_sev}"
+            )));
         }
     }
 

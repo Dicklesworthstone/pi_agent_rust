@@ -2157,6 +2157,29 @@ pub enum Commands {
         check: bool,
     },
 
+    /// Prioritized parallel code review with ship verdict (bd-cv653.3.11)
+    #[command(name = "review")]
+    Review {
+        /// Target to review: uncommitted (default), commit range (e.g. main..HEAD), or branch
+        #[arg(value_name = "TARGET")]
+        target: Option<String>,
+        /// Fail with non-zero exit code if findings meet or exceed severity (P0, P1, P2)
+        #[arg(long, value_name = "SEVERITY")]
+        fail_on: Option<String>,
+        /// Output format: text (default), json, or markdown
+        #[arg(long, default_value = "text", value_parser = ["text", "json", "markdown"])]
+        format: String,
+        /// Minimum confidence threshold for findings (0.0 to 1.0)
+        #[arg(long, default_value_t = 0.70)]
+        confidence_threshold: f64,
+        /// Maximum number of findings to report
+        #[arg(long, default_value_t = 50)]
+        max_findings: usize,
+        /// Optional path to write output report to
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {

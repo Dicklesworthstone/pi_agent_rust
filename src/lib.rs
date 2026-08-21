@@ -235,6 +235,8 @@ pub mod resource_governor;
 #[doc(hidden)]
 pub mod resources;
 #[doc(hidden)]
+pub mod review;
+#[doc(hidden)]
 pub mod rpc;
 #[doc(hidden)]
 pub mod scheduler;

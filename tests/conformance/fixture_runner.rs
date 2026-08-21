@@ -467,6 +467,9 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::SelfUpdate { .. }) => json!({
             "name": "self-update",
         }),
+        Some(Commands::Review { .. }) => json!({
+            "name": "review",
+        }),
         None => Value::Null,
     }
 }
