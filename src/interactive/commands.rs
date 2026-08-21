@@ -55,8 +55,6 @@ pub enum SlashCommand {
     Omfg,
     Commit,
     Review,
-    AddDir,
-    RemoveDir,
 }
 
 impl SlashCommand {
@@ -111,8 +109,6 @@ impl SlashCommand {
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
             "/review" => Self::Review,
-            "/add-dir" => Self::AddDir,
-            "/remove-dir" => Self::RemoveDir,
             _ => return None,
         };
 
@@ -154,8 +150,6 @@ impl SlashCommand {
   /omfg <complaint>  - Record user grievance and draft a candidate stream rule
   /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
   /review [target]   - Run prioritized code review on changes with ship verdict card
-  /add-dir <dir>     - Grant access to an additional workspace root
-  /remove-dir <dir>  - Revoke an additional workspace root immediately
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
@@ -2333,8 +2327,6 @@ impl PiApp {
             SlashCommand::Omfg => self.handle_slash_omfg(args),
             SlashCommand::Commit => self.handle_slash_commit(args),
             SlashCommand::Review => self.handle_slash_review(args),
-            SlashCommand::AddDir => self.handle_slash_add_dir(args),
-            SlashCommand::RemoveDir => self.handle_slash_remove_dir(args),
         }
     }
 
@@ -3260,109 +3252,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         None
     }
 
-    /// /add-dir <dir> — grant access to an additional workspace root
-    /// (bd-cv653.3.12). The root is validated (must exist, be a directory),
-    /// canonicalized, added to the shared handle every tool consults, and
-    /// persisted into the session header for resume fidelity.
-    pub(super) fn handle_slash_add_dir(&mut self, args: &str) -> Option<Cmd> {
-        let raw = args.trim();
-        if raw.is_empty() {
-            self.status_message = Some("Usage: /add-dir <directory>".to_string());
-            self.scroll_to_bottom();
-            return None;
-        }
-        let expanded = if let Some(stripped) = raw.strip_prefix('~') {
-            std::env::var("HOME").map_or_else(
-                |_| std::path::PathBuf::from(raw),
-                |home| std::path::PathBuf::from(home).join(stripped),
-            )
-        } else {
-            std::path::PathBuf::from(raw)
-        };
-        let canonical = match crate::workspace::validate_new_root(&expanded) {
-            Ok(canonical) => canonical,
-            Err(err) => {
-                self.status_message = Some(err.to_string());
-                self.scroll_to_bottom();
-                return None;
-            }
-        };
-        let already = self.workspace.snapshot_or(&self.cwd).contains_canonical(&canonical);
-        if !already {
-            self.workspace.add_root(canonical.clone());
-        }
-        // Persist the union for resume fidelity; best-effort under a sync
-        // try_lock (the async autosave path flushes the dirty header).
-        let mut roots = self.workspace.additional_roots();
-        if !roots.contains(&canonical) {
-            roots.push(canonical.clone());
-        }
-        let persisted = match self.session.try_lock() {
-            Ok(mut guard) => {
-                guard.set_additional_roots(roots);
-                true
-            }
-            Err(_) => false,
-        };
-        let display = canonical.display().to_string();
-        self.status_message = Some(if already {
-            format!("Already a workspace root: {display}")
-        } else if persisted {
-            format!("Workspace root added: {display}")
-        } else {
-            format!("Workspace root added (not persisted; session busy): {display}")
-        });
-        self.scroll_to_bottom();
-        None
-    }
-
-    /// /remove-dir <dir> — revoke an additional workspace root immediately
-    /// (bd-cv653.3.12). Tools snapshot the shared set at execution time, so
-    /// the next read/edit/search in that root fails closed. The primary cwd
-    /// can never be removed.
-    pub(super) fn handle_slash_remove_dir(&mut self, args: &str) -> Option<Cmd> {
-        let raw = args.trim();
-        if raw.is_empty() {
-            self.status_message = Some("Usage: /remove-dir <directory>".to_string());
-            self.scroll_to_bottom();
-            return None;
-        }
-        let path = std::path::PathBuf::from(raw);
-        let canonical = crate::extensions::safe_canonicalize(&path);
-        if self
-            .workspace
-            .snapshot_or(&self.cwd)
-            .primary()
-            == canonical.as_path()
-        {
-            self.status_message =
-                Some("Cannot remove the primary working directory".to_string());
-            self.scroll_to_bottom();
-            return None;
-        }
-        let removed = self.workspace.remove_root(&canonical);
-        if removed {
-            let remaining: Vec<std::path::PathBuf> = self
-                .workspace
-                .additional_roots()
-                .into_iter()
-                .filter(|root| root != &canonical)
-                .collect();
-            if let Ok(mut guard) = self.session.try_lock() {
-                guard.set_additional_roots(remaining);
-            }
-            self.status_message =
-                Some(format!("Workspace root removed: {}", canonical.display()));
-        } else {
-            self.status_message = Some(format!(
-                "Not a workspace root: {}",
-                canonical.display()
-            ));
-        }
-        self.scroll_to_bottom();
-        None
-    }
-
     pub(super) fn handle_slash_review(&mut self, args: &str) -> Option<Cmd> {
         let args = args.trim();
         let target = if args.is_empty() {
@@ -4083,12 +3972,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 .and_then(|images| images.auto_resize)
                 .unwrap_or(true);
 
-            let processed = match process_file_arguments(
-                &file_refs,
-                &self.cwd,
-                auto_resize,
-                self.workspace(),
-            ) {
+            let processed = match process_file_arguments(&file_refs, &self.cwd, auto_resize) {
                 Ok(processed) => processed,
                 Err(err) => {
                     self.status_message = Some(err.to_string());

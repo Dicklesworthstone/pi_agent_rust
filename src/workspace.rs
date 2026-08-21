@@ -53,7 +53,6 @@ impl WorkspaceHandle {
             additional: Arc::new(RwLock::new(Vec::new())),
         }
     }
-
     /// Add a root (`--add-dir` / `/add-dir` land here). The path is
     /// canonicalized before storage so symlink-resolved confinement checks
     /// compare like against like; duplicates (of the primary or an existing
@@ -61,6 +60,13 @@ impl WorkspaceHandle {
     /// [`validate_new_root`] first when it must fail loudly.
     pub fn add_root(&mut self, root: PathBuf) {
         let canonical = safe_canonicalize(&root);
+        if self
+            .primary
+            .as_ref()
+            .is_some_and(|primary| primary == &canonical)
+        {
+            return;
+        }
         let mut guard = self
             .additional
             .write()
@@ -265,6 +271,15 @@ mod tests {
     }
 
     #[test]
+    fn add_rejects_missing_directory_fails_closed() {
+        let primary = dir("reject-primary");
+        let missing = std::env::temp_dir().join("pi-workspace-definitely-missing-xyz");
+        // add_root itself is infallible (canonicalization degrades to
+        // lexical), so fail-closed behavior lives in validate_new_root.
+        let err = validate_new_root(&missing).expect_err("missing dir must fail");
+        assert!(err.to_string().contains("must be an existing directory"));
+    }
+    #[test]
     fn remove_never_takes_primary_and_matches_canonically() {
         let primary = dir("rm-primary");
         let extra = dir("rm-extra");
@@ -287,9 +302,9 @@ mod tests {
         let mut handle = WorkspaceHandle::single(&primary);
         handle.add_root(extra.clone());
 
-        let inside_primary = safe_canonicalize(primary.join("a.txt"));
-        let inside_extra = safe_canonicalize(extra.join("b.txt"));
-        let outside = safe_canonicalize(std::env::temp_dir());
+        let inside_primary = safe_canonicalize(primary.join("a.txt").as_path());
+        let inside_extra = safe_canonicalize(extra.join("b.txt").as_path());
+        let outside = safe_canonicalize(std::env::temp_dir().as_path());
         assert!(handle.is_within(&inside_primary));
         assert!(handle.is_within(&inside_extra));
         assert!(!handle.is_within(&outside));
@@ -328,7 +343,7 @@ mod tests {
         handle.add_root(extra.clone());
 
         let cloned = handle.clone();
-        let inside_extra = safe_canonicalize(extra.join("f.txt"));
+        let inside_extra = safe_canonicalize(extra.join("f.txt").as_path());
         assert!(cloned.is_within(&inside_extra));
 
         assert!(handle.remove_root(&extra));
