@@ -638,8 +638,13 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
 fn process_file_arguments_missing_file_reports_error() {
     let harness = TestHarness::new("process_file_arguments_missing_file_reports_error");
     let args = vec!["missing.txt".to_string()];
-    let err = process_file_arguments(&args, harness.temp_dir(), false)
-        .expect_err("missing file should error");
+    let err = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect_err("missing file should error");
     assert!(err.to_string().contains("Cannot access file"));
 }
 
@@ -653,8 +658,13 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
     let image_path = harness.create_file("image.png", &bytes);
     let args = vec![image_path.to_string_lossy().to_string()];
 
-    let processed =
-        process_file_arguments(&args, harness.temp_dir(), true).expect("process file arguments");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        true,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("process file arguments");
     assert_eq!(processed.images.len(), 1);
     assert!(
         processed
@@ -802,7 +812,13 @@ fn process_file_arguments_multiple_text_files() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("alpha"));
     assert!(processed.text.contains("bravo"));
@@ -824,7 +840,13 @@ fn process_file_arguments_empty_file_skipped() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("content"));
     // Only non-empty file gets a <file> tag
@@ -847,7 +869,13 @@ fn process_file_arguments_mixed_text_and_image() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("some notes"));
     assert_eq!(processed.images.len(), 1);
@@ -863,7 +891,13 @@ fn process_file_arguments_unicode_content_preserved() {
     let file_path = harness.create_file("unicode.txt", "hello 世界\nこんにちは\n");
     let args = vec![file_path.to_string_lossy().to_string()];
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("hello 世界"));
     assert!(processed.text.contains("こんにちは"));

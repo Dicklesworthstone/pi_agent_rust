@@ -2253,8 +2253,8 @@ async fn run(
             !cli.no_session,
             resources,
             resource_cli,
-            cwd.clone(),
             runtime_handle.clone(),
+            workspace.clone(),
             ask_tool,
             Some(mcp_manager),
         )
@@ -2283,7 +2283,8 @@ async fn run(
             ext.shutdown().await;
         }
         result
-    };
+    }
+
 
     // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
     // held across the flush await, and the borrowed MutexGuard is !Send
@@ -8661,7 +8662,7 @@ async fn run_interactive_mode(
     resource_cli: ResourceCliOptions,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
-    ask_tool: Option<pi::ask::AskTool>,
+    workspace: pi::workspace::WorkspaceHandle,
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();
@@ -8681,7 +8682,6 @@ async fn run_interactive_mode(
         ..
     } = session;
     // Extract manager for the interactive loop; the region stays alive to
-    // handle shutdown when this scope exits.
     let extensions = region.as_ref().map(|r| r.manager().clone());
     let interactive_result = pi::interactive::run_interactive(
         agent,
@@ -8696,8 +8696,8 @@ async fn run_interactive_mode(
         resources,
         resource_cli,
         extensions,
-        cwd,
         runtime_handle,
+        workspace,
         ask_tool,
         mcp_manager,
     )
