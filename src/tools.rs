@@ -14866,13 +14866,23 @@ mod tests {
             .expect("first ls");
         assert!(first_text(&ls_first).contains("note.txt"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let ls_second = ls_tool
-            .execute("ls-2", ls_input.clone(), None)
-            .await
-            .expect("cached ls");
-        assert_eq!(first_text(&ls_first), first_text(&ls_second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        // The cache is process-global and LRU-bounded, so parallel tests can
+        // evict the freshly inserted entry between two calls; a miss
+        // re-inserts, so retrying converges unless caching is actually broken.
+        let mut saw_hit = false;
+        for _attempt in 0..8 {
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let ls_second = ls_tool
+                .execute("ls-2", ls_input.clone(), None)
+                .await
+                .expect("cached ls");
+            assert_eq!(first_text(&ls_first), first_text(&ls_second));
+            if tool_output_cache_stats_for_tests().hits > hits_before {
+                saw_hit = true;
+                break;
+            }
+        }
+        assert!(saw_hit, "ls output was never served from the cache");
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("new.txt"), "new\n").expect("write new file");
@@ -14899,13 +14909,22 @@ mod tests {
             .expect("first grep");
         assert!(first_text(&grep_first).contains("a.txt"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let grep_second = grep_tool
-            .execute("grep-2", grep_input.clone(), None)
-            .await
-            .expect("cached grep");
-        assert_eq!(first_text(&grep_first), first_text(&grep_second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        // See assert_ls_cache_hit_and_stale: bounded retry absorbs LRU
+        // eviction by concurrently running tests.
+        let mut saw_hit = false;
+        for _attempt in 0..8 {
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let grep_second = grep_tool
+                .execute("grep-2", grep_input.clone(), None)
+                .await
+                .expect("cached grep");
+            assert_eq!(first_text(&grep_first), first_text(&grep_second));
+            if tool_output_cache_stats_for_tests().hits > hits_before {
+                saw_hit = true;
+                break;
+            }
+        }
+        assert!(saw_hit, "grep output was never served from the cache");
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("b.txt"), "needle\n").expect("write new match");
@@ -14932,13 +14951,22 @@ mod tests {
             .expect("first find");
         assert!(first_text(&find_first).contains("find-a.txt"));
 
-        let hits_before = tool_output_cache_stats_for_tests().hits;
-        let find_second = find_tool
-            .execute("find-2", find_input.clone(), None)
-            .await
-            .expect("cached find");
-        assert_eq!(first_text(&find_first), first_text(&find_second));
-        assert!(tool_output_cache_stats_for_tests().hits > hits_before);
+        // See assert_ls_cache_hit_and_stale: bounded retry absorbs LRU
+        // eviction by concurrently running tests.
+        let mut saw_hit = false;
+        for _attempt in 0..8 {
+            let hits_before = tool_output_cache_stats_for_tests().hits;
+            let find_second = find_tool
+                .execute("find-2", find_input.clone(), None)
+                .await
+                .expect("cached find");
+            assert_eq!(first_text(&find_first), first_text(&find_second));
+            if tool_output_cache_stats_for_tests().hits > hits_before {
+                saw_hit = true;
+                break;
+            }
+        }
+        assert!(saw_hit, "find output was never served from the cache");
 
         let invalidations_before = tool_output_cache_stats_for_tests().invalidations;
         std::fs::write(tmp.join("find-b.txt"), "find\n").expect("write second find file");
