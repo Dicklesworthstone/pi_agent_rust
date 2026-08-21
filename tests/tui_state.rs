@@ -2612,7 +2612,12 @@ fn tui_login_no_args_shows_provider_table() {
     let test_name = "tui_login_no_args_shows_provider_table";
     let harness = TestHarness::new(test_name);
     let mut app = build_app(&harness, Vec::new());
-    app.set_terminal_size(80, 80);
+    // The provider-metadata catalog has grown past 100 entries, so the /login
+    // table is taller than any realistic terminal; the view anchors the table
+    // header at the top and clips the rest. This test asserts table CONTENT,
+    // not viewport paging, so use a terminal tall enough to show every row
+    // (paging behavior is covered by the scroll tests).
+    app.set_terminal_size(80, 400);
     log_initial_state(&harness, &app);
     log_auth_test_event(
         test_name,
