@@ -981,6 +981,13 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
 
+                // Extension command output is arbitrary text; strip
+                // escapes/controls before it enters the transcript
+                // (bd-p45xh, same class as tool and !cmd output).
+                let display = match super::tool_render::sanitize_terminal_text(&display) {
+                    std::borrow::Cow::Borrowed(_) => display,
+                    std::borrow::Cow::Owned(clean) => clean,
+                };
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: display,
