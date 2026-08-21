@@ -165,6 +165,7 @@ impl EvalTool {
 
     /// Run one JavaScript cell on the persistent QuickJS kernel. Bridge
     /// requests re-enter pi tools exactly like the Python path.
+    #[allow(clippy::too_many_lines)]
     async fn run_js_cell(&self, code: &str, timeout: Duration) -> Result<ToolOutput> {
         let kernel = {
             let mut slot = self
@@ -174,9 +175,10 @@ impl EvalTool {
             slot.take()
         };
         let mut restarted = false;
-        let mut kernel = match kernel {
-            Some(kernel) => kernel,
-            None => {
+        let mut kernel = if let Some(kernel) = kernel {
+            kernel
+        } else {
+            {
                 restarted = true;
                 js_kernel::JsKernel::spawn()
                     .map_err(|err| Error::tool("eval", format!("EVAL_SPAWN: {err}")))?
@@ -657,8 +659,7 @@ mod tests {
         let survivor = std::process::Command::new("pgrep")
             .args(["-f", "sleep 60"])
             .output()
-            .map(|output| output.status.success() && !output.stdout.is_empty())
-            .unwrap_or(false);
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
         assert!(!survivor, "kernel-spawned sleep survived session end");
     }
 

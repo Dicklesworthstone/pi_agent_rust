@@ -16,9 +16,9 @@
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A cell request for the kernel thread.
