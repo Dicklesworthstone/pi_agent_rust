@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use tempfile::tempdir;
 
 use pi::gc::{
-    check_storage_pressure, format_bytes, parse_retention_days, GarbageCollector, GcOptions,
-    GcStoreKind, GC_LEDGER_SCHEMA,
+    GC_LEDGER_SCHEMA, GarbageCollector, GcOptions, GcStoreKind, check_storage_pressure,
+    format_bytes, parse_retention_days,
 };
 
 #[test]
@@ -185,10 +185,11 @@ fn test_orphaned_sidecar_detection() {
     };
 
     let plan = GarbageCollector::plan(&options).expect("plan");
-    assert!(plan
-        .items_to_prune
-        .iter()
-        .any(|i| i.path == s_orphan_meta && i.store == GcStoreKind::Sidecars));
+    assert!(
+        plan.items_to_prune
+            .iter()
+            .any(|i| i.path == s_orphan_meta && i.store == GcStoreKind::Sidecars)
+    );
     assert!(!plan.items_to_prune.iter().any(|i| i.path == s_live_meta));
 }
 
@@ -212,8 +213,10 @@ fn test_storage_pressure_detection() {
     let elevated_status = check_storage_pressure(&sessions_dir, 0);
     assert!(elevated_status.is_elevated);
     assert!(elevated_status.recommendation.is_some());
-    assert!(elevated_status
-        .recommendation
-        .unwrap()
-        .contains("Storage pressure detected"));
+    assert!(
+        elevated_status
+            .recommendation
+            .unwrap()
+            .contains("Storage pressure detected")
+    );
 }
