@@ -1,11 +1,11 @@
-//! Integration tests for learn + manage_skill (bd-cv653.4.2).
+//! Integration tests for `learn` + `manage_skill` (bd-cv653.4.2).
 //!
 //! Acceptance coverage:
-//! 1. learn(promote=true) → a fresh skills discovery finds the managed
+//! 1. `learn(promote=true)` → a fresh skills discovery finds the managed
 //!    skill in the dead-last tier.
 //! 2. A user skill with the same name shadows the managed one; the
 //!    collision diagnostic records it.
-//! 3. manage_skill delete/update on content lacking the managed marker is
+//! 3. `manage_skill` delete/update on content lacking the managed marker is
 //!    refused (user-authored protection).
 //! 4. Invalid promote draft → lesson stored, skill not written, warning.
 //! 5. learn is gated behind memory.backend=local like the other bank tools.
@@ -23,7 +23,6 @@ use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::tools::{Tool, ToolOutput, ToolRegistry};
 use serde_json::json;
-use std::path::Path;
 
 fn first_text(output: &ToolOutput) -> &str {
     output
@@ -104,8 +103,8 @@ fn promote_then_fresh_discovery_finds_managed_skill() {
     // with managed provenance.
     let agent_dir = pi::config::Config::global_dir();
     let loaded = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
-        cwd: cwd.clone(),
-        agent_dir: agent_dir.clone(),
+        cwd,
+        agent_dir,
         skill_paths: Vec::new(),
         include_defaults: true,
     });
@@ -155,8 +154,8 @@ fn user_skill_shadows_managed_with_diagnostic() {
     .expect("write user");
 
     let loaded = pi::resources::load_skills(pi::resources::LoadSkillsOptions {
-        cwd: cwd.clone(),
-        agent_dir: agent_dir.clone(),
+        cwd,
+        agent_dir,
         skill_paths: Vec::new(),
         include_defaults: true,
     });

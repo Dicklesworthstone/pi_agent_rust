@@ -5182,6 +5182,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
+    #[allow(clippy::too_many_lines)]
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let shell_path = config.and_then(|c| c.shell_path.clone());
@@ -7263,7 +7264,7 @@ pub struct LearnTool {
 }
 
 impl LearnTool {
-    pub fn new(store: std::sync::Arc<crate::memory::MemoryStore>) -> Self {
+    pub const fn new(store: std::sync::Arc<crate::memory::MemoryStore>) -> Self {
         Self { store }
     }
 }
