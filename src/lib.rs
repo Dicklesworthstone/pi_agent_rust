@@ -247,6 +247,8 @@ pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
 #[doc(hidden)]
+pub mod skills_managed;
+#[doc(hidden)]
 pub mod sse;
 #[doc(hidden)]
 pub mod subagents;

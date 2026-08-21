@@ -86,7 +86,7 @@ pub struct ResourceDiagnostic {
 const MAX_SKILL_NAME_LEN: usize = 64;
 const MAX_SKILL_DESC_LEN: usize = 1024;
 
-const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
+const ALLOWED_SKILL_FRONTMATTER: [&str; 8] = [
     "name",
     "description",
     "license",
@@ -94,6 +94,9 @@ const ALLOWED_SKILL_FRONTMATTER: [&str; 7] = [
     "metadata",
     "allowed-tools",
     "disable-model-invocation",
+    // Agent-authored managed skills (bd-cv653.4.2): the marker protects
+    // user-authored skills from manage_skill mutations.
+    "managed",
 ];
 
 #[derive(Debug, Clone)]
@@ -1038,6 +1041,27 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
         }
     }
 
+    // Managed skills tier (bd-cv653.4.2): agent-authored skills load dead
+    // last — user/project skills always win collisions, and the collision
+    // diagnostic names the shadowed managed skill.
+    if options.include_defaults {
+        let managed_dir = options.agent_dir.join("skills.managed");
+        if managed_dir.is_dir() {
+            merge_skills(
+                load_skills_from_dir_with_visited(
+                    managed_dir,
+                    "managed".to_string(),
+                    true,
+                    &mut visited_dirs,
+                ),
+                &mut skill_map,
+                &mut real_paths,
+                &mut diagnostics,
+                &mut collisions,
+            );
+        }
+    }
+
     diagnostics.extend(collisions);
 
     let mut skills: Vec<Skill> = skill_map.into_values().collect();
@@ -1217,7 +1241,7 @@ fn load_skill_from_file(path: &Path, source: String) -> LoadSkillFileResult {
     }
 }
 
-fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
+pub(crate) fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
     let mut errors = Vec::new();
 
     if name != parent_dir {
@@ -1254,7 +1278,7 @@ fn validate_name(name: &str, parent_dir: &str) -> Vec<String> {
     errors
 }
 
-fn validate_description(description: &str) -> Vec<String> {
+pub(crate) fn validate_description(description: &str) -> Vec<String> {
     let mut errors = Vec::new();
     if description.trim().is_empty() {
         errors.push("description is required".to_string());
@@ -1267,7 +1291,7 @@ fn validate_description(description: &str) -> Vec<String> {
     errors
 }
 
-fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
+pub(crate) fn validate_frontmatter_fields<'a, I>(keys: I) -> Vec<String>
 where
     I: IntoIterator<Item = &'a String>,
 {

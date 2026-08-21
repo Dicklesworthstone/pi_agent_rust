@@ -5263,8 +5263,16 @@ impl ToolRegistry {
             tools.push(Box::new(crate::memory::ReflectTool::new(
                 std::sync::Arc::clone(&store),
             )));
-            tools.push(Box::new(crate::memory::MemoryEditTool::new(store)));
+            tools.push(Box::new(crate::memory::MemoryEditTool::new(
+                std::sync::Arc::clone(&store),
+            )));
+            // learn captures lessons into the same bank (bd-cv653.4.2).
+            tools.push(Box::new(LearnTool::new(store)));
         }
+
+        // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
+        // dir; always available — it can never touch user-authored skills.
+        tools.push(Box::new(ManageSkillTool));
 
         // Tool load modes (bd-cv653.1.6): register the xdev dispatcher when
         // the enabled set contains discoverable-tier tools and `xdev` itself
@@ -7227,6 +7235,317 @@ impl Tool for JobsTool {
             details: Some(payload),
             is_error: false,
         })
+    }
+}
+
+// ============================================================================
+// Learn Tool (bd-cv653.4.2)
+// ============================================================================
+
+/// Input parameters for the learn tool.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LearnInput {
+    /// The reusable lesson to capture.
+    lesson: String,
+    /// Optional context (when/why this applies).
+    context: Option<String>,
+    /// Also draft a managed skill from the lesson (default false).
+    promote: Option<bool>,
+    /// Optional skill name for promotion (slugified otherwise).
+    skill_name: Option<String>,
+}
+
+/// Capture a reusable lesson (memory kind=lesson, bd-cv653.4.1) and
+/// optionally promote it into a managed skill.
+pub struct LearnTool {
+    store: std::sync::Arc<crate::memory::MemoryStore>,
+}
+
+impl LearnTool {
+    pub fn new(store: std::sync::Arc<crate::memory::MemoryStore>) -> Self {
+        Self { store }
+    }
+}
+
+/// Derive a valid skill slug from free text: lowercase, non-alnum → hyphen,
+/// collapsed, trimmed, capped at 48 chars.
+fn slugify(text: &str) -> String {
+    let mut slug = String::with_capacity(text.len().min(48));
+    let mut last_was_hyphen = true; // suppress leading hyphen
+    for ch in text.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            None
+        };
+        match mapped {
+            Some(c) => {
+                slug.push(c);
+                last_was_hyphen = false;
+            }
+            None if !last_was_hyphen => {
+                slug.push('-');
+                last_was_hyphen = true;
+            }
+            None => {}
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    let slug = slug.trim_end_matches('-').to_string();
+    if slug.is_empty() {
+        "lesson".to_string()
+    } else {
+        slug
+    }
+}
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for LearnTool {
+    fn name(&self) -> &str {
+        "learn"
+    }
+
+    fn label(&self) -> &str {
+        "learn"
+    }
+
+    fn description(&self) -> &str {
+        "Capture a reusable lesson into this project's memory bank (survives \
+         sessions). With promote=true, also draft a managed skill from the \
+         lesson (lint-gated; invalid drafts stay lessons with a warning)."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "lesson": { "type": "string", "description": "The reusable lesson" },
+                "context": { "type": "string", "description": "When/why this applies (optional)" },
+                "promote": { "type": "boolean", "description": "Also draft a managed skill (default false)" },
+                "skillName": { "type": "string", "description": "Skill name for promotion (derived from the lesson otherwise)" }
+            },
+            "required": ["lesson"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: LearnInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        if input.lesson.trim().is_empty() {
+            return Err(Error::validation(
+                "learn requires a non-empty lesson".to_string(),
+            ));
+        }
+        let content = input.context.as_deref().map_or_else(
+            || input.lesson.clone(),
+            |ctx| format!("{}\n\nContext: {ctx}", input.lesson),
+        );
+        let memory = self.store.retain(
+            crate::memory::MemoryKind::Lesson,
+            &content,
+            &["learn".to_string()],
+            None,
+        )?;
+        let mut lines = vec![format!("Lesson captured [{}].", memory.id)];
+        let mut promoted: Option<serde_json::Value> = None;
+        if input.promote.unwrap_or(false) {
+            let name = input
+                .skill_name
+                .as_deref()
+                .map(slugify)
+                .filter(|slug| slug != "lesson")
+                .unwrap_or_else(|| slugify(&input.lesson));
+            let description: String = input.lesson.chars().take(200).collect();
+            match crate::skills_managed::create(&name, &description, &content) {
+                Ok(info) => {
+                    lines.push(format!(
+                        "Promoted to managed skill '{name}' ({}).",
+                        info.path
+                    ));
+                    promoted = Some(serde_json::to_value(&info)?);
+                }
+                Err(err) => {
+                    lines.push(format!("Skill promotion skipped: {err} (lesson kept)."));
+                }
+            }
+        }
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(lines.join("\n")))],
+            details: Some(serde_json::json!({
+                "schema": crate::memory::MEMORY_SCHEMA,
+                "memory": memory,
+                "promoted": promoted,
+            })),
+            is_error: false,
+        })
+    }
+}
+
+// ============================================================================
+// Manage Skill Tool (bd-cv653.4.2)
+// ============================================================================
+
+/// Input parameters for the manage_skill tool.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManageSkillInput {
+    /// create | update | delete | list.
+    op: String,
+    /// Skill name (required for create/update/delete).
+    name: Option<String>,
+    /// Description (create; optional for update).
+    description: Option<String>,
+    /// Skill body markdown (create/update).
+    content: Option<String>,
+}
+
+/// CRUD over the isolated managed-skills dir. The managed tier loads dead
+/// last — user/project skills always win collisions.
+pub struct ManageSkillTool;
+
+#[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl Tool for ManageSkillTool {
+    fn name(&self) -> &str {
+        "manage_skill"
+    }
+
+    fn label(&self) -> &str {
+        "manage skill"
+    }
+
+    fn description(&self) -> &str {
+        "Create, update, delete, or list agent-authored managed skills. \
+         Managed skills load dead-last in precedence (user/project skills \
+         always win) and carry a `managed: true` marker; operations on \
+         content lacking the marker are refused."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {
+                    "type": "string",
+                    "enum": ["create", "update", "delete", "list"],
+                    "description": "Operation"
+                },
+                "name": { "type": "string", "description": "Skill name (create/update/delete)" },
+                "description": { "type": "string", "description": "Skill description (create; optional for update)" },
+                "content": { "type": "string", "description": "Skill body markdown (create/update)" }
+            },
+            "required": ["op"]
+        })
+    }
+
+    fn effects(&self) -> ToolEffects {
+        ToolEffects::write()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: serde_json::Value,
+        _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+    ) -> Result<ToolOutput> {
+        let input: ManageSkillInput =
+            serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
+        let op = input.op.trim().to_ascii_lowercase();
+        let name_required = |op: &str| -> Result<String> {
+            input
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| Error::validation(format!("manage_skill {op} requires name")))
+        };
+        let result: Result<(String, serde_json::Value)> = (|| match op.as_str() {
+            "create" => {
+                let name = name_required("create")?;
+                let description = input.description.clone().ok_or_else(|| {
+                    Error::validation("manage_skill create requires description".to_string())
+                })?;
+                let content = input.content.clone().unwrap_or_default();
+                let info = crate::skills_managed::create(&name, &description, &content)?;
+                Ok((
+                    format!("Managed skill '{name}' created at {}.", info.path),
+                    serde_json::to_value(&info)?,
+                ))
+            }
+            "update" => {
+                let name = name_required("update")?;
+                let content = input.content.clone().unwrap_or_default();
+                let info =
+                    crate::skills_managed::update(&name, input.description.as_deref(), &content)?;
+                Ok((
+                    format!("Managed skill '{name}' updated."),
+                    serde_json::to_value(&info)?,
+                ))
+            }
+            "delete" => {
+                let name = name_required("delete")?;
+                crate::skills_managed::delete(&name)?;
+                Ok((
+                    format!("Managed skill '{name}' deleted."),
+                    serde_json::json!({
+                        "schema": crate::skills_managed::SKILL_SCHEMA,
+                        "name": name,
+                        "op": "delete",
+                    }),
+                ))
+            }
+            "list" => {
+                let skills = crate::skills_managed::list()?;
+                let text = if skills.is_empty() {
+                    "No managed skills.".to_string()
+                } else {
+                    skills
+                        .iter()
+                        .map(|skill| {
+                            format!(
+                                "- {} (managed: {}): {}\n  {}",
+                                skill.name, skill.managed, skill.description, skill.path
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Ok((
+                    text,
+                    serde_json::json!({
+                        "schema": crate::skills_managed::SKILL_SCHEMA,
+                        "skills": skills,
+                    }),
+                ))
+            }
+            other => Err(Error::validation(format!(
+                "Unknown manage_skill op '{other}'; expected create, update, delete, or list"
+            ))),
+        })();
+        match result {
+            Ok((text, details)) => Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                details: Some(details),
+                is_error: false,
+            }),
+            Err(err) => Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(err.to_string()))],
+                details: Some(serde_json::json!({ "error": err.to_string() })),
+                is_error: true,
+            }),
+        }
     }
 }
 
