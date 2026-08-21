@@ -53,6 +53,7 @@ pub enum SlashCommand {
     Handoff,
     Rules,
     Omfg,
+    Commit,
 }
 
 impl SlashCommand {
@@ -105,6 +106,7 @@ impl SlashCommand {
             "/handoff" => Self::Handoff,
             "/rules" => Self::Rules,
             "/omfg" => Self::Omfg,
+            "/commit" => Self::Commit,
             _ => return None,
         };
 
@@ -144,6 +146,7 @@ impl SlashCommand {
   /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
   /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
   /omfg <complaint>  - Record user grievance and draft a candidate stream rule
+  /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
@@ -2319,6 +2322,7 @@ impl PiApp {
             SlashCommand::Handoff => self.handle_slash_handoff(args),
             SlashCommand::Rules => self.handle_slash_rules(args),
             SlashCommand::Omfg => self.handle_slash_omfg(args),
+            SlashCommand::Commit => self.handle_slash_commit(args),
         }
     }
 
@@ -3118,6 +3122,127 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             Err(e) => {
                 self.status_message = Some(format!("Failed to record grievance: {e}"));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn handle_slash_commit(&mut self, args: &str) -> Option<Cmd> {
+        let args = args.trim();
+        let dry_run = args.contains("--dry-run")
+            || args.contains("-n")
+            || args == "dry-run"
+            || args == "plan";
+        let include_lockfiles = args.contains("--include-lockfiles");
+
+        let status_out = match std::process::Command::new("git")
+            .arg("status")
+            .arg("--porcelain")
+            .current_dir(&self.cwd)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                self.status_message = Some(format!("Failed to run git status: {e}"));
+                return None;
+            }
+        };
+
+        let status_str = String::from_utf8_lossy(&status_out.stdout);
+        let mut changed_files = Vec::new();
+        for line in status_str.lines() {
+            let trimmed = line.trim();
+            if trimmed.len() > 3 {
+                let file_path = &trimmed[3..].trim();
+                let actual_path = if let Some((_, new_p)) = file_path.split_once(" -> ") {
+                    new_p.trim()
+                } else {
+                    file_path
+                };
+                changed_files.push(actual_path.to_string());
+            }
+        }
+
+        if changed_files.is_empty() {
+            self.status_message = Some("Working tree clean; nothing to commit.".to_string());
+            return None;
+        }
+
+        let diff_out = std::process::Command::new("git")
+            .arg("diff")
+            .arg("HEAD")
+            .current_dir(&self.cwd)
+            .output()
+            .ok();
+
+        let hunks = if let Some(out) = diff_out {
+            let diff_str = String::from_utf8_lossy(&out.stdout);
+            crate::commit_split::DiffParser::parse_unified_diff(&diff_str).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let options = crate::commit_split::CommitOptions {
+            dry_run,
+            include_lockfiles,
+            all_untracked: false,
+            bead_reference: None,
+            custom_prefix: None,
+        };
+
+        match crate::commit_split::CommitPlanner::plan(&hunks, &changed_files, &options) {
+            Ok(plan) => {
+                if plan.units.is_empty() {
+                    self.status_message = Some("No eligible files to commit.".to_string());
+                    return None;
+                }
+
+                let mut card = format!("### 📦 Planned Atomic Commits ({})\n\n", plan.units.len());
+                for (idx, unit) in plan.units.iter().enumerate() {
+                    let msg = unit.formatted_message(None);
+                    card.push_str(&format!("{}. **{}** (`{}`)\n", idx + 1, msg, unit.scope));
+                    for f in &unit.files {
+                        card.push_str(&format!("   - `{f}`\n"));
+                    }
+                }
+
+                if dry_run {
+                    card.push_str("\n*Dry run: no commits were created.*");
+                } else {
+                    match crate::commit_split::CommitExecutor::execute(&self.cwd, &plan, &options) {
+                        Ok(results) => {
+                            let successful = results.iter().filter(|r| r.success).count();
+                            card.push_str(&format!(
+                                "\n\n**Committed {successful}/{} units successfully.**\n",
+                                plan.units.len()
+                            ));
+                            for res in results {
+                                if let Some(ref sha) = res.commit_sha {
+                                    card.push_str(&format!("- `[{sha}]` {}\n", res.message));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            card.push_str(&format!("\n\n**Error executing commits:** {e}"));
+                        }
+                    }
+                }
+
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: card,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                self.status_message = Some(format!(
+                    "Generated commit plan with {} units",
+                    plan.units.len()
+                ));
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Failed to plan commits: {e}"));
             }
         }
 

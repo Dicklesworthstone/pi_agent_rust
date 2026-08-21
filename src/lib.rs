@@ -97,6 +97,7 @@ pub mod buffer_shim;
 pub mod checkpoint;
 #[doc(hidden)]
 pub mod cli;
+pub mod commit_split;
 #[doc(hidden)]
 pub mod compaction;
 #[doc(hidden)]

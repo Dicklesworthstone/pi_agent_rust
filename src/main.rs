@@ -2310,6 +2310,22 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::Grievances { command } => {
             handle_grievances(cwd, &command)?;
         }
+        cli::Commands::Commit {
+            dry_run,
+            include_lockfiles,
+            all,
+            bead,
+            message,
+        } => {
+            handle_commit(
+                cwd,
+                dry_run,
+                include_lockfiles,
+                all,
+                bead.as_deref(),
+                message.as_deref(),
+            )?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4626,6 +4642,126 @@ fn handle_grievances(cwd: &Path, command: &cli::GrievancesCommands) -> Result<()
             println!("Saved candidate rule to project .pi/stream-rules.json");
         }
     }
+    Ok(())
+}
+
+/// `pi commit [-n|--dry-run] [--include-lockfiles] [-a|--all] [-b|--bead <id>]` (bd-cv653.3.14):
+/// creates dependency-ordered atomic commits from working tree changes.
+fn handle_commit(
+    cwd: &Path,
+    dry_run: bool,
+    include_lockfiles: bool,
+    stage_all: bool,
+    bead_ref: Option<&str>,
+    custom_msg: Option<&str>,
+) -> Result<()> {
+    // 1. If --all specified, stage untracked files
+    if stage_all {
+        let mut add_cmd = std::process::Command::new("git");
+        add_cmd.arg("add").arg("-A").current_dir(cwd);
+        let _ = add_cmd.status();
+    }
+
+    // 2. Query git status --porcelain
+    let status_out = std::process::Command::new("git")
+        .arg("status")
+        .arg("--porcelain")
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| Error::Io(format!("Failed to run git status: {e}")))?;
+
+    if !status_out.status.success() {
+        bail!("Failed to get working tree status in {}", cwd.display());
+    }
+
+    let status_str = String::from_utf8_lossy(&status_out.stdout);
+    let mut changed_files = Vec::new();
+    for line in status_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.len() > 3 {
+            let file_path = &trimmed[3..].trim();
+            // Handle renames: R  orig -> new
+            let actual_path = if let Some((_, new_p)) = file_path.split_once(" -> ") {
+                new_p.trim()
+            } else {
+                file_path
+            };
+            changed_files.push(actual_path.to_string());
+        }
+    }
+
+    if changed_files.is_empty() {
+        println!("Nothing to commit, working tree clean.");
+        return Ok(());
+    }
+
+    // 3. Check for conflict markers in changed files
+    for file in &changed_files {
+        let p = cwd.join(file);
+        if p.is_file() {
+            if let Ok(content) = fs::read_to_string(&p) {
+                pi::commit_split::ConflictScanner::check_content(&content, file)?;
+            }
+        }
+    }
+
+    // 4. Query git diff (staged + unstaged)
+    let diff_out = std::process::Command::new("git")
+        .arg("diff")
+        .arg("HEAD")
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| Error::Io(format!("Failed to run git diff: {e}")))?;
+
+    let diff_str = String::from_utf8_lossy(&diff_out.stdout);
+    let hunks = pi::commit_split::DiffParser::parse_unified_diff(&diff_str).unwrap_or_default();
+
+    // 5. Plan commits
+    let options = pi::commit_split::CommitOptions {
+        dry_run,
+        include_lockfiles,
+        all_untracked: stage_all,
+        bead_reference: bead_ref.map(ToString::to_string),
+        custom_prefix: custom_msg.map(ToString::to_string),
+    };
+
+    let plan = pi::commit_split::CommitPlanner::plan(&hunks, &changed_files, &options)?;
+
+    if plan.units.is_empty() {
+        println!("No eligible files to commit (check --include-lockfiles if lockfiles only).");
+        return Ok(());
+    }
+
+    println!("Planned Atomic Commits ({}):", plan.units.len());
+    for (idx, unit) in plan.units.iter().enumerate() {
+        let msg = unit.formatted_message(options.bead_reference.as_deref());
+        println!("  {}. [{:?}] {}", idx + 1, unit.category, msg);
+        for f in &unit.files {
+            println!("     - {f}");
+        }
+    }
+
+    if dry_run {
+        println!("\n[DRY RUN] No commits created.");
+        return Ok(());
+    }
+
+    // 6. Execute commits
+    let results = pi::commit_split::CommitExecutor::execute(cwd, &plan, &options)?;
+    let successful = results.iter().filter(|r| r.success).count();
+    println!(
+        "\nSuccessfully created {successful}/{} atomic commits.",
+        plan.units.len()
+    );
+    for res in results {
+        if res.success {
+            let sha = res.commit_sha.as_deref().unwrap_or("unknown");
+            println!("  ✓ [{sha}] {}", res.message);
+        } else if let Some(ref err) = res.error {
+            eprintln!("  ✗ Failed on unit {}: {err}", res.unit_id);
+        }
+    }
+
     Ok(())
 }
 

@@ -2083,6 +2083,18 @@ pub enum Commands {
         input: String,
     },
 
+    /// Import a foreign session into a native continuable pi session
+    /// (bd-cv653.6.4): Claude Code or Codex JSONL.
+    #[command(name = "import")]
+    Import {
+        /// Import from Claude Code (~/.claude/projects/**/*.jsonl)
+        #[arg(long, conflicts_with = "from_codex")]
+        from_claude: Option<String>,
+        /// Import from Codex (~/.codex/sessions/**/*.jsonl)
+        #[arg(long, conflicts_with = "from_claude")]
+        from_codex: Option<String>,
+    },
+
     /// Generate structured cross-session/cross-agent handoff brief (bd-cv653.3.17)
     #[command(name = "handoff")]
     Handoff {
@@ -2112,6 +2124,26 @@ pub enum Commands {
     Grievances {
         #[command(subcommand)]
         command: GrievancesCommands,
+    },
+
+    /// Create dependency-ordered atomic commits from working tree changes (bd-cv653.3.14)
+    #[command(name = "commit")]
+    Commit {
+        /// Dry-run mode: plan and preview atomic commits without writing to git
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+        /// Include lockfiles (Cargo.lock, etc.) in commit planning (excluded by default)
+        #[arg(long)]
+        include_lockfiles: bool,
+        /// Automatically stage all untracked files
+        #[arg(short = 'a', long)]
+        all: bool,
+        /// Optional bead / issue reference to annotate conventional commit messages
+        #[arg(short = 'b', long)]
+        bead: Option<String>,
+        /// Optional custom commit message prefix
+        #[arg(short = 'm', long)]
+        message: Option<String>,
     },
 
     /// Preview the semantic context bundle Pi would use for a task

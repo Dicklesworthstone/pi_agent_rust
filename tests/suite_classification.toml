@@ -153,6 +153,7 @@ files = [
     "edit_empty_string_repro",
     "handoff_generator",
     "stream_rules",
+    "commit_split",
     "sdk_api",
     "sdk_unit",
 ]
