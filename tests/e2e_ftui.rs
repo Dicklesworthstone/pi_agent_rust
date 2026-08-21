@@ -487,6 +487,168 @@ fn e2e_ftui_resize_storm_survives() {
     session.write_artifacts();
 }
 
+/// Acceptance #3 residual (bd-bi0qc): torn-frame detection over the raw
+/// pane stream. `tmux pipe-pane` records every byte pi writes into the pane
+/// while a resize storm plus input churn run; the capture is then fed to
+/// the upstream FrankenTUI analyzer (ftui-harness `flicker_scan`, wired via
+/// `PI_FTUI_FLICKER_SCAN_BIN`), whose detector flags unsynchronized full
+/// repaints, partial clears, and unpaired frame markers. Skipped when tmux
+/// or the analyzer binary is unavailable so CI and worker runs stay green;
+/// owner hosts with `/dp/frankentui` get real detection:
+///
+/// ```sh
+/// cd /dp/frankentui && cargo build -p ftui-harness --bin flicker_scan
+/// export PI_FTUI_FLICKER_SCAN_BIN="$CARGO_TARGET_DIR/debug/flicker_scan"
+/// ```
+#[test]
+fn e2e_ftui_resize_storm_stream_is_flicker_free() {
+    let analyzer = std::env::var("PI_FTUI_FLICKER_SCAN_BIN")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_file());
+    let Some(analyzer) = analyzer else {
+        eprintln!(
+            "Skipping: PI_FTUI_FLICKER_SCAN_BIN must point at a built ftui-harness \
+             flicker_scan binary"
+        );
+        return;
+    };
+    let Some((_lock, mut session)) = new_locked_session("e2e_ftui_resize_storm_flicker_free")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&ftui_args());
+    session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+
+    // Tap the RAW output stream (escape sequences included — capture-pane
+    // only exposes rendered text). `-o` pipes everything the pane emits.
+    let capture_path = session.harness.temp_path("ftui-stream.raw");
+    let pane_target = format!("{}:0.0", session.tmux.session_name);
+    let pipe_cmd = format!("cat >> {}", capture_path.display());
+    let mut tap = std::process::Command::new("tmux"); // ubs:ignore test helper — direct tmux invocation, same pattern as the resize loop below
+    let tap_status = tap
+        .args([
+            "-L",
+            &session.tmux.socket_name,
+            "pipe-pane",
+            "-o",
+            "-t",
+            &pane_target,
+            &pipe_cmd,
+        ])
+        .status()
+        .expect("tmux pipe-pane start"); // ubs:ignore test assertion expect — failed tap open is an immediate failure, same convention as the resize storm lane
+    assert!(tap_status.success(), "pipe-pane start failed");
+
+    // Storm + churn: geometry flapping forces repeated full re-renders while
+    // editor input and /help force incremental redraws interleaved mid-stream.
+    for (w, h) in [
+        ("40", "12"),
+        ("120", "40"),
+        ("32", "10"),
+        ("100", "30"),
+        ("60", "18"),
+        ("80", "24"),
+    ] {
+        let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
+        let status = cmd
+            .args([
+                "-L",
+                &session.tmux.socket_name,
+                "resize-window",
+                "-t",
+                &session.tmux.session_name,
+                "-x",
+                w,
+                "-y",
+                h,
+            ])
+            .status()
+            .expect("tmux resize-window"); // ubs:ignore test assertion expect
+        assert!(status.success(), "resize to {w}x{h} failed");
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    session.send_text_and_wait(
+        "flicker_help",
+        "/help",
+        "ftui preview commands",
+        COMMAND_TIMEOUT,
+    );
+    for (w, h) in [("90", "28"), ("50", "16"), ("80", "24")] {
+        let mut cmd = std::process::Command::new("tmux"); // ubs:ignore test helper — same tmux invocation pattern as tests/common/tmux.rs
+        let status = cmd
+            .args([
+                "-L",
+                &session.tmux.socket_name,
+                "resize-window",
+                "-t",
+                &session.tmux.session_name,
+                "-x",
+                w,
+                "-y",
+                h,
+            ])
+            .status()
+            .expect("tmux resize-window"); // ubs:ignore test assertion expect
+        assert!(status.success(), "resize to {w}x{h} failed");
+        std::thread::sleep(Duration::from_millis(60));
+    }
+
+    // Close the tap (pipe-pane with no command detaches) and let the
+    // recorder shell flush its buffered tail.
+    let mut untap = std::process::Command::new("tmux"); // ubs:ignore test helper — direct tmux invocation
+    let untap_status = untap
+        .args(["-L", &session.tmux.socket_name, "pipe-pane", "-t", &pane_target])
+        .status()
+        .expect("tmux pipe-pane close"); // ubs:ignore test assertion expect
+    assert!(untap_status.success(), "pipe-pane close failed");
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Analyze with the upstream detector; keep both artifacts.
+    let output = std::process::Command::new(&analyzer)
+        .arg(&capture_path)
+        .output()
+        .expect("run flicker_scan analyzer"); // ubs:ignore test assertion expect
+    session
+        .harness
+        .record_artifact("ftui-flicker-stream.raw", &capture_path);
+    let verdict_path = session.harness.temp_path("ftui-flicker-verdict.txt");
+    std::fs::write(&verdict_path, &output.stdout).expect("write verdict artifact");
+    session
+        .harness
+        .record_artifact("ftui-flicker-verdict.txt", &verdict_path);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let verdict_line = stdout
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("FLICKER_VERDICT "))
+        .unwrap_or_else(|| {
+            panic!(
+                "analyzer produced no verdict; stdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    let payload = &verdict_line["FLICKER_VERDICT ".len()..];
+    let verdict: serde_json::Value =
+        serde_json::from_str(payload).expect("parse FLICKER_VERDICT JSON");
+    let bytes_total = verdict["bytes_total"].as_u64().unwrap_or(0);
+    assert!(bytes_total > 0, "analyzer consumed an empty stream");
+    assert_eq!(
+        verdict["flicker_free"],
+        serde_json::Value::Bool(true),
+        "torn/flickering frames detected during resize storm: {payload}"
+    );
+
+    quit_and_assert_clean(&session);
+    session.write_artifacts();
+}
+
 /// Acceptance #2 lane: the inline (scrollback-preserving) runtime path boots,
 /// renders, and quits cleanly.
 #[test]
