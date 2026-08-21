@@ -589,6 +589,12 @@ pub struct Cli {
     #[arg(long, value_name = "SECONDS")]
     pub max_time: Option<u64>,
 
+    /// Additional workspace roots (bd-cv653.3.12): grant the agent access to
+    /// extra directories beyond the primary cwd. Repeatable. Tools and the
+    /// extension filesystem connector can then touch paths under ANY root;
+    /// paths outside all roots stay fail-closed.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    pub add_dir: Vec<std::path::PathBuf>,
     // === Export & Listing ===
     /// Export session file to HTML
     #[arg(long)]

@@ -2379,7 +2379,12 @@ After approving access in the browser, press Enter in Pi to complete login."
                 .and_then(|images| images.auto_resize)
                 .unwrap_or(true);
 
-            let processed = match process_file_arguments(&file_refs, &self.cwd, auto_resize) {
+            let processed = match process_file_arguments(
+                &file_refs,
+                &self.cwd,
+                auto_resize,
+                self.workspace(),
+            ) {
                 Ok(processed) => processed,
                 Err(err) => {
                     self.status_message = Some(err.to_string());

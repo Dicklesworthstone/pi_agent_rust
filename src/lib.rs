@@ -303,6 +303,7 @@ pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
 pub mod web_search;
+pub mod workspace;
 pub mod workspace_trust;
 #[doc(hidden)]
 pub mod worktree_iso;
