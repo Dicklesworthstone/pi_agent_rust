@@ -787,8 +787,11 @@ impl PiApp {
                 self.conversation_viewport.set_content(content.trim_end());
                 self.conversation_viewport.set_y_offset(saved_offset);
                 self.conversation_viewport.page_down();
-                // Re-enable auto-follow if the user scrolled back to the bottom.
-                if self.is_at_bottom() {
+                // Re-enable auto-follow if the user scrolled back to the
+                // bottom. Content/height were synced just above, so the
+                // viewport's own at_bottom() avoids a second full
+                // conversation rebuild (bd-k4l7w).
+                if self.conversation_viewport.at_bottom() {
                     self.follow_stream_tail = true;
                 }
                 None

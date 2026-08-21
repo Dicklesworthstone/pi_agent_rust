@@ -382,20 +382,6 @@ fn overlay_max_visible(term_height: usize) -> usize {
 // ============================================================================
 
 impl PiApp {
-    /// Returns true when the viewport is currently anchored to the tail of the
-    /// conversation content (i.e. the user has not scrolled away from the bottom).
-    fn is_at_bottom(&self) -> bool {
-        let content = self.build_conversation_content();
-        let trimmed = content.trim_end();
-        let line_count = trimmed.lines().count();
-        let visible_rows = self.view_effective_conversation_height().max(1);
-        if line_count <= visible_rows {
-            return true;
-        }
-        let max_offset = line_count.saturating_sub(visible_rows);
-        self.conversation_viewport.y_offset() >= max_offset
-    }
-
     /// Rebuild viewport content after conversation state changes.
     /// If `follow_tail` is true the viewport is scrolled to the very bottom;
     /// otherwise the current scroll position is preserved.
@@ -537,8 +523,12 @@ impl PiApp {
             self.follow_stream_tail = false;
         } else {
             self.conversation_viewport.scroll_down(1);
-            // Re-enable auto-follow if scrolled back to the bottom.
-            if self.is_at_bottom() {
+            // Re-enable auto-follow if scrolled back to the bottom. The
+            // viewport content/height were synced just above, so its own
+            // at_bottom() is authoritative — rebuilding the whole
+            // conversation again here doubled the cost of every wheel tick
+            // (bd-k4l7w).
+            if self.conversation_viewport.at_bottom() {
                 self.follow_stream_tail = true;
             }
         }
