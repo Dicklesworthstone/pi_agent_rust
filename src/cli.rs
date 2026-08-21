@@ -45,6 +45,18 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "doctor",
     "migrate",
     "usage",
+    "gc",
+    "review",
+    "rules",
+    "handoff",
+    "commit",
+    "worktree",
+    "completions",
+    "__complete",
+    "token",
+    "import",
+    "grievances",
+    "self-update",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
