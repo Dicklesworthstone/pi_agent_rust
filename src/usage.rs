@@ -113,18 +113,18 @@ impl UsageReader for OpenRouterUsageReader {
     }
 
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage> {
-        let url = format!("{}/api/v1/credits", self.base_url.trim_end_matches('/')); // ubs:ignore no enclosing loop; one URL per fetch call
+        let url = format!("{}/api/v1/credits", self.base_url.trim_end_matches('/'));
         let body = get_json(
             client,
             &url,
-            &[("Authorization", &format!("Bearer {}", self.api_key))], // ubs:ignore no enclosing loop; outbound auth header, local credential
+            &[("Authorization", &format!("Bearer {}", self.api_key))],
         )
         .await?;
         let data = &body["data"]; // ubs:ignore serde_json Value index returns Null, never panics
         let total = data["total_credits"].as_f64(); // ubs:ignore serde_json Value index returns Null, never panics
         let used = data["total_usage"].as_f64(); // ubs:ignore serde_json Value index returns Null, never panics
         Ok(ProviderUsage {
-            provider: "openrouter".to_string(), // ubs:ignore no enclosing loop; one allocation per fetch call
+            provider: "openrouter".to_string(),
             plan: None,
             used,
             limit: total,
@@ -132,7 +132,7 @@ impl UsageReader for OpenRouterUsageReader {
                 (Some(total), Some(used)) => Some(total - used),
                 _ => None,
             },
-            unit: Some("USD credits".to_string()), // ubs:ignore no enclosing loop; one allocation per fetch call
+            unit: Some("USD credits".to_string()),
             resets_at: None,
             detail: None,
             source: url,
@@ -169,7 +169,6 @@ impl UsageReader for MoonshotUsageReader {
     }
 
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage> {
-        // ubs:ignore-block one URL per fetch call; no enclosing loop
         let url = format!(
             "{}/v1/users/me/balance",
             self.base_url.trim_end_matches('/')
@@ -177,7 +176,7 @@ impl UsageReader for MoonshotUsageReader {
         let body = get_json(
             client,
             &url,
-            &[("Authorization", &format!("Bearer {}", self.api_key))], // ubs:ignore no enclosing loop; outbound auth header, local credential
+            &[("Authorization", &format!("Bearer {}", self.api_key))],
         )
         .await?;
         let data = &body["data"]; // ubs:ignore serde_json Value index returns Null, never panics
@@ -185,16 +184,16 @@ impl UsageReader for MoonshotUsageReader {
         let voucher = data["voucher_balance"].as_f64(); // ubs:ignore serde_json Value index returns Null, never panics
         let cash = data["cash_balance"].as_f64();
         Ok(ProviderUsage {
-            provider: "moonshotai".to_string(), // ubs:ignore cold path; no hot loop
+            provider: "moonshotai".to_string(),
             plan: None,
             used: None,
             limit: None,
             remaining: available,
-            unit: Some("balance".to_string()), // ubs:ignore cold path; no hot loop
+            unit: Some("balance".to_string()),
             resets_at: None,
             detail: match (voucher, cash) {
                 (Some(voucher), Some(cash)) => {
-                    Some(format!("voucher {voucher:.2}, cash {cash:.2}")) // ubs:ignore cold path; no hot loop
+                    Some(format!("voucher {voucher:.2}, cash {cash:.2}"))
                 }
                 _ => None,
             },
@@ -236,7 +235,6 @@ impl UsageReader for CopilotUsageReader {
     }
 
     async fn fetch(&self, client: &Client) -> Result<ProviderUsage> {
-        // ubs:ignore-block one URL per fetch call; no enclosing loop
         let url = format!(
             "{}/copilot_internal/v2/token",
             self.base_url.trim_end_matches('/')
@@ -254,16 +252,16 @@ impl UsageReader for CopilotUsageReader {
         let chat_quota = body["limited_user_quotas"]["chat"].as_f64(); // ubs:ignore serde_json Value index returns Null, never panics
         let reset = body["limited_user_reset_date"].as_str().map(str::to_string);
         Ok(ProviderUsage {
-            provider: "github-copilot".to_string(), // ubs:ignore cold path; no hot loop
+            provider: "github-copilot".to_string(),
             plan,
             used: None,
             limit: None,
             remaining: chat_quota,
-            unit: chat_quota.is_some().then(|| "chat requests".to_string()), // ubs:ignore cold path; no hot loop
+            unit: chat_quota.is_some().then(|| "chat requests".to_string()),
             resets_at: reset,
             detail: body["limited_user_quotas"]["completions"] // ubs:ignore serde_json Value index returns Null, never panics
                 .as_f64()
-                .map(|c| format!("completions quota {c}")), // ubs:ignore cold path; no hot loop
+                .map(|c| format!("completions quota {c}")),
             source: url,
             fetched_at_ms: now_ms(),
             cache_age_secs: None,
@@ -328,7 +326,7 @@ pub fn readers_from_auth(auth: &AuthStorage) -> ConfiguredReaders {
     }
     for (provider, reason) in NO_ENDPOINT_REASON {
         if auth.resolve_api_key(provider, None).is_some() {
-            unavailable.push(((*provider).to_string(), (*reason).to_string())); // ubs:ignore cold path; no hot loop
+            unavailable.push(((*provider).to_string(), (*reason).to_string()));
         }
     }
 
@@ -364,7 +362,7 @@ pub async fn gather_usage(auth: &AuthStorage, refresh: bool) -> Vec<UsageStatus>
     let mut rows = Vec::new();
 
     for reader in readers {
-        let provider = reader.provider().to_string(); // ubs:ignore cold path; no hot loop
+        let provider = reader.provider().to_string();
         if !refresh && let Some((age, mut usage)) = cache_get(&provider, USAGE_CACHE_TTL) {
             usage.cache_age_secs = Some(age.as_secs());
             rows.push(UsageStatus::Ready(usage));
@@ -381,10 +379,10 @@ pub async fn gather_usage(auth: &AuthStorage, refresh: bool) -> Vec<UsageStatus>
                 cache_put(&provider, &usage);
                 rows.push(UsageStatus::Ready(usage));
             }
-            Ok(Err(err)) => rows.push(stale_or_error(&provider, &err.to_string())), // ubs:ignore cold path; no hot loop
+            Ok(Err(err)) => rows.push(stale_or_error(&provider, &err.to_string())),
             Err(_) => rows.push(stale_or_error(
                 &provider,
-                &format!("timed out after {}s", USAGE_FETCH_TIMEOUT.as_secs()), // ubs:ignore cold path; no hot loop
+                &format!("timed out after {}s", USAGE_FETCH_TIMEOUT.as_secs()),
             )),
         }
     }
@@ -426,40 +424,40 @@ pub fn render_usage_text(rows: &[UsageStatus]) -> String {
             UsageStatus::Ready(usage) => {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(plan) = &usage.plan {
-                    parts.push(format!("plan {plan}")); // ubs:ignore cold path; no hot loop
+                    parts.push(format!("plan {plan}"));
                 }
                 match (usage.used, usage.limit) {
                     (Some(used), Some(limit)) => {
-                        parts.push(format!("{used:.2} of {limit:.2} used")); // ubs:ignore cold path; no hot loop
+                        parts.push(format!("{used:.2} of {limit:.2} used"));
                     }
-                    (Some(used), None) => parts.push(format!("{used:.2} used")), // ubs:ignore cold path; no hot loop
+                    (Some(used), None) => parts.push(format!("{used:.2} used")),
                     _ => {}
                 }
                 if let Some(remaining) = usage.remaining {
-                    parts.push(format!("{remaining:.2} remaining")); // ubs:ignore cold path; no hot loop
+                    parts.push(format!("{remaining:.2} remaining"));
                 }
                 if let Some(unit) = &usage.unit {
-                    parts.push(format!("({unit})")); // ubs:ignore cold path; no hot loop
+                    parts.push(format!("({unit})"));
                 }
                 if let Some(resets) = &usage.resets_at {
-                    parts.push(format!("resets {resets}")); // ubs:ignore cold path; no hot loop
+                    parts.push(format!("resets {resets}"));
                 }
                 if let Some(detail) = &usage.detail {
-                    parts.push(format!("— {detail}")); // ubs:ignore cold path; no hot loop
+                    parts.push(format!("— {detail}"));
                 }
                 if let Some(age) = usage.cache_age_secs {
-                    parts.push(format!("[cached {age}s ago]")); // ubs:ignore cold path; no hot loop
+                    parts.push(format!("[cached {age}s ago]"));
                 }
                 if parts.is_empty() {
-                    parts.push("no quota data in response".to_string()); // ubs:ignore cold path; no hot loop
+                    parts.push("no quota data in response".to_string());
                 }
-                lines.push(format!("  {}: {}", usage.provider, parts.join(" "))); // ubs:ignore cold path; no hot loop
+                lines.push(format!("  {}: {}", usage.provider, parts.join(" ")));
             }
             UsageStatus::Unavailable { provider, reason } => {
-                lines.push(format!("  {provider}: unavailable — {reason}")); // ubs:ignore cold path; no hot loop
+                lines.push(format!("  {provider}: unavailable — {reason}"));
             }
             UsageStatus::Error { provider, error } => {
-                lines.push(format!("  {provider}: read failed — {error}")); // ubs:ignore cold path; no hot loop
+                lines.push(format!("  {provider}: read failed — {error}"));
             }
         }
     }

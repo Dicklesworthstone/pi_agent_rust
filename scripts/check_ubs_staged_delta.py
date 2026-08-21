@@ -116,6 +116,149 @@ def vec_push_false_positive(source: str, line_no: int) -> bool:
     return True
 
 
+LOOP_ALLOC_FINDING_RE = re.compile(
+    r"allocation inside loop|Consider preallocating buffers|inside loops \(heuristic\)"
+)
+FN_HEADER_RE = re.compile(r"\bfn\s+\w+")
+LOOP_HEADER_RE = re.compile(r"(?:^|[^\w.])(?:for|while|loop)\b")
+
+
+def _strip_strings_and_comments(source: str) -> str | None:
+    """Blank out string/char literals and comments, preserving offsets.
+
+    Handles line/block comments, plain strings, char literals, and raw
+    strings (r"..", r#".."# and byte variants). Returns None when the source
+    ends inside a string/comment or a raw string never closes, so callers
+    treat the file as unparseable and keep every finding.
+    """
+    raw_open = re.compile(r'b?r(#*)"')
+    out = list(source)
+    i = 0
+    n = len(source)
+    state = "code"
+    while i < n:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+        if state == "code":
+            if ch in "br" and (i == 0 or not (source[i - 1].isalnum() or source[i - 1] in '_"')):
+                raw = raw_open.match(source, i)
+                if raw is not None:
+                    close = '"' + raw.group(1)
+                    end = source.find(close, raw.end())
+                    if end == -1:
+                        return None
+                    for k in range(i, end + len(close)):
+                        if source[k] != "\n":
+                            out[k] = " "
+                    i = end + len(close)
+                    continue
+            if ch == "/" and nxt == "/":
+                j = source.find("\n", i)
+                j = n if j == -1 else j
+                for k in range(i, j):
+                    out[k] = " "
+                i = j
+                continue
+            if ch == "/" and nxt == "*":
+                state = "block_comment"
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if ch == '"':
+                state = "string"
+                out[i] = " "
+                i += 1
+                continue
+            if ch == "'" and i + 2 < n and (source[i + 1] == "\\" or source[i + 2] == "'"):
+                # char literal ('x' or an escape); lifetimes ('a) fall through
+                j = source.find("'", i + 1)
+                if j != -1 and j - i <= 4:
+                    for k in range(i, j + 1):
+                        out[k] = " "
+                    i = j + 1
+                    continue
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if ch != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        # state == "string"
+        if ch == "\\":
+            out[i] = " "
+            if i + 1 < n and source[i + 1] != "\n":
+                out[i + 1] = " "
+            i += 2
+            continue
+        if ch == '"':
+            state = "code"
+            out[i] = " "
+            i += 1
+            continue
+        if ch != "\n":
+            out[i] = " "
+        i += 1
+    if state != "code":
+        return None
+    return "".join(out)
+
+
+def flagged_line_is_loop_free(source: str, line_no: int) -> bool:
+    """True only when the flagged line provably has NO enclosing loop.
+
+    Walk the brace structure of the stripped source. Between the flagged
+    line and its innermost enclosing fn, no block may open with a
+    for/while/loop header or a closure (iterator adapters make closures
+    ambiguous). A block's header is the text since the previous statement
+    boundary (;, {, }), so multi-line fn signatures resolve correctly. Any
+    parse uncertainty returns False, keeping the finding.
+    """
+    stripped = _strip_strings_and_comments(source)
+    if stripped is None:
+        return False
+
+    stack: list[str] = []
+    enclosing: list[str] | None = None
+    last_boundary = 0
+    current_line = 1
+    for offset, ch in enumerate(stripped):
+        if ch == "\n":
+            if current_line == line_no:
+                enclosing = list(stack)
+                break
+            current_line += 1
+            continue
+        if ch == "{":
+            stack.append(stripped[last_boundary:offset])
+            last_boundary = offset + 1
+        elif ch == "}":
+            if not stack:
+                return False
+            stack.pop()
+            last_boundary = offset + 1
+        elif ch == ";":
+            last_boundary = offset + 1
+    if enclosing is None and current_line == line_no:
+        enclosing = list(stack)
+    if enclosing is None:
+        return False
+
+    saw_fn = False
+    for header in reversed(enclosing):
+        if FN_HEADER_RE.search(header):
+            saw_fn = True
+            break
+        if LOOP_HEADER_RE.search(header) or "|" in header:
+            return False
+    return saw_fn
+
+
 def apply_verified_waivers(
     root: Path, failures: list[Finding]
 ) -> tuple[list[Finding], list[tuple[Finding, str]]]:
@@ -129,6 +272,13 @@ def apply_verified_waivers(
             source = sources[finding.path]
             if source is not None and vec_push_false_positive(source, finding.line):
                 waived.append((finding, "Vec-like receiver, push is not a filesystem op"))
+                continue
+        if LOOP_ALLOC_FINDING_RE.search(finding.message):
+            if finding.path not in sources:
+                sources[finding.path] = staged_file_text(root, finding.path)
+            source = sources[finding.path]
+            if source is not None and flagged_line_is_loop_free(source, finding.line):
+                waived.append((finding, "provably no enclosing loop (bd-ol5j9)"))
                 continue
         kept.append(finding)
     return kept, waived
@@ -172,6 +322,58 @@ def run_waiver_self_test() -> None:
 
     join_source = "let mut p = std::path::PathBuf::new();\np.join(seg);\n"
     assert not vec_push_false_positive(join_source, 2)
+
+    loop_free_source = (
+        "impl Reader {\n"
+        "    async fn fetch(&self) -> Result<Usage, Error> {\n"
+        "        let url = format!(\"{}/credits\", self.base);\n"
+        "        Ok(Usage {\n"
+        "            provider: \"x\".to_string(),\n"
+        "        })\n"
+        "    }\n"
+        "}\n"
+    )
+    assert flagged_line_is_loop_free(loop_free_source, 3), "plain fn body"
+    assert flagged_line_is_loop_free(loop_free_source, 5), "struct literal is not a loop"
+
+    looped_source = (
+        "fn render(rows: &[Row]) -> Vec<String> {\n"
+        "    let mut lines = Vec::new();\n"
+        "    for row in rows {\n"
+        "        lines.push(format!(\"{row:?}\"));\n"
+        "    }\n"
+        "    lines\n"
+        "}\n"
+    )
+    assert not flagged_line_is_loop_free(looped_source, 4), "for loop must keep"
+
+    closure_source = (
+        "fn tally(rows: &[Row]) {\n"
+        "    rows.iter().for_each(|row| {\n"
+        "        record(format!(\"{row:?}\"));\n"
+        "    });\n"
+        "}\n"
+    )
+    assert not flagged_line_is_loop_free(closure_source, 3), "closure is ambiguous"
+
+    braces_in_strings = (
+        "fn fmt() -> String {\n"
+        "    let open = \"{\";\n"
+        "    format!(\"{open} done\")\n"
+        "}\n"
+    )
+    assert flagged_line_is_loop_free(braces_in_strings, 3), "string braces ignored"
+
+    raw_string_source = (
+        "fn f() -> String {\n"
+        "    let x = r#\"{\"a\": [1, {\"b\": 2}]}\"#;\n"
+        "    format!(\"{x}\")\n"
+        "}\n"
+    )
+    assert flagged_line_is_loop_free(raw_string_source, 3), "raw-string braces ignored"
+
+    unterminated_source = "fn f() { let x = r#\"never closed...\n"
+    assert not flagged_line_is_loop_free(unterminated_source, 1), "unterminated raw string bails"
 
     print("WAIVER SELF-TEST PASS")
 
@@ -328,6 +530,11 @@ def parse_ubs_output(root: Path, output: str) -> tuple[list[Finding], dict[str, 
                 # location listed under this severity block.
                 remainder = re.sub(r"^:\d+", "", raw_line[location.end() :].strip())
                 remainder = remainder.strip().lstrip("–—-:· ").strip()
+                # A bare parenthesized permalink is annotation, not a
+                # description; fall back to the block message instead.
+                if re.fullmatch(r"\(https?://\S+\)", remainder):
+                    remainder = ""
+
                 findings.append(
                     Finding(
                         severity=severity,
