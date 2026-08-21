@@ -1740,11 +1740,10 @@ mod tests {
         assert!(summary.contains("Warning"));
     }
 
-    /// bd-1h9dp: the RSS reader must work on every supported host platform
-    /// (Linux via /proc, macOS/others via sysinfo). If it returns None, the
-    /// entire memory-pressure degradation path is silently inert.
+    /// bd-1h9dp: the RSS reading must be plausible for the test process
+    /// (Linux via /proc, macOS/others via sysinfo).
     #[test]
-    fn proc_self_rss_reader_reports_rss_on_this_platform() {
+    fn proc_self_rss_reader_reports_plausible_rss() {
         let rss = ProcSelfRssReader.read_rss_bytes();
         assert!(
             rss.is_some_and(|bytes| bytes > 1_000_000),
@@ -1928,13 +1927,12 @@ mod tests {
     }
 
     #[test]
-    fn proc_self_rss_reader_returns_some_on_linux() {
+    fn proc_self_rss_reader_returns_some_on_all_platforms() {
+        // bd-1h9dp: non-Linux used to return None, leaving the entire
+        // memory-pressure degradation path silently inert off Linux.
         let reader = ProcSelfRssReader;
         let result = reader.read_rss_bytes();
-        #[cfg(target_os = "linux")]
         assert!(result.is_some());
-        #[cfg(not(target_os = "linux"))]
-        assert!(result.is_none());
     }
 
     // --- MessageRenderCache tests (PERF-1) ---

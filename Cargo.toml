@@ -302,6 +302,9 @@ unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 sysinfo = "0.39.6"
+# BPE token counting tables (bd-cv653.7.2.1); enabled via the `bpe-tokens`
+# feature.
+tiktoken-rs = { version = "0.12.0", optional = true }
 rquickjs = { version = "0.12.2", features = ["futures", "loader"] }
 swc_common = "26.0.0"
 swc_ecma_codegen = "32.0.0"
@@ -399,7 +402,7 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 
 [features]
-default = ["sqlite-sessions", "tui"]
+default = ["sqlite-sessions", "tui", "bpe-tokens"]
 full = [
     "image-resize",
     "jemalloc",
@@ -409,8 +412,12 @@ full = [
     "syntax-highlighting",
     "tui",
     "url-pdf",
+    "bpe-tokens",
     "rich_rust/full",
 ]
+# BPE token counting (bd-cv653.7.2.1): real O200k/Cl100k tables replace the
+# chars/4 heuristic; default-on, disable for size-critical minimal builds.
+bpe-tokens = ["dep:tiktoken-rs"]
 # PDF extraction for URL reads (bd-cv653.2.2) — opt-in to keep the default
 # release binary inside the 22 MiB size budget.
 url-pdf = ["dep:pdf-extract"]
