@@ -5295,7 +5295,18 @@ fn events_get_active_tools_returns_all_when_none_set() {
             .filter_map(Value::as_str)
             .map(ToString::to_string)
             .collect();
-        assert_eq!(tool_names, vec!["read", "bash", "edit"]);
+        // The registry auto-registers always-on tools (manage_skill, and the
+        // xdev dispatcher when discoverable tools exist) beyond the requested
+        // set, so derive the expectation from the live registry.
+        let expected: Vec<String> = tools
+            .tools()
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        assert_eq!(tool_names, expected);
+        for name in ["read", "bash", "edit"] {
+            assert!(tool_names.iter().any(|n| n == name), "missing {name}");
+        }
     });
 }
 
@@ -5364,7 +5375,9 @@ fn events_get_all_tools_returns_builtin_tools() {
             }
         };
         let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
-        assert_eq!(tool_list.len(), 2);
+        // The registry auto-registers always-on tools beyond the requested
+        // set, so derive the expected count from the live registry.
+        assert_eq!(tool_list.len(), tools.tools().len());
 
         let names: Vec<&str> = tool_list
             .iter()
@@ -5424,7 +5437,8 @@ fn events_get_all_tools_includes_extension_tools() {
             }
         };
         let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
-        assert_eq!(tool_list.len(), 2); // 1 built-in + 1 extension
+        // Built-ins (requested + always-on registry tools) + 1 extension tool.
+        assert_eq!(tool_list.len(), tools.tools().len() + 1);
 
         let names: Vec<&str> = tool_list
             .iter()
