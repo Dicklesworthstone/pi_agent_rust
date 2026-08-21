@@ -688,6 +688,12 @@ pub struct AgentConfig {
 
     /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15).
     pub turn_recovery: crate::turn_recovery::TurnRecoveryMode,
+
+    /// Graduated tool approval mode state (bd-cv653.3.19).
+    pub approval_state: Option<crate::approval::ApprovalState>,
+
+    /// Bash mediation settings for hard policy gating (bd-cv653.1.7).
+    pub bash_settings: Option<crate::config::BashSettings>,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -702,6 +708,8 @@ impl fmt::Debug for AgentConfig {
             .field("keyword_settings", &self.keyword_settings)
             .field("max_time", &self.max_time)
             .field("turn_recovery", &self.turn_recovery)
+            .field("approval_state", &self.approval_state)
+            .field("bash_settings", &self.bash_settings)
             .finish()
     }
 }
@@ -745,6 +753,8 @@ impl Default for AgentConfig {
             keyword_settings: None,
             max_time: None,
             turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+            approval_state: None,
+            bash_settings: None,
         }
     }
 }
@@ -1373,6 +1383,12 @@ impl Agent {
     #[must_use]
     pub fn plan_state(&self) -> crate::plan::PlanState {
         self.plan_state.clone()
+    }
+
+    /// The shared tool approval state (bd-cv653.3.19).
+    #[must_use]
+    pub fn approval_state(&self) -> Option<crate::approval::ApprovalState> {
+        self.config.approval_state.clone()
     }
 
     /// Drain the dialect-repair ledger (bd-cv653.7.8): the session layer
@@ -3546,6 +3562,98 @@ impl Agent {
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
     ) -> Option<ToolOutput> {
+        // 1. If approval_state is configured, evaluate graduated gating first (bd-cv653.3.19)
+        if let Some(approval_state) = &self.config.approval_state {
+            let effects = self.effects_for_call(tool_call);
+            let evaluation = approval_state.evaluate(
+                &tool_call.name,
+                &tool_call.arguments,
+                effects,
+                Some(&self.plan_state),
+                self.config.bash_settings.as_ref(),
+            );
+
+            match evaluation {
+                crate::approval::ApprovalEvaluation::HardBlocked { reason } => {
+                    return Some(Self::tool_approval_denied_output(&format!(
+                        "Refused by policy gate: {reason}"
+                    )));
+                }
+                crate::approval::ApprovalEvaluation::AutoApproved { mode, reason } => {
+                    let audit_details = crate::approval::ApprovalState::audit_payload(
+                        &tool_call.id,
+                        &tool_call.name,
+                        &crate::approval::ApprovalEvaluation::AutoApproved {
+                            mode,
+                            reason: reason.clone(),
+                        },
+                    );
+                    on_event(AgentEvent::ToolExecutionUpdate {
+                        tool_call_id: tool_call.id.clone(),
+                        tool_name: tool_call.name.clone(),
+                        args: tool_call.arguments.clone(),
+                        partial_result: ToolOutput {
+                            content: Vec::new(),
+                            details: Some(audit_details),
+                            is_error: false,
+                        },
+                    });
+                    return None;
+                }
+                crate::approval::ApprovalEvaluation::RequiresApproval {
+                    mode,
+                    reason,
+                    is_dual_confirm,
+                    danger_classes: _,
+                } => {
+                    if let Some(approval) = &self.config.tool_approval {
+                        let request = ToolApprovalRequest {
+                            tool_call_id: tool_call.id.clone(),
+                            tool_name: tool_call.name.clone(),
+                            arguments: tool_call.arguments.clone(),
+                        };
+                        match approval(request).await {
+                            ToolApprovalDecision::Allow => {
+                                if is_dual_confirm {
+                                    let cmd = tool_call
+                                        .arguments
+                                        .get("command")
+                                        .or_else(|| tool_call.arguments.get("cmd"))
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let token = format!("{}:{cmd}", tool_call.name);
+                                    approval_state.record_confirmation(&token);
+                                }
+                                on_event(AgentEvent::ToolExecutionUpdate {
+                                    tool_call_id: tool_call.id.clone(),
+                                    tool_name: tool_call.name.clone(),
+                                    args: tool_call.arguments.clone(),
+                                    partial_result: ToolOutput {
+                                        content: Vec::new(),
+                                        details: Some(json!({
+                                            "schema": TOOL_APPROVAL_STATUS_SCHEMA_V1,
+                                            "status": "approved",
+                                            "mode": mode.as_str(),
+                                        })),
+                                        is_error: false,
+                                    },
+                                });
+                                return None;
+                            }
+                            ToolApprovalDecision::Deny { reason } => {
+                                return Some(Self::tool_approval_denied_output(&reason));
+                            }
+                        }
+                    } else {
+                        return Some(Self::tool_approval_denied_output(&format!(
+                            "Approval required in {mode} mode: {reason}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // 2. Legacy / default path when approval_state is not configured
         let Some(approval) = &self.config.tool_approval else {
             return None;
         };
@@ -13120,6 +13228,8 @@ mod tests {
                 keyword_settings: None,
                 max_time: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13156,6 +13266,8 @@ mod tests {
                 keyword_settings: None,
                 max_time: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13353,6 +13465,8 @@ mod tests {
                 keyword_settings: None,
                 max_time: None,
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
+                approval_state: None,
+                bash_settings: None,
             },
         );
 

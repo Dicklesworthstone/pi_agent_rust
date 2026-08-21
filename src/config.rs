@@ -76,6 +76,8 @@ pub struct Config {
     pub advisor: Option<AdvisorSettings>,
     /// LSP tool settings (bd-cv653.1.1).
     pub lsp: Option<LspSettings>,
+    /// Approval mode settings (bd-cv653.3.19).
+    pub approval: Option<ApprovalSettings>,
 
     /// HTTP request timeout in seconds for provider API calls.
     ///
@@ -498,6 +500,20 @@ pub struct LspServerSettings {
     pub initialization_options: Option<serde_json::Value>,
 }
 
+/// Approval mode configuration (bd-cv653.3.19).
+///
+/// `approval.mode`: `always-ask` (default) | `write` | `yolo`.
+/// `approval.dualConfirmClasses`: danger classes that always require typed confirmation even in yolo.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct ApprovalSettings {
+    /// Approval mode: `always-ask` | `write` | `yolo`.
+    pub mode: Option<String>,
+    /// Dangerous command classes requiring a second typed confirmation even in yolo mode.
+    #[serde(alias = "dualConfirmClasses")]
+    pub dual_confirm_classes: Option<Vec<String>>,
+}
+
 /// Read-tool configuration (bd-cv653.2.2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -820,6 +836,7 @@ impl Config {
             keywords: other.keywords.or(base.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
             lsp: merge_lsp(base.lsp, other.lsp),
+            approval: merge_approval(base.approval, other.approval),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
 
             // Message Handling
@@ -942,6 +959,30 @@ impl Config {
             .as_ref()
             .and_then(|p| p.auto_approve)
             .unwrap_or(false)
+    }
+
+    /// Active tool approval mode (bd-cv653.3.19). Default: `always-ask`.
+    #[must_use]
+    pub fn approval_mode(&self) -> crate::approval::ApprovalMode {
+        self.approval
+            .as_ref()
+            .and_then(|a| a.mode.as_deref())
+            .map_or(crate::approval::ApprovalMode::AlwaysAsk, |s| {
+                crate::approval::ApprovalMode::from_setting(Some(s))
+            })
+    }
+
+    /// Dangerous command classes requiring dual confirmation even under YOLO mode (bd-cv653.3.19).
+    #[must_use]
+    pub fn approval_dual_confirm_classes(&self) -> Vec<crate::extensions::DangerousCommandClass> {
+        self.approval
+            .as_ref()
+            .and_then(|a| a.dual_confirm_classes.as_ref())
+            .map_or_else(Vec::new, |list| {
+                list.iter()
+                    .filter_map(|s| crate::approval::parse_dangerous_command_class(s))
+                    .collect()
+            })
     }
 
     /// Whether the advisor is enabled when its role resolves (bd-cv653.3.3).
@@ -1655,6 +1696,36 @@ fn merge_lsp(base: Option<LspSettings>, other: Option<LspSettings>) -> Option<Ls
                 },
                 request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),
                 idle_shutdown_secs: other.idle_shutdown_secs.or(base.idle_shutdown_secs),
+            })
+        }
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge approval settings (other wins per scalar, classes union).
+fn merge_approval(
+    base: Option<ApprovalSettings>,
+    other: Option<ApprovalSettings>,
+) -> Option<ApprovalSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => {
+            let mut classes = base.dual_confirm_classes.unwrap_or_default();
+            if let Some(other_classes) = other.dual_confirm_classes {
+                for c in other_classes {
+                    if !classes.contains(&c) {
+                        classes.push(c);
+                    }
+                }
+            }
+            Some(ApprovalSettings {
+                mode: other.mode.or(base.mode),
+                dual_confirm_classes: if classes.is_empty() {
+                    None
+                } else {
+                    Some(classes)
+                },
             })
         }
         (None, Some(other)) => Some(other),

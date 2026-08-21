@@ -49,6 +49,7 @@ pub enum SlashCommand {
     Undo,
     Redo,
     Usage,
+    Approval,
 }
 
 impl SlashCommand {
@@ -97,6 +98,7 @@ impl SlashCommand {
             "/undo" => Self::Undo,
             "/redo" => Self::Redo,
             "/usage" => Self::Usage,
+            "/approval" => Self::Approval,
             _ => return None,
         };
 
@@ -132,6 +134,7 @@ impl SlashCommand {
   /share             - Upload session HTML to a secret GitHub gist and show URL
   /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
+  /approval [always-ask|write|yolo|status] - Set or show tool approval mode
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
@@ -2303,6 +2306,7 @@ impl PiApp {
             SlashCommand::Undo => self.handle_slash_undo(args),
             SlashCommand::Redo => self.handle_slash_redo(args),
             SlashCommand::Usage => self.handle_slash_usage(args),
+            SlashCommand::Approval => self.handle_slash_approval(args),
         }
     }
 
@@ -2863,6 +2867,86 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             guard.append_custom_entry(
                 "plan_mode".to_string(),
                 Some(serde_json::json!({"mode": mode})),
+            );
+        }
+    }
+
+    fn handle_slash_approval(&mut self, args: &str) -> Option<Cmd> {
+        let sub = args.trim().to_ascii_lowercase();
+        let approval_state = {
+            let agent_guard = match self.agent.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    self.status_message = Some("Agent is busy".to_string());
+                    return None;
+                }
+            };
+            agent_guard.approval_state()
+        };
+
+        let Some(state) = approval_state else {
+            self.status_message = Some("Tool approval state not configured".to_string());
+            return None;
+        };
+
+        match sub.as_str() {
+            "" | "status" => {
+                let mode = state.mode();
+                let dual_classes = state.dual_confirm_classes();
+                let dual_str = if dual_classes.is_empty() {
+                    "none".to_string()
+                } else {
+                    dual_classes
+                        .iter()
+                        .map(|c| c.label())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                self.status_message = Some(format!(
+                    "Approval mode: {} | Dual-confirm classes: {}",
+                    mode.as_str(),
+                    dual_str
+                ));
+            }
+            "always-ask" | "always_ask" | "always" | "ask" => {
+                state.set_mode(crate::approval::ApprovalMode::AlwaysAsk);
+                Self::log_approval_transition(
+                    &self.session,
+                    crate::approval::ApprovalMode::AlwaysAsk,
+                );
+                self.status_message = Some("Approval mode set to always-ask".to_string());
+            }
+            "write" | "files" => {
+                state.set_mode(crate::approval::ApprovalMode::Write);
+                Self::log_approval_transition(&self.session, crate::approval::ApprovalMode::Write);
+                self.status_message =
+                    Some("Approval mode set to write (file mutations auto-approved)".to_string());
+            }
+            "yolo" | "auto-approve" | "auto" | "all" => {
+                state.set_mode(crate::approval::ApprovalMode::Yolo);
+                Self::log_approval_transition(&self.session, crate::approval::ApprovalMode::Yolo);
+                self.status_message = Some(
+                    "Approval mode set to yolo (all auto-approved except hard policy gates)"
+                        .to_string(),
+                );
+            }
+            other => {
+                self.status_message = Some(format!(
+                    "Unknown /approval mode {other:?}: use /approval [always-ask|write|yolo|status]"
+                ));
+            }
+        }
+        None
+    }
+
+    fn log_approval_transition(
+        session: &Arc<Mutex<crate::session::Session>>,
+        mode: crate::approval::ApprovalMode,
+    ) {
+        if let Ok(mut guard) = session.try_lock() {
+            guard.append_custom_entry(
+                "approval_mode".to_string(),
+                Some(serde_json::json!({"mode": mode.as_str()})),
             );
         }
     }

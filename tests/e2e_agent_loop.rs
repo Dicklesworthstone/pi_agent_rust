@@ -708,6 +708,9 @@ fn run_scenario(
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         };
         let agent = Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -997,6 +1000,9 @@ fn context_intelligence_no_mock_harness() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         },
     );
     let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1471,6 +1477,9 @@ fn rpc_partial_tool_call_arguments_grow_during_stream() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         };
         let agent = Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(

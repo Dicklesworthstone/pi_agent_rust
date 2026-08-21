@@ -826,15 +826,28 @@ impl PiApp {
             .vcs_info
             .as_ref()
             .map_or_else(String::new, |b| format!("  |  {b}"));
+        let approval_str = self
+            .agent
+            .try_lock()
+            .ok()
+            .and_then(|g| g.approval_state())
+            .map_or_else(String::new, |s| {
+                let m = s.mode();
+                if m == crate::approval::ApprovalMode::AlwaysAsk {
+                    String::new()
+                } else {
+                    format!("  |  Approval: {}", m.as_str())
+                }
+            });
         let mode_hint = match self.input_mode {
             InputMode::SingleLine => "Shift+Enter: newline  |  Alt+Enter: multi-line",
             InputMode::MultiLine => "Enter: newline  |  Alt+Enter: send  |  Esc: single-line",
         };
         let footer_long = format!(
-            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}  |  {persistence_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
+            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}{approval_str}  |  {persistence_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
         );
         let footer_short = format!(
-            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}  |  {persistence_str}  |  /help  |  Ctrl+C: quit"
+            "Tokens: {input} in / {output_tokens} out{cost_str}{branch_str}{approval_str}  |  {persistence_str}  |  /help  |  Ctrl+C: quit"
         );
         let max_width = self.term_width.saturating_sub(2);
         let mut footer = if footer_long.chars().count() <= max_width {

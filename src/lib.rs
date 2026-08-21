@@ -81,6 +81,7 @@ pub mod agent;
 pub mod agent_cx;
 #[doc(hidden)]
 pub mod app;
+pub mod approval;
 pub mod ask;
 #[doc(hidden)]
 pub mod ast_tools;

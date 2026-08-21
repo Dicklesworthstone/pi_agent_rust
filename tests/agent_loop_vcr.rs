@@ -194,6 +194,9 @@ fn agent_loop_openai_vcr_basic() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -379,6 +382,9 @@ fn agent_loop_anthropic_simple_text() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -481,6 +487,9 @@ fn agent_loop_anthropic_error_stream() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -566,6 +575,9 @@ fn agent_loop_anthropic_tool_call_stop() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: Default::default(),
+            approval_state: None,
+            bash_settings: None,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 

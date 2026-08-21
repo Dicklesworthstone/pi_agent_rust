@@ -426,10 +426,19 @@ fn command_value(command: Option<&Commands>) -> Value {
             "format": format,
             "policy": policy,
         }),
+        Some(Commands::Usage { format, refresh }) => json!({
+            "name": "usage",
+            "format": format,
+            "refresh": refresh,
+        }),
         Some(Commands::Migrate { path, dry_run }) => json!({
             "name": "migrate",
             "path": path,
             "dry_run": dry_run,
+        }),
+        Some(Commands::Token { input }) => json!({
+            "name": "token",
+            "input": input,
         }),
         None => Value::Null,
     }

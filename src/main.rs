@@ -1677,6 +1677,21 @@ async fn run(
     } else {
         pi::agent::resolved_max_tool_iterations_default()
     };
+    // Approval mode (bd-cv653.3.19): CLI flags override config.
+    let approval_mode = if cli.yolo {
+        pi::approval::ApprovalMode::Yolo
+    } else if let Some(ref m) = cli.approval_mode {
+        pi::approval::ApprovalMode::from_setting(Some(m))
+    } else {
+        config.approval_mode()
+    };
+    let dual_confirm_classes = config.approval_dual_confirm_classes();
+    let approval_state = pi::approval::ApprovalState::new(
+        approval_mode,
+        cli.plan_yolo || config.plan_auto_approve(),
+        dual_confirm_classes,
+    );
+
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
         max_tool_iterations,
@@ -1687,6 +1702,8 @@ async fn run(
         keyword_settings: config.keywords.clone(),
         max_time: cli.max_time.map(std::time::Duration::from_secs),
         turn_recovery: config.turn_recovery_mode(),
+        approval_state: Some(approval_state),
+        bash_settings: config.bash.clone(),
     };
 
     // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit
@@ -2275,6 +2292,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         }
         cli::Commands::Complete { flag, prefix } => {
             pi::completions::complete(&flag, &prefix, &mut std::io::stdout().lock())?;
+        }
+        cli::Commands::Token { input } => {
+            handle_token(&input)?;
         }
         cli::Commands::ContextPreview {
             format,
@@ -4402,6 +4422,21 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// `pi token <text|@file>` (bd-cv653.7.1): count tokens against the active
+/// counter, printing per-table counts so users can price a prompt before
+/// sending it.
+fn handle_token(input: &str) -> Result<()> {
+    let text = if let Some(path) = input.strip_prefix('@') {
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("failed to read {path}: {e}"))?
+    } else {
+        input.to_string()
+    };
+    for (table, count) in pi::token_count::count_all_tables(&text) {
+        println!("{}: {} tokens", table.as_str(), count);
+    }
     Ok(())
 }
 

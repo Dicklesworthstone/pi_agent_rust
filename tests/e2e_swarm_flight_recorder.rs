@@ -534,6 +534,9 @@ async fn run_flight_session(
         tool_approval: None,
         keyword_settings: None,
         max_time: None,
+        turn_recovery: Default::default(),
+        approval_state: None,
+        bash_settings: None,
     };
     let agent = Agent::new(provider, tools, config);
     let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -669,6 +672,9 @@ async fn run_cancelled_pressure_session(
         tool_approval: None,
         keyword_settings: None,
         max_time: None,
+        turn_recovery: Default::default(),
+        approval_state: None,
+        bash_settings: None,
     };
     let agent = Agent::new(provider, tools, config);
     let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(

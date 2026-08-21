@@ -341,6 +341,14 @@ pub struct Cli {
     #[arg(long)]
     pub plan_yolo: bool,
 
+    /// Tool approval mode: always-ask (default), write, or yolo (bd-cv653.3.19).
+    #[arg(long, value_parser = ["always-ask", "write", "yolo"])]
+    pub approval_mode: Option<String>,
+
+    /// Shorthand alias for --approval-mode yolo (bd-cv653.3.19).
+    #[arg(long, alias = "auto-approve")]
+    pub yolo: bool,
+
     /// HTTP request timeout in seconds for provider API calls.
     ///
     /// Bounds connect + request + first-response-header latency for each
@@ -2065,6 +2073,14 @@ pub enum Commands {
         /// Prefix typed so far (may be empty)
         #[arg(default_value = "", allow_hyphen_values = true)]
         prefix: String,
+    },
+
+    /// Count tokens in text (or @file) against the active counter
+    /// (bd-cv653.7.1) — price a prompt before sending it.
+    #[command(name = "token")]
+    Token {
+        /// Text to count, or @file to read from disk
+        input: String,
     },
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
