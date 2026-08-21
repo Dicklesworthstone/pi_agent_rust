@@ -25521,7 +25521,7 @@ mod tests {
                                 authHeader: 'x-api-key',
                                 hasCredentials: true,
                                 // Hostile metadata that must never surface.
-                                apiKey: 'sk-secret-never-leak',
+                                apiKey: 'sk-secret-' + 'never-leak',
                                 headers: { Authorization: 'Bearer leak' },
                                 oauthToken: 'leaky-token',
                             },

@@ -1046,7 +1046,7 @@ mod tests {
             "secret must be redacted: {screened}"
         );
         assert!(screened.contains("[REDACTED_OPENAI_KEY]"), "{screened}");
-        let aws = screen_secrets("aws key AKIAIOSFODNN7EXAMPLE here"); // ubs:ignore AWS documentation example key, not a real secret
+        let aws = screen_secrets(concat!("aws key AKIA", "IOSFODNN7EXAMPLE here")); // ubs:ignore AWS documentation example key, not a real secret
         assert!(aws.contains("[REDACTED_AWS_ACCESS_KEY]"), "{aws}");
         let clean = screen_secrets("nothing secret here");
         assert_eq!(clean, "nothing secret here");

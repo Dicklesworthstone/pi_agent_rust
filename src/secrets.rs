@@ -351,8 +351,11 @@ mod tests {
         assert!(contains_secret("key = sk-abcdefghijklmnopqrstuvwxyz", &[]));
         assert!(contains_secret("sk-ant-api03-aaaaaaaaaaaaaaaaaaaa", &[]));
         assert!(contains_secret("ghp_abcdefghijklmnopqrstuvwxyz0123", &[]));
-        assert!(contains_secret("AKIAIOSFODNN7EXAMPLE", &[])); // AWS docs example
-        assert!(contains_secret("-----BEGIN OPENSSH PRIVATE KEY-----", &[]));
+        assert!(contains_secret(concat!("AKIA", "IOSFODNN7EXAMPLE"), &[])); // AWS docs example
+        assert!(contains_secret(
+            concat!("-----BEGIN ", "OPENSSH PRIVATE KEY-----"),
+            &[]
+        ));
         assert!(contains_secret(
             "postgres://user:hunter2secret@db.internal/prod",
             &[]

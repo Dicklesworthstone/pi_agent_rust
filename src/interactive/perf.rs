@@ -838,50 +838,7 @@ impl PiApp {
             recorder.undo(count, force)
         };
 
-        let mut lines: Vec<String> = Vec::new();
-        for unit in &outcome.applied {
-            for file in &unit.files {
-                lines.push(format!(
-                    "  {} {} (+{} -{}) [{}]",
-                    file.action, file.path, file.lines_added, file.lines_removed, unit.tool_name
-                ));
-            }
-        }
-        let headline = match (outcome.applied.len(), redo) {
-            (0, _) => String::new(),
-            (n, false) => format!("Undid {n} edit(s):"),
-            (n, true) => format!("Redid {n} edit(s):"),
-        };
-        let stop_note = outcome.stopped.as_ref().map(|stop| match stop {
-            crate::undo::UndoStop::Exhausted => {
-                format!("Nothing to {verb}.")
-            }
-            crate::undo::UndoStop::ExternalChange { paths } => format!(
-                "Stopped: file(s) changed outside the agent since the recorded state: {}. \
-                 Re-run `/{verb} {count} force` to override.",
-                paths.join(", ")
-            ),
-            crate::undo::UndoStop::SnapshotOmitted { paths } => format!(
-                "Stopped: snapshot was not recorded for {} (file too large or unreadable); \
-                 use git to roll further back.",
-                paths.join(", ")
-            ),
-            crate::undo::UndoStop::RestoreFailed { path, error } => {
-                format!("Stopped: failed to restore {path}: {error}")
-            }
-        });
-
-        let mut message = headline;
-        if !lines.is_empty() {
-            message.push('\n');
-            message.push_str(&lines.join("\n"));
-        }
-        if let Some(note) = stop_note {
-            if !message.is_empty() {
-                message.push('\n');
-            }
-            message.push_str(&note);
-        }
+        let message = crate::undo::render_outcome_text(&outcome, redo, count);
 
         // Audit trail: record the applied operation as a session Custom entry
         // (mirrors checkpoint/rewind), then surface the report.

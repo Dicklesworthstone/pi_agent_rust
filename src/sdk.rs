@@ -1877,7 +1877,18 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
-        || ToolRegistry::new(&enabled_tools, &cwd, Some(&config)),
+        // The default registry carries an undo recorder (bd-cv653.3.13) so
+        // SDK-driven surfaces (ftui, embedders) can offer /undo //redo too.
+        || {
+            ToolRegistry::with_mutation_recorder(
+                &enabled_tools,
+                &cwd,
+                Some(&config),
+                Some(std::sync::Arc::new(
+                    crate::undo::FileMutationRecorder::default(),
+                )),
+            )
+        },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));

@@ -5287,6 +5287,7 @@ impl ToolRegistry {
                 )),
                 "jobs" => tools.push(Box::new(JobsTool)),
                 "hub" => tools.push(Box::new(HubTool::new(cwd))),
+                "security_scan" => tools.push(Box::new(crate::security_scan::SecurityScanTool::new(cwd))),
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
                 "eval" => tools.push(Box::new(crate::eval::EvalTool::new(cwd))),
                 "github" => tools.push(Box::new(crate::github::GithubTool::new(

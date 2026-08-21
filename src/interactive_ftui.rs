@@ -383,6 +383,15 @@ pub enum UiCommand {
     /// Compact the conversation (`/compact`): the driver runs compaction and
     /// replays the rewritten history into the transcript.
     Compact,
+    /// Roll back (`/undo`) or re-apply (`/redo`) recorded agent file edits
+    /// (bd-cv653.3.13).
+    Undo {
+        count: usize,
+        force: bool,
+        redo: bool,
+    },
+    /// Show provider usage/quota state (`/usage`, bd-cv653.7.4).
+    Usage { refresh: bool },
     /// Dispatch a non-built-in slash command to the extension runtime; the
     /// driver checks registration and reports unknown commands.
     ExtensionCommand { name: String, args: String },
@@ -403,6 +412,28 @@ pub enum UiCommand {
     SetThinking(Option<crate::model::ThinkingLevel>),
     /// Set the session display name (`/name <name>`).
     SetName(String),
+}
+
+/// Match `input` against a slash command name: returns the argument tail for
+/// exactly `name` or `name<space>args`, and `None` for prefixes of longer
+/// commands (`/undocumented` must not hit `/undo`).
+fn strip_command<'a>(input: &'a str, name: &str) -> Option<&'a str> {
+    // Case-insensitive command tokens (SlashCommand::parse parity, a11a0cda);
+    // the argument tail keeps its original case.
+    if input.len() < name.len() || !input.is_char_boundary(name.len()) {
+        return None;
+    }
+    let (head, rest) = input.split_at(name.len());
+    if !head.eq_ignore_ascii_case(name) {
+        return None;
+    }
+    if rest.is_empty() {
+        Some("")
+    } else if rest.starts_with(' ') {
+        Some(rest.trim_start())
+    } else {
+        None
+    }
 }
 
 /// Agent activity as the UI sees it. Drives which surfaces accept input:
@@ -1002,6 +1033,25 @@ impl PiFtuiModel {
         }
     }
 
+    /// `/undo [n] [force]` and `/redo [n] [force]` (bd-cv653.3.13).
+    fn route_undo_command(&mut self, args: &str, redo: bool) -> bool {
+        let verb = if redo { "redo" } else { "undo" };
+        let mut count = 1_usize;
+        let mut force = false;
+        for token in args.split_whitespace() {
+            if token.eq_ignore_ascii_case("force") {
+                force = true;
+            } else if let Ok(n) = token.parse::<usize>() {
+                count = n.max(1);
+            } else {
+                self.push_entry(EntryRole::Error, format!("usage: /{verb} [n] [force]")); // ubs:ignore loop returns immediately after; cold error path
+                return true;
+            }
+        }
+        self.send_command(UiCommand::Undo { count, force, redo });
+        true
+    }
+
     /// Remaining slash routing after `/model`.
     fn route_slash_command_tail(&mut self, clean: &str) -> bool {
         // Case-insensitive tokens (SlashCommand::parse parity): compare on
@@ -1017,6 +1067,21 @@ impl PiFtuiModel {
                 String::from("compacting conversation ..."),
             );
             self.send_command(UiCommand::Compact);
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/undo") {
+            return self.route_undo_command(rest, false);
+        }
+        if let Some(rest) = strip_command(clean, "/redo") {
+            return self.route_undo_command(rest, true);
+        }
+        if let Some(rest) = strip_command(clean, "/usage") {
+            let refresh = rest.trim().eq_ignore_ascii_case("refresh");
+            self.push_entry(
+                EntryRole::System,
+                String::from("fetching provider usage ..."),
+            );
+            self.send_command(UiCommand::Usage { refresh });
             return true;
         }
         if canon == "/theme" {
@@ -2212,7 +2277,44 @@ async fn run_set_name_command(
         Ok(()) => PiMsg::System(format!("Session name: {name}")),
         Err(err) => PiMsg::AgentError(format!("name: {err}")),
     };
-    let _ = agent_tx.send(msg);
+    let _ = agent_tx.send(msg);}
+
+/// Handle `/undo` and `/redo` in the driver (bd-cv653.3.13): apply through
+/// the session agent's mutation recorder and report the shared outcome text.
+fn run_undo_command(
+    handle: &crate::sdk::AgentSessionHandle,
+    count: usize,
+    force: bool,
+    redo: bool,
+    agent_tx: &Sender<PiMsg>,
+) {
+    let verb = if redo { "redo" } else { "undo" };
+    let Some(recorder) = handle.session().agent.mutation_recorder() else {
+        let _ = agent_tx.send(PiMsg::AgentError(format!(
+            "/{verb} unavailable: no mutation recorder in this session"
+        )));
+        return;
+    };
+    let outcome = if redo {
+        recorder.redo(count, force)
+    } else {
+        recorder.undo(count, force)
+    };
+    let _ = agent_tx.send(PiMsg::System(crate::undo::render_outcome_text(
+        &outcome, redo, count,
+    )));
+}
+
+/// Handle `/usage` in the driver (bd-cv653.7.4): read-only quota table.
+async fn run_usage_command(refresh: bool, agent_tx: &Sender<PiMsg>) {
+    let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+        Ok(auth) => {
+            let rows = crate::usage::gather_usage(&auth, refresh).await;
+            crate::usage::render_usage_text(&rows)
+        }
+        Err(err) => format!("failed to load credentials: {err}"),
+    };
+    let _ = agent_tx.send(PiMsg::System(message));
 }
 
 /// Handle `/resume` in the driver: open the chosen session file with the
@@ -2342,6 +2444,37 @@ async fn run_bash_ui_command(
     output
 }
 
+/// Create the driver's agent session with the extension UI surface
+/// (bd-1eoh4) installed on the options BEFORE creation so extension init
+/// prompts work too. Errors surface to the UI and yield `None`.
+async fn create_driver_session(
+    mut session_options: crate::sdk::SessionOptions,
+    agent_tx: &Sender<PiMsg>,
+    ext_reply_rx: std::sync::mpsc::Receiver<ExtensionUiResponse>,
+    runtime_handle: &asupersync::runtime::RuntimeHandle,
+) -> Option<(crate::sdk::AgentSessionHandle, Arc<FtuiExtensionUiHandler>)> {
+    let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
+    session_options.extension_ui_handler =
+        Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
+    spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, runtime_handle);
+    match crate::sdk::create_agent_session(session_options).await {
+        Ok(handle) => Some((handle, ext_handler)),
+        Err(err) => {
+            let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
+            None
+        }
+    }
+}
+
+/// Working directory for `!` bash commands in the driver.
+fn driver_bash_cwd(session_options: &crate::sdk::SessionOptions) -> std::path::PathBuf {
+    session_options
+        .working_directory
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 pub fn run(
     session_options: crate::sdk::SessionOptions,
     theme: &crate::theme::Theme,
@@ -2353,11 +2486,7 @@ pub fn run(
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
     let (ext_reply_tx, ext_reply_rx) = std::sync::mpsc::channel::<ExtensionUiResponse>();
-    let bash_cwd = session_options
-        .working_directory
-        .clone()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let bash_cwd = driver_bash_cwd(&session_options);
     let resume_template = resume_template_from(&session_options);
 
     let driver = std::thread::Builder::new()
@@ -2372,19 +2501,15 @@ pub fn run(
             };
             let runtime_handle = runtime.handle();
             runtime.block_on(async move {
-                // Extension UI surface (bd-1eoh4): installed on the session
-                // options BEFORE creation so extension init prompts work too.
-                let mut session_options = session_options;
-                let ext_handler = Arc::new(FtuiExtensionUiHandler::new(agent_tx.clone()));
-                session_options.extension_ui_handler =
-                    Some(Arc::clone(&ext_handler) as Arc<dyn crate::sdk::ExtensionUiHandler>);
-                spawn_ext_reply_pump(Arc::clone(&ext_handler), ext_reply_rx, &runtime_handle);
-                let mut handle = match crate::sdk::create_agent_session(session_options).await {
-                    Ok(handle) => handle,
-                    Err(err) => {
-                        let _ = agent_tx.send(PiMsg::AgentError(format!("session: {err}")));
-                        return;
-                    }
+                let Some((mut handle, ext_handler)) = create_driver_session(
+                    session_options,
+                    &agent_tx,
+                    ext_reply_rx,
+                    &runtime_handle,
+                )
+                .await
+                else {
+                    return;
                 };
                 let current_ask =
                     install_ask_bridges(&handle, &agent_tx, ask_reply_rx, &runtime_handle);
@@ -2411,6 +2536,12 @@ pub fn run(
                         }
                         Ok(UiCommand::Compact) => {
                             run_compact_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Undo { count, force, redo }) => {
+                            run_undo_command(&handle, count, force, redo, &agent_tx);
+                        }
+                        Ok(UiCommand::Usage { refresh }) => {
+                            run_usage_command(refresh, &agent_tx).await;
                         }
                         Ok(UiCommand::ExtensionCommand { name, args }) => {
                             run_extension_command(&handle, &bash_cwd, &name, &args, &agent_tx)
@@ -3365,6 +3496,67 @@ mod tests {
             }
         );
         assert!(sim.model().picker.is_none());
+    }
+
+    /// bd-cv653.3.13/7.4 parity: /undo //redo //usage route driver commands.
+    #[test]
+    fn slash_undo_redo_usage_route_commands() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        type_str(&mut sim, "/undo 3 force");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Undo {
+                count: 3,
+                force: true,
+                redo: false
+            }
+        );
+
+        type_str(&mut sim, "/redo");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Undo {
+                count: 1,
+                force: false,
+                redo: true
+            }
+        );
+
+        type_str(&mut sim, "/usage refresh");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Usage { refresh: true }
+        );
+
+        // Bad argument reports usage instead of sending a command.
+        type_str(&mut sim, "/undo everything");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(submit_rx.try_recv().is_err(), "no command for bad args");
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("usage: /undo")),
+            "usage error shown"
+        );
+    }
+
+    /// A longer command must not be captured by a shorter prefix.
+    #[test]
+    fn strip_command_requires_exact_name_or_space() {
+        assert_eq!(strip_command("/undo", "/undo"), Some(""));
+        assert_eq!(strip_command("/UNDO 2", "/undo"), Some("2"));
+        assert_eq!(strip_command("/undo 2", "/undo"), Some("2"));
+        assert_eq!(strip_command("/undocumented", "/undo"), None);
+        assert_eq!(strip_command("/usage", "/usage"), Some(""));
     }
 
     #[test]

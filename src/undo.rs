@@ -467,6 +467,46 @@ impl FileMutationRecorder {
     }
 }
 
+/// Render an undo/redo outcome as the user-facing report used by both the
+/// bubbletea and ftui surfaces.
+#[must_use]
+pub fn render_outcome_text(outcome: &UndoOutcome, redo: bool, requested: usize) -> String {
+    let verb = if redo { "redo" } else { "undo" };
+    let mut lines: Vec<String> = Vec::new();
+    match (outcome.applied.len(), redo) {
+        (0, _) => {}
+        (n, false) => lines.push(format!("Undid {n} edit(s):")),
+        (n, true) => lines.push(format!("Redid {n} edit(s):")),
+    }
+    for unit in &outcome.applied {
+        for file in &unit.files {
+            lines.push(format!(
+                "  {} {} (+{} -{}) [{}]",
+                file.action, file.path, file.lines_added, file.lines_removed, unit.tool_name
+            ));
+        }
+    }
+    if let Some(stop) = &outcome.stopped {
+        lines.push(match stop {
+            UndoStop::Exhausted => format!("Nothing to {verb}."),
+            UndoStop::ExternalChange { paths } => format!(
+                "Stopped: file(s) changed outside the agent since the recorded state: {}. \
+                 Re-run `/{verb} {requested} force` to override.",
+                paths.join(", ")
+            ),
+            UndoStop::SnapshotOmitted { paths } => format!(
+                "Stopped: snapshot was not recorded for {} (file too large or unreadable); \
+                 use git to roll further back.",
+                paths.join(", ")
+            ),
+            UndoStop::RestoreFailed { path, error } => {
+                format!("Stopped: failed to restore {path}: {error}")
+            }
+        });
+    }
+    lines.join("\n")
+}
+
 #[derive(Clone, Copy)]
 enum Direction {
     Undo,
