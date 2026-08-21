@@ -4954,9 +4954,9 @@ fn handle_review(
             .iter()
             .any(|f| f.severity <= threshold_sev && f.confidence >= confidence_threshold);
         if has_failing {
-            return Err(Error::Other(format!(
+            return Err(anyhow::anyhow!(
                 "Review failed: findings met or exceeded severity threshold {threshold_sev}"
-            )));
+            ));
         }
     }
 
@@ -4976,7 +4976,7 @@ fn handle_gc(
     format: &str,
 ) -> Result<()> {
     let days = pi::gc::parse_retention_days(older_than).ok_or_else(|| {
-        Error::Validation(format!(
+        pi::error::Error::Validation(format!(
             "Invalid retention window format '{older_than}'. Expected e.g. 30d, 7d, 24h, 14."
         ))
     })?;
