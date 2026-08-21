@@ -273,10 +273,13 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
 
     if blind_stty_sane {
         // SIGKILL path: the tty is expected to still be raw here; a blind
-        // `stty sane` (typed without echo) must recover it.
+        // `stty sane` (typed without echo) must recover it. The terminator
+        // MUST be Ctrl-J (literal \n): with -icanon there is no ICRNL
+        // translation, so Enter arrives as a bare \r, which dash does not
+        // treat as a line terminator — strace showed the recovery line sit
+        // unterminated forever while every later keystroke appended to it.
         session.tmux.send_literal("stty sane");
-        session.tmux.send_key("Enter");
-        std::thread::sleep(Duration::from_millis(300));
+        session.tmux.send_key("C-j");
     }
 
     // Post-signal probe: typed input must echo AND execute.
