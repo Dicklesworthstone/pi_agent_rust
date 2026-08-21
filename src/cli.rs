@@ -2082,6 +2082,23 @@ pub enum Commands {
         /// Text to count, or @file to read from disk
         input: String,
     },
+
+    /// Generate structured cross-session/cross-agent handoff brief (bd-cv653.3.17)
+    #[command(name = "handoff")]
+    Handoff {
+        /// Delivery target: human | bead:<id> | agent:<thread_id>
+        #[arg(long, default_value = "human")]
+        to: String,
+        /// Output file path for markdown brief (sidecar .json written alongside)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Session ID or session file path (defaults to latest active session)
+        #[arg(short, long)]
+        session: Option<String>,
+        /// Print generated handoff markdown directly to stdout
+        #[arg(long)]
+        print: bool,
+    },
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {

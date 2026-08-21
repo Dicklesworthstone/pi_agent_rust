@@ -440,6 +440,18 @@ fn command_value(command: Option<&Commands>) -> Value {
             "name": "token",
             "input": input,
         }),
+        Some(Commands::Handoff {
+            to,
+            out,
+            session,
+            print,
+        }) => json!({
+            "name": "handoff",
+            "to": to,
+            "out": out.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "session": session,
+            "print": print,
+        }),
         None => Value::Null,
     }
 }

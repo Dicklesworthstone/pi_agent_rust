@@ -999,8 +999,32 @@ fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate 
         .iter()
         .map(estimate_tokens)
         .fold(0u64, u64::saturating_add);
+
+    // Calibration (bd-cv653.7.1): when measured usage exists, estimate the
+    // SAME span with the active counter and log the drift so the compaction
+    // quality harness can observe token_estimate_delta over time.
+    let estimated_total = messages
+        .iter()
+        .map(estimate_tokens)
+        .fold(0u64, u64::saturating_add);
+    let measured_total = usage_tokens.saturating_add(trailing_tokens);
+    if estimated_total > 0 && measured_total > 0 {
+        let delta = i64::try_from(estimated_total).unwrap_or(i64::MAX)
+            - i64::try_from(measured_total).unwrap_or(i64::MAX);
+        #[allow(clippy::cast_precision_loss)] // diagnostic ratio only
+        let ratio = estimated_total as f64 / measured_total as f64;
+        tracing::debug!(
+            event = "pi.compaction.token_estimate_delta",
+            estimated_total,
+            measured_total,
+            delta,
+            ratio,
+            "token estimate calibration"
+        );
+    }
+
     ContextUsageEstimate {
-        tokens: usage_tokens.saturating_add(trailing_tokens),
+        tokens: measured_total,
         last_usage_index: Some(usage_index),
     }
 }

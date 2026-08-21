@@ -120,6 +120,7 @@ files = [
     "checkpoint",
     "eval",
     "url_router",
+    "token_count",
     "fts5_spike",
     "bash_mediation",
     "json_mode_parity",

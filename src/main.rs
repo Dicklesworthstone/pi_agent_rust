@@ -2296,6 +2296,14 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::Token { input } => {
             handle_token(&input)?;
         }
+        cli::Commands::Handoff {
+            to,
+            out,
+            session,
+            print,
+        } => {
+            handle_handoff(cwd, &to, out, session.as_deref(), print).await?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4437,6 +4445,52 @@ fn handle_token(input: &str) -> Result<()> {
     for (table, count) in pi::token_count::count_all_tables(&text) {
         println!("{}: {} tokens", table.as_str(), count);
     }
+    Ok(())
+}
+
+/// `pi handoff [--to human|bead:<id>|agent:<thread_id>] [--out PATH] [--session ID]` (bd-cv653.3.17):
+/// generates a structured handoff brief from a session.
+async fn handle_handoff(
+    cwd: &Path,
+    to: &str,
+    out: Option<PathBuf>,
+    session_id_or_path: Option<&str>,
+    print_stdout: bool,
+) -> Result<()> {
+    let target = pi::handoff::HandoffTarget::parse(to);
+    let session = if let Some(spec) = session_id_or_path {
+        let path = PathBuf::from(spec);
+        if path.exists() {
+            Session::open(&path.to_string_lossy()).await?
+        } else {
+            let index = pi::session_index::SessionIndex::new();
+            let cwd_str = cwd.display().to_string();
+            let sessions = index.list_sessions(Some(&cwd_str))?;
+            if let Some(matching) = sessions.iter().find(|s| s.id == spec) {
+                Session::open(&matching.path).await?
+            } else {
+                bail!("Session '{spec}' not found in index for {}", cwd.display());
+            }
+        }
+    } else {
+        let index = pi::session_index::SessionIndex::new();
+        let cwd_str = cwd.display().to_string();
+        let sessions = index.list_sessions(Some(&cwd_str))?;
+        if let Some(latest) = sessions.last() {
+            Session::open(&latest.path).await?
+        } else {
+            bail!("No active or previous sessions found in {}", cwd.display());
+        }
+    };
+
+    let doc = pi::handoff::HandoffGenerator::generate_from_session(&session);
+    let report = pi::handoff::HandoffGenerator::deliver(&doc, &target, out.as_deref())?;
+
+    if print_stdout || (out.is_none() && matches!(target, pi::handoff::HandoffTarget::Human)) {
+        println!("{}", doc.to_markdown());
+    }
+
+    println!("{}", report.status);
     Ok(())
 }
 

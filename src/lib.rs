@@ -162,6 +162,7 @@ pub mod file_lock;
 pub mod flake_classifier;
 #[doc(hidden)]
 pub mod github;
+pub mod handoff;
 #[doc(hidden)]
 pub mod hostcall_amac;
 #[doc(hidden)]

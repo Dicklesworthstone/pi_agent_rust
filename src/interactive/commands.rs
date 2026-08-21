@@ -50,6 +50,7 @@ pub enum SlashCommand {
     Redo,
     Usage,
     Approval,
+    Handoff,
 }
 
 impl SlashCommand {
@@ -99,6 +100,7 @@ impl SlashCommand {
             "/redo" => Self::Redo,
             "/usage" => Self::Usage,
             "/approval" => Self::Approval,
+            "/handoff" => Self::Handoff,
             _ => return None,
         };
 
@@ -135,6 +137,7 @@ impl SlashCommand {
   /mcp               - Manage MCP servers: list, add, remove, test, trust (Model Context Protocol)
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
+  /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
@@ -2307,6 +2310,7 @@ impl PiApp {
             SlashCommand::Redo => self.handle_slash_redo(args),
             SlashCommand::Usage => self.handle_slash_usage(args),
             SlashCommand::Approval => self.handle_slash_approval(args),
+            SlashCommand::Handoff => self.handle_slash_handoff(args),
         }
     }
 
@@ -2949,6 +2953,48 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 Some(serde_json::json!({"mode": mode.as_str()})),
             );
         }
+    }
+
+    pub(super) fn handle_slash_handoff(&mut self, args: &str) -> Option<Cmd> {
+        let args = args.trim();
+        let (to_target, out_path) = if args.is_empty() {
+            (crate::handoff::HandoffTarget::Human, None)
+        } else {
+            let mut parts = args.split_whitespace();
+            let target_str = parts.next().unwrap_or("human");
+            let path_str = parts.next().map(std::path::PathBuf::from);
+            (crate::handoff::HandoffTarget::parse(target_str), path_str)
+        };
+
+        let Ok(session_guard) = self.session.try_lock() else {
+            self.status_message = Some("Session busy; try again".to_string());
+            return None;
+        };
+
+        let doc = crate::handoff::HandoffGenerator::generate_from_session(&session_guard);
+        drop(session_guard);
+
+        match crate::handoff::HandoffGenerator::deliver(&doc, &to_target, out_path.as_deref()) {
+            Ok(report) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "### 📋 Handoff Brief Generated\n\n{}\n\n*{}*",
+                        doc.to_markdown(),
+                        report.status
+                    ),
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                self.status_message = Some("Handoff brief generated successfully".to_string());
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Failed to generate handoff: {e}"));
+            }
+        }
+
+        None
     }
 
     /// Switch the active model to a role-resolved spec when one is configured.
