@@ -22,14 +22,14 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 /// A cell request for the kernel thread.
-pub(crate) struct JsCellRequest {
+pub struct JsCellRequest {
     pub code: String,
     pub deadline: Instant,
     pub reply: Sender<JsCellResponse>,
 }
 
 /// Cell outcome from the kernel thread.
-pub(crate) struct JsCellResponse {
+pub struct JsCellResponse {
     pub ok: bool,
     pub console: String,
     pub result: Option<String>,
@@ -37,13 +37,13 @@ pub(crate) struct JsCellResponse {
 }
 
 /// A tool re-entry request from inside a JS cell.
-pub(crate) struct JsBridgeRequest {
+pub struct JsBridgeRequest {
     pub tool: String,
     pub input: Value,
     pub reply: Sender<Result<String, String>>,
 }
 
-pub(crate) struct JsKernel {
+pub struct JsKernel {
     requests: Sender<JsCellRequest>,
     pub bridge: Receiver<JsBridgeRequest>,
     pub cells_run: u64,
@@ -91,10 +91,8 @@ impl DeadlineCell {
         Self(Arc::new(AtomicU64::new(u64::MAX)))
     }
     fn set(&self, deadline: Instant, origin: Instant) {
-        let millis = deadline
-            .saturating_duration_since(origin)
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
+        let millis = u64::try_from(deadline.saturating_duration_since(origin).as_millis())
+            .unwrap_or(u64::MAX);
         self.0.store(millis, Ordering::SeqCst);
     }
     fn clear(&self) {
@@ -102,7 +100,8 @@ impl DeadlineCell {
     }
     fn expired(&self, origin: Instant) -> bool {
         let budget = self.0.load(Ordering::SeqCst);
-        budget != u64::MAX && origin.elapsed().as_millis() as u64 > budget
+        budget != u64::MAX
+            && u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX) > budget
     }
 }
 
@@ -200,12 +199,12 @@ fn install_globals(
     globals.set("__pi_bridge", bridge_fn).expect("bridge fn");
     let _: () = ctx
         .eval(
-            r#"globalThis.tool = {
+            r"globalThis.tool = {
                 read: (path, extra) => __pi_bridge('read', JSON.stringify({ path, ...(extra || {}) })),
                 grep: (pattern, extra) => __pi_bridge('grep', JSON.stringify({ pattern, ...(extra || {}) })),
                 find: (pattern, extra) => __pi_bridge('find', JSON.stringify({ pattern, ...(extra || {}) })),
                 ls: (path, extra) => __pi_bridge('ls', JSON.stringify({ path: path || '.', ...(extra || {}) })),
-            };"#,
+            };",
         )
         .expect("tool wrapper");
 }
@@ -249,10 +248,10 @@ fn run_cell(
         };
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),
-            Ok(value) => match rquickjs::Promise::from_value(value.clone()) {
-                Ok(promise) => Phase1::Pending(rquickjs::Persistent::save(&ctx, promise)),
-                Err(_) => Phase1::Done(extract_result(&ctx, &value)),
-            },
+            Ok(value) => rquickjs::Promise::from_value(value.clone()).map_or_else(
+                |_| Phase1::Done(extract_result(&ctx, &value)),
+                |promise| Phase1::Pending(rquickjs::Persistent::save(&ctx, promise)),
+            ),
         }
     });
 

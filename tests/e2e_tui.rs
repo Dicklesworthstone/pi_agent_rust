@@ -578,7 +578,7 @@ fn write_vcr_cassette_for_read(
         "system": system_prompt,
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
-        "tools": tool_schemas.clone(),
+        "tools": &tool_schemas,
     });
     common::apply_prompt_cache_wire_shape(&mut request_one);
     let mut request_two = json!({
@@ -4115,12 +4115,12 @@ fn e2e_scenario_exit_strategy_roundtrip() {
 fn vcr_template_matches(recorded: &Value, incoming: &Value) -> bool {
     match (recorded, incoming) {
         (Value::Object(recorded_obj), Value::Object(incoming_obj)) => {
-            recorded_obj
-                .iter()
-                .all(|(key, recorded_value)| match incoming_obj.get(key) {
-                    Some(incoming_value) => vcr_template_matches(recorded_value, incoming_value),
-                    None => recorded_value.is_null(),
-                })
+            recorded_obj.iter().all(|(key, recorded_value)| {
+                incoming_obj.get(key).map_or_else(
+                    || recorded_value.is_null(),
+                    |incoming_value| vcr_template_matches(recorded_value, incoming_value),
+                )
+            })
         }
         (Value::Array(recorded_items), Value::Array(incoming_items)) => {
             recorded_items.len() == incoming_items.len()
@@ -4384,9 +4384,14 @@ fn e2e_tui_tool_call_stress_scroll_stays_functional() {
 
     session.harness.section("setup");
     let sample_path = session.harness.temp_path(SAMPLE_FILE_NAME);
-    let sample_content: String = (1..=40)
-        .map(|line| format!("stress line {line:02}: the quick brown fox jumps over the lazy dog\n"))
-        .collect();
+    let sample_content: String = (1..=40).fold(String::new(), |mut out, line| {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            out,
+            "stress line {line:02}: the quick brown fox jumps over the lazy dog"
+        );
+        out
+    });
     std::fs::write(&sample_path, &sample_content).expect("write sample file");
 
     let tool_output = read_output_for_sample(session.harness.temp_dir(), SAMPLE_FILE_NAME);

@@ -9835,7 +9835,7 @@ fn validate_or_write_perf_artifact(filename: &str, entries: &[serde_json::Value]
 // bugs: "lots of tool calls freeze/scramble the UI", "auto-scroll is weird").
 // ============================================================================
 
-/// Drive one complete tool cycle through the PiMsg pipeline.
+/// Drive one complete tool cycle through the `PiMsg` pipeline.
 fn run_tool_cycle(harness: &TestHarness, app: &mut PiApp, idx: usize, output_lines: usize) {
     let tool_id = format!("stress-tool-{idx}");
     apply_pi(

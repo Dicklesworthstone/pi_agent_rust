@@ -30,7 +30,7 @@ impl TokenTable {
 /// Pick the table for a provider id (anthropic → Cl100k-class; everything
 /// else → O200k, the documented approximation).
 #[must_use]
-pub fn table_for_provider(provider: &str) -> TokenTable {
+pub const fn table_for_provider(provider: &str) -> TokenTable {
     if provider.eq_ignore_ascii_case("anthropic") {
         TokenTable::Cl100k
     } else {

@@ -1038,6 +1038,36 @@ fn should_compact(
     context_tokens >= window.saturating_sub(reserve)
 }
 
+/// Accumulate one content block's countable text into `text`, or add its
+/// flat estimate (images) to `flat_tokens`.
+fn accumulate_block_estimate(block: &ContentBlock, text: &mut String, flat_tokens: &mut u64) {
+    match block {
+        ContentBlock::Text(t) => {
+            text.push_str(&t.text);
+            text.push('\n');
+        }
+        ContentBlock::Thinking(thinking) => {
+            text.push_str(&thinking.thinking);
+            text.push('\n');
+        }
+        ContentBlock::Image(_) => {
+            *flat_tokens =
+                flat_tokens.saturating_add((IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64);
+        }
+        ContentBlock::ToolCall(call) => {
+            text.push_str(&call.name);
+            text.push('\n');
+            if let Ok(args) = serde_json::to_string(&call.arguments) {
+                text.push_str(&args);
+            }
+        }
+        // Opaque marker — the data field is never replayed to a model
+        // (see `convert_content_block_to_anthropic`), so it contributes
+        // zero context tokens.
+        ContentBlock::RedactedThinking(_) => {}
+    }
+}
+
 fn estimate_tokens(message: &SessionMessage) -> u64 {
     // BPE counting (bd-cv653.7.1): accumulate the countable text and count
     // it with the active counter (real O200k/Cl100k-class tables when the
@@ -1053,88 +1083,19 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
             UserContent::Text(t) => text.push_str(t),
             UserContent::Blocks(blocks) => {
                 for block in blocks {
-                    match block {
-                        ContentBlock::Text(t) => {
-                            text.push_str(&t.text);
-                            text.push('\n');
-                        }
-                        ContentBlock::Image(_) => {
-                            flat_tokens = flat_tokens.saturating_add(
-                                (IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64,
-                            );
-                        }
-                        ContentBlock::Thinking(thinking) => {
-                            text.push_str(&thinking.thinking);
-                            text.push('\n');
-                        }
-                        ContentBlock::ToolCall(call) => {
-                            text.push_str(&call.name);
-                            text.push('\n');
-                            if let Ok(args) = serde_json::to_string(&call.arguments) {
-                                text.push_str(&args);
-                            }
-                        }
-                        // Opaque marker — the data field is never replayed to a model
-                        // (see `convert_content_block_to_anthropic`), so it contributes
-                        // zero context tokens.
-                        ContentBlock::RedactedThinking(_) => {}
-                    }
+                    accumulate_block_estimate(block, &mut text, &mut flat_tokens);
                 }
             }
         },
         SessionMessage::Assistant { message } => {
             assistant_provider = Some(message.provider.as_str());
             for block in &message.content {
-                match block {
-                    ContentBlock::Text(t) => {
-                        text.push_str(&t.text);
-                        text.push('\n');
-                    }
-                    ContentBlock::Thinking(thinking) => {
-                        text.push_str(&thinking.thinking);
-                        text.push('\n');
-                    }
-                    ContentBlock::Image(_) => {
-                        flat_tokens = flat_tokens.saturating_add(
-                            (IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64,
-                        );
-                    }
-                    ContentBlock::ToolCall(call) => {
-                        text.push_str(&call.name);
-                        text.push('\n');
-                        if let Ok(args) = serde_json::to_string(&call.arguments) {
-                            text.push_str(&args);
-                        }
-                    }
-                    ContentBlock::RedactedThinking(_) => {}
-                }
+                accumulate_block_estimate(block, &mut text, &mut flat_tokens);
             }
         }
         SessionMessage::ToolResult { content, .. } => {
             for block in content {
-                match block {
-                    ContentBlock::Text(t) => {
-                        text.push_str(&t.text);
-                        text.push('\n');
-                    }
-                    ContentBlock::Thinking(thinking) => {
-                        text.push_str(&thinking.thinking);
-                        text.push('\n');
-                    }
-                    ContentBlock::Image(_) => {
-                        flat_tokens = flat_tokens.saturating_add(
-                            (IMAGE_CHAR_ESTIMATE / CHARS_PER_TOKEN_ESTIMATE) as u64,
-                        );
-                    }
-                    ContentBlock::ToolCall(call) => {
-                        text.push_str(&call.name);
-                        text.push('\n');
-                        if let Ok(args) = serde_json::to_string(&call.arguments) {
-                            text.push_str(&args);
-                        }
-                    }
-                    ContentBlock::RedactedThinking(_) => {}
-                }
+                accumulate_block_estimate(block, &mut text, &mut flat_tokens);
             }
         }
         SessionMessage::Custom { content, .. } => text.push_str(content),
