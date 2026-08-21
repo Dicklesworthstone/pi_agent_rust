@@ -470,6 +470,9 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::Review { .. }) => json!({
             "name": "review",
         }),
+        Some(Commands::Gc { .. }) => json!({
+            "name": "gc",
+        }),
         None => Value::Null,
     }
 }

@@ -2180,6 +2180,35 @@ pub enum Commands {
         out: Option<PathBuf>,
     },
 
+    /// Prune stale sessions, artifacts, and caches per retention policy (bd-cv653.7.11)
+    #[command(name = "gc")]
+    Gc {
+        /// Retention window (e.g. 30d, 7d, 24h, or integer days; default: 30d)
+        #[arg(long, default_value = "30d")]
+        older_than: String,
+        /// Number of most recent sessions to unconditionally preserve per project (default: 5)
+        #[arg(long, default_value_t = 5)]
+        keep_last: usize,
+        /// Include extension transpile caches and temporary runtime caches
+        #[arg(long, default_value_t = true)]
+        caches: bool,
+        /// Perform dry run: analyze and print the reclamation plan without modifying disk (default: true)
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm destructive sweep and move pruned items to trash
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Empty the trash directory permanently
+        #[arg(long)]
+        empty_trash: bool,
+        /// Restore a previously trashed session by filename or ID
+        #[arg(long)]
+        restore: Option<String>,
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {

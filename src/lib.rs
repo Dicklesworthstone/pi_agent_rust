@@ -161,6 +161,7 @@ pub mod failover;
 pub mod file_lock;
 #[doc(hidden)]
 pub mod flake_classifier;
+pub mod gc;
 #[doc(hidden)]
 pub mod github;
 pub mod handoff;
