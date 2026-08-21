@@ -1,8 +1,71 @@
 use crate::model::ContentBlock;
 use crate::theme::TuiStyles;
 use serde_json::Value;
+use std::borrow::Cow;
 
 use super::conversation::tool_content_blocks_to_text;
+
+/// Strip ANSI escape sequences and non-printing control characters from
+/// terminal-bound tool output (bd-p45xh). Commands that emit color codes,
+/// cursor movement, alt-screen switches, or `\r`-rewritten progress bars
+/// would otherwise be painted straight into the transcript and corrupt the
+/// frame. `\n` and `\t` survive; CRLF collapses to LF; a bare CR (progress
+/// frame rewrite) becomes LF so successive frames stay readable.
+pub(super) fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
+    let needs_work = input
+        .bytes()
+        .any(|b| b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t'));
+    if !needs_work {
+        return Cow::Borrowed(input);
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\u{1b}' => match chars.peek() {
+                // CSI: ESC '[' params/intermediates then a final byte @..~.
+                Some('[') => {
+                    chars.next();
+                    while let Some(&c) = chars.peek() {
+                        chars.next();
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ']' ... terminated by BEL or ST (ESC '\').
+                Some(']') => {
+                    chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == '\u{07}' {
+                            break;
+                        }
+                        if c == '\u{1b}' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Two-character escape (ESC c, ESC 7, ...) or dangling ESC.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\r' => {
+                if chars.peek() != Some(&'\n') {
+                    out.push('\n');
+                }
+            }
+            c if c == '\u{7f}' || (c < '\u{20}' && c != '\n' && c != '\t') => {}
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
 
 pub(super) fn format_tool_output(
     content: &[ContentBlock],
@@ -31,7 +94,10 @@ pub(super) fn format_tool_output(
     if output.trim().is_empty() {
         None
     } else {
-        Some(output)
+        Some(match sanitize_terminal_text(&output) {
+            Cow::Borrowed(_) => output,
+            Cow::Owned(clean) => clean,
+        })
     }
 }
 
@@ -248,6 +314,54 @@ pub(super) fn pretty_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::model::TextContent;
+
+    // ── sanitize_terminal_text (bd-p45xh) ───────────────────────────────
+
+    #[test]
+    fn sanitize_passes_clean_text_through_borrowed() {
+        let input = "plain output\nwith lines\tand tabs";
+        assert!(matches!(
+            sanitize_terminal_text(input),
+            Cow::Borrowed(text) if text == input
+        ));
+    }
+
+    #[test]
+    fn sanitize_strips_csi_color_and_cursor_sequences() {
+        let input = "\u{1b}[31mred\u{1b}[0m and \u{1b}[2J\u{1b}[Hcleared";
+        assert_eq!(sanitize_terminal_text(input), "red and cleared");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_title_sequences() {
+        // BEL-terminated and ST-terminated OSC.
+        let input = "\u{1b}]0;window title\u{07}before \u{1b}]8;;http://x\u{1b}\\after";
+        assert_eq!(sanitize_terminal_text(input), "before after");
+    }
+
+    #[test]
+    fn sanitize_normalizes_carriage_returns() {
+        // CRLF collapses to LF; bare CR (progress rewrite) becomes LF.
+        assert_eq!(sanitize_terminal_text("a\r\nb"), "a\nb");
+        assert_eq!(sanitize_terminal_text("10%\r50%\r100%"), "10%\n50%\n100%");
+    }
+
+    #[test]
+    fn sanitize_drops_other_control_chars_and_dangling_escape() {
+        assert_eq!(sanitize_terminal_text("a\u{08}b\u{07}c\u{7f}d"), "abcd");
+        assert_eq!(sanitize_terminal_text("tail\u{1b}"), "tail");
+        // Two-character escapes (ESC 7 / ESC c) are consumed entirely.
+        assert_eq!(sanitize_terminal_text("x\u{1b}7y\u{1b}cz"), "xyz");
+    }
+
+    #[test]
+    fn format_tool_output_sanitizes_content() {
+        let content = vec![ContentBlock::Text(TextContent::new(
+            "\u{1b}[1;32mok\u{1b}[0m: 3 passed\r\ndone",
+        ))];
+        let output = format_tool_output(&content, None, false).expect("output");
+        assert_eq!(output, "ok: 3 passed\ndone");
+    }
 
     // ── split_diff_prefix ───────────────────────────────────────────────
 

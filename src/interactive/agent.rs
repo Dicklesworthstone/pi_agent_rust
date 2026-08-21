@@ -836,6 +836,12 @@ impl PiApp {
                     return self.submit_content(content);
                 }
 
+                // `!cmd` output is raw terminal bytes; strip escapes/controls
+                // before it enters the transcript (bd-p45xh).
+                let display = match super::tool_render::sanitize_terminal_text(&display) {
+                    std::borrow::Cow::Borrowed(_) => display,
+                    std::borrow::Cow::Owned(clean) => clean,
+                };
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: display,

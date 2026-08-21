@@ -10137,3 +10137,55 @@ fn tui_tool_invocation_summary_never_mislabels_interleaved_tools() {
     assert_after_contains(&harness, &step, "output-from-B");
     assert_after_contains(&harness, &step, "$ echo B");
 }
+
+#[test]
+fn tui_tool_output_ansi_escapes_are_sanitized() {
+    // bd-p45xh: raw escape sequences in tool output (clear-screen, OSC window
+    // titles, colors, CR progress rewrites) must never reach the transcript.
+    let harness = TestHarness::new("tui_tool_output_ansi_escapes_are_sanitized");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "ansi-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(bash ansi)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "ansi-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "\u{1b}[2J\u{1b}[H\u{1b}]0;evil title\u{7}\u{1b}[1;31mFAIL\u{1b}[0m turned \u{1b}[32mPASS\u{1b}[0m\r\nprogress 10%\rprogress 100%",
+            ))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "ansi-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Cleaned text is present…
+    assert_after_contains(&harness, &step, "FAIL turned PASS");
+    assert_after_contains(&harness, &step, "progress 100%");
+    // …and the dangerous sequences are gone (the view's own styling uses SGR
+    // sequences, so assert on the specific non-SGR payloads).
+    assert_after_not_contains(&harness, &step, "\u{1b}[2J");
+    assert_after_not_contains(&harness, &step, "]0;evil title");
+}
