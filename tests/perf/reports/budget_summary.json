@@ -421,12 +421,12 @@
   "data_contract_failures_count": 0,
   "fail": 0,
   "failing_data_contracts": [],
-  "generated_at": "2026-08-21T22:02:18.076Z",
+  "generated_at": "2026-08-21T23:36:42.256Z",
   "no_data": 19,
   "pass": 0,
   "run_id": null,
   "schema": "pi.perf.budget_summary.v2",
-  "source_commit": "24ad06053dbb548f9d2b2d42b314c7a91aca24b5",
+  "source_commit": "4191408864f8a1af2f90a99a12ab5fbec059ce20",
   "strict_mode": false,
   "total_budgets": 19
 }
