@@ -272,6 +272,8 @@ pub mod terminal_images;
 pub mod theme;
 #[doc(hidden)]
 pub mod todo;
+#[doc(hidden)]
+pub mod token_count;
 pub mod tools;
 #[doc(hidden)]
 pub mod tui;
