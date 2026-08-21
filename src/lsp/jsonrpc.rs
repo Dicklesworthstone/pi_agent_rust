@@ -149,13 +149,77 @@ pub fn encode_frame(body: &Value) -> Vec<u8> {
     out
 }
 
-/// Read one framed message from `reader`. Returns `Ok(None)` on clean EOF
-/// before any header byte.
-/// Read one framed message from `reader`. Returns `Ok(None)` on clean EOF
-/// before any header byte. Crate-public: the DAP transport uses the same
-/// framing (bd-cv653.1.2).
+/// Read one framed message from `reader` without consuming any bytes past the
+/// frame, so back-to-back frames survive sequential calls (this wrapper has no
+/// scratch to carry over-read bytes between calls). Returns `Ok(None)` on
+/// clean EOF before any header byte. Crate-public: the DAP transport uses the
+/// same framing (bd-cv653.1.2).
 pub(crate) fn read_frame(reader: &mut BufReader<impl Read>) -> std::io::Result<Option<Value>> {
-    read_frame_with_scratch(reader, &mut Vec::new())
+    // Headers byte-at-a-time (cheap through the BufReader) so nothing beyond
+    // this frame is pulled out of the reader.
+    let mut header: Vec<u8> = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        if reader.read(&mut byte)? == 0 {
+            if header.is_empty() {
+                return Ok(None); // clean EOF
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "EOF mid-headers",
+            ));
+        }
+        header.push(byte[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if header.len() > 64 * 1024 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "headers exceed 64 KiB",
+            ));
+        }
+    }
+    let length = parse_content_length(&header)?;
+    let mut body = vec![0u8; length];
+    reader.read_exact(&mut body)?;
+    let value = serde_json::from_slice(&body).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid JSON body: {err}"),
+        )
+    })?;
+    Ok(Some(value))
+}
+
+/// Parse the `Content-Length` value out of a raw header block, enforcing the
+/// frame-size cap.
+fn parse_content_length(header_bytes: &[u8]) -> std::io::Result<usize> {
+    let headers = String::from_utf8_lossy(header_bytes);
+    let mut content_length: Option<usize> = None;
+    for line in headers.split("\r\n") {
+        if let Some(value) = line
+            .split_once(':')
+            .map(|(k, v)| (k.trim(), v.trim()))
+            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+            .map(|(_, v)| v)
+        {
+            content_length = value.parse::<usize>().ok();
+        }
+    }
+    let length = content_length.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "missing Content-Length header",
+        )
+    })?;
+    if length > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("frame body {length} bytes exceeds cap {MAX_FRAME_BYTES}"),
+        ));
+    }
+    Ok(length)
 }
 
 /// Read one framed message, carrying leftover bytes in `scratch` between
@@ -183,33 +247,11 @@ pub(crate) fn read_frame_with_scratch(
             ));
         }
     };
-    let headers = String::from_utf8_lossy(&scratch[..body_start]);
     if trace {
+        let headers = String::from_utf8_lossy(&scratch[..body_start]);
         eprintln!("[dap-frame] headers: {headers:?}");
     }
-    let mut content_length: Option<usize> = None;
-    for line in headers.split("\r\n") {
-        if let Some(value) = line
-            .split_once(':')
-            .map(|(k, v)| (k.trim(), v.trim()))
-            .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-            .map(|(_, v)| v)
-        {
-            content_length = value.parse::<usize>().ok();
-        }
-    }
-    let length = content_length.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "missing Content-Length header",
-        )
-    })?;
-    if length > MAX_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("frame body {length} bytes exceeds cap {MAX_FRAME_BYTES}"),
-        ));
-    }
+    let length = parse_content_length(&scratch[..body_start])?;
     // Phase 2: body (scratch already holds the first bytes after headers).
     let mut body: Vec<u8> = scratch.split_off(body_start);
     while body.len() < length {
