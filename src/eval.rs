@@ -39,26 +39,29 @@ struct PyKernel {
 
 impl PyKernel {
     fn spawn(python_path: &str, cwd: &Path) -> Result<Self> {
-        let mut child = Command::new(python_path)
+        let mut command = Command::new(python_path);
+        command
             .args(["-c", PY_KERNEL_SERVER])
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|err| {
-                if err.kind() == std::io::ErrorKind::NotFound {
-                    Error::tool(
-                        "eval",
-                        format!(
-                            "EVAL_PY_MISSING: `{python_path}` not found. Install Python 3 \
-                             or set PI_EVAL_PYTHON."
-                        ),
-                    )
-                } else {
-                    Error::tool("eval", format!("EVAL_SPAWN: {err}"))
-                }
-            })?;
+            .stderr(Stdio::null());
+        // Own process group so shutdown kills kernel-spawned children too
+        // (session-end tree discipline, bd-cv653.1.4 acceptance #5).
+        crate::tools::isolate_command_process_group(&mut command);
+        let mut child = command.spawn().map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Error::tool(
+                    "eval",
+                    format!(
+                        "EVAL_PY_MISSING: `{python_path}` not found. Install Python 3 \
+                         or set PI_EVAL_PYTHON."
+                    ),
+                )
+            } else {
+                Error::tool("eval", format!("EVAL_SPAWN: {err}"))
+            }
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -127,6 +130,8 @@ impl PyKernel {
     }
 
     fn kill(&mut self) {
+        // Process-tree discipline: the kernel's own children die with it.
+        crate::tools::kill_process_group_tree(Some(self.child.id()));
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -619,6 +624,42 @@ mod tests {
         let out = run_cell_sync(&tool, "'alive'").expect("after exception");
         assert!(!out.is_error);
         assert!(output_text(&out).contains("alive"));
+    }
+
+    #[test]
+    fn session_end_kills_kernel_tree_no_orphans() {
+        if !python_available() {
+            eprintln!("Skipping: python3 not available");
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let kernel_pid = {
+            let tool = EvalTool::new(dir.path());
+            let out = run_cell_sync(&tool, "import os\nimport subprocess\npid = os.getpid()\nsubprocess.Popen(['sleep', '60'])").expect("spawn cell");
+            assert!(!out.is_error, "cell: {}", output_text(&out));
+            let out = run_cell_sync(&tool, "pid").expect("pid cell");
+            let text = output_text(&out);
+            text.trim()
+                .trim_matches('"')
+                .parse::<u32>()
+                .unwrap_or_else(|_| panic!("pid from cell output: {text}"))
+            // tool (and its kernel) drop here
+        };
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let state = std::fs::read_to_string(format!("/proc/{kernel_pid}/stat"))
+            .ok()
+            .and_then(|stat| stat.rsplit(')').next()?.trim().chars().next());
+        assert!(
+            state.is_none() || state == Some('Z'),
+            "kernel pid {kernel_pid} survived session end (state {state:?})"
+        );
+        // The kernel's own `sleep` child died with it (tree discipline).
+        let survivor = std::process::Command::new("pgrep")
+            .args(["-f", "sleep 60"])
+            .output()
+            .map(|output| output.status.success() && !output.stdout.is_empty())
+            .unwrap_or(false);
+        assert!(!survivor, "kernel-spawned sleep survived session end");
     }
 
     #[test]

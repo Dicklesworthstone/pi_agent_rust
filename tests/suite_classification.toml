@@ -118,6 +118,7 @@ files = [
     "magic_keywords",
     "worktree_iso",
     "checkpoint",
+    "eval",
     "fts5_spike",
     "bash_mediation",
     "json_mode_parity",
