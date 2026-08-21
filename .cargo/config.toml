@@ -5,22 +5,26 @@
 # so we add the prefix to the native-library and pkg-config search paths.
 # These settings are inert on Linux/macOS/Windows.
 
-# Release binaries are held to a strict <22 MiB budget. The pinned nightly
-# toolchain exposes Cargo's profile-scoped rustflags support, which lets the
-# LLVM machine outliner reduce repeated instruction sequences without changing
-# dev/test diagnostics or applying flags to non-release builds.
+# Release binaries are held to a <48 MiB budget (raised for the v0.3.0
+# capability wave). The pinned nightly toolchain exposes Cargo's
+# profile-scoped rustflags support, which lets the LLVM machine outliner
+# reduce repeated instruction sequences without changing dev/test
+# diagnostics or applying flags to non-release builds.
 [unstable]
 profile-rustflags = true
 
 [profile.release]
-rustflags = ["-Z", "threads=4", "-Cllvm-args=-enable-machine-outliner=always"]
+rustflags = ["-Cllvm-args=-enable-machine-outliner=always"]
+
+# Parallel rustc front-end (nightly). Scoped away from Windows: the parallel
+# front-end breaks SEH directive emission on *-msvc targets
+# (".seh_ directive must appear within an active frame"), so Windows builds
+# use the default single-threaded front-end.
+[target.'cfg(all(not(target_os = "windows"), not(target_os = "freebsd")))']
+rustflags = ["-Z", "threads=4"]
 
 [target.'cfg(target_os = "freebsd")']
 rustflags = ["-L", "/usr/local/lib"]
 
 [env]
 PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
-
-[build]
-# Parallel rustc front-end (nightly). Added by build-settings sweep.
-rustflags = ["-Z", "threads=4"]

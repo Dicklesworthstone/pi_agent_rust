@@ -19,7 +19,10 @@ pub const BENCH_ALLOCATOR_ENV: &str = "PI_BENCH_ALLOCATOR";
 /// (bd-oc1wu): the pure-Rust engine replaces libsqlite3-sys C code and costs
 /// ~5.6 MiB of compiled core (parser/planner/VDBE/MVCC/pager) that LTO cannot
 /// remove. Reclaim tracked in the follow-up size bead before tightening.
-pub const BINARY_SIZE_RELEASE_BUDGET_MB: f64 = 26.0;
+/// Raised 26.0 → 48.0 on 2026-08-21 for the v0.3.0 capability wave (BPE
+/// token tables, LSP/DAP bridges, MCP client, eval kernels, web tools);
+/// bd tracker holds the re-trim investigation.
+pub const BINARY_SIZE_RELEASE_BUDGET_MB: f64 = 48.0;
 
 /// Cargo profile family embedded by `build.rs` (`PROFILE`; custom release-derived
 /// profiles are reported by Cargo as `release`).

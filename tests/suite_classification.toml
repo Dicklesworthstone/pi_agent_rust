@@ -121,6 +121,7 @@ files = [
     "eval",
     "url_router",
     "session_import",
+    "secrets",
     "token_count",
     "fts5_spike",
     "bash_mediation",

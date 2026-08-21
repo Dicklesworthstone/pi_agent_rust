@@ -928,11 +928,11 @@ jobs:
           binary = Path("target") / os.environ["RELEASE_TARGET"] / "release" / (
               "pi.exe" if is_windows else "pi"
           )
-          max_binary_bytes = 26 * 1024 * 1024
+          max_binary_bytes = 48 * 1024 * 1024
           binary_size = binary.stat().st_size
           if binary_size >= max_binary_bytes:
               raise SystemExit(
-                  f"release binary is {binary_size} bytes; policy requires < {max_binary_bytes} bytes (26 MiB)"
+                  f"release binary is {binary_size} bytes; policy requires < {max_binary_bytes} bytes (48 MiB)"
               )
           manifest = {
               "schema": "pi.release.build_manifest.v1",
@@ -1376,8 +1376,8 @@ jobs:
               expected_binary = {"name": binary_name, "sha256": sha256(binary_bytes), "size": len(binary_bytes)}
               if manifest.get("binary") != expected_binary:
                   fail(f"{manifest_path} extracted binary digest/size binding failed")
-              if len(binary_bytes) >= 26 * 1024 * 1024:
-                  fail(f"{manifest_path} binary violates the <26 MiB release budget")
+              if len(binary_bytes) >= 48 * 1024 * 1024:
+                  fail(f"{manifest_path} binary violates the <48 MiB release budget")
               validate_binary(binary_bytes, target)
           print("Verified exact five-platform inventory, strict manifests, archives, binaries, and compiler provenance")
           PY
