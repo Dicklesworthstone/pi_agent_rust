@@ -1184,9 +1184,9 @@ async fn run(
 
     // Multi-root workspace (bd-cv653.3.12): shared handle threaded through
     // @-file processing, the tool registry, and the interactive host so
-    // /add-dir + /remove-dir mutate one live root set.
-    let workspace =
-        pi::workspace::WorkspaceHandle::shared(pi::workspace::RootSet::new(cwd.clone()));
+    // /add-dir + /remove-dir mutate one live root set (the additional-roots
+    // Arc<RwLock> is shared across clones).
+    let mut workspace = pi::workspace::WorkspaceHandle::single(&cwd);
 
     // Resolve the HTTP request timeout before any provider HTTP client is
     // constructed so the client's single resolution path sees it. The
@@ -1612,7 +1612,7 @@ async fn run(
 
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
-    let session = Box::pin(Session::new(&cli, &config)).await?;
+    let mut session = Box::pin(Session::new(&cli, &config)).await?;
 
     // Multi-root roots (bd-cv653.3.12): restore persisted additional_roots on
     // resume, then layer any explicit --add-dir flags on top and persist the
@@ -1621,7 +1621,7 @@ async fn run(
     // --add-dir failure is fatal.
     {
         for root in session.additional_roots() {
-            if let Err(err) = crate::workspace::validate_new_root(&root) {
+            if let Err(err) = pi::workspace::validate_new_root(&root) {
                 eprintln!("Warning: skipping restored workspace root: {err}");
             } else {
                 workspace.add_root(root);
@@ -1629,7 +1629,7 @@ async fn run(
         }
         if !cli.add_dir.is_empty() {
             for dir in &cli.add_dir {
-                let canonical = crate::workspace::validate_new_root(dir)
+                let canonical = pi::workspace::validate_new_root(dir)
                     .map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
                 workspace.add_root(canonical);
             }
@@ -1748,6 +1748,7 @@ async fn run(
         &cwd,
         Some(&config),
         Some(Arc::new(pi::undo::FileMutationRecorder::default())),
+        Some(&workspace),
     );
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
@@ -2253,6 +2254,7 @@ async fn run(
             !cli.no_session,
             resources,
             resource_cli,
+            cwd.clone(),
             runtime_handle.clone(),
             workspace.clone(),
             ask_tool,
@@ -2260,6 +2262,31 @@ async fn run(
         )
         .await
     } else {
+        // Agent-hub steering (bd-cv653.5.3): when this process is a subagent
+        // child, drain the parent's steering queue file between turns so
+        // `hub agent steer` / peer bus messages reach the running child.
+        if let Some(steer_file) = std::env::var_os("PI_SUBAGENT_STEER_FILE") {
+            let steer_path = std::path::PathBuf::from(steer_file);
+            let steering_fetcher: pi::agent::MessageFetcher = std::sync::Arc::new(move || {
+                let path = steer_path.clone();
+                Box::pin(async move {
+                    pi::agent_hub::drain_steer_file(&path)
+                        .into_iter()
+                        .map(|body| {
+                            pi::model::Message::User(pi::model::UserMessage {
+                                content: pi::model::UserContent::Text(body),
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |d| d.as_millis() as i64),
+                            })
+                        })
+                        .collect()
+                }) as futures::future::BoxFuture<'static, Vec<pi::model::Message>>
+            });
+            agent_session
+                .agent
+                .register_message_fetchers(Some(steering_fetcher), None);
+        }
         let result = run_print_mode(
             &mut agent_session,
             &mode,
@@ -2283,8 +2310,7 @@ async fn run(
             ext.shutdown().await;
         }
         result
-    }
-
+    };
 
     // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
     // held across the flush await, and the borrowed MutexGuard is !Send
@@ -7968,6 +7994,7 @@ async fn run_rpc_mode(
         },
         futures::future::Either::Right(((), _)) => {
             // Signal received, return Ok to trigger main_impl's shutdown flush
+            Ok(())
         }
     }
 }
@@ -8696,6 +8723,7 @@ async fn run_interactive_mode(
         resources,
         resource_cli,
         extensions,
+        cwd,
         runtime_handle,
         workspace,
         ask_tool,
