@@ -9816,3 +9816,219 @@ fn validate_or_write_perf_artifact(filename: &str, entries: &[serde_json::Value]
         .join(filename);
     write_verified_perf_artifact(&path, &payload);
 }
+
+// ============================================================================
+// Tool-heavy stress + scroll-stability regression tests (HN-reported class of
+// bugs: "lots of tool calls freeze/scramble the UI", "auto-scroll is weird").
+// ============================================================================
+
+/// Drive one complete tool cycle through the PiMsg pipeline.
+fn run_tool_cycle(harness: &TestHarness, app: &mut PiApp, idx: usize, output_lines: usize) {
+    let tool_id = format!("stress-tool-{idx}");
+    apply_pi(
+        harness,
+        app,
+        "ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: tool_id.clone(),
+        },
+    );
+    apply_pi(
+        harness,
+        app,
+        "ToolInvocation(bash)",
+        PiMsg::ToolInvocation {
+            tool_id: tool_id.clone(),
+            summary: format!("echo stress-{idx}"),
+        },
+    );
+    apply_pi(
+        harness,
+        app,
+        "ToolUpdate(bash)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: tool_id.clone(),
+            content: vec![ContentBlock::Text(TextContent::new(numbered_lines(
+                output_lines,
+            )))],
+            details: None,
+        },
+    );
+    apply_pi(
+        harness,
+        app,
+        "ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id,
+            is_error: false,
+        },
+    );
+}
+
+#[test]
+fn tui_tool_end_preserves_scroll_position_when_scrolled_up() {
+    let harness = TestHarness::new("tui_tool_end_preserves_scroll_position_when_scrolled_up");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(80, 20);
+    log_initial_state(&harness, &app);
+
+    // Build a scrollable transcript, then scroll away from the bottom.
+    fill_viewport_with_stream(&harness, &mut app, 80);
+    finalize_agent(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    let pct_before = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator before tool");
+    assert!(pct_before < 100, "should be scrolled up before tool runs");
+
+    // A tool completes while the user is reading earlier output.
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    run_tool_cycle(&harness, &mut app, 0, 30);
+
+    let pct_after = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after tool");
+    assert!(
+        pct_after < 100,
+        "ToolEnd must not yank a scrolled-up reader to the bottom (got {pct_after}%)"
+    );
+}
+
+#[test]
+fn tui_tool_end_follows_tail_when_at_bottom() {
+    let harness = TestHarness::new("tui_tool_end_follows_tail_when_at_bottom");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(80, 20);
+    log_initial_state(&harness, &app);
+
+    fill_viewport_with_stream(&harness, &mut app, 80);
+    finalize_agent(&harness, &mut app);
+    let pct_before = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator at bottom");
+    assert_eq!(pct_before, 100, "should start at the bottom");
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    run_tool_cycle(&harness, &mut app, 0, 30);
+
+    let pct_after = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after tool");
+    assert_eq!(
+        pct_after, 100,
+        "a reader following the tail should stay at the bottom after ToolEnd"
+    );
+}
+
+#[test]
+fn tui_stress_many_tool_calls_stays_consistent() {
+    let harness = TestHarness::new("tui_stress_many_tool_calls_stays_consistent");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+
+    // Phase 1: 150 sequential tool cycles with non-trivial output while the
+    // user follows the tail. The view must keep rendering and stay pinned to
+    // the bottom.
+    for idx in 0..150 {
+        run_tool_cycle(&harness, &mut app, idx, 40);
+    }
+    let view = normalize_view(&BubbleteaModel::view(&app));
+    assert!(
+        view.contains("stress-149") || view.contains("collapsed"),
+        "latest tool output should be visible or collapsed at the tail"
+    );
+    let pct = parse_scroll_percent(&view).expect("scroll indicator after stress phase 1");
+    assert_eq!(pct, 100, "tail-following reader should remain at bottom");
+
+    // Phase 2: user scrolls up, then 50 more tool cycles land. The scroll
+    // position must be preserved the whole time.
+    press_pgup(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    press_pgup(&harness, &mut app);
+    let pct_scrolled = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after scrolling up");
+    assert!(pct_scrolled < 100, "should be scrolled up");
+    for idx in 150..200 {
+        run_tool_cycle(&harness, &mut app, idx, 40);
+        let pct_now = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+            .expect("scroll indicator during stress phase 2");
+        assert!(
+            pct_now < 100,
+            "tool cycle {idx} yanked a scrolled-up reader to the bottom"
+        );
+    }
+
+    // Phase 3: returning to the bottom must still work, and the app must
+    // finalize cleanly with all 200 tool messages in the transcript.
+    for _ in 0..400 {
+        press_pgdown(&harness, &mut app);
+    }
+    let pct_bottom = parse_scroll_percent(&normalize_view(&BubbleteaModel::view(&app)))
+        .expect("scroll indicator after returning to bottom");
+    assert_eq!(pct_bottom, 100, "PageDown must reach the bottom again");
+    let step = finalize_agent(&harness, &mut app);
+    assert!(
+        step.after.contains("tokens") || !step.after.is_empty(),
+        "view must render after the stress run"
+    );
+}
+
+#[test]
+fn tui_tool_invocation_summary_visible_in_status_and_transcript() {
+    let harness = TestHarness::new("tui_tool_invocation_summary_visible_in_status_and_transcript");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-cmd-1".to_string(),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolInvocation(bash)",
+        PiMsg::ToolInvocation {
+            tool_id: "tool-cmd-1".to_string(),
+            summary: "cargo test --lib".to_string(),
+        },
+    );
+    // While running, the status row shows the command, not just "Running bash".
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_contains(&harness, &step, "cargo test --lib");
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(bash)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-cmd-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("test result: ok."))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-cmd-1".to_string(),
+            is_error: false,
+        },
+    );
+    // The transcript block records what ran alongside its output.
+    assert_after_contains(&harness, &step, "Tool bash output:");
+    assert_after_contains(&harness, &step, "$ cargo test --lib");
+    assert_after_contains(&harness, &step, "test result: ok.");
+}

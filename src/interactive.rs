@@ -1847,6 +1847,9 @@ pub enum PiMsg {
     ThinkingDelta(String),
     /// Tool execution started.
     ToolStart { name: String, tool_id: String },
+    /// Human-readable summary of the running tool's invocation (e.g. the bash
+    /// command line). Sent immediately after `ToolStart` when derivable.
+    ToolInvocation { tool_id: String, summary: String },
     /// Tool execution update (streaming output).
     ToolUpdate {
         name: String,
@@ -2352,6 +2355,9 @@ pub struct PiApp {
     thinking_visible: bool,
     tools_expanded: bool,
     current_tool: Option<String>,
+    /// One-line invocation summary for the running tool (bash command, file
+    /// path, search pattern). Shown in the status row and transcript header.
+    current_tool_summary: Option<String>,
     tool_progress: Option<ToolProgress>,
     pending_tool_output: Option<String>,
     /// Compact `todo_list.v1` footer summary (bd-cv653.3.9), state-driven
@@ -2701,6 +2707,7 @@ impl PiApp {
             thinking_visible,
             tools_expanded: true,
             current_tool: None,
+            current_tool_summary: None,
             tool_progress: None,
             pending_tool_output: None,
             todo_summary: None,

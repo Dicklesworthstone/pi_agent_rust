@@ -157,6 +157,23 @@ impl AutocompleteProvider {
         if segment.text.starts_with('/') {
             let path_response = self.suggest_path(&segment);
             if should_prefer_absolute_path_completion(segment.text, &path_response) {
+                // A bare `/name` fragment is ambiguous between a slash command
+                // and an absolute path (e.g. `/t` → `/tree` vs `/tmp`). Only
+                // surrender the token to path completion when no slash command
+                // prefix-matches the fragment; otherwise the command menu
+                // vanishes for common 1-2 character prefixes.
+                if is_unambiguous_path_token(segment.text) {
+                    return path_response;
+                }
+                let slash_response = self.suggest_slash(&segment);
+                let query = segment.text.trim_start_matches('/');
+                let has_prefix_command = slash_response
+                    .items
+                    .iter()
+                    .any(|item| item.insert.trim_start_matches('/').starts_with(query));
+                if has_prefix_command {
+                    return slash_response;
+                }
                 return path_response;
             }
             return self.suggest_slash(&segment);
@@ -279,6 +296,30 @@ impl AutocompleteProvider {
                         description: cmd.description.clone(),
                     },
                 });
+            }
+        }
+
+        // Skills (`/skill:<name>`) — listed here too so skills are
+        // discoverable from a bare `/` or partial prefix, not only after the
+        // user already knows to type the literal `/skill:` prefix.
+        if self.catalog.enable_skill_commands {
+            for skill in &self.catalog.skills {
+                let full = format!("skill:{}", skill.name);
+                if let Some((is_prefix, score)) = fuzzy_match_score(&full, query) {
+                    let label = format!("/{full}");
+                    items.push(ScoredItem {
+                        is_prefix,
+                        score,
+                        kind_rank: kind_rank(AutocompleteItemKind::Skill),
+                        label: label.clone(),
+                        item: AutocompleteItem {
+                            kind: AutocompleteItemKind::Skill,
+                            label: label.clone(),
+                            insert: label,
+                            description: skill.description.clone(),
+                        },
+                    });
+                }
             }
         }
 
@@ -1108,7 +1149,7 @@ fn should_prefer_absolute_path_completion(
         return false;
     }
 
-    if token_text.starts_with("/.") || token_text[1..].contains('/') {
+    if is_unambiguous_path_token(token_text) {
         return true;
     }
 
@@ -1116,6 +1157,13 @@ fn should_prefer_absolute_path_completion(
         .items
         .iter()
         .any(|item| item.insert.starts_with(token_text))
+}
+
+/// True when a `/`-prefixed token can only mean a filesystem path: it starts
+/// a dotfile segment (`/.`) or already contains a second path separator.
+fn is_unambiguous_path_token(token_text: &str) -> bool {
+    let token_text = token_text.trim();
+    token_text.starts_with("/.") || token_text.get(1..).is_some_and(|rest| rest.contains('/'))
 }
 
 fn clamp_cursor(text: &str, cursor: usize) -> usize {
@@ -1513,6 +1561,91 @@ mod tests {
             resp.items
                 .iter()
                 .any(|item| item.insert.starts_with("/tmp"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn short_slash_prefix_shows_commands_not_root_paths() {
+        // Regression: `/t` used to vanish into `/tmp` path completion,
+        // hiding /tree, /theme, /thinking, /template at the 2-char stage.
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        for (input, expected) in [("/t", "/tree"), ("/e", "/exit"), ("/h", "/help")] {
+            let resp = provider.suggest(input, input.len());
+            assert!(
+                resp.items.iter().any(|item| item.insert == expected),
+                "expected {expected} for input {input}, got: {:?}",
+                resp.items
+            );
+            assert!(
+                resp.items
+                    .iter()
+                    .all(|item| item.kind != AutocompleteItemKind::Path),
+                "slash-command menu for {input} must not be path items"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_segment_slash_token_still_prefers_paths() {
+        let mut provider =
+            AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
+        let input = "/usr/";
+        let resp = provider.suggest(input, input.len());
+        assert!(
+            resp.items
+                .iter()
+                .all(|item| item.kind == AutocompleteItemKind::Path),
+            "multi-segment absolute tokens must stay path completions"
+        );
+    }
+
+    #[test]
+    fn skills_discoverable_from_bare_slash_prefix() {
+        // Regression: skills only appeared after typing the literal
+        // `/skill:` prefix, which made the feature look nonexistent.
+        let catalog = AutocompleteCatalog {
+            prompt_templates: Vec::new(),
+            skills: vec![NamedEntry {
+                name: "rustfmt".to_string(),
+                description: Some("Format Rust code".to_string()),
+            }],
+            extension_commands: Vec::new(),
+            enable_skill_commands: true,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        for input in ["/sk", "/skill"] {
+            let resp = provider.suggest(input, input.len());
+            assert!(
+                resp.items.iter().any(|item| item.insert == "/skill:rustfmt"
+                    && item.kind == AutocompleteItemKind::Skill),
+                "expected /skill:rustfmt suggestion for {input}, got: {:?}",
+                resp.items
+            );
+        }
+    }
+
+    #[test]
+    fn skills_hidden_from_bare_slash_when_disabled() {
+        let catalog = AutocompleteCatalog {
+            prompt_templates: Vec::new(),
+            skills: vec![NamedEntry {
+                name: "rustfmt".to_string(),
+                description: None,
+            }],
+            extension_commands: Vec::new(),
+            enable_skill_commands: false,
+        };
+        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
+        let resp = provider.suggest("/sk", "/sk".len());
+        assert!(
+            !resp
+                .items
+                .iter()
+                .any(|item| item.kind == AutocompleteItemKind::Skill),
+            "skills must not appear when skill commands are disabled"
         );
     }
 

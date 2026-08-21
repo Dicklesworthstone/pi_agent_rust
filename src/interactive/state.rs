@@ -197,10 +197,13 @@ impl AutocompleteState {
         self.selected.and_then(|idx| self.items.get(idx))
     }
 
-    /// Returns the scroll offset for the dropdown view.
-    pub(super) const fn scroll_offset(&self) -> usize {
+    /// Returns the scroll offset for the dropdown view given the number of
+    /// rows actually visible (which the renderer may clamp below
+    /// `max_visible` on short terminals — using `max_visible` here would let
+    /// the highlighted item scroll out of the rendered window).
+    pub(super) const fn scroll_offset(&self, visible: usize) -> usize {
         match self.selected {
-            Some(idx) if idx >= self.max_visible => idx - self.max_visible + 1,
+            Some(idx) if visible > 0 && idx >= visible => idx - visible + 1,
             _ => 0,
         }
     }
@@ -1088,6 +1091,29 @@ mod tests {
         // Selected suggestion no longer present after refresh.
         state.open_with(response(0..6, ["gpt-4o"]));
         assert!(state.selected_item().is_none());
+    }
+
+    #[test]
+    fn autocomplete_scroll_offset_tracks_clamped_visible_window() {
+        let mut state = AutocompleteState::new(PathBuf::from("."), AutocompleteCatalog::default());
+        state.open_with(response(
+            0..1,
+            ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+        ));
+        // Navigate to index 5.
+        for _ in 0..6 {
+            state.select_next();
+        }
+        assert_eq!(state.selected, Some(5));
+        // Full-height window (max_visible = 10): no scrolling needed.
+        assert_eq!(state.scroll_offset(state.max_visible), 0);
+        // Short terminal clamps the window to 3 rows: the offset must follow
+        // the selection so the highlighted item stays inside the window.
+        let offset = state.scroll_offset(3);
+        assert_eq!(offset, 3);
+        assert!((offset..offset + 3).contains(&5));
+        // Degenerate zero-height window must not underflow.
+        assert_eq!(state.scroll_offset(0), 0);
     }
 
     #[test]

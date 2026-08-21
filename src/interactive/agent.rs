@@ -390,12 +390,21 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
         AgentEvent::ToolExecutionStart {
             tool_name,
             tool_call_id,
-            ..
+            args,
         } => {
             batcher.send_immediate(PiMsg::ToolStart {
                 name: tool_name.clone(),
                 tool_id: tool_call_id.clone(),
             });
+            // Surface *what* the tool was asked to do (e.g. the bash command
+            // line) so the transcript is not just "Running bash ..." with an
+            // anonymous output block.
+            if let Some(summary) = tool_invocation_summary(tool_name, args) {
+                batcher.send_immediate(PiMsg::ToolInvocation {
+                    tool_id: tool_call_id.clone(),
+                    summary,
+                });
+            }
         }
         AgentEvent::ToolExecutionUpdate {
             tool_name,
@@ -431,6 +440,16 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
                         .map(str::to_string),
                 });
             }
+            // The end result is the authoritative cumulative output. Send it
+            // as a final ToolUpdate so the transcript block reflects the full
+            // result even when intermediate updates were coalesced away (or
+            // the tool never emitted streaming updates at all).
+            batcher.send_immediate(PiMsg::ToolUpdate {
+                name: tool_name.clone(),
+                tool_id: tool_call_id.clone(),
+                content: result.content.clone(),
+                details: result.details.clone(),
+            });
             batcher.send_immediate(PiMsg::ToolEnd {
                 name: tool_name.clone(),
                 tool_id: tool_call_id.clone(),
@@ -441,6 +460,44 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
             batcher.send_immediate(build_agent_done_pi_msg(messages));
         }
         _ => {}
+    }
+}
+
+/// Compact, single-line description of what a tool invocation will do,
+/// derived from its arguments (the bash command line, the file path, the
+/// search pattern, ...). Returns `None` for tools without an obvious
+/// one-line summary.
+fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+    fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        args.get(key).and_then(serde_json::Value::as_str)
+    }
+    /// First line only, collapsed to at most `max` characters.
+    fn clip(text: &str, max: usize) -> String {
+        let first_line = text.lines().next().unwrap_or("").trim();
+        let mut out: String = first_line.chars().take(max).collect();
+        if first_line.chars().count() > max || text.trim().lines().count() > 1 {
+            out.push('…');
+        }
+        out
+    }
+
+    const MAX: usize = 96;
+    let summary = match tool_name {
+        "bash" => clip(str_arg(args, "command")?, MAX),
+        "read" | "write" | "edit" | "hashline_edit" | "ls" => clip(str_arg(args, "path")?, MAX),
+        "grep" | "find" => {
+            let pattern = str_arg(args, "pattern")?;
+            match str_arg(args, "path") {
+                Some(path) if !path.is_empty() => clip(&format!("{pattern} in {path}"), MAX),
+                _ => clip(pattern, MAX),
+            }
+        }
+        _ => return None,
+    };
+    if summary.is_empty() {
+        None
+    } else {
+        Some(summary)
     }
 }
 
@@ -515,8 +572,12 @@ impl PiApp {
             PiMsg::ToolStart { name, .. } => {
                 self.agent_state = AgentState::ToolRunning;
                 self.current_tool = Some(name);
+                self.current_tool_summary = None;
                 self.tool_progress = Some(ToolProgress::new());
                 self.pending_tool_output = None;
+            }
+            PiMsg::ToolInvocation { summary, .. } => {
+                self.current_tool_summary = Some(summary);
             }
             PiMsg::ToolUpdate {
                 name,
@@ -537,16 +598,32 @@ impl PiApp {
                     details.as_ref(),
                     self.config.terminal_show_images(),
                 ) {
-                    self.pending_tool_output = Some(format!("Tool {name} output:\n{output}"));
+                    // Include the invocation (e.g. the bash command) in the
+                    // transcript header so the reader can see what ran, not
+                    // just its output.
+                    self.pending_tool_output =
+                        Some(self.current_tool_summary.as_ref().map_or_else(
+                            || format!("Tool {name} output:\n{output}"),
+                            |invocation| {
+                                let prefix = if name == "bash" { "$ " } else { "→ " };
+                                format!("Tool {name} output:\n{prefix}{invocation}\n{output}")
+                            },
+                        ));
                 }
             }
             PiMsg::ToolEnd { .. } => {
                 self.agent_state = AgentState::Processing;
                 self.current_tool = None;
+                self.current_tool_summary = None;
                 self.tool_progress = None;
                 if let Some(output) = self.pending_tool_output.take() {
                     self.messages.push(ConversationMessage::tool(output));
-                    self.scroll_to_bottom();
+                    // Respect the user's scroll position: only snap to the
+                    // bottom when they were already following the tail.
+                    // Yanking a scrolled-up reader down on every tool
+                    // completion made long tool-heavy turns unreadable.
+                    let follow_tail = self.follow_stream_tail;
+                    self.refresh_conversation_viewport(follow_tail);
                 }
             }
             PiMsg::TodoSummary { summary } => {

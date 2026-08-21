@@ -499,11 +499,28 @@ impl PiApp {
                 }
                 format!(" ({})", parts.join(" \u{2022} "))
             });
+            // Show what the tool was asked to do (bash command line, file
+            // path, ...) truncated to the terminal width.
+            let invocation_str =
+                self.current_tool_summary
+                    .as_ref()
+                    .map_or_else(String::new, |summary| {
+                        let budget = self
+                            .term_width
+                            .saturating_sub(16 + tool.len() + progress_str.len())
+                            .max(12);
+                        let mut clipped: String = summary.chars().take(budget).collect();
+                        if summary.chars().count() > budget {
+                            clipped.push('…');
+                        }
+                        format!(": {clipped}")
+                    });
             let _ = write!(
                 output,
-                "\n  {} {}{} ...\n",
+                "\n  {} {}{}{} ...\n",
                 self.spinner.view(),
                 self.styles.warning_bold.render(&format!("Running {tool}")),
+                self.styles.muted.render(&invocation_str),
                 self.styles.muted.render(&progress_str),
             );
         }
@@ -1081,7 +1098,6 @@ impl PiApp {
     pub(super) fn render_autocomplete_dropdown(&self) -> String {
         let mut output = String::new();
 
-        let offset = self.autocomplete.scroll_offset();
         // Constrain visible items to available terminal space.
         // Dropdown chrome uses ~5 rows (borders, help, pagination, description).
         let max_dropdown_rows = self.term_height.saturating_sub(
@@ -1094,6 +1110,9 @@ impl PiApp {
             .max_visible
             .min(self.autocomplete.items.len())
             .min(max_dropdown_rows.max(1));
+        // Scroll relative to the clamped window so the highlighted item is
+        // always inside the rendered rows, even on short terminals.
+        let offset = self.autocomplete.scroll_offset(visible_count);
         let end = (offset + visible_count).min(self.autocomplete.items.len());
 
         // Styles
@@ -1102,8 +1121,10 @@ impl PiApp {
         let kind_style = &self.styles.warning;
         let desc_style = &self.styles.muted_italic;
 
-        // Top border
-        let width = 60;
+        // Top border. Clamp to the terminal width so dropdown rows never
+        // soft-wrap on narrow terminals (wrapping breaks the newline-based
+        // frame height accounting and pushes the footer off screen).
+        let width = 60usize.min(self.term_width.saturating_sub(4)).max(20);
         let _ = write!(
             output,
             "\n  {}",

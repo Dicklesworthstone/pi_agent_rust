@@ -871,7 +871,11 @@ pi migrate ~/.pi/agent/sessions
 
 ## Configuration
 
-Pi reads configuration from `~/.pi/agent/settings.json`:
+Pi reads configuration from `~/.pi/agent/settings.json`. Keys are shown in
+their canonical snake_case form below, but every field also accepts the
+original TypeScript Pi's camelCase spelling (e.g. `defaultProvider`,
+`shellCommandPrefix`) as a serde alias, so an existing pi-mono `settings.json`
+is parsed as-is and is never rewritten to snake_case:
 
 ```json
 {
