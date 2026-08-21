@@ -472,10 +472,17 @@ fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<
         args.get(key).and_then(serde_json::Value::as_str)
     }
     /// First non-blank line only, collapsed to at most `max` characters.
+    /// Control characters (incl. ESC) are dropped so a hostile or binary
+    /// command string can never inject escape sequences into the transcript
+    /// header, which bypasses the tool-output sanitizer.
     fn clip(text: &str, max: usize) -> String {
         let text = text.trim();
         let first_line = text.lines().next().unwrap_or("").trim_end();
-        let mut out: String = first_line.chars().take(max).collect();
+        let mut out: String = first_line
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\t')
+            .take(max)
+            .collect();
         if first_line.chars().count() > max || text.lines().count() > 1 {
             out.push('…');
         }
@@ -2650,6 +2657,17 @@ mod tool_invocation_summary_tests {
             tool_invocation_summary("grep", &json!({"pattern": "TODO", "path": "src/"})).as_deref(),
             Some("TODO in src/")
         );
+    }
+
+    #[test]
+    fn control_chars_are_stripped_from_summaries() {
+        // Escape bytes in a command string must not reach the transcript
+        // header (the output sanitizer runs on tool output, not on args).
+        let summary = tool_invocation_summary(
+            "bash",
+            &json!({"command": "echo \u{1b}[31mred\u{7}\u{7f} done"}),
+        );
+        assert_eq!(summary.as_deref(), Some("echo [31mred done"));
     }
 
     #[test]

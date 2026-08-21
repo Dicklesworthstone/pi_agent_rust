@@ -34,11 +34,15 @@ pub(super) fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
                         }
                     }
                 }
-                // OSC: ESC ']' ... terminated by BEL or ST (ESC '\').
-                Some(']') => {
+                // String-payload sequences whose body must be consumed too:
+                // OSC (ESC ']'), DCS (ESC 'P', e.g. sixel), SOS (ESC 'X'),
+                // PM (ESC '^'), APC (ESC '_', e.g. tmux passthrough).
+                // Terminated by ST (ESC '\'); OSC also accepts BEL.
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    let accepts_bel = chars.peek() == Some(&']');
                     chars.next();
                     while let Some(c) = chars.next() {
-                        if c == '\u{07}' {
+                        if accepts_bel && c == '\u{07}' {
                             break;
                         }
                         if c == '\u{1b}' {
@@ -442,6 +446,22 @@ mod tests {
         // BEL-terminated and ST-terminated OSC.
         let input = "\u{1b}]0;window title\u{07}before \u{1b}]8;;http://x\u{1b}\\after";
         assert_eq!(sanitize_terminal_text(input), "before after");
+    }
+
+    #[test]
+    fn sanitize_consumes_dcs_and_apc_payloads() {
+        // DCS (sixel-style) and APC (tmux passthrough) payloads must be
+        // consumed to their ST terminator, not leaked as text.
+        let input =
+            "before \u{1b}Pq#0;2;0;0;0-payload\u{1b}\\middle \u{1b}_Gtmux-blob\u{1b}\\after";
+        assert_eq!(sanitize_terminal_text(input), "before middle after");
+        // Unterminated DCS swallows to end of input rather than leaking.
+        assert_eq!(sanitize_terminal_text("x\u{1b}Pdangling"), "x");
+        // BEL does NOT terminate DCS (it is data there); only ST does.
+        assert_eq!(
+            sanitize_terminal_text("a\u{1b}Pdata\u{7}more\u{1b}\\b"),
+            "ab"
+        );
     }
 
     #[test]
