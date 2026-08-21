@@ -15,6 +15,7 @@ use crate::platform::{
     EffectiveModeAccessContext, UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE,
     ensure_effective_mode_access,
 };
+use crate::workspace::{WorkspaceHandle, ensure_canonical_path_allowed};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
@@ -2749,16 +2750,27 @@ pub(crate) fn resolve_read_path(file_path: &str, cwd: &Path) -> PathBuf {
     resolved
 }
 
-fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
+fn enforce_cwd_scope(
+    path: &Path,
+    cwd: &Path,
+    action: &str,
+    workspace: &WorkspaceHandle,
+) -> Result<PathBuf> {
     let canonical_path = crate::extensions::safe_canonicalize(path);
     let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
-    if !canonical_path.starts_with(&canonical_cwd) {
-        return Err(Error::validation(format!(
-            "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
-            path_for_line_output(&canonical_path),
-            path_for_line_output(&canonical_cwd)
-        )));
+    let roots = workspace.snapshot_or(cwd);
+    if roots.additional().is_empty() {
+        // Single-root sessions keep the legacy decision and message verbatim.
+        if !canonical_path.starts_with(&canonical_cwd) {
+            return Err(Error::validation(format!(
+                "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
+                path_for_line_output(&canonical_path),
+                path_for_line_output(&canonical_cwd)
+            )));
+        }
+        return Ok(canonical_path);
     }
+    ensure_canonical_path_allowed(&canonical_path, &roots.all(), action)?;
     Ok(canonical_path)
 }
 
@@ -4095,31 +4107,43 @@ async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
 /// symlinks before the prefix check, so e.g. `~/.pi/agent/skills/foo/SKILL.md`
 /// pointing at `/etc/passwd` resolves to `/etc/passwd` and fails the prefix
 /// test against both cwd and agent dir.
-fn enforce_read_scope_with_roots(path: &Path, cwd: &Path, agent_dir: &Path) -> Result<PathBuf> {
+fn enforce_read_scope_with_roots(
+    path: &Path,
+    cwd: &Path,
+    agent_dir: &Path,
+    workspace: &WorkspaceHandle,
+) -> Result<PathBuf> {
     let canonical_path = crate::extensions::safe_canonicalize(path);
     let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
-    if canonical_path.starts_with(&canonical_cwd) {
-        return Ok(canonical_path);
-    }
-
     let canonical_agent = crate::extensions::safe_canonicalize(agent_dir);
-    if canonical_path.starts_with(&canonical_agent) {
-        return Ok(canonical_path);
+    let roots = workspace.snapshot_or(cwd);
+    if roots.additional().is_empty() {
+        // Single-root sessions keep the legacy decision and message verbatim.
+        if canonical_path.starts_with(&canonical_cwd)
+            || canonical_path.starts_with(&canonical_agent)
+        {
+            return Ok(canonical_path);
+        }
+        return Err(Error::validation(format!(
+            "Cannot read outside the working directory or agent dir \
+             (resolved: {}, cwd: {}, agent dir: {})",
+            canonical_path.display(),
+            canonical_cwd.display(),
+            canonical_agent.display(),
+        )));
     }
 
-    Err(Error::validation(format!(
-        "Cannot read outside the working directory or agent dir \
-         (resolved: {}, cwd: {}, agent dir: {})",
-        canonical_path.display(),
-        canonical_cwd.display(),
-        canonical_agent.display(),
-    )))
+    // Multi-root: cwd + additional roots + agent dir (read broadening, #71).
+    let mut all_roots = roots.all();
+    all_roots.push(canonical_agent);
+    ensure_canonical_path_allowed(&canonical_path, &all_roots, "read")?;
+    Ok(canonical_path)
 }
 
 /// Convenience wrapper that pulls the agent dir from the active config.
-fn enforce_read_scope(path: &Path, cwd: &Path) -> Result<PathBuf> {
+fn enforce_read_scope(path: &Path, cwd: &Path, workspace: &WorkspaceHandle) -> Result<PathBuf> {
     let agent_dir = crate::config::Config::global_dir();
-    enforce_read_scope_with_roots(path, cwd, &agent_dir)
+    enforce_read_scope_with_roots(path, cwd, &agent_dir, workspace)
 }
 
 // ============================================================================
@@ -4834,13 +4858,18 @@ pub fn process_file_arguments(
     file_args: &[String],
     cwd: &Path,
     auto_resize_images: bool,
+    workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<ProcessedFiles> {
+    // bd-cv653.3.12: the workspace handle is threaded through for
+    // multi-root confinement; file args are read-only today (reads confine
+    // through the tool layer), so the handle is accepted and unused here.
+    let _ = workspace;
     let mut out = ProcessedFiles::default();
 
     for file_arg in file_args {
         let resolved = resolve_read_path(file_arg, cwd);
         let absolute_path = normalize_dot_segments(&resolved);
-        let absolute_path = enforce_read_scope(&absolute_path, cwd)?;
+        let absolute_path = enforce_read_scope(&absolute_path, cwd, workspace)?;
 
         let meta = std::fs::metadata(&absolute_path).map_err(|e| {
             Error::tool(
@@ -5186,7 +5215,7 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// Create a new registry with the specified tools enabled.
     pub fn new(enabled: &[&str], cwd: &Path, config: Option<&Config>) -> Self {
-        Self::with_mutation_recorder(enabled, cwd, config, None)
+        Self::with_mutation_recorder(enabled, cwd, config, None, None)
     }
 
     /// The undo recorder attached at construction, if any.
@@ -5196,14 +5225,18 @@ impl ToolRegistry {
     }
 
     /// Like [`ToolRegistry::new`] but attaches a session undo recorder to the
-    /// mutating file tools (bd-cv653.3.13).
+    /// mutating file tools (bd-cv653.3.13). `workspace` installs the shared
+    /// multi-root handle on every path-confining tool (bd-cv653.3.12).
     #[allow(clippy::too_many_lines)]
     pub fn with_mutation_recorder(
         enabled: &[&str],
         cwd: &Path,
         config: Option<&Config>,
         mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+        workspace: Option<&WorkspaceHandle>,
     ) -> Self {
+        let legacy_workspace = WorkspaceHandle::default();
+        let workspace = workspace.unwrap_or(&legacy_workspace);
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
         let shell_path = config.and_then(|c| c.shell_path.clone());
         let shell_command_prefix = config.and_then(|c| c.shell_command_prefix.clone());
@@ -5215,34 +5248,42 @@ impl ToolRegistry {
         for name in enabled {
             match *name {
                 "read" => tools.push(Box::new(
-                    ReadTool::with_settings(cwd, image_auto_resize, block_images).with_url_policy(
-                        config
-                            .and_then(|c| c.read.as_ref())
-                            .and_then(|r| r.url_allow_private_targets)
-                            .unwrap_or(false),
-                    ),
+                    ReadTool::with_settings(cwd, image_auto_resize, block_images)
+                        .with_url_policy(
+                            config
+                                .and_then(|c| c.read.as_ref())
+                                .and_then(|r| r.url_allow_private_targets)
+                                .unwrap_or(false),
+                        )
+                        .with_workspace(workspace.clone()),
                 )),
                 "bash" => tools.push(Box::new(
                     BashTool::with_shell(cwd, shell_path.clone(), shell_command_prefix.clone())
                         .with_mediation(config.and_then(|c| c.bash.clone())),
                 )),
                 "edit" => tools.push(Box::new(
-                    EditTool::new(cwd).with_mutation_recorder(mutation_recorder.clone()),
+                    EditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone())
+                        .with_workspace(workspace.clone()),
                 )),
                 "write" => tools.push(Box::new(
-                    WriteTool::new(cwd).with_mutation_recorder(mutation_recorder.clone()),
+                    WriteTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone())
+                        .with_workspace(workspace.clone()),
                 )),
-                "grep" => tools.push(Box::new(GrepTool::with_backend(
-                    cwd,
-                    search_backend_from_config(config),
-                ))),
-                "find" => tools.push(Box::new(FindTool::with_backend(
-                    cwd,
-                    search_backend_from_config(config),
-                ))),
-                "ls" => tools.push(Box::new(LsTool::new(cwd))),
+                "grep" => tools.push(Box::new(
+                    GrepTool::with_backend(cwd, search_backend_from_config(config))
+                        .with_workspace(workspace.clone()),
+                )),
+                "find" => tools.push(Box::new(
+                    FindTool::with_backend(cwd, search_backend_from_config(config))
+                        .with_workspace(workspace.clone()),
+                )),
+                "ls" => tools.push(Box::new(LsTool::new(cwd).with_workspace(workspace.clone()))),
                 "hashline_edit" => tools.push(Box::new(
-                    HashlineEditTool::new(cwd).with_mutation_recorder(mutation_recorder.clone()),
+                    HashlineEditTool::new(cwd)
+                        .with_mutation_recorder(mutation_recorder.clone())
+                        .with_workspace(workspace.clone()),
                 )),
                 "jobs" => tools.push(Box::new(JobsTool)),
                 "hub" => tools.push(Box::new(HubTool::new(cwd))),
@@ -5427,6 +5468,7 @@ pub struct ReadTool {
     /// SSRF override for URL reads (bd-cv653.2.2): allow private/loopback
     /// targets (from `read.urlAllowPrivateTargets`).
     allow_private_urls: bool,
+    workspace: WorkspaceHandle,
     #[cfg(test)]
     after_open_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -5435,6 +5477,7 @@ impl ReadTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
             artifact_root: None,
@@ -5444,9 +5487,17 @@ impl ReadTool {
         }
     }
 
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     pub fn with_settings(cwd: &Path, auto_resize: bool, block_images: bool) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             auto_resize,
             block_images,
             artifact_root: None,
@@ -5467,6 +5518,7 @@ impl ReadTool {
     fn with_artifact_root(cwd: &Path, artifact_root: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
             artifact_root: Some(artifact_root.to_path_buf()),
@@ -5482,6 +5534,7 @@ impl ReadTool {
     ) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             auto_resize: true,
             block_images: false,
             artifact_root: None,
@@ -5756,10 +5809,11 @@ impl Tool for ReadTool {
         }
 
         let path = resolve_read_path(&input.path, &self.cwd);
-        let path = enforce_read_scope(&path, &self.cwd)?;
+        let path = enforce_read_scope(&path, &self.cwd, &self.workspace)?;
 
         let path_for_open = path.clone();
-        let allowed_roots = vec![self.cwd.clone(), Config::global_dir()];
+        let mut allowed_roots = self.workspace.snapshot_or(&self.cwd).all();
+        allowed_roots.push(Config::global_dir());
         #[cfg(test)]
         let after_open_hook = self.after_open_hook.clone();
         let (std_file, cache_file, meta, cache_deps) =
@@ -8099,15 +8153,24 @@ pub struct EditTool {
     cwd: PathBuf,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    workspace: WorkspaceHandle,
 }
 
 impl EditTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             before_persist_hook: None,
             mutation_recorder: None,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     /// Attach the session's undo recorder (bd-cv653.3.13).
@@ -8124,6 +8187,7 @@ impl EditTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             before_persist_hook: Some(Arc::new(hook)),
             mutation_recorder: None,
         }
@@ -8747,7 +8811,7 @@ impl Tool for EditTool {
         }
 
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
-        let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit")?;
+        let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit", &self.workspace)?;
 
         let meta = std_metadata_async(&absolute_path).await.map_err(|err| {
             let message = match err.kind() {
@@ -9053,15 +9117,24 @@ pub struct WriteTool {
     cwd: PathBuf,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    workspace: WorkspaceHandle,
 }
 
 impl WriteTool {
     pub fn new(cwd: &Path) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             before_persist_hook: None,
             mutation_recorder: None,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     /// Attach the session's undo recorder (bd-cv653.3.13).
@@ -9078,6 +9151,7 @@ impl WriteTool {
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
+            workspace: WorkspaceHandle::default(),
             before_persist_hook: Some(Arc::new(hook)),
             mutation_recorder: None,
         }
@@ -9133,7 +9207,7 @@ impl Tool for WriteTool {
         }
 
         let path = resolve_path(&input.path, &self.cwd);
-        let path = enforce_cwd_scope(&path, &self.cwd, "write")?;
+        let path = enforce_cwd_scope(&path, &self.cwd, "write", &self.workspace)?;
 
         match std_metadata_async(&path).await {
             Ok(meta) => {
@@ -9262,6 +9336,7 @@ pub struct GrepTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
     backend: SearchBackend,
+    workspace: WorkspaceHandle,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -9271,11 +9346,19 @@ impl GrepTool {
         Self::with_backend(cwd, SearchBackend::default())
     }
 
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend,
+            workspace: WorkspaceHandle::default(),
             #[cfg(test)]
             after_scope_hook: None,
         }
@@ -9287,6 +9370,7 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
             backend: SearchBackend::default(),
+            workspace: WorkspaceHandle::default(),
             after_scope_hook: None,
         }
     }
@@ -9300,6 +9384,7 @@ impl GrepTool {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend: SearchBackend::default(),
+            workspace: WorkspaceHandle::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -9876,7 +9961,8 @@ impl Tool for GrepTool {
 
         let search_dir = input.path.as_deref().unwrap_or(".");
         let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&lexical_search_path, &self.cwd, "grep")?;
+        let search_path =
+            enforce_cwd_scope(&lexical_search_path, &self.cwd, "grep", &self.workspace)?;
         ensure_scan_path_ancestors_searchable(&lexical_search_path, &search_path)
             .await
             .map_err(|err| {
@@ -10535,6 +10621,7 @@ pub struct FindTool {
     cwd: PathBuf,
     artifact_root: Option<PathBuf>,
     backend: SearchBackend,
+    workspace: WorkspaceHandle,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -10544,11 +10631,19 @@ impl FindTool {
         Self::with_backend(cwd, SearchBackend::default())
     }
 
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     pub(crate) fn with_backend(cwd: &Path, backend: SearchBackend) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend,
+            workspace: WorkspaceHandle::default(),
             #[cfg(test)]
             after_scope_hook: None,
         }
@@ -10563,6 +10658,7 @@ impl FindTool {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
             backend: SearchBackend::default(),
+            workspace: WorkspaceHandle::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -10639,7 +10735,8 @@ impl Tool for FindTool {
 
         let search_dir = input.path.as_deref().unwrap_or(".");
         let lexical_search_path = resolve_read_path(search_dir, &self.cwd);
-        let search_path = enforce_cwd_scope(&lexical_search_path, &self.cwd, "find")?;
+        let search_path =
+            enforce_cwd_scope(&lexical_search_path, &self.cwd, "find", &self.workspace)?;
         let search_path = strip_unc_prefix(search_path);
         ensure_scan_path_ancestors_searchable(&lexical_search_path, &search_path)
             .await
@@ -11281,8 +11378,9 @@ struct LsInput {
 }
 
 pub struct LsTool {
-    cwd: PathBuf,
     artifact_root: Option<PathBuf>,
+    cwd: PathBuf,
+    workspace: WorkspaceHandle,
     #[cfg(test)]
     after_scope_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -11292,9 +11390,17 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            workspace: WorkspaceHandle::default(),
             #[cfg(test)]
             after_scope_hook: None,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
     }
 
     #[cfg(test)]
@@ -11302,11 +11408,13 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: Some(artifact_root.to_path_buf()),
+            workspace: WorkspaceHandle::default(),
+            #[cfg(test)]
             after_scope_hook: None,
         }
     }
-
     #[cfg(test)]
+
     fn with_after_scope_hook(
         cwd: &Path,
         after_scope_hook: impl Fn() + Send + Sync + 'static,
@@ -11314,6 +11422,7 @@ impl LsTool {
         Self {
             cwd: cwd.to_path_buf(),
             artifact_root: None,
+            workspace: WorkspaceHandle::default(),
             after_scope_hook: Some(Arc::new(after_scope_hook)),
         }
     }
@@ -11385,7 +11494,7 @@ impl Tool for LsTool {
             .path
             .as_ref()
             .map_or_else(|| self.cwd.clone(), |p| resolve_read_path(p, &self.cwd));
-        let dir_path = enforce_cwd_scope(&dir_path, &self.cwd, "list")?;
+        let dir_path = enforce_cwd_scope(&dir_path, &self.cwd, "list", &self.workspace)?;
 
         let effective_limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT);
 
@@ -12721,6 +12830,7 @@ pub struct HashlineEditTool {
     cwd: PathBuf,
     before_persist_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     mutation_recorder: Option<Arc<crate::undo::FileMutationRecorder>>,
+    workspace: WorkspaceHandle,
 }
 
 impl HashlineEditTool {
@@ -12729,6 +12839,7 @@ impl HashlineEditTool {
             cwd: cwd.to_path_buf(),
             before_persist_hook: None,
             mutation_recorder: None,
+            workspace: WorkspaceHandle::default(),
         }
     }
 
@@ -12742,12 +12853,20 @@ impl HashlineEditTool {
         self
     }
 
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: WorkspaceHandle) -> Self {
+        self.workspace = workspace;
+        self
+    }
+
     #[cfg(test)]
     fn with_before_persist_hook(cwd: &Path, hook: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             cwd: cwd.to_path_buf(),
             before_persist_hook: Some(Arc::new(hook)),
             mutation_recorder: None,
+            workspace: WorkspaceHandle::default(),
         }
     }
 }
@@ -12932,7 +13051,8 @@ impl Tool for HashlineEditTool {
 
         // Resolve file path and enforce scope before touching the filesystem.
         let resolved = resolve_read_path(&input.path, &self.cwd);
-        let absolute_path = enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit")?;
+        let absolute_path =
+            enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit", &self.workspace)?;
 
         // Check file size
         let metadata = std_metadata_async(&absolute_path).await.map_err(|err| {

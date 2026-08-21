@@ -1182,6 +1182,12 @@ async fn run(
 ) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
+    // Multi-root workspace (bd-cv653.3.12): shared handle threaded through
+    // @-file processing, the tool registry, and the interactive host so
+    // /add-dir + /remove-dir mutate one live root set.
+    let workspace =
+        pi::workspace::WorkspaceHandle::shared(pi::workspace::RootSet::new(cwd.clone()));
+
     // Resolve the HTTP request timeout before any provider HTTP client is
     // constructed so the client's single resolution path sees it. The
     // `--request-timeout` flag is bound to the PI_HTTP_REQUEST_TIMEOUT_SECS env
@@ -1539,6 +1545,7 @@ async fn run(
             .as_ref()
             .and_then(|i| i.auto_resize)
             .unwrap_or(true),
+        &workspace,
     )?;
     messages.retain(|message| !message.trim().is_empty());
 
@@ -1606,6 +1613,33 @@ async fn run(
     let allow_setup_prompt =
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
     let session = Box::pin(Session::new(&cli, &config)).await?;
+
+    // Multi-root roots (bd-cv653.3.12): restore persisted additional_roots on
+    // resume, then layer any explicit --add-dir flags on top and persist the
+    // resulting canonical set for future resumes. A vanished restored root
+    // degrades to a warning rather than blocking resume; an explicit
+    // --add-dir failure is fatal.
+    {
+        for root in session.additional_roots() {
+            if let Err(err) = crate::workspace::validate_new_root(&root) {
+                eprintln!("Warning: skipping restored workspace root: {err}");
+            } else {
+                workspace.add_root(root);
+            }
+        }
+        if !cli.add_dir.is_empty() {
+            for dir in &cli.add_dir {
+                let canonical = crate::workspace::validate_new_root(dir)
+                    .map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
+                workspace.add_root(canonical);
+            }
+        }
+        let snapshot = workspace.snapshot_or(&cwd);
+        let additional = snapshot.additional().to_vec();
+        if !additional.is_empty() || !cli.add_dir.is_empty() {
+            session.set_additional_roots(additional);
+        }
+    }
 
     let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
         &mut cli,

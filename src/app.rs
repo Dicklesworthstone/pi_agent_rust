@@ -116,12 +116,13 @@ pub fn prepare_initial_message(
     file_args: &[String],
     messages: &mut Vec<String>,
     auto_resize_images: bool,
+    workspace: &crate::workspace::WorkspaceHandle,
 ) -> Result<Option<InitialMessage>> {
     if file_args.is_empty() {
         return Ok(None);
     }
 
-    let processed = process_file_arguments(file_args, cwd, auto_resize_images)?;
+    let processed = process_file_arguments(file_args, cwd, auto_resize_images, workspace)?;
     let mut initial_message = processed.text;
     let has_message = !messages.is_empty();
     if has_message {

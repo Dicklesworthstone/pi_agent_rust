@@ -4909,6 +4909,34 @@ impl Session {
         self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
     }
 
+    /// Additional workspace roots recorded for resume fidelity (bd-cv653.3.12).
+    /// Empty for single-root sessions.
+    pub fn additional_roots(&self) -> Vec<std::path::PathBuf> {
+        self.header
+            .additional_roots
+            .as_deref()
+            .map_or_else(Vec::new, |roots| {
+                roots.iter().map(std::path::PathBuf::from).collect()
+            })
+    }
+
+    /// Record additional workspace roots in the header (bd-cv653.3.12).
+    /// Canonical absolute paths only — callers canonicalize via
+    /// [`crate::workspace::RootSet::add`] before persisting.
+    pub fn set_additional_roots(&mut self, roots: Vec<std::path::PathBuf>) {
+        let serialized: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
+        let next = if serialized.is_empty() {
+            None
+        } else {
+            Some(serialized)
+        };
+        if self.header.additional_roots != next {
+            self.header.additional_roots = next;
+            self.header_dirty = true;
+            self.enqueue_autosave_mutation(AutosaveMutationKind::Metadata);
+        }
+    }
+
     /// Create a lightweight snapshot for non-blocking HTML export.
     ///
     /// Captures only the fields needed by `to_html()` (header, entries, path),
@@ -5889,6 +5917,10 @@ pub struct SessionHeader {
     pub thinking_level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_provider: Option<String>,
+    /// Additional workspace roots (bd-cv653.3.12), canonical absolute paths;
+    /// recorded for resume fidelity and absent for single-root sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_roots: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_model_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -5914,6 +5946,7 @@ impl SessionHeader {
             cwd: std::env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            additional_roots: None,
             provider: None,
             model_id: None,
             thinking_level: None,
