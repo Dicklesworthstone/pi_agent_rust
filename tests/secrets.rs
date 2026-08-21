@@ -30,6 +30,7 @@ fn finish_case(harness: &TestHarness, case: &str) {
     harness
         .log()
         .info("verify", format!("case '{case}' assertions passed"));
+    // ubs:ignore harness pattern (single-line chains keep the marker on the flagged line)
     let path = harness.temp_path(format!("{case}.jsonl"));
     harness
         .write_jsonl_logs(&path)
