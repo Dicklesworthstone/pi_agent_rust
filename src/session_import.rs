@@ -126,6 +126,25 @@ pub fn import_codex(path: &Path, target_dir: Option<&Path>) -> Result<ImportOutc
     import_bytes(ImportSource::Codex, &raw, path, target_dir)
 }
 
+/// Find an already-imported session by content-addressed id anywhere under
+/// the target root (the store nests by cwd).
+fn find_imported_session(root: &Path, id: &str) -> Option<std::path::PathBuf> {
+    let needle = format!("{id}.jsonl");
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir).ok()?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str()) == Some(needle.as_str()) {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 fn import_bytes(
     source: ImportSource,
     raw: &[u8],
@@ -136,26 +155,27 @@ fn import_bytes(
     let target_root = target_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(crate::config::Config::sessions_dir);
-    let session_path = target_root.join(format!("{id}.jsonl"));
-
-    let already_imported = session_path.exists();
-    if already_imported {
+    // Idempotency probe: the session store nests by cwd, so scan for the
+    // content-addressed id anywhere under the target root.
+    let already_imported = find_imported_session(&target_root, &id);
+    if let Some(existing_path) = already_imported {
         return Ok(ImportOutcome {
             schema: IMPORT_SCHEMA.to_string(),
             source: source.as_str().to_string(),
             original_path: original_path.display().to_string(),
             session_id: id,
-            session_path: session_path.display().to_string(),
+            session_path: existing_path.display().to_string(),
             imported: 0,
             skipped: 0,
             already_imported: true,
-            report: vec![format!("already imported: {}", session_path.display())],
+            report: vec![format!("already imported: {}", existing_path.display())],
         });
     }
 
     let mut session = Session::create_with_dir(Some(target_root.clone()));
     session.header.id = id.clone();
-    session.path = Some(session_path.clone());
+    // Let the store derive the canonical path (it nests by cwd); the outcome
+    // reads the actual path after save.
     session.header.provider = Some(source.as_str().to_string());
     session.header.model_id = Some(format!("foreign-{}", source.as_str()));
     session.header.cwd = std::env::current_dir()
@@ -212,20 +232,23 @@ fn import_bytes(
         "imported {imported} message(s), skipped {skipped} line(s)"
     ));
 
-    // Persist.
-    let persist = {
+    // Persist; the store derives the canonical (cwd-nested) path.
+    let actual_path = {
         let mut session = session;
-        async move { session.save().await }
+        futures::executor::block_on(async {
+            session.save().await?;
+            Ok::<_, crate::error::Error>(session.path.clone())
+        })
+        .map_err(|e| Error::tool("import", format!("failed to write session: {e}")))?
+        .ok_or_else(|| Error::tool("import", "session save produced no path".to_string()))?
     };
-    futures::executor::block_on(persist)
-        .map_err(|e| Error::tool("import", format!("failed to write session: {e}")))?;
 
     Ok(ImportOutcome {
         schema: IMPORT_SCHEMA.to_string(),
         source: source.as_str().to_string(),
         original_path: original_path.display().to_string(),
         session_id: id,
-        session_path: session_path.display().to_string(),
+        session_path: actual_path.display().to_string(),
         imported,
         skipped,
         already_imported: false,
