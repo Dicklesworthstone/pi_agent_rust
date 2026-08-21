@@ -242,6 +242,43 @@ fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
     build_vcr_system_prompt_for_args(vcr_interactive_args, workdir, env_root)
 }
 
+/// The exact Anthropic tool schemas the interactive binary sends for
+/// `vcr_interactive_args()`: every registered tool that is not
+/// discoverable-tier (the agent keeps discoverable tools out of the live
+/// schema until promoted via `xdev`). Deriving this from the real
+/// `ToolRegistry` keeps cassettes from drifting when implicitly-registered
+/// tools (e.g. `xdev`, `submit_plan`) change.
+fn vcr_anthropic_tool_schemas(cwd: &Path) -> Vec<Value> {
+    let mut args: Vec<&str> = vec!["pi"];
+    args.extend(vcr_interactive_args());
+    let cli = cli::Cli::try_parse_from(args).expect("parse vcr cli args");
+    let enabled = cli.enabled_tools();
+    let config = pi::config::Config::default();
+    let registry = pi::tools::ToolRegistry::new(&enabled, cwd, Some(&config));
+    let mut schemas: Vec<Value> = registry
+        .tools()
+        .iter()
+        .filter(|tool| !registry.is_discoverable(tool.name()))
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "input_schema": tool.parameters(),
+            })
+        })
+        .collect();
+    // `submit_plan` is appended by main.rs via `agent.extend_tools` after
+    // registry construction ("always registered — self-errors outside plan
+    // mode"), so it is part of the live schema too.
+    let submit_plan = pi::plan::SubmitPlanTool::new(pi::plan::PlanState::new(), false);
+    schemas.push(json!({
+        "name": submit_plan.name(),
+        "description": submit_plan.description(),
+        "input_schema": submit_plan.parameters(),
+    }));
+    schemas
+}
+
 fn parse_scroll_percent(pane: &str) -> Option<u32> {
     let marker = pane
         .lines()
@@ -288,7 +325,7 @@ fn vcr_scroll_finalize_response() -> String {
 fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
     let cassette_path = dir.join(format!("{VCR_BASIC_CHAT_TEST_NAME}.json"));
 
-    let request = json!({
+    let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
@@ -297,6 +334,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request);
 
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");
@@ -378,7 +416,7 @@ fn write_vcr_scroll_finalize_cassette(dir: &Path, system_prompt: &str) -> PathBu
     let cassette_path = dir.join(format!("{VCR_SCROLL_FINALIZE_TEST_NAME}.json"));
     let response_text = vcr_scroll_finalize_response();
 
-    let request = json!({
+    let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": VCR_SCROLL_FINALIZE_PROMPT } ] }
@@ -387,6 +425,7 @@ fn write_vcr_scroll_finalize_cassette(dir: &Path, system_prompt: &str) -> PathBu
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request);
 
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");
@@ -530,15 +569,8 @@ fn write_vcr_cassette_for_read(
     read_path: &str,
 ) -> PathBuf {
     let cassette_path = dir.join(format!("{VCR_TEST_NAME}.json"));
-    let tool_schema = {
-        let tool = ReadTool::new(dir);
-        json!({
-            "name": tool.name(),
-            "description": tool.description(),
-            "input_schema": tool.parameters(),
-        })
-    };
-    let request_one = json!({
+    let tool_schemas = vcr_anthropic_tool_schemas(dir);
+    let mut request_one = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt } ] }
@@ -546,9 +578,10 @@ fn write_vcr_cassette_for_read(
         "system": system_prompt,
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
-        "tools": [tool_schema],
+        "tools": tool_schemas.clone(),
     });
-    let request_two = json!({
+    common::apply_prompt_cache_wire_shape(&mut request_one);
+    let mut request_two = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt } ] },
@@ -579,8 +612,9 @@ fn write_vcr_cassette_for_read(
         "system": system_prompt,
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
-        "tools": [tool_schema],
+        "tools": tool_schemas,
     });
+    common::apply_prompt_cache_wire_shape(&mut request_two);
 
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");
@@ -1736,7 +1770,7 @@ fn e2e_tui_basic_chat_vcr() {
 
     // Diagnostic: write the expected request body for comparison
     let diag_path = session.harness.temp_path("expected_body.json");
-    let expected_body = json!({
+    let mut expected_body = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
@@ -1745,6 +1779,7 @@ fn e2e_tui_basic_chat_vcr() {
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut expected_body);
     std::fs::write(
         &diag_path,
         serde_json::to_string_pretty(&expected_body).unwrap(),
@@ -2855,7 +2890,7 @@ fn e2e_scenario_error_api_failure() {
 
     let error_prompt = "trigger error";
     let cassette_path = cassette_dir.join(format!("{test_name}.json"));
-    let request = json!({
+    let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": error_prompt } ] }
@@ -2864,6 +2899,7 @@ fn e2e_scenario_error_api_failure() {
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request);
 
     let error_response = RecordedResponse {
         status: 500,
@@ -3458,7 +3494,7 @@ fn e2e_scenario_prompt_loop_multi_round() {
         }
     };
 
-    let request_1 = json!({
+    let mut request_1 = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt_1 } ] }
@@ -3467,8 +3503,9 @@ fn e2e_scenario_prompt_loop_multi_round() {
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request_1);
 
-    let request_2 = json!({
+    let mut request_2 = json!({
         "model": VCR_MODEL,
         "messages": [
             { "role": "user", "content": [ { "type": "text", "text": prompt_1 } ] },
@@ -3482,6 +3519,7 @@ fn e2e_scenario_prompt_loop_multi_round() {
         "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
+    common::apply_prompt_cache_wire_shape(&mut request_2);
 
     let cassette = Cassette {
         version: "1.0".to_string(),
@@ -4055,5 +4093,98 @@ fn e2e_scenario_exit_strategy_roundtrip() {
     test(
         ExitStrategy::Timeout(Duration::from_secs(30)),
         "timeout_30000ms",
+    );
+}
+
+// ============================================================================
+// VCR cassette shape parity (no tmux needed).
+//
+// Every VCR e2e in this file synthesizes its cassette request bodies by hand.
+// When the Anthropic provider's wire shape evolves (e.g. the prompt-cache
+// work moved `system` from a string to a block array), the hand-written
+// templates silently stop matching and every VCR e2e dies with "No matching
+// interaction". This test rebuilds the real provider request for the
+// tool-read scenario's first turn and template-matches the synthesized
+// cassette against it, failing with both bodies printed so the drift is
+// obvious.
+// ============================================================================
+
+/// Recorded-template match with the same semantics as `pi::vcr`:
+/// object keys in `recorded` must match (incoming may have extras), arrays
+/// are strict length + per-element, scalars strict equality.
+fn vcr_template_matches(recorded: &Value, incoming: &Value) -> bool {
+    match (recorded, incoming) {
+        (Value::Object(recorded_obj), Value::Object(incoming_obj)) => {
+            recorded_obj
+                .iter()
+                .all(|(key, recorded_value)| match incoming_obj.get(key) {
+                    Some(incoming_value) => vcr_template_matches(recorded_value, incoming_value),
+                    None => recorded_value.is_null(),
+                })
+        }
+        (Value::Array(recorded_items), Value::Array(incoming_items)) => {
+            recorded_items.len() == incoming_items.len()
+                && recorded_items
+                    .iter()
+                    .zip(incoming_items)
+                    .all(|(left, right)| vcr_template_matches(left, right))
+        }
+        _ => recorded == incoming,
+    }
+}
+
+#[test]
+fn vcr_tool_read_cassette_template_matches_provider_request() {
+    let harness = common::TestHarness::new("vcr_tool_read_cassette_template_matches_request");
+    let workdir = harness.temp_dir().to_path_buf();
+    let env_root = workdir.join("env");
+    let system_prompt = build_vcr_system_prompt(&workdir, &env_root);
+    let cassette_dir = harness.temp_path("vcr");
+    let cassette_path = write_vcr_cassette(&cassette_dir, "irrelevant tool output", &system_prompt);
+    let cassette: Value =
+        serde_json::from_str(&std::fs::read_to_string(&cassette_path).expect("read cassette"))
+            .expect("parse cassette");
+    let recorded = cassette["interactions"][0]["request"]["body"].clone();
+    assert!(!recorded.is_null(), "cassette first request body missing");
+
+    // Mirror the interactive binary's first-turn request for the same CLI
+    // args (`vcr_interactive_args`): anthropic provider, read tool only,
+    // thinking off, prompt-cache retention default (short).
+    let provider = pi::providers::anthropic::AnthropicProvider::new(VCR_MODEL);
+    let tools: Vec<pi::provider::ToolDef> = vcr_anthropic_tool_schemas(&workdir)
+        .iter()
+        .map(|schema| pi::provider::ToolDef {
+            name: schema["name"].as_str().unwrap_or_default().to_string(),
+            description: schema["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            parameters: schema["input_schema"].clone(),
+        })
+        .collect();
+    let messages = vec![pi::model::Message::User(pi::model::UserMessage {
+        content: pi::model::UserContent::Text(VCR_PROMPT.to_string()),
+        timestamp: 0,
+    })];
+    let context = pi::provider::Context {
+        system_prompt: Some(std::borrow::Cow::Borrowed(system_prompt.as_str())),
+        messages: std::borrow::Cow::Owned(messages),
+        tools: std::borrow::Cow::Owned(tools),
+    };
+    let options = pi::provider::StreamOptions {
+        cache_retention: pi::provider::CacheRetention::Short,
+        max_tokens: Some(VCR_MODEL_MAX_TOKENS),
+        thinking_level: Some(pi::model::ThinkingLevel::Off),
+        ..Default::default()
+    };
+    let actual = serde_json::to_value(provider.build_request(&context, &options))
+        .expect("serialize provider request");
+
+    assert!(
+        vcr_template_matches(&recorded, &actual),
+        "synthesized VCR cassette no longer matches the provider's request \
+         shape.\n--- recorded template ---\n{}\n--- actual provider request ---\n{}",
+        serde_json::to_string_pretty(&recorded).unwrap_or_default(),
+        serde_json::to_string_pretty(&actual).unwrap_or_default(),
     );
 }
