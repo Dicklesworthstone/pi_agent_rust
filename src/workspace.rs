@@ -206,7 +206,6 @@ pub fn validate_new_root(root: &Path) -> Result<PathBuf> {
     }
     Ok(safe_canonicalize(root))
 }
-
 /// THE unified confinement gate (bd-cv653.3.12): a canonical path must sit
 /// under one of the allowed roots. Named refusal otherwise. Callers must
 /// symlink-resolve (`safe_canonicalize`) both the path and each root before
@@ -219,10 +218,7 @@ pub fn ensure_canonical_path_allowed(
     allowed_roots: &[PathBuf],
     action: &str,
 ) -> Result<()> {
-    if allowed_roots
-        .iter()
-        .any(|root| canonical_path.starts_with(root.as_path()))
-    {
+    if any_root_contains(allowed_roots, canonical_path) {
         return Ok(());
     }
     let listed = allowed_roots
@@ -237,6 +233,17 @@ pub fn ensure_canonical_path_allowed(
             canonical_path.display()
         ),
     ))
+}
+
+/// The single containment decision (bd-cv653.3.12): whether a canonical
+/// path sits under any of the canonical roots. Tool enforcement and the
+/// extension FS connector both call this so their prefix semantics cannot
+/// drift.
+#[must_use]
+pub fn any_root_contains(roots: &[PathBuf], canonical_path: &Path) -> bool {
+    roots
+        .iter()
+        .any(|root| canonical_path.starts_with(root.as_path()))
 }
 
 #[cfg(test)]

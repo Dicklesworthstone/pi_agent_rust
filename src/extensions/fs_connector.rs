@@ -249,7 +249,13 @@ impl FsConnector {
             FsOp::Write | FsOp::Mkdir => canonicalize_for_create(&target),
         }?;
 
-        let matched_root = roots.iter().find(|root| canonical_target.starts_with(root));
+        // bd-cv653.3.12: the containment decision routes through the same
+        // helper as tool enforcement so prefix semantics cannot drift.
+        let matched_root = if crate::workspace::any_root_contains(roots, &canonical_target) {
+            roots.iter().find(|root| canonical_target.starts_with(root.as_path()))
+        } else {
+            None
+        };
 
         if matched_root.is_none() {
             let root_hashes = roots.iter().map(|root| hash_path(root)).collect::<Vec<_>>();
