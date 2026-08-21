@@ -335,6 +335,15 @@ fn command_value(command: Option<&Commands>) -> Value {
             "action": action,
             "older_than_days": older_than_days,
         }),
+        Some(Commands::Completions { shell }) => json!({
+            "name": "completions",
+            "shell": shell,
+        }),
+        Some(Commands::Complete { flag, prefix }) => json!({
+            "name": "__complete",
+            "flag": flag,
+            "prefix": prefix,
+        }),
         Some(Commands::ContextPreview {
             format,
             bead,

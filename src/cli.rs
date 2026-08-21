@@ -2045,6 +2045,26 @@ pub enum Commands {
         older_than_days: u64,
     },
 
+    /// Print shell completion script from the live CLI graph (bd-cv653.7.2)
+    #[command(name = "completions")]
+    Completions {
+        /// bash | zsh | fish
+        #[arg(value_parser = ["bash", "zsh", "fish"])]
+        shell: String,
+    },
+
+    /// Dynamic completion protocol (bd-cv653.7.2): answer candidates for a
+    /// value-taking flag from the live registry/session index.
+    #[command(name = "__complete", hide = true)]
+    Complete {
+        /// The flag being completed (`--model`, `--session`, ...). Hyphen
+        /// values are allowed because the completed token IS a flag.
+        #[arg(allow_hyphen_values = true)]
+        flag: String,
+        /// Prefix typed so far (may be empty)
+        #[arg(default_value = "", allow_hyphen_values = true)]
+        prefix: String,
+    },
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {

@@ -2262,6 +2262,12 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         } => {
             handle_worktree(cwd, &action, older_than_days)?;
         }
+        cli::Commands::Completions { shell } => {
+            pi::completions::print_script(&shell, &mut std::io::stdout().lock())?;
+        }
+        cli::Commands::Complete { flag, prefix } => {
+            pi::completions::complete(&flag, &prefix, &mut std::io::stdout().lock())?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
