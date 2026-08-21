@@ -216,6 +216,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         turn_recovery: Default::default(),
         approval_state: None,
         bash_settings: None,
+            secrets: None,
     };
     Agent::new(provider, tools, config)
 }
@@ -1193,6 +1194,7 @@ fn agent_tool_execution_error_wraps_in_output() {
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
 
         let agent = Agent::new(provider, tools, config);
@@ -1269,6 +1271,7 @@ fn agent_queue_follow_up_only_at_idle() {
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
         let mut agent = Agent::new(provider, tools, config);
 

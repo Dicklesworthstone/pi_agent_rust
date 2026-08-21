@@ -1873,6 +1873,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         turn_recovery: config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: config.bash.clone(),
+            secrets: None,
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
@@ -2281,6 +2282,7 @@ mod tests {
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
+            secrets: None,
             },
         );
 
@@ -2452,6 +2454,7 @@ mod tests {
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
+            secrets: None,
             },
         );
 

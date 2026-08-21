@@ -198,6 +198,7 @@ fn run_scripted(
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1075,6 +1076,7 @@ fn sdk_conformance_session_tool_hooks() {
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1164,6 +1166,7 @@ fn sdk_conformance_combined_callback_ordering() {
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1280,6 +1283,7 @@ fn sdk_continue_turn_uses_combined_listener_path() {
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1373,6 +1377,7 @@ fn sdk_continue_turn_with_abort_returns_aborted_message() {
             turn_recovery: Default::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(

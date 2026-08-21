@@ -694,6 +694,9 @@ pub struct AgentConfig {
 
     /// Bash mediation settings for hard policy gating (bd-cv653.1.7).
     pub bash_settings: Option<crate::config::BashSettings>,
+
+    /// Secrets vault settings (bd-cv653.7.9): mode + user patterns.
+    pub secrets: Option<crate::secrets::SecretsSettings>,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -755,6 +758,7 @@ impl Default for AgentConfig {
             turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
+            secrets: None,
         }
     }
 }
@@ -1249,6 +1253,10 @@ pub struct Agent {
     /// Magic-keyword activations this run (bd-cv653.3.6), drained by the
     /// session wrapper into session Custom entries for auditability.
     keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
+
+    /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
+    /// memory and dies with the session — never persisted raw.
+    secrets_vault: crate::secrets::SecretVault,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1304,6 +1312,7 @@ impl Agent {
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
             keyword_ledger: Vec::new(),
+            secrets_vault: crate::secrets::SecretVault::default(),
         }
     }
 
@@ -1755,6 +1764,132 @@ impl Agent {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         self.run_loop(Vec::new(), Arc::new(on_event), abort).await
+    }
+
+    /// Outbound secrets transform (bd-cv653.7.9): obfuscate credential
+    /// shapes in the context before the provider sees it (or refuse the
+    /// send in block mode). Off mode is byte-identical.
+    fn apply_secrets_outbound(
+        &mut self,
+        mut context: Context<'static>,
+    ) -> Result<Context<'static>> {
+        let mode = crate::secrets::SecretsMode::from_setting(
+            self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
+        );
+        if mode == crate::secrets::SecretsMode::Off {
+            return Ok(context);
+        }
+        let extra = crate::secrets::compile_extra_patterns(
+            self.config
+                .secrets
+                .as_ref()
+                .and_then(|s| s.extra_patterns.as_deref())
+                .unwrap_or(&[]),
+        );
+        let mut total = 0usize;
+        let mut labels: Vec<String> = Vec::new();
+
+        if let Some(prompt) = context.system_prompt.as_deref() {
+            let out = Self::secrets_transform_text(
+                prompt,
+                &mut self.secrets_vault,
+                mode,
+                &extra,
+                &mut total,
+                &mut labels,
+            )?;
+            context.system_prompt = Some(std::borrow::Cow::Owned(out));
+        }
+        for message in context.messages.to_mut().iter_mut() {
+            match message {
+                Message::User(user) => {
+                    if let UserContent::Text(text) = &mut user.content {
+                        *text = Self::secrets_transform_text(
+                            text,
+                            &mut self.secrets_vault,
+                            mode,
+                            &extra,
+                            &mut total,
+                            &mut labels,
+                        )?;
+                    }
+                }
+                Message::Assistant(assistant) => {
+                    let assistant_mut = Arc::make_mut(assistant);
+                    for block in &mut assistant_mut.content {
+                        match block {
+                            ContentBlock::Text(t) => {
+                                t.text = Self::secrets_transform_text(
+                                    &t.text,
+                                    &mut self.secrets_vault,
+                                    mode,
+                                    &extra,
+                                    &mut total,
+                                    &mut labels,
+                                )?;
+                            }
+                            ContentBlock::Thinking(t) => {
+                                t.thinking = Self::secrets_transform_text(
+                                    &t.thinking,
+                                    &mut self.secrets_vault,
+                                    mode,
+                                    &extra,
+                                    &mut total,
+                                    &mut labels,
+                                )?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Message::ToolResult(result) => {
+                    let result_mut = Arc::make_mut(result);
+                    for block in &mut result_mut.content {
+                        if let ContentBlock::Text(t) = block {
+                            t.text = Self::secrets_transform_text(
+                                &t.text,
+                                &mut self.secrets_vault,
+                                mode,
+                                &extra,
+                                &mut total,
+                                &mut labels,
+                            )?;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if total > 0 {
+            tracing::info!(
+                event = "pi.secrets.outbound",
+                detections = total,
+                rules = ?labels,
+                "secrets obfuscated in outbound context (redacted)"
+            );
+        }
+        Ok(context)
+    }
+
+    fn secrets_transform_text(
+        text: &str,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<String> {
+        if mode == crate::secrets::SecretsMode::Block {
+            crate::secrets::gate_outbound(text, mode, extra)?;
+        }
+        let (out, audit) = crate::secrets::obfuscate(text, vault, extra);
+        *total += audit.detections;
+        for rule in audit.rules {
+            if !labels.contains(&rule) {
+                labels.push(rule);
+            }
+        }
+        Ok(out)
     }
 
     fn build_abort_message(&self, partial: Option<&AssistantMessage>) -> AssistantMessage {
@@ -2500,6 +2635,11 @@ impl Agent {
             .await
             .unwrap_or(base_messages);
         let context = Context::owned(system_prompt, messages, tools);
+        // Secrets vault (bd-cv653.7.9): credential shapes in the outbound
+        // context become stable placeholders (obfuscate) or a named refusal
+        // (block) before any provider sees them. The vault is in-memory and
+        // dies with the session.
+        let context = self.apply_secrets_outbound(context)?;
         let mut stream = provider.stream(&context, &stream_options).await?;
 
         let mut added_partial = false;
@@ -3513,6 +3653,12 @@ impl Agent {
     ) -> (ToolOutput, bool) {
         let extensions = self.extensions.clone();
 
+        // Inbound secrets restore (bd-cv653.7.9): placeholders in tool-call
+        // arguments become the real values before approval/execution (the
+        // operator approves the REAL command), and restored values are
+        // masked again in the result heading back to the model.
+        let tool_call = self.restore_secrets_inbound(tool_call);
+
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
             .await;
@@ -3554,7 +3700,78 @@ impl Agent {
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
         }
 
+        // Mask any restored real values in the result heading back to the
+        // model (echo hygiene: a bash echo of the value shows the
+        // placeholder).
+        self.mask_secrets_in_output(&mut output);
+
         (output, is_error)
+    }
+
+    /// Inbound restore (bd-cv653.7.9): placeholders in tool-call arguments
+    /// become real values before approval/execution.
+    fn restore_secrets_inbound(&self, mut tool_call: ToolCall) -> ToolCall {
+        if crate::secrets::SecretsMode::from_setting(
+            self.config
+                .secrets
+                .as_ref()
+                .and_then(|s| s.mode.as_deref()),
+        ) == crate::secrets::SecretsMode::Off
+        {
+            return tool_call;
+        }
+        tool_call.arguments = Self::restore_json_value(&self.secrets_vault, tool_call.arguments);
+        tool_call
+    }
+
+    fn restore_json_value(
+        vault: &crate::secrets::SecretVault,
+        value: serde_json::Value,
+    ) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(text) => serde_json::Value::String(vault.restore(&text)),
+            serde_json::Value::Array(items) => serde_json::Value::Array(
+                items
+                    .into_iter()
+                    .map(|item| Self::restore_json_value(vault, item))
+                    .collect(),
+            ),
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.into_iter()
+                    .map(|(key, item)| (vault.restore(&key), Self::restore_json_value(vault, item)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    /// Echo hygiene (bd-cv653.7.9): restored real values in tool output are
+    /// masked back to placeholders before the model sees the result.
+    fn mask_secrets_in_output(&self, output: &mut ToolOutput) {
+        if crate::secrets::SecretsMode::from_setting(
+            self.config
+                .secrets
+                .as_ref()
+                .and_then(|s| s.mode.as_deref()),
+        ) == crate::secrets::SecretsMode::Off
+        {
+            return;
+        }
+        for block in &mut output.content {
+            if let ContentBlock::Text(t) = block {
+                t.text = self.secrets_vault.mask(&t.text);
+            }
+        }
+        if let Some(details) = &mut output.details
+            && let Some(text) = serde_json::to_string(details)
+                .ok()
+                .filter(|text| text.contains("<pi-secret:"))
+        {
+            let masked = self.secrets_vault.mask(&text);
+            if let Ok(value) = serde_json::from_str(&masked) {
+                *details = value;
+            }
+        }
     }
 
     async fn request_tool_approval(
@@ -13230,6 +13447,7 @@ mod tests {
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
+                secrets: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13268,6 +13486,7 @@ mod tests {
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
+                secrets: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13467,6 +13686,7 @@ mod tests {
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
+                secrets: None,
             },
         );
 
