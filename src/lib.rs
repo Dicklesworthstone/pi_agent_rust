@@ -277,6 +277,7 @@ pub mod token_count;
 pub mod tools;
 #[doc(hidden)]
 pub mod tui;
+pub mod turn_recovery;
 pub mod undo;
 pub mod url_read;
 #[doc(hidden)]

@@ -1377,6 +1377,7 @@ fn handle_session_new(
             .map(|client| client.handler_for_session(session_id.clone())),
         keyword_settings: options.config.keywords.clone(),
         max_time: None,
+        turn_recovery: options.config.turn_recovery_mode(),
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
@@ -2448,6 +2449,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             },
         );
 

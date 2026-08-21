@@ -208,6 +208,11 @@ pub struct Config {
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
 
+    /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15):
+    /// "off" | "conservative" (default) | "aggressive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_recovery: Option<crate::turn_recovery::TurnRecoveryMode>,
+
     // Extension Policy
     #[serde(alias = "extensionPolicy")]
     pub extension_policy: Option<ExtensionPolicyConfig>,
@@ -882,6 +887,7 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
             // Extension Policy
             extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),
@@ -1089,6 +1095,12 @@ impl Config {
 
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
+    }
+
+    /// Resolved turn-recovery mode (bd-cv653.3.15).
+    #[must_use]
+    pub fn turn_recovery_mode(&self) -> crate::turn_recovery::TurnRecoveryMode {
+        self.turn_recovery.unwrap_or_default()
     }
 
     pub fn fail_closed_hooks(&self) -> bool {

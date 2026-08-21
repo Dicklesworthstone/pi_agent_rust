@@ -685,6 +685,9 @@ pub struct AgentConfig {
     /// after the deadline the agent stops with a 'time cap reached' marker
     /// instead of starting another turn.
     pub max_time: Option<std::time::Duration>,
+
+    /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15).
+    pub turn_recovery: crate::turn_recovery::TurnRecoveryMode,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -698,6 +701,7 @@ impl fmt::Debug for AgentConfig {
             .field("tool_approval", &self.tool_approval.is_some())
             .field("keyword_settings", &self.keyword_settings)
             .field("max_time", &self.max_time)
+            .field("turn_recovery", &self.turn_recovery)
             .finish()
     }
 }
@@ -740,6 +744,7 @@ impl Default for AgentConfig {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
+            turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
         }
     }
 }
@@ -1857,6 +1862,8 @@ impl Agent {
 
         // Delivery boundary: start of turn (steering messages queued while idle).
         let mut pending_messages = self.drain_steering_messages().await;
+        let mut turn_recovery =
+            crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
         // Wall-clock run cap (bd-cv653.3.7, --max-time): checked at turn
         // boundaries — never mid-tool-call. On expiry the run stops with a
@@ -2266,6 +2273,21 @@ impl Agent {
                 } else {
                     // Delivery boundary: after assistant completion (no tool calls).
                     pending_messages = self.drain_steering_messages().await;
+                }
+
+                // Turn recovery (bd-cv653.3.15): with nothing queued and no
+                // tool calls pending, an unexpected mid-task stop earns one
+                // synthetic continue nudge (hard-capped) instead of a silent
+                // end. The nudge flows through pending_messages so it is
+                // evented and persisted like any user message.
+                if pending_messages.is_empty() && !has_more_tool_calls {
+                    let text = assistant_text_content(&assistant_arc.content);
+                    if let Some(action) = turn_recovery.evaluate(assistant_arc.stop_reason, &text) {
+                        pending_messages = vec![Message::User(UserMessage {
+                            content: UserContent::Text(action.nudge_text),
+                            timestamp: Utc::now().timestamp_millis(),
+                        })];
+                    }
                 }
             }
 
@@ -6522,6 +6544,155 @@ mod extensions_integration_tests {
 
             // A steer message should short-circuit remaining tool dispatch.
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    /// bd-cv653.3.15: a Length-truncated reply mid-code-block earns one
+    /// auto-continue nudge and the next call completes the turn; the nudge
+    /// is recorded in history as a user message carrying the marker.
+    struct TruncatingProvider {
+        stream_calls: AtomicUsize,
+        truncated_replies: usize,
+    }
+
+    impl TruncatingProvider {
+        const fn new(truncated_replies: usize) -> Self {
+            Self {
+                stream_calls: AtomicUsize::new(0),
+                truncated_replies,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for TruncatingProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call_index = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            let (reason, text) = if call_index < self.truncated_replies {
+                (StopReason::Length, "```rust\nfn main() {")
+            } else {
+                (StopReason::Stop, "}\n```\nAll done.")
+            };
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: reason,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            let partial = AssistantMessage {
+                content: Vec::new(),
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            let events = vec![
+                Ok(StreamEvent::Start { partial }),
+                Ok(StreamEvent::Done { reason, message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn turn_recovery_auto_continues_budget_truncation() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(1));
+            let tools = ToolRegistry::from_tools(vec![]);
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(provider_dyn, tools, AgentConfig::default());
+
+            let final_message = agent.run("write main", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+            assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+
+            let nudges: Vec<_> = agent
+                .messages()
+                .iter()
+                .filter(|message| {
+                    matches!(message, Message::User(user)
+                        if matches!(&user.content, crate::model::UserContent::Text(text)
+                            if text.contains("auto-continue")))
+                })
+                .collect();
+            assert_eq!(nudges.len(), 1, "exactly one nudge recorded");
+        });
+    }
+
+    /// bd-cv653.3.15: the cap allows two auto-continuations, then the run
+    /// ends with the truncated message instead of looping forever.
+    #[test]
+    fn turn_recovery_cap_stops_after_two_continuations() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(10));
+            let tools = ToolRegistry::from_tools(vec![]);
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(provider_dyn, tools, AgentConfig::default());
+
+            let final_message = agent.run("write main", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Length);
+            assert_eq!(
+                provider.stream_calls.load(Ordering::SeqCst),
+                3,
+                "initial call + two capped continuations"
+            );
+        });
+    }
+
+    /// bd-cv653.3.15: recovery off means a truncated stop ends the run
+    /// untouched.
+    #[test]
+    fn turn_recovery_off_leaves_truncation_alone() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatingProvider::new(10));
+            let tools = ToolRegistry::from_tools(vec![]);
+            let config = AgentConfig {
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::Off,
+                ..Default::default()
+            };
+            let provider_dyn: Arc<dyn Provider> = provider.clone();
+            let mut agent = Agent::new(provider_dyn, tools, config);
+
+            let final_message = agent.run("write main", |_| {}).await.expect("run");
+            assert_eq!(final_message.stop_reason, StopReason::Length);
+            assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
         });
     }
 
@@ -11771,6 +11942,21 @@ fn is_truncated_before_tool_call(message: &AssistantMessage, tool_call_started: 
 }
 
 /// Extract tool calls from content blocks.
+/// Concatenated visible text of an assistant message, for stop
+/// classification (bd-cv653.3.15).
+fn assistant_text_content(content: &[ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in content {
+        if let ContentBlock::Text(part) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&part.text);
+        }
+    }
+    text
+}
+
 fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
         .iter()
@@ -12933,6 +13119,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -12968,6 +13155,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13164,6 +13352,7 @@ mod tests {
                 tool_approval: None,
                 keyword_settings: None,
                 max_time: None,
+                turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
             },
         );
 

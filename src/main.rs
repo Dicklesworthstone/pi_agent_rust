@@ -1686,6 +1686,7 @@ async fn run(
         tool_approval: None,
         keyword_settings: config.keywords.clone(),
         max_time: cli.max_time.map(std::time::Duration::from_secs),
+        turn_recovery: config.turn_recovery_mode(),
     };
 
     // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit
