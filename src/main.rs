@@ -2251,6 +2251,12 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::UpdateIndex => {
             handle_update_index().await?;
         }
+        cli::Commands::Worktree {
+            action,
+            older_than_days,
+        } => {
+            handle_worktree(cwd, &action, older_than_days)?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4368,6 +4374,44 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// `pi worktree list|clean` (bd-cv653.5.2): the user-facing worktree
+/// manager. Shares the reaper with the subagent isolation machinery so
+/// policy can't drift.
+fn handle_worktree(cwd: &std::path::Path, action: &str, older_than_days: u64) -> Result<()> {
+    match action {
+        "list" => {
+            let mine = pi::worktree_iso::list_mine(cwd)?;
+            if mine.is_empty() {
+                println!("No pi-iso agent worktrees under {}", cwd.display());
+            } else {
+                for info in &mine {
+                    let age_hours = info.age_ms / 3_600_000;
+                    println!("{} (branch {}, age {}h)", info.path, info.branch, age_hours);
+                }
+            }
+        }
+        "clean" => {
+            let reaped = pi::worktree_iso::reap_stale(
+                cwd,
+                std::time::Duration::from_secs(older_than_days.saturating_mul(86_400)),
+            )?;
+            if reaped.is_empty() {
+                println!("No stale pi-iso worktrees to reap.");
+            } else {
+                for path in &reaped {
+                    println!("reaped {path}");
+                }
+            }
+        }
+        other => {
+            return Err(anyhow::anyhow!(
+                "Unknown worktree action '{other}'; expected list or clean"
+            ));
+        }
+    }
     Ok(())
 }
 

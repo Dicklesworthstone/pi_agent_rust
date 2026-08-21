@@ -197,7 +197,7 @@ impl Tool for SubagentTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md."
+        "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md. Workspace isolation: per-task `isolation: \"worktree\"` runs the child in a git worktree carrying the parent's uncommitted state, returning {worktree_path, diff_stat, patch} and applying per `isoApply` (keep|apply|drop; serial application, conflicts reported never forced). Coordination: isolated worktree children need no file reservations by construction; NON-isolated children share the parent checkout, so concurrent edits to the same files should be coordinated (e.g. Agent Mail file reservations with reason=<task id>)."
     }
 
     fn parameters(&self) -> Value {
@@ -221,6 +221,8 @@ impl Tool for SubagentTool {
                         "agent": {"type": "string"},
                         "task": {"type": "string"},
                         "cwd": {"type": "string"},
+                        "isolation": {"type": "string", "enum": ["none", "worktree"], "default": "none", "description": "worktree runs the child in a git worktree with the parent's uncommitted state; non-git dirs refuse with PI_ISO_NOT_GIT."},
+                        "isoApply": {"type": "string", "enum": ["keep", "apply", "drop"], "default": "apply", "description": "What to do with the isolated worktree after completion."},
                         "outputSchema": {"type": "object", "description": "JSON Schema this task's final output must match."},
                         "schemaMode": {"type": "string", "enum": ["permissive", "strict"], "default": "permissive"}
                     }
@@ -304,6 +306,8 @@ impl SubagentRequest {
                 agent: agent.clone(),
                 task: task.clone(),
                 cwd: None,
+                isolation: None,
+                iso_apply: None,
                 output_schema: self.output_schema.clone(),
                 schema_mode: self.schema_mode,
             });
@@ -371,6 +375,13 @@ struct SubagentTask {
     task: String,
     #[serde(default)]
     cwd: Option<PathBuf>,
+    /// Workspace isolation: `none` (default) or `worktree` (bd-cv653.5.2).
+    #[serde(default)]
+    isolation: Option<String>,
+    /// What to do with an isolated worktree after completion: `keep`,
+    /// `apply` (default), or `drop`.
+    #[serde(default)]
+    iso_apply: Option<String>,
     /// JSON Schema the child's final output must match (bd-cv653.5.1).
     /// Overrides the agent definition's `output_schema` when both are set.
     #[serde(default)]
@@ -798,6 +809,30 @@ impl ChildRunner {
                 format!("Working directory does not exist: {}", cwd.display()),
             );
         }
+
+        // Workspace isolation (bd-cv653.5.2): `worktree` runs the child in
+        // a git worktree carrying the parent's uncommitted state; the patch
+        // is collected and applied per `iso_apply` at completion.
+        let isolation = task
+            .isolation
+            .as_deref()
+            .unwrap_or("none")
+            .to_ascii_lowercase();
+        let iso_handle = if isolation == "worktree" {
+            match crate::worktree_iso::isolate(&cwd, &task.task) {
+                Ok(handle) => Some(handle),
+                Err(err) => {
+                    return SubagentResult::failed(agent, task, step, err.to_string());
+                }
+            }
+        } else {
+            None
+        };
+        let run_cwd = iso_handle
+            .as_ref()
+            .map_or_else(|| cwd.clone(), |handle| handle.path.clone());
+        let iso_apply = task.iso_apply.clone();
+
         let args = child_args(
             agent,
             &task.task,
@@ -805,14 +840,14 @@ impl ChildRunner {
             output_schema,
         );
         let mut result =
-            SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args);
+            SubagentResult::starting(agent, task, step, &self.child_binary, &run_cwd, &args);
         let update = on_update.as_ref();
         emit_progress(update, &result);
 
         let mut command = Command::new(&self.child_binary);
         command
             .args(&args)
-            .current_dir(&cwd)
+            .current_dir(&run_cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -893,6 +928,51 @@ impl ChildRunner {
         }
         child.disarm();
         emit_progress(update, &result);
+
+        // Worktree isolation completion (bd-cv653.5.2): collect the patch
+        // and apply per `iso_apply` (keep/apply/drop). A conflicting apply
+        // reports files and leaves the worktree — never force.
+        if let Some(handle) = iso_handle {
+            let mode = crate::worktree_iso::IsoApplyMode::parse(iso_apply.as_deref())
+                .unwrap_or(crate::worktree_iso::IsoApplyMode::Apply);
+            let mut outcome = crate::worktree_iso::IsoOutcome {
+                schema: crate::worktree_iso::ISO_SCHEMA.to_string(),
+                worktree_path: handle.path.display().to_string(),
+                branch: handle.branch.clone(),
+                diff_stat: String::new(),
+                patch: String::new(),
+                conflicted_files: Vec::new(),
+                apply_mode: mode.as_str().to_string(),
+                applied: false,
+            };
+            match crate::worktree_iso::collect_diff(&handle) {
+                Ok((patch, diff_stat)) => {
+                    outcome.diff_stat = diff_stat;
+                    outcome.patch.clone_from(&patch);
+                    if mode == crate::worktree_iso::IsoApplyMode::Apply {
+                        match crate::worktree_iso::apply_to_parent(&handle, &patch) {
+                            Ok(()) => {
+                                outcome.applied = true;
+                                let _ = crate::worktree_iso::drop_worktree(&handle);
+                            }
+                            Err(err) => {
+                                outcome.conflicted_files =
+                                    err.to_string().lines().map(str::to_string).collect();
+                                result.error = Some(err.to_string());
+                                result.is_error = true;
+                            }
+                        }
+                    } else if mode == crate::worktree_iso::IsoApplyMode::Drop {
+                        let _ = crate::worktree_iso::drop_worktree(&handle);
+                    }
+                }
+                Err(err) => {
+                    result.error = Some(format!("failed to collect isolated diff: {err}"));
+                    result.is_error = true;
+                }
+            }
+            result.iso = Some(outcome);
+        }
         result
     }
 }
@@ -1147,6 +1227,9 @@ struct SubagentResult {
     /// Corrective retries consumed (bounded to one).
     #[serde(skip_serializing_if = "Option::is_none")]
     schema_retries: Option<usize>,
+    /// Worktree-isolation outcome (bd-cv653.5.2) when the task ran isolated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iso: Option<crate::worktree_iso::IsoOutcome>,
     session_isolation: &'static str,
     #[serde(skip)]
     is_error: bool,
@@ -1186,6 +1269,7 @@ impl SubagentResult {
             schema_valid: None,
             validation_errors: None,
             schema_retries: None,
+            iso: None,
             session_isolation: "ephemeral_no_session",
             is_error: false,
         }
@@ -1214,6 +1298,7 @@ impl SubagentResult {
             schema_valid: None,
             validation_errors: None,
             schema_retries: None,
+            iso: None,
             session_isolation: "ephemeral_no_session",
             is_error: true,
         }
@@ -1622,6 +1707,8 @@ mod tests {
             agent: "review".to_string(),
             task: concat!("review {", "previous}").to_string(),
             cwd: None,
+            isolation: None,
+            iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
         };
@@ -1644,6 +1731,8 @@ mod tests {
             task: "verdict {{previous.data.verdict}} n {{previous.data.stats.count}} miss {{previous.data.absent}}"
                 .to_string(),
             cwd: None,
+            isolation: None,
+            iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
         };
@@ -1812,6 +1901,8 @@ mod tests {
             agent: name.to_string(),
             task: "t".to_string(),
             cwd: None,
+            isolation: None,
+            iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
         };
@@ -1858,6 +1949,8 @@ mod tests {
             agent: "inj".to_string(),
             task: "t".to_string(),
             cwd: None,
+            isolation: None,
+            iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
         };

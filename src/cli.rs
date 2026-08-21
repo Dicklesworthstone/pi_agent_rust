@@ -2026,6 +2026,17 @@ pub enum Commands {
     #[command(name = "update-index")]
     UpdateIndex,
 
+    /// Manage pi-iso agent worktrees (bd-cv653.5.2)
+    #[command(name = "worktree")]
+    Worktree {
+        /// `list` live agent worktrees or `clean` stale ones
+        #[arg(value_parser = ["list", "clean"])]
+        action: String,
+        /// Reap worktrees older than this many days (clean only, default 1)
+        #[arg(long, default_value = "1")]
+        older_than_days: u64,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {

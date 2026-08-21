@@ -327,6 +327,14 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::UpdateIndex) => json!({
             "name": "update-index",
         }),
+        Some(Commands::Worktree {
+            action,
+            older_than_days,
+        }) => json!({
+            "name": "worktree",
+            "action": action,
+            "older_than_days": older_than_days,
+        }),
         Some(Commands::ContextPreview {
             format,
             bead,
