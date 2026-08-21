@@ -2994,7 +2994,12 @@ mod tests {
         let entries: Vec<&SessionEntry> = vec![&user, &assistant];
 
         let heuristic = estimate_entries_context_tokens(&entries);
-        assert_eq!(heuristic, 2, "char heuristic: 'hi' => 1, 'ok' => 1");
+        // Exact counts differ between the BPE counter (feature `bpe-tokens`)
+        // and the chars/4 fallback; either way two 2-char messages stay tiny.
+        assert!(
+            (1..=8).contains(&heuristic),
+            "tiny-message heuristic should be a handful of tokens: {heuristic}"
+        );
 
         // Sanity: the usage-aware estimator WOULD balloon to the stale total,
         // proving the two paths diverge and tokensAfter uses the heuristic.
@@ -3164,6 +3169,23 @@ mod tests {
             parent_id: None,
             timestamp: "2026-01-01T00:00:00.000Z".to_string(),
         }
+    }
+
+    /// `n` distinct space-separated words. Unlike a run of one repeated
+    /// character (which BPE collapses to almost nothing), this keeps the
+    /// token count in the same ballpark under the O200k/Cl100k counters
+    /// (~2 tokens/word) and the chars/4 fallback (~1.6 tokens/word), so
+    /// cut-point calibrations hold with `bpe-tokens` on or off.
+    fn distinct_words(n: usize) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for i in 0..n {
+            if i > 0 {
+                out.push(' ');
+            }
+            let _ = write!(out, "word{i}");
+        }
+        out
     }
 
     fn user_entry(id: &str, text: &str) -> SessionEntry {
@@ -4014,9 +4036,11 @@ mod tests {
         // If it picked >= 2, it would pick 3, discarding the ToolResult and Call (keeping only 20 tokens).
         // By picking 1, we keep 1..4 (130 tokens).
 
-        // Create entries with controlled lengths.
-        // With chars/token ~=3, 400 chars => ceil(400/3)=134 tokens.
-        let tr_text = "x".repeat(400);
+        // Create entries with controlled lengths. Distinct words keep the
+        // token count high under BOTH counters (a run of identical chars
+        // BPE-compresses to almost nothing): 80 words is ~130 tokens via
+        // chars/4 and ~160 via O200k.
+        let tr_text = distinct_words(80);
         let entries = vec![
             user_entry("0", "user"),              // Valid
             assistant_entry("1", "call", 10, 10), // Valid (Assistant)
@@ -4087,10 +4111,13 @@ mod tests {
         // entries 1-3 and summarizing only entry 0.
 
         let entries = vec![
-            user_entry("0", &"x".repeat(4000)),             // 1000 tokens
-            assistant_entry("1", &"x".repeat(400), 50, 50), // 100 tokens
-            tool_result_entry("2", &"x".repeat(400)),       // 100 tokens
-            user_entry("3", "next"),                        // 1 token
+            // Distinct words keep counts materially similar under the BPE
+            // counter and the chars/4 fallback (see the sibling cut-point
+            // test): ~1000+, ~100-120, ~65-80, ~1 tokens respectively.
+            user_entry("0", &distinct_words(600)),
+            assistant_entry("1", &distinct_words(120), 50, 50),
+            tool_result_entry("2", &distinct_words(60)),
+            user_entry("3", "next"),
         ];
 
         let settings = ResolvedCompactionSettings {
