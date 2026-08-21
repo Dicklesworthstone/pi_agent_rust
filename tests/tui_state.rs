@@ -2583,6 +2583,10 @@ fn tui_state_system_message_appends_without_processing() {
     let harness = TestHarness::new("tui_state_system_message_appends_without_processing");
     let message = "OAuth token for anthropic has expired. Run /login anthropic to re-authenticate.";
     let mut app = build_app(&harness, Vec::new());
+    // System messages hard-wrap to the terminal width (bd-06s4y); use a
+    // terminal wide enough for the whole sentence so the contains() below
+    // stays byte-exact.
+    app.set_terminal_size(200, 30);
     log_initial_state(&harness, &app);
 
     let step = apply_pi(
@@ -9465,6 +9469,10 @@ fn tui_perf_e2e_streaming_with_history() {
     } else {
         1.0
     };
+    // Round so the JSONL round-trip assertion in
+    // validate_or_write_perf_artifact never trips over f64 shortest-repr
+    // precision for unlucky quotients (timing-dependent flake).
+    let ratio = (ratio * 1_000_000.0).round() / 1_000_000.0;
     assert!(
         ratio < 5.0,
         "late tokens should not be much slower than early tokens: \
