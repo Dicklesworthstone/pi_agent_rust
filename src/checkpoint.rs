@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::model::{Message, UserContent, UserMessage};
 use crate::session::{Session, SessionEntry, SessionMessage};
 
