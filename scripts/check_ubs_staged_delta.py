@@ -5,6 +5,12 @@
 already have known baseline findings, that can bury the actionable signal for a
 small patch. This gate keeps UBS in the loop while reducing the result to the
 lines introduced or modified in the staged diff.
+
+It also auto-waives one verified UBS false-positive class (bd-gel2u): the
+"Path join/push with untrusted-looking segment" warning fired on `recv.push(x)`
+where `recv` provably resolves to a Vec-like local declaration in the staged
+file. Anything ambiguous (parameters, fields, shadowed or path-like
+declarations) still fails and needs an inline `ubs:ignore` marker.
 """
 
 from __future__ import annotations
@@ -54,6 +60,144 @@ EXPECTED_HOOK_COMMANDS = (
     "timeout 60s ubs --staged --only=rust .",
     "python3 scripts/check_ubs_staged_delta.py",
 )
+
+# bd-gel2u class 3: UBS's path-traversal checker keys on argument names like
+# `path`, so `vec.push(path)` trips "Path join/push with untrusted-looking
+# segment" even though Vec::push cannot touch the filesystem. Both the category
+# line and the advice line can end up as the parsed finding message, so match
+# either phrasing.
+PATH_PUSH_FINDING_RE = re.compile(r"Path join/push|Reject absolute paths")
+PUSH_RECEIVER_RE = re.compile(r"^\s*(?P<recv>[A-Za-z_]\w*)\s*\.\s*push\s*\(")
+VEC_LIKE_RE = re.compile(
+    r"\b(?:Vec|VecDeque|BinaryHeap)\s*(?:::\s*<[^=;]*>\s*)?::\s*"
+    r"(?:new|with_capacity|from)\b"
+    r"|\bvec!\s*[\[(]"
+    r"|^\s*(?:std::(?:collections::)?)?(?:Vec|VecDeque|BinaryHeap)\s*<"
+)
+PATH_LIKE_RE = re.compile(r"\bPathBuf\b|\bPath\s*::|to_path_buf\s*\(|\bOsString\b")
+
+
+def staged_file_text(root: Path, rel_path: str) -> str | None:
+    proc = run(["git", "show", f":{rel_path}"], root, check=False)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def vec_push_false_positive(source: str, line_no: int) -> bool:
+    """True only when the flagged line pushes onto a provably Vec-like local.
+
+    The declaration scan is whole-file, so require that every `let` binding of
+    the receiver name is Vec-like; one path-like or unrecognized declaration
+    (possible shadowing) keeps the finding. Parameters and struct fields have
+    no `let` declaration and therefore never waive.
+    """
+    lines = source.splitlines()
+    if not 1 <= line_no <= len(lines):
+        return False
+    push = PUSH_RECEIVER_RE.match(lines[line_no - 1])
+    if push is None:
+        return False
+    recv = push.group("recv")
+    decl_re = re.compile(
+        rf"\blet\s+(?:mut\s+)?{re.escape(recv)}\b\s*"
+        rf"(?::\s*(?P<ty>[^=;]+?))?\s*=\s*(?P<init>[^;]*)"
+    )
+    declarations = list(decl_re.finditer(source))
+    if not declarations:
+        return False
+    for decl in declarations:
+        ty = (decl.group("ty") or "").strip()
+        init = (decl.group("init") or "").strip()
+        if PATH_LIKE_RE.search(f"{ty} {init}"):
+            return False
+        if not (VEC_LIKE_RE.search(init) or VEC_LIKE_RE.search(ty)):
+            return False
+    return True
+
+
+def apply_verified_waivers(
+    root: Path, failures: list[Finding]
+) -> tuple[list[Finding], list[tuple[Finding, str]]]:
+    kept: list[Finding] = []
+    waived: list[tuple[Finding, str]] = []
+    sources: dict[str, str | None] = {}
+    for finding in failures:
+        if PATH_PUSH_FINDING_RE.search(finding.message):
+            if finding.path not in sources:
+                sources[finding.path] = staged_file_text(root, finding.path)
+            source = sources[finding.path]
+            if source is not None and vec_push_false_positive(source, finding.line):
+                waived.append((finding, "Vec-like receiver, push is not a filesystem op"))
+                continue
+        kept.append(finding)
+    return kept, waived
+
+
+def run_waiver_self_test() -> None:
+    vec_source = (
+        "pub fn path_like_inputs(inputs: &[String]) -> Vec<String> {\n"
+        "    let mut out: Vec<String> = Vec::new();\n"
+        "    for raw in inputs {\n"
+        "        let path = raw.trim().to_string();\n"
+        "        out.push(path);\n"
+        "    }\n"
+        "    out\n"
+        "}\n"
+    )
+    assert vec_push_false_positive(vec_source, 5)
+
+    inferred_source = "let mut out = vec![];\nout.push(path);\n"
+    assert vec_push_false_positive(inferred_source, 2)
+
+    pathbuf_source = (
+        "let mut p = base.to_path_buf();\n"
+        "p.push(seg);\n"
+    )
+    assert not vec_push_false_positive(pathbuf_source, 2)
+
+    param_source = (
+        "pub fn add(out: &mut Vec<String>, path: String) {\n"
+        "    out.push(path);\n"
+        "}\n"
+    )
+    assert not vec_push_false_positive(param_source, 2)
+
+    shadowed_source = (
+        "let mut out = Vec::new();\n"
+        "let out = std::path::PathBuf::from(base);\n"
+        "out.push(path);\n"
+    )
+    assert not vec_push_false_positive(shadowed_source, 3)
+
+    join_source = "let mut p = std::path::PathBuf::new();\np.join(seg);\n"
+    assert not vec_push_false_positive(join_source, 2)
+
+    print("WAIVER SELF-TEST PASS")
+
+
+def run_parse_self_test() -> None:
+    sample = (
+        "• Path join/push with untrusted-looking segment\n"
+        "  ⚠ Warning (2 found)\n"
+        "    Path join/push with untrusted-looking segment\n"
+        "    Reject absolute paths and '..' components; canonicalize\n"
+        "      /repo/a.rs:5\n"
+        "      dest.push(path);\n"
+        "      /repo/b.rs:4\n"
+        "      out.push(path);\n"
+        "Critical: 0\n"
+        "Warning: 2\n"
+        "Info: 0\n"
+    )
+    findings, totals = parse_ubs_output(Path("/repo"), sample)
+    assert totals == {"critical": 0, "warning": 2, "info": 0}, totals
+    assert [f.path for f in findings] == ["a.rs", "b.rs"], findings
+    assert all(f.severity == "warning" for f in findings)
+    expected = "Path join/push with untrusted-looking segment"
+    assert all(f.message == expected for f in findings), findings
+
+    print("PARSE SELF-TEST PASS")
 
 
 def run(args: list[str], cwd: Path, *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -149,6 +293,7 @@ def parse_ubs_output(root: Path, output: str) -> tuple[list[Finding], dict[str, 
     totals: dict[str, int] = {}
     severity = ""
     message = ""
+    locations_seen = False
 
     for raw_line in output.splitlines():
         stripped = raw_line.strip()
@@ -160,14 +305,17 @@ def parse_ubs_output(root: Path, output: str) -> tuple[list[Finding], dict[str, 
         if "Critical" in stripped:
             severity = "critical"
             message = ""
+            locations_seen = False
             continue
         if "Warning" in stripped:
             severity = "warning"
             message = ""
+            locations_seen = False
             continue
         if "Info" in stripped:
             severity = "info"
             message = ""
+            locations_seen = False
             continue
 
         location = UBS_LOCATION_RE.search(raw_line)
@@ -175,11 +323,9 @@ def parse_ubs_output(root: Path, output: str) -> tuple[list[Finding], dict[str, 
             rel_path = normalize_path(root, location.group("path"))
             if rel_path is not None:
                 # Prefer the description on the SAME line as the location
-                # ("file.rs:42:5 – Issue description"). Only fall back to the
-                # carried category/context line when the location line has no
-                # trailing text, and consume the carried message either way so
-                # a previous finding's snippet or fix text never attaches to a
-                # later finding in a different file (bd-gel2u class 2).
+                # ("file.rs:42:5 – Issue description"); otherwise use the
+                # block description captured below, which applies to every
+                # location listed under this severity block.
                 remainder = re.sub(r"^:\d+", "", raw_line[location.end() :].strip())
                 remainder = remainder.strip().lstrip("–—-:· ").strip()
                 findings.append(
@@ -190,14 +336,17 @@ def parse_ubs_output(root: Path, output: str) -> tuple[list[Finding], dict[str, 
                         message=remainder or message,
                     )
                 )
-            message = ""
+            locations_seen = True
             continue
 
-        # 💡 lines are fix suggestions for the PREVIOUS finding; code-snippet
-        # and box-drawing lines are context — none of them may become the
-        # message of the NEXT finding.
-        if severity and stripped and not stripped.startswith(("✓", "▓", "─", "╔", "║", "╚", "💡")):
-            message = stripped
+        # The first plain text line after a severity marker is the block's
+        # issue description; later pre-location lines are advice. Once
+        # locations start, every following text line is a code snippet echo
+        # of a flagged line and must never become a finding message
+        # (bd-gel2u class 2 — snippets used to leak across files).
+        if severity and stripped and not stripped.startswith(("✓", "▓", "─", "╔", "║", "╚", "💡", "•")):
+            if not locations_seen and not message:
+                message = stripped
 
     return findings, totals
 
@@ -506,6 +655,8 @@ def main() -> int:
 
     root = repo_root()
     if args.self_test:
+        run_waiver_self_test()
+        run_parse_self_test()
         return run_precommit_hook_self_test()
 
     if args.check_pre_commit_hook:
@@ -554,6 +705,11 @@ def main() -> int:
     if args.fail_on_info:
         fail_severities.add("info")
     failures = [finding for finding in changed_findings if finding.severity in fail_severities]
+    failures, waived = apply_verified_waivers(root, failures)
+    waived_findings = {finding for finding, _ in waived}
+    changed_findings = [
+        finding for finding in changed_findings if finding not in waived_findings
+    ]
 
     print(
         "UBS staged delta: "
@@ -574,6 +730,11 @@ def main() -> int:
         print(f"UBS command failed with exit {proc.returncode}.", file=sys.stderr)
         print(proc.stdout[-4000:], file=sys.stderr)
         return proc.returncode
+
+    if waived:
+        print("UBS staged delta auto-waived verified false positives (bd-gel2u):")
+        for finding, reason in waived:
+            print(f" - {finding.severity}: {finding.path}:{finding.line} - {reason}")
 
     if failures:
         print("UBS staged delta failed on changed-line findings:", file=sys.stderr)
