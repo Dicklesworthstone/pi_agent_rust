@@ -904,6 +904,26 @@ impl PiApp {
         None
     }
 
+    /// `/usage [refresh]` (bd-cv653.7.4): provider quota/credit table.
+    pub(super) fn handle_slash_usage(&mut self, args: &str) -> Option<Cmd> {
+        let refresh = args.trim().eq_ignore_ascii_case("refresh");
+        let cx = asupersync::Cx::for_request();
+        let event_tx = self.event_tx.clone();
+        self.status_message = Some("Fetching provider usage...".to_string());
+        self.runtime_handle.spawn(async move {
+            let message = match crate::auth::AuthStorage::load(crate::config::Config::auth_path()) {
+                Ok(auth) => {
+                    let rows = crate::usage::gather_usage(&auth, refresh).await;
+                    crate::usage::render_usage_text(&rows)
+                }
+                Err(err) => format!("Failed to load credentials: {err}"),
+            };
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &cx, PiMsg::System(message)).await;
+        });
+        None
+    }
+
     /// `/fresh` (bd-cv653.3.7): reset provider stream state; transcript
     /// untouched.
     pub(super) fn handle_slash_fresh(&mut self) -> Option<Cmd> {

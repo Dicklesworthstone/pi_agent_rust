@@ -2365,6 +2365,15 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 only.as_deref(),
             )?;
         }
+        cli::Commands::Usage { format, refresh } => {
+            let auth = AuthStorage::load(Config::auth_path())?;
+            let rows = pi::usage::gather_usage(&auth, refresh).await;
+            if format == "json" {
+                println!("{}", pi::usage::render_usage_json(&rows));
+            } else {
+                println!("{}", pi::usage::render_usage_text(&rows));
+            }
+        }
         cli::Commands::Migrate { path, dry_run } => {
             handle_session_migrate(&path, dry_run)?;
         }

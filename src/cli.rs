@@ -44,6 +44,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "config",
     "doctor",
     "migrate",
+    "usage",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -2197,6 +2198,16 @@ pub enum Commands {
     },
 
     /// Migrate session files from JSONL v1 to v2 segment format
+    /// Show provider usage/quota state (bd-cv653.7.4)
+    Usage {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+        /// Force live reads (skip the 60s cache)
+        #[arg(long)]
+        refresh: bool,
+    },
+
     Migrate {
         /// Path to specific session JSONL file (or directory to migrate all)
         path: String,

@@ -48,6 +48,7 @@ pub enum SlashCommand {
     Retry,
     Undo,
     Redo,
+    Usage,
 }
 
 impl SlashCommand {
@@ -95,6 +96,7 @@ impl SlashCommand {
             "/retry" => Self::Retry,
             "/undo" => Self::Undo,
             "/redo" => Self::Redo,
+            "/usage" => Self::Usage,
             _ => return None,
         };
 
@@ -133,6 +135,7 @@ impl SlashCommand {
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
+  /usage [refresh]   - Show provider usage/quota state
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2299,6 +2302,7 @@ impl PiApp {
             SlashCommand::Retry => self.handle_slash_retry(),
             SlashCommand::Undo => self.handle_slash_undo(args),
             SlashCommand::Redo => self.handle_slash_redo(args),
+            SlashCommand::Usage => self.handle_slash_usage(args),
         }
     }
 
