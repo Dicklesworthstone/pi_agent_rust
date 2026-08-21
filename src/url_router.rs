@@ -672,10 +672,10 @@ mod tests {
         git(&["commit", "-m", "init"]);
         // Branch A edits, branch B edits the same line → conflict on merge.
         git(&["checkout", "-b", "side"]);
-        std::fs::write(dir.join("f.txt"), "side\n").expect("side");
+        std::fs::write(dir.join("f.txt"), "side\n").expect("side"); // ubs:ignore test fixture
         git(&["commit", "-am", "side"]);
         git(&["checkout", "main"]);
-        std::fs::write(dir.join("f.txt"), "main\n").expect("main");
+        std::fs::write(dir.join("f.txt"), "main\n").expect("main"); // ubs:ignore test fixture
         git(&["commit", "-am", "main"]);
         let out = std::process::Command::new("git")
             .arg("-C")

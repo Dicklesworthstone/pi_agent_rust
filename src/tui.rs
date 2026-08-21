@@ -27,17 +27,19 @@ use rich_rust::segment::Segment;
 static TUI_OWNS_TERMINAL: AtomicBool = AtomicBool::new(false);
 static TUI_LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
 
-fn tui_log_file() -> &'static Option<Mutex<std::fs::File>> {
-    TUI_LOG_FILE.get_or_init(|| {
-        let dir = crate::config::Config::global_dir().join("logs");
-        std::fs::create_dir_all(&dir).ok()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("tui.log"))
-            .ok()?;
-        Some(Mutex::new(file))
-    })
+fn tui_log_file() -> Option<&'static Mutex<std::fs::File>> {
+    TUI_LOG_FILE
+        .get_or_init(|| {
+            let dir = crate::config::Config::global_dir().join("logs");
+            std::fs::create_dir_all(&dir).ok()?;
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("tui.log"))
+                .ok()?;
+            Some(Mutex::new(file))
+        })
+        .as_ref()
 }
 
 /// RAII guard that diverts tracing output away from the terminal for as long
@@ -72,10 +74,7 @@ impl Write for TuiAwareLogWriter {
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 // Best-effort: a failed log write must never disturb the TUI.
-                return match file.write(buf) {
-                    Ok(written) => Ok(written),
-                    Err(_) => Ok(buf.len()),
-                };
+                return Ok(file.write(buf).unwrap_or(buf.len()));
             }
             // No log file available: swallow the output rather than corrupt
             // the alt-screen frame.
