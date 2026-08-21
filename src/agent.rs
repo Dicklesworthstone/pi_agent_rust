@@ -3712,10 +3712,7 @@ impl Agent {
     /// become real values before approval/execution.
     fn restore_secrets_inbound(&self, mut tool_call: ToolCall) -> ToolCall {
         if crate::secrets::SecretsMode::from_setting(
-            self.config
-                .secrets
-                .as_ref()
-                .and_then(|s| s.mode.as_deref()),
+            self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
         ) == crate::secrets::SecretsMode::Off
         {
             return tool_call;
@@ -3749,10 +3746,7 @@ impl Agent {
     /// masked back to placeholders before the model sees the result.
     fn mask_secrets_in_output(&self, output: &mut ToolOutput) {
         if crate::secrets::SecretsMode::from_setting(
-            self.config
-                .secrets
-                .as_ref()
-                .and_then(|s| s.mode.as_deref()),
+            self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
         ) == crate::secrets::SecretsMode::Off
         {
             return;
