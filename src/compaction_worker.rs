@@ -860,6 +860,7 @@ mod tests {
                 details: compaction::CompactionDetails {
                     read_files: vec![],
                     modified_files: vec![],
+                    mode: None,
                 },
             };
             let pending = ready_pending_with_handle(runtime_handle, Ok(result)).await;
@@ -888,6 +889,7 @@ mod tests {
             details: compaction::CompactionDetails {
                 read_files: vec![],
                 modified_files: vec![],
+                mode: None,
             },
         })
     }

@@ -14097,6 +14097,7 @@ mod tests {
                 details: compaction::CompactionDetails {
                     read_files: vec!["src/main.rs".to_string()],
                     modified_files: vec!["src/agent.rs".to_string()],
+                    mode: None,
                 },
             };
 

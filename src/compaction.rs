@@ -95,6 +95,10 @@ impl Default for ResolvedCompactionSettings {
 pub struct CompactionDetails {
     pub read_files: Vec<String>,
     pub modified_files: Vec<String>,
+    /// Compaction mode that produced this entry ("shake"); absent for the
+    /// default LLM-summary mode (bd-cv653.3.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1988,6 +1992,7 @@ fn finish_compaction(preparation: CompactionPreparation, mut summary: String) ->
     let details = CompactionDetails {
         read_files: read_files.clone(),
         modified_files: modified_files.clone(),
+        mode: None,
     };
 
     summary.push_str(&format_file_operations(&read_files, &modified_files));
@@ -2044,6 +2049,158 @@ pub async fn compact(
 pub fn compact_local(preparation: CompactionPreparation) -> CompactionResult {
     let summary = build_fallback_summary(&preparation);
     finish_compaction(preparation, summary)
+}
+
+// ── Shake compaction (bd-cv653.3.18) ────────────────────────────────
+
+/// Tool-result payloads at or below this size survive a shake verbatim.
+pub const SHAKE_KEEP_RESULT_CHARS: usize = 512;
+
+/// Projected effect of a shake on the to-be-compacted span.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShakeProjection {
+    pub tokens_before: u64,
+    pub projected_tokens: u64,
+}
+
+impl ShakeProjection {
+    #[must_use]
+    pub const fn reclaimed_tokens(&self) -> u64 {
+        self.tokens_before.saturating_sub(self.projected_tokens)
+    }
+}
+
+fn content_blocks_text(content: &[ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in content {
+        if let ContentBlock::Text(part) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&part.text);
+        }
+    }
+    text
+}
+
+/// Deterministic no-LLM "shake" summary: conversation text preserved
+/// verbatim, bulky tool-result payloads dropped to one-line stubs. Cheap and
+/// instant — the reclaim comes entirely from tool output bulk.
+#[must_use]
+pub fn build_shake_summary(preparation: &CompactionPreparation) -> String {
+    let mut out = String::from(
+        "## Context Checkpoint (shake)\n\n\
+         Bulky tool results were dropped from this span; the conversation \
+         text below is verbatim. Re-run a tool if its full output is needed \
+         again.",
+    );
+
+    if let Some(previous) = preparation
+        .previous_summary
+        .as_deref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        out.push_str("\n\n## Previous Summary\n\n");
+        out.push_str(previous);
+    }
+
+    for message in preparation
+        .messages_to_summarize
+        .iter()
+        .chain(preparation.turn_prefix_messages.iter())
+    {
+        match message {
+            SessionMessage::User { content, .. } => {
+                let text = match content {
+                    UserContent::Text(text) => text.clone(),
+                    UserContent::Blocks(blocks) => content_blocks_text(blocks),
+                };
+                if !text.trim().is_empty() {
+                    let _ = write!(out, "\n\n[user]\n{text}");
+                }
+            }
+            SessionMessage::Assistant { message } => {
+                let text = content_blocks_text(&message.content);
+                if !text.trim().is_empty() {
+                    let _ = write!(out, "\n\n[assistant]\n{text}");
+                }
+                for block in &message.content {
+                    if let ContentBlock::ToolCall(call) = block {
+                        let _ = write!(out, "\n[assistant called {}]", call.name);
+                    }
+                }
+            }
+            SessionMessage::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                ..
+            } => {
+                let text = content_blocks_text(content);
+                let status = if *is_error { "failed " } else { "" };
+                if text.len() <= SHAKE_KEEP_RESULT_CHARS {
+                    let _ = write!(out, "\n\n[{status}tool result {tool_name}]\n{text}");
+                } else {
+                    let lines = text.lines().count();
+                    let _ = write!(
+                        out,
+                        "\n\n[{status}tool result {tool_name} — {lines} lines / {} bytes dropped; re-run if needed]",
+                        text.len()
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+/// Provider-free "shake" compaction.
+///
+/// Replaces the span with a deterministic summary that keeps conversation
+/// text and stubs bulky tool results — zero LLM calls. Cut-point and
+/// adjacency rules are inherited from [`prepare_compaction`], so no dangling
+/// tool-call/result pairs survive.
+#[must_use]
+pub fn compact_shake(preparation: CompactionPreparation) -> CompactionResult {
+    let summary = build_shake_summary(&preparation);
+    let mut result = finish_compaction(preparation, summary);
+    result.details.mode = Some("shake".to_string());
+    result
+}
+
+/// Chars/3 token estimate for a summary string (matches the module's
+/// internal estimator).
+#[must_use]
+pub const fn estimate_text_tokens(text: &str) -> u64 {
+    (text.len() / CHARS_PER_TOKEN_ESTIMATE) as u64
+}
+
+/// Estimate what the compacted span would shrink to under a shake.
+#[must_use]
+pub fn shake_projection(preparation: &CompactionPreparation) -> ShakeProjection {
+    let summary = build_shake_summary(preparation);
+    ShakeProjection {
+        tokens_before: preparation.tokens_before,
+        projected_tokens: (summary.len() / CHARS_PER_TOKEN_ESTIMATE) as u64,
+    }
+}
+
+/// Shake-first auto policy (bd-cv653.3.18): after a shake, would the span
+/// still trip the compaction threshold? True means escalate to the LLM
+/// summary; false means the shake alone reclaims enough.
+#[must_use]
+pub fn shake_first_needs_summary(
+    projection: ShakeProjection,
+    settings: &ResolvedCompactionSettings,
+) -> bool {
+    should_compact(
+        projection.projected_tokens,
+        settings.context_window_tokens,
+        settings,
+    )
 }
 
 pub fn compaction_details_to_value(details: &CompactionDetails) -> Result<Value> {
@@ -3138,6 +3295,7 @@ mod tests {
         let details = CompactionDetails {
             read_files: vec!["a.rs".to_string()],
             modified_files: vec!["b.rs".to_string()],
+            mode: None,
         };
         let value = compaction_details_to_value(&details).unwrap();
         assert_eq!(value["readFiles"], json!(["a.rs"]));
@@ -3944,7 +4102,7 @@ mod tests {
             enabled: true,
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
-            keep_recent_tokens: 100,
+            keep_recent_tokens: 5,
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -3952,6 +4110,126 @@ mod tests {
         assert!(!p.messages_to_summarize.is_empty());
         assert!(p.tokens_before > 0);
         assert!(p.previous_summary.is_none());
+    }
+
+    /// bd-cv653.3.18: shake drops bulky tool-result payloads to stubs while
+    /// keeping conversation text verbatim, with zero LLM involvement. The
+    /// fixture places the bulk before the second-to-last user boundary so the
+    /// standard cut point puts it inside the compacted span.
+    #[test]
+    fn shake_drops_bulky_tool_results_and_keeps_text() {
+        let huge_result = "line of tool output\n".repeat(10_000);
+        let entries = vec![
+            user_entry("1", "Please audit the parser module"),
+            assistant_entry("2", "Reading the parser now.", 55_000, 5_000),
+            tool_result_entry("3", &huge_result),
+            user_entry("4", "Also check the lexer"),
+            assistant_entry("5", "Lexer is clean.", 55_000, 5_000),
+            user_entry("6", "recent question"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 50_000,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 5,
+        };
+        let prep = prepare_compaction(&entries, settings).expect("prep");
+        let first_kept = prep.first_kept_entry_id.clone();
+        let result = compact_shake(prep);
+
+        assert_eq!(result.details.mode.as_deref(), Some("shake"));
+        assert_eq!(result.first_kept_entry_id, first_kept);
+        assert!(
+            result.summary.contains("Please audit the parser module"),
+            "user text preserved: {}",
+            result.summary
+        );
+        assert!(
+            result.summary.contains("dropped; re-run if needed"),
+            "bulky result stubbed: {}",
+            result.summary
+        );
+        assert!(
+            !result
+                .summary
+                .contains("line of tool output\nline of tool output"),
+            "payload must not survive"
+        );
+    }
+
+    /// bd-cv653.3.18: small tool results survive a shake verbatim.
+    #[test]
+    fn shake_keeps_small_tool_results() {
+        let entries = vec![
+            user_entry("1", "start the build"),
+            assistant_entry("2", "running the build", 55_000, 5_000),
+            tool_result_entry("3", "exit 0"),
+            user_entry("4", "now check tests"),
+            assistant_entry("5", "tests pass", 55_000, 5_000),
+            user_entry("6", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 50_000,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 5,
+        };
+        let prep = prepare_compaction(&entries, settings).expect("prep");
+        let result = compact_shake(prep);
+        assert!(
+            result.summary.contains("exit 0"),
+            "small result kept: {}",
+            result.summary
+        );
+    }
+
+    /// bd-cv653.3.18: the shake projection captures the tool-bulk reclaim,
+    /// and the shake-first policy escalates only when the remaining span
+    /// still trips the threshold.
+    #[test]
+    fn shake_projection_and_shake_first_policy() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 50_000,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 5,
+        };
+
+        // Tool-heavy span: shake reclaims nearly everything -> no escalation.
+        let huge_result = "x".repeat(300_000);
+        let entries = vec![
+            user_entry("1", "small goal"),
+            assistant_entry("2", "checking", 55_000, 5_000),
+            tool_result_entry("3", &huge_result),
+            user_entry("4", "next step"),
+            assistant_entry("5", "ok", 55_000, 5_000),
+            user_entry("6", "recent"),
+        ];
+        let prep = prepare_compaction(&entries, settings.clone()).expect("prep");
+        let projection = shake_projection(&prep);
+        assert!(
+            projection.reclaimed_tokens() * 10 >= projection.tokens_before * 8,
+            "tool-heavy shake reclaims at least 80%: {projection:?}"
+        );
+        assert!(
+            !shake_first_needs_summary(projection, &prep.settings),
+            "no escalation when shake reclaims enough"
+        );
+
+        // Text-heavy span: shake keeps the text, so the summary must run.
+        let entries = vec![
+            user_entry("1", &"prose ".repeat(30_000)),
+            assistant_entry("2", &"reply ".repeat(30_000), 55_000, 5_000),
+            user_entry("3", "next step"),
+            assistant_entry("4", "ok", 55_000, 5_000),
+            user_entry("5", "recent"),
+        ];
+        let prep = prepare_compaction(&entries, settings).expect("prep");
+        let projection = shake_projection(&prep);
+        assert!(
+            shake_first_needs_summary(projection, &prep.settings),
+            "text-heavy shake must escalate: {projection:?}"
+        );
     }
 
     #[test]
@@ -3968,7 +4246,7 @@ mod tests {
             enabled: true,
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
-            keep_recent_tokens: 100,
+            keep_recent_tokens: 5,
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());

@@ -1015,10 +1015,27 @@ impl PiApp {
         let api_key_opt = agent_guard.stream_options().api_key.clone();
         drop(agent_guard);
 
-        let Some(api_key) = api_key_opt else {
+        // Mode selection (bd-cv653.3.18): a leading `shake` drops bulky tool
+        // results deterministically with zero LLM calls; `aggressive` runs the
+        // LLM summary with a halved keep-recent window. Remaining words stay
+        // custom instructions for the summarizer.
+        let trimmed_args = args.trim();
+        let first_token = trimmed_args.split_whitespace().next();
+        let shake_mode = matches!(first_token, Some("shake" | "--shake"));
+        let aggressive_mode = matches!(first_token, Some("aggressive" | "--aggressive"));
+        let rest = if shake_mode || aggressive_mode {
+            trimmed_args
+                .split_once(char::is_whitespace)
+                .map_or("", |(_, rest)| rest)
+                .trim()
+        } else {
+            trimmed_args
+        };
+
+        if !shake_mode && api_key_opt.is_none() {
             self.status_message = Some("No API key configured; cannot run compaction".to_string());
             return None;
-        };
+        }
 
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
@@ -1026,12 +1043,15 @@ impl PiApp {
         let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
         let reserve_tokens = self.config.compaction_reserve_tokens();
-        let keep_recent_tokens = self.config.compaction_keep_recent_tokens();
-        let custom_instructions = args.trim().to_string();
-        let custom_instructions = if custom_instructions.is_empty() {
+        let keep_recent_tokens = if aggressive_mode {
+            self.config.compaction_keep_recent_tokens() / 2
+        } else {
+            self.config.compaction_keep_recent_tokens()
+        };
+        let custom_instructions = if rest.is_empty() {
             None
         } else {
-            Some(custom_instructions)
+            Some(rest.to_string())
         };
         let is_compacting = Arc::clone(&self.extension_compacting);
 
@@ -1132,14 +1152,18 @@ impl PiApp {
                         true,
                     )
                 } else {
-                    let result = match crate::compaction::compact(
-                        prep,
-                        Arc::clone(&provider),
-                        &api_key,
-                        custom_instructions.as_deref(),
-                    )
-                    .await
-                    {
+                    let compact_outcome = if shake_mode {
+                        Ok(crate::compaction::compact_shake(prep))
+                    } else {
+                        crate::compaction::compact(
+                            prep,
+                            Arc::clone(&provider),
+                            api_key_opt.as_deref().unwrap_or_default(),
+                            custom_instructions.as_deref(),
+                        )
+                        .await
+                    };
+                    let result = match compact_outcome {
                         Ok(result) => result,
                         Err(err) => {
                             is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1164,6 +1188,7 @@ impl PiApp {
                     )
                 };
 
+            let summary_tokens_after = crate::compaction::estimate_text_tokens(&summary);
             let (messages_for_agent, compaction_entry) = {
                 let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
@@ -1238,7 +1263,18 @@ impl PiApp {
                 PiMsg::ConversationReset {
                     messages,
                     usage,
-                    status: Some("Compaction complete".to_string()),
+                    status: Some({
+                        let label = if shake_mode {
+                            "shake"
+                        } else if aggressive_mode {
+                            "aggressive"
+                        } else {
+                            "summary"
+                        };
+                        format!(
+                            "Compaction complete ({label}: {tokens_before} → ~{summary_tokens_after} tokens in compacted span)"
+                        )
+                    }),
                 },
             )
             .await;
