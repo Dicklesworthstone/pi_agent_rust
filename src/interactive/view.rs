@@ -504,7 +504,7 @@ impl PiApp {
             let invocation_str =
                 self.current_tool_summary
                     .as_ref()
-                    .map_or_else(String::new, |summary| {
+                    .map_or_else(String::new, |(_, summary)| {
                         let budget = self
                             .term_width
                             .saturating_sub(16 + tool.len() + progress_str.len())

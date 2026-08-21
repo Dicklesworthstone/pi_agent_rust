@@ -471,11 +471,12 @@ fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
-    /// First line only, collapsed to at most `max` characters.
+    /// First non-blank line only, collapsed to at most `max` characters.
     fn clip(text: &str, max: usize) -> String {
-        let first_line = text.lines().next().unwrap_or("").trim();
+        let text = text.trim();
+        let first_line = text.lines().next().unwrap_or("").trim_end();
         let mut out: String = first_line.chars().take(max).collect();
-        if first_line.chars().count() > max || text.trim().lines().count() > 1 {
+        if first_line.chars().count() > max || text.lines().count() > 1 {
             out.push('…');
         }
         out
@@ -572,18 +573,22 @@ impl PiApp {
             PiMsg::ToolStart { name, .. } => {
                 self.agent_state = AgentState::ToolRunning;
                 self.current_tool = Some(name);
+                // Clear any previous invocation summary: the status row shows
+                // it next to this tool's name without an id check, so a stale
+                // sibling summary must not linger. (Transcript headers are
+                // additionally tool_id-matched at use.)
                 self.current_tool_summary = None;
                 self.tool_progress = Some(ToolProgress::new());
                 self.pending_tool_output = None;
             }
-            PiMsg::ToolInvocation { summary, .. } => {
-                self.current_tool_summary = Some(summary);
+            PiMsg::ToolInvocation { tool_id, summary } => {
+                self.current_tool_summary = Some((tool_id, summary));
             }
             PiMsg::ToolUpdate {
                 name,
+                tool_id,
                 content,
                 details,
-                ..
             } => {
                 // Update progress metrics from details if present.
                 if let Some(ref mut progress) = self.tool_progress {
@@ -600,21 +605,36 @@ impl PiApp {
                 ) {
                     // Include the invocation (e.g. the bash command) in the
                     // transcript header so the reader can see what ran, not
-                    // just its output.
-                    self.pending_tool_output =
-                        Some(self.current_tool_summary.as_ref().map_or_else(
-                            || format!("Tool {name} output:\n{output}"),
-                            |invocation| {
-                                let prefix = if name == "bash" { "$ " } else { "→ " };
-                                format!("Tool {name} output:\n{prefix}{invocation}\n{output}")
-                            },
-                        ));
+                    // just its output. Matched by tool_id so interleaved
+                    // (parallel) tool events cannot stamp one tool's command
+                    // onto another tool's output block.
+                    let invocation = self
+                        .current_tool_summary
+                        .as_ref()
+                        .filter(|(summary_tool_id, _)| *summary_tool_id == tool_id)
+                        .map(|(_, summary)| summary);
+                    self.pending_tool_output = Some(invocation.map_or_else(
+                        || format!("Tool {name} output:\n{output}"),
+                        |invocation| {
+                            let prefix = if name == "bash" { "$ " } else { "→ " };
+                            format!("Tool {name} output:\n{prefix}{invocation}\n{output}")
+                        },
+                    ));
                 }
             }
-            PiMsg::ToolEnd { .. } => {
+            PiMsg::ToolEnd { tool_id, .. } => {
                 self.agent_state = AgentState::Processing;
                 self.current_tool = None;
-                self.current_tool_summary = None;
+                // Only clear the invocation summary if it belongs to the tool
+                // that just ended; an interleaved sibling's summary must
+                // survive until its own ToolEnd.
+                if self
+                    .current_tool_summary
+                    .as_ref()
+                    .is_some_and(|(summary_tool_id, _)| *summary_tool_id == tool_id)
+                {
+                    self.current_tool_summary = None;
+                }
                 self.tool_progress = None;
                 if let Some(output) = self.pending_tool_output.take() {
                     self.messages.push(ConversationMessage::tool(output));
@@ -2584,6 +2604,54 @@ fn emit_submit_continue_deadline_probe(deadline: Option<asupersync::Time>) {
     let guard = probe.lock().expect("lock submit_continue deadline probe");
     if let Some(tx) = guard.as_ref() {
         let _ = tx.send(deadline);
+    }
+}
+
+#[cfg(test)]
+mod tool_invocation_summary_tests {
+    use super::tool_invocation_summary;
+    use serde_json::json;
+
+    #[test]
+    fn bash_command_first_line_clipped() {
+        let summary = tool_invocation_summary("bash", &json!({"command": "cargo test --lib"}));
+        assert_eq!(summary.as_deref(), Some("cargo test --lib"));
+    }
+
+    #[test]
+    fn bash_multiline_command_keeps_first_nonblank_line_with_ellipsis() {
+        let summary =
+            tool_invocation_summary("bash", &json!({"command": "\n  cargo build\ncargo test"}));
+        assert_eq!(summary.as_deref(), Some("cargo build…"));
+    }
+
+    #[test]
+    fn bash_long_command_is_truncated() {
+        let long = "x".repeat(300);
+        let summary = tool_invocation_summary("bash", &json!({ "command": long }));
+        let summary = summary.expect("summary for long command");
+        assert!(summary.chars().count() <= 97, "96 chars + ellipsis");
+        assert!(summary.ends_with('…'));
+    }
+
+    #[test]
+    fn read_uses_path_and_grep_combines_pattern_with_path() {
+        assert_eq!(
+            tool_invocation_summary("read", &json!({"path": "src/main.rs"})).as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            tool_invocation_summary("grep", &json!({"pattern": "TODO", "path": "src/"})).as_deref(),
+            Some("TODO in src/")
+        );
+    }
+
+    #[test]
+    fn unknown_tools_and_missing_or_blank_args_yield_none() {
+        assert!(tool_invocation_summary("todo", &json!({"op": "view"})).is_none());
+        assert!(tool_invocation_summary("bash", &json!({})).is_none());
+        assert!(tool_invocation_summary("bash", &json!({"command": "   \n  "})).is_none());
+        assert!(tool_invocation_summary("bash", &json!({"command": 42})).is_none());
     }
 }
 

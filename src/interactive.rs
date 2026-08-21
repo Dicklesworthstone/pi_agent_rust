@@ -2355,9 +2355,11 @@ pub struct PiApp {
     thinking_visible: bool,
     tools_expanded: bool,
     current_tool: Option<String>,
-    /// One-line invocation summary for the running tool (bash command, file
-    /// path, search pattern). Shown in the status row and transcript header.
-    current_tool_summary: Option<String>,
+    /// One-line invocation summary for the running tool, keyed by tool_id so
+    /// interleaved (parallel) tool events can never stamp one tool's command
+    /// onto another tool's output block. Shown in the status row and
+    /// transcript header. Tuple is `(tool_id, summary)`.
+    current_tool_summary: Option<(String, String)>,
     tool_progress: Option<ToolProgress>,
     pending_tool_output: Option<String>,
     /// Compact `todo_list.v1` footer summary (bd-cv653.3.9), state-driven

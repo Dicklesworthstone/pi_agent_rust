@@ -9970,9 +9970,10 @@ fn tui_stress_many_tool_calls_stays_consistent() {
         .expect("scroll indicator after returning to bottom");
     assert_eq!(pct_bottom, 100, "PageDown must reach the bottom again");
     let step = finalize_agent(&harness, &mut app);
-    assert!(
-        step.after.contains("tokens") || !step.after.is_empty(),
-        "view must render after the stress run"
+    let pct_final = parse_scroll_percent(&step.after).expect("scroll indicator after finalize");
+    assert_eq!(
+        pct_final, 100,
+        "finalizing at the bottom must keep the viewport at the bottom"
     );
 }
 
@@ -10031,4 +10032,103 @@ fn tui_tool_invocation_summary_visible_in_status_and_transcript() {
     assert_after_contains(&harness, &step, "Tool bash output:");
     assert_after_contains(&harness, &step, "$ cargo test --lib");
     assert_after_contains(&harness, &step, "test result: ok.");
+}
+
+#[test]
+fn tui_tool_invocation_summary_never_mislabels_interleaved_tools() {
+    // Parallel tool execution emits all ToolStart events first, then
+    // interleaved updates. A stale invocation summary from tool B must not be
+    // stamped onto tool A's output block (summaries are matched by tool_id).
+    let harness = TestHarness::new("tui_tool_invocation_summary_never_mislabels_interleaved_tools");
+    let mut app = build_app(&harness, Vec::new());
+    app.set_terminal_size(100, 30);
+    log_initial_state(&harness, &app);
+
+    apply_pi(&harness, &mut app, "AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(a)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "par-a".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolInvocation(a)",
+        PiMsg::ToolInvocation {
+            tool_id: "par-a".to_string(),
+            summary: "echo A".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolStart(b)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "par-b".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolInvocation(b)",
+        PiMsg::ToolInvocation {
+            tool_id: "par-b".to_string(),
+            summary: "echo B".to_string(),
+        },
+    );
+
+    // Tool A's update arrives while the summary slot holds tool B's command.
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(a)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "par-a".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("output-from-A"))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(a)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "par-a".to_string(),
+            is_error: false,
+        },
+    );
+    assert_after_contains(&harness, &step, "output-from-A");
+    assert_after_not_contains(&harness, &step, "$ echo B");
+
+    // Tool B's own block still gets its correct header.
+    apply_pi(
+        &harness,
+        &mut app,
+        "ToolUpdate(b)",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "par-b".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("output-from-B"))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "ToolEnd(b)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "par-b".to_string(),
+            is_error: false,
+        },
+    );
+    assert_after_contains(&harness, &step, "output-from-B");
+    assert_after_contains(&harness, &step, "$ echo B");
 }
