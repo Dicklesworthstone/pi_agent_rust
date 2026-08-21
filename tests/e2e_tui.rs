@@ -4188,3 +4188,271 @@ fn vcr_tool_read_cassette_template_matches_provider_request() {
         serde_json::to_string_pretty(&actual).unwrap_or_default(),
     );
 }
+
+// ============================================================================
+// Tool-call stress e2e (bd-d4um2): one turn with dozens of sequential real
+// tool executions through the live binary in tmux, then scroll integrity.
+// The agent's max_tool_iterations default is 50, so the round count stays
+// under it while still exercising the "lots of tool calls" failure mode HN
+// reported (frozen scrolling / corrupted transcript).
+// ============================================================================
+
+const VCR_STRESS_TEST_NAME: &str = "e2e_tui_tool_stress";
+// 35 = 70% of the default max_tool_iterations (50). At >=80% the agent
+// injects a "[runtime] Tool-iteration budget" notice into the conversation,
+// which a pre-recorded cassette cannot predict.
+const STRESS_TOOL_ROUNDS: usize = 35;
+const STRESS_PROMPT: &str = "Stress-read sample.txt thirty-five times";
+const STRESS_DONE_MARKER: &str = "STRESS-DONE";
+
+#[allow(clippy::too_many_lines)]
+fn write_vcr_stress_cassette(dir: &Path, tool_output: &str, system_prompt: &str) -> PathBuf {
+    let cassette_path = dir.join(format!("{VCR_STRESS_TEST_NAME}.json"));
+    let tool_schemas = vcr_anthropic_tool_schemas(dir);
+
+    let sse_chunk = |event: &str, data: serde_json::Value| -> String {
+        let payload = serde_json::to_string(&data).expect("serialize sse payload");
+        format!("event: {event}\ndata: {payload}\n\n")
+    };
+    let tool_args_json =
+        serde_json::to_string(&json!({ "path": SAMPLE_FILE_NAME })).expect("serialize tool args");
+
+    let request_for_history = |history: &[Value]| -> Value {
+        let mut request = json!({
+            "model": VCR_MODEL,
+            "messages": history,
+            "system": system_prompt,
+            "max_tokens": VCR_MODEL_MAX_TOKENS,
+            "stream": true,
+            "tools": tool_schemas.clone(),
+        });
+        common::apply_prompt_cache_wire_shape(&mut request);
+        request
+    };
+
+    let tool_use_response = |call_id: &str| RecordedResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body_chunks: vec![
+            sse_chunk(
+                "message_start",
+                json!({ "type": "message_start", "message": { "usage": { "input_tokens": 42 }}}),
+            ),
+            sse_chunk(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "tool_use", "id": call_id, "name": "read" }
+                }),
+            ),
+            sse_chunk(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "input_json_delta", "partial_json": tool_args_json }
+                }),
+            ),
+            sse_chunk(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse_chunk(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "tool_use" },
+                    "usage": { "output_tokens": 12 }
+                }),
+            ),
+            sse_chunk("message_stop", json!({ "type": "message_stop" })),
+        ],
+        body_chunks_base64: None,
+    };
+
+    let final_text = format!("All {STRESS_TOOL_ROUNDS} reads complete. {STRESS_DONE_MARKER}");
+    let final_response = RecordedResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body_chunks: vec![
+            sse_chunk(
+                "message_start",
+                json!({ "type": "message_start", "message": { "usage": { "input_tokens": 64 }}}),
+            ),
+            sse_chunk(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text" }
+                }),
+            ),
+            sse_chunk(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": final_text }
+                }),
+            ),
+            sse_chunk(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse_chunk(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": { "output_tokens": 8 }
+                }),
+            ),
+            sse_chunk("message_stop", json!({ "type": "message_stop" })),
+        ],
+        body_chunks_base64: None,
+    };
+
+    let make_request = |body: Value| RecordedRequest {
+        method: "POST".to_string(),
+        url: "https://api.anthropic.com/v1/messages".to_string(),
+        headers: vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+            ("Accept".to_string(), "text/event-stream".to_string()),
+        ],
+        body: Some(body),
+        body_text: None,
+    };
+
+    let mut history: Vec<Value> = vec![json!(
+        { "role": "user", "content": [ { "type": "text", "text": STRESS_PROMPT } ] }
+    )];
+    let mut interactions: Vec<Interaction> = Vec::with_capacity(STRESS_TOOL_ROUNDS + 1);
+    for round in 0..STRESS_TOOL_ROUNDS {
+        let call_id = format!("toolu_stress_{round}");
+        interactions.push(Interaction {
+            request: make_request(request_for_history(&history)),
+            response: tool_use_response(&call_id),
+        });
+        history.push(json!({
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "read",
+                    "input": { "path": SAMPLE_FILE_NAME }
+                }
+            ]
+        }));
+        history.push(json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": [ { "type": "text", "text": tool_output } ]
+                }
+            ]
+        }));
+    }
+    interactions.push(Interaction {
+        request: make_request(request_for_history(&history)),
+        response: final_response,
+    });
+
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: VCR_STRESS_TEST_NAME.to_string(),
+        recorded_at: "1970-01-01T00:00:00Z".to_string(),
+        interactions,
+    };
+
+    std::fs::create_dir_all(dir).expect("create cassette dir");
+    let json = serde_json::to_string_pretty(&cassette).expect("serialize cassette");
+    std::fs::write(&cassette_path, json).expect("write cassette");
+    cassette_path
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_tui_tool_call_stress_scroll_stays_functional() {
+    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_tool_stress") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.harness.section("setup");
+    let sample_path = session.harness.temp_path(SAMPLE_FILE_NAME);
+    let sample_content: String = (1..=40)
+        .map(|line| format!("stress line {line:02}: the quick brown fox jumps over the lazy dog\n"))
+        .collect();
+    std::fs::write(&sample_path, &sample_content).expect("write sample file");
+
+    let tool_output = read_output_for_sample(session.harness.temp_dir(), SAMPLE_FILE_NAME);
+    let cassette_dir = session.harness.temp_path("vcr");
+    let env_root = session.harness.temp_dir().join("env");
+    let system_prompt = build_vcr_system_prompt(session.harness.temp_dir(), &env_root);
+    let cassette_path = write_vcr_stress_cassette(&cassette_dir, &tool_output, &system_prompt);
+    session
+        .harness
+        .record_artifact("stress-cassette.json", &cassette_path);
+
+    let cassette_dir_str = cassette_dir.display().to_string();
+    session.set_env(VCR_ENV_MODE, "playback");
+    session.set_env(VCR_ENV_DIR, &cassette_dir_str);
+    session.set_env("PI_VCR_TEST_NAME", VCR_STRESS_TEST_NAME);
+    session.set_env("PI_TEST_MODE", "1");
+
+    session.launch(&vcr_interactive_args());
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+
+    // One turn, STRESS_TOOL_ROUNDS sequential tool executions, then the
+    // final text. Generous timeout: this is a real binary doing 40 provider
+    // round-trips plus 40 tool runs.
+    let pane = session.send_text_and_wait(
+        "stress_prompt",
+        STRESS_PROMPT,
+        STRESS_DONE_MARKER,
+        Duration::from_secs(120),
+    );
+    assert!(
+        !pane.contains("No matching interaction"),
+        "cassette drift during stress run.\nPane:\n{pane}"
+    );
+    let pct = parse_scroll_percent(&pane).expect("scroll indicator after stress");
+    assert_eq!(pct, 100, "tail-following viewport should end at the bottom");
+
+    // Scrolling must still work after the stress: page up moves off the
+    // bottom, and returning to the bottom is possible.
+    session.tmux.send_key("PPage");
+    session.tmux.send_key("PPage");
+    std::thread::sleep(Duration::from_millis(400));
+    let pane_up = session.wait_and_capture("after_pgup", "%]", Duration::from_secs(5));
+    let pct_up = parse_scroll_percent(&pane_up).expect("scroll indicator after PageUp");
+    assert!(
+        pct_up < 100,
+        "PageUp must scroll away from the bottom after a tool-heavy turn (got {pct_up}%)"
+    );
+    for _ in 0..80 {
+        session.tmux.send_key("NPage");
+    }
+    std::thread::sleep(Duration::from_millis(400));
+    let pane_down = session.wait_and_capture("after_pgdn", "%]", Duration::from_secs(5));
+    let pct_down = parse_scroll_percent(&pane_down).expect("scroll indicator after PageDown");
+    assert_eq!(pct_down, 100, "PageDown must return to the bottom");
+
+    session.exit_gracefully();
+    session.write_artifacts();
+
+    // The session log must contain every tool round.
+    let sessions_dir = session.harness.temp_dir().join("env").join("sessions");
+    let session_file = find_session_jsonl(&sessions_dir).expect("expected session jsonl file");
+    let content = std::fs::read_to_string(&session_file).expect("read session jsonl");
+    let tool_mentions = content.matches("toolu_stress_").count();
+    assert!(
+        tool_mentions >= STRESS_TOOL_ROUNDS * 2,
+        "expected all {STRESS_TOOL_ROUNDS} tool rounds in the session log, \
+         found {tool_mentions} toolu_stress_ mentions"
+    );
+}
