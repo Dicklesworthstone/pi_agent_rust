@@ -2146,6 +2146,17 @@ pub enum Commands {
         message: Option<String>,
     },
 
+    /// Verified in-place self-updater for Pi binary (bd-cv653.7.10)
+    #[command(name = "self-update")]
+    SelfUpdate {
+        /// Target version to update to (e.g. v0.2.0 or 0.2.0; defaults to latest release)
+        #[arg(long)]
+        version: Option<String>,
+        /// Check for available updates without applying any binary changes
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {

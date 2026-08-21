@@ -156,6 +156,7 @@ files = [
     "stream_rules",
     "commit_split",
     "session_import",
+    "self_update",
     "sdk_api",
     "sdk_unit",
 ]

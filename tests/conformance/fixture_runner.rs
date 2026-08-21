@@ -464,6 +464,9 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::Import { .. }) => json!({
             "name": "import",
         }),
+        Some(Commands::SelfUpdate { .. }) => json!({
+            "name": "self-update",
+        }),
         None => Value::Null,
     }
 }

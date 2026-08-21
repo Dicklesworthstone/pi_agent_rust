@@ -364,7 +364,7 @@ impl StreamRuleStore {
     pub fn add_rule(&mut self, rule: StreamRule, is_global: bool) -> Result<()> {
         // Validate regex compilation
         Regex::new(&rule.pattern)
-            .map_err(|e| Error::InvalidValue(format!("Invalid regex pattern: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Invalid regex pattern: {e}")))?;
 
         if is_global {
             if let Some(target) = self.global_rules.iter_mut().find(|r| r.id == rule.id) {
@@ -445,7 +445,7 @@ impl StreamRuleStore {
         };
 
         let regex = Regex::new(&pattern)
-            .map_err(|e| Error::InvalidValue(format!("Invalid regex pattern: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Invalid regex pattern: {e}")))?;
 
         if let Some(mat) = regex.find(sample_text) {
             Ok(Some(mat.as_str().to_string()))
@@ -462,13 +462,13 @@ impl StreamRuleStore {
             rules: all_rules,
         };
         serde_json::to_string_pretty(&cfg)
-            .map_err(|e| Error::InvalidValue(format!("Serialization failure: {e}")))
+            .map_err(|e| Error::Validation(format!("Serialization failure: {e}")))
     }
 
     /// Import rules from a JSON string.
     pub fn import_json(&mut self, json_str: &str, is_global: bool) -> Result<usize> {
         let cfg: StreamRulesConfigFile = serde_json::from_str(json_str)
-            .map_err(|e| Error::InvalidValue(format!("Invalid JSON format: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Invalid JSON format: {e}")))?;
 
         let count = cfg.rules.len();
         for rule in cfg.rules {
@@ -492,9 +492,13 @@ impl StreamRuleStore {
                 rules: self.project_rules.clone(),
             };
             let json = serde_json::to_string_pretty(&cfg)
-                .map_err(|e| Error::InvalidValue(format!("Serialization failure: {e}")))?;
-            fs::write(path, json)
-                .map_err(|e| Error::Io(format!("Failed to write {}: {e}", path.display())))?;
+                .map_err(|e| Error::Validation(format!("Serialization failure: {e}")))?;
+            fs::write(path, json).map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to write {}: {e}",
+                    path.display()
+                ))))
+            })?;
         }
         Ok(())
     }
@@ -514,9 +518,13 @@ impl StreamRuleStore {
                 rules: self.global_rules.clone(),
             };
             let json = serde_json::to_string_pretty(&cfg)
-                .map_err(|e| Error::InvalidValue(format!("Serialization failure: {e}")))?;
-            fs::write(path, json)
-                .map_err(|e| Error::Io(format!("Failed to write {}: {e}", path.display())))?;
+                .map_err(|e| Error::Validation(format!("Serialization failure: {e}")))?;
+            fs::write(path, json).map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to write {}: {e}",
+                    path.display()
+                ))))
+            })?;
         }
         Ok(())
     }
@@ -554,8 +562,12 @@ impl GrievancesLedger {
     ) -> Result<Grievance> {
         let path = Self::ledger_path(project_root);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(format!("Failed to create {}: {e}", parent.display())))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to create {}: {e}",
+                    parent.display()
+                ))))
+            })?;
         }
 
         let screened_complaint = screen_secrets(complaint.trim());
@@ -574,12 +586,19 @@ impl GrievancesLedger {
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|e| Error::Io(format!("Failed to open grievances ledger: {e}")))?;
+            .map_err(|e| {
+                Error::Io(Box::new(std::io::Error::other(format!(
+                    "Failed to open grievances ledger: {e}"
+                ))))
+            })?;
 
         let line = serde_json::to_string(&grievance)
-            .map_err(|e| Error::InvalidValue(format!("Serialization error: {e}")))?;
-        writeln!(file, "{line}")
-            .map_err(|e| Error::Io(format!("Failed to append to grievances ledger: {e}")))?;
+            .map_err(|e| Error::Validation(format!("Serialization error: {e}")))?;
+        writeln!(file, "{line}").map_err(|e| {
+            Error::Io(Box::new(std::io::Error::other(format!(
+                "Failed to append to grievances ledger: {e}"
+            ))))
+        })?;
 
         Ok(grievance)
     }
@@ -591,8 +610,11 @@ impl GrievancesLedger {
             return Ok(Vec::new());
         }
 
-        let content = fs::read_to_string(&path)
-            .map_err(|e| Error::Io(format!("Failed to read grievances ledger: {e}")))?;
+        let content = fs::read_to_string(&path).map_err(|e| {
+            Error::Io(Box::new(std::io::Error::other(format!(
+                "Failed to read grievances ledger: {e}"
+            ))))
+        })?;
 
         let mut grievances = Vec::new();
         for line in content.lines() {

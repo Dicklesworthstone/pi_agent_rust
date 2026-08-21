@@ -2332,6 +2332,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 message.as_deref(),
             )?;
         }
+        cli::Commands::SelfUpdate { version, check } => {
+            handle_self_update(version.as_deref(), check).await?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4798,6 +4801,66 @@ fn handle_commit(
             println!("  ✓ [{sha}] {}", res.message);
         } else if let Some(ref err) = res.error {
             eprintln!("  ✗ Failed on unit {}: {err}", res.unit_id);
+        }
+    }
+
+    Ok(())
+}
+
+/// `pi self-update [--version vX.Y.Z] [--check]` (bd-cv653.7.10): verified in-place
+/// binary upgrades with package manager detection and fail-closed SHA-256 verification.
+async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
+    let updater = pi::self_update::SelfUpdater::new();
+    let options = pi::self_update::SelfUpdateOptions {
+        version: version.map(ToString::to_string),
+        check,
+        custom_manifest_url: None,
+        custom_download_base: None,
+    };
+
+    let status = updater.run(&options).await?;
+    match status {
+        pi::self_update::SelfUpdateStatus::AlreadyUpToDate { current_version } => {
+            println!("Pi is already up to date (v{current_version}).");
+        }
+        pi::self_update::SelfUpdateStatus::CheckResult {
+            current_version,
+            latest_version,
+            is_newer,
+            manager,
+        } => {
+            println!("Current version : v{current_version}");
+            println!("Latest release  : v{latest_version}");
+            if is_newer {
+                println!("An update is available (v{current_version} -> v{latest_version}).");
+                if manager != pi::self_update::PackageManager::Manual {
+                    if let Some(cmd) = manager.upgrade_command() {
+                        println!("Pi is installed via package manager. Run `{cmd}` to update.");
+                    }
+                } else {
+                    println!("Run `pi self-update` to perform an in-place upgrade.");
+                }
+            } else {
+                println!("You are on the latest version.");
+            }
+        }
+        pi::self_update::SelfUpdateStatus::ManagedExternally {
+            manager: _,
+            upgrade_command,
+        } => {
+            println!("Pi is installed via a package manager.");
+            println!("Please update via: {upgrade_command}");
+        }
+        pi::self_update::SelfUpdateStatus::Updated {
+            previous_version,
+            new_version,
+            backup_path,
+        } => {
+            println!("Successfully updated Pi from v{previous_version} to v{new_version}!");
+            println!(
+                "Backup of previous binary saved at: {}",
+                backup_path.display()
+            );
         }
     }
 

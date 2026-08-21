@@ -6,8 +6,10 @@
 
 use crate::error::{Error, Result};
 use crate::memory::screen_secrets;
-use crate::model::{ContentBlock, UserContent};
-use crate::session::{CompactionEntry, MessageEntry, Session, SessionEntry, SessionMessage};
+use crate::model::{AssistantMessage, ContentBlock, UserContent};
+use crate::session::{
+    CompactionEntry, EntryBase, MessageEntry, Session, SessionEntry, SessionMessage,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

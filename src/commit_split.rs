@@ -192,7 +192,7 @@ impl ConflictScanner {
         });
 
         if let Some(line_no) = conflict_line {
-            Err(Error::InvalidValue(format!(
+            Err(Error::Validation(format!(
                 "Unresolved merge conflict marker detected in {file_name}:L{line_no}"
             )))
         } else {
