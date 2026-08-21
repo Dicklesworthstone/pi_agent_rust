@@ -120,6 +120,7 @@ files = [
     "checkpoint",
     "eval",
     "url_router",
+    "session_import",
     "token_count",
     "fts5_spike",
     "bash_mediation",
@@ -154,6 +155,7 @@ files = [
     "handoff_generator",
     "stream_rules",
     "commit_split",
+    "session_import",
     "sdk_api",
     "sdk_unit",
 ]

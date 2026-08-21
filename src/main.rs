@@ -2296,6 +2296,12 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::Token { input } => {
             handle_token(&input)?;
         }
+        cli::Commands::Import {
+            from_claude,
+            from_codex,
+        } => {
+            handle_import(from_claude.as_deref(), from_codex.as_deref())?;
+        }
         cli::Commands::Handoff {
             to,
             out,
@@ -4452,6 +4458,39 @@ where
         }
     }
 
+    Ok(())
+}
+
+/// `pi import --from-claude|--from-codex [PATH]` (bd-cv653.6.4): convert a
+/// foreign session into a native continuable pi session and print the new
+/// session path.
+fn handle_import(from_claude: Option<&str>, from_codex: Option<&str>) -> Result<()> {
+    let (path, source) = match (from_claude, from_codex) {
+        (Some(path), None) => (path, "claude"),
+        (None, Some(path)) => (path, "codex"),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "pi import requires exactly one of --from-claude <path> or --from-codex <path>"
+            ));
+        }
+    };
+    let outcome = match source {
+        "claude" => pi::session_import::import_claude(std::path::Path::new(path), None)?,
+        _ => pi::session_import::import_codex(std::path::Path::new(path), None)?,
+    };
+    for line in &outcome.report {
+        println!("{line}");
+    }
+    println!(
+        "{} session {} -> {}",
+        if outcome.already_imported {
+            "already imported:"
+        } else {
+            "imported:"
+        },
+        outcome.session_id,
+        outcome.session_path
+    );
     Ok(())
 }
 
