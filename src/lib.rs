@@ -80,6 +80,8 @@ pub mod agent;
 #[doc(hidden)]
 pub mod agent_cx;
 #[doc(hidden)]
+pub mod agent_hub;
+#[doc(hidden)]
 pub mod app;
 pub mod approval;
 pub mod ask;
@@ -165,8 +167,6 @@ pub mod gc;
 #[doc(hidden)]
 pub mod github;
 pub mod handoff;
-#[doc(hidden)]
-pub mod agent_hub;
 #[doc(hidden)]
 pub mod hostcall_amac;
 #[doc(hidden)]
@@ -305,8 +305,8 @@ pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
 pub mod web_search;
-pub mod workspace_trust;
 pub mod workspace;
+pub mod workspace_trust;
 #[doc(hidden)]
 pub mod worktree_iso;
 pub mod xdev;
