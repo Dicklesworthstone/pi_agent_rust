@@ -16192,7 +16192,11 @@ mod tests {
         handle.add_root(canonical);
 
         let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
-        let outside_path = outside.path().join("secret.txt").to_string_lossy().to_string();
+        let outside_path = outside
+            .path()
+            .join("secret.txt")
+            .to_string_lossy()
+            .to_string();
 
         // Read inside the additional root succeeds.
         asupersync::test_utils::run_test(|| {

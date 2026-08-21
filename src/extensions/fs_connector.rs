@@ -252,7 +252,9 @@ impl FsConnector {
         // bd-cv653.3.12: the containment decision routes through the same
         // helper as tool enforcement so prefix semantics cannot drift.
         let matched_root = if crate::workspace::any_root_contains(roots, &canonical_target) {
-            roots.iter().find(|root| canonical_target.starts_with(root.as_path()))
+            roots
+                .iter()
+                .find(|root| canonical_target.starts_with(root.as_path()))
         } else {
             None
         };

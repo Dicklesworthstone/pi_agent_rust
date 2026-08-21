@@ -251,10 +251,8 @@ mod tests {
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "pi-workspace-test-{}-{name}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("pi-workspace-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create fixture dir");
         base
