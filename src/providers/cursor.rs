@@ -866,6 +866,9 @@ impl Provider for CursorProvider {
         let message_id = Uuid::new_v4().to_string();
         let request_id = Uuid::new_v4().to_string();
 
+        // `before_provider_request` (bd-dzddo) is deliberately not wired
+        // here: the wire format is Connect+protobuf framing, not JSON, so the
+        // hook's JSON-payload rewrite contract cannot apply.
         let request_body = build_run_request(
             &self.model,
             system_prompt,

@@ -268,7 +268,9 @@ impl Provider for CopilotProvider {
             .with_client(self.client.clone());
 
         // Override the authorization: Copilot uses the session token,
-        // not the GitHub OAuth token.
+        // not the GitHub OAuth token. The clone carries
+        // `before_provider_request` through, so the inner OpenAI route's
+        // rewrite hook wiring covers Copilot too (bd-dzddo).
         let mut copilot_options = options.clone();
         copilot_options.api_key = Some(session.token);
 

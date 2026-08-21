@@ -265,8 +265,20 @@ impl Provider for GitLabProvider {
             )
         })?;
 
-        let body_bytes = serde_json::to_vec(&request_body)
-            .map_err(|e| Error::provider("gitlab", format!("Failed to serialize request: {e}")))?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &url,
+            &request_body,
+            |value| super::validate_streamed_json_rewrite(value, &["content"], &[], &[]),
+        )
+        .await;
+        let body_bytes = rewritten_body
+            .as_ref()
+            .map_or_else(|| serde_json::to_vec(&request_body), serde_json::to_vec)
+        .map_err(|e| Error::provider("gitlab", format!("Failed to serialize request: {e}")))?;
 
         let mut request = self
             .client

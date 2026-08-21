@@ -584,12 +584,6 @@ impl Provider for BedrockProvider {
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let request_body = Self::build_request(context, options);
-        let body = serde_json::to_vec(&request_body).map_err(|err| {
-            Error::provider(
-                "amazon-bedrock",
-                format!("Failed to serialize request body: {err}"),
-            )
-        })?;
 
         let auth_context = self.resolve_auth_context(options).await?;
         // Reject caller-owned signing headers before endpoint parsing or an inference request.
@@ -598,6 +592,30 @@ impl Provider for BedrockProvider {
         // ownership violation.
         self.validate_auth_header_ownership(&auth_context, options)?;
         let url = self.converse_url(&auth_context.region)?;
+
+        // The rewrite hook must run before serialization: SigV4 signs the
+        // final body bytes, so the chosen body (rewritten or original) is
+        // serialized once, below, and signed as-is. Model lives in the URL,
+        // so only the `messages` array is structurally required.
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            url.as_str(),
+            &request_body,
+            |value| super::validate_streamed_json_rewrite(value, &[], &["messages"], &[]),
+        )
+        .await;
+        let body = rewritten_body
+            .as_ref()
+            .map_or_else(|| serde_json::to_vec(&request_body), serde_json::to_vec)
+        .map_err(|err| {
+            Error::provider(
+                "amazon-bedrock",
+                format!("Failed to serialize request body: {err}"),
+            )
+        })?;
         let (request, response_secrets) =
             self.authenticated_request(&url, &body, auth_context, options)?;
 

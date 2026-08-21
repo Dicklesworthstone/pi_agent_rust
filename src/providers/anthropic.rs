@@ -747,7 +747,27 @@ impl Provider for AnthropicProvider {
             &["authorization", "x-api-key"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &self.base_url,
+            &request_body,
+            |value| {
+                super::validate_streamed_json_rewrite(
+                    value,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+            },
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
@@ -3386,6 +3406,108 @@ mod tests {
             captured.headers.get("x-api-key").map(String::as_str),
             Some("sk-ant-test-key"),
         );
+    }
+
+    /// bd-dzddo: a `before_provider_request` rewrite must reach the wire on
+    /// the Anthropic route (hook breadth beyond the Responses API), with
+    /// `stream: true` re-imposed on the accepted rewrite.
+    #[test]
+    fn test_before_provider_request_rewrite_reaches_wire() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |event| {
+                    Box::pin(async move {
+                        let mut payload = event.payload;
+                        payload["metadata"] = serde_json::json!({"user_id": "pi-rewrite-marker"});
+                        payload["stream"] = serde_json::json!(false);
+                        Some(payload)
+                    })
+                },
+            )),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+        assert_eq!(body["metadata"]["user_id"], "pi-rewrite-marker");
+        assert_eq!(
+            body["stream"],
+            serde_json::Value::Bool(true),
+            "stream: true must be re-imposed on accepted rewrites"
+        );
+    }
+
+    /// bd-dzddo: a structurally invalid rewrite must fail open — the original
+    /// request body goes out unchanged.
+    #[test]
+    fn test_before_provider_request_invalid_rewrite_fails_open() {
+        let (base_url, rx) = spawn_test_server(200, "text/event-stream", &success_sse_body());
+        let provider = AnthropicProvider::new("claude-test").with_base_url(base_url);
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+        let options = StreamOptions {
+            api_key: Some("sk-ant-test-key".to_string()),
+            before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                |_event| Box::pin(async move { Some(serde_json::json!("not an object")) }),
+            )),
+            ..Default::default()
+        };
+
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let mut stream = provider.stream(&context, &options).await.expect("stream");
+            while let Some(event) = stream.next().await {
+                if matches!(event.expect("stream event"), StreamEvent::Done { .. }) {
+                    break;
+                }
+            }
+        });
+
+        let captured = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("captured request");
+        let body: serde_json::Value = serde_json::from_str(&captured.body).expect("json body");
+        assert_eq!(body["model"], "claude-test");
+        assert!(
+            body.get("metadata").is_none(),
+            "rejected rewrite must not alter the body"
+        );
+        assert!(body["messages"].is_array());
     }
 
     #[test]

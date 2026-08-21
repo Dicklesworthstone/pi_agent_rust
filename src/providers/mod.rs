@@ -46,6 +46,86 @@ pub use model_fetch::{
     refresh_provider_model_catalog, refresh_provider_models, static_registry_models,
 };
 
+/// Offer a fully built request body to the `before_provider_request`
+/// extension hook (gh #167 / bd-1q31s core, bd-dzddo breadth).
+///
+/// Returns a validated rewritten body to send verbatim, or `None` to keep the
+/// original. Every failure path — serialization, hook error, rejected rewrite —
+/// fails open to the original request. Auth material is never part of the
+/// exchange: the event carries only the JSON body plus routing metadata.
+pub(super) async fn offer_before_provider_request<B, V>(
+    options: &StreamOptions,
+    provider: &str,
+    api: &str,
+    model: &str,
+    base_url: &str,
+    body: &B,
+    validate: V,
+) -> Option<serde_json::Value>
+where
+    B: serde::Serialize + Sync,
+    V: FnOnce(serde_json::Value) -> std::result::Result<serde_json::Value, String> + Send,
+{
+    let hook = options.before_provider_request.as_ref()?;
+    let original = match serde_json::to_value(body) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                "failed to serialize request body for before_provider_request (fail-open): {err}"
+            );
+            return None;
+        }
+    };
+    let event = crate::provider::BeforeProviderRequestEvent {
+        provider: provider.to_string(),
+        api: api.to_string(),
+        model: model.to_string(),
+        base_url: base_url.to_string(),
+        payload: original,
+    };
+    let mutated = hook.rewrite(event).await?;
+    match validate(mutated) {
+        Ok(validated) => Some(validated),
+        Err(reason) => {
+            tracing::warn!(
+                "before_provider_request rewrite rejected (fail-open, original request kept): {reason}"
+            );
+            None
+        }
+    }
+}
+
+/// Structural validation shared by the JSON-body provider routes.
+///
+/// A rewrite must remain a JSON object, keep each required key as a non-empty
+/// string / an array respectively, and has stream-critical key/values
+/// re-imposed (e.g. `stream: true` where the SSE reader depends on it).
+pub(super) fn validate_streamed_json_rewrite(
+    mut value: serde_json::Value,
+    required_string_keys: &[&str],
+    required_array_keys: &[&str],
+    forced: &[(&str, serde_json::Value)],
+) -> std::result::Result<serde_json::Value, String> {
+    let Some(object) = value.as_object_mut() else {
+        return Err("rewrite is not a JSON object".to_string());
+    };
+    for key in required_string_keys {
+        match object.get(*key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => {}
+            _ => return Err(format!("rewrite is missing a non-empty string `{key}`")),
+        }
+    }
+    for key in required_array_keys {
+        if !object.get(*key).is_some_and(serde_json::Value::is_array) {
+            return Err(format!("rewrite is missing a `{key}` array"));
+        }
+    }
+    for (key, forced_value) in forced {
+        object.insert((*key).to_string(), forced_value.clone());
+    }
+    Ok(value)
+}
+
 pub(super) fn first_non_empty_header_value_case_insensitive(
     headers: &HashMap<String, String>,
     names: &[&str],
@@ -1314,6 +1394,109 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
+
+    /// bd-dzddo: the shared rewrite validator must keep well-formed rewrites
+    /// (with forced stream keys re-imposed and extension-added fields
+    /// preserved) and reject everything structurally unsound.
+    #[test]
+    fn validate_streamed_json_rewrite_accepts_and_rejects() {
+        let valid = serde_json::json!({
+            "model": "m1",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false,
+            "extension_field": {"kept": true},
+        });
+        let accepted = validate_streamed_json_rewrite(
+            valid,
+            &["model"],
+            &["messages"],
+            &[("stream", serde_json::Value::Bool(true))],
+        )
+        .expect("valid rewrite accepted");
+        assert_eq!(accepted["stream"], serde_json::Value::Bool(true));
+        assert_eq!(accepted["extension_field"]["kept"], true);
+
+        for (label, invalid) in [
+            ("non-object", serde_json::json!(["array"])),
+            ("missing model", serde_json::json!({"messages": []})),
+            (
+                "empty model",
+                serde_json::json!({"model": "", "messages": []}),
+            ),
+            ("missing messages", serde_json::json!({"model": "m1"})),
+            (
+                "non-array messages",
+                serde_json::json!({"model": "m1", "messages": {}}),
+            ),
+        ] {
+            assert!(
+                validate_streamed_json_rewrite(
+                    invalid,
+                    &["model"],
+                    &["messages"],
+                    &[("stream", serde_json::Value::Bool(true))],
+                )
+                .is_err(),
+                "rewrite must be rejected: {label}"
+            );
+        }
+    }
+
+    /// bd-dzddo: the shared offer plumbing must pass hook rewrites through
+    /// validation and fail open (return None) on rejection or missing hook.
+    #[test]
+    fn offer_before_provider_request_validates_and_fails_open() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let body = serde_json::json!({"model": "orig", "messages": []});
+            let validate = |value: serde_json::Value| {
+                validate_streamed_json_rewrite(value, &["model"], &["messages"], &[])
+            };
+
+            let no_hook = StreamOptions::default();
+            assert!(
+                offer_before_provider_request(&no_hook, "p", "a", "m", "u", &body, validate)
+                    .await
+                    .is_none(),
+                "no hook configured must keep the original"
+            );
+
+            let rewriting = StreamOptions {
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    |event| {
+                        Box::pin(async move {
+                            let mut payload = event.payload;
+                            payload["messages"] = serde_json::json!([{"role": "user"}]);
+                            payload["marker"] = serde_json::json!(event.provider);
+                            Some(payload)
+                        })
+                    },
+                )),
+                ..Default::default()
+            };
+            let accepted = offer_before_provider_request(
+                &rewriting, "prov", "api", "model", "url", &body, validate,
+            )
+            .await
+            .expect("valid rewrite accepted");
+            assert_eq!(accepted["marker"], "prov");
+
+            let invalid = StreamOptions {
+                before_provider_request: Some(crate::provider::BeforeProviderRequestHook::new(
+                    |_event| Box::pin(async move { Some(serde_json::json!("not an object")) }),
+                )),
+                ..Default::default()
+            };
+            assert!(
+                offer_before_provider_request(&invalid, "p", "a", "m", "u", &body, validate)
+                    .await
+                    .is_none(),
+                "rejected rewrite must fail open"
+            );
+        });
+    }
 
     #[test]
     fn vcr_loopback_detection_covers_provider_factory_mock_hosts() {

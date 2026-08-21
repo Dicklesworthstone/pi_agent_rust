@@ -361,10 +361,35 @@ impl Provider for GeminiProvider {
                 &["authorization", "x-goog-api-key"],
             );
 
+            // Offer the inner Gemini request (not the CloudCodeAssist
+            // wrapper) to the rewrite hook: the wrapper is transport detail
+            // and its project/user-agent fields must stay host-controlled.
+            let rewritten_inner = super::offer_before_provider_request(
+                options,
+                self.name(),
+                self.api(),
+                self.model_id(),
+                &url,
+                &request_body,
+                |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
+            )
+            .await;
             let cli_request =
                 build_google_cli_request(&self.model, &project_id, request_body, is_antigravity)
                     .map_err(|message| Error::provider(self.name(), message.to_string()))?;
-            let request = request.json(&cli_request)?;
+            let request = match rewritten_inner {
+                Some(inner) => {
+                    let mut wrapper = serde_json::to_value(&cli_request).map_err(|err| {
+                        Error::provider(
+                            self.name(),
+                            format!("Failed to serialize Gemini CLI request: {err}"),
+                        )
+                    })?;
+                    wrapper["request"] = inner;
+                    request.json(&wrapper)?
+                }
+                None => request.json(&cli_request)?,
+            };
             let response = Box::pin(request.send()).await?;
             let status = response.status();
             if !(200..300).contains(&status) {
@@ -501,7 +526,20 @@ impl Provider for GeminiProvider {
             &["authorization", "x-goog-api-key"],
         );
 
-        let request = request.json(&request_body)?;
+        let rewritten_body = super::offer_before_provider_request(
+            options,
+            self.name(),
+            self.api(),
+            self.model_id(),
+            &url,
+            &request_body,
+            |value| super::validate_streamed_json_rewrite(value, &[], &["contents"], &[]),
+        )
+        .await;
+        let request = match &rewritten_body {
+            Some(body) => request.json(body)?,
+            None => request.json(&request_body)?,
+        };
 
         let response = Box::pin(request.send()).await?;
         let status = response.status();
