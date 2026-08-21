@@ -704,11 +704,15 @@ fn main_impl() -> Result<()> {
         bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
     }
 
-    // Initialize logging (skip for ultra-fast paths like --version)
+    // Initialize logging (skip for ultra-fast paths like --version).
+    // The TUI-aware writer targets stderr normally but diverts to
+    // `<global_dir>/logs/tui.log` while the interactive TUI owns the
+    // terminal, so tracing output (e.g. RUST_LOG=info) can never be painted
+    // into the alt-screen transcript (bd-trkef).
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .with_target(false)
-        .with_writer(io::stderr)
+        .with_writer(|| pi::tui::TuiAwareLogWriter)
         .init();
 
     // Run the application

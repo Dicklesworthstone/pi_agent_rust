@@ -4,12 +4,100 @@
 //! built on rich_rust for beautiful markup-based output.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use rich_rust::prelude::*;
 use rich_rust::renderables::Markdown;
 #[cfg(feature = "syntax-highlighting")]
 use rich_rust::renderables::Syntax;
 use rich_rust::segment::Segment;
+
+// ============================================================================
+// TUI-aware tracing log routing (bd-trkef)
+//
+// The global tracing subscriber writes to stderr. While the interactive TUI
+// owns the terminal in alt-screen mode, any stderr write (e.g. RUST_LOG=info
+// pulling in sqlite/session-index INFO spans) is painted straight into the
+// pane, corrupting the transcript. While the gate is active, log writes are
+// diverted to `<global_dir>/logs/tui.log` instead (or dropped if the file
+// cannot be opened) so the terminal stays clean.
+// ============================================================================
+
+static TUI_OWNS_TERMINAL: AtomicBool = AtomicBool::new(false);
+static TUI_LOG_FILE: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+
+fn tui_log_file() -> &'static Option<Mutex<std::fs::File>> {
+    TUI_LOG_FILE.get_or_init(|| {
+        let dir = crate::config::Config::global_dir().join("logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("tui.log"))
+            .ok()?;
+        Some(Mutex::new(file))
+    })
+}
+
+/// RAII guard that diverts tracing output away from the terminal for as long
+/// as it is alive. Created around the interactive TUI program loop.
+pub struct TuiLogRedirectGuard(());
+
+impl TuiLogRedirectGuard {
+    #[must_use]
+    pub fn begin() -> Self {
+        TUI_OWNS_TERMINAL.store(true, Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for TuiLogRedirectGuard {
+    fn drop(&mut self) {
+        TUI_OWNS_TERMINAL.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A `tracing` writer that targets stderr normally but diverts to the TUI
+/// log file (or a sink) while the interactive TUI owns the terminal.
+/// Install with `.with_writer(|| TuiAwareLogWriter)`.
+pub struct TuiAwareLogWriter;
+
+impl Write for TuiAwareLogWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if TUI_OWNS_TERMINAL.load(Ordering::SeqCst) {
+            if let Some(file) = tui_log_file() {
+                let mut file = match file.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                // Best-effort: a failed log write must never disturb the TUI.
+                return match file.write(buf) {
+                    Ok(written) => Ok(written),
+                    Err(_) => Ok(buf.len()),
+                };
+            }
+            // No log file available: swallow the output rather than corrupt
+            // the alt-screen frame.
+            return Ok(buf.len());
+        }
+        io::stderr().write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if TUI_OWNS_TERMINAL.load(Ordering::SeqCst) {
+            if let Some(file) = tui_log_file() {
+                let mut file = match file.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                let _ = file.flush();
+            }
+            return Ok(());
+        }
+        io::stderr().flush()
+    }
+}
 
 /// Pi's console wrapper providing styled terminal output.
 pub struct PiConsole {
@@ -747,6 +835,23 @@ mod tests {
     #[cfg(feature = "syntax-highlighting")]
     use std::collections::HashSet;
     use std::sync::{Arc, Mutex};
+
+    /// While the redirect gate is active, tracing writes must be accepted
+    /// without touching stderr (diverted to the log file or swallowed), and
+    /// dropping the guard must restore normal routing. Uses only the public
+    /// surface; safe against parallel tests because the gate is only ever
+    /// enabled here and in the real TUI entry points.
+    #[test]
+    fn tui_log_writer_diverts_while_gate_active() {
+        let mut writer = TuiAwareLogWriter;
+        let guard = TuiLogRedirectGuard::begin();
+        assert!(TUI_OWNS_TERMINAL.load(Ordering::SeqCst));
+        let payload = b"tui-log-gate probe\n";
+        assert_eq!(writer.write(payload).expect("gated write"), payload.len());
+        writer.flush().expect("gated flush");
+        drop(guard);
+        assert!(!TUI_OWNS_TERMINAL.load(Ordering::SeqCst));
+    }
 
     fn capture_markdown_segments(markdown: &str) -> Vec<Segment<'static>> {
         capture_markdown_segments_with_indent(markdown, None)

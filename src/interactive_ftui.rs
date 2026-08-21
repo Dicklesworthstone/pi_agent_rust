@@ -2062,7 +2062,11 @@ pub fn run(
     } else {
         ftui::App::fullscreen(model)
     };
+    // Divert tracing output away from the terminal while the TUI owns it
+    // (bd-trkef); restored on drop.
+    let log_guard = crate::tui::TuiLogRedirectGuard::begin();
     let result = app.with_mouse().run();
+    drop(log_guard);
 
     // The UI (and with it the submit sender) is gone; the driver's next poll
     // sees Disconnected and unwinds. Join briefly so session teardown (saves)
