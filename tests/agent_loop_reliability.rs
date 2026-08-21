@@ -235,7 +235,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         turn_recovery: Default::default(),
         approval_state: None,
         bash_settings: None,
-            secrets: None,
+        secrets: None,
     };
     Agent::new(provider, tools, config)
 }
@@ -1415,7 +1415,7 @@ fn repeated_interruption_cycles_no_corruption() {
                 turn_recovery: Default::default(),
                 approval_state: None,
                 bash_settings: None,
-            secrets: None,
+                secrets: None,
             };
             let agent = Agent::new(provider, tools, config);
             let mut agent_session = AgentSession::new(
@@ -1986,7 +1986,7 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
                 turn_recovery: Default::default(),
                 approval_state: None,
                 bash_settings: None,
-            secrets: None,
+                secrets: None,
             },
         );
         let session = make_session(&harness);

@@ -216,7 +216,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         turn_recovery: Default::default(),
         approval_state: None,
         bash_settings: None,
-            secrets: None,
+        secrets: None,
     };
     Agent::new(provider, tools, config)
 }

@@ -1380,7 +1380,7 @@ fn handle_session_new(
         turn_recovery: options.config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: options.config.bash.clone(),
-            secrets: None,
+        secrets: None,
     };
 
     let agent = crate::agent::Agent::new(provider, tools, agent_config);
@@ -2455,7 +2455,7 @@ mod tests {
                 turn_recovery: crate::turn_recovery::TurnRecoveryMode::default(),
                 approval_state: None,
                 bash_settings: None,
-            secrets: None,
+                secrets: None,
             },
         );
 

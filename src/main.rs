@@ -1704,7 +1704,7 @@ async fn run(
         turn_recovery: config.turn_recovery_mode(),
         approval_state: Some(approval_state),
         bash_settings: config.bash.clone(),
-            secrets: config.secrets.clone(),
+        secrets: config.secrets.clone(),
     };
 
     // Session undo recorder (bd-cv653.3.13): write/edit/hashline_edit

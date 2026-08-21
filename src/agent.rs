@@ -713,6 +713,7 @@ impl fmt::Debug for AgentConfig {
             .field("turn_recovery", &self.turn_recovery)
             .field("approval_state", &self.approval_state)
             .field("bash_settings", &self.bash_settings)
+            .field("secrets", &self.secrets)
             .finish()
     }
 }
@@ -1857,7 +1858,7 @@ impl Agent {
                         }
                     }
                 }
-                _ => {}
+                Message::Assistant(_) => {}
             }
         }
         if total > 0 {
@@ -3767,7 +3768,6 @@ impl Agent {
             }
         }
     }
-
 
     #[allow(clippy::too_many_lines)]
     async fn request_tool_approval(
