@@ -872,7 +872,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "share",
-            description: "Export to a temp HTML file and show path",
+            description: "Share the session as a GitHub Gist",
         },
         BuiltinSlashCommand {
             name: "mcp",
@@ -881,6 +881,66 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         BuiltinSlashCommand {
             name: "template",
             description: "Expand a prompt template by name",
+        },
+        BuiltinSlashCommand {
+            name: "plan",
+            description: "Enter or manage read-only plan mode",
+        },
+        BuiltinSlashCommand {
+            name: "advisor",
+            description: "Second-model turn review (advisor)",
+        },
+        BuiltinSlashCommand {
+            name: "checkpoint",
+            description: "Mark a session restore point",
+        },
+        BuiltinSlashCommand {
+            name: "rewind",
+            description: "Collapse back to a checkpoint with a report",
+        },
+        BuiltinSlashCommand {
+            name: "fresh",
+            description: "Reset provider cache and stream bookkeeping",
+        },
+        BuiltinSlashCommand {
+            name: "retry",
+            description: "Re-queue the last user turn",
+        },
+        BuiltinSlashCommand {
+            name: "undo",
+            description: "Revert the last recorded file mutation",
+        },
+        BuiltinSlashCommand {
+            name: "redo",
+            description: "Replay an undone file mutation",
+        },
+        BuiltinSlashCommand {
+            name: "usage",
+            description: "Show provider credit/quota usage",
+        },
+        BuiltinSlashCommand {
+            name: "approval",
+            description: "Show or change the tool approval mode",
+        },
+        BuiltinSlashCommand {
+            name: "handoff",
+            description: "Emit a handoff document for the next agent",
+        },
+        BuiltinSlashCommand {
+            name: "rules",
+            description: "Show or manage stream rules",
+        },
+        BuiltinSlashCommand {
+            name: "omfg",
+            description: "File a grievance and inject a stream rule",
+        },
+        BuiltinSlashCommand {
+            name: "commit",
+            description: "Dependency-ordered atomic commit splitting",
+        },
+        BuiltinSlashCommand {
+            name: "review",
+            description: "Review the current changes",
         },
     ]
 }
