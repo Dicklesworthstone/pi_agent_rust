@@ -137,6 +137,7 @@ pub enum SemanticCompactionMarkerKind {
     BeadsClaim,
     Interruption,
     TruncationNotice,
+    StreamRule,
 }
 
 impl SemanticCompactionMarkerKind {
@@ -152,6 +153,7 @@ impl SemanticCompactionMarkerKind {
             Self::BeadsClaim => "beads_claim",
             Self::Interruption => "interruption",
             Self::TruncationNotice => "truncation_notice",
+            Self::StreamRule => "stream_rule",
         }
     }
 }

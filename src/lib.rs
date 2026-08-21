@@ -243,6 +243,8 @@ pub mod semantic_workspace_graph;
 #[doc(hidden)]
 pub mod session;
 #[doc(hidden)]
+pub mod session_import;
+#[doc(hidden)]
 pub mod session_index;
 #[doc(hidden)]
 pub mod session_metrics;
@@ -258,6 +260,7 @@ pub mod session_store_v2;
 pub mod skills_managed;
 #[doc(hidden)]
 pub mod sse;
+pub mod stream_rules;
 #[doc(hidden)]
 pub mod subagents;
 #[doc(hidden)]

@@ -2099,6 +2099,21 @@ pub enum Commands {
         #[arg(long)]
         print: bool,
     },
+
+    /// Manage time-traveling stream rules (TTSR) (bd-cv653.3.4)
+    #[command(name = "rules")]
+    Rules {
+        #[command(subcommand)]
+        command: RulesCommands,
+    },
+
+    /// Manage per-project grievances ledger (bd-cv653.3.4)
+    #[command(name = "grievances")]
+    Grievances {
+        #[command(subcommand)]
+        command: GrievancesCommands,
+    },
+
     /// Preview the semantic context bundle Pi would use for a task
     #[command(name = "context-preview")]
     ContextPreview {
@@ -2378,6 +2393,75 @@ pub enum ValidationBrokerCommand {
         /// Write concise text; refuses to overwrite
         #[arg(long = "out-text")]
         out_text: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum RulesCommands {
+    /// List configured stream rules
+    List {
+        /// Show global rules in addition to project rules
+        #[arg(long)]
+        global: bool,
+    },
+    /// Add a new stream rule
+    Add {
+        /// Rule identifier (e.g. no-box-leak)
+        #[arg(short, long)]
+        id: String,
+        /// Rule display name
+        #[arg(short, long)]
+        name: String,
+        /// Matching regex pattern
+        #[arg(short, long)]
+        pattern: String,
+        /// Reminder directive body injected on match
+        #[arg(short, long)]
+        body: String,
+        /// Save to global settings (~/.pi/agent/stream-rules.json) instead of project
+        #[arg(long)]
+        global: bool,
+        /// Optional turn cooldown in turns
+        #[arg(long)]
+        cooldown: Option<usize>,
+    },
+    /// Remove a stream rule by ID
+    Remove {
+        /// Rule ID
+        id: String,
+    },
+    /// Test a regex pattern or existing rule against sample text
+    Test {
+        /// Regex pattern or rule ID
+        pattern: String,
+        /// Sample text to test against
+        sample: String,
+    },
+    /// Export stream rules as JSON
+    Export,
+    /// Import stream rules from JSON file or stdin
+    Import {
+        /// File path or "-" for stdin
+        path: String,
+        /// Import to global rules
+        #[arg(long)]
+        global: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum GrievancesCommands {
+    /// List recorded grievances
+    List,
+    /// Record a user complaint / grievance
+    Add {
+        /// Complaint description
+        complaint: String,
+    },
+    /// Forge a stream rule from a grievance
+    ForgeRule {
+        /// Grievance ID
+        id: String,
     },
 }
 

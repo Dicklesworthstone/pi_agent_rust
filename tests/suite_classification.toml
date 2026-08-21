@@ -151,6 +151,8 @@ files = [
     "validate_e2e_artifact_schema",
     "vcr_parity_validation",
     "edit_empty_string_repro",
+    "handoff_generator",
+    "stream_rules",
     "sdk_api",
     "sdk_unit",
 ]

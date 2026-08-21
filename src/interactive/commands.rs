@@ -51,6 +51,8 @@ pub enum SlashCommand {
     Usage,
     Approval,
     Handoff,
+    Rules,
+    Omfg,
 }
 
 impl SlashCommand {
@@ -101,6 +103,8 @@ impl SlashCommand {
             "/usage" => Self::Usage,
             "/approval" => Self::Approval,
             "/handoff" => Self::Handoff,
+            "/rules" => Self::Rules,
+            "/omfg" => Self::Omfg,
             _ => return None,
         };
 
@@ -138,6 +142,8 @@ impl SlashCommand {
   /plan [approve|reject|off|status] - Enter plan mode / review a submitted plan
   /approval [always-ask|write|yolo|status] - Set or show tool approval mode
   /handoff [to] [path] - Generate structured cross-session/cross-agent handoff brief
+  /rules [list|remove|toggle] - Manage time-traveling stream rules (TTSR)
+  /omfg <complaint>  - Record user grievance and draft a candidate stream rule
   /advisor [status|pause|resume] - Manage the turn-review advisor model
   /undo [n] [force]  - Roll back the last n agent file edits (force: skip external-change guard)
   /redo [n] [force]  - Re-apply previously undone file edits
@@ -2311,6 +2317,8 @@ impl PiApp {
             SlashCommand::Usage => self.handle_slash_usage(args),
             SlashCommand::Approval => self.handle_slash_approval(args),
             SlashCommand::Handoff => self.handle_slash_handoff(args),
+            SlashCommand::Rules => self.handle_slash_rules(args),
+            SlashCommand::Omfg => self.handle_slash_omfg(args),
         }
     }
 
@@ -2991,6 +2999,125 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
             Err(e) => {
                 self.status_message = Some(format!("Failed to generate handoff: {e}"));
+            }
+        }
+
+        None
+    }
+
+    pub(super) fn handle_slash_rules(&mut self, args: &str) -> Option<Cmd> {
+        let args = args.trim();
+        let project_root = self.cwd.clone();
+        let mut store = crate::stream_rules::StreamRuleStore::load_for_project(&project_root);
+
+        if args.is_empty() || args == "list" {
+            let rules = store.list_all_rules();
+            let mut text = format!("### 🛡️ Active Stream Rules ({})\n\n", rules.len());
+            if rules.is_empty() {
+                text.push_str("No stream rules configured. Use `/rules add <id> <pattern> <body>` or `/omfg <complaint>` to create one.\n");
+            } else {
+                for r in &rules {
+                    let status = if r.enabled {
+                        "✅ enabled"
+                    } else {
+                        "⏸️ disabled"
+                    };
+                    text.push_str(&format!(
+                        "- **{}** [{status}]: `/{}/`\n  {}\n",
+                        r.name, r.pattern, r.body
+                    ));
+                }
+            }
+            self.messages.push(ConversationMessage {
+                role: MessageRole::System,
+                content: text,
+                thinking: None,
+                collapsed: false,
+            });
+            self.scroll_to_bottom();
+        } else if let Some(rest) = args.strip_prefix("remove ") {
+            let id = rest.trim();
+            match store.remove_rule(id) {
+                Ok(true) => {
+                    self.status_message = Some(format!("Removed stream rule '{id}'"));
+                }
+                Ok(false) => {
+                    self.status_message = Some(format!("Stream rule '{id}' not found"));
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Error removing rule: {e}"));
+                }
+            }
+        } else if let Some(rest) = args.strip_prefix("toggle ") {
+            let id = rest.trim();
+            let current = store
+                .list_all_rules()
+                .into_iter()
+                .find(|r| r.id == id)
+                .map(|r| r.enabled)
+                .unwrap_or(true);
+            match store.toggle_rule(id, !current) {
+                Ok(true) => {
+                    let st = if !current { "enabled" } else { "disabled" };
+                    self.status_message = Some(format!("Stream rule '{id}' is now {st}"));
+                }
+                _ => {
+                    self.status_message = Some(format!("Stream rule '{id}' not found"));
+                }
+            }
+        } else {
+            self.status_message = Some("Usage: /rules [list|remove <id>|toggle <id>]".to_string());
+        }
+
+        None
+    }
+
+    pub(super) fn handle_slash_omfg(&mut self, args: &str) -> Option<Cmd> {
+        let args = args.trim();
+        if args.is_empty() {
+            self.status_message = Some("Usage: /omfg <complaint about model behavior>".to_string());
+            return None;
+        }
+
+        let project_root = self.cwd.clone();
+        match crate::stream_rules::GrievancesLedger::record_complaint(&project_root, args, None) {
+            Ok(g) => {
+                let candidate = crate::stream_rules::GrievancesLedger::forge_candidate_rule(&g);
+                let mut store =
+                    crate::stream_rules::StreamRuleStore::load_for_project(&project_root);
+                let _ = store.add_rule(candidate.clone(), false);
+
+                let content = format!(
+                    "### 📝 Grievance Logged & Stream Rule Forged\n\n\
+                     - **Grievance ID:** `{gid}`\n\
+                     - **Complaint:** {complaint}\n\n\
+                     **Generated TTSR Stream Rule (`{rid}`):**\n\
+                     - **Name:** {name}\n\
+                     - **Pattern:** `/{pattern}/`\n\
+                     - **Directive:** {body}\n\n\
+                     *Rule is now active for this project and will abort & retry if this pattern occurs mid-stream.*",
+                    gid = g.id,
+                    complaint = g.complaint,
+                    rid = candidate.id,
+                    name = candidate.name,
+                    pattern = candidate.pattern,
+                    body = candidate.body,
+                );
+
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content,
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.scroll_to_bottom();
+                self.status_message = Some(format!(
+                    "Forged and activated stream rule '{}'",
+                    candidate.id
+                ));
+            }
+            Err(e) => {
+                self.status_message = Some(format!("Failed to record grievance: {e}"));
             }
         }
 

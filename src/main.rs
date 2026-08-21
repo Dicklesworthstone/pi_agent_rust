@@ -2304,6 +2304,12 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         } => {
             handle_handoff(cwd, &to, out, session.as_deref(), print).await?;
         }
+        cli::Commands::Rules { command } => {
+            handle_rules(cwd, &command)?;
+        }
+        cli::Commands::Grievances { command } => {
+            handle_grievances(cwd, &command)?;
+        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -4491,6 +4497,135 @@ async fn handle_handoff(
     }
 
     println!("{}", report.status);
+    Ok(())
+}
+
+/// `pi rules list|add|remove|test|export|import` (bd-cv653.3.4):
+/// user-facing stream rules manager.
+fn handle_rules(cwd: &Path, command: &cli::RulesCommands) -> Result<()> {
+    let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd);
+
+    match command {
+        cli::RulesCommands::List { global } => {
+            let rules = if *global {
+                store.list_all_rules()
+            } else {
+                store.list_project_rules().to_vec()
+            };
+
+            if rules.is_empty() {
+                println!("No stream rules configured.");
+            } else {
+                println!("Stream Rules ({}):", rules.len());
+                for r in &rules {
+                    let status = if r.enabled { "enabled" } else { "disabled" };
+                    println!("  • {} [{status}] (pattern: /{}/)", r.id, r.pattern);
+                    println!("    Name: {}", r.name);
+                    println!("    Directive: {}", r.body);
+                    if let Some(cd) = r.cooldown_turns {
+                        println!("    Cooldown: {cd} turns");
+                    }
+                }
+            }
+        }
+        cli::RulesCommands::Add {
+            id,
+            name,
+            pattern,
+            body,
+            global,
+            cooldown,
+        } => {
+            let rule = pi::stream_rules::StreamRule {
+                id: id.clone(),
+                name: name.clone(),
+                pattern: pattern.clone(),
+                body: body.clone(),
+                enabled: true,
+                created_from: None,
+                cooldown_turns: *cooldown,
+            };
+            store.add_rule(rule, *global)?;
+            let scope = if *global { "global" } else { "project" };
+            println!("Added stream rule '{id}' ({scope}).");
+        }
+        cli::RulesCommands::Remove { id } => {
+            if store.remove_rule(id)? {
+                println!("Removed stream rule '{id}'.");
+            } else {
+                println!("Stream rule '{id}' not found.");
+            }
+        }
+        cli::RulesCommands::Test { pattern, sample } => match store.test_pattern(pattern, sample) {
+            Ok(Some(matched)) => {
+                println!("Match found: \"{matched}\"");
+            }
+            Ok(None) => {
+                println!("No match.");
+            }
+            Err(e) => {
+                eprintln!("Error testing pattern: {e}");
+            }
+        },
+        cli::RulesCommands::Export => {
+            let json = store.export_json()?;
+            println!("{json}");
+        }
+        cli::RulesCommands::Import { path, global } => {
+            let json_content = if path == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                fs::read_to_string(path)?
+            };
+            let count = store.import_json(&json_content, *global)?;
+            let scope = if *global { "global" } else { "project" };
+            println!("Imported {count} stream rules ({scope}).");
+        }
+    }
+    Ok(())
+}
+
+/// `pi grievances list|add|forge-rule` (bd-cv653.3.4):
+/// user complaints ledger and candidate rule generator.
+fn handle_grievances(cwd: &Path, command: &cli::GrievancesCommands) -> Result<()> {
+    match command {
+        cli::GrievancesCommands::List => {
+            let grievances = pi::stream_rules::GrievancesLedger::list_grievances(cwd)?;
+            if grievances.is_empty() {
+                println!("No grievances recorded in .pi/grievances.jsonl.");
+            } else {
+                println!("Project Grievances ({}):", grievances.len());
+                for g in &grievances {
+                    let status = if g.resolved { "resolved" } else { "open" };
+                    println!("  • {} [{status}] ({})", g.id, g.timestamp);
+                    println!("    Complaint: {}", g.complaint);
+                    if let Some(ref rid) = g.suggested_rule_id {
+                        println!("    Suggested Rule: {rid}");
+                    }
+                }
+            }
+        }
+        cli::GrievancesCommands::Add { complaint } => {
+            let g = pi::stream_rules::GrievancesLedger::record_complaint(cwd, complaint, None)?;
+            println!("Recorded grievance {} in .pi/grievances.jsonl", g.id);
+        }
+        cli::GrievancesCommands::ForgeRule { id } => {
+            let grievances = pi::stream_rules::GrievancesLedger::list_grievances(cwd)?;
+            let Some(target) = grievances.iter().find(|g| &g.id == id) else {
+                bail!("Grievance '{id}' not found in .pi/grievances.jsonl");
+            };
+            let candidate = pi::stream_rules::GrievancesLedger::forge_candidate_rule(target);
+            println!("Candidate Stream Rule forged from grievance {}:", target.id);
+            println!("  ID: {}", candidate.id);
+            println!("  Name: {}", candidate.name);
+            println!("  Pattern: {}", candidate.pattern);
+            println!("  Body: {}", candidate.body);
+
+            let mut store = pi::stream_rules::StreamRuleStore::load_for_project(cwd);
+            store.add_rule(candidate, false)?;
+            println!("Saved candidate rule to project .pi/stream-rules.json");
+        }
+    }
     Ok(())
 }
 

@@ -452,6 +452,12 @@ fn command_value(command: Option<&Commands>) -> Value {
             "session": session,
             "print": print,
         }),
+        Some(Commands::Rules { .. }) => json!({
+            "name": "rules",
+        }),
+        Some(Commands::Grievances { .. }) => json!({
+            "name": "grievances",
+        }),
         None => Value::Null,
     }
 }
