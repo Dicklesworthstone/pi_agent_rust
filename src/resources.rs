@@ -2044,9 +2044,7 @@ fn legacy_skills_dir_diagnostic(
     if is_same_dir {
         return None;
     }
-    let has_entries = fs::read_dir(&legacy_dir)
-        .map(|mut entries| entries.next().is_some())
-        .unwrap_or(false);
+    let has_entries = fs::read_dir(&legacy_dir).is_ok_and(|mut entries| entries.next().is_some());
     if !has_entries {
         return None;
     }
