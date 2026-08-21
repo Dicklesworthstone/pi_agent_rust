@@ -1453,6 +1453,12 @@ impl Agent {
         self.messages.clear();
     }
 
+    /// Truncate the active message history to `len` (rewind/retry keep the
+    /// full span in the session tree — bd-cv653.3.7).
+    pub fn truncate_messages(&mut self, len: usize) {
+        self.messages.truncate(len);
+    }
+
     /// Add a message to the history.
     pub fn add_message(&mut self, message: Message) {
         if self.messages.len() >= MAX_AGENT_MESSAGES {

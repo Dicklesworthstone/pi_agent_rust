@@ -93,6 +93,8 @@ pub mod bash_mediation;
 #[doc(hidden)]
 pub mod buffer_shim;
 #[doc(hidden)]
+pub mod checkpoint;
+#[doc(hidden)]
 pub mod cli;
 #[doc(hidden)]
 pub mod compaction;
