@@ -141,6 +141,13 @@ impl AutocompleteState {
         }
     }
 
+    /// Attach the session workspace root handle (bd-cv653.3.12): @-file
+    /// suggestions then span every additional root.
+    pub(super) fn set_workspace(&mut self, workspace: crate::workspace::WorkspaceHandle) {
+        self.provider.set_workspace(workspace);
+        self.close();
+    }
+
     pub(super) fn close(&mut self) {
         self.open = false;
         self.items.clear();

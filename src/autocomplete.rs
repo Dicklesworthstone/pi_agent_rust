@@ -96,6 +96,9 @@ impl AutocompleteCatalog {
 #[derive(Debug)]
 pub struct AutocompleteProvider {
     cwd: PathBuf,
+    /// Session workspace roots (bd-cv653.3.12): when set, @-file
+    /// suggestions span the primary root plus every additional root.
+    workspace: Option<crate::workspace::WorkspaceHandle>,
     home_dir_override: Option<PathBuf>,
     catalog: AutocompleteCatalog,
     file_cache: FileCache,
@@ -107,11 +110,18 @@ impl AutocompleteProvider {
     pub const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             cwd,
+            workspace: None,
             home_dir_override: None,
             catalog,
             file_cache: FileCache::new(),
             max_items: 50,
         }
+    }
+
+    /// Attach the session workspace root handle (bd-cv653.3.12).
+    pub fn set_workspace(&mut self, workspace: crate::workspace::WorkspaceHandle) {
+        self.file_cache.invalidate();
+        self.workspace = Some(workspace);
     }
 
     pub fn set_catalog(&mut self, catalog: AutocompleteCatalog) {
@@ -132,7 +142,11 @@ impl AutocompleteProvider {
     }
 
     pub(crate) fn refresh_background(&mut self) {
-        self.file_cache.refresh_if_needed(&self.cwd);
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        self.file_cache.refresh_if_needed(&self.cwd, &roots);
     }
 
     /// Return suggestions for the given editor state.
@@ -202,13 +216,19 @@ impl AutocompleteProvider {
         if is_absolute_like(&normalized) {
             return Some(normalized);
         }
-
-        self.file_cache.refresh_if_needed(&self.cwd);
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        self.file_cache.refresh_if_needed(&self.cwd, &roots);
         let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
         if self.file_cache.files.iter().any(|path| path == stripped) {
             return Some(stripped.to_string());
         }
-
         None
     }
 
@@ -357,7 +377,11 @@ impl AutocompleteProvider {
 
     fn suggest_file_ref(&mut self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
         let query = token.text.strip_prefix('@').unwrap_or(token.text);
-        self.file_cache.refresh_if_needed(&self.cwd);
+        let roots = self.workspace.as_ref().map_or_else(
+            || vec![self.cwd.clone()],
+            |w| w.snapshot_or(&self.cwd).all(),
+        );
+        self.file_cache.refresh_if_needed(&self.cwd, &roots);
 
         let mut items = self
             .file_cache
@@ -627,7 +651,7 @@ impl FileCache {
         self.updating = false;
     }
 
-    fn refresh_if_needed(&mut self, cwd: &Path) {
+    fn refresh_if_needed(&mut self, cwd: &Path, extra_roots: &[PathBuf]) {
         // Poll for completed updates
         if let Some(rx) = &self.update_rx {
             match rx.try_recv() {
@@ -652,11 +676,12 @@ impl FileCache {
             self.updating = true;
             self.last_update_request = Some(now);
             let cwd_buf = cwd.to_path_buf();
+            let roots_buf = extra_roots.to_vec();
             let (tx, rx) = std::sync::mpsc::channel();
             self.update_rx = Some(rx);
 
             std::thread::spawn(move || {
-                let files = collect_project_files(&cwd_buf);
+                let files = collect_project_files_multi(&cwd_buf, &roots_buf);
                 let _ = tx.send(files);
             });
         }
@@ -671,6 +696,23 @@ fn collect_project_files(cwd: &Path) -> Vec<String> {
         |bin| run_fd_list_files(bin, cwd).unwrap_or_else(|| walk_project_files(cwd)),
     );
 
+    if files.len() > MAX_FILE_CACHE_ENTRIES {
+        files.truncate(MAX_FILE_CACHE_ENTRIES);
+    }
+    files
+}
+
+/// Multi-root @-index (bd-cv653.3.12): the primary root keeps bare relative
+/// paths (single-root sessions stay byte-identical); each additional root's
+/// files are listed as `<root>/<rel>` so same-named files cannot collide in
+/// suggestion labels.
+fn collect_project_files_multi(primary: &Path, roots: &[PathBuf]) -> Vec<String> {
+    let mut files = collect_project_files(primary);
+    for root in roots.iter().skip(1) {
+        for file in collect_project_files(root) {
+            files.push(format!("{}/{file}", root.display()));
+        }
+    }
     if files.len() > MAX_FILE_CACHE_ENTRIES {
         files.truncate(MAX_FILE_CACHE_ENTRIES);
     }

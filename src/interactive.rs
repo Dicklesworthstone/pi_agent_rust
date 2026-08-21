@@ -2504,9 +2504,9 @@ impl PiApp {
     /// Attach the session workspace root handle (bd-cv653.3.12). Installed
     /// after construction by hosts that own the shared root set.
     pub fn set_workspace(&mut self, workspace: WorkspaceHandle) {
+        self.autocomplete.set_workspace(workspace.clone());
         self.workspace = workspace;
     }
-
     /// Live workspace root handle for @-file processing and /add-dir.
     pub const fn workspace(&self) -> &WorkspaceHandle {
         &self.workspace
