@@ -7770,9 +7770,12 @@ struct HubInput {
     /// `send`: signal name (SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGKILL).
     signal: Option<String>,
     /// `jobs`: list | wait | cancel.
+    /// `agent`: roster | transcript | steer | kill | revive | send | inbox.
     action: Option<String>,
     /// `jobs`: job id for wait/cancel.
     job_id: Option<String>,
+    /// `agent steer|send`: sender label recorded on the bus message.
+    from: Option<String>,
     /// `jobs`: wait budget in milliseconds.
     timeout_ms: Option<u64>,
 }
@@ -7830,7 +7833,7 @@ impl Tool for HubTool {
             "properties": {
                 "op": {
                     "type": "string",
-                    "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs"],
+                    "enum": ["start", "ps", "logs", "stop", "restart", "describe", "send", "jobs", "agent"],
                     "description": "Operation"
                 },
                 "name": { "type": "string", "description": "Service name (unique per project)" },
@@ -7856,7 +7859,8 @@ impl Tool for HubTool {
                 "enter": { "type": "boolean", "description": "send: append ENTER after text (default true)" },
                 "keys": { "type": "array", "items": { "type": "string" }, "description": "send: named keys (ENTER, TAB, ESCAPE, CTRL_C, CTRL_D, UP, DOWN, LEFT, RIGHT)" },
                 "signal": { "type": "string", "description": "send: SIGINT, SIGTERM, SIGHUP, SIGQUIT, or SIGKILL" },
-                "action": { "type": "string", "enum": ["list", "wait", "cancel"], "description": "jobs: action" },
+                "action": { "type": "string", "enum": ["list", "wait", "cancel", "roster", "transcript", "steer", "kill", "revive", "send", "inbox"], "description": "jobs: list/wait/cancel; agent: roster/transcript/steer/kill/revive/send/inbox" },
+                "from": { "type": "string", "description": "agent steer/send: sender label recorded on the bus message" },
                 "jobId": { "type": "string", "description": "jobs: job id for wait/cancel" },
                 "timeoutMs": { "type": "integer", "description": "jobs: wait budget in ms" }
             },
@@ -8129,10 +8133,183 @@ impl HubTool {
                     }
                 }
             }
+            "agent" => {
+                let action = input
+                    .action
+                    .clone()
+                    .unwrap_or_else(|| "roster".to_string())
+                    .to_ascii_lowercase();
+                self.dispatch_agent(&action, input)?
+            }
             other => {
                 return Err(Error::validation(format!(
                     "Unknown hub op '{other}'; expected start, ps, logs, stop, restart, \
-                     describe, send, or jobs"
+                     describe, send, jobs, or agent"
+                )));
+            }
+        };
+        Ok((text, details))
+    }
+
+    /// Agent-hub action group (bd-cv653.5.3): roster / transcript / steer /
+    /// kill / revive / send / inbox over this session's subagent children.
+    fn dispatch_agent(
+        &self,
+        action: &str,
+        input: &HubInput,
+    ) -> Result<(String, serde_json::Value)> {
+        let id_required = |action: &str| -> Result<String> {
+            input
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .ok_or_else(|| {
+                    Error::validation(format!("hub agent {action} requires name (child run id)"))
+                })
+        };
+        let from = input.from.clone().unwrap_or_else(|| "parent".to_string());
+        let (text, details) = match action {
+            "roster" => {
+                let entries = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .roster();
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.roster/v1",
+                    "children": entries,
+                });
+                let text = if entries.is_empty() {
+                    "No subagent children this session.".to_string()
+                } else {
+                    let lines: Vec<String> = entries
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{} [{}] {} (pid {}, {} bytes out)",
+                                e.id,
+                                e.status.as_str(),
+                                e.task,
+                                e.pid
+                                    .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
+                                e.output_bytes
+                            )
+                        })
+                        .collect();
+                    format!("{} child run(s):\n{}", entries.len(), lines.join("\n"))
+                };
+                (text, details)
+            }
+            "transcript" => {
+                let id = id_required("transcript")?;
+                let page = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .transcript_page(&id)?;
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.transcript/v1",
+                    "id": id,
+                    "redacted": true,
+                });
+                let text = if page.is_empty() {
+                    "(no transcript frames yet)".to_string()
+                } else {
+                    page
+                };
+                (text, details)
+            }
+            "steer" | "send" => {
+                let id = id_required(action)?;
+                let body = input
+                    .text
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .ok_or_else(|| {
+                        Error::validation(format!("hub agent {action} requires text"))
+                    })?;
+                let message = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .steer(&id, &from, &body)?;
+                let details = serde_json::to_value(&message)?;
+                (
+                    format!("Steering queued for {id} (seq {}).", message.seq),
+                    details,
+                )
+            }
+            "kill" => {
+                let id = id_required("kill")?;
+                let entry = {
+                    let reg = crate::agent_hub::registry()
+                        .lock()
+                        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+                    reg.get(&id)
+                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
+                };
+                if entry.status.settled() {
+                    return Err(Error::validation(format!(
+                        "hub: cannot kill '{id}' — already {}",
+                        entry.status.as_str()
+                    )));
+                }
+                if let Some(pid) = entry.pid {
+                    // Process-tree kill so the child's bash descendants die too.
+                    crate::tools::kill_process_group_tree(Some(pid));
+                }
+                crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .mark_killed(&id);
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.kill/v1",
+                    "id": id,
+                    "killedBy": from,
+                });
+                (format!("Child {id} killed by operator."), details)
+            }
+            "revive" => {
+                let id = id_required("revive")?;
+                let (entry, _task) = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .revive(&id)?;
+                // The revived task is queued as a steering continuation: the
+                // next subagent tool call can launch it; the registry entry
+                // already records the lineage so the roster shows it.
+                let details = serde_json::to_value(&entry)?;
+                (
+                    format!(
+                        "Revival registered as {} (continues {id}); relaunch via the subagent tool with the recorded task.",
+                        entry.id
+                    ),
+                    details,
+                )
+            }
+            "inbox" => {
+                let id = id_required("inbox")?;
+                let messages = crate::agent_hub::registry()
+                    .lock()
+                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+                    .inbox(&id);
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.inbox/v1",
+                    "id": id,
+                    "messages": messages,
+                });
+                let text = if messages.is_empty() {
+                    format!("{id}: inbox empty.")
+                } else {
+                    let lines: Vec<String> = messages
+                        .iter()
+                        .map(|m| format!("#{} from {}: {}", m.seq, m.from, m.body))
+                        .collect();
+                    format!("{id}: {} message(s):\n{}", messages.len(), lines.join("\n"))
+                };
+                (text, details)
+            }
+            other => {
+                return Err(Error::validation(format!(
+                    "Unknown agent action '{other}'; expected roster, transcript, steer, \
+                     kill, revive, send, or inbox"
                 )));
             }
         };
@@ -15914,8 +16091,13 @@ mod tests {
         let skill_path = skill_dir.join("SKILL.md");
         std::fs::write(&skill_path, "---\nname: test\n---\n# body\n").unwrap();
 
-        let resolved =
-            enforce_read_scope_with_roots(&skill_path, cwd.path(), agent_dir.path()).unwrap();
+        let resolved = enforce_read_scope_with_roots(
+            &skill_path,
+            cwd.path(),
+            agent_dir.path(),
+            &WorkspaceHandle::default(),
+        )
+        .unwrap();
         assert!(
             resolved.starts_with(
                 agent_dir
@@ -15936,8 +16118,13 @@ mod tests {
         std::fs::write(unrelated.path().join("secret.txt"), "secret").unwrap();
         let secret_path = unrelated.path().join("secret.txt");
 
-        let err =
-            enforce_read_scope_with_roots(&secret_path, cwd.path(), agent_dir.path()).unwrap_err();
+        let err = enforce_read_scope_with_roots(
+            &secret_path,
+            cwd.path(),
+            agent_dir.path(),
+            &WorkspaceHandle::default(),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("outside the working directory") && msg.contains("agent dir"),
@@ -15953,9 +16140,13 @@ mod tests {
         let agent_dir = tempfile::tempdir().unwrap();
         std::fs::write(cwd.path().join("a.txt"), "in cwd").unwrap();
 
-        let resolved =
-            enforce_read_scope_with_roots(&cwd.path().join("a.txt"), cwd.path(), agent_dir.path())
-                .unwrap();
+        let resolved = enforce_read_scope_with_roots(
+            &cwd.path().join("a.txt"),
+            cwd.path(),
+            agent_dir.path(),
+            &WorkspaceHandle::default(),
+        )
+        .unwrap();
         assert!(
             resolved.starts_with(
                 cwd.path()
@@ -15985,7 +16176,64 @@ mod tests {
             assert!(!out.is_error);
         });
     }
+    #[test]
+    fn read_tool_spans_additional_roots_and_revokes_on_removal() {
+        // Multi-root acceptance (bd-cv653.3.12): read succeeds in the
+        // additional root, paths outside every root fail closed, and
+        // removing the root from the shared handle revokes immediately.
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(extra.path().join("extra.txt"), "extra-content").unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside-content").unwrap();
 
+        let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
+        let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
+        handle.add_root(canonical);
+
+        let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
+        let outside_path = outside.path().join("secret.txt").to_string_lossy().to_string();
+
+        // Read inside the additional root succeeds.
+        asupersync::test_utils::run_test(|| {
+            let tool = ReadTool::new(primary.path()).with_workspace(handle.clone());
+            let extra_path = extra_path.clone();
+            async move {
+                let out = tool
+                    .execute("t", serde_json::json!({ "path": extra_path }), None)
+                    .await
+                    .unwrap();
+                assert!(get_text(&out.content).contains("extra-content"));
+            }
+        });
+
+        // Outside every root fails closed with a named denial.
+        asupersync::test_utils::run_test(|| {
+            let tool = ReadTool::new(primary.path()).with_workspace(handle.clone());
+            let outside_path = outside_path.clone();
+            async move {
+                let err = tool
+                    .execute("t", serde_json::json!({ "path": outside_path }), None)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("outside the"), "{err}");
+            }
+        });
+
+        // Revoking the additional root denies the previously-allowed path.
+        handle.remove_root(extra.path());
+        asupersync::test_utils::run_test(|| {
+            let tool = ReadTool::new(primary.path()).with_workspace(handle.clone());
+            let extra_path = extra_path.clone();
+            async move {
+                let err = tool
+                    .execute("t", serde_json::json!({ "path": extra_path }), None)
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("outside the"), "{err}");
+            }
+        });
+    }
     #[test]
     fn test_read_empty_file_positive_offset_errors() {
         asupersync::test_utils::run_test(|| async {
