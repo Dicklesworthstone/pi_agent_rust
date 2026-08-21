@@ -1580,10 +1580,9 @@ mod tests {
         assert!(cli.list_models.is_none());
         assert!(cli.command.is_none());
         assert!(cli.args.is_empty());
-        assert_eq!(
-            cli.tools,
-            "read,bash,edit,write,grep,find,ls,hashline_edit,web_search,ast_grep,ast_edit,lsp,debug,ask,todo,submit_plan"
-        );
+        // The bare-invocation default must stay in lockstep with the
+        // canonical default-enabled tool list.
+        assert_eq!(cli.tools, crate::xdev::default_enabled_tools().join(","));
     }
 
     // ── 11. Combined flags ───────────────────────────────────────────

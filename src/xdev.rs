@@ -127,6 +127,8 @@ pub fn default_enabled_tools() -> Vec<&'static str> {
         "ask",
         "todo",
         "submit_plan",
+        "jobs",
+        "hub",
     ]
 }
 
@@ -154,7 +156,11 @@ pub fn builtin_one_liner(name: &str) -> Option<&'static str> {
         "lsp" => {
             "IDE-grade code intelligence (definition, references, rename) via language servers"
         }
-        "debug" => "Drive a real debugger (DAP): launch/attach, breakpoints, step, evaluate",
+        "debug" => {
+            "Drive a real debugger (DAP): launch/attach, breakpoints, step, evaluate, stack/memory rea…"
+        }
+        "jobs" => "Manage background bash jobs started with `bash {background: true}`",
+        "hub" => "Supervise long-running processes and manage background jobs",
         "subagent" => "Delegate an isolated task to a named Pi child agent",
         "ask" => "Ask the user structured questions mid-turn instead of guessing",
         "todo" => "Maintain the session task list",
