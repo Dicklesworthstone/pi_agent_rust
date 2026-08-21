@@ -8774,10 +8774,38 @@ mod tests {
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept auth request");
             stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
+                .set_read_timeout(Some(Duration::from_millis(500)))
                 .expect("bound auth request read");
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
+            // Drain the full request (headers + declared body). Responding
+            // and dropping the socket while inbound bytes are still unread
+            // makes the OS send RST, which can clobber the queued response
+            // on the client side ("Connection reset by peer" flake).
+            let mut request: Vec<u8> = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => {
+                        request.extend_from_slice(&chunk[..read]);
+                        let Some(headers_end) = request.windows(4).position(|w| w == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&request[..headers_end]);
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= headers_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+            }
             let reason = if status == 200 { "OK" } else { "Unauthorized" };
             write!(
                 stream,
@@ -8785,6 +8813,11 @@ mod tests {
                 body.len()
             )
             .expect("write auth response");
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            // Let the client finish reading before the socket drops.
+            let mut sink = [0_u8; 256];
+            while matches!(stream.read(&mut sink), Ok(read) if read > 0) {}
         });
         format!("http://{address}/token")
     }
