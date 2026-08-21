@@ -82,8 +82,7 @@ fn session_id_for(source: ImportSource, content: &[u8]) -> String {
 /// Parse an ISO-8601/RFC3339 timestamp to epoch millis (best effort).
 fn parse_ts_ms(raw: Option<&str>) -> i64 {
     raw.and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
-        .map(|dt| dt.timestamp_millis())
-        .unwrap_or(0)
+        .map_or(0, |dt| dt.timestamp_millis())
 }
 
 fn text_message(role: &str, text: String, ts: i64) -> Message {
@@ -127,9 +126,22 @@ pub fn import_codex(path: &Path, target_dir: Option<&Path>) -> Result<ImportOutc
 }
 
 /// Find an already-imported session by content-addressed id anywhere under
-/// the target root (the store nests by cwd).
+/// the target root. Session files are named `<timestamp>_<id-prefix>.jsonl`
+/// (first 8 id chars), so the probe matches the prefix and verifies the
+/// full id in the header line.
 fn find_imported_session(root: &Path, id: &str) -> Option<std::path::PathBuf> {
-    let needle = format!("{id}.jsonl");
+    let prefix: String = id
+        .chars()
+        .take(8)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let suffix = format!("{prefix}.jsonl");
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = std::fs::read_dir(&dir).ok()?;
@@ -137,8 +149,17 @@ fn find_imported_session(root: &Path, id: &str) -> Option<std::path::PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.file_name().and_then(|n| n.to_str()) == Some(needle.as_str()) {
-                return Some(path);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.ends_with(&suffix))
+            {
+                let header_line = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|content| content.lines().next().map(str::to_string));
+                if header_line.is_some_and(|line| line.contains(id)) {
+                    return Some(path);
+                }
             }
         }
     }
@@ -152,9 +173,8 @@ fn import_bytes(
     target_dir: Option<&Path>,
 ) -> Result<ImportOutcome> {
     let id = session_id_for(source, raw);
-    let target_root = target_dir
-        .map(Path::to_path_buf)
-        .unwrap_or_else(crate::config::Config::sessions_dir);
+    let target_root =
+        target_dir.map_or_else(crate::config::Config::sessions_dir, Path::to_path_buf);
     // Idempotency probe: the session store nests by cwd, so scan for the
     // content-addressed id anywhere under the target root.
     let already_imported = find_imported_session(&target_root, &id);
@@ -172,8 +192,8 @@ fn import_bytes(
         });
     }
 
-    let mut session = Session::create_with_dir(Some(target_root.clone()));
-    session.header.id = id.clone();
+    let mut session = Session::create_with_dir(Some(target_root));
+    session.header.id.clone_from(&id);
     // Let the store derive the canonical path (it nests by cwd); the outcome
     // reads the actual path after save.
     session.header.provider = Some(source.as_str().to_string());
@@ -292,7 +312,7 @@ fn now_ms() -> i64 {
 
 fn convert_claude_entry(entry: &serde_json::Value) -> std::result::Result<Option<Message>, String> {
     let entry_type = entry.get("type").and_then(|v| v.as_str());
-    if !matches!(entry_type, Some("user") | Some("assistant")) {
+    if !matches!(entry_type, Some("user" | "assistant")) {
         // Non-conversational envelope (title/summary/meta) — not an error,
         // just not a message.
         return Ok(None);
@@ -467,16 +487,13 @@ fn convert_codex_entry(entry: &serde_json::Value) -> std::result::Result<Option<
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
             let ts = parse_ts_ms(entry.get("timestamp").and_then(|v| v.as_str()));
-            convert_codex_payload(&payload, ts)
+            Ok(convert_codex_payload(&payload, ts))
         }
         _ => Ok(None),
     }
 }
 
-fn convert_codex_payload(
-    payload: &serde_json::Value,
-    ts: i64,
-) -> std::result::Result<Option<Message>, String> {
+fn convert_codex_payload(payload: &serde_json::Value, ts: i64) -> Option<Message> {
     let kind = payload.get("type").and_then(|v| v.as_str());
     match kind {
         Some("message") => {
@@ -490,9 +507,9 @@ fn convert_codex_payload(
                 .map(|blocks| extract_codex_text_blocks(blocks))
                 .unwrap_or_default();
             if content.trim().is_empty() {
-                return Ok(None);
+                return None;
             }
-            Ok(Some(text_message(role, content, ts)))
+            Some(text_message(role, content, ts))
         }
         Some("reasoning") => {
             let summary = payload
@@ -501,20 +518,18 @@ fn convert_codex_payload(
                 .map(|blocks| extract_codex_text_blocks(blocks))
                 .unwrap_or_default();
             if summary.trim().is_empty() {
-                return Ok(None);
+                return None;
             }
-            Ok(Some(Message::Assistant(std::sync::Arc::new(
-                AssistantMessage {
-                    content: vec![ContentBlock::Thinking(ThinkingContent {
-                        thinking: summary,
-                        thinking_signature: None,
-                    })],
-                    timestamp: ts,
-                    ..Default::default()
-                },
-            ))))
+            Some(Message::Assistant(std::sync::Arc::new(AssistantMessage {
+                content: vec![ContentBlock::Thinking(ThinkingContent {
+                    thinking: summary,
+                    thinking_signature: None,
+                })],
+                timestamp: ts,
+                ..Default::default()
+            })))
         }
-        Some("function_call") | Some("custom_tool_call") => {
+        Some("function_call" | "custom_tool_call") => {
             let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let arguments = payload
                 .get("arguments")
@@ -525,20 +540,18 @@ fn convert_codex_payload(
                 .get("call_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            Ok(Some(Message::Assistant(std::sync::Arc::new(
-                AssistantMessage {
-                    content: vec![ContentBlock::ToolCall(ToolCall {
-                        id: call_id.to_string(),
-                        name: name.to_string(),
-                        arguments,
-                        thought_signature: None,
-                    })],
-                    timestamp: ts,
-                    ..Default::default()
-                },
-            ))))
+            Some(Message::Assistant(std::sync::Arc::new(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    arguments,
+                    thought_signature: None,
+                })],
+                timestamp: ts,
+                ..Default::default()
+            })))
         }
-        _ => Ok(None),
+        _ => None,
     }
 }
 
