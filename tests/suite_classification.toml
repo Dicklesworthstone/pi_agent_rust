@@ -115,6 +115,7 @@ files = [
     "hub",
     "memory",
     "skills_managed",
+    "magic_keywords",
     "fts5_spike",
     "bash_mediation",
     "json_mode_parity",

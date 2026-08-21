@@ -676,6 +676,10 @@ pub struct AgentConfig {
 
     /// Optional approval gate invoked before a tool executes.
     pub tool_approval: Option<ToolApprovalHandler>,
+
+    /// Magic-keyword settings (bd-cv653.3.6): per-keyword toggles plus
+    /// custom words. None = all three built-ins enabled, no customs.
+    pub keyword_settings: Option<crate::magic_keywords::KeywordSettings>,
 }
 
 impl fmt::Debug for AgentConfig {
@@ -687,6 +691,7 @@ impl fmt::Debug for AgentConfig {
             .field("block_images", &self.block_images)
             .field("fail_closed_hooks", &self.fail_closed_hooks)
             .field("tool_approval", &self.tool_approval.is_some())
+            .field("keyword_settings", &self.keyword_settings)
             .finish()
     }
 }
@@ -727,6 +732,7 @@ impl Default for AgentConfig {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
         }
     }
 }
@@ -1217,6 +1223,10 @@ pub struct Agent {
     /// Dialect repair ledger (bd-cv653.7.8): every text→tool-call fixup this
     /// session, drained by the session layer into session Custom entries.
     repair_ledger: Arc<StdMutex<crate::dialects::RepairLedger>>,
+
+    /// Magic-keyword activations this run (bd-cv653.3.6), drained by the
+    /// session wrapper into session Custom entries for auditability.
+    keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
 }
 
 /// Activation state for glob-scoped foreign rules (bd-cv653.6.2).
@@ -1271,6 +1281,7 @@ impl Agent {
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
+            keyword_ledger: Vec::new(),
         }
     }
 
@@ -1359,6 +1370,12 @@ impl Agent {
             .lock()
             .map(|mut ledger| std::mem::take(&mut ledger.entries))
             .unwrap_or_default()
+    }
+
+    /// Drain magic-keyword activations (bd-cv653.3.6) for the session layer
+    /// to persist as Custom entries.
+    pub fn drain_keyword_ledger(&mut self) -> Vec<crate::magic_keywords::KeywordActivation> {
+        std::mem::take(&mut self.keyword_ledger)
     }
 
     /// Install glob-scoped imported workspace rules (bd-cv653.6.2). Each rule
@@ -1771,6 +1788,43 @@ impl Agent {
         on_event(agent_start_event);
 
         for prompt in prompts {
+            // Magic keywords (bd-cv653.3.6): pre-send prose scan of the user
+            // message. ultrathink raises the turn's thinking level (clamped
+            // per model downstream); orchestrate/workflowz/custom words
+            // append their directive to the system prompt (appended, never
+            // inserted, so provider prompt caches stay valid).
+            if let Message::User(user) = &prompt
+                && let UserContent::Text(text) = &user.content
+            {
+                let hits =
+                    crate::magic_keywords::detect(text, self.config.keyword_settings.as_ref());
+                if !hits.is_empty() {
+                    let mut directives = Vec::new();
+                    for hit in &hits {
+                        if hit.action == "ultrathink" {
+                            self.stream_options_mut().thinking_level =
+                                Some(crate::model::ThinkingLevel::Max);
+                        }
+                    }
+                    directives.extend(crate::magic_keywords::directives_for(
+                        &hits,
+                        self.config.keyword_settings.as_ref(),
+                    ));
+                    if !directives.is_empty() {
+                        let block = directives.join("\n");
+                        match &mut self.config.system_prompt {
+                            Some(existing) => {
+                                existing.push_str("\n\n");
+                                existing.push_str(&block);
+                            }
+                            none_slot => {
+                                *none_slot = Some(block);
+                            }
+                        }
+                    }
+                    self.keyword_ledger.extend(hits);
+                }
+            }
             self.messages.push(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),
@@ -10223,6 +10277,28 @@ impl AgentSession {
         self.run_text_with_abort(input, None, on_event).await
     }
 
+    /// Drain the magic-keyword activation ledger into session Custom
+    /// entries (bd-cv653.3.6) so activations are auditable ("why did
+    /// thinking jump to max?").
+    async fn persist_keyword_ledger(&mut self) {
+        let activations = self.agent.drain_keyword_ledger();
+        if activations.is_empty() {
+            return;
+        }
+        let cx = pi::agent_cx::AgentCx::for_request();
+        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
+            for activation in &activations {
+                inner.append_custom_entry(
+                    "magic_keyword".to_string(),
+                    Some(serde_json::json!({
+                        "word": activation.word,
+                        "action": activation.action,
+                    })),
+                );
+            }
+        }
+    }
+
     /// Drain the dialect-repair ledger into session Custom entries
     /// (bd-cv653.7.8) so repairs are replayable/auditable.
     async fn persist_repair_ledger(&self) {
@@ -10358,6 +10434,7 @@ impl AgentSession {
 
             self.agent.set_system_prompt(base_system_prompt);
             self.persist_repair_ledger().await;
+            self.persist_keyword_ledger().await;
             self.maybe_advise_turn().await;
             result
         }
@@ -12802,6 +12879,7 @@ mod tests {
                 block_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -12835,6 +12913,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
             },
         );
         agent.add_message(Message::User(UserMessage {
@@ -13029,6 +13108,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
             },
         );
 

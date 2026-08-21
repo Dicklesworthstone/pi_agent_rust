@@ -1868,6 +1868,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
+        keyword_settings: config.keywords.clone(),
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
@@ -2271,6 +2272,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
             },
         );
 
@@ -2437,6 +2439,7 @@ mod tests {
                 block_images: false,
                 fail_closed_hooks: false,
                 tool_approval: None,
+                keyword_settings: None,
             },
         );
 

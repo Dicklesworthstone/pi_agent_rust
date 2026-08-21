@@ -190,6 +190,8 @@ pub mod keybindings;
 #[doc(hidden)]
 pub mod lsp;
 #[doc(hidden)]
+pub mod magic_keywords;
+#[doc(hidden)]
 pub mod mcp;
 #[doc(hidden)]
 pub mod memory;

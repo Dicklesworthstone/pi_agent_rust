@@ -70,6 +70,8 @@ pub struct Config {
     pub bash: Option<BashSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
     pub memory: Option<MemorySettings>,
+    /// Magic-keyword settings (bd-cv653.3.6).
+    pub keywords: Option<crate::magic_keywords::KeywordSettings>,
     /// Advisor settings (bd-cv653.3.3).
     pub advisor: Option<AdvisorSettings>,
     /// LSP tool settings (bd-cv653.1.1).
@@ -810,6 +812,7 @@ impl Config {
             read: merge_read(base.read, other.read),
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
+            keywords: other.keywords.or(base.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
             lsp: merge_lsp(base.lsp, other.lsp),
             request_timeout_secs: other.request_timeout_secs.or(base.request_timeout_secs),

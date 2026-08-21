@@ -193,6 +193,7 @@ fn run_scripted(
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1065,6 +1066,7 @@ fn sdk_conformance_session_tool_hooks() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1149,6 +1151,7 @@ fn sdk_conformance_combined_callback_ordering() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1260,6 +1263,7 @@ fn sdk_continue_turn_uses_combined_listener_path() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
@@ -1348,6 +1352,7 @@ fn sdk_continue_turn_with_abort_returns_aborted_message() {
             block_images: false,
             fail_closed_hooks: false,
             tool_approval: None,
+            keyword_settings: None,
         };
         let agent = pi::agent::Agent::new(provider, tools, config);
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
