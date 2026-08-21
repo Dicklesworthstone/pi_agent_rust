@@ -119,6 +119,7 @@ files = [
     "worktree_iso",
     "checkpoint",
     "eval",
+    "url_router",
     "fts5_spike",
     "bash_mediation",
     "json_mode_parity",

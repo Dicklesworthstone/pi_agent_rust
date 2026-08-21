@@ -275,6 +275,8 @@ pub mod tools;
 pub mod tui;
 pub mod url_read;
 #[doc(hidden)]
+pub mod url_router;
+#[doc(hidden)]
 pub mod validation_broker;
 #[doc(hidden)]
 pub mod vcr;

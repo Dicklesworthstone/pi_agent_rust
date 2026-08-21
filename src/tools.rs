@@ -5483,6 +5483,93 @@ where
 }
 
 impl ReadTool {
+    /// Internal-scheme reads (bd-cv653.6.3): resolve via the URL router,
+    /// then apply the same line-window/truncation contract as text files.
+    async fn execute_scheme_read(&self, input: &ReadInput) -> Result<ToolOutput> {
+        use std::fmt::Write as _;
+
+        let resolved = crate::url_router::resolve(&input.path, &self.cwd)?;
+        let total_lines = resolved.content.lines().count();
+        let start_line = input
+            .offset
+            .and_then(|n| usize::try_from(n).ok())
+            .map_or(0, |n| n.saturating_sub(1));
+        if total_lines == 0 {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(""))],
+                details: Some(serde_json::to_value(&resolved)?),
+                is_error: false,
+            });
+        }
+        if start_line >= total_lines {
+            let offset_display = input.offset.unwrap_or(0);
+            return Err(Error::tool(
+                "read",
+                format!(
+                    "Offset {offset_display} is beyond end of document ({total_lines} lines total)"
+                ),
+            ));
+        }
+        let max_lines_for_truncation = input
+            .limit
+            .and_then(|l| usize::try_from(l).ok())
+            .unwrap_or(DEFAULT_MAX_LINES);
+        let limit_lines = input
+            .limit
+            .and_then(|l| usize::try_from(l).ok())
+            .unwrap_or(usize::MAX);
+        let lines_to_take = limit_lines.min(max_lines_for_truncation.saturating_add(1));
+
+        let mut selected_content = String::new();
+        let max_line_num = start_line.saturating_add(lines_to_take).min(total_lines);
+        let line_num_width = max_line_num.to_string().len().max(5);
+        for (i, line) in resolved.content.lines().skip(start_line).enumerate() {
+            if i >= lines_to_take || start_line + i >= total_lines {
+                break;
+            }
+            if i > 0 {
+                selected_content.push('\n');
+            }
+            let line = line.strip_suffix('\r').unwrap_or(line);
+            let line_idx = start_line + i;
+            if input.hashline {
+                let tag = format_hashline_tag(line_idx, line);
+                let _ = write!(selected_content, "{tag}:{line}");
+            } else {
+                let line_num = line_idx + 1;
+                let _ = write!(selected_content, "{line_num:>line_num_width$}→{line}");
+            }
+            if selected_content.len() > DEFAULT_MAX_BYTES * 2 {
+                break;
+            }
+        }
+
+        let mut truncation = truncate_head(
+            selected_content,
+            max_lines_for_truncation,
+            DEFAULT_MAX_BYTES,
+        );
+        truncation.total_lines = total_lines;
+        let mut output_text = std::mem::take(&mut truncation.content);
+        if truncation.truncated {
+            let end_line = (start_line + lines_to_take).min(total_lines);
+            let _ = write!(
+                output_text,
+                "\n\n[Showing lines {}-{end_line} of {total_lines}. Document: {}]",
+                start_line + 1,
+                input.path
+            );
+        }
+        let mut details = serde_json::to_value(&resolved)?;
+        details["truncated"] = serde_json::Value::Bool(truncation.truncated);
+        details["totalLines"] = serde_json::Value::from(total_lines);
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(output_text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+
     /// URL reads (bd-cv653.2.2): fetch + convert, then window with the same
     /// 1-based offset/limit and continuation-notice shapes as file reads.
     /// 1-based offset/limit and continuation-notice shapes as file reads.
@@ -5629,6 +5716,15 @@ impl Tool for ReadTool {
         // reader-mode markdown; pagination/truncation shapes match file reads.
         if input.path.starts_with("http://") || input.path.starts_with("https://") {
             return self.execute_url_read(&input).await;
+        }
+
+        // Internal URL schemes (bd-cv653.6.3): skill://, prompt://,
+        // local://, conflict://, pr://, issue://, ssh:// resolve into
+        // virtual documents with the same pagination contract as file
+        // reads. Unknown schemes error with the registered list — never a
+        // silent filesystem fallback.
+        if crate::url_router::has_scheme(&input.path) {
+            return self.execute_scheme_read(&input).await;
         }
 
         let path = resolve_read_path(&input.path, &self.cwd);
