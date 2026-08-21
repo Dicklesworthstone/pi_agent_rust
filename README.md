@@ -42,7 +42,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 9 built-in tools.
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 28 built-in tools (18 live in a default session; 13 always in the model's schema, the rest reachable through the `xdev` dispatcher).
 
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
@@ -357,33 +357,46 @@ pi "Write a quicksort implementation"
 
 Watch the response appear incrementally, with thinking blocks shown inline.
 
-### 9 Built-in Tools
+### 28 Built-in Tools
 
-| Tool | Description | Example |
-|------|-------------|---------|
-| `read` | Read file contents, supports images | Read src/main.rs |
-| `write` | Create or overwrite files | Write a new config file |
-| `edit` | Surgical string replacement | Fix the typo on line 42 |
-| `hashline_edit` | Precise edits using LINE#HASH tags | Apply edits to specific lines using hashline anchors |
-| `bash` | Execute shell commands with timeout | Run the test suite |
-| `grep` | Search file contents with context | Find all TODO comments |
-| `find` | Discover files by pattern | Find all *.rs files |
-| `ls` | List directory contents | What's in src/? |
-| `subagent` | Delegate isolated work to a named Rust Pi child agent | Ask a scout to inspect a provider |
-| `todo` | Session task list with phases and auto-promotion (opt-in) | Track a multi-step refactor |
-| `ask` | Structured mid-turn option picker (opt-in) | Choose between two migration paths |
+Tools are tiered so the model's live schema stays small while everything
+remains reachable:
 
-All tools include:
-- Automatic truncation for large outputs (2000 lines / 1MB)
-- Detailed metadata in responses
-- Process tree cleanup for bash (no orphaned processes)
+- **Essential** (always in the provider schema): `read`, `write`, `edit`,
+  `bash`, `grep`, `find`, `ls`, `hashline_edit`, `ask`, `todo`,
+  `web_search`, `submit_plan`, `xdev`
+- **Discoverable** (registered, hidden from the schema until promoted via
+  `xdev list/describe/run/promote`): `ast_grep`, `ast_edit`, `lsp`,
+  `debug`, `manage_skill` — plus the memory-bank tools (`retain`,
+  `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is
+  `local`
+- **`--tools` opt-in extras**: `jobs`, `hub`, `eval`, `github`
+- **Opt-in only**: `subagent` (it can start additional coding-agent
+  processes)
 
-`subagent` is intentionally opt-in because it can start additional coding-agent
-processes. `todo` is opt-in during its rollout; enable either explicitly with
-`--tools` (or in the tools setting) — e.g. `--tools ...,todo` gives the model
-a session task list (ops: init/start/done/drop/block/unblock/rm/append/view)
-that persists across `--continue`, forks with session branches, and shows a
-compact progress line in the TUI footer:
+| Tool | Description |
+|------|-------------|
+| `read` | Read files (images and http(s)/`skill://`-style URLs supported) |
+| `write` / `edit` / `hashline_edit` | Create, surgically replace, or hashline-anchored edit files |
+| `bash` | Shell with timeout, command mediation, optional PTY, background jobs |
+| `grep` / `find` / `ls` | In-process content search, file discovery, listing |
+| `web_search` | Ranked multi-provider web search with circuit breaking |
+| `ask` / `todo` | Structured mid-turn option cards; persistent session task list |
+| `submit_plan` | Submit a completed plan for approval when plan mode is active |
+| `xdev` | Dispatcher exposing the discoverable tier (`list/describe/run/promote`) |
+| `ast_grep` / `ast_edit` | Structural code search and rewrite |
+| `lsp` / `debug` | Language-server (14 ops) and DAP debugging (28 ops) bridges |
+| `eval` | Persistent Python and JS kernels with cell semantics |
+| `jobs` / `hub` | Background bash job control; PTY service supervision |
+| `github` | `gh`-backed PR/issue/run operations |
+| `manage_skill` + memory tools | Managed skills CRUD; opt-in project memory bank |
+| `subagent` | Delegate isolated work to named Rust Pi child agents |
+
+All tools include automatic truncation for large outputs (2000 lines /
+1MB), detailed metadata in responses, and process-tree cleanup for bash.
+Per-tool exposure is configurable via `tools.loadMode.<name>` set to
+`essential`, `discoverable`, or `off`; an explicit `--tools` list always
+wins:
 
 ```bash
 pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
@@ -467,19 +480,20 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
 Pi provides context-aware autocomplete in the interactive editor:
 
 - **`@` file references**: Type `@` followed by a path fragment to attach file contents. The completion engine indexes project files (respecting `.gitignore`) via the `ignore` crate's `WalkBuilder`, capping at 5,000 entries.
-- **`/` slash commands**: Built-in commands (`/help`, `/model`, `/tree`, `/clear`, `/compact`, `/exit`) and user-defined prompt templates and skills all appear as completions.
+- **`/` slash commands**: 40+ built-in commands (see the slash-command table below) and user-defined prompt templates and skills all appear as completions.
 - **Fuzzy scoring**: Prefix matches rank above substring matches. Results are sorted by match quality, then by kind (commands > templates > skills > files > paths).
 - **Background refresh**: A background thread re-indexes the project file tree every 30 seconds, so completions stay current without blocking the input loop.
 
-### Three Execution Modes
+### Four Execution Modes
 
-Pi runs in three modes, each suited to different workflows:
+Pi runs in four modes, each suited to different workflows:
 
 | Mode | Invocation | Use Case |
 |------|-----------|----------|
 | **Interactive** | `pi` (default) | Full TUI with streaming, tools, session branching, autocomplete |
 | **Print** | `pi -p "..."` | Single response to stdout, no TUI, scriptable |
 | **RPC** | `pi --mode rpc` | Headless JSON protocol over stdin/stdout for IDE integrations |
+| **ACP** | `pi --acp` | JSON-RPC 2.0 Agent Client Protocol over stdin/stdout (e.g. the Zed editor) |
 
 **Interactive mode** provides the full experience: a multi-line text editor with history, scrollable conversation viewport, model selector (`Ctrl+L`), scoped model cycling (`Ctrl+P`/`Ctrl+Shift+P`), session branch navigator (`/tree`), and real-time token/cost tracking.
 
@@ -498,7 +512,7 @@ Pi supports two extension runtime families with capability-gated host connectors
   - `.js/.ts/.mjs/.cjs/.tsx/.mts/.cts` run directly in embedded QuickJS (no descriptor conversion).
   - `*.native.json` loads the native-rust descriptor runtime.
   - One session currently uses one runtime family at a time (JS/TS or native descriptor).
-- Cold/warm extension load paths are instrumented; fresh `v0.2.0` measurements are pending
+- Cold/warm extension load paths are instrumented; fresh `v0.3.0` measurements are pending
 - Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
 - Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
 - Command-level exec mediation: dangerous shell signatures are classified and blocked before spawn, with redacted denial alerts and mediation ledger entries
@@ -523,7 +537,7 @@ and [docs/extension-catalog.json](docs/extension-catalog.json) for the
 
 This project validates extension compatibility with a three-track pipeline:
 
-- **Vendored corpus (224)**: deterministic conformance, compatibility matrix, and scenario suites.
+- **Vendored corpus (223, plus one intentionally excluded negative test fixture)**: deterministic conformance, compatibility matrix, and scenario suites.
 - **Unvendored corpus (777)**: source acquisition and onboarding prioritization.
 - **Release-binary live-provider E2E**: real `target/release/pi` execution against a non-mocked provider/model path.
 
@@ -623,7 +637,7 @@ cargo run --example ext_full_validation --
 
 ### Historical run snapshot (extension gate refresh 2026-05-15)
 
-These artifacts predate `v0.2.0` and do not certify the current source revision.
+These artifacts predate `v0.3.0` and do not certify the current source revision.
 Current strict drop-in status is **NOT CERTIFIED** until the active contract is
 rerun successfully from a clean release source commit and the final release ref
 contains no later non-evidence changes. The figures below are retained only as
@@ -641,13 +655,13 @@ From:
 - `tests/full_suite_gate/certification_verdict.json` (generated `2026-05-14T19:59:37.227Z`)
 - Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
-- Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.2.0`)*
+- Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
 - Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json)*
 - Historical extension gate: `123/123` then-observed must-pass extensions passed; informational stretch set `100/101` passed with one non-blocking stretch failure *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json)*
 - Extension health delta: `223/223` tested extensions passed (`100.0%`), `0` regressions, `13` fixes vs the 2026-02-07 baseline, with `1` intentionally excluded test fixture disclosed in the report *(from tests/ext_conformance/reports/health_delta/health_delta_report.json)*
 - Health-delta full-manifest non-pass extensions: `0`; `base_fixtures` is a test-only negative fixture excluded from release-facing pass-rate claims with disposition recorded in `docs/evidence/extension-health-delta-failure-disposition.json`.
 - Extension journey coverage: `123/123` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json)*
-- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a `v0.2.0` performance claim.
+- Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a `v0.3.0` performance claim.
 
 ---
 
@@ -663,13 +677,13 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
 
 # Pin a release tag
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.2.0/install.sh" | bash -s -- --version v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | bash -s -- --version v0.3.0
 
 # Install from explicit artifact URL + checksum URL
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.2.0/install.sh" | \
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.3.0/install.sh" | \
   bash -s -- \
-    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.2.0/pi-linux-amd64.tar.xz" \
-    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.2.0/SHA256SUMS"
+    --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/pi-linux-amd64.tar.xz" \
+    --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.3.0/SHA256SUMS"
 
 # Skip completion setup (CI/non-interactive minimal install)
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
@@ -1076,7 +1090,7 @@ This is a second comparison pass focused on high-impact architectural deltas and
 |------|---------------------------------------------|------------------|----------------------------|
 | **Distribution model** | npm package (`npm install -g @mariozechner/pi-coding-agent`) | Single Rust binary (`pi`) | Remove Node runtime dependency and improve startup/deployment portability |
 | **Execution surfaces** | Interactive + print + JSON mode + RPC + SDK | Interactive + print + JSON mode + RPC + Rust SDK | Rust SDK provides idiomatic companion API for embedding Pi programmatically (documented in `docs/sdk.md`) |
-| **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Eight built-ins treated as first-class (`read/write/edit/bash/grep/find/ls/hashline_edit`) | Keep common code-navigation, shell, and hashline-anchored edit workflows available without extra configuration |
+| **Default built-in tool posture** | Defaults to `read/write/edit/bash` (others available) | Thirteen Essential-tier built-ins always in the schema (`read/write/edit/bash/grep/find/ls/hashline_edit/ask/todo/web_search/submit_plan/xdev`), with a discoverable tier behind the `xdev` dispatcher | Keep common code-navigation, shell, and edit workflows available without extra configuration while bounding schema size |
 | **Extension trust model** | Extension/package model documented as full system access | Embedded runtime with capability-gated hostcalls and policy profiles | Reduce ambient authority and make extension behavior auditable/deny-by-default |
 | **Session architecture emphasis** | JSONL tree session model and branch navigation | JSONL v3 tree + derived SQLite metadata index + default-enabled SQLite session backend support | Bound eligible resume/lookups and coordinate multi-instance access |
 | **Streaming transport stack** | Node runtime networking stack | Purpose-built HTTP/TLS client + custom SSE parser on asupersync | Tighter control over chunking, parsing, and failure handling in long streams |
@@ -1681,15 +1695,26 @@ The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `
 
 | Command | Action |
 |---------|--------|
-| `/help` | Show available commands and keybindings |
-| `/model` or `Ctrl+L` | Open model selector with fuzzy search |
+| `/help` (`/h`, `/?`) | Show available commands and keybindings |
+| `/model` (`/m`) or `Ctrl+L` | Open model selector with fuzzy search; `/model roles` edits role bindings |
 | `Ctrl+P` / `Ctrl+Shift+P` | Cycle scoped models forward/backward |
-| `/tree` | Browse and fork the conversation tree |
-| `/clear` | Clear conversation and start fresh |
-| `/compact` | Trigger manual compaction |
-| `/thinking <level>` | Change thinking level mid-conversation |
-| `/share` | Export session to GitHub Gist |
-| `/exit` or `Ctrl+C` | Exit Pi |
+| `/login`, `/logout` | Provider OAuth/API-key credential management |
+| `/thinking <level>` (`/t`) | Change thinking level mid-conversation |
+| `/scoped-models` (`/scoped`) | Show or set model scope patterns |
+| `/tree`, `/fork` | Browse the conversation tree; branch from a previous message |
+| `/clear` (`/cls`), `/new` | Clear conversation; start a new session |
+| `/compact [shake\|aggressive]` | Manual compaction (shake drops oversized tool results with no LLM call) |
+| `/checkpoint`, `/rewind`, `/fresh`, `/retry` | Session restore points and turn control |
+| `/undo`, `/redo` | Revert/replay file mutations made by tools |
+| `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
+| `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
+| `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
+| `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
+| `/export`, `/share`, `/copy` (`/cp`) | HTML export, GitHub Gist share, copy last reply |
+| `/handoff`, `/commit`, `/review` | Handoff document, dependency-ordered commit splitting, review |
+| `/template`, `/skill:<name>` | Expand a prompt template; invoke a skill |
+| `/reload` | Reload skills/prompts/themes/extensions from disk |
+| `/exit` (`/quit`, `/q`) or `Ctrl+C` | Exit Pi |
 
 ### RPC Protocol
 
@@ -1912,7 +1937,7 @@ CLI tools have different performance requirements than servers or GUI applicatio
 | Application runtime bootstrap | Required | Not required |
 | Application module loading | Commonly dynamic | Ahead-of-time linked Rust code |
 | JIT warmup | Runtime-dependent | Not used |
-| Current release timing | Not measured here | Fresh `v0.2.0` measurement pending |
+| Current release timing | Not measured here | Fresh `v0.3.0` measurement pending |
 
 Current comparative timing numbers are intentionally omitted until a fresh,
 provenance-matched benchmark run is available.
@@ -1993,7 +2018,7 @@ strip = true         # Remove symbol tables
 Binary size is explicitly budgeted in CI via `binary_size_release`, with a target
 threshold of `26.0 MiB` (the harness computes bytes / 1024 / 1024; raised from
 `22.0 MiB` with the FrankenSQLite cutover). A fresh
-`v0.2.0` release measurement is required before reporting the achieved size.
+`v0.3.0` release measurement is required before reporting the achieved size.
 Default release builds keep heavyweight extras opt-in; use `--features full`
 when you need the image, clipboard, wasm, jemalloc, and syntax-highlighting
 extras in one build.
@@ -2044,7 +2069,7 @@ Current checked-in performance evidence state:
 - Regenerate the perf evidence bundle before adding release-facing speed,
   throughput, memory, or startup numbers to this README.
 
-Historical certification/evidence refresh (`2026-05-15` progress SLO closeout; `2026-05-15` extension gate; `2026-05-14` full-suite reports; `2026-05-18` drop-in certification verdict). These results do not certify the current source revision or `v0.2.0`:
+Historical certification/evidence refresh (`2026-05-15` progress SLO closeout; `2026-05-15` extension gate; `2026-05-14` full-suite reports; `2026-05-18` drop-in certification verdict). These results do not certify the current source revision or `v0.3.0`:
 - Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json)*
 - Full-suite gate: `20/20` gates passed, including `14/14` blocking gates *(from tests/full_suite_gate/full_suite_verdict.json)*
 - Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
@@ -2382,7 +2407,7 @@ multi-agent runs, see [docs/swarm-operations-runbook.md](docs/swarm-operations-r
 
 Pi's perf pipeline includes strict evidence checks so global speed claims cannot be based on partial or stale data.
 
-**v0.2.0 performance-claim status: NOT authorized.** Its checked-in
+**v0.3.0 performance-claim status: NOT authorized.** Its checked-in
 `pi.perf.budget_summary.v2` artifact is an explicit blocked/NO_DATA result, so
 this release may ship only without quantitative or global performance claims.
 That blocked state is not a passing benchmark result.
@@ -2428,7 +2453,7 @@ closed to the compiled allocator and includes a fallback reason in artifacts.
 ### Memory Usage
 
 Rust's ownership model avoids a garbage-collected application runtime. Current
-memory figures are intentionally withheld until the `v0.2.0` evidence inputs
+memory figures are intentionally withheld until the `v0.3.0` evidence inputs
 are regenerated with matching source and run provenance.
 
 ### Streaming Architecture
@@ -2747,7 +2772,7 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | **Startup** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Memory** | Fresh comparative measurement pending | Not measured here | Not measured here | Not measured here |
 | **Providers** | 11 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
-| **Tools** | 9 built-in | Many | File-focused | IDE-integrated |
+| **Tools** | 28 built-in (18 default-enabled) | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
 
@@ -2887,11 +2912,12 @@ Releases are tag-driven and must align with `Cargo.toml` versions.
   crates.io. `.github/workflows/publish.yml` is a manual dry-run diagnostic;
   it has no registry secret and never publishes.
 - The no-Actions DSR lane is specified in [docs/releasing.md](docs/releasing.md).
-  It is fail-closed. For v0.2.0, the audited preserved wrapper is authorized
-  only to produce five raw binaries plus its aggregate build manifest; a
-  separate source-bound deterministic stage creates the exact 12 public assets.
-  Publication uses the checksum-gated Cargo credential provider materialized
-  from the frozen release workflow; a plain `cargo:token` publish is forbidden.
+  It is fail-closed. The audited preserved wrapper documented there is
+  hash-pinned to the v0.2.0 release and was authorized only to produce five
+  raw binaries plus its aggregate build manifest, with a separate
+  source-bound deterministic stage creating the exact 12 public assets;
+  later releases built without that preserved wrapper use the standard DSR
+  fallback under direct operator instruction instead.
   Immutable `v*` tag ruleset `20418963` was created and read back on 2026-08-04
   with update/deletion forbidden and no bypass actors. The manual lane
   re-verifies that live control before tagging and publication and stops on any

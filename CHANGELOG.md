@@ -14,7 +14,265 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
-## [v0.2.0] — 2026-08-06 — Release
+## [v0.3.0] — 2026-08-21 — Release
+
+First published release since [v0.1.23](https://github.com/Dicklesworthstone/pi_agent_rust/releases/tag/v0.1.23).
+This release also ships everything documented under the unpublished
+[v0.2.0](#v020--2026-08-06--unpublished-milestone) milestone below — users
+upgrading from v0.1.23 should read both sections. Roughly 450 commits; the
+dominant arc is the OMP-ADOPT capability wave (`bd-cv653` epic in
+[`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/pi_agent_rust/blob/main/.beads/issues.jsonl)),
+a pure-Rust session-storage engine swap, and a hardening pass over the
+interactive TUI driven by real end-to-end stress testing.
+
+### Breaking Changes
+
+- **Token accounting moved from the `chars/4` heuristic to real BPE tables**
+  (O200k/Cl100k via the default-on `bpe-tokens` feature). Compaction
+  thresholds and cut points shift for existing sessions; disabling the
+  feature restores the old heuristic
+  ([`b91f6a3c`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b91f6a3c)).
+- **Extension discovery is manifest-only** — all inference heuristics
+  (sibling-entry discovery, workspace-bundle clustering, `examples/` scans,
+  node_modules fallback) were removed for upstream parity. Extensions not
+  declared in `package.json#pi.extensions` or the conventional `extensions/`
+  directory stop loading
+  ([`3f37f46a`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/3f37f46a)).
+- **Workspace trust-on-first-use** — project-local `.pi/settings.json`
+  packages and `.pi/extensions/` no longer execute on plain startup;
+  non-interactive launches fail closed. Automation needs `--trust`,
+  `PI_WORKSPACE_TRUST=1`, or global `trustAllWorkspaces`
+  ([`17faf856`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/17faf856), GH #151).
+- **Session storage engine swapped to FrankenSQLite** — session index and
+  SQLite-backed sessions run on the pure-Rust fsqlite engine instead of
+  libsqlite3-sys. `Error::Sqlite` now wraps typed `fsqlite::FrankenError`
+  variants (SDK-visible), a new sidecar file family appears next to session
+  stores, and the release binary size budget moved from 22 to 26 MiB
+  ([`432c90cc`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/432c90cc)).
+- **Tool schema surface is tiered** — non-essential tools leave the provider
+  schema by default and become reachable through the new `xdev`
+  dispatcher (`list/describe/run/promote`), with `tools.loadMode.<name>`
+  overrides; `--tools` still wins
+  ([`319f70ef`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/319f70ef)).
+- **MCP servers no longer inherit the ambient environment** — stdio servers
+  get a PATH/HOME/locale/temp/TERM allowlist (`MCP_ENV_ALLOWLIST`); servers
+  depending on ambient tokens must be configured explicitly
+  ([`2da01cbc`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2da01cbc)).
+- **SDK/embedder struct changes** — `AgentConfig` gains `keyword_settings`,
+  `turn_recovery`, and `max_time` fields; `PiApp::new` takes an
+  `mcp_manager` argument; SDK sessions now emit Anthropic prompt-cache
+  breakpoints (short retention) by default, overridable via
+  `PI_CACHE_RETENTION=long|none`
+  ([`9ec0ab34`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9ec0ab34)).
+- **Image decoding narrowed** to jpeg/png/gif/webp; avif/exr/tiff/qoi/bmp are
+  no longer compiled into default builds
+  ([`2f6c227b`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2f6c227b)).
+
+### Features — code intelligence and execution tools
+
+- **`lsp` tool** — 14 operations over child language servers (JSON-RPC over
+  stdio, per-server registry, rename/definition/diagnostics), with
+  `lsp.servers` config merged over built-in defaults
+  ([`912a4650`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/912a4650)).
+- **`debug` tool** — 28 DAP operations with adapter auto-selection
+  (lldb-dap, debugpy, dlv)
+  ([`2db8f6b1`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2db8f6b1)).
+- **`eval` tool** — persistent Python and QuickJS kernels with cell
+  semantics, trailing-expression repr, a tool-bridge whitelist, and
+  top-level `await`
+  ([`ee942ba2`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/ee942ba2)).
+- **`ast_grep` / `ast_edit`** structural search and rewrite tools
+  ([`1952d084`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1952d084)).
+- **Bash execution hardening** — every spawn is classified against
+  `bash.mediation` (`off|warn|block-critical|block-high`) before exec;
+  `portable-pty` gives isatty-requiring commands a real tty (`PtyMode
+  off|always|auto`); `bash {background: true}` returns a job id managed by
+  the new `jobs` tool; the `hub` tool supervises PTY services with
+  readiness gates
+  ([`ca14c3ab`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/ca14c3ab),
+  [`da62aebf`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/da62aebf),
+  [`b8e39600`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b8e39600)).
+
+### Features — web, integrations, and interop
+
+- **`web_search` tool** with a nine-rung ranked provider chain (keyed:
+  perplexity/brave/tavily/exa/jina/kagi; keyless: duckduckgo/startpage/
+  mojeek), per-rung circuit breaking, `site:`/`after:` filters, and
+  canonical-URL dedupe
+  ([`45181b06`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/45181b06)).
+- **URL-aware `read`** — http(s) paths return reader-mode markdown with
+  SSRF default-deny for private targets; internal `skill:// prompt://
+  pr:// issue:// ssh://` URL schemes route through the same tool
+  ([`f5e2987a`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f5e2987a),
+  [`a0d31499`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/a0d31499)).
+- **MCP client** — unified registry over native (`.pi/mcp.json`,
+  `--mcp-config`) and foreign (`.claude/.cursor/.windsurf/.gemini/.codex`)
+  configs, fingerprint-bound trust lifecycle, stdio + streamable-HTTP
+  transports, `mcp__<server>__<tool>` wrappers, and a `/mcp` command
+  ([`952fb3bd`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/952fb3bd)).
+- **`github` tool** (`gh`-backed pr/issue/run operations) and
+  **`pi import --from-claude|--from-codex`** for idempotent foreign-session
+  import
+  ([`506a76ae`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/506a76ae),
+  [`ddc075d9`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/ddc075d9)).
+- **Richer JS extension host** (GH #167) — `buildSessionContext`,
+  `convertToLlm`, `modelRegistry.find`, native `ctx.compact()`, typed
+  subagent results validated against per-task JSON Schemas, and
+  `before_provider_request` hooks on all JSON-body provider routes
+  ([`cd9c2bfc`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/cd9c2bfc),
+  [`9974d79d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9974d79d)).
+
+### Features — model routing and resilience
+
+- **Model roles** (`modelRoles` settings, `--smol/--slow/--plan` flags,
+  `/model roles`) with cheap auto-titling and task-role subagents
+  ([`d5b8cf72`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/d5b8cf72)).
+- **Failover chains** — `retry.fallbackChains` continues a turn on the next
+  configured model after classified transient failures, with cooldowns and
+  per-turn caps; auth failures never fail over. Plural env credential
+  rings (`OPENAI_API_KEYS`-style) rotate keys with per-key backoff
+  ([`bbc68341`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/bbc68341)).
+- **Dialect repair for weak models** — text-emitted tool calls (bare JSON,
+  fenced blocks, `<tool_call>` tags) are repaired into structured calls
+  through the normal executor with strict anti-false-positive rules
+  ([`89a15c22`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/89a15c22)).
+- **Advisor** — a second-model turn reviewer with fail-closed isolation
+  (`/advisor`)
+  ([`b0c6dd59`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b0c6dd59)).
+
+### Features — session control and agent ergonomics
+
+- **Checkpoints** — `/checkpoint`, `/rewind` (collapse-with-report),
+  `/fresh`, `/retry`, and a `--max-time` wall-clock cap
+  ([`b3723e4d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b3723e4d)).
+- **`/undo` and `/redo`** over a content-addressed snapshot recorder for
+  file-mutating tools
+  ([`dd77beaa`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/dd77beaa)).
+- **Turn recovery** — deterministic unexpected-stop classifier with capped
+  auto-continue
+  ([`1ba1e39d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1ba1e39d)).
+- **`pi handoff`** (schema `pi.handoff.v1`, secret-screened) and
+  **`pi commit`** (dependency-ordered atomic commit splitting)
+  ([`d59bffa7`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/d59bffa7),
+  [`644a077d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/644a077d)).
+- **`ask` and `todo` tools** are now default-enabled: structured mid-turn
+  option cards across TUI/RPC/SDK, and a persistent session task list with
+  a footer progress line
+  ([`bba4345f`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/bba4345f),
+  [`6ccdea44`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/6ccdea44)).
+- **Plan mode** — read-only planning with `submit_plan` and an approval
+  gate, plus RPC commands and approval modes
+  (`--approval-mode`, `--yolo`, `/approval`)
+  ([`be2a71c2`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/be2a71c2),
+  [`af47798d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/af47798d)).
+- **Memory bank (opt-in)** — per-project SQLite+FTS5 store behind
+  `memory.backend = local` with `retain/recall/reflect/memory_edit/learn`
+  tools and a managed-skills tier
+  ([`3be3a829`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/3be3a829)).
+- **Magic keywords** — prose-only `ultrathink`/`orchestrate`/`workflowz`
+  triggers with a grammar-aware tokenizer, plus time-traveling stream rules
+  with mid-stream abort/injection (`pi rules`, `/omfg`)
+  ([`3aac814f`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/3aac814f),
+  [`441ffaa6`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/441ffaa6)).
+- **Compaction shake mode** — `/compact shake` reclaims context by dropping
+  oversized tool-result payloads deterministically with zero LLM calls;
+  the automatic policy shakes first and escalates to an LLM summary only
+  if still over threshold
+  ([`2a6607bf`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2a6607bf)).
+
+### Features — operator surface
+
+- **`pi self-update`** with fail-closed SHA-256 verification, package-manager
+  detection, and atomic swap with rollback
+  ([`f16763f2`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f16763f2)).
+- **Shell completions** — `pi completions bash|zsh|fish` from the live clap
+  graph, plus a `pi __complete` protocol serving live model/session
+  candidates
+  ([`09e8dcc4`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/09e8dcc4)).
+- **`pi usage` / `/usage`** — provider credit/quota readers (OpenRouter,
+  Moonshot, Copilot)
+  ([`f6be31da`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f6be31da)).
+- **FrankenTUI preview** — an experimental alternative TUI behind
+  `pi --ftui` (default-off feature): tail-follow scroll, modal pickers,
+  extension bridging, and an `--inline` mode that preserves shell
+  scrollback
+  ([`41dfdb7e`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/41dfdb7e)).
+- **`/theme auto`** terminal light/dark detection
+  ([`6b7ac35c`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/6b7ac35c)).
+
+### TUI reliability (HN-feedback hardening wave)
+
+- Tracing output can no longer paint over the alt-screen transcript: logs
+  divert to `<global_dir>/logs/tui.log` while the TUI owns the terminal
+  ([`41e97d31`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/41e97d31)).
+- Tool, `!cmd`, and extension-command output is sanitized before entering
+  the transcript (CSI/OSC/DCS/SOS/PM/APC sequences and C0 controls
+  stripped; CR-rewritten progress bars normalized)
+  ([`1d723625`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1d723625),
+  [`f6df955f`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/f6df955f)).
+- Tool transcript blocks now show what ran (`$ <command>` headers keyed by
+  tool id so parallel tools can never mislabel each other), tool
+  completions no longer yank a scrolled-up reader to the bottom, the slash
+  menu no longer vanishes on short prefixes like `/t`, and skills are
+  discoverable from a bare `/`
+  ([`c98ac8fd`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/c98ac8fd),
+  [`9d184467`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9d184467)).
+- User, system, and tool lines hard-wrap to the terminal width; long diff
+  lines clamp to the pane; scroll no longer rebuilds the conversation
+  twice per wheel tick; memory-pressure tiers now work on macOS (RSS via
+  sysinfo)
+  ([`28a798d4`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/28a798d4),
+  [`7c391723`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/7c391723)).
+- New end-to-end coverage: a tmux stress lane drives 35 sequential real
+  tool executions through the release-shaped binary and asserts scroll
+  integrity afterward; VCR request templates are now derived from the live
+  tool registry with a shape-parity guard so cassettes cannot silently
+  drift
+  ([`9b0f2841`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9b0f2841),
+  [`8b43a2bf`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/8b43a2bf)).
+
+### Fixes
+
+- Anthropic prompt caching: 1h TTL emitted only on the first-party API;
+  last-user-block caching with empty system omitted; foreign reasoning
+  signatures dropped on model switch
+  ([`1d817ab0`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/1d817ab0),
+  [`5e20d9df`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/5e20d9df)).
+- Custom model catalogs honor `thinkingFormat`/`thinkingLevelMap` (GH #166)
+  and Bearer auth for OpenAI-family providers with an `apiKey`
+  ([`281c2984`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/281c2984),
+  [`d5d8d276`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/d5d8d276)).
+- OpenAI Responses replay hardened (merged `msg_` parts, gated `fc_` ids,
+  lossless reasoning item-id replay)
+  ([`5432397d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/5432397d)).
+- `grep` results respect the workspace-root `.gitignore`; path-shaped
+  `find` globs and pinned-file context reads fixed; the `/login` provider
+  table, template completions, and subagent output fencing hardened
+  ([`317b0293`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/317b0293),
+  [`72602d1d`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/72602d1d)).
+- A legacy `~/.pi/skills` directory now triggers a warning instead of a
+  silent no-op
+  ([`81f3c646`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/81f3c646)).
+
+### Performance
+
+- In-process grep/find engines replace external `rg`/`fd` shell-outs by
+  default
+  ([`b7724e62`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/b7724e62)).
+- SDK embedders default to short Anthropic prompt-cache retention, closing
+  a full-input-price-every-turn cost leak
+  ([`9ec0ab34`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9ec0ab34)).
+- Binary size: image stack trimmed to decode-only jpeg/png/gif/webp;
+  parallel rustc front-end enabled for builds
+  ([`2f6c227b`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/2f6c227b),
+  [`9d4872a0`](https://github.com/Dicklesworthstone/pi_agent_rust/commit/9d4872a0)).
+
+
+## [v0.2.0] — 2026-08-06 — Unpublished milestone
+
+> This version was prepared and set in `Cargo.toml` but was never tagged or
+> published (no GitHub Release, no crates.io upload). Its changes first ship
+> in [v0.3.0](#v030--2026-08-21--release) above.
 
 ### Breaking Changes
 
