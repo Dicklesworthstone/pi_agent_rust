@@ -60,7 +60,7 @@ pub(super) fn normalize_raw_terminal_newlines(input: String) -> String {
 ///
 /// We do explicit wrapping here instead of relying on terminal auto-wrap so the
 /// renderer's logical rows stay aligned with physical rows in alt-screen mode.
-fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
+pub(super) fn wrapped_line_segments(line: &str, max_width: usize) -> Vec<&str> {
     if max_width == 0 || line.is_empty() {
         return vec![line];
     }
@@ -849,16 +849,34 @@ impl PiApp {
     }
 
     /// Render a single conversation message to a string (uncached path).
+    #[allow(clippy::too_many_lines)]
     fn render_single_message(&self, msg: &ConversationMessage) -> String {
         let mut output = String::new();
         match msg.role {
             MessageRole::User => {
-                let _ = write!(
-                    output,
-                    "\n  {} {}\n",
-                    self.styles.accent_bold.render("You:"),
-                    msg.content
-                );
+                // Hard-wrap so logical rows match physical rows (the frame
+                // height clamp counts newlines; verbatim long lines overflow
+                // and make the scroll percentage lie — bd-06s4y).
+                let wrap_width = self.term_width.saturating_sub(9).max(20);
+                output.push('\n');
+                let mut first = true;
+                for line in msg.content.lines() {
+                    for segment in wrapped_line_segments(line, wrap_width) {
+                        if first {
+                            first = false;
+                            let _ = writeln!(
+                                output,
+                                "  {} {segment}",
+                                self.styles.accent_bold.render("You:")
+                            );
+                        } else {
+                            let _ = writeln!(output, "       {segment}");
+                        }
+                    }
+                }
+                if first {
+                    let _ = writeln!(output, "  {}", self.styles.accent_bold.render("You:"));
+                }
             }
             MessageRole::Assistant => {
                 let _ = write!(
@@ -893,8 +911,9 @@ impl PiApp {
             MessageRole::Tool => {
                 // Per-message collapse: global toggle overrides, then per-message.
                 let show_expanded = self.tools_expanded && !msg.collapsed;
+                let wrap_width = self.term_width.saturating_sub(4).max(20);
                 if show_expanded {
-                    let rendered = render_tool_message(&msg.content, &self.styles);
+                    let rendered = render_tool_message(&msg.content, &self.styles, wrap_width);
                     let _ = write!(output, "\n  {rendered}\n");
                 } else {
                     let header = msg.content.lines().next().unwrap_or("Tool output");
@@ -924,17 +943,27 @@ impl PiApp {
                                 );
                                 break;
                             }
-                            let _ = writeln!(
-                                output,
-                                "  {}",
-                                self.styles.muted.render(&format!("  {line}"))
-                            );
+                            for segment in
+                                wrapped_line_segments(line, wrap_width.saturating_sub(2).max(10))
+                            {
+                                let _ = writeln!(
+                                    output,
+                                    "  {}",
+                                    self.styles.muted.render(&format!("  {segment}"))
+                                );
+                            }
                         }
                     }
                 }
             }
             MessageRole::System => {
-                let _ = write!(output, "\n  {}\n", self.styles.warning.render(&msg.content));
+                let wrap_width = self.term_width.saturating_sub(4).max(20);
+                output.push('\n');
+                for line in msg.content.lines() {
+                    for segment in wrapped_line_segments(line, wrap_width) {
+                        let _ = writeln!(output, "  {}", self.styles.warning.render(segment));
+                    }
+                }
             }
         }
         output
