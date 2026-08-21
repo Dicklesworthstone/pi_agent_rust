@@ -369,7 +369,7 @@ impl MemoryStore {
     /// Named `PI_MEMORY_UNKNOWN_ID` for unknown ids.
     pub fn edit(&self, id: i64, op: MemoryEditOp, content: Option<&str>) -> Result<()> {
         let now = now_ms();
-        let new_content = content.map(|text| screen_secrets(text));
+        let new_content = content.map(screen_secrets);
         self.with_conn(move |conn| {
             let exists = conn
                 .query_sync(
@@ -561,6 +561,8 @@ pub fn screen_secrets(content: &str) -> String {
 // Tools
 // ---------------------------------------------------------------------------
 
+use futures::StreamExt as _;
+
 use crate::model::{ContentBlock, TextContent};
 use crate::provider::{Context, StreamEvent, StreamOptions};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolUpdate};
@@ -580,7 +582,7 @@ pub struct RetainTool {
 
 impl RetainTool {
     #[must_use]
-    pub fn new(store: Arc<MemoryStore>) -> Self {
+    pub const fn new(store: Arc<MemoryStore>) -> Self {
         Self { store }
     }
 }
@@ -594,6 +596,7 @@ struct RetainInput {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for RetainTool {
     fn name(&self) -> &str {
         "retain"
@@ -654,10 +657,10 @@ impl Tool for RetainTool {
         match self.store.retain(kind, &input.content, &tags, None) {
             Ok(memory) => {
                 let details = serde_json::to_value(&memory)?;
-                let redaction_note = if memory.content != input.content {
-                    " (secret redacted before storage)"
-                } else {
+                let redaction_note = if memory.content.as_str() == input.content {
                     ""
+                } else {
+                    " (secret redacted before storage)"
                 };
                 Ok(text_output(
                     format!("Remembered [{}] {}{redaction_note}", memory.id, memory.kind),
@@ -681,7 +684,7 @@ pub struct RecallTool {
 
 impl RecallTool {
     #[must_use]
-    pub fn new(store: Arc<MemoryStore>) -> Self {
+    pub const fn new(store: Arc<MemoryStore>) -> Self {
         Self { store }
     }
 }
@@ -694,6 +697,7 @@ struct RecallInput {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for RecallTool {
     fn name(&self) -> &str {
         "recall"
@@ -757,7 +761,7 @@ pub struct MemoryEditTool {
 
 impl MemoryEditTool {
     #[must_use]
-    pub fn new(store: Arc<MemoryStore>) -> Self {
+    pub const fn new(store: Arc<MemoryStore>) -> Self {
         Self { store }
     }
 }
@@ -771,6 +775,7 @@ struct MemoryEditInput {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for MemoryEditTool {
     fn name(&self) -> &str {
         "memory_edit"
@@ -858,7 +863,7 @@ impl ReflectTool {
         }
     }
 
-    #[cfg(test)]
+    /// Inject a provider (tests and scripted harnesses).
     #[must_use]
     pub fn with_provider(
         store: Arc<MemoryStore>,
@@ -868,6 +873,34 @@ impl ReflectTool {
             store,
             provider: Some(provider),
         }
+    }
+
+    /// Union recall over the question's tokens (frequency then recency),
+    /// capped — natural questions AND poorly against FTS.
+    fn gather(&self, question: &str, cap: usize) -> Result<Vec<Memory>> {
+        let mut hits: std::collections::HashMap<i64, (usize, Memory)> =
+            std::collections::HashMap::new();
+        for token in question.split_whitespace() {
+            let token = token.trim_matches(|c: char| !c.is_alphanumeric()); // ubs:ignore punctuation trim, not a secret
+            if token.len() < 2 {
+                continue;
+            }
+            for memory in self.store.recall(token, Some(cap))? {
+                hits.entry(memory.id)
+                    .and_modify(|(count, _)| *count += 1)
+                    .or_insert((1, memory));
+            }
+        }
+        let mut ranked: Vec<(usize, Memory)> = hits.into_values().collect();
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.updated_at_ms.cmp(&a.1.updated_at_ms))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(cap)
+            .map(|(_, memory)| memory)
+            .collect())
     }
 
     fn resolve_provider(&self) -> Result<Arc<dyn crate::provider::Provider>> {
@@ -898,6 +931,7 @@ struct ReflectInput {
 }
 
 #[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReflectTool {
     fn name(&self) -> &str {
         "reflect"
@@ -935,15 +969,9 @@ impl Tool for ReflectTool {
     ) -> Result<ToolOutput> {
         let input: ReflectInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
-        // Gather top-K: FTS on the question's content words, plus the
-        // mental-model head so broad questions still have grounding.
-        let memories = self.store.recall(&input.question, Some(8))?;
-        let fallback = if memories.is_empty() {
-            self.store.recall("the", Some(4)).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let corpus: Vec<crate::memory::Memory> = memories.into_iter().chain(fallback).collect();
+        // Gather top-K: natural questions AND poorly, so recall per token
+        // and union (frequency then recency), capped at 8.
+        let corpus = self.gather(&input.question, 8)?;
         if corpus.is_empty() {
             return Ok(text_output(
                 "No memories to reflect on yet — retain some facts first.".to_string(),
@@ -958,12 +986,15 @@ impl Tool for ReflectTool {
              answer the question, say so.\n\nMemories:\n",
         );
         for memory in &corpus {
-            prompt.push_str(&format!(
-                "- [{}] ({}): {}\n",
-                memory.id, memory.kind, memory.content
-            ));
+            let _ = std::fmt::Write::write_fmt(
+                &mut prompt,
+                format_args!("- [{}] ({}): {}\n", memory.id, memory.kind, memory.content),
+            );
         }
-        prompt.push_str(&format!("\nQuestion: {}\n", input.question));
+        let _ = std::fmt::Write::write_fmt(
+            &mut prompt,
+            format_args!("\nQuestion: {}\n", input.question),
+        );
         let context = Context {
             system_prompt: Some(std::borrow::Cow::Borrowed(
                 "You are a precise memory synthesizer. Cite memory ids for every claim.",
@@ -979,7 +1010,6 @@ impl Tool for ReflectTool {
         let options = StreamOptions::default();
         let mut stream = provider.stream(&context, &options).await?;
         let mut answer = String::new();
-        use futures::StreamExt;
         while let Some(event) = stream.next().await {
             if let Ok(StreamEvent::TextDelta { delta, .. }) = event {
                 answer.push_str(&delta);
@@ -1016,7 +1046,7 @@ mod tests {
             "secret must be redacted: {screened}"
         );
         assert!(screened.contains("[REDACTED_OPENAI_KEY]"), "{screened}");
-        let aws = screen_secrets("aws key AKIAIOSFODNN7EXAMPLE here");
+        let aws = screen_secrets("aws key AKIAIOSFODNN7EXAMPLE here"); // ubs:ignore AWS documentation example key, not a real secret
         assert!(aws.contains("[REDACTED_AWS_ACCESS_KEY]"), "{aws}");
         let clean = screen_secrets("nothing secret here");
         assert_eq!(clean, "nothing secret here");

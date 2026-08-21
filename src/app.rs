@@ -212,6 +212,19 @@ pub fn build_system_prompt(
         prompt.push_str(&block);
     }
 
+    // Memory bank mental model (bd-cv653.4.1): budget-capped block of the
+    // project's top active facts/lessons on the first turn. Appended (never
+    // inserted mid-history) so provider prompt caches stay valid.
+    if !test_mode
+        && config.memory_backend() == "local"
+        && let Ok(store) = crate::memory::MemoryStore::open(cwd)
+        && let Ok(model) = store.mental_model()
+        && !model.is_empty()
+    {
+        prompt.push_str("\n\n# Project Memory\n\nWhat you remember about this project:\n\n");
+        prompt.push_str(&model);
+    }
+
     if let Some(skills_prompt) = skills_prompt {
         prompt.push_str(skills_prompt);
     }

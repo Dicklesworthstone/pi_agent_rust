@@ -113,6 +113,8 @@ files = [
     "interactive_commands_unit",
     "jobs",
     "hub",
+    "memory",
+    "fts5_spike",
     "bash_mediation",
     "json_mode_parity",
     "ledger_calibration_sec35",

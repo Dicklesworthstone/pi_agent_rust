@@ -524,10 +524,12 @@ pub struct BashSettings {
     pub pty: Option<String>,
 }
 
-/// `memory.backend` (bd-cv653.4.1): `off` (default while experimental,
-/// omp's setting-gated posture) | `local` (per-project SQLite+FTS5 bank
-/// with retain/recall/reflect/memory_edit tools and a mental-model block
-/// on the first turn) | `cass` (reserved, not yet implemented).
+/// `memory.backend` (bd-cv653.4.1).
+///
+/// `off` (default while experimental, omp's setting-gated posture) |
+/// `local` (per-project SQLite+FTS5 bank with
+/// retain/recall/reflect/memory_edit tools and a mental-model block on the
+/// first turn) | `cass` (reserved, not yet implemented).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MemorySettings {
