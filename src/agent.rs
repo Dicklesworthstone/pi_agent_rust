@@ -1858,7 +1858,7 @@ impl Agent {
                         }
                     }
                 }
-                Message::Assistant(_) => {}
+                Message::Assistant(_) | Message::Custom(_) => {}
             }
         }
         if total > 0 {
