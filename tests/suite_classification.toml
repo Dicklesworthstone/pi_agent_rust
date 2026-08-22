@@ -113,6 +113,7 @@ files = [
     "interactive_commands_unit",
     "jobs",
     "hub",
+    "agent_hub",
     "memory",
     "skills_managed",
     "magic_keywords",
@@ -122,7 +123,6 @@ files = [
     "url_router",
     "session_import",
     "secrets",
-    "token_count",
     "fts5_spike",
     "bash_mediation",
     "json_mode_parity",
@@ -156,7 +156,6 @@ files = [
     "handoff_generator",
     "stream_rules",
     "commit_split",
-    "session_import",
     "self_update",
     "review",
     "gc",
@@ -305,6 +304,7 @@ files = [
     "tui_state",
     "validation_broker_cli",
     "validation_broker_e2e",
+    "web_search_rungs",
 ]
 
 [suite.e2e]
@@ -351,6 +351,14 @@ files = [
     "perf_e2e",
     "e2e_workflow_preflight",
     "provider_live_verify",
+    "e2e_advisor",
+    "e2e_failover",
+    "e2e_ftui",
+    "e2e_plan_mode",
+    "e2e_subagent_roles",
+    "e2e_url_read",
+    "e2e_web_search",
+    "e2e_xdev",
 ]
 
 # Quarantine: flaky tests with tracked expiry and ownership.

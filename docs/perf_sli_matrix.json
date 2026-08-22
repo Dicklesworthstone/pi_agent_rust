@@ -543,6 +543,83 @@
           "matched-state",
           "realistic"
         ]
+      },
+      {
+        "workflow_id": "wf-advisor-concern-injection",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-ast-tools-binary-journeys",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-foreign-rules-discovery",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-ftui-interactive-surface",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-lsp-bridge-journeys",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-plan-mode-approval-gate",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-provider-failover-and-rotation",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-subagent-task-role-routing",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-url-read-reader-mode",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-web-search-provider-chain",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-xdev-discoverable-tools",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
       }
     ],
     "weighting_policy": {
@@ -888,6 +965,73 @@
         "sli_e2e_turn_latency_p95_ms",
         "sli_resume_ready_p95_ms"
       ]
+    },
+    {
+      "workflow_id": "wf-advisor-concern-injection",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-ast-tools-binary-journeys",
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-foreign-rules-discovery",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-ftui-interactive-surface",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-lsp-bridge-journeys",
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-plan-mode-approval-gate",
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-provider-failover-and-rotation",
+      "sli_ids": [
+        "sli_failure_recovery_success_rate",
+        "sli_time_to_first_token_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-subagent-task-role-routing",
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-url-read-reader-mode",
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-web-search-provider-chain",
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ]
+    },
+    {
+      "workflow_id": "wf-xdev-discoverable-tools",
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ]
     }
   ],
   "phase_validation_consumers": [
@@ -961,7 +1105,18 @@
       "wf-ollama-local-live-provider-smoke",
       "wf-runtime-risk-and-security-scenarios",
       "wf-tui-feature-and-performance-pack",
-      "wf-soak-and-performance-regression-pack"
+      "wf-soak-and-performance-regression-pack",
+      "wf-advisor-concern-injection",
+      "wf-ast-tools-binary-journeys",
+      "wf-foreign-rules-discovery",
+      "wf-ftui-interactive-surface",
+      "wf-lsp-bridge-journeys",
+      "wf-plan-mode-approval-gate",
+      "wf-provider-failover-and-rotation",
+      "wf-subagent-task-role-routing",
+      "wf-url-read-reader-mode",
+      "wf-web-search-provider-chain",
+      "wf-xdev-discoverable-tools"
     ],
     "required_metric_fields": [
       "run_id",
@@ -1160,6 +1315,94 @@
           "rust_vs_node_ratio",
           "rust_vs_bun_ratio"
         ]
+      },
+      {
+        "workflow_id": "wf-advisor-concern-injection",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-ast-tools-binary-journeys",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-foreign-rules-discovery",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-ftui-interactive-surface",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-lsp-bridge-journeys",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-plan-mode-approval-gate",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-provider-failover-and-rotation",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-subagent-task-role-routing",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-url-read-reader-mode",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-web-search-provider-chain",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
+      },
+      {
+        "workflow_id": "wf-xdev-discoverable-tools",
+        "required_absolute_metrics": true,
+        "required_relative_ratios": [
+          "rust_vs_node_ratio",
+          "rust_vs_bun_ratio"
+        ]
       }
     ],
     "scenario_partition_requirements": [
@@ -1305,6 +1548,83 @@
       },
       {
         "workflow_id": "wf-soak-and-performance-regression-pack",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-advisor-concern-injection",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-ast-tools-binary-journeys",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-foreign-rules-discovery",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-ftui-interactive-surface",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-lsp-bridge-journeys",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-plan-mode-approval-gate",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-provider-failover-and-rotation",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-subagent-task-role-routing",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-url-read-reader-mode",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-web-search-provider-chain",
+        "required_partitions": [
+          "matched-state",
+          "realistic"
+        ]
+      },
+      {
+        "workflow_id": "wf-xdev-discoverable-tools",
         "required_partitions": [
           "matched-state",
           "realistic"

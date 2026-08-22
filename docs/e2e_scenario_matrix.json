@@ -1,7 +1,7 @@
 {
   "schema": "pi.e2e.scenario_matrix.v2",
   "bead_id": "bd-1f42.8.5.1",
-  "updated_at": "2026-05-10",
+  "updated_at": "2026-08-21",
   "source_inputs": [
     "tests/suite_classification.toml",
     "scripts/e2e/run_all.sh",
@@ -38,7 +38,7 @@
     "min_e2e_suite_matrix_coverage_pct": 100,
     "live_budget_policy": {
       "max_live_api_calls_per_suite": 50,
-      "max_live_cost_usd_per_suite": 1.00,
+      "max_live_cost_usd_per_suite": 1.0,
       "rate_limit_delay_ms": 500,
       "credential_env_prefix": "PI_E2E_",
       "skip_env_var": "PI_SKIP_LIVE_E2E"
@@ -370,7 +370,7 @@
         ],
         "budget_controls": {
           "max_api_calls": 50,
-          "max_cost_usd": 1.00,
+          "max_cost_usd": 1.0,
           "rate_limit_delay_ms": 500,
           "timeout_per_test_secs": 60
         },
@@ -812,6 +812,349 @@
         "evidence_contract.json"
       ],
       "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_soak_stability --suite perf_e2e"
+    },
+    {
+      "workflow_id": "wf-advisor-concern-injection",
+      "workflow_class": "success_path",
+      "workflow_title": "Advisor concern injection and failure isolation over RPC",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime",
+        "provider-routing"
+      ],
+      "suite_ids": [
+        "e2e_advisor"
+      ],
+      "test_paths": [
+        "tests/e2e_advisor.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_advisor"
+    },
+    {
+      "workflow_id": "wf-provider-failover-and-rotation",
+      "workflow_class": "failure_recovery",
+      "workflow_title": "Cross-model failover, auth refusal, and credential rotation",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "provider-routing"
+      ],
+      "suite_ids": [
+        "e2e_failover"
+      ],
+      "test_paths": [
+        "tests/e2e_failover.rs"
+      ],
+      "sli_ids": [
+        "sli_failure_recovery_success_rate",
+        "sli_time_to_first_token_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_failover"
+    },
+    {
+      "workflow_id": "wf-ftui-interactive-surface",
+      "workflow_class": "success_path",
+      "workflow_title": "FTUI interactive surface journeys under tmux",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Scripted mock provider drives the tmux TUI deterministically; no live calls.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_ftui"
+      ],
+      "test_paths": [
+        "tests/e2e_ftui.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_ftui"
+    },
+    {
+      "workflow_id": "wf-plan-mode-approval-gate",
+      "workflow_class": "success_path",
+      "workflow_title": "Plan mode block/submit/approve/execute over RPC",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_plan_mode"
+      ],
+      "test_paths": [
+        "tests/e2e_plan_mode.rs"
+      ],
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_plan_mode"
+    },
+    {
+      "workflow_id": "wf-subagent-task-role-routing",
+      "workflow_class": "success_path",
+      "workflow_title": "Subagent fan-out routes to task-role models",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "provider-routing"
+      ],
+      "suite_ids": [
+        "e2e_subagent_roles"
+      ],
+      "test_paths": [
+        "tests/e2e_subagent_roles.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_subagent_roles"
+    },
+    {
+      "workflow_id": "wf-url-read-reader-mode",
+      "workflow_class": "success_path",
+      "workflow_title": "URL reads with reader mode, SSRF denial, and pagination",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_url_read"
+      ],
+      "test_paths": [
+        "tests/e2e_url_read.rs"
+      ],
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_url_read"
+    },
+    {
+      "workflow_id": "wf-web-search-provider-chain",
+      "workflow_class": "success_path",
+      "workflow_title": "web_search provider chain with per-provider overrides",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "provider-routing"
+      ],
+      "suite_ids": [
+        "e2e_web_search"
+      ],
+      "test_paths": [
+        "tests/e2e_web_search.rs"
+      ],
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_web_search"
+    },
+    {
+      "workflow_id": "wf-xdev-discoverable-tools",
+      "workflow_class": "success_path",
+      "workflow_title": "xdev discoverable tool discovery, run, and promotion",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers only; no live credentials or network beyond 127.0.0.1.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_xdev"
+      ],
+      "test_paths": [
+        "tests/e2e_xdev.rs"
+      ],
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_xdev"
+    },
+    {
+      "workflow_id": "wf-ast-tools-binary-journeys",
+      "workflow_class": "success_path",
+      "workflow_title": "AST tools exercised through the real binary",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Scripted mock provider and local parser fixtures only; deterministic, no live calls.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_ast_tools"
+      ],
+      "test_paths": [
+        "tests/e2e_ast_tools.rs"
+      ],
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_ast_tools"
+    },
+    {
+      "workflow_id": "wf-foreign-rules-discovery",
+      "workflow_class": "success_path",
+      "workflow_title": "Foreign rules discovery and application",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Local fixture workspaces with a scripted mock provider; deterministic, no live calls.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_foreign_rules"
+      ],
+      "test_paths": [
+        "tests/e2e_foreign_rules.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_foreign_rules"
+    },
+    {
+      "workflow_id": "wf-lsp-bridge-journeys",
+      "workflow_class": "success_path",
+      "workflow_title": "LSP bridge end-to-end against local language servers",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Local language-server processes and scripted mock provider; deterministic, no network.",
+      "owner": "bd-cv653",
+      "provider_families": [
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "e2e_lsp"
+      ],
+      "test_paths": [
+        "tests/e2e_lsp.rs"
+      ],
+      "sli_ids": [
+        "sli_tool_roundtrip_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_lsp"
     }
   ]
 }

@@ -27923,10 +27923,18 @@ def build_adaptive_execution_closeout_gate_summary(
                     file_contains(extensions_path, "ExtensionPermissionDriftClass"),
                     file_contains(extensions_path, "ExtensionPermissionDriftVerdict"),
                     file_contains(extensions_path, "detect_extension_permission_drift"),
-                    file_contains(extensions_path, "ExtensionPermissionDriftVerdict::FailClosed"),
+                    # The fail-closed verdict logic moved into the split
+                    # permission_drift module behind the extensions façade (#130).
+                    file_contains(
+                        root / "src/extensions/permission_drift.rs",
+                        "ExtensionPermissionDriftVerdict::FailClosed",
+                    ),
                 )
             ),
-            [{"path": "src/extensions.rs"}],
+            [
+                {"path": "src/extensions.rs"},
+                {"path": "src/extensions/permission_drift.rs"},
+            ],
         )
     )
     checklist.append(

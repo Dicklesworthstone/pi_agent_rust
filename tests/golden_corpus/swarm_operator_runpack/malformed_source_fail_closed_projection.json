@@ -11,7 +11,7 @@
   "actions": [
     "fail_closed"
   ],
-  "artifact_dir": "[WORKSPACE]/autopilot-e2e/malformed_source_fail_closed",
+  "artifact_dir": "/private[WORKSPACE]/autopilot-e2e/malformed_source_fail_closed",
   "budget_state": {
     "status": "not_evaluated"
   },

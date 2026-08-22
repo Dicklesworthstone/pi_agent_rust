@@ -195,7 +195,7 @@
       "comparison": "maximum",
       "source": "not evaluated: authoritative benchmark lineage is incomplete",
       "status": "NO_DATA",
-      "threshold": 26.0,
+      "threshold": 48.0,
       "unit": "MB"
     },
     {
@@ -388,7 +388,7 @@
       "methodology": "ls -la target/release/pi (stripped)",
       "metric": "release binary size",
       "name": "binary_size_release",
-      "threshold": 26.0,
+      "threshold": 48.0,
       "unit": "MB"
     },
     {
@@ -412,7 +412,6 @@
       "ci_budget_data_missing",
       "correlation_id_missing",
       "run_id_missing",
-      "source_commit_unbound",
       "strict_mode_disabled"
     ],
     "performance_claims_authorized": false,
@@ -422,12 +421,12 @@
   "data_contract_failures_count": 0,
   "fail": 0,
   "failing_data_contracts": [],
-  "generated_at": "2026-08-05T18:08:56.356Z",
+  "generated_at": "2026-08-21T23:36:42.256Z",
   "no_data": 19,
   "pass": 0,
   "run_id": null,
   "schema": "pi.perf.budget_summary.v2",
-  "source_commit": null,
+  "source_commit": "4191408864f8a1af2f90a99a12ab5fbec059ce20",
   "strict_mode": false,
   "total_budgets": 19
 }

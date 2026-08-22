@@ -1724,7 +1724,7 @@
           "rendered": "rch exec -- cargo check --all-targets"
         },
         "command_class": "cargo_check",
-        "entry_id": "rvpe-3a546a5f40287059",
+        "entry_id": "rvpe-60b5540272c29240",
         "evidence_classification": {
           "clean_remote_proof": false,
           "coverage": {
@@ -1828,7 +1828,7 @@
       ],
       "head": "abc123fixture"
     },
-    "ledger_id": "rvpl-0adebefc11879754",
+    "ledger_id": "rvpl-d669f0936df2e53f",
     "producer": {
       "name": "scripts/build_swarm_operator_runpack.py",
       "version": "1.0.0"
@@ -2353,48 +2353,6 @@
         "state": "active"
       },
       {
-        "bead_id": null,
-        "cleanup_command": null,
-        "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "smoke_harness.artifact_manifest[0].path"
-        ],
-        "id": "temp-8233707e3f0f",
-        "kind": "e2e_artifact",
-        "last_observed_at": "[TIMESTAMP]",
-        "owner": null,
-        "path": "[WORKSPACE]/events.jsonl",
-        "permission_boundary": "No deletion command emitted. Explicit written operator approval is required before deleting any file or directory.",
-        "reason": "events_jsonl",
-        "review_commands": [
-          "test -e [WORKSPACE]/events.jsonl && stat [WORKSPACE]/events.jsonl",
-          "du -sh [WORKSPACE]/events.jsonl"
-        ],
-        "source": "smoke_harness",
-        "state": "retained"
-      },
-      {
-        "bead_id": null,
-        "cleanup_command": null,
-        "deletion_policy": "retain_active",
-        "evidence_paths": [
-          "validation_outputs.outputs[0].path"
-        ],
-        "id": "temp-61cc7fa94ac7",
-        "kind": "validation_output",
-        "last_observed_at": "[TIMESTAMP]",
-        "owner": null,
-        "path": "[WORKSPACE]/validation.log",
-        "permission_boundary": "No deletion command emitted. Explicit written operator approval is required before deleting any file or directory.",
-        "reason": "validation output artifact",
-        "review_commands": [
-          "test -e [WORKSPACE]/validation.log && stat [WORKSPACE]/validation.log",
-          "du -sh [WORKSPACE]/validation.log"
-        ],
-        "source": "validation_outputs",
-        "state": "retained"
-      },
-      {
         "bead_id": "bd-fixture",
         "cleanup_command": null,
         "deletion_policy": "retain_active",
@@ -2477,11 +2435,11 @@
     "schema": "pi.swarm.temp_artifact_inventory.v1",
     "status": "review_required",
     "summary": {
-      "active_or_retained_count": 6,
+      "active_or_retained_count": 4,
       "cleanup_candidate_count": 1,
       "deletion_protected_count": 1,
       "emitted_deletion_command_count": 0,
-      "entry_count": 7
+      "entry_count": 5
     }
   },
   "turn_pressure_ledger": {
