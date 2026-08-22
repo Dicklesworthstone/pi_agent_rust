@@ -94,8 +94,9 @@ pub mod autocomplete;
 #[doc(hidden)]
 pub mod bash_mediation;
 #[doc(hidden)]
-pub mod buffer_shim;
+pub mod btw;
 #[doc(hidden)]
+pub mod buffer_shim;
 pub mod checkpoint;
 #[doc(hidden)]
 pub mod cli;
