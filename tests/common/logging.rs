@@ -414,10 +414,18 @@ fn validate_coverage_path(path: &str, field_name: &str, index: usize) -> Result<
         ));
     }
     let parsed = Path::new(&normalized);
+    // Repo-relative means the same string must resolve inside the repo on
+    // every platform, so the rejection checks operate on the normalized
+    // string rather than the host platform's `Path` semantics (gh #175: on
+    // Windows `Path::is_absolute()` requires a drive/UNC prefix, so a lone
+    // leading `/` — rooted but prefix-less — sailed through). After
+    // `normalize_coverage_path` every `\` is `/` and every `//` run is
+    // collapsed, so a single `starts_with('/')` also covers `\foo`,
+    // `//server/share`, and `\\server\share` forms. Any `X:` drive prefix
+    // (absolute `C:/x` or drive-relative `C:x`) is likewise non-portable.
     if parsed.is_absolute()
-        || looks_like_windows_absolute_path(&normalized)
-        || candidate.starts_with("\\\\")
-        || normalized.starts_with("//")
+        || normalized.starts_with('/')
+        || looks_like_windows_drive_path(&normalized)
     {
         return Err(format!(
             "{field_name}[{index}] must be repo-relative, got: {candidate}"
@@ -447,12 +455,12 @@ fn normalize_coverage_path(candidate: &str) -> String {
     normalized
 }
 
-const fn looks_like_windows_absolute_path(path: &str) -> bool {
+/// Detect any Windows drive prefix: absolute (`C:/x`, `C:\x`) and
+/// drive-relative (`C:x`) forms alike. A drive prefix can never appear in a
+/// portable repo-relative path, so all forms fail closed (gh #175).
+const fn looks_like_windows_drive_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn format_elapsed_ms(elapsed_ms: u64) -> String {
@@ -2896,6 +2904,38 @@ mod tests {
         let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
             .expect_err("windows absolute test-file path must fail closed");
         assert!(err.contains("repo-relative"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn bead_coverage_try_new_rejects_rooted_paths_on_every_platform() {
+        // gh #175: these shapes must fail closed on Unix AND Windows. The
+        // guard operates on the normalized string, so this test exercises
+        // the identical code path a Windows host takes.
+        for candidate in [
+            "/tmp/absolute-path.rs",      // POSIX-absolute (the reported gap)
+            "\\tmp\\absolute-path.rs",    // rooted backslash form
+            "//server/share/path.rs",     // forward-slash UNC
+            "\\\\server\\share\\path.rs", // backslash UNC
+            "C:\\temp\\absolute-path.rs", // drive-absolute, backslashes
+            "C:temp/drive-relative.rs",   // drive-relative (no root)
+            "c:onefile.rs",               // lowercase drive-relative
+        ] {
+            let test_files = vec![candidate.to_string()];
+            let err = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+                .expect_err(&format!("non-portable path must fail closed: {candidate}"));
+            assert!(err.contains("repo-relative"), "unexpected error: {err}");
+        }
+    }
+
+    #[test]
+    fn bead_coverage_try_new_accepts_backslash_relative_path() {
+        // Planted negative for the gh #175 tightening: a genuinely
+        // repo-relative path written with backslashes must still be accepted
+        // (normalization maps it to forward slashes).
+        let test_files = vec!["src\\lib.rs".to_string()];
+        let link = BeadCoverageLink::try_new("bd-3ar8v.6.11", &test_files, EvidenceType::Unit)
+            .expect("backslash repo-relative path must remain accepted");
+        assert_eq!(link.test_files, vec!["src/lib.rs".to_string()]);
     }
 
     #[test]
