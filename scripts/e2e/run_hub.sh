@@ -28,4 +28,11 @@ cargo test --lib hub:: -- --nocapture 2>&1 | tee "$ARTIFACT_DIR/units.log"
 echo "[hub] Running hub integration target (correlation: $CORRELATION_ID)"
 cargo test --test hub -- --nocapture 2>&1 | tee "$ARTIFACT_DIR/integration.log"
 
+echo "[hub] Running agent-hub registry suite (bd-cv653.5.3; correlation: $CORRELATION_ID)"
+cargo test --lib agent_hub -- --nocapture 2>&1 | tee "$ARTIFACT_DIR/agent_hub_units.log"
+cargo test --lib hub_agent -- --nocapture 2>&1 | tee -a "$ARTIFACT_DIR/agent_hub_units.log"
+
+echo "[hub] Running agent-hub integration target (correlation: $CORRELATION_ID)"
+cargo test --test agent_hub -- --nocapture 2>&1 | tee "$ARTIFACT_DIR/agent_hub_integration.log"
+
 echo "[hub] PASS (artifacts: $ARTIFACT_DIR)"

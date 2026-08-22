@@ -113,6 +113,7 @@ files = [
     "interactive_commands_unit",
     "jobs",
     "hub",
+    "agent_hub",
     "memory",
     "skills_managed",
     "magic_keywords",
