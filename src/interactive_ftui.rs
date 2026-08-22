@@ -2277,7 +2277,8 @@ async fn run_set_name_command(
         Ok(()) => PiMsg::System(format!("Session name: {name}")),
         Err(err) => PiMsg::AgentError(format!("name: {err}")),
     };
-    let _ = agent_tx.send(msg);}
+    let _ = agent_tx.send(msg);
+}
 
 /// Handle `/undo` and `/redo` in the driver (bd-cv653.3.13): apply through
 /// the session agent's mutation recorder and report the shared outcome text.

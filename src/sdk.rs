@@ -1887,6 +1887,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
                 Some(std::sync::Arc::new(
                     crate::undo::FileMutationRecorder::default(),
                 )),
+                None,
             )
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
