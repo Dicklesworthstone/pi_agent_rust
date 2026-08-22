@@ -220,10 +220,6 @@ impl AutocompleteProvider {
             || vec![self.cwd.clone()],
             |w| w.snapshot_or(&self.cwd).all(),
         );
-        let roots = self.workspace.as_ref().map_or_else(
-            || vec![self.cwd.clone()],
-            |w| w.snapshot_or(&self.cwd).all(),
-        );
         self.file_cache.refresh_if_needed(&self.cwd, &roots);
         let stripped = normalized.strip_prefix("./").unwrap_or(&normalized);
         if self.file_cache.files.iter().any(|path| path == stripped) {

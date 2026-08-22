@@ -48,12 +48,9 @@ fn roster_tracks_lifecycle_and_transcript() {
 #[test]
 fn kill_terminates_real_process_tree() {
     let _guard = LOCK.lock().expect("lock");
-    let dir = test_dir("kill");
-    let mut reg = agent_hub::AgentHubRegistry::default();
-    reg.set_dir_for_tests(dir.clone());
 
     // A real wedged child stand-in: sleep for an hour.
-    let child = Command::new("sleep")
+    let mut child = Command::new("sleep")
         .arg("3600")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -62,25 +59,41 @@ fn kill_terminates_real_process_tree() {
         .expect("spawn sleep");
     let pid = child.id();
 
-    let entry = reg.register("wedged", "infinite loop fixture").expect("register");
-    reg.mark_running(&entry.id, pid);
+    let (id, steer_dir) = {
+        let mut reg = agent_hub::registry().lock().expect("registry");
+        reg.set_dir_for_tests(test_dir("kill"));
+        let entry = reg
+            .register("wedged", "infinite loop fixture")
+            .expect("register");
+        reg.mark_running(&entry.id, pid);
+        let pair = (
+            entry.id,
+            entry.steer_path.parent().map(std::path::Path::to_path_buf),
+        );
+        drop(reg);
+        pair
+    };
 
-    // The operator kill path: tree signal + registry settle (mirrors
-    // HubTool::dispatch_agent "kill").
-    pi::tools::kill_process_group_tree(Some(pid));
-    reg.mark_killed(&entry.id);
+    // The operator kill path, exactly as HubTool `agent kill` invokes it.
+    agent_hub::kill_child_tree(&id).expect("kill");
 
-    let settled = reg.get(&entry.id).expect("get");
+    let settled = agent_hub::registry()
+        .lock()
+        .expect("registry")
+        .get(&id)
+        .expect("get");
     assert_eq!(settled.status, ChildStatus::Killed);
     assert!(settled.finished_ms.is_some());
 
-    // The process is gone: signaling it again must fail.
-    let probe = Command::new("kill").arg("-0").arg(pid.to_string()).output();
+    // Reap the child: exit status proves death by signal, not natural exit.
+    let status = child.wait().expect("wait reaps the killed child");
     assert!(
-        probe.map(|o| !o.status.success()).unwrap_or(true),
-        "wedged child survived the kill path"
+        !status.success(),
+        "wedged child exited cleanly — kill path did not fire: {status}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    if let Some(dir) = steer_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
@@ -118,15 +131,29 @@ fn revive_registers_lineage_with_transcript_context() {
     let mut reg = agent_hub::AgentHubRegistry::default();
     reg.set_dir_for_tests(dir.clone());
 
-    let entry = reg.register("worker", "original task body").expect("register");
+    let entry = reg
+        .register("worker", "original task body")
+        .expect("register");
     reg.mark_running(&entry.id, 55);
-    reg.append_transcript(&entry.id, "{\"type\":\"message_end\",\"text\":\"partial progress\"}");
+    reg.append_transcript(
+        &entry.id,
+        "{\"type\":\"message_end\",\"text\":\"partial progress\"}",
+    );
     reg.settle(&entry.id, ChildStatus::Failed);
 
-    let (revived, task) = reg.revive(&entry.id).expect("revive");
-    assert_eq!(revived.revived_from.as_deref(), Some(entry.id.as_str()));
-    assert_eq!(revived.status, ChildStatus::Starting);
+    // prepare_revival (pure) → the subagent run registers with lineage.
+    let (name, task) = reg.prepare_revival(&entry.id).expect("revive");
+    assert_eq!(name, "worker");
     assert!(task.contains("original task body"));
     assert!(task.contains("partial progress"));
+    let continuation = reg.register(&name, &task).expect("register continuation");
+    reg.link_revival(&continuation.id, &entry.id);
+    assert_eq!(
+        reg.get(&continuation.id)
+            .expect("get")
+            .revived_from
+            .as_deref(),
+        Some(entry.id.as_str())
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
