@@ -3087,6 +3087,7 @@ mod stream_delta_batcher_tests {
             name: "bash".to_string(),
             tool_id: "t1".to_string(),
             is_error: false,
+            output: None,
         });
 
         let first = rx.try_recv().expect("expected coalesced latest update");
