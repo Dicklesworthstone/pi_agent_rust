@@ -603,7 +603,13 @@ fn e2e_ftui_resize_storm_stream_is_flicker_free() {
     // recorder shell flush its buffered tail.
     let mut untap = std::process::Command::new("tmux"); // ubs:ignore test helper — direct tmux invocation
     let untap_status = untap
-        .args(["-L", &session.tmux.socket_name, "pipe-pane", "-t", &pane_target])
+        .args([
+            "-L",
+            &session.tmux.socket_name,
+            "pipe-pane",
+            "-t",
+            &pane_target,
+        ])
         .status()
         .expect("tmux pipe-pane close"); // ubs:ignore test assertion expect
     assert!(untap_status.success(), "pipe-pane close failed");

@@ -8140,7 +8140,7 @@ impl HubTool {
                     .clone()
                     .unwrap_or_else(|| "roster".to_string())
                     .to_ascii_lowercase();
-                self.dispatch_agent(&action, input)?
+                Self::dispatch_agent(&action, input)?
             }
             other => {
                 return Err(Error::validation(format!(
@@ -8152,13 +8152,72 @@ impl HubTool {
         Ok((text, details))
     }
 
+    /// `roster` arm of [`Self::dispatch_agent`].
+    fn hub_agent_roster() -> Result<(String, serde_json::Value)> {
+        let entries = crate::agent_hub::registry()
+            .lock()
+            .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+            .roster();
+        let details = serde_json::json!({
+            "schema": "pi.agent-hub.roster/v1",
+            "children": entries,
+        });
+        let text = if entries.is_empty() {
+            "No subagent children this session.".to_string()
+        } else {
+            let lines: Vec<String> = entries
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{} [{}] {} (pid {}, {} bytes out)",
+                        e.id,
+                        e.status.as_str(),
+                        e.task,
+                        e.pid
+                            .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
+                        e.output_bytes
+                    )
+                })
+                .collect();
+            format!("{} child run(s):\n{}", entries.len(), lines.join("\n"))
+        };
+        Ok((text, details))
+    }
+
+    /// `kill` arm of [`Self::dispatch_agent`].
+    fn hub_agent_kill(id: &str, from: &str) -> Result<(String, serde_json::Value)> {
+        let entry = {
+            let reg = crate::agent_hub::registry()
+                .lock()
+                .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+            reg.get(id)
+                .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
+        };
+        if entry.status.settled() {
+            return Err(Error::validation(format!(
+                "hub: cannot kill '{id}' — already {}",
+                entry.status.as_str()
+            )));
+        }
+        if let Some(pid) = entry.pid {
+            // Process-tree kill so the child's bash descendants die too.
+            crate::tools::kill_process_group_tree(Some(pid));
+        }
+        crate::agent_hub::registry()
+            .lock()
+            .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+            .mark_killed(id);
+        let details = serde_json::json!({
+            "schema": "pi.agent-hub.kill/v1",
+            "id": id,
+            "killedBy": from,
+        });
+        Ok((format!("Child {id} killed by operator."), details))
+    }
+
     /// Agent-hub action group (bd-cv653.5.3): roster / transcript / steer /
     /// kill / revive / send / inbox over this session's subagent children.
-    fn dispatch_agent(
-        &self,
-        action: &str,
-        input: &HubInput,
-    ) -> Result<(String, serde_json::Value)> {
+    fn dispatch_agent(action: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
         let id_required = |action: &str| -> Result<String> {
             input
                 .name
@@ -8170,36 +8229,7 @@ impl HubTool {
         };
         let from = input.from.clone().unwrap_or_else(|| "parent".to_string());
         let (text, details) = match action {
-            "roster" => {
-                let entries = crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .roster();
-                let details = serde_json::json!({
-                    "schema": "pi.agent-hub.roster/v1",
-                    "children": entries,
-                });
-                let text = if entries.is_empty() {
-                    "No subagent children this session.".to_string()
-                } else {
-                    let lines: Vec<String> = entries
-                        .iter()
-                        .map(|e| {
-                            format!(
-                                "{} [{}] {} (pid {}, {} bytes out)",
-                                e.id,
-                                e.status.as_str(),
-                                e.task,
-                                e.pid
-                                    .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),
-                                e.output_bytes
-                            )
-                        })
-                        .collect();
-                    format!("{} child run(s):\n{}", entries.len(), lines.join("\n"))
-                };
-                (text, details)
-            }
+            "roster" => Self::hub_agent_roster()?,
             "transcript" => {
                 let id = id_required("transcript")?;
                 let page = crate::agent_hub::registry()
@@ -8237,36 +8267,7 @@ impl HubTool {
                     details,
                 )
             }
-            "kill" => {
-                let id = id_required("kill")?;
-                let entry = {
-                    let reg = crate::agent_hub::registry()
-                        .lock()
-                        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
-                    reg.get(&id)
-                        .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
-                };
-                if entry.status.settled() {
-                    return Err(Error::validation(format!(
-                        "hub: cannot kill '{id}' — already {}",
-                        entry.status.as_str()
-                    )));
-                }
-                if let Some(pid) = entry.pid {
-                    // Process-tree kill so the child's bash descendants die too.
-                    crate::tools::kill_process_group_tree(Some(pid));
-                }
-                crate::agent_hub::registry()
-                    .lock()
-                    .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .mark_killed(&id);
-                let details = serde_json::json!({
-                    "schema": "pi.agent-hub.kill/v1",
-                    "id": id,
-                    "killedBy": from,
-                });
-                (format!("Child {id} killed by operator."), details)
-            }
+            "kill" => Self::hub_agent_kill(&id_required("kill")?, &from)?,
             "revive" => {
                 let id = id_required("revive")?;
                 let (entry, _task) = crate::agent_hub::registry()
@@ -11592,7 +11593,6 @@ impl LsTool {
         }
     }
     #[cfg(test)]
-
     fn with_after_scope_hook(
         cwd: &Path,
         after_scope_hook: impl Fn() + Send + Sync + 'static,
@@ -12434,7 +12434,9 @@ pub fn kill_process_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, false);
 }
 
-pub(crate) fn kill_process_group_tree(pid: Option<u32>) {
+/// Kill a child process together with its process group and descendants
+/// (the hub operator-kill path; public so integration tests can mirror it).
+pub fn kill_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, true);
 }
 
@@ -16190,7 +16192,7 @@ mod tests {
 
         let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
         let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
-        handle.add_root(canonical);
+        handle.add_root(&canonical);
 
         let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
         let outside_path = outside

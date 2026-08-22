@@ -42,8 +42,7 @@ fn test_stream_rule_split_chunk_boundary_matching() {
 
     let m2 = matcher.feed("leak(boxed);\n}", StreamChannel::AssistantText);
     let Some(match_result) = m2 else {
-        assert!(false, "Matcher should detect split pattern across chunks");
-        return;
+        panic!("Matcher should detect split pattern across chunks");
     };
 
     assert_eq!(match_result.rule_id, "no-box-leak");
@@ -99,8 +98,7 @@ fn test_ttsr_coordinator_injection_and_cap_guard() {
         reminder_message,
     } = act1
     else {
-        assert!(false, "Should abort and inject on first match");
-        return;
+        panic!("Should abort and inject on first match");
     };
     assert_eq!(rule.id, "no-raw-sql");
     assert!(matched_excerpt.contains("SELECT * FROM users"));
@@ -132,8 +130,7 @@ fn test_ttsr_coordinator_injection_and_cap_guard() {
         ..
     } = act4
     else {
-        assert!(false, "Should exceed turn cap and stop without looping");
-        return;
+        panic!("Should exceed turn cap and stop without looping");
     };
     assert_eq!(cap_rule.id, "no-raw-sql");
     assert_eq!(total_injections, 3);
@@ -160,8 +157,7 @@ fn test_stream_rule_store_lifecycle_and_grievances() {
     };
 
     let Ok(()) = store.add_rule(rule, false) else {
-        assert!(false, "add_rule should succeed");
-        return;
+        panic!("add_rule should succeed");
     };
 
     assert_eq!(store.list_all_rules().len(), 1);
@@ -169,8 +165,7 @@ fn test_stream_rule_store_lifecycle_and_grievances() {
 
     // Test export
     let Ok(exported_json) = store.export_json() else {
-        assert!(false, "export_json should succeed");
-        return;
+        panic!("export_json should succeed");
     };
     assert!(exported_json.contains("no-magic-numbers"));
 
@@ -184,8 +179,7 @@ fn test_stream_rule_store_lifecycle_and_grievances() {
         "Model used magic literal MAGIC_VALUE_99 in unit tests",
         Some("no-magic-numbers"),
     ) else {
-        assert!(false, "record_complaint should succeed");
-        return;
+        panic!("record_complaint should succeed");
     };
 
     assert_eq!(
@@ -194,8 +188,7 @@ fn test_stream_rule_store_lifecycle_and_grievances() {
     );
 
     let Ok(grievances) = GrievancesLedger::list_grievances(project_root) else {
-        assert!(false, "list_grievances should succeed");
-        return;
+        panic!("list_grievances should succeed");
     };
     assert_eq!(grievances.len(), 1);
     assert_eq!(grievances[0].id, grievance.id);

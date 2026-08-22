@@ -125,10 +125,16 @@ pub fn registry() -> &'static Mutex<AgentHubRegistry> {
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 impl AgentHubRegistry {
+    /// Override the artifacts directory (integration tests cannot reach the
+    /// private `dir` field; production callers rely on the lazy default).
+    pub fn set_dir_for_tests(&mut self, dir: PathBuf) {
+        self.dir = Some(dir);
+    }
+
     /// Artifacts directory for hub files: `<global_dir>/agent-hub/<pid>/`.
     /// Created lazily; per-process so concurrent sessions never share files.
     fn dir(&mut self) -> Result<PathBuf> {
@@ -166,7 +172,7 @@ impl AgentHubRegistry {
             steer_path: dir.join(format!("{id}.steer")),
             revived_from: None,
         };
-        self.entries.insert(id.clone(), entry.clone());
+        self.entries.insert(id, entry.clone());
         Ok(entry)
     }
 

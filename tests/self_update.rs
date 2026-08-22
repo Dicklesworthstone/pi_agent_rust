@@ -11,11 +11,11 @@ use pi::version_check::CURRENT_VERSION;
 
 #[test]
 fn test_checksum_verification_fail_closed() {
-    let raw_sums = r#"
+    let raw_sums = r"
 # Valid release checksums
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  empty.tar.gz
 2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae *test_binary
-"#;
+";
     let checksums = ChecksumMap::parse(raw_sums);
 
     // Empty file matches hash e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855

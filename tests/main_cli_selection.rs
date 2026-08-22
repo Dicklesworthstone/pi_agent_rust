@@ -486,9 +486,15 @@ fn prepare_initial_message_wraps_files_and_appends_first_message() {
     let mut messages = vec!["please review".to_string()];
     let file_args = vec![file_path.to_string_lossy().to_string()];
 
-    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
-        .expect("prepare initial")
-        .expect("initial message present");
+    let initial = prepare_initial_message(
+        harness.temp_dir(),
+        &file_args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("prepare initial")
+    .expect("initial message present");
 
     harness.log().info_ctx("result", "Initial message", |ctx| {
         ctx.push(("text_len".into(), initial.text.len().to_string()));
@@ -586,9 +592,15 @@ fn prepare_initial_message_leaves_remaining_messages() {
     let mut messages = vec!["first".to_string(), "second".to_string()];
     let file_args = vec![file_path.to_string_lossy().to_string()];
 
-    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
-        .expect("prepare initial")
-        .expect("initial message present");
+    let initial = prepare_initial_message(
+        harness.temp_dir(),
+        &file_args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("prepare initial")
+    .expect("initial message present");
 
     assert_eq!(messages, vec!["second".to_string()]);
     assert!(initial.text.contains("first"));
@@ -607,9 +619,15 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
     let mut messages = Vec::new();
     let file_args = vec![image_path.to_string_lossy().to_string()];
 
-    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
-        .expect("prepare initial")
-        .expect("initial message present");
+    let initial = prepare_initial_message(
+        harness.temp_dir(),
+        &file_args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("prepare initial")
+    .expect("initial message present");
 
     harness
         .log()
@@ -638,8 +656,13 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
 fn process_file_arguments_missing_file_reports_error() {
     let harness = TestHarness::new("process_file_arguments_missing_file_reports_error");
     let args = vec!["missing.txt".to_string()];
-    let err = process_file_arguments(&args, harness.temp_dir(), false)
-        .expect_err("missing file should error");
+    let err = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect_err("missing file should error");
     assert!(err.to_string().contains("Cannot access file"));
 }
 
@@ -653,8 +676,13 @@ fn process_file_arguments_small_image_respects_auto_resize_flag() {
     let image_path = harness.create_file("image.png", &bytes);
     let args = vec![image_path.to_string_lossy().to_string()];
 
-    let processed =
-        process_file_arguments(&args, harness.temp_dir(), true).expect("process file arguments");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        true,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("process file arguments");
     assert_eq!(processed.images.len(), 1);
     assert!(
         processed
@@ -755,8 +783,14 @@ fn resolve_api_key_precedence_and_error_paths() {
 fn prepare_initial_message_no_files_returns_none() {
     let harness = TestHarness::new("prepare_initial_message_no_files_returns_none");
     let mut messages = vec!["hello".to_string()];
-    let result =
-        prepare_initial_message(harness.temp_dir(), &[], &mut messages, false).expect("ok");
+    let result = prepare_initial_message(
+        harness.temp_dir(),
+        &[],
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
     assert!(result.is_none());
     // messages are untouched when no file args
     assert_eq!(messages, vec!["hello".to_string()]);
@@ -769,9 +803,15 @@ fn prepare_initial_message_files_only_no_messages() {
     let mut messages: Vec<String> = Vec::new();
     let file_args = vec![file_path.to_string_lossy().to_string()];
 
-    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
-        .expect("prepare initial")
-        .expect("initial message present");
+    let initial = prepare_initial_message(
+        harness.temp_dir(),
+        &file_args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("prepare initial")
+    .expect("initial message present");
 
     assert!(initial.text.contains("payload"));
     assert!(initial.text.contains("<file name=\""));
@@ -785,8 +825,14 @@ fn prepare_initial_message_empty_file_returns_none() {
     let mut messages: Vec<String> = Vec::new();
     let file_args = vec![file_path.to_string_lossy().to_string()];
 
-    let result =
-        prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false).expect("ok");
+    let result = prepare_initial_message(
+        harness.temp_dir(),
+        &file_args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
     // Empty file produces no text and no images → returns None
     assert!(result.is_none());
 }
@@ -802,7 +848,13 @@ fn process_file_arguments_multiple_text_files() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("alpha"));
     assert!(processed.text.contains("bravo"));
@@ -824,7 +876,13 @@ fn process_file_arguments_empty_file_skipped() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("content"));
     // Only non-empty file gets a <file> tag
@@ -847,7 +905,13 @@ fn process_file_arguments_mixed_text_and_image() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("some notes"));
     assert_eq!(processed.images.len(), 1);
@@ -863,7 +927,13 @@ fn process_file_arguments_unicode_content_preserved() {
     let file_path = harness.create_file("unicode.txt", "hello 世界\nこんにちは\n");
     let args = vec![file_path.to_string_lossy().to_string()];
 
-    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+    let processed = process_file_arguments(
+        &args,
+        harness.temp_dir(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("ok");
 
     assert!(processed.text.contains("hello 世界"));
     assert!(processed.text.contains("こんにちは"));
@@ -948,9 +1018,15 @@ fn prepare_initial_message_multiple_files_with_message() {
         .map(|p| p.to_string_lossy().to_string())
         .collect();
 
-    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
-        .expect("prepare initial")
-        .expect("initial message present");
+    let initial = prepare_initial_message(
+        harness.temp_dir(),
+        &file_args,
+        &mut messages,
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    )
+    .expect("prepare initial")
+    .expect("initial message present");
 
     // Both file contents present
     assert!(initial.text.contains("alpha"));

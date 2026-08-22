@@ -239,8 +239,12 @@ fn truncate_tail_many_empty_lines() {
 #[test]
 fn process_file_arguments_nonexistent_file() {
     let dir = TempDir::new().unwrap();
-    let result =
-        pi::tools::process_file_arguments(&["nonexistent.txt".to_string()], dir.path(), false);
+    let result = pi::tools::process_file_arguments(
+        &["nonexistent.txt".to_string()],
+        dir.path(),
+        false,
+        &pi::workspace::WorkspaceHandle::default(),
+    );
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(err.to_string().contains("Cannot access file"));
@@ -255,6 +259,7 @@ fn process_file_arguments_empty_file_skipped() {
         &[empty_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(result.text.is_empty());
@@ -271,6 +276,7 @@ fn process_file_arguments_rejects_outside_cwd() {
         &[outside_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     );
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -286,6 +292,7 @@ fn process_file_arguments_text_file_wrapped_in_tags() {
         &[text_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(result.text.contains("<file name="));
@@ -302,6 +309,7 @@ fn process_file_arguments_text_file_without_trailing_newline() {
         &[text_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     // The function adds a newline if content doesn't end with one
@@ -322,6 +330,7 @@ fn process_file_arguments_multiple_files() {
         ],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(result.text.contains("first"));
@@ -352,6 +361,7 @@ fn process_file_arguments_png_image_detected() {
         &[img_file.to_string_lossy().to_string()],
         dir.path(),
         false,
+        &pi::workspace::WorkspaceHandle::default(),
     )
     .unwrap();
     assert!(!result.images.is_empty());

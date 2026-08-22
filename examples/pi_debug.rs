@@ -131,6 +131,7 @@ async fn run_debug(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<(
             .as_ref()
             .and_then(|i| i.auto_resize)
             .unwrap_or(true),
+        &pi::workspace::WorkspaceHandle::default(),
     )?;
     step!(
         "   Initial message prepared: {:?}",

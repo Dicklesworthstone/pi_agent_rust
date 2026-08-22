@@ -168,6 +168,7 @@ fn proptest_session_header() -> impl Strategy<Value = SessionHeader> {
                 fallback_thinking_level: None,
                 current_leaf: None,
                 parent_session,
+                additional_roots: None,
             },
         )
 }
@@ -273,6 +274,7 @@ proptest! {
             fallback_thinking_level: None,
             current_leaf: None,
             parent_session: None,
+            additional_roots: None,
         };
         session.entries = decoded_entries;
         session._test_set_leaf_id(leaf_id);

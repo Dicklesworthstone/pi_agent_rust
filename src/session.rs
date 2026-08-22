@@ -4923,7 +4923,7 @@ impl Session {
     /// Record additional workspace roots in the header (bd-cv653.3.12).
     /// Canonical absolute paths only — callers canonicalize via
     /// [`crate::workspace::RootSet::add`] before persisting.
-    pub fn set_additional_roots(&mut self, roots: Vec<std::path::PathBuf>) {
+    pub fn set_additional_roots(&mut self, roots: &[std::path::PathBuf]) {
         let serialized: Vec<String> = roots.iter().map(|p| p.display().to_string()).collect();
         let next = if serialized.is_empty() {
             None
