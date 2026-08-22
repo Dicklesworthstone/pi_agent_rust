@@ -623,8 +623,12 @@ mod tests {
     fn no_network_surface_static_audit() {
         // Privacy acceptance (bd-cv653.7.7 #4): the stats code path must not
         // construct any network client or reference the provider usage
-        // readers. Static scan of this module's own source.
-        let source = include_str!("stats.rs");
+        // readers. Static scan of this module's own source — the non-test
+        // portion only, so this test's banned-word list cannot self-match.
+        let source = include_str!("stats.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
         for banned in [
             "reqwest",
             "HttpClient",
