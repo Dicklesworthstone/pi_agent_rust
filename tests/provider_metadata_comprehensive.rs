@@ -252,7 +252,7 @@ fn provider_auth_reference_artifacts_match_runtime_metadata() {
         serde_json::from_str(include_str!("../docs/provider-canonical-id-policy.json"))
             .expect("provider canonical ID policy must be valid JSON");
 
-    assert_eq!(PROVIDER_METADATA.len(), 102);
+    assert_eq!(PROVIDER_METADATA.len(), 103);
     assert_eq!(crosswalk["schema"], "pi.docs.provider_auth_crosswalk.v2");
     assert!(crosswalk.get("api_key_resolution_precedence").is_none());
     assert!(crosswalk.get("auth_method_patterns").is_none());
@@ -264,12 +264,12 @@ fn provider_auth_reference_artifacts_match_runtime_metadata() {
         crosswalk["schema_migration_from_v1"]["renamed_sections"]["auth_method_patterns"],
         "request_auth_methods"
     );
-    assert_eq!(crosswalk["providers"].as_array().map(Vec::len), Some(102));
+    assert_eq!(crosswalk["providers"].as_array().map(Vec::len), Some(103));
     assert_eq!(
         policy["canonical_id_map"]["entries"]
             .as_array()
             .map(Vec::len),
-        Some(102)
+        Some(103)
     );
     assert_eq!(
         provider_reference_strings(&crosswalk, "/providers", "aliases"),
@@ -1006,7 +1006,7 @@ fn generate_canonical_id_alias_table_json() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn canonical_id_snapshot_detects_additions_and_removals() {
-    // ── Snapshot: 102 canonical IDs (sorted) ─────────────────────────────
+    // ── Snapshot: 103 canonical IDs (sorted) ─────────────────────────────
     // To update: run the failing test, copy the "actual" list printed
     // below, and replace this array.
     const EXPECTED: &[&str] = &[
@@ -1081,6 +1081,7 @@ fn canonical_id_snapshot_detects_additions_and_removals() {
         "opencode",
         "opencode-go",
         "openrouter",
+        "orcarouter",
         "ovhcloud",
         "perplexity",
         "poe",
@@ -1186,6 +1187,7 @@ fn alias_mapping_snapshot_is_current() {
         ("nvidia-nim", "nvidia"),
         ("open-router", "openrouter"),
         ("opencode-zen", "opencode"),
+        ("orca", "orcarouter"),
         ("pplx", "perplexity"),
         ("qwen", "alibaba"),
         ("sakana-ai", "sakana"),
