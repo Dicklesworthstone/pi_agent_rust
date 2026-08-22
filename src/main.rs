@@ -2188,6 +2188,7 @@ async fn run(
                 session_path: cli.session.as_ref().map(PathBuf::from),
                 session_dir: cli.session_dir.as_ref().map(PathBuf::from),
                 // Explicit -e extension files load with UI prompts bridged
+                workspace: Some(workspace.clone()),
                 // (bd-1eoh4). Workspace/package-discovered extensions are a
                 // ResourceLoader integration follow-up.
                 // Extensions load with UI prompts bridged (bd-1eoh4): the
@@ -2407,6 +2408,16 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 bead.as_deref(),
                 message.as_deref(),
             )?;
+        }
+        cli::Commands::Stats {
+            since,
+            until,
+            project,
+            provider,
+            model,
+            format,
+        } => {
+            handle_stats(since, until, project.as_deref(), provider, model, &format)?;
         }
         cli::Commands::SelfUpdate { version, check } => {
             handle_self_update(version.as_deref(), check).await?;
@@ -4673,6 +4684,39 @@ async fn handle_handoff(
     Ok(())
 }
 
+/// `pi stats [--since TS] [--until TS] [--project NAME] [--provider P]
+/// [--model M] [--format text|json|markdown]` (bd-cv653.7.7): aggregate
+/// local session usage. All data stays local — no network.
+fn handle_stats(
+    since: Option<String>,
+    until: Option<String>,
+    project: Option<&str>,
+    provider: Option<String>,
+    model: Option<String>,
+    format: &str,
+) -> Result<()> {
+    // Test/e2e seam (bd-cv653.7.7): lanes point this at a synthetic corpus.
+    let sessions_dir = std::env::var("PI_STATS_SESSIONS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| pi::config::Config::sessions_dir());
+    let files = pi::stats::collect_session_files(&sessions_dir, project);
+    let filter = pi::stats::StatsFilter {
+        since,
+        until,
+        provider,
+        model,
+    };
+    let report = pi::stats::aggregate(&files, &filter);
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("stats serialization failed: {e}"))?,
+        "markdown" | "md" => pi::stats::render_markdown(&report),
+        _ => pi::stats::render_text(&report),
+    };
+    println!("{rendered}");
+    Ok(())
+}
+
 /// `pi rules list|add|remove|test|export|import` (bd-cv653.3.4):
 /// user-facing stream rules manager.
 fn handle_rules(cwd: &Path, command: &cli::RulesCommands) -> Result<()> {
@@ -5056,7 +5100,10 @@ fn handle_gc(
         ))
     })?;
 
-    let effective_dry_run = if empty_trash || restore.is_some() {
+    // Restore is inherently non-destructive, so it always runs live.
+    // --empty-trash is the ONE permanently destructive gc action: it must
+    // honor an explicit --dry-run and still requires --yes to go live.
+    let effective_dry_run = if restore.is_some() {
         false
     } else {
         dry_run || !yes
