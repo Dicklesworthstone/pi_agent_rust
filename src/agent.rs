@@ -14500,6 +14500,7 @@ mod tests {
                 context_window_tokens: 100,
                 reserve_tokens: 10,
                 keep_recent_tokens: 30,
+                mode: compaction::AutoCompactionMode::default(),
             };
 
             {
@@ -14601,6 +14602,7 @@ mod tests {
                 context_window_tokens: 150,
                 reserve_tokens: 10,
                 keep_recent_tokens: 30,
+                mode: compaction::AutoCompactionMode::default(),
             };
 
             {

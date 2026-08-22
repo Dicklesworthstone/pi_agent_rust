@@ -1905,6 +1905,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             reserve_tokens: config.compaction_reserve_tokens(),
             keep_recent_tokens: config.compaction_keep_recent_tokens(),
             context_window_tokens,
+            mode: config.compaction_mode(),
         }
     });
 
@@ -2848,6 +2849,7 @@ mod tests {
             context_window_tokens: 55_555,
             reserve_tokens: 1_234,
             keep_recent_tokens: 4_321,
+            mode: crate::compaction::AutoCompactionMode::default(),
         };
         let options = SessionOptions {
             compaction_settings: Some(custom.clone()),

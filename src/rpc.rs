@@ -15,7 +15,8 @@ use crate::agent::{AbortHandle, AgentEvent, AgentSession, InputSource, QueueMode
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
-    ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
+    ResolvedCompactionSettings, compact, compact_auto, compaction_details_to_value,
+    prepare_compaction,
 };
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -4885,7 +4886,7 @@ async fn maybe_auto_compact(
         (guard.agent.provider(), key)
     };
 
-    let result = compact(prep, provider, &key, None).await;
+    let result = compact_auto(prep, provider, &key, None).await;
 
     match result {
         Ok(result) => {

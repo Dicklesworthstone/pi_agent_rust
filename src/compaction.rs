@@ -59,12 +59,40 @@ fn json_byte_len(value: &Value) -> usize {
 // Public types
 // =============================================================================
 
+/// Auto-compaction mode policy (bd-cv653.3.18): how the automatic
+/// threshold-triggered compaction reclaims space. Manual `/compact` mode
+/// arguments override per invocation and do not consult this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoCompactionMode {
+    /// Always run the LLM summary (previous behavior).
+    #[default]
+    Summary,
+    /// Try the instant no-LLM shake first; escalate to the LLM summary only
+    /// when the shaken span would still trip the threshold.
+    ShakeFirst,
+    /// LLM summary with a halved keep-recent window.
+    Aggressive,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedCompactionSettings {
     pub enabled: bool,
     pub context_window_tokens: u32,
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
+    pub mode: AutoCompactionMode,
+}
+
+impl ResolvedCompactionSettings {
+    /// Apply the mode's settings adjustments (aggressive halves keep-recent).
+    #[must_use]
+    pub const fn with_mode_applied(mut self) -> Self {
+        if matches!(self.mode, AutoCompactionMode::Aggressive) {
+            self.keep_recent_tokens /= 2;
+        }
+        self
+    }
 }
 
 impl Default for ResolvedCompactionSettings {
@@ -85,6 +113,7 @@ impl Default for ResolvedCompactionSettings {
             reserve_tokens: 10_240,
             // 10% of context window
             keep_recent_tokens: 12_800,
+            mode: AutoCompactionMode::default(),
         }
     }
 }
@@ -726,6 +755,7 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
     })?;
     Ok(ResolvedCompactionSettings {
         enabled,
+        mode: AutoCompactionMode::default(),
         context_window_tokens: preparation_settings_u32(
             obj,
             "contextWindowTokens",
@@ -1798,6 +1828,7 @@ pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
+    let settings = settings.with_mode_applied();
     if path_entries.is_empty() {
         return None;
     }
@@ -2202,6 +2233,31 @@ pub fn compact_shake(preparation: CompactionPreparation) -> CompactionResult {
 #[must_use]
 pub const fn estimate_text_tokens(text: &str) -> u64 {
     (text.len() / CHARS_PER_TOKEN_ESTIMATE) as u64
+}
+
+/// Mode-aware automatic compaction (bd-cv653.3.18).
+///
+/// `shake-first` takes the instant no-LLM shortcut when it reclaims enough;
+/// everything else (and an insufficient shake) runs the standard LLM summary
+/// with its local fallback.
+pub async fn compact_auto(
+    preparation: CompactionPreparation,
+    provider: Arc<dyn Provider>,
+    api_key: &str,
+    custom_instructions: Option<&str>,
+) -> Result<CompactionResult> {
+    if matches!(preparation.settings.mode, AutoCompactionMode::ShakeFirst) {
+        let projection = shake_projection(&preparation);
+        if !shake_first_needs_summary(projection, &preparation.settings) {
+            tracing::info!(
+                tokens_before = projection.tokens_before,
+                projected_tokens = projection.projected_tokens,
+                "auto-compaction: shake reclaims enough; skipping LLM summary"
+            );
+            return Ok(compact_shake(preparation));
+        }
+    }
+    compact(preparation, provider, api_key, custom_instructions).await
 }
 
 /// Estimate what the compacted span would shrink to under a shake.
@@ -4129,6 +4185,7 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            mode: AutoCompactionMode::default(),
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -4136,6 +4193,93 @@ mod tests {
         assert!(!p.messages_to_summarize.is_empty());
         assert!(p.tokens_before > 0);
         assert!(p.previous_summary.is_none());
+    }
+
+    /// bd-cv653.3.18: shake-first auto mode takes the no-LLM shortcut on a
+    /// tool-heavy span — proven by a provider stub that panics if contacted.
+    #[test]
+    fn compact_auto_shake_first_skips_llm_when_reclaim_suffices() {
+        struct PanickingProvider;
+        #[async_trait::async_trait]
+        #[allow(clippy::unnecessary_literal_bound)]
+        impl crate::provider::Provider for PanickingProvider {
+            fn name(&self) -> &str {
+                "panic-provider"
+            }
+            fn api(&self) -> &str {
+                "panic-api"
+            }
+            fn model_id(&self) -> &str {
+                "panic-model"
+            }
+            async fn stream(
+                &self,
+                _context: &crate::provider::Context<'_>,
+                _options: &crate::provider::StreamOptions,
+            ) -> crate::error::Result<
+                std::pin::Pin<
+                    Box<
+                        dyn futures::Stream<
+                                Item = crate::error::Result<crate::provider::StreamEvent>,
+                            > + Send,
+                    >,
+                >,
+            > {
+                panic!("shake-first shortcut must not contact the provider"); // ubs:ignore test stub asserts the provider is never reached
+            }
+        }
+
+        let huge_result = "x".repeat(300_000);
+        let entries = vec![
+            user_entry("1", "small goal"),
+            assistant_entry("2", "checking", 55_000, 5_000),
+            tool_result_entry("3", &huge_result),
+            user_entry("4", "next step"),
+            assistant_entry("5", "ok", 55_000, 5_000),
+            user_entry("6", "recent"),
+        ];
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 50_000,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 5,
+            mode: AutoCompactionMode::ShakeFirst,
+        };
+        let prep = prepare_compaction(&entries, settings).expect("prep");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let result = runtime
+            .block_on(compact_auto(
+                prep,
+                Arc::new(PanickingProvider),
+                "unused",
+                None,
+            ))
+            .expect("compact_auto");
+        assert_eq!(result.details.mode.as_deref(), Some("shake"));
+    }
+
+    /// bd-cv653.3.18: aggressive mode halves keep-recent at prepare time.
+    #[test]
+    fn aggressive_mode_halves_keep_recent() {
+        let settings = ResolvedCompactionSettings {
+            enabled: true,
+            context_window_tokens: 50_000,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 12_800,
+            mode: AutoCompactionMode::Aggressive,
+        };
+        assert_eq!(settings.with_mode_applied().keep_recent_tokens, 6_400);
+
+        let summary = ResolvedCompactionSettings {
+            mode: AutoCompactionMode::Summary,
+            ..Default::default()
+        };
+        assert_eq!(
+            summary.clone().with_mode_applied().keep_recent_tokens,
+            summary.keep_recent_tokens
+        );
     }
 
     /// bd-cv653.3.18: shake drops bulky tool-result payloads to stubs while
@@ -4158,6 +4302,7 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            mode: AutoCompactionMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let first_kept = prep.first_kept_entry_id.clone();
@@ -4199,6 +4344,7 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            mode: AutoCompactionMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let result = compact_shake(prep);
@@ -4219,6 +4365,7 @@ mod tests {
             context_window_tokens: 50_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            mode: AutoCompactionMode::default(),
         };
 
         // Tool-heavy span: shake reclaims nearly everything -> no escalation.
@@ -4273,6 +4420,7 @@ mod tests {
             context_window_tokens: 100_000,
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
+            mode: AutoCompactionMode::default(),
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -4367,6 +4515,7 @@ mod tests {
             context_window_tokens: 15,
             reserve_tokens: 0,
             keep_recent_tokens: 100,
+            mode: AutoCompactionMode::default(),
         };
 
         let prep = prepare_compaction(&entries, settings).expect("should compact");
@@ -4429,6 +4578,7 @@ mod tests {
             context_window_tokens: 200,
             reserve_tokens: 0,
             keep_recent_tokens: 150,
+            mode: AutoCompactionMode::default(),
         };
 
         // We use prepare_compaction as the entry point
@@ -4881,6 +5031,7 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: 16_384,
                     keep_recent_tokens: 20_000,
+                    mode: AutoCompactionMode::default(),
                 };
                 assert!(!should_compact(ctx_tokens, window, &settings));
             }
@@ -4897,6 +5048,7 @@ mod tests {
                     context_window_tokens: window,
                     reserve_tokens: reserve,
                     keep_recent_tokens: 20_000,
+                    mode: AutoCompactionMode::default(),
                 };
                 let threshold = u64::from(window).saturating_sub(u64::from(reserve));
                 let result = should_compact(ctx_tokens, window, &settings);

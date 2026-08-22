@@ -409,7 +409,7 @@ async fn run_compaction_task(
         Err(Error::session("Background compaction aborted".to_string()))
     }
     .fuse();
-    let compaction_fut = std::panic::AssertUnwindSafe(compaction::compact(
+    let compaction_fut = std::panic::AssertUnwindSafe(compaction::compact_auto(
         preparation,
         provider,
         &api_key,

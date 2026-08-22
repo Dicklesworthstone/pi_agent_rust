@@ -438,7 +438,6 @@ fn main_impl() -> Result<()> {
     pi::crash::install(&crash_agent_dir, None);
     let _ = pi::crash::emit_startup_notice(&crash_agent_dir);
     if cli.crash_test {
-
         pi::crash::record_operation("crash-test injected panic".to_string());
         panic!("pi --crash-test: intentional panic for bundle verification");
     }
@@ -1766,6 +1765,7 @@ async fn run(
         reserve_tokens: config.compaction_reserve_tokens(),
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
         context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
+        mode: config.compaction_mode(),
     };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),

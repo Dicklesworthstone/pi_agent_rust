@@ -1389,6 +1389,7 @@ fn handle_session_new(
         enabled: options.config.compaction_enabled(),
         reserve_tokens: options.config.compaction_reserve_tokens(),
         keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
+        mode: options.config.compaction_mode(),
         context_window_tokens: if model_entry.model.context_window == 0 {
             ResolvedCompactionSettings::default().context_window_tokens
         } else {

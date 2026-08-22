@@ -212,6 +212,11 @@ pub struct Config {
     #[serde(alias = "failClosedHooks")]
     pub fail_closed_hooks: Option<bool>,
 
+    /// Auto-compaction mode (bd-cv653.3.18): "summary" (default) |
+    /// "shake-first" | "aggressive".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_mode: Option<crate::compaction::AutoCompactionMode>,
+
     /// Auto-continue policy for unexpected mid-task stops (bd-cv653.3.15):
     /// "off" | "conservative" (default) | "aggressive".
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -907,6 +912,7 @@ impl Config {
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
             fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
+            compaction_mode: other.compaction_mode.or(base.compaction_mode),
             turn_recovery: other.turn_recovery.or(base.turn_recovery),
 
             // Extension Policy
@@ -1026,6 +1032,12 @@ impl Config {
 
     pub fn follow_up_queue_mode(&self) -> QueueMode {
         parse_queue_mode_or_default(self.follow_up_mode.as_deref())
+    }
+
+    /// Resolved auto-compaction mode (bd-cv653.3.18).
+    #[must_use]
+    pub fn compaction_mode(&self) -> crate::compaction::AutoCompactionMode {
+        self.compaction_mode.unwrap_or_default()
     }
 
     pub fn compaction_reserve_tokens(&self) -> u32 {
