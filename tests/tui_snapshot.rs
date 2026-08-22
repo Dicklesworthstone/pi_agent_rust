@@ -453,6 +453,7 @@ fn tui_snapshot_tool_output_message() {
             name: "read".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
     send_pi(

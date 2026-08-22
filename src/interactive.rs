@@ -1854,11 +1854,15 @@ pub enum PiMsg {
         content: Vec<ContentBlock>,
         details: Option<Value>,
     },
-    /// Tool execution ended.
+    /// Tool execution ended. `output` carries an OPTIONAL size-capped text
+    /// preview of the tool result (bd-cv653.9.2 diff cards); `None` when
+    /// the surface folds output elsewhere (e.g. the ftui bash flow) or the
+    /// result had no text content.
     ToolEnd {
         name: String,
         tool_id: String,
         is_error: bool,
+        output: Option<String>,
     },
     /// Session todo list changed (bd-cv653.3.9). Carries the compact
     /// `todo_list.v1` summary line for the footer; `None` clears it.

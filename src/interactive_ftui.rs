@@ -240,6 +240,7 @@ fn push_card_block(
     state: CardState,
     text: &str,
     detail: Option<&String>,
+    diff_styled: bool,
     palette: &FtuiPalette,
     spinner_frame: usize,
 ) {
@@ -258,8 +259,23 @@ fn push_card_block(
     lines.push(ftui::text::Line::styled(rendered, style));
     if let Some(detail) = detail {
         let dim = ftui::Style::new().dim().fg(palette.muted);
+        let added = ftui::Style::new().fg(palette.accent);
+        let removed = ftui::Style::new().fg(palette.error);
         for line in detail.lines() {
-            lines.push(ftui::text::Line::styled(format!("  {line}"), dim));
+            // Diff cards (edit/hashline_edit): word-level styling comes
+            // with the dedicated widget; the seed colors whole added and
+            // removed lines (markers kept) so the shape of a change reads
+            // at a glance.
+            let line_style = if diff_styled {
+                match line.as_bytes().first() {
+                    Some(b'+') => added,
+                    Some(b'-') => removed,
+                    _ => dim,
+                }
+            } else {
+                dim
+            };
+            lines.push(ftui::text::Line::styled(format!("  {line}"), line_style));
         }
     }
 }
@@ -314,8 +330,10 @@ struct TranscriptEntry {
     card: Option<CardState>,
     /// Folded result preview for tool cards (sanitized, size-capped).
     detail: Option<String>,
+    /// Detail lines are diff content (edit/hashline_edit): style added and
+    /// removed markers.
+    diff_styled: bool,
 }
-
 /// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
 /// of the bubbletea stack: the card renders into the transcript and the
 /// editor collects the reply (`1`/label to select, comma-separated for multi,
@@ -698,6 +716,7 @@ impl PiFtuiModel {
             text,
             card: None,
             detail: None,
+            diff_styled: false,
         });
     }
 
@@ -711,12 +730,30 @@ impl PiFtuiModel {
             text: sanitized_name.to_string(),
             card: Some(CardState::Pending),
             detail: None,
+            diff_styled: false,
         });
     }
-
     /// Close the last pending tool card named `sanitized_name`, falling
     /// back to a plain trace line when no matching open card exists.
-    fn finish_tool_card(&mut self, sanitized_name: &str, ok: bool) {
+    /// A turn that ends (or dies) between ToolStart and ToolEnd leaves a
+    /// pending card whose spinner freezes once ticks stop. Settle any
+    /// leftover pending cards as errors so the transcript never shows a
+    /// tool that is "still running" after the turn is over.
+    fn settle_pending_cards(&mut self) {
+        for entry in &mut self.transcript {
+            if entry.card == Some(CardState::Pending) {
+                entry.card = Some(CardState::Err);
+            }
+        }
+    }
+
+    fn finish_tool_card(
+        &mut self,
+        sanitized_name: &str,
+        ok: bool,
+        sanitized_output: Option<String>,
+        diff_styled: bool,
+    ) {
         if let Some(entry) = self
             .transcript
             .iter_mut()
@@ -724,6 +761,10 @@ impl PiFtuiModel {
             .find(|e| e.card == Some(CardState::Pending) && e.text == sanitized_name)
         {
             entry.card = Some(if ok { CardState::Ok } else { CardState::Err });
+            if let Some(output) = sanitized_output {
+                entry.detail = Some(output);
+                entry.diff_styled = diff_styled;
+            }
             return;
         }
         let mark = if ok { "✓" } else { "✗" };
@@ -796,12 +837,19 @@ impl PiFtuiModel {
                 self.current_tool = Some(name.clone());
                 self.push_tool_card(&name);
             }
-            PiMsg::ToolEnd { name, is_error, .. } => {
+            PiMsg::ToolEnd {
+                name,
+                is_error,
+                output,
+                ..
+            } => {
                 // The tool card flips to its terminal state in place
                 // (bd-cv653.9.2 card framework). Sanitize ONCE here,
                 // matching ToolStart, so start/end names always pair.
                 let name = sanitize(&name).into_owned();
-                self.finish_tool_card(&name, !is_error);
+                let output = output.map(|o| sanitize(&o).into_owned());
+                let diff_styled = matches!(name.as_str(), "edit" | "hashline_edit");
+                self.finish_tool_card(&name, !is_error, output, diff_styled);
                 self.current_tool = None;
             }
             PiMsg::TodoSummary { summary } => {
@@ -829,14 +877,21 @@ impl PiFtuiModel {
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
+                self.settle_pending_cards();
             }
             PiMsg::AgentError(err) => {
                 // Pinned above the editor (bd-cv653.9.2), dismiss-on-send —
-                // not duplicated into the transcript.
+                // not duplicated into the transcript. Partial streamed text
+                // is still flushed so it isn't merged into the next turn.
+                if !self.streaming.is_empty() {
+                    let text = std::mem::take(&mut self.streaming);
+                    self.push_entry(EntryRole::Assistant, text);
+                }
                 self.error_banner = Some(sanitize(&err).into_owned());
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
+                self.settle_pending_cards();
             }
             PiMsg::System(text) | PiMsg::SystemNote(text) => {
                 let text = sanitize(&text).into_owned();
@@ -1578,6 +1633,7 @@ impl PiFtuiModel {
                     state,
                     &entry.text,
                     entry.detail.as_ref(),
+                    entry.diff_styled,
                     &palette,
                     self.spinner.current_frame,
                 );
@@ -1744,6 +1800,34 @@ impl Model for PiFtuiModel {
 
 // ── Launch path ─────────────────────────────────────────────────────────────
 
+/// Cap a tool result's text content into an 8-line preview for the card
+/// detail, with an elision counter. `None` when the result has no text.
+fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
+    const MAX_DETAIL_LINES: usize = 8;
+    let mut text = String::new();
+    for block in &result.content {
+        if let crate::model::ContentBlock::Text(t) = block {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&t.text);
+        }
+    }
+    if text.trim().is_empty() {
+        return None;
+    }
+    let total = text.lines().count();
+    let mut preview = text
+        .lines()
+        .take(MAX_DETAIL_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if total > MAX_DETAIL_LINES {
+        preview.push_str(&format!("\n… +{} more lines", total - MAX_DETAIL_LINES));
+    }
+    Some(preview)
+}
+
 /// Translate one [`AgentEvent`](crate::agent::AgentEvent) into the `PiMsg`
 /// vocabulary the model consumes. Pure so tests can pin the mapping.
 ///
@@ -1790,11 +1874,13 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
             tool_call_id,
             tool_name,
             is_error,
+            result,
             ..
         } => vec![PiMsg::ToolEnd {
             name: tool_name.clone(),
             tool_id: tool_call_id.clone(),
             is_error: *is_error,
+            output: tool_output_preview(result),
         }],
         E::AutoRetryStart {
             attempt,
@@ -2117,6 +2203,7 @@ async fn run_extension_command(
             EXT_COMMAND_TIMEOUT_MS,
         )
         .await;
+    let is_error = result.is_err();
     let msg = match result {
         Ok(value) if value.is_null() => PiMsg::SystemNote(format!("/{name} done")),
         Ok(value) => PiMsg::SystemNote(format!("/{name} → {value}")),
@@ -2126,7 +2213,8 @@ async fn run_extension_command(
     let _ = agent_tx.send(PiMsg::ToolEnd {
         name: format!("/{name}"),
         tool_id: String::from("ftui-ext-command"),
-        is_error: false,
+        is_error,
+        output: None,
     });
 }
 
@@ -2341,7 +2429,6 @@ async fn run_set_name_command(
     let _ = agent_tx.send(msg);
 }
 
-
 /// `/add-dir <dir>` driver (bd-cv653.3.12): validate + add on the shared
 /// workspace handle and persist the canonical set into the session header.
 async fn run_add_dir_command(
@@ -2418,9 +2505,7 @@ fn run_crash_command(action: &str, agent_tx: &Sender<PiMsg>) {
             let removed = pi::crash::delete_all(&agent_dir);
             PiMsg::System(format!("Deleted {removed} crash bundle(s)"))
         }
-        other => PiMsg::AgentError(format!(
-            "usage: /crash [list|show|delete] (got: {other})"
-        )),
+        other => PiMsg::AgentError(format!("usage: /crash [list|show|delete] (got: {other})")),
     };
     let _ = agent_tx.send(msg);
 }
@@ -2580,7 +2665,10 @@ async fn run_bash_ui_command(
     let _ = agent_tx.send(PiMsg::ToolEnd {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
-        is_error: false,
+        is_error: output.is_none(),
+        // BashResult already folded the display into the card; a second
+        // detail here would duplicate it.
+        output: None,
     });
     let _ = agent_tx.send(PiMsg::AgentDone {
         usage: None,

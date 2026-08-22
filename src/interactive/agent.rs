@@ -454,6 +454,7 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
                 name: tool_name.clone(),
                 tool_id: tool_call_id.clone(),
                 is_error: *is_error,
+                output: None,
             });
         }
         AgentEvent::AgentEnd { messages, .. } => {

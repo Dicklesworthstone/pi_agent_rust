@@ -468,6 +468,7 @@ fn drive_tool_pressure(app: &mut PiApp, trace: &mut TuiDegradationDrillTrace) {
         name: "bash".to_string(),
         tool_id: "tool-pressure".to_string(),
         is_error: false,
+        output: None,
     });
     trace.event();
 }
