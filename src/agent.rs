@@ -11248,7 +11248,9 @@ impl AgentSession {
             .dispatch_event_with_response(
                 ExtensionEventName::SessionBeforeCompact,
                 Some(Value::Object(payload)),
-                EXTENSION_EVENT_TIMEOUT_MS,
+                // gh #178: a dedicated long-running budget — this hook may
+                // legitimately await the host compaction bridge.
+                ExtensionEventName::SessionBeforeCompact.default_timeout_ms(),
             )
             .await;
 
