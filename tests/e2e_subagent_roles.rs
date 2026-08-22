@@ -114,7 +114,7 @@ fn e2e_subagent_child_uses_task_role_model() {
     // Task role assignment (bd-cv653.3.1).
     std::fs::write(
         env_root.join("settings.json"),
-        r#"{"modelRoles": {"task": "e2erole/role-model"}, "checkForUpdates": false}"#,
+        r#"{"modelRoles": {"task": "e2erole/role-model"}, "checkForUpdates": false, "approval": {"mode": "yolo"}}"#,
     )
     .expect("write settings.json");
 

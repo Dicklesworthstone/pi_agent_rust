@@ -8154,6 +8154,7 @@ impl HubTool {
 
     /// Agent-hub action group (bd-cv653.5.3): roster / transcript / steer /
     /// kill / revive / send / inbox over this session's subagent children.
+    #[allow(clippy::too_many_lines)]
     fn dispatch_agent(
         &self,
         action: &str,
@@ -8269,19 +8270,42 @@ impl HubTool {
             }
             "revive" => {
                 let id = id_required("revive")?;
-                let (entry, _task) = crate::agent_hub::registry()
+                let (agent_name, task) = crate::agent_hub::registry()
                     .lock()
                     .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
-                    .revive(&id)?;
-                // The revived task is queued as a steering continuation: the
-                // next subagent tool call can launch it; the registry entry
-                // already records the lineage so the roster shows it.
-                let details = serde_json::to_value(&entry)?;
+                    .prepare_revival(&id)?;
+                // Respawn as a background subagent run carrying the prior
+                // transcript context; the child registers on the roster and
+                // the lineage link lands when its entry exists.
+                let cwd = self.cwd.clone();
+                let from_id = id.clone();
+                std::thread::spawn(move || {
+                    let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                        .build()
+                        .expect("failed to build revival runtime"); // ubs:ignore test harness pattern — revival thread has no ambient runtime
+                    let outcome = rt.block_on(async {
+                        let tool = crate::subagents::SubagentTool::new(&cwd);
+                        tool.execute(
+                            "hub-revive",
+                            serde_json::json!({
+                                "agent": agent_name,
+                                "task": task,
+                                "revivedFrom": from_id,
+                            }),
+                            None,
+                        )
+                        .await
+                    });
+                    if let Err(err) = outcome {
+                        eprintln!("hub revive child failed: {err}");
+                    }
+                });
+                let details = serde_json::json!({
+                    "schema": "pi.agent-hub.revive/v1",
+                    "revives": id,
+                });
                 (
-                    format!(
-                        "Revival registered as {} (continues {id}); relaunch via the subagent tool with the recorded task.",
-                        entry.id
-                    ),
+                    format!("Revival of {id} launched as a new background run."),
                     details,
                 )
             }
@@ -11592,7 +11616,6 @@ impl LsTool {
         }
     }
     #[cfg(test)]
-
     fn with_after_scope_hook(
         cwd: &Path,
         after_scope_hook: impl Fn() + Send + Sync + 'static,
@@ -16187,11 +16210,9 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(extra.path().join("extra.txt"), "extra-content").unwrap();
         std::fs::write(outside.path().join("secret.txt"), "outside-content").unwrap();
-
         let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
         let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
-        handle.add_root(canonical);
-
+        handle.add_root(&canonical);
         let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
         let outside_path = outside
             .path()

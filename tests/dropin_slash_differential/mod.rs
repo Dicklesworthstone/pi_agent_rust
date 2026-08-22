@@ -690,6 +690,22 @@ fn run_rust_rpc_sequence(
     run_rpc_sequence("rust", &mut child, commands)
 }
 
+/// Resolve the Node.js binary portably: prefer the pinned Linux CI path,
+/// fall back to Homebrew's darwin location, then to `node` on PATH.
+fn node_binary() -> PathBuf {
+    for candidate in [
+        "/usr/bin/node",
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+    ] {
+        let path = Path::new(candidate);
+        if path.is_file() {
+            return path.to_path_buf();
+        }
+    }
+    PathBuf::from("node")
+}
+
 fn run_pi_mono_rpc_sequence(
     paths: &RunnerPaths,
     scenario: &SlashCommandScenario,
@@ -705,7 +721,7 @@ fn run_pi_mono_rpc_sequence(
         .map_err(|err| anyhow::anyhow!("create {}: {err}", agent_dir.display()))?;
     write_fixture_models_json(&agent_dir)?;
 
-    let mut child = Command::new("/usr/bin/node")
+    let mut child = Command::new(node_binary())
         .arg(&paths.pi_mono_tsx)
         .args(["--tsconfig", "tsconfig.json"])
         .arg(&paths.pi_mono_cli)

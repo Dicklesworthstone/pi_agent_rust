@@ -1624,20 +1624,20 @@ async fn run(
             if let Err(err) = pi::workspace::validate_new_root(&root) {
                 eprintln!("Warning: skipping restored workspace root: {err}");
             } else {
-                workspace.add_root(root);
+                workspace.add_root(&root);
             }
         }
         if !cli.add_dir.is_empty() {
             for dir in &cli.add_dir {
                 let canonical = pi::workspace::validate_new_root(dir)
                     .map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
-                workspace.add_root(canonical);
+                workspace.add_root(&canonical);
             }
         }
         let snapshot = workspace.snapshot_or(&cwd);
         let additional = snapshot.additional().to_vec();
         if !additional.is_empty() || !cli.add_dir.is_empty() {
-            session.set_additional_roots(additional);
+            session.set_additional_roots(&additional);
         }
     }
 
@@ -1820,9 +1820,11 @@ async fn run(
             match pi::providers::create_provider(&entry, None) {
                 Ok(advisor_provider) => {
                     agent_session.advisor = Some(
-                        pi::advisor::AdvisorRuntime::new(advisor_provider, label).with_timeout(
-                            std::time::Duration::from_secs(config.advisor_timeout_secs()),
-                        ),
+                        pi::advisor::AdvisorRuntime::new(advisor_provider, label)
+                            .with_timeout(std::time::Duration::from_secs(
+                                config.advisor_timeout_secs(),
+                            ))
+                            .with_api_key(key.clone()),
                     );
                 }
                 Err(err) => {

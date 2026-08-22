@@ -79,8 +79,11 @@ impl PiEnv {
         let root = harness.temp_path(format!("pi-env-{case}"));
         std::fs::create_dir_all(root.join("agent")).expect("mkdir agent");
         std::fs::create_dir_all(root.join("home")).expect("mkdir home");
-        std::fs::write(root.join("settings.json"), r#"{"checkForUpdates": false}"#)
-            .expect("write settings");
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"checkForUpdates": false, "approval": {"mode": "yolo"}}"#,
+        )
+        .expect("write settings");
         Self { root }
     }
 
@@ -177,13 +180,25 @@ fn finish_case(harness: &TestHarness, case: &str) {
 #[test]
 fn e2e_chain_falls_through_failing_provider_to_next() {
     let harness = TestHarness::new("e2e_chain_falls_through_failing_provider_to_next");
-    harness.log().info("setup", "tavily 500s, brave answers");
+    // The default chain tries brave before tavily, so fail the earlier rung
+    // (brave) and let the later one (tavily) answer.
+    harness.log().info("setup", "brave 500s, tavily answers");
     let server = harness.start_mock_http_server();
-    server.add_route("POST", "/search", json_response(500, r#"{"error":"boom"}"#));
     server.add_route(
         "GET",
         "/res/v1/web/search",
-        json_response(200, &brave_results_body()),
+        json_response(500, r#"{"error":"boom"}"#),
+    );
+    server.add_route(
+        "POST",
+        "/search",
+        json_response(
+            200,
+            r#"{"results":[
+                {"title":"Tokio tutorial","url":"https://tokio.rs/tutorial","content":"Async Rust runtime guide"},
+                {"title":"Rust async book","url":"https://rust-lang.github.io/async-book/","content":"Official async book"}
+            ]}"#,
+        ),
     );
 
     let env = PiEnv::new(&harness, "fallthrough");
@@ -223,12 +238,12 @@ fn e2e_chain_falls_through_failing_provider_to_next() {
     );
     let paths: Vec<String> = server.requests().into_iter().map(|r| r.path).collect();
     assert!(
-        paths.iter().any(|p| p == "/search"),
-        "tavily rung hit first: {paths:?}"
+        paths.iter().any(|p| p.starts_with("/res/v1/web/search")),
+        "brave rung hit first: {paths:?}"
     );
     assert!(
-        paths.iter().any(|p| p == "/res/v1/web/search"),
-        "brave rung answered after tavily failed: {paths:?}"
+        paths.iter().any(|p| p == "/search"),
+        "tavily rung answered after brave failed: {paths:?}"
     );
     let model_bound = server
         .requests()
@@ -327,7 +342,7 @@ fn e2e_provider_pin_uses_only_that_rung() {
         "/v1/chat/completions",
         vec![
             sse_response({
-                let args = r#"{"query":"rust async\",\"provider\":\"brave\"}"#;
+                let args = r#"{\"query\":\"rust async\",\"provider\":\"brave\"}"#;
                 [
                     format!(
                         r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"s1","type":"function","function":{{"name":"web_search","arguments":"{args}"}}}}]}}}}]}}"#

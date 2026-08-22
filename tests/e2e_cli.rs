@@ -3474,17 +3474,44 @@ fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
     let config = Config::default();
     let tools = ToolRegistry::new(enabled, cwd, Some(&config));
 
-    tools
+    fn tool_json(tool: &dyn pi::tools::Tool) -> serde_json::Value {
+        json!({
+            "name": tool.name(),
+            "description": tool.description(),
+            "input_schema": tool.parameters(),
+        })
+    }
+
+    // The provider request only carries the live schema: discoverable-tier
+    // tools are hidden behind the xdev dispatcher until promoted
+    // (bd-cv653.1.6), mirroring the filter in Agent's request build.
+    let mut defs: Vec<serde_json::Value> = tools
         .tools()
         .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name(),
-                "description": tool.description(),
-                "input_schema": tool.parameters(),
-            })
-        })
-        .collect()
+        .filter(|tool| !tools.is_discoverable(tool.name()))
+        .map(|tool| tool_json(tool.as_ref()))
+        .collect();
+
+    // Session-coupled tools join via extend_tools in main.rs, in this
+    // order: todo (when enabled), submit_plan (always registered — it
+    // self-errors outside plan mode), ask (when enabled).
+    if enabled.contains(&"todo") {
+        let session = Arc::new(asupersync::sync::Mutex::new(
+            pi::session::Session::in_memory(),
+        ));
+        defs.push(tool_json(&pi::todo::TodoTool::new(session)));
+    }
+    defs.push(tool_json(&pi::plan::SubmitPlanTool::new(
+        pi::plan::PlanState::new(),
+        false,
+    )));
+    if enabled.contains(&"ask") {
+        defs.push(tool_json(&pi::ask::AskTool::new(
+            pi::ask::AskPolicy::from_config(None),
+        )));
+    }
+
+    defs
 }
 
 fn log_tool_scenario_setup(
@@ -4279,16 +4306,10 @@ fn e2e_cli_specific_tools_enables_subset() {
 fn e2e_cli_default_tools_when_no_flag() {
     let mut harness = CliTestHarness::new("e2e_cli_default_tools_when_no_flag");
     let system_prompt = "Test default tools.";
-    let expected_tools = [
-        "read",
-        "bash",
-        "edit",
-        "write",
-        "grep",
-        "find",
-        "ls",
-        "hashline_edit",
-    ];
+    // The default enabled set (pi::xdev::default_enabled_tools) now includes
+    // the discoverable tier (ast_grep, lsp, jobs, hub, ...); the helper
+    // filters those down to the live schema the request actually carries.
+    let expected_tools = pi::xdev::default_enabled_tools();
 
     let request_body = json!({
         "model": "claude-sonnet-4-5",

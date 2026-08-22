@@ -1398,13 +1398,15 @@ fn run_crash_interrupt_recovery_active_worker(
         )
         .await;
         let idle_state_id = format!("active-{cycle}-extension-idle");
-        let _idle_state = wait_for_non_streaming_state(
+        let idle_state = wait_for_non_streaming_state(
             &in_tx,
             &out_rx,
             &idle_state_id,
             "active extension completion",
         )
         .await;
+        let idle_message_count =
+            require_response_field_u64(&idle_state, "messageCount", "active idle get_state");
 
         let prompt = json!({
             "id": format!("active-{cycle}-prompt"),
@@ -1420,8 +1422,31 @@ fn run_crash_interrupt_recovery_active_worker(
             "sessionFile",
             "active streaming get_state",
         );
-        let message_count =
+        // The streaming user prompt is appended to the session just after the
+        // streaming state flips on, so poll until the count includes it —
+        // otherwise the recorded count races the persisted session file.
+        let expected_count = idle_message_count + 1;
+        let mut message_count =
             require_response_field_u64(&streaming_state, "messageCount", "active get_state");
+        for attempt in 0..200 {
+            if message_count >= expected_count {
+                break;
+            }
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+            let recheck_cmd = json!({
+                "id": format!("active-{cycle}-count-{attempt}"),
+                "type": "get_state",
+            })
+            .to_string();
+            let recheck = send_recv(&in_tx, &out_rx, &recheck_cmd, "active count get_state").await;
+            assert_ok(&recheck, "get_state");
+            message_count =
+                require_response_field_u64(&recheck, "messageCount", "active count get_state");
+        }
+        assert_eq!(
+            message_count, expected_count,
+            "streaming prompt should be persisted exactly once before the interrupt"
+        );
 
         write_json_atomic(
             &ready_path,

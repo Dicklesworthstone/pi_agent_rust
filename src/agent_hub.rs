@@ -125,7 +125,7 @@ pub fn registry() -> &'static Mutex<AgentHubRegistry> {
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
 impl AgentHubRegistry {
@@ -148,6 +148,12 @@ impl AgentHubRegistry {
         Ok(dir)
     }
 
+    /// Override the artifacts dir (integration tests).
+    #[doc(hidden)]
+    pub fn set_dir_for_tests(&mut self, dir: PathBuf) {
+        self.dir = Some(dir);
+    }
+
     /// Register a child at spawn time. Returns the assigned run id.
     pub fn register(&mut self, name: &str, task: &str) -> Result<ChildEntry> {
         self.seq = self.seq.saturating_add(1);
@@ -166,7 +172,7 @@ impl AgentHubRegistry {
             steer_path: dir.join(format!("{id}.steer")),
             revived_from: None,
         };
-        self.entries.insert(id.clone(), entry.clone());
+        self.entries.insert(id, entry.clone());
         Ok(entry)
     }
 
@@ -293,15 +299,15 @@ impl AgentHubRegistry {
         self.settle(id, ChildStatus::Killed);
     }
 
-    /// Register a revived run continuing `from_id`: fresh entry carrying the
-    /// prior transcript as context. Returns the new entry plus the task text
-    /// to launch (original task + transcript tail + continue directive).
-    pub fn revive(&mut self, from_id: &str) -> Result<(ChildEntry, String)> {
+    /// Prepare a revival: build the continuation task for a settled run from
+    /// its transcript tail. Pure — the caller launches the continuation via
+    /// the subagent tool (which registers the new run with `revived_from`
+    /// lineage).
+    pub fn prepare_revival(&self, from_id: &str) -> Result<(String, String)> {
         let prior = self
             .entries
             .get(from_id)
-            .ok_or_else(|| Error::validation(format!("hub: unknown child '{from_id}'")))?
-            .clone();
+            .ok_or_else(|| Error::validation(format!("hub: unknown child '{from_id}'")))?;
         if !prior.status.settled() {
             return Err(Error::validation(format!(
                 "hub: cannot revive '{from_id}' — still {}",
@@ -317,10 +323,14 @@ impl AgentHubRegistry {
             prior.status.as_str(),
             tail
         );
-        let mut entry = self.register(&prior.name, &task)?;
-        entry.revived_from = Some(from_id.to_string());
-        self.entries.insert(entry.id.clone(), entry.clone());
-        Ok((entry, task))
+        Ok((prior.name.clone(), task))
+    }
+
+    /// Record lineage on a freshly-registered run.
+    pub fn link_revival(&mut self, new_id: &str, from_id: &str) {
+        if let Some(entry) = self.entries.get_mut(new_id) {
+            entry.revived_from = Some(from_id.to_string());
+        }
     }
 
     /// Remove this session's hub artifacts directory (session exit).
@@ -330,6 +340,32 @@ impl AgentHubRegistry {
             .join(std::process::id().to_string());
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+/// Kill a child's process tree (its bash descendants die too) and mark the
+/// registry entry killed. Mirrors the HubTool `agent kill` path.
+pub fn kill_child_tree(id: &str) -> Result<()> {
+    let entry = {
+        let reg = registry()
+            .lock()
+            .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?;
+        reg.get(id)
+            .ok_or_else(|| Error::validation(format!("hub: unknown child '{id}'")))?
+    };
+    if entry.status.settled() {
+        return Err(Error::validation(format!(
+            "hub: cannot kill '{id}' — already {}",
+            entry.status.as_str()
+        )));
+    }
+    if let Some(pid) = entry.pid {
+        crate::tools::kill_process_group_tree(Some(pid));
+    }
+    registry()
+        .lock()
+        .map_err(|_| Error::tool("hub", "agent registry lock poisoned"))?
+        .mark_killed(id);
+    Ok(())
 }
 
 /// Append one steering frame to the child's queue file. The child drains the
@@ -486,11 +522,21 @@ mod tests {
             "{\"type\":\"message_end\",\"text\":\"half-done\"}",
         );
         reg.settle(&entry.id, ChildStatus::Failed);
-        let (revived, task) = reg.revive(&entry.id).expect("revive");
-        assert_eq!(revived.revived_from.as_deref(), Some(entry.id.as_str()));
+        let (name, task) = reg.prepare_revival(&entry.id).expect("revive");
+        assert_eq!(name, "scout");
         assert!(task.contains("original task"));
         assert!(task.contains("half-done"));
         assert!(task.contains("Continuation"));
+        // Lineage lands on the continuation's own registry entry.
+        let continuation = reg.register(&name, &task).expect("register continuation");
+        reg.link_revival(&continuation.id, &entry.id);
+        assert_eq!(
+            reg.get(&continuation.id)
+                .expect("get")
+                .revived_from
+                .as_deref(),
+            Some(entry.id.as_str())
+        );
         let _ = fs::remove_dir_all(&temp);
     }
 
@@ -501,7 +547,7 @@ mod tests {
         reg.dir = Some(temp.clone());
         let entry = reg.register("scout", "task").expect("register");
         reg.mark_running(&entry.id, 9);
-        let err = reg.revive(&entry.id).unwrap_err();
+        let err = reg.prepare_revival(&entry.id).unwrap_err();
         assert!(err.to_string().contains("still running"));
         let _ = fs::remove_dir_all(&temp);
     }

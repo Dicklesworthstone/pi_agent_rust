@@ -307,6 +307,9 @@ pub struct AdvisorRuntime {
     timeout: Duration,
     guard: EmissionGuard,
     consecutive_failures: u32,
+    /// Resolved credential for the advisor's provider; forwarded on every
+    /// review call so keyed providers authenticate exactly like the doer.
+    api_key: Option<String>,
     /// Set when disabled after repeated failures (user notice rides once).
     pub disabled_notice: Option<String>,
 }
@@ -333,6 +336,7 @@ impl AdvisorRuntime {
             timeout: Duration::from_secs(15),
             guard: EmissionGuard::new(3, 10),
             consecutive_failures: 0,
+            api_key: None,
             disabled_notice: None,
         }
     }
@@ -340,6 +344,12 @@ impl AdvisorRuntime {
     #[must_use]
     pub const fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    #[must_use]
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
         self
     }
 
@@ -397,6 +407,7 @@ impl AdvisorRuntime {
         };
         let options = crate::provider::StreamOptions {
             max_tokens: Some(512),
+            api_key: self.api_key.clone(),
             ..Default::default()
         };
         let mut stream = self.provider.stream(&context, &options).await?;

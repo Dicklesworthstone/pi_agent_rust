@@ -11779,6 +11779,9 @@ const __pi_vfs = (() => {
   function unmapExtensionTempPath(normalized) {
     for (const tempBase of extensionTempRoots()) {
       const root = currentExtensionTempRoot(tempBase);
+      if (!root) {
+        continue;
+      }
       if (normalized === root) {
         return tempBase;
       }
