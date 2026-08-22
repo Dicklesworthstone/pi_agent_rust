@@ -232,11 +232,73 @@ impl EntryRole {
     }
 }
 
+/// Render one tool-card line: state glyph plus the sanitized tool name in
+/// the state's tint (pending dims, ok settles in accent, errors shout).
+fn push_card_line(
+    lines: &mut Vec<ftui::text::Line<'static>>,
+    state: CardState,
+    text: &str,
+    palette: &FtuiPalette,
+) {
+    let (glyph, style) = match state {
+        CardState::Pending => ("▸", ftui::Style::new().dim().fg(palette.accent)),
+        CardState::Ok => ("✓", ftui::Style::new().fg(palette.accent)),
+        CardState::Err => ("✗", ftui::Style::new().bold().fg(palette.error)),
+    };
+    let mut rendered = String::with_capacity(text.len() + 2);
+    rendered.push_str(glyph);
+    rendered.push(' ');
+    rendered.push_str(text);
+    lines.push(ftui::text::Line::styled(rendered, style));
+}
+
+/// Render one role block: assistant content as markdown, everything else
+/// with the role prefix on the first line and role style throughout.
+fn push_role_block(
+    lines: &mut Vec<ftui::text::Line<'static>>,
+    role: EntryRole,
+    content: &str,
+    palette: &FtuiPalette,
+    md: &ftui_extras::markdown::MarkdownRenderer,
+) {
+    if role == EntryRole::Assistant {
+        let rendered = md.render(content);
+        lines.extend(rendered.lines().iter().cloned());
+        return;
+    }
+    let style = role.style(palette);
+    let prefix = role.prefix();
+    let indent = " ".repeat(prefix.chars().count());
+    for (i, line) in content.lines().enumerate() {
+        let lead = if i == 0 { prefix } else { indent.as_str() };
+        let mut rendered = String::with_capacity(lead.len() + line.len());
+        rendered.push_str(lead);
+        rendered.push_str(line);
+        lines.push(ftui::text::Line::styled(rendered, style));
+    }
+    if content.is_empty() {
+        lines.push(ftui::text::Line::styled(prefix.to_string(), style));
+    }
+}
+
+/// Live state of a tool-execution card (bd-cv653.9.2 seed): a pending card
+/// flips to its terminal state IN PLACE when the tool ends, mirroring omp's
+/// state-tinted tool boxes. Full bordered widgets land with the widget-grade
+/// card framework slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CardState {
+    Pending,
+    Ok,
+    Err,
+}
+
 /// One sanitized conversation entry (message, note, card, or error).
 #[derive(Debug)]
 struct TranscriptEntry {
     role: EntryRole,
     text: String,
+    /// Set for tool-execution cards; `None` renders as a plain role block.
+    card: Option<CardState>,
 }
 
 /// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
@@ -567,7 +629,39 @@ impl PiFtuiModel {
     }
 
     fn push_entry(&mut self, role: EntryRole, text: String) {
-        self.transcript.push(TranscriptEntry { role, text });
+        self.transcript.push(TranscriptEntry {
+            role,
+            text,
+            card: None,
+        });
+    }
+
+    /// Push a pending tool-execution card; the matching [`PiMsg::ToolEnd`]
+    /// flips the LAST pending card with the same name in place.
+    fn push_tool_card(&mut self, name: &str) {
+        let text = sanitize(name).into_owned();
+        self.transcript.push(TranscriptEntry {
+            role: EntryRole::System,
+            text,
+            card: Some(CardState::Pending),
+        });
+    }
+
+    /// Close the last pending tool card named `name`, falling back to a
+    /// plain trace line when no matching open card exists.
+    fn finish_tool_card(&mut self, name: &str, ok: bool) {
+        let text = sanitize(name).into_owned();
+        if let Some(entry) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|e| e.card == Some(CardState::Pending) && e.text == text)
+        {
+            entry.card = Some(if ok { CardState::Ok } else { CardState::Err });
+            return;
+        }
+        let mark = if ok { "✓" } else { "✗" };
+        self.push_entry(EntryRole::System, format!("{mark} {text}"));
     }
 
     /// Cap for `scroll_from_tail`: can't scroll further up than the content.
@@ -605,14 +699,14 @@ impl PiFtuiModel {
                 self.thinking.push_str(&sanitize(&delta));
             }
             PiMsg::ToolStart { name, .. } => {
-                self.current_tool = Some(sanitize(&name).into_owned());
+                let name = sanitize(&name).into_owned();
+                self.current_tool = Some(name.clone());
+                self.push_tool_card(&name);
             }
             PiMsg::ToolEnd { name, is_error, .. } => {
-                // Durable trace: one line per tool run (the full collapsible
-                // tool cards of the bubbletea stack come with the view port).
-                let mark = if is_error { "✗" } else { "✓" };
-                let text = format!("{mark} {}", sanitize(&name));
-                self.push_entry(EntryRole::System, text);
+                // The tool card flips to its terminal state in place
+                // (state-tinted seed of the bd-cv653.9.2 card framework).
+                self.finish_tool_card(&name, !is_error);
                 self.current_tool = None;
             }
             PiMsg::TodoSummary { summary } => {
@@ -1308,28 +1402,12 @@ impl PiFtuiModel {
         let palette = self.palette;
         let mut lines: Vec<ftui::text::Line<'static>> =
             Vec::with_capacity(self.conversation_line_count());
-        let mut push_block = |role: EntryRole, content: &str| {
-            if role == EntryRole::Assistant {
-                let rendered = md.render(content);
-                lines.extend(rendered.lines().iter().cloned());
-                return;
-            }
-            let style = role.style(&palette);
-            let prefix = role.prefix();
-            let indent = " ".repeat(prefix.chars().count());
-            for (i, line) in content.lines().enumerate() {
-                let lead = if i == 0 { prefix } else { indent.as_str() };
-                let mut rendered = String::with_capacity(lead.len() + line.len());
-                rendered.push_str(lead);
-                rendered.push_str(line);
-                lines.push(ftui::text::Line::styled(rendered, style));
-            }
-            if content.is_empty() {
-                lines.push(ftui::text::Line::styled(prefix.to_string(), style));
-            }
-        };
         for entry in &self.transcript {
-            push_block(entry.role, &entry.text);
+            if let Some(state) = entry.card {
+                push_card_line(&mut lines, state, &entry.text, &palette);
+                continue;
+            }
+            push_role_block(&mut lines, entry.role, &entry.text, &palette, &md);
         }
         if !self.streaming.is_empty() {
             // Streaming fragments may end mid-construct; the streaming
