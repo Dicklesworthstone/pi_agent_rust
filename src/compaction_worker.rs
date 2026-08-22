@@ -415,10 +415,14 @@ async fn run_compaction_task(
         &api_key,
         custom_instructions.as_deref(),
     ))
-    .catch_unwind()
-    .fuse();
-
+    .catch_unwind();
     futures::pin_mut!(abort_fut, compaction_fut);
+
+    // bd-ajg8l #3: panics inside background compaction are recovered here,
+    // so suppress crash-bundle capture while this future is polled. The
+    // guard lives across the await; thread-local suppression applies on the
+    // polling thread.
+    let _panic_guard = pi::crash::SuppressPanicHook::new();
 
     match futures::future::select(abort_fut, compaction_fut).await {
         futures::future::Either::Left((abort_result, _)) => abort_result,
