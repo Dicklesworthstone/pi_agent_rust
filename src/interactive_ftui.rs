@@ -549,12 +549,12 @@ fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
         .constraints([
-            Constraint::Fixed(1),          // header
-            Constraint::Fill,              // conversation body
+            Constraint::Fixed(1),           // header
+            Constraint::Fill,               // conversation body
             Constraint::Fixed(banner_rows), // pinned error banner (0 = none)
-            Constraint::Fixed(1),          // status line (tool/todo/messages)
-            Constraint::Fixed(input_rows), // input editor
-            Constraint::Fixed(1),          // footer (usage)
+            Constraint::Fixed(1),           // status line (tool/todo/messages)
+            Constraint::Fixed(input_rows),  // input editor
+            Constraint::Fixed(1),           // footer (usage)
         ])
         .split(area);
     Regions {
@@ -1573,7 +1573,11 @@ impl Model for PiFtuiModel {
 
     fn view(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
-        let regions = layout_regions(area, self.input_rows());
+        let regions = layout_regions(
+            area,
+            self.input_rows(),
+            u16::from(self.error_banner.is_some()),
+        );
 
         // Header: identity + agent state.
         let header = format!("pi · {}", self.state.label());
@@ -1627,6 +1631,16 @@ impl Model for PiFtuiModel {
             .scroll((offset_u16, 0))
             .render(regions.body, frame);
 
+        // Pinned error banner (bd-cv653.9.2): sits between the conversation
+        // and the status line until the next sent input dismisses it.
+        if let Some(banner) = &self.error_banner {
+            let banner_style = ftui::Style::new().bold().fg(self.palette.error);
+            Paragraph::new(Text::from_lines([ftui::text::Line::styled(
+                format!("✗ {banner}"),
+                banner_style,
+            )]))
+            .render(regions.banner, frame);
+        }
         // Status region. While working: spinner + activity (tool > thinking >
         // responding). While idle: the todo summary.
         let status_line = if self.state == AgentUiState::Working {
