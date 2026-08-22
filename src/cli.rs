@@ -597,6 +597,11 @@ pub struct Cli {
     pub add_dir: Vec<std::path::PathBuf>,
     // === Export & Listing ===
     /// Export session file to HTML
+
+    /// Inject an intentional panic to verify the crash-bundle pipeline
+    /// (bd-cv653.7.12). Hidden smoke hook.
+    #[arg(long, hide = true)]
+    pub crash_test: bool,
     #[arg(long)]
     pub export: Option<String>,
 

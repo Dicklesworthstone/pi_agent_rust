@@ -432,6 +432,16 @@ fn main_impl() -> Result<()> {
     // Named themes (without .json, /, ~) are validated later after resource loading.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     validate_theme_path_spec(cli.theme.as_deref(), &cwd)?;
+
+    // Crash capture (bd-cv653.7.12): bundles land under the agent dir;
+    let crash_agent_dir = pi::config::Config::global_dir();
+    pi::crash::install(&crash_agent_dir, None);
+    let _ = pi::crash::emit_startup_notice(&crash_agent_dir);
+    if cli.crash_test {
+
+        pi::crash::record_operation("crash-test injected panic".to_string());
+        panic!("pi --crash-test: intentional panic for bundle verification");
+    }
     if cli.rpc && cli.mode.is_none() {
         cli.mode = Some("rpc".to_string());
     }
