@@ -51,6 +51,7 @@ pub enum Error {
     Json(#[from] Box<serde_json::Error>),
 
     /// SQLite errors
+    #[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
     #[error("SQLite error: {0}")]
     Sqlite(#[from] Box<sqlmodel_core::Error>),
 
@@ -216,7 +217,9 @@ impl Error {
     pub const fn hostcall_error_code(&self) -> &'static str {
         match self {
             Self::Validation(_) => "invalid_request",
-            Self::Io(_) | Self::Session(_) | Self::SessionNotFound { .. } | Self::Sqlite(_) => "io",
+            Self::Io(_) | Self::Session(_) | Self::SessionNotFound { .. } => "io",
+            #[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
+            Self::Sqlite(_) => "io",
             Self::Auth(_) => "denied",
             Self::Aborted => "timeout",
             Self::Json(_)
@@ -241,6 +244,7 @@ impl Error {
             Self::Extension(_) => "extension",
             Self::Io(_) => "io",
             Self::Json(_) => "json",
+            #[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
             Self::Sqlite(_) => "sqlite",
             Self::Aborted => "runtime",
             Self::Api(_) => "api",
@@ -302,6 +306,7 @@ impl Error {
                 ],
                 vec![("details", err.to_string())],
             ),
+            #[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
             Self::Sqlite(err) => sqlite_hints(err),
             Self::Aborted => build_hints(
                 "Operation aborted.",
@@ -859,6 +864,7 @@ fn io_hints(err: &std::io::Error) -> ErrorHints {
     }
 }
 
+#[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
 fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHints {
     let details = err.to_string();
     let lower = details.to_lowercase();
@@ -909,6 +915,7 @@ impl From<serde_json::Error> for Error {
     }
 }
 
+#[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
 impl From<sqlmodel_core::Error> for Error {
     fn from(value: sqlmodel_core::Error) -> Self {
         Self::Sqlite(Box::new(value))

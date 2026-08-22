@@ -13,6 +13,16 @@
 //! let _tools: Vec<ToolDefinition> = Vec::new();
 //! ```
 //!
+//! # JSONL-only embedding
+//!
+//! Compile Pi with `default-features = false` to exclude SQLite conversation
+//! storage and session indexing. Call [`create_agent_session_with_store`] with
+//! [`SessionStoreKind::Jsonl`] when persistence must be JSONL regardless of the
+//! user's global Pi configuration. Existing JSONL files can be resumed through
+//! [`SessionOptions::session_path`].
+//!
+//! The default feature composition remains intended for the standalone Pi CLI
+//! and includes its SQLite backend, index, and interactive session picker.
 //! Internal implementation types are intentionally not part of this surface.
 //!
 //! ```compile_fail
@@ -53,7 +63,7 @@ pub use crate::provider::{
     Context as ProviderContext, InputType, Model, ModelCost, Provider, StreamOptions,
     ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
-pub use crate::session::Session;
+pub use crate::session::{Session, SessionStoreKind};
 pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 
 /// Stable alias for model-exposed tool schema definitions.
@@ -1647,8 +1657,28 @@ fn build_stream_options_with_optional_key(
 ///
 /// This is the programmatic entrypoint for non-CLI consumers that want to run
 /// Pi sessions in-process.
-#[allow(clippy::too_many_lines)]
 pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessionHandle> {
+    create_agent_session_inner(options, None).await
+}
+
+/// Create an embeddable agent session with an explicit conversation store.
+///
+/// This overrides only conversation persistence for this SDK session. It does
+/// not mutate global Pi configuration, and selecting [`SessionStoreKind::Jsonl`]
+/// prevents an embedder from inheriting a user's global SQLite store setting.
+/// A JSONL path supplied through [`SessionOptions::session_path`] is opened and
+/// resumed normally.
+pub async fn create_agent_session_with_store(
+    options: SessionOptions,
+    store_kind: SessionStoreKind,
+) -> Result<AgentSessionHandle> {
+    create_agent_session_inner(options, Some(store_kind)).await
+}
+#[allow(clippy::too_many_lines)]
+async fn create_agent_session_inner(
+    options: SessionOptions,
+    store_kind_override: Option<SessionStoreKind>,
+) -> Result<AgentSessionHandle> {
     let process_cwd =
         std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
     let cwd = options.working_directory.as_deref().map_or_else(
@@ -1689,7 +1719,10 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         }
     }
 
-    let config = Config::load()?;
+    let mut config = Config::load()?;
+    if let Some(store_kind) = store_kind_override {
+        config.session_store = Some(store_kind.as_str().to_string());
+    }
 
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
@@ -2003,6 +2036,70 @@ mod tests {
         assert_eq!(header_cwd, sdk_cwd.path().display().to_string());
         assert_eq!(path.parent(), Some(expected_dir.as_path()));
         assert_ne!(path.parent(), Some(process_dir.as_path()));
+    }
+
+    #[cfg(not(feature = "session-index"))]
+    #[test]
+    fn explicit_jsonl_store_persists_and_resumes_via_sdk() {
+        let sdk_cwd = tempdir().expect("sdk cwd");
+        let session_root = tempdir().expect("session root");
+        let base_options = SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(sdk_cwd.path().to_path_buf()),
+            no_session: false,
+            session_dir: Some(session_root.path().to_path_buf()),
+            ..SessionOptions::default()
+        };
+
+        let handle = run_async(create_agent_session_with_store(
+            base_options.clone(),
+            SessionStoreKind::Jsonl,
+        ))
+        .expect("create explicit JSONL session");
+        let (path, session_id) = run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut guard = handle
+                .session()
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("lock session");
+            guard.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text("persisted through SDK".to_string()),
+                timestamp: Some(0),
+            });
+            guard.save().await.expect("save explicit JSONL session");
+            (
+                guard.path.clone().expect("saved session path"),
+                guard.header.id.clone(),
+            )
+        });
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl"));
+
+        let resumed = run_async(create_agent_session_with_store(
+            SessionOptions {
+                session_path: Some(path),
+                ..base_options
+            },
+            SessionStoreKind::Jsonl,
+        ))
+        .expect("resume explicit JSONL session");
+        let (resumed_id, message_count) = run_async(async {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let guard = resumed
+                .session()
+                .session
+                .lock(cx.cx())
+                .await
+                .expect("lock resumed session");
+            (guard.header.id.clone(), guard.to_messages().len())
+        });
+
+        assert_eq!(resumed_id, session_id);
+        assert_eq!(message_count, 1);
+        assert!(!session_root.path().join("session-index.sqlite").exists());
     }
 
     #[test]

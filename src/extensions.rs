@@ -4,6 +4,7 @@
 //! validation utilities plus a minimal WASM host scaffold.
 
 use crate::agent::AgentEvent;
+use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::connectors::Connector;
 use crate::connectors::http::HttpConnector;
@@ -16182,7 +16183,7 @@ fn cx_with_deadline(timeout_ms: u64) -> Cx {
         deadline: Some(wall_now() + Duration::from_millis(timeout_ms)),
         ..Budget::INFINITE
     };
-    Cx::for_request_with_budget(budget)
+    AgentCx::for_request_with_budget(budget).cx().clone()
 }
 
 /// Event names for the extension lifecycle.
@@ -18907,7 +18908,7 @@ impl JsExtensionRuntimeHandle {
                 .build()
                 .expect("extension runtime build");
             runtime.block_on(async move {
-                let cx = Cx::for_request();
+                let cx = AgentCx::for_request().cx().clone();
                 let runtime_config = config.clone();
                 let warm_pool = crate::extensions_js::WarmIsolatePool::new(runtime_config.clone());
                 let cold_init_started = Instant::now();
@@ -19356,7 +19357,7 @@ impl JsExtensionRuntimeHandle {
             });
         });
 
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request().cx().clone();
         init_rx
             .recv(&cx)
             .await
@@ -19374,7 +19375,7 @@ impl JsExtensionRuntimeHandle {
     /// to exit its event loop.  Returns `true` if the runtime exited
     /// within the budget.
     pub async fn shutdown(&self, budget: Duration) -> bool {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request().cx().clone();
         let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
 
         // Send shutdown command (ignore error if channel already closed).
@@ -19907,7 +19908,7 @@ impl JsExtensionRuntimeHandle {
                     return;
                 };
                 runtime.block_on(async move {
-                    let cx = Cx::for_request();
+                    let cx = AgentCx::for_request().cx().clone();
                     let _ = sender
                         .send(
                             &cx,
@@ -26900,9 +26901,9 @@ impl ExtensionManager {
         let budget = self.budget();
         if budget.deadline.is_some() || budget.poll_quota < u32::MAX || budget.cost_quota.is_some()
         {
-            Cx::for_request_with_budget(budget)
+            AgentCx::for_request_with_budget(budget).cx().clone()
         } else {
-            Cx::for_request()
+            AgentCx::for_request().cx().clone()
         }
     }
 
@@ -30337,7 +30338,7 @@ impl ExtensionManager {
         &self,
         mut request: ExtensionUiRequest,
     ) -> Result<Option<ExtensionUiResponse>> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request().cx().clone();
         if request.id.trim().is_empty() {
             request.id = Uuid::new_v4().to_string();
         }
@@ -30406,7 +30407,7 @@ impl ExtensionManager {
     }
 
     pub fn respond_ui(&self, response: ExtensionUiResponse) -> bool {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request().cx().clone();
         let tx = {
             let mut guard = self
                 .inner

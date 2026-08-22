@@ -142,7 +142,7 @@ where
 {
     let mut future = Box::pin(future);
     std::future::poll_fn(move |poll_cx| {
-        let _guard = asupersync::Cx::set_current(Some(current_cx.clone()));
+        let _guard = current_cx.clone().set_current_restricted();
         future.as_mut().poll(poll_cx)
     })
 }
@@ -4767,7 +4767,7 @@ async fn run_bash_rpc(
     let _stderr_handle = std::thread::spawn(move || pump_bash_rpc_stream(stderr, tx, "stderr"));
 
     let tick = Duration::from_millis(10);
-    let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
+    let cx = AgentCx::for_current_or_request();
 
     // Bounded buffer state (same logic as BashTool)
     let mut chunks: VecDeque<Vec<u8>> = VecDeque::new();

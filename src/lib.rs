@@ -87,6 +87,7 @@ pub mod conformance_shapes;
 pub mod connectors;
 #[doc(hidden)]
 pub mod crypto_shim;
+#[cfg(feature = "session-index")]
 #[doc(hidden)]
 pub mod doctor;
 #[doc(hidden)]
@@ -141,6 +142,7 @@ pub mod hostcall_trace_jit;
 pub mod http;
 #[doc(hidden)]
 pub mod http_shim;
+#[cfg(feature = "tui")]
 #[doc(hidden)]
 pub mod interactive;
 #[doc(hidden)]
@@ -186,10 +188,12 @@ pub mod semantic_workspace_graph;
 #[doc(hidden)]
 pub mod session;
 #[doc(hidden)]
+#[cfg(feature = "session-index")]
 pub mod session_index;
 #[doc(hidden)]
 pub mod session_metrics;
 #[doc(hidden)]
+#[cfg(all(feature = "session-index", feature = "tui"))]
 pub mod session_picker;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]

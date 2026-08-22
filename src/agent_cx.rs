@@ -40,29 +40,42 @@ impl AgentCx {
     /// point that needs to create a fresh request context.
     #[must_use]
     pub fn for_current_or_request() -> Self {
-        Self {
-            cx: Cx::current().unwrap_or_else(Cx::for_request),
-        }
+        #[cfg(any(test, feature = "tui"))]
+        let cx = Cx::current().unwrap_or_else(Cx::for_request);
+        #[cfg(not(any(test, feature = "tui")))]
+        let cx = Cx::current()
+            .expect("embedded Pi operations require an ambient asupersync runtime context");
+        Self { cx }
     }
 
     /// Create a request-scoped context (infinite budget).
     #[must_use]
     pub fn for_request() -> Self {
-        Self {
-            cx: Cx::for_request(),
-        }
+        #[cfg(any(test, feature = "tui"))]
+        let cx = Cx::for_request();
+        #[cfg(not(any(test, feature = "tui")))]
+        let cx = Cx::current()
+            .expect("embedded Pi operations require an ambient asupersync runtime context");
+        Self { cx }
     }
 
     /// Create a request-scoped context with an explicit budget.
     #[must_use]
     pub fn for_request_with_budget(budget: Budget) -> Self {
-        Self {
-            cx: Cx::for_request_with_budget(budget),
-        }
+        #[cfg(any(test, feature = "tui"))]
+        let cx = Cx::for_request_with_budget(budget);
+        #[cfg(not(any(test, feature = "tui")))]
+        let cx = {
+            let _ = budget;
+            Cx::current()
+                .expect("embedded Pi operations require an ambient asupersync runtime context")
+        };
+        Self { cx }
     }
 
     /// Create a test-only context (infinite budget).
     #[must_use]
+    #[cfg(any(test, feature = "tui"))]
     pub fn for_testing() -> Self {
         Self {
             cx: Cx::for_testing(),
@@ -71,6 +84,7 @@ impl AgentCx {
 
     /// Create a test-only context with lab I/O capability.
     #[must_use]
+    #[cfg(any(test, feature = "tui"))]
     pub fn for_testing_with_io() -> Self {
         Self {
             cx: Cx::for_testing_with_io(),

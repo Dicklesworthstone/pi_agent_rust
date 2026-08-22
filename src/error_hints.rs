@@ -41,6 +41,7 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
         Error::Extension(msg) => extension_hints(msg),
         Error::Io(err) => io_hints(err),
         Error::Json(err) => json_hints(err),
+        #[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
         Error::Sqlite(err) => sqlite_hints(err),
         Error::Aborted => aborted_hints(),
         Error::Api(msg) => api_hints(msg),
@@ -422,6 +423,7 @@ fn json_hints(err: &serde_json::Error) -> ErrorHint {
     }
 }
 
+#[cfg(any(feature = "session-index", feature = "sqlite-sessions"))]
 fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHint {
     let message = err.to_string();
     if message.contains("locked") {

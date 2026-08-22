@@ -13,11 +13,12 @@ use crate::model::{
     UserMessage,
 };
 use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
+#[cfg(feature = "session-index")]
 use crate::session_index::{
-    SessionIndex, SessionIndexRefreshSummary, enqueue_session_index_snapshot_update,
-    is_session_file_path, session_file_stats,
+    SessionIndex, enqueue_session_index_snapshot_update, is_session_file_path, session_file_stats,
 };
 use crate::session_store_v2::{self, SessionStoreV2};
+#[cfg(feature = "session-index")]
 use crate::tui::PiConsole;
 use asupersync::channel::oneshot;
 use asupersync::sync::Mutex;
@@ -28,13 +29,15 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::io::{BufReader, IsTerminal, Read, Write};
+#[cfg(feature = "session-index")]
+use std::io::IsTerminal;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Instant;
-#[cfg(test)]
+#[cfg(all(test, feature = "session-index"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
@@ -149,17 +152,22 @@ fn save_jsonl_full_rewrite_blocking(
         .persist(path)
         .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
     sync_parent_dir(path).map_err(|e| crate::Error::Io(Box::new(e)))?;
-    let mut entries_for_stats = entries_to_write.clone();
-    let finalized = finalize_loaded_entries(&mut entries_for_stats);
-    let message_count = finalized.message_count;
-    let session_name = finalized.name;
-    enqueue_session_index_snapshot_update(
-        sessions_root,
-        path,
-        &header_to_write,
-        message_count,
-        session_name,
-    );
+    #[cfg(feature = "session-index")]
+    {
+        let mut entries_for_stats = entries_to_write.clone();
+        let finalized = finalize_loaded_entries(&mut entries_for_stats);
+        let message_count = finalized.message_count;
+        let session_name = finalized.name;
+        enqueue_session_index_snapshot_update(
+            sessions_root,
+            path,
+            &header_to_write,
+            message_count,
+            session_name,
+        );
+    }
+    #[cfg(not(feature = "session-index"))]
+    let _ = sessions_root;
     Ok((header_to_write, entries_to_write))
 }
 
@@ -179,7 +187,10 @@ fn append_jsonl_entries_blocking(
     file.write_all(serialized_entries)?;
     file.sync_all().map_err(|e| crate::Error::Io(Box::new(e)))?;
 
+    #[cfg(feature = "session-index")]
     enqueue_session_index_snapshot_update(sessions_root, path, header, message_count, session_name);
+    #[cfg(not(feature = "session-index"))]
+    let _ = (sessions_root, header, message_count, session_name);
     Ok(())
 }
 
@@ -553,6 +564,16 @@ pub enum SessionStoreKind {
 }
 
 impl SessionStoreKind {
+    /// Stable configuration value for this conversation store.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Jsonl => "jsonl",
+            #[cfg(feature = "sqlite-sessions")]
+            Self::Sqlite => "sqlite",
+        }
+    }
+
     fn from_config(config: &Config) -> Self {
         let Some(value) = config.session_store.as_deref() else {
             return Self::Jsonl;
@@ -1019,7 +1040,7 @@ pub struct SessionColdStartPhaseTrace {
 }
 
 /// Incremental session-index refresh summary.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionColdStartIndexRefreshTrace {
     pub scanned_files: usize,
     pub cache_hit_files: usize,
@@ -1281,24 +1302,39 @@ impl Session {
         }
 
         if cli.resume {
-            let picker_input_override = config
-                .session_picker_input
-                .filter(|value| *value > 0)
-                .map(|value| value.to_string());
-            let mut session = Box::pin(Self::resume_with_picker(
-                session_dir.as_deref(),
-                config,
-                picker_input_override,
-            ))
-            .await?;
-            session.set_autosave_durability_mode(durability_mode);
-            return Ok(session);
+            #[cfg(feature = "session-index")]
+            {
+                let picker_input_override = config
+                    .session_picker_input
+                    .filter(|value| *value > 0)
+                    .map(|value| value.to_string());
+                let mut session = Box::pin(Self::resume_with_picker(
+                    session_dir.as_deref(),
+                    config,
+                    picker_input_override,
+                ))
+                .await?;
+                session.set_autosave_durability_mode(durability_mode);
+                return Ok(session);
+            }
+            #[cfg(not(feature = "session-index"))]
+            return Err(Error::session(
+                "Session picker requires the `session-index` feature",
+            ));
         }
 
         if cli.r#continue {
-            let mut session = Self::continue_recent_in_dir(session_dir.as_deref(), config).await?;
-            session.set_autosave_durability_mode(durability_mode);
-            return Ok(session);
+            #[cfg(feature = "session-index")]
+            {
+                let mut session =
+                    Self::continue_recent_in_dir(session_dir.as_deref(), config).await?;
+                session.set_autosave_durability_mode(durability_mode);
+                return Ok(session);
+            }
+            #[cfg(not(feature = "session-index"))]
+            return Err(Error::session(
+                "Recent-session lookup requires the `session-index` feature",
+            ));
         }
 
         let store_kind = SessionStoreKind::from_config(config);
@@ -1311,6 +1347,7 @@ impl Session {
 
     /// Resume a session by prompting the user to select from recent sessions.
     #[allow(clippy::too_many_lines)]
+    #[cfg(feature = "session-index")]
     pub async fn resume_with_picker(
         override_dir: Option<&Path>,
         config: &Config,
@@ -1575,6 +1612,8 @@ impl Session {
         path: &Path,
         sessions_root: &Path,
     ) -> Result<SessionColdStartTraceBundle> {
+        #[cfg(not(feature = "session-index"))]
+        let _ = sessions_root;
         let total_start = Instant::now();
         let mut phases = Vec::with_capacity(4);
         let mut storage = session_cold_start_storage_trace(path);
@@ -1589,21 +1628,30 @@ impl Session {
             status: "ok".to_string(),
         });
 
-        let index_start = Instant::now();
-        let index_summary = SessionIndex::for_sessions_root(sessions_root).refresh_incremental()?;
-        phases.push(SessionColdStartPhaseTrace {
-            name: "session_index_refresh".to_string(),
-            elapsed_us: elapsed_us_since(index_start),
-            status: "ok".to_string(),
-        });
-        let index_refresh = SessionColdStartIndexRefreshTrace {
-            scanned_files: index_summary.scanned_files,
-            cache_hit_files: index_summary.reused_files,
-            reused_files: index_summary.reused_files,
-            refreshed_files: index_summary.refreshed_files,
-            pruned_rows: index_summary.pruned_rows,
-            failed_files: index_summary.failed_files,
+        #[cfg(feature = "session-index")]
+        let (index_refresh, indexed_files_scanned) = {
+            let index_start = Instant::now();
+            let index_summary =
+                SessionIndex::for_sessions_root(sessions_root).refresh_incremental()?;
+            phases.push(SessionColdStartPhaseTrace {
+                name: "session_index_refresh".to_string(),
+                elapsed_us: elapsed_us_since(index_start),
+                status: "ok".to_string(),
+            });
+            (
+                SessionColdStartIndexRefreshTrace {
+                    scanned_files: index_summary.scanned_files,
+                    cache_hit_files: index_summary.reused_files,
+                    reused_files: index_summary.reused_files,
+                    refreshed_files: index_summary.refreshed_files,
+                    pruned_rows: index_summary.pruned_rows,
+                    failed_files: index_summary.failed_files,
+                },
+                index_summary.scanned_files,
+            )
         };
+        #[cfg(not(feature = "session-index"))]
+        let (index_refresh, indexed_files_scanned) = (Default::default(), 0);
 
         let compaction_start = Instant::now();
         let compaction_scan = session.cold_start_compaction_scan_trace();
@@ -1621,8 +1669,11 @@ impl Session {
             status: "ok".to_string(),
         });
 
-        let replay_minimization =
-            session.cold_start_replay_minimization_trace(&storage, &index_summary, &diagnostics);
+        let replay_minimization = session.cold_start_replay_minimization_trace(
+            &storage,
+            indexed_files_scanned,
+            &diagnostics,
+        );
 
         let bundle = SessionColdStartTraceBundle {
             schema: SESSION_COLD_START_TRACE_SCHEMA.to_string(),
@@ -1756,7 +1807,7 @@ impl Session {
     fn cold_start_replay_minimization_trace(
         &self,
         storage: &SessionColdStartStorageTrace,
-        index_summary: &SessionIndexRefreshSummary,
+        indexed_files_scanned: usize,
         diagnostics: &SessionOpenDiagnostics,
     ) -> SessionReplayMinimizationTrace {
         let path_entries = self.cold_start_current_path_entries();
@@ -1775,7 +1826,7 @@ impl Session {
         let (entry_count, branch_count) = self.cold_start_total_entries_and_branch_count();
         let skipped_sibling_entries = entry_count.saturating_sub(selected_depth);
         let deterministic_steps = selected_depth
-            .saturating_add(index_summary.scanned_files)
+            .saturating_add(indexed_files_scanned)
             .saturating_add(diagnostics.skipped_entries.len())
             .saturating_add(diagnostics.orphaned_parent_links.len());
         let opened_backend = storage.opened_backend.as_str();
@@ -1819,7 +1870,7 @@ impl Session {
             branch_count,
             entry_count,
             selected_depth,
-            scanned_files: index_summary.scanned_files,
+            scanned_files: indexed_files_scanned,
             replayed_entries,
             skipped_sibling_entries,
             deterministic_steps,
@@ -2012,14 +2063,14 @@ impl Session {
     async fn open_v2_with_diagnostics(path: &Path) -> Result<(Self, SessionOpenDiagnostics)> {
         let path_buf = path.to_path_buf();
         let (tx, mut rx) = oneshot::channel();
+        let cx = AgentCx::for_request();
+        let worker_cx = cx.cx().clone();
 
         let handle = thread::spawn(move || {
             let res = crate::session::open_from_v2_store_blocking(path_buf);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
+            let _ = tx.send(&worker_cx, res);
         });
 
-        let cx = AgentCx::for_request();
         let recv_result = rx.recv(cx.cx()).await;
         finish_worker_result(handle, recv_result, "V2 open task cancelled")
     }
@@ -2027,14 +2078,14 @@ impl Session {
     async fn open_jsonl_with_diagnostics(path: &Path) -> Result<(Self, SessionOpenDiagnostics)> {
         let path_buf = path.to_path_buf();
         let (tx, mut rx) = oneshot::channel();
+        let cx = AgentCx::for_request();
+        let worker_cx = cx.cx().clone();
 
         let handle = thread::spawn(move || {
             let res = open_jsonl_blocking(path_buf);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
+            let _ = tx.send(&worker_cx, res);
         });
 
-        let cx = AgentCx::for_request();
         let recv_result = rx.recv(cx.cx()).await;
         finish_worker_result(handle, recv_result, "Open task cancelled")
     }
@@ -2075,6 +2126,7 @@ impl Session {
     }
 
     /// Continue the most recent session.
+    #[cfg(feature = "session-index")]
     pub async fn continue_recent_in_dir(
         override_dir: Option<&Path>,
         config: &Config,
@@ -2592,14 +2644,17 @@ impl Session {
                     // No new entries → no-op, nothing to write.
                 }
 
-                let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
-                enqueue_session_index_snapshot_update(
-                    &sessions_root,
-                    &path_clone,
-                    &self.header,
-                    message_count,
-                    session_name,
-                );
+                #[cfg(feature = "session-index")]
+                {
+                    let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
+                    enqueue_session_index_snapshot_update(
+                        &sessions_root,
+                        &path_clone,
+                        &self.header,
+                        message_count,
+                        session_name,
+                    );
+                }
             }
         }
         Ok(())
@@ -3646,6 +3701,7 @@ pub struct SiblingBranch {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(feature = "session-index")]
 struct SessionPickEntry {
     path: PathBuf,
     id: String,
@@ -3657,6 +3713,7 @@ struct SessionPickEntry {
     size_bytes: u64,
 }
 
+#[cfg(feature = "session-index")]
 impl SessionPickEntry {
     fn from_meta(meta: crate::session_index::SessionMeta) -> Self {
         Self {
@@ -3685,6 +3742,7 @@ impl SessionPickEntry {
     }
 }
 
+#[cfg(feature = "session-index")]
 fn indexed_session_path_is_missing(path: &Path) -> bool {
     match path.try_exists() {
         Ok(exists) => !exists,
@@ -3699,6 +3757,7 @@ fn indexed_session_path_is_missing(path: &Path) -> bool {
     }
 }
 
+#[cfg(feature = "session-index")]
 fn split_indexed_session_entries(
     metas: Vec<crate::session_index::SessionMeta>,
 ) -> (Vec<SessionPickEntry>, Vec<PathBuf>) {
@@ -3718,6 +3777,7 @@ fn split_indexed_session_entries(
     (entries, missing_paths)
 }
 
+#[cfg(feature = "session-index")]
 fn prune_session_index_path(index: &SessionIndex, path: &Path, reason: &'static str) {
     if let Err(err) = index.delete_session_path(path) {
         tracing::warn!(
@@ -3729,18 +3789,21 @@ fn prune_session_index_path(index: &SessionIndex, path: &Path, reason: &'static 
     }
 }
 
+#[cfg(feature = "session-index")]
 fn can_reuse_known_entry(known_entry: &SessionPickEntry, disk_ms: i64, disk_size: u64) -> bool {
     (known_entry.last_modified_ms, known_entry.size_bytes)
         .cmp(&(disk_ms, disk_size))
         .is_eq()
 }
 
+#[cfg(feature = "session-index")]
 struct ScanSessionsResult {
     entries: Vec<SessionPickEntry>,
     refreshed_entries: Vec<SessionPickEntry>,
     failed_paths: Vec<PathBuf>,
 }
 
+#[cfg(feature = "session-index")]
 fn refresh_session_index_entries(
     index: &SessionIndex,
     entries: &[SessionPickEntry],
@@ -3758,6 +3821,7 @@ fn refresh_session_index_entries(
     }
 }
 
+#[cfg(feature = "session-index")]
 fn merge_scanned_session_entries(
     by_path: &mut HashMap<PathBuf, SessionPickEntry>,
     entries: Vec<SessionPickEntry>,
@@ -3770,6 +3834,7 @@ fn merge_scanned_session_entries(
     }
 }
 
+#[cfg(feature = "session-index")]
 async fn scan_sessions_on_disk(
     project_session_dir: &Path,
     known: Vec<SessionPickEntry>,
@@ -3831,6 +3896,7 @@ async fn scan_sessions_on_disk(
     finish_worker_result(handle, recv_result, "Scan task cancelled")
 }
 
+#[cfg(feature = "session-index")]
 fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("jsonl") => load_session_meta_jsonl(path),
@@ -3844,6 +3910,7 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
 }
 
 #[derive(Deserialize)]
+#[cfg(feature = "session-index")]
 struct PartialEntry {
     #[serde(default)]
     r#type: String,
@@ -3851,6 +3918,7 @@ struct PartialEntry {
     name: Option<String>,
 }
 
+#[cfg(feature = "session-index")]
 fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
     let file = std::fs::File::open(path)
         .map_err(|e| Error::session(format!("Failed to read session: {e}")))?;
@@ -3902,6 +3970,7 @@ fn load_session_meta_jsonl(path: &Path) -> Result<SessionPickEntry> {
 }
 
 #[cfg(feature = "sqlite-sessions")]
+#[cfg(feature = "session-index")]
 fn load_session_meta_sqlite(path: &Path) -> Result<SessionPickEntry> {
     let meta = futures::executor::block_on(async {
         crate::session_sqlite::load_session_meta(path).await
@@ -7031,6 +7100,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_lines)]
+    #[cfg(feature = "session-index")]
     #[test]
     fn cold_start_replay_minimization_bounds_branch_heavy_v2_resume() {
         const FORKS: usize = 700;
@@ -7314,6 +7384,32 @@ mod tests {
         assert!(types.contains(&"session_info".to_string()));
     }
 
+    #[cfg(not(feature = "session-index"))]
+    #[test]
+    fn jsonl_persistence_resumes_without_session_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("before resume"));
+
+        run_async(async { session.save().await }).expect("save JSONL session");
+        let path = session.path.clone().expect("saved JSONL path");
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("jsonl"));
+        assert!(!temp.path().join("session-index.sqlite").exists());
+
+        let path_string = path.to_string_lossy().into_owned();
+        let mut resumed =
+            run_async(async { Session::open(&path_string).await }).expect("resume JSONL session");
+        assert_eq!(resumed.to_messages().len(), 1);
+        resumed.append_message(make_test_message("after resume"));
+        run_async(async { resumed.save().await }).expect("save resumed JSONL session");
+
+        let reopened =
+            run_async(async { Session::open(&path_string).await }).expect("reopen JSONL session");
+        assert_eq!(reopened.to_messages().len(), 2);
+        assert!(!temp.path().join("session-index.sqlite").exists());
+    }
+
+    #[cfg(feature = "session-index")]
     #[test]
     fn cold_start_trace_bundle_is_bounded_redacted_and_cache_aware() {
         let temp = tempdir_under_tmpdir("pi-session-cold-start-");
@@ -9089,6 +9185,7 @@ mod tests {
         assert_ne!(path.parent(), Some(process_dir.as_path()));
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_can_reuse_known_entry_requires_matching_mtime_and_size() {
         let known_entry = SessionPickEntry {
@@ -9145,6 +9242,7 @@ mod tests {
         assert_eq!(next_line, "y\n");
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_scan_sessions_on_disk_ignores_stale_known_entry_when_size_mismatch() {
         let temp = tempfile::tempdir().unwrap();
@@ -9187,6 +9285,7 @@ mod tests {
         assert_eq!(scanned.entries[0].size_bytes, disk_size);
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_merge_scanned_session_entries_replaces_cached_entry_when_size_changes() {
         let path = PathBuf::from("session.jsonl");
@@ -9224,6 +9323,7 @@ mod tests {
         assert_eq!(merged.size_bytes, 8192);
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_merge_scanned_session_entries_replaces_cached_entry_even_if_disk_mtime_regresses() {
         let path = PathBuf::from("session.jsonl");
@@ -9262,6 +9362,7 @@ mod tests {
         assert_eq!(merged.size_bytes, 2048);
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_scan_sessions_on_disk_reports_failed_paths_for_corrupt_changed_session() {
         let temp = tempfile::tempdir().unwrap();
@@ -9304,6 +9405,7 @@ mod tests {
         assert_eq!(scanned.failed_paths, vec![path]);
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_continue_recent_in_dir_prunes_corrupt_stale_index_entry() {
         let _lock = current_dir_lock();
@@ -9353,6 +9455,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_continue_recent_in_dir_prunes_missing_stale_index_entry() {
         let _lock = current_dir_lock();
@@ -9402,6 +9505,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_continue_recent_in_dir_prunes_index_when_project_dir_is_missing() {
         let _lock = current_dir_lock();
@@ -9445,6 +9549,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "session-index")]
     #[cfg(unix)]
     #[test]
     fn split_indexed_session_entries_keeps_permission_denied_path_out_of_missing_bucket() {
@@ -9493,6 +9598,7 @@ mod tests {
         assert_eq!(entries[0].path, session_path);
     }
 
+    #[cfg(feature = "session-index")]
     #[cfg(unix)]
     #[test]
     fn test_continue_recent_in_dir_prunes_unreadable_cached_entry_on_open_failure() {
@@ -9543,6 +9649,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_continue_recent_in_dir_refreshes_index_after_changed_disk_session() {
         let _lock = current_dir_lock();
@@ -9585,6 +9692,7 @@ mod tests {
         assert_eq!(indexed[0].name.as_deref(), Some("Refreshed"));
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_resume_with_picker_refreshes_index_after_changed_disk_session() {
         let _lock = current_dir_lock();
@@ -9632,6 +9740,7 @@ mod tests {
         assert_eq!(indexed[0].name.as_deref(), Some("Refreshed"));
     }
 
+    #[cfg(feature = "session-index")]
     #[test]
     fn test_load_session_meta_jsonl_errors_on_invalid_utf8_entry_line() {
         use std::io::Write;
@@ -9670,7 +9779,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "sqlite-sessions")]
+    #[cfg(all(feature = "sqlite-sessions", feature = "session-index"))]
     #[test]
     fn test_scan_sessions_on_disk_reloads_sqlite_when_wal_stats_change() {
         let temp = tempfile::tempdir().unwrap();
@@ -9716,7 +9825,7 @@ mod tests {
         assert_eq!(scanned.entries[0].last_modified_ms, updated_ms);
     }
 
-    #[cfg(feature = "sqlite-sessions")]
+    #[cfg(all(feature = "sqlite-sessions", feature = "session-index"))]
     #[test]
     fn test_load_session_meta_sqlite_uses_wal_aware_stats() {
         let temp = tempfile::tempdir().unwrap();

@@ -41,6 +41,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "pi"
 path = "src/main.rs"
+required-features = ["tui"]
 
 # RETIRABLE binary (pending RULE 1 approval)
 # Legacy capture functionality - 91KB, last modified 2026-03-12
@@ -150,7 +151,7 @@ clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 clap_complete = "4.5.66"
 
 # Async runtime
-asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
+asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots"] }
 futures = "0.3"
 async-trait = "0.1"
 
@@ -190,8 +191,8 @@ fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
 crossbeam-queue = "0.3"
-sqlmodel-sqlite = { version = "0.2.2" }
-sqlmodel-core = { version = "0.2.2" }
+sqlmodel-sqlite = { version = "0.2.2", optional = true }
+sqlmodel-core = { version = "0.2.2", optional = true }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -304,20 +305,32 @@ rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 
 [features]
-default = ["sqlite-sessions"]
+default = ["sqlite-sessions", "session-index", "tui"]
 full = [
     "image-resize",
     "jemalloc",
     "clipboard",
     "wasm-host",
     "sqlite-sessions",
+    "session-index",
     "syntax-highlighting",
+    "tui",
     "rich_rust/full",
 ]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 wasm-host = ["dep:wasmtime"]
-sqlite-sessions = []
+# SQLite conversation persistence. Keep its complete SQLModel dependency set
+# here so embedders can select JSONL without inheriting any SQLite packages.
+sqlite-sessions = ["dep:sqlmodel-core", "dep:sqlmodel-sqlite"]
+# Derived SQLite metadata index used by Pi's session picker and recent-session
+# lookup. This is independent from the conversation storage backend.
+session-index = ["dep:sqlmodel-core", "dep:sqlmodel-sqlite"]
+# The interactive CLI owns the picker and therefore requires session indexing.
+# SDK/library consumers can omit all three default features for JSONL-only use.
+# Standalone Pi retains its legacy detached context constructors. Embedded
+# runtimes use the ambient context installed by asupersync::Runtime::block_on.
+tui = ["session-index", "asupersync/test-internals"]
 syntax-highlighting = ["rich_rust/syntax"]
 ext-conformance = []
 fuzzing = []
