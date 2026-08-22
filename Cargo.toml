@@ -275,6 +275,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Utilities
 uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
+signal-hook = "0.4.4"
 base64 = "0.23"
 flate2 = "1.1.9"
 sha2 = "0.11"
@@ -350,7 +351,6 @@ toml = "1.0.3"
 # which overflows before these hostcall models can begin exploring. The exact
 # revision is immutable and remains test-only until upstream publishes it.
 loom = { version = "0.7.2", git = "https://github.com/ongardie-atomix/loom", rev = "2b7c402034cc041b5e325384c67bb43bff93c048" }
-signal-hook = "0.4.4"
 
 [[bench]]
 name = "tools"
