@@ -2,9 +2,9 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::session::{Session, SessionEntry, SessionHeader};
+use crate::session::{Session, SessionEntry, SessionHeader, SessionMessage};
 use crate::session_sqlite::{SqliteConnection, run_on_sqlite_thread};
-use fsqlite::SqliteValue as Value;
+use fsqlite::{compat::RowExt, SqliteValue as Value};
 use serde::Deserialize;
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
@@ -150,10 +150,9 @@ impl SessionIndex {
                 },
                 |cwd| {
                     (
-                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
-                         FROM sessions WHERE cwd=?1 ORDER BY last_modified_ms DESC",
-                        vec![Value::from(cwd.to_string())],
-                    )
+"SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name,first_message,parent_session_path,modified_ms
+                         FROM sessions WHERE cwd=?1 ORDER BY modified_ms DESC",
+                        vec![Value::from(cwd.to_string())],                    )
                 },
             );
 
@@ -514,7 +513,7 @@ fn init_schema(conn: &SqliteConnection) -> Result<()> {
             .query_sync("PRAGMA table_info(sessions)", &[])
             .map_err(|e| Error::session(format!("PRAGMA table_info: {e}")))?;
         let col_exists = rows.iter().any(|row| {
-            row.get_named::<String>("name")
+            row.get_typed::<String>(7)
                 .map(|n| n == col)
                 .unwrap_or(false)
         });
@@ -561,7 +560,9 @@ fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
             Value::from(meta.last_modified_ms),
             Value::from(size_bytes),
             meta.name.map_or(Value::Null, Value::from),
-        ],
+            Value::from(meta.first_message),
+            meta.parent_session_path.map_or(Value::Null, Value::from),
+            Value::from(meta.modified_ms),        ],
     )
     .map_err(|e| Error::session(format!("Insert failed: {e}")))?;
     Ok(())
@@ -631,7 +632,17 @@ fn row_to_meta(row: &fsqlite::Row) -> Result<SessionMeta> {
                 )));
             }
         },
-    })
+        first_message: row
+            .get_typed::<Option<String>>(8)
+            .map_err(|e| Error::session(format!("get first_message: {e}")))?
+            .unwrap_or_else(|| "(no messages)".to_string()),
+        parent_session_path: row
+            .get_typed::<Option<String>>(9)
+            .map_err(|e| Error::session(format!("get parent_session_path: {e}")))?,
+        modified_ms: row
+            .get_typed::<Option<i64>>(10)
+            .map_err(|e| Error::session(format!("get modified_ms: {e}")))?
+            .unwrap_or(0),    })
 }
 
 /// modified = 最后消息活动时间;无活动回退 header 时间戳,再回退文件 mtime。
@@ -790,10 +801,11 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
 
     let mut message_count = 0u64;
     let mut name = None;
+    let mut first_message: Option<String> = None;
+    let mut max_activity_ms: Option<i64> = None;
     while let Some(line_buf) = read_capped_utf8_line(&mut reader).map_err(|err| {
         Error::session(format!("Read session entry line {}: {err}", path.display()))
-    })? {
-        if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_buf) {
+    })? {        if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_buf) {
             match entry.r#type.as_str() {
                 "message" => {
                     message_count += 1;
@@ -2696,7 +2708,7 @@ mod tests {
                                 Value::from(row.last_modified_ms),
                                 Value::from(row.size_bytes),
                                 row.name.clone().map_or(Value::Null, Value::from),
-                            ],
+                                Value::from("(no messages)".to_string()),                            ],
                         )
                         .map_err(|err| Error::session(format!("insert session row {idx}: {err}")))?;
                     }

@@ -463,15 +463,15 @@ impl OpenAIProvider {
         // into `high` itself, so we only emit the values it documents and let
         // `off` request the explicit non-thinking path. Both `xhigh` and `max`
         // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
-        // when the first-class `max` level was added; gh #139). A catalog
-        // `thinkingLevelMap` overrides the emitted `reasoning_effort` value for
-        // enabled levels (gh #117/#165), matching the anthropic-messages and
-        // openai-responses transports; `off` never emits an effort.
-        let (thinking, reasoning_effort) = match self.reasoning_style() {
+        // when the first-class `max` level was added; gh #139).
+        // 对齐 TS thinkingFormat 方言:DeepSeek / Z.ai(二进制 thinking)/
+        // Qwen(`enable_thinking: bool`);非方言推理模型经 `reasoning_effort`;
+        // catalog `thinkingLevelMap` 覆盖启用的档位(gh #117/#165),`off` 不发 effort。
+        let level = options.thinking_level.unwrap_or_default();
+        let (thinking, reasoning_effort, enable_thinking) = match self.reasoning_style() {
             Some(ReasoningStyle::DeepSeek) => {
-                let level = options.thinking_level.unwrap_or_default();
                 if level == ThinkingLevel::Off {
-                    (Some(OpenAIThinking { kind: "disabled" }), None)
+                    (Some(OpenAIThinking { kind: "disabled" }), None, None)
                 } else {
                     let mapped = self
                         .compat
@@ -487,11 +487,23 @@ impl OpenAIProvider {
                         | ThinkingLevel::Low
                         | ThinkingLevel::Medium => None,
                     });
-                    (Some(OpenAIThinking { kind: "enabled" }), effort)
+                    (Some(OpenAIThinking { kind: "enabled" }), effort, None)
                 }
             }
-            None => (None, None),
-        };
+            Some(ReasoningStyle::Zai) => {
+                // 对齐 TS:`thinking: {type: "enabled" | "disabled"}`(off → disabled)。
+                let kind = if level == ThinkingLevel::Off {
+                    "disabled"
+                } else {
+                    "enabled"
+                };
+                (Some(OpenAIThinking { kind }), None, None)
+            }
+            Some(ReasoningStyle::Qwen) => {
+                // 对齐 TS:`enable_thinking: !!options?.reasoningEffort`(off → false)。
+                (None, None, Some(level != ThinkingLevel::Off))
+            }
+            None => (None, None, None),        };
 
         OpenAIRequest {
             model: &self.model,
@@ -1610,7 +1622,9 @@ pub struct OpenAIRequest<'a> {
     /// compat config) is sent verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
-}
+    /// Qwen-only `enable_thinking: bool`(对齐 TS `thinkingFormat === "qwen"`)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,}
 
 #[derive(Debug, Serialize)]
 struct OpenAIStreamOptions {

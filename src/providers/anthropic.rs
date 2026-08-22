@@ -71,7 +71,11 @@ const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
 /// actually carries a `ttl: "1h"` cache breakpoint (first-party API + `Long`
 /// retention); relays commonly reject both the flag and the `ttl` field.
 const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
-const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
+
+/// 对齐 TS betaFeatures:无条件发送;`interleaved-thinking` 在 TS 默认开启
+/// (`options?.interleavedThinking ?? true`),Rust 无对应选项,故恒含。
+const ANTHROPIC_STREAMING_BETA_FLAGS: &str =
+    "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14";const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
     std::env::var("PI_ANTHROPIC_BETA_FLAGS")
@@ -522,7 +526,11 @@ impl AnthropicProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> AnthropicRequest<'a> {
-        let mut messages: Vec<AnthropicMessage<'_>> = context
+        // 对齐 TS `isOAuthToken(apiKey)`:OAuth token 触发隐身模式(Claude Code 身份/工具名/头)。
+        let is_oauth_token = options
+            .api_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("sk-ant-oat"));        let mut messages: Vec<AnthropicMessage<'_>> = context
             .messages
             .iter()
             .map(|m| convert_message_to_anthropic(m, is_oauth_token))
@@ -544,13 +552,12 @@ impl AnthropicProvider {
             let mut tools: Vec<AnthropicTool<'_>> = context
                 .tools
                 .iter()
-                .map(convert_tool_to_anthropic)
+                .map(|t| convert_tool_to_anthropic(t, is_oauth_token))
                 .collect();
             if let Some(last) = tools.last_mut() {
                 last.cache_control = cache_control;
             }
-            Some(tools)
-        };
+            Some(tools)        };
 
         // Decide between the modern adaptive-thinking API and the legacy
         // fixed-budget extended-thinking API. Catalog metadata
@@ -653,11 +660,13 @@ impl AnthropicProvider {
         // (UTF-8 不产生孤立代理对)。
         let system = if is_oauth_token {
             let mut blocks = vec![AnthropicSystemBlock {
+                r#type: "text",
                 text: "You are Claude Code, Anthropic's official CLI for Claude.",
                 cache_control: cache_control.clone(),
             }];
             if let Some(prompt) = context.system_prompt.as_deref() {
                 blocks.push(AnthropicSystemBlock {
+                    r#type: "text",
                     text: prompt,
                     cache_control: cache_control.clone(),
                 });
@@ -667,7 +676,9 @@ impl AnthropicProvider {
             context
                 .system_prompt
                 .as_deref()
+                .filter(|prompt| !prompt.is_empty())
                 .map(|prompt| vec![AnthropicSystemBlock {
+                    r#type: "text",
                     text: prompt,
                     cache_control: cache_control.clone(),
                 }])
@@ -689,22 +700,7 @@ impl AnthropicProvider {
         AnthropicRequest {
             model: &self.model,
             messages,
-            // An empty system prompt must be omitted entirely: as a bare
-            // string it was tolerated, but a `{"type":"text","text":""}`
-            // block is rejected by the API (min length 1). pi-mono's falsy
-            // check (`context.systemPrompt &&`) skips it the same way.
-            system: context
-                .system_prompt
-                .as_deref()
-                .filter(|text| !text.is_empty())
-                .map(|text| {
-                    vec![AnthropicSystemBlock {
-                        r#type: "text",
-                        text,
-                        cache_control,
-                    }]
-                }),
-            max_tokens,
+            system,            max_tokens,
             temperature,
             tools,
             stream: true,
@@ -819,10 +815,10 @@ impl Provider for AnthropicProvider {
         // sent iff a marker would carry `ttl: "1h"`. (A degenerate request
         // with no system prompt, no tools, and no markable trailing user
         // block sends the flags without any marker — a harmless no-op.)
+        beta_flags.push(ANTHROPIC_STREAMING_BETA_FLAGS.to_string());
         if let Some(cache_control) =
             anthropic_cache_control_for(options.cache_retention, &self.base_url)
-        {
-            beta_flags.push(anthropic_cache_beta_flag());
+        {            beta_flags.push(anthropic_cache_beta_flag());
             if cache_control.ttl.is_some() {
                 beta_flags.push(ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG.to_string());
             }
@@ -1340,23 +1336,6 @@ pub struct AnthropicRequest<'a> {
     output_config: Option<AnthropicOutputConfig>,
 }
 
-/// 对齐 TS `cache_control: { type: "ephemeral", ttl?: "1h" }`。
-/// `ttl:"1h"` 仅在 `retention==="long"` 且 base_url 含 `api.anthropic.com` 时附加。
-#[derive(Debug, Serialize, Clone, PartialEq)]
-struct AnthropicCacheControl {
-    r#type: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ttl: Option<&'static str>,
-}
-
-/// `system` 数组的一个文本 block(可携带 cache_control)。
-#[derive(Debug, Serialize, PartialEq)]
-struct AnthropicSystemBlock<'a> {
-    text: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    cache_control: Option<AnthropicCacheControl>,
-}
-
 /// Thinking configuration. Two shapes share this struct:
 /// - Legacy fixed-budget extended thinking: `{"type":"enabled","budget_tokens":N}`.
 /// - Modern adaptive thinking: `{"type":"adaptive","display":"summarized"}`.
@@ -1393,8 +1372,7 @@ enum AnthropicContent<'a> {
     Text {
         text: &'a str,
         /// Prompt-cache breakpoint for incremental conversation caching.
-        /// Set only on the final block of the last user-role message.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Set only on the final block of the last user-role message.        #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
     Thinking {
@@ -1667,8 +1645,7 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
                 ContentBlock::Text(t) => Some(AnthropicContent::Text {
                     text: &t.text,
                     cache_control: None,
-                }),
-                ContentBlock::Image(img) => Some(AnthropicContent::Image {
+                }),                ContentBlock::Image(img) => Some(AnthropicContent::Image {
                     source: AnthropicImageSource {
                         r#type: "base64",
                         media_type: &img.mime_type,
@@ -1690,8 +1667,7 @@ fn convert_content_block_to_anthropic(
         ContentBlock::Text(t) => Some(AnthropicContent::Text {
             text: &t.text,
             cache_control: None,
-        }),
-        ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
+        }),        ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
             id: &tc.id,
             // 对齐 TS:OAuth 时 assistant tool_use 名映射为 CC 规范大小写。
             name: if is_oauth_token {
@@ -1736,8 +1712,7 @@ fn is_foreign_reasoning_signature(signature: &str) -> bool {
     signature.trim_start().starts_with('{')
 }
 
-fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
-    AnthropicTool {
+fn convert_tool_to_anthropic(tool: &ToolDef, is_oauth_token: bool) -> AnthropicTool<'_> {    AnthropicTool {
         // 对齐 TS:OAuth 时工具名映射为 CC 规范大小写。
         name: if is_oauth_token {
             to_claude_code_name(&tool.name)
@@ -1881,12 +1856,10 @@ mod tests {
 
         let request = provider.build_request(&context, &options);
         assert_eq!(request.model, "claude-test");
-        let system = request.system.as_ref().expect("system blocks");
+        let system = request.system.expect("system array");
         assert_eq!(system.len(), 1);
         assert_eq!(system[0].r#type, "text");
-        assert_eq!(system[0].text, "System prompt");
-        // Default retention is None: no cache breakpoint on the system block.
-        assert!(system[0].cache_control.is_none());
+        assert_eq!(system[0].text, "System prompt");        assert!(system[0].cache_control.is_none());
         assert_eq!(request.temperature, Some(1.0)); // thinking forces temperature to 1.0
         assert!(request.stream);
         assert_eq!(request.max_tokens, 13_096);
