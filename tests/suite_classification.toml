@@ -308,6 +308,7 @@ files = [
 
 [suite.e2e]
 files = [
+    "agent_hub",
     "e2e_agent_loop",
     "e2e_ast_tools",
     "e2e_auto_repair",
