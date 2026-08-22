@@ -63,7 +63,7 @@ pub struct Finding {
 /// Fingerprint a finding from its stable identity parts. Line numbers are
 /// excluded so edits above a finding don't churn its disposition.
 #[must_use]
-pub fn fingerprint(rule_id: &str, path: &str, matched_text: &str) -> String {
+pub fn fingerprint(rule_id: &str, path: &str, matched_text: &str, occurrence: usize) -> String {
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(rule_id.as_bytes());
@@ -71,6 +71,11 @@ pub fn fingerprint(rule_id: &str, path: &str, matched_text: &str) -> String {
     hasher.update(path.as_bytes());
     hasher.update(b"\0");
     hasher.update(matched_text.as_bytes());
+    // Occurrence ordinal (per identical match within one file): without it,
+    // two different private keys in a file share one fingerprint and a
+    // single false-positive disposition would silently suppress both.
+    hasher.update(b"\0");
+    hasher.update(occurrence.to_le_bytes());
     let digest = hasher.finalize();
     digest[..8]
         .iter()
@@ -214,9 +219,52 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
+/// A rule compiled for scanning: regex, optional glob scope, multi-line flag.
+struct CompiledRule {
+    rule: Rule,
+    regex: regex::Regex,
+    applies_to: Option<globset::GlobSet>,
+    multi_line: bool,
+}
+
+impl CompiledRule {
+    fn build(rule: &Rule) -> Result<Self> {
+        let regex = regex::Regex::new(&rule.pattern)
+            .map_err(|e| Error::validation(format!("rule {} pattern invalid: {e}", rule.id)))?;
+        // Validate the severity vocabulary at load: an unknown severity
+        // would count as "active" while appearing in no summary bucket.
+        if !matches!(rule.severity.as_str(), "error" | "warning" | "note") {
+            return Err(Error::validation(format!(
+                "rule {} has invalid severity {:?}; expected error, warning, or note",
+                rule.id, rule.severity
+            )));
+        }
+        let applies_to = if rule.applies_to.is_empty() {
+            None
+        } else {
+            let mut builder = globset::GlobSetBuilder::new();
+            for glob in &rule.applies_to {
+                builder.add(globset::Glob::new(glob).map_err(|e| {
+                    Error::validation(format!("rule {} glob {glob:?} invalid: {e}", rule.id))
+                })?);
+            }
+            Some(builder.build().map_err(|e| {
+                Error::validation(format!("rule {} applies_to globs: {e}", rule.id))
+            })?)
+        };
+        let multi_line = rule.pattern.contains("(?s)") || rule.pattern.contains("(?s");
+        Ok(Self {
+            rule: rule.clone(),
+            regex,
+            applies_to,
+            multi_line,
+        })
+    }
+}
+
 /// Run compiled rules over one file, returning findings with paths relative
 /// to `cwd`. Binary/undecodable files are skipped.
-fn scan_file(cwd: &Path, path: &Path, rules: &[(Rule, regex::Regex)], findings: &mut Vec<Finding>) {
+fn scan_file(cwd: &Path, path: &Path, rules: &[CompiledRule], findings: &mut Vec<Finding>) {
     let Ok(content) = fs::read_to_string(path) else {
         return; // binary or unreadable — regex packs only scan text
     };
@@ -224,28 +272,47 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[(Rule, regex::Regex)], findings: 
         .strip_prefix(cwd)
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf);
     let rel_display = rel.display().to_string();
-    for (rule, re) in rules {
-        if !rule.applies_to.is_empty() {
+    // Per (rule, matched-text) occurrence counter within this file, so
+    // identical matches get distinct fingerprints.
+    let mut occurrences: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut push = |rule: &Rule, line_no: usize, matched: &str, out: &mut Vec<Finding>| {
+        let counter = occurrences
+            .entry((rule.id.clone(), matched.to_string()))
+            .or_insert(0);
+        let occurrence = *counter;
+        *counter += 1;
+        out.push(Finding {
+            rule_id: rule.id.clone(),
+            severity: rule.severity.clone(),
+            message: rule.message.clone(),
+            path: rel_display.clone(),
+            line: u32::try_from(line_no).unwrap_or(u32::MAX),
+            fingerprint: fingerprint(&rule.id, &rel_display, matched, occurrence),
+            fix_hint: rule.fix_hint.clone(),
+        });
+    };
+    for compiled in rules {
+        if let Some(globs) = &compiled.applies_to {
             let name = rel.file_name().map_or("", |n| n.to_str().unwrap_or(""));
-            let matches_glob = rule.applies_to.iter().any(|glob| {
-                glob.trim_start_matches("*.") == name.rsplit('.').next().unwrap_or("")
-                    || name == glob
-            });
-            if !matches_glob {
+            // Match both the relative path (`src/*.rs` style globs) and the
+            // bare file name (`*.rs`, `Dockerfile*` style globs).
+            if !globs.is_match(&rel) && !globs.is_match(name) {
                 continue;
             }
         }
-        for (idx, line) in content.lines().enumerate() {
-            if let Some(m) = re.find(line) {
-                findings.push(Finding {
-                    rule_id: rule.id.clone(),
-                    severity: rule.severity.clone(),
-                    message: rule.message.clone(),
-                    path: rel_display.clone(),
-                    line: u32::try_from(idx + 1).unwrap_or(u32::MAX),
-                    fingerprint: fingerprint(&rule.id, &rel_display, m.as_str()),
-                    fix_hint: rule.fix_hint.clone(),
-                });
+        if compiled.multi_line {
+            // `(?s)` rules span lines: match the whole file and derive the
+            // line from the match offset (line-based iteration can never
+            // fire these — a silent false-negative factory).
+            for m in compiled.regex.find_iter(&content) {
+                let line_no = content[..m.start()].matches('\n').count() + 1;
+                push(&compiled.rule, line_no, m.as_str(), findings);
+            }
+        } else {
+            for (idx, line) in content.lines().enumerate() {
+                for m in compiled.regex.find_iter(line) {
+                    push(&compiled.rule, idx + 1, m.as_str(), findings);
+                }
             }
         }
     }
@@ -256,12 +323,10 @@ fn scan_file(cwd: &Path, path: &Path, rules: &[(Rule, regex::Regex)], findings: 
 /// factory).
 pub fn run_scan(cwd: &Path, paths: &[String]) -> Result<Vec<Finding>> {
     let packs = load_rule_packs(cwd)?;
-    let mut compiled: Vec<(Rule, regex::Regex)> = Vec::new();
+    let mut compiled: Vec<CompiledRule> = Vec::new();
     for pack in &packs {
         for rule in &pack.rules {
-            let re = regex::Regex::new(&rule.pattern)
-                .map_err(|e| Error::validation(format!("rule {} pattern invalid: {e}", rule.id)))?;
-            compiled.push((rule.clone(), re));
+            compiled.push(CompiledRule::build(rule)?);
         }
     }
     let mut findings = Vec::new();
@@ -656,15 +721,22 @@ impl Tool for SecurityScanTool {
         let parsed: ScanInput = serde_json::from_value(input)
             .map_err(|e| Error::validation(format!("security_scan input: {e}")))?;
         let op = parsed.op.trim().to_ascii_lowercase();
-        match op.as_str() {
-            "plan" => self.op_plan(&parsed),
-            "run" => self.op_run(&parsed),
-            "disposition" => self.op_disposition(&parsed),
-            "compare" => self.op_compare(&parsed),
+        // plan/run/compare walk and read the whole scope synchronously —
+        // off the async runtime so a large repo doesn't stall the agent
+        // loop mid-scan.
+        let tool = Self {
+            cwd: self.cwd.clone(),
+        };
+        asupersync::runtime::spawn_blocking(move || match op.as_str() {
+            "plan" => tool.op_plan(&parsed),
+            "run" => tool.op_run(&parsed),
+            "disposition" => tool.op_disposition(&parsed),
+            "compare" => tool.op_compare(&parsed),
             other => Err(Error::validation(format!(
                 "Unknown security_scan op '{other}'; expected plan, run, disposition, or compare"
             ))),
-        }
+        })
+        .await
     }
 }
 
@@ -822,7 +894,23 @@ impl SecurityScanTool {
                 format!("read baseline {}: {e}", baseline_path.display()),
             )
         })?;
-        let previous = findings_from_sarif(&text);
+        let mut previous = findings_from_sarif(&text);
+        // Scope-narrowed compare: baseline findings outside the requested
+        // paths are invisible to the current scan and would all read as
+        // "fixed". Restrict the baseline to the same scope.
+        if !input.paths.is_empty() {
+            let scope: Vec<String> = input
+                .paths
+                .iter()
+                .map(|p| p.trim_end_matches('/').to_string())
+                .collect();
+            previous.retain(|finding| {
+                scope.iter().any(|prefix| {
+                    finding.path == *prefix
+                        || finding.path.starts_with(&format!("{prefix}/"))
+                })
+            });
+        }
         let current = run_scan(&self.cwd, &input.paths)?;
         let dispositions = load_dispositions(&self.cwd)?;
         let report = compare(&previous, &current, &dispositions);
@@ -871,11 +959,15 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_line_independent() {
-        let a = fingerprint("rule.x", "src/a.rs", "matched");
-        let b = fingerprint("rule.x", "src/a.rs", "matched");
-        let c = fingerprint("rule.x", "src/b.rs", "matched");
+        let a = fingerprint("rule.x", "src/a.rs", "matched", 0);
+        let b = fingerprint("rule.x", "src/a.rs", "matched", 0);
+        let c = fingerprint("rule.x", "src/b.rs", "matched", 0);
+        // Same match text, different occurrence → distinct fingerprint (a
+        // disposition on one private key must not suppress a second one).
+        let d = fingerprint("rule.x", "src/a.rs", "matched", 1);
         assert_eq!(a, b);
         assert_ne!(a, c);
+        assert_ne!(a, d);
         assert_eq!(a.len(), 16);
     }
 
@@ -953,6 +1045,7 @@ mod tests {
                 "secret.aws-access-key",
                 "src/main.rs",
                 concat!("AKIA", "IOSFODNN7EXAMPLE"),
+                0,
             ),
             fix_hint: None,
         };
