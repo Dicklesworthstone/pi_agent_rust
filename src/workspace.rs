@@ -45,11 +45,14 @@ impl PartialEq for WorkspaceHandle {
 }
 
 impl WorkspaceHandle {
-    /// The single-root handle for a session cwd.
+    /// The single-root handle for a session cwd. The primary is stored in
+    /// canonical form so every containment/dedup comparison is
+    /// canonical-vs-canonical (on macOS `/var/...` vs `/private/var/...`
+    /// would otherwise never match).
     #[must_use]
     pub fn single(cwd: &Path) -> Self {
         Self {
-            primary: Some(cwd.to_path_buf()),
+            primary: Some(safe_canonicalize(cwd)),
             additional: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -209,10 +212,11 @@ pub fn validate_new_root(root: &Path) -> Result<PathBuf> {
     Ok(safe_canonicalize(root))
 }
 /// THE unified confinement gate (bd-cv653.3.12): a canonical path must sit
-/// under one of the allowed roots; named refusal otherwise.
+/// under one of the allowed roots.
 ///
-/// Callers must symlink-resolve (`safe_canonicalize`) both the path and each
-/// root before calling so escapes via symlinks cannot pass the prefix test.
+/// Named refusal otherwise. Callers must symlink-resolve
+/// (`safe_canonicalize`) both the path and each root before calling so
+/// escapes via symlinks cannot pass the prefix test.
 ///
 /// # Errors
 /// Tool error naming the offending path when outside every root.

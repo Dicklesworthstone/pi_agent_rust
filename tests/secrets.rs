@@ -5,7 +5,7 @@
 //!    placeholders, zero raw secrets (canary assertions).
 //! 2. Model echoes a placeholder into a write → file on disk gets the REAL
 //!    value; a bash echo of the value is masked in the tool result.
-//! 3. Block mode refuses the send with a named PI_SECRET_BLOCK error.
+//! 3. Block mode refuses the send with a named `PI_SECRET_BLOCK` error.
 //! 4. Session content contains placeholders only (the vault never persists
 //!    raw values — nothing to leak on export/share).
 //!
@@ -17,7 +17,7 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::agent::{Agent, AgentConfig};
-use pi::model::{Message, StreamEvent, UserContent, UserMessage};
+use pi::model::StreamEvent;
 use pi::provider::{Context, StreamOptions};
 use pi::secrets::SecretsSettings;
 use pi::tools::{ToolOutput, ToolRegistry};
@@ -99,7 +99,8 @@ impl pi::provider::Provider for CaptureProvider {
             payload.push('\n');
         }
         for message in context.messages.iter() {
-            payload.push_str(&format!("{message:?}")); // ubs:ignore capture loop in a stub provider
+            use std::fmt::Write as _;
+            let _ = write!(payload, "{message:?}"); // ubs:ignore capture loop in a stub provider
             payload.push('\n');
         }
         self.capture.lock().expect("capture").payloads.push(payload); // ubs:ignore test capture

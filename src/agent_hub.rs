@@ -129,8 +129,9 @@ fn now_ms() -> u64 {
 }
 
 impl AgentHubRegistry {
-    /// Override the artifacts directory (integration tests cannot reach the
-    /// private `dir` field; production callers rely on the lazy default).
+    /// Point the registry's artifacts dir at `dir` (integration-test hook:
+    /// keeps hub files out of the real `<global_dir>/agent-hub/` tree).
+    #[doc(hidden)]
     pub fn set_dir_for_tests(&mut self, dir: PathBuf) {
         self.dir = Some(dir);
     }

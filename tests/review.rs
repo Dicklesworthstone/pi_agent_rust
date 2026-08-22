@@ -4,7 +4,7 @@ use std::fs;
 use std::process::Command;
 use tempfile::tempdir;
 
-use pi::commit_split::{DiffHunk, DiffParser};
+use pi::commit_split::DiffParser;
 use pi::review::{
     CodeReviewer, REVIEW_SCHEMA, ReviewDeduplicator, ReviewFinding, ReviewOptions, ReviewReport,
     ReviewRuleEngine, ReviewSeverity, ReviewVerdict,

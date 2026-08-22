@@ -2244,8 +2244,6 @@ async fn run(
             .collect::<Vec<_>>();
         let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
 
-        // Boxed: the interactive-mode future is ~16 KiB on the stack
-        // (clippy::large_futures) — heap-pin it once at the entry point.
         Box::pin(run_interactive_mode(
             agent_session,
             initial,
@@ -5030,8 +5028,7 @@ fn handle_review(
 }
 
 /// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.
-// The bools mirror independent CLI flags one-to-one; a two-variant enum per
-// flag would just restate clap's parse.
+// The bools mirror independent `pi gc` CLI flags one-to-one.
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn handle_gc(
     older_than: &str,
