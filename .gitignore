@@ -226,8 +226,12 @@ src/bin/test_time.rs
 /fix_tools_write.rs
 
 # ACFS ephemeral patterns (auto-generated agent artifacts)
-core
-core.*
+# NOTE: a bare `core` pattern here used to swallow the vendored
+# legacy_pi_mono_code/.../src/core/ directory (the slash-differential
+# suite's pi-mono runner), so the pattern is anchored to the repo root.
+/core
+/core.*
+core.[0-9]*
 !src/extensions/tests/core.rs
 cline.mcp.json
 codex.mcp.json
