@@ -2100,6 +2100,31 @@ pub enum Commands {
         input: String,
     },
 
+    /// Aggregate local session usage: tokens/cost by provider, model, day;
+    /// tool-call frequency; compactions (bd-cv653.7.7). All local — no
+    /// network.
+    #[command(name = "stats")]
+    Stats {
+        /// Only entries at/after this RFC 3339 timestamp (day prefixes work)
+        #[arg(long)]
+        since: Option<String>,
+        /// Only entries at/before this RFC 3339 timestamp
+        #[arg(long)]
+        until: Option<String>,
+        /// Only sessions under project dirs whose name contains this text
+        #[arg(long)]
+        project: Option<String>,
+        /// Only assistant messages from this provider
+        #[arg(long)]
+        provider: Option<String>,
+        /// Only assistant messages from this model
+        #[arg(long)]
+        model: Option<String>,
+        /// Output format: text | json | markdown
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
+
     /// Import a foreign session into a native continuable pi session
     /// (bd-cv653.6.4): Claude Code or Codex JSONL.
     #[command(name = "import")]

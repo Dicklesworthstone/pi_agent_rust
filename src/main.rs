@@ -2396,6 +2396,23 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 message.as_deref(),
             )?;
         }
+        cli::Commands::Stats {
+            since,
+            until,
+            project,
+            provider,
+            model,
+            format,
+        } => {
+            handle_stats(
+                since,
+                until,
+                project.as_deref(),
+                provider,
+                model,
+                &format,
+            )?;
+        }
         cli::Commands::SelfUpdate { version, check } => {
             handle_self_update(version.as_deref(), check).await?;
         }
@@ -4658,6 +4675,39 @@ async fn handle_handoff(
     }
 
     println!("{}", report.status);
+    Ok(())
+}
+
+/// `pi stats [--since TS] [--until TS] [--project NAME] [--provider P]
+/// [--model M] [--format text|json|markdown]` (bd-cv653.7.7): aggregate
+/// local session usage. All data stays local — no network.
+fn handle_stats(
+    since: Option<String>,
+    until: Option<String>,
+    project: Option<&str>,
+    provider: Option<String>,
+    model: Option<String>,
+    format: &str,
+) -> Result<()> {
+    // Test/e2e seam (bd-cv653.7.7): lanes point this at a synthetic corpus.
+    let sessions_dir = std::env::var("PI_STATS_SESSIONS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| pi::config::Config::sessions_dir());
+    let files = pi::stats::collect_session_files(&sessions_dir, project);
+    let filter = pi::stats::StatsFilter {
+        since,
+        until,
+        provider,
+        model,
+    };
+    let report = pi::stats::aggregate(&files, &filter);
+    let rendered = match format {
+        "json" => serde_json::to_string_pretty(&report)
+            .map_err(|e| anyhow::anyhow!("stats serialization failed: {e}"))?,
+        "markdown" | "md" => pi::stats::render_markdown(&report),
+        _ => pi::stats::render_text(&report),
+    };
+    println!("{rendered}");
     Ok(())
 }
 
