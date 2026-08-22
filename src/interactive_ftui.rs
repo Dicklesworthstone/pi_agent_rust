@@ -470,6 +470,9 @@ pub struct PiFtuiModel {
     current_tool: Option<String>,
     /// Compact todo footer summary (`settled/total · current task`).
     todo_summary: Option<String>,
+    /// Pinned error banner above the editor (bd-cv653.9.2): set by
+    /// AgentError, dismissed on the next sent input.
+    error_banner: Option<String>,
     /// Sanitized in-flight thinking text (drives the `thinking…` status).
     thinking: String,
     /// Spinner animation state; advanced by `Event::Tick` while working.
@@ -527,6 +530,8 @@ pub struct PiFtuiModel {
 struct Regions {
     header: Rect,
     body: Rect,
+    /// Pinned error banner row (present only while an error is undissmissed).
+    banner: Rect,
     status: Rect,
     input: Rect,
     footer: Rect,
@@ -540,12 +545,13 @@ const FIXED_CHROME_ROWS: u16 = 3;
 /// The input editor grows with its content up to this many rows.
 const MAX_INPUT_ROWS: u16 = 5;
 
-fn layout_regions(area: Rect, input_rows: u16) -> Regions {
+fn layout_regions(area: Rect, input_rows: u16, banner_rows: u16) -> Regions {
     use ftui::layout::{Constraint, Flex};
     let rects = Flex::vertical()
         .constraints([
             Constraint::Fixed(1),          // header
             Constraint::Fill,              // conversation body
+            Constraint::Fixed(banner_rows), // pinned error banner (0 = none)
             Constraint::Fixed(1),          // status line (tool/todo/messages)
             Constraint::Fixed(input_rows), // input editor
             Constraint::Fixed(1),          // footer (usage)
@@ -554,9 +560,10 @@ fn layout_regions(area: Rect, input_rows: u16) -> Regions {
     Regions {
         header: rects[0],
         body: rects[1],
-        status: rects[2],
-        input: rects[3],
-        footer: rects[4],
+        banner: rects[2],
+        status: rects[3],
+        input: rects[4],
+        footer: rects[5],
     }
 }
 
@@ -568,6 +575,7 @@ impl PiFtuiModel {
             streaming: String::new(),
             current_tool: None,
             todo_summary: None,
+            error_banner: None,
             thinking: String::new(),
             spinner: SpinnerState::default(),
             usage_line: None,
@@ -651,10 +659,11 @@ impl PiFtuiModel {
 
     /// Visible conversation rows given the tracked terminal size.
     fn body_height(&self) -> usize {
+        let banner = u16::from(self.error_banner.is_some());
         usize::from(
             self.term
                 .1
-                .saturating_sub(FIXED_CHROME_ROWS + self.input_rows()),
+                .saturating_sub(FIXED_CHROME_ROWS + banner + self.input_rows()),
         )
         .max(1)
     }
@@ -815,8 +824,9 @@ impl PiFtuiModel {
                 self.thinking.clear();
             }
             PiMsg::AgentError(err) => {
-                let text = sanitize(&err).into_owned();
-                self.push_entry(EntryRole::Error, text);
+                // Pinned above the editor (bd-cv653.9.2), dismiss-on-send —
+                // not duplicated into the transcript.
+                self.error_banner = Some(sanitize(&err).into_owned());
                 self.state = AgentUiState::Ready;
                 self.current_tool = None;
                 self.thinking.clear();
@@ -949,6 +959,9 @@ impl PiFtuiModel {
         if trimmed.is_empty() {
             return;
         }
+        // Sending anything dismisses the pinned error banner
+        // (bd-cv653.9.2 dismiss-on-send semantics).
+        self.error_banner = None;
         // User input is the one text source the user typed themself, but it
         // still goes through sanitize: paste can smuggle control sequences.
         let clean = sanitize(trimmed).into_owned();
