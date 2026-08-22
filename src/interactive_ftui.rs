@@ -3690,4 +3690,81 @@ mod tests {
         sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
         assert!(sim.model().pending_quit, "uppercase /Q must quit");
     }
+
+    #[test]
+    fn tool_card_transitions_and_bash_detail_folding() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        // !bash flow: ToolStart opens a pending card, BashResult folds an
+        // 8-line-capped preview into it, ToolEnd flips it to Ok in place.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .and_then(|e| e.card.as_ref())
+                .is_some_and(|c| *c == CardState::Pending),
+            "ToolStart must open a pending card"
+        );
+        let output = "line-one\nline-two";
+        sim.send(PiFtuiMsg::Agent(PiMsg::BashResult {
+            display: format!("$ demo\n{output}"),
+            content_for_agent: None,
+        }));
+        let card = sim
+            .model()
+            .transcript
+            .iter()
+            .rev()
+            .find(|e| e.text == "bash")
+            .expect("bash card exists");
+        assert!(
+            card.detail
+                .as_deref()
+                .is_some_and(|d| d.contains("line-one") && d.contains("line-two")),
+            "BashResult must fold its preview into the pending card"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+            is_error: false,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.card == Some(CardState::Ok))
+        );
+        // An errored run opens and closes its own Err card.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "edit".into(),
+            tool_id: "t2".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "edit".into(),
+            tool_id: "t2".into(),
+            is_error: true,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.card == Some(CardState::Err))
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 16), 60, 16);
+        assert!(
+            rendered.contains("✓ bash"),
+            "ok glyph missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("✗ edit"),
+            "error glyph missing: {rendered:?}"
+        );
+        assert!(rendered.contains("line-one"), "folded detail missing");
+    }
 }
