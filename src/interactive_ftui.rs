@@ -1075,6 +1075,12 @@ impl PiFtuiModel {
     /// Remaining slash routing after `/model`.
     fn route_slash_command_tail(&mut self, clean: &str) -> bool {
         // Case-insensitive tokens (SlashCommand::parse parity): compare on
+        // an ASCII-lowercased copy; args keep their original case.
+        let canon = clean.to_ascii_lowercase();
+        if canon == "/exit" || canon == "/quit" || canon == "/q" {
+            self.pending_quit = true;
+            return true;
+        }
         if let Some(rest) = strip_command(clean, "/add-dir") {
             self.push_entry(
                 EntryRole::System,
@@ -1101,12 +1107,7 @@ impl PiFtuiModel {
             });
             return true;
         }
-        // an ASCII-lowercased copy; args keep their original case.
         let canon = clean.to_ascii_lowercase();
-        if canon == "/exit" || canon == "/quit" || canon == "/q" {
-            self.pending_quit = true;
-            return true;
-        }
         if canon == "/compact" {
             self.push_entry(
                 EntryRole::System,
@@ -2340,6 +2341,90 @@ async fn run_set_name_command(
     let _ = agent_tx.send(msg);
 }
 
+
+/// `/add-dir <dir>` driver (bd-cv653.3.12): validate + add on the shared
+/// workspace handle and persist the canonical set into the session header.
+async fn run_add_dir_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    dir: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    if dir.trim().is_empty() {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "usage: /add-dir <directory>",
+        )));
+        return;
+    }
+    let msg = match handle.add_workspace_root(dir).await {
+        Ok(status) => PiMsg::System(status),
+        Err(err) => PiMsg::AgentError(format!("add-dir: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
+/// `/remove-dir <dir>` driver (bd-cv653.3.12): revoke on the shared
+/// workspace handle — every tool holding a clone sees the removal on its
+/// next confinement check.
+async fn run_remove_dir_command(
+    handle: &mut crate::sdk::AgentSessionHandle,
+    dir: &str,
+    agent_tx: &Sender<PiMsg>,
+) {
+    if dir.trim().is_empty() {
+        let _ = agent_tx.send(PiMsg::AgentError(String::from(
+            "usage: /remove-dir <directory>",
+        )));
+        return;
+    }
+    let msg = match handle.remove_workspace_root(dir).await {
+        Ok(status) => PiMsg::System(status),
+        Err(err) => PiMsg::AgentError(format!("remove-dir: {err}")),
+    };
+    let _ = agent_tx.send(msg);
+}
+
+/// `/crash [list|show|delete]` driver (bd-cv653.7.12): inspect or clear
+/// redacted crash bundles under the agent dir. Nothing is transmitted.
+fn run_crash_command(action: &str, agent_tx: &Sender<PiMsg>) {
+    let agent_dir = crate::config::Config::global_dir();
+    let msg = match action {
+        "" | "list" => {
+            let bundles = pi::crash::list_bundles(&agent_dir);
+            if bundles.is_empty() {
+                PiMsg::System(String::from("No crash bundles recorded."))
+            } else {
+                PiMsg::System(
+                    bundles
+                        .iter()
+                        .map(|b| {
+                            format!(
+                                "{} {} {}{}",
+                                b.created_at,
+                                b.kind,
+                                b.dir.display(),
+                                if b.noticed { "" } else { " (new)" }
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            }
+        }
+        "show" => match pi::crash::show_latest(&agent_dir) {
+            Some(report) => PiMsg::System(report),
+            None => PiMsg::System(String::from("No crash bundles recorded.")),
+        },
+        "delete" => {
+            let removed = pi::crash::delete_all(&agent_dir);
+            PiMsg::System(format!("Deleted {removed} crash bundle(s)"))
+        }
+        other => PiMsg::AgentError(format!(
+            "usage: /crash [list|show|delete] (got: {other})"
+        )),
+    };
+    let _ = agent_tx.send(msg);
+}
+
 /// Handle `/undo` and `/redo` in the driver (bd-cv653.3.13): apply through
 /// the session agent's mutation recorder and report the shared outcome text.
 fn run_undo_command(
@@ -2597,6 +2682,15 @@ pub fn run(
                         }
                         Ok(UiCommand::Compact) => {
                             run_compact_command(&mut handle, &agent_tx).await;
+                        }
+                        Ok(UiCommand::AddDir { dir }) => {
+                            run_add_dir_command(&mut handle, &dir, &agent_tx).await;
+                        }
+                        Ok(UiCommand::RemoveDir { dir }) => {
+                            run_remove_dir_command(&mut handle, &dir, &agent_tx).await;
+                        }
+                        Ok(UiCommand::Crash { action }) => {
+                            run_crash_command(&action, &agent_tx);
                         }
                         Ok(UiCommand::Undo { count, force, redo }) => {
                             run_undo_command(&handle, count, force, redo, &agent_tx);
