@@ -512,8 +512,9 @@ fn init_schema(conn: &SqliteConnection) -> Result<()> {
         let rows = conn
             .query_sync("PRAGMA table_info(sessions)", &[])
             .map_err(|e| Error::session(format!("PRAGMA table_info: {e}")))?;
+        // PRAGMA table_info 列序:cid=0, name=1, type=2, …(name 在 1)
         let col_exists = rows.iter().any(|row| {
-            row.get_typed::<String>(7)
+            row.get_typed::<String>(1)
                 .map(|n| n == col)
                 .unwrap_or(false)
         });

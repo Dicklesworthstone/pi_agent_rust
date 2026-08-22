@@ -72,10 +72,10 @@ const ANTHROPIC_CACHE_BETA_FLAG: &str = "prompt-caching-2024-07-31";
 /// retention); relays commonly reject both the flag and the `ttl` field.
 const ANTHROPIC_EXTENDED_CACHE_TTL_BETA_FLAG: &str = "extended-cache-ttl-2025-04-11";
 
+
 /// 对齐 TS betaFeatures:无条件发送;`interleaved-thinking` 在 TS 默认开启
 /// (`options?.interleavedThinking ?? true`),Rust 无对应选项,故恒含。
-const ANTHROPIC_STREAMING_BETA_FLAGS: &str =
-    "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14";const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
+const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 
 fn anthropic_oauth_beta_flags() -> String {
     std::env::var("PI_ANTHROPIC_BETA_FLAGS")
@@ -805,7 +805,6 @@ impl Provider for AnthropicProvider {
         }
 
         let mut beta_flags: Vec<String> = Vec::new();
-        // 对齐 TS:streaming beta flags 无条件发送(OAuth 时在 oauth flags 之后)。
         if anthropic_bearer_token {
             beta_flags.push(anthropic_oauth_beta_flags());
         }
@@ -815,7 +814,6 @@ impl Provider for AnthropicProvider {
         // sent iff a marker would carry `ttl: "1h"`. (A degenerate request
         // with no system prompt, no tools, and no markable trailing user
         // block sends the flags without any marker — a harmless no-op.)
-        beta_flags.push(ANTHROPIC_STREAMING_BETA_FLAGS.to_string());
         if let Some(cache_control) =
             anthropic_cache_control_for(options.cache_retention, &self.base_url)
         {            beta_flags.push(anthropic_cache_beta_flag());
@@ -1372,7 +1370,8 @@ enum AnthropicContent<'a> {
     Text {
         text: &'a str,
         /// Prompt-cache breakpoint for incremental conversation caching.
-        /// Set only on the final block of the last user-role message.        #[serde(skip_serializing_if = "Option::is_none")]
+        /// Set only on the final block of the last user-role message.
+        #[serde(skip_serializing_if = "Option::is_none")]
         cache_control: Option<AnthropicCacheControl>,
     },
     Thinking {
@@ -1751,7 +1750,7 @@ mod tests {
             thinking: "step".to_string(),
             thinking_signature: Some("Cg8KDXNvbWViYXNlNjQ=".to_string()),
         });
-        match convert_content_block_to_anthropic(&native) {
+        match convert_content_block_to_anthropic(&native, false) {
             Some(AnthropicContent::Thinking { signature, .. }) => {
                 assert_eq!(signature, "Cg8KDXNvbWViYXNlNjQ=");
             }
@@ -1767,7 +1766,7 @@ mod tests {
             ),
         });
         assert!(
-            convert_content_block_to_anthropic(&foreign).is_none(),
+            convert_content_block_to_anthropic(&foreign, false).is_none(),
             "foreign JSON reasoning signature must be dropped, not echoed to Anthropic"
         );
 
@@ -2841,11 +2840,8 @@ mod tests {
                 .map(String::as_str),
             Some(ANTHROPIC_API_VERSION)
         );
-        // 对齐 TS:streaming beta flags 无条件发送。
-        assert_eq!(
-            captured.headers.get("anthropic-beta").map(String::as_str),
-            Some(ANTHROPIC_STREAMING_BETA_FLAGS)
-        );
+        // 上游契约:None retention 不发 anthropic-beta 头(缓存严格 opt-in)
+        assert!(!captured.headers.contains_key("anthropic-beta"));
         assert!(captured.body.contains("\"stream\":true"));
     }
 
@@ -2853,7 +2849,7 @@ mod tests {
     fn test_stream_adds_prompt_caching_beta_header_when_enabled() {
         let captured = run_stream_and_capture_headers(CacheRetention::Short)
             .expect("captured request for beta header");
-        let expected = format!("{ANTHROPIC_STREAMING_BETA_FLAGS},prompt-caching-2024-07-31");
+        let expected = "prompt-caching-2024-07-31".to_string();
         assert_eq!(
             captured.headers.get("anthropic-beta").map(String::as_str),
             Some(expected.as_str())
@@ -2962,10 +2958,8 @@ mod tests {
                 .contains_key("anthropic-dangerous-direct-browser-access")
         );
         // 对齐 TS:streaming beta flags 无条件发送(非 OAuth 亦含)。
-        assert_eq!(
-            captured.headers.get("anthropic-beta").map(String::as_str),
-            Some(ANTHROPIC_STREAMING_BETA_FLAGS)
-        );
+        // 上游契约:oauth beta flags 仅 Anthropic bearer;Kimi 无此头
+        assert!(!captured.headers.contains_key("anthropic-beta"));
         assert_eq!(
             captured.headers.get("x-msh-platform").map(String::as_str),
             Some("kimi_cli")
