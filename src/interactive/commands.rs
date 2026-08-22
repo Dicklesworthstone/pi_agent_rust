@@ -3115,8 +3115,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 return None;
             }
         };
-        let already =
-            self.workspace.snapshot_or(&self.cwd).contains_canonical(&canonical);
+        let already = self
+            .workspace
+            .snapshot_or(&self.cwd)
+            .contains_canonical(&canonical);
         if !already {
             self.workspace.add_root(&canonical);
         }
@@ -3156,8 +3158,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
         let canonical = crate::extensions::safe_canonicalize(std::path::Path::new(raw));
         if self.workspace.snapshot_or(&self.cwd).primary() == canonical.as_path() {
-            self.status_message =
-                Some("Cannot remove the primary working directory".to_string());
+            self.status_message = Some("Cannot remove the primary working directory".to_string());
             self.scroll_to_bottom();
             return None;
         }
@@ -3172,11 +3173,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             if let Ok(mut guard) = self.session.try_lock() {
                 guard.set_additional_roots(&remaining);
             }
-            self.status_message =
-                Some(format!("Workspace root removed: {}", canonical.display()));
+            self.status_message = Some(format!("Workspace root removed: {}", canonical.display()));
         } else {
-            self.status_message =
-                Some(format!("Not a workspace root: {}", canonical.display()));
+            self.status_message = Some(format!("Not a workspace root: {}", canonical.display()));
         }
         self.scroll_to_bottom();
         None
@@ -3233,8 +3232,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
             }
             other => {
-                self.status_message =
-                    Some(format!("Usage: /crash [show|delete] (got: {other})"));
+                self.status_message = Some(format!("Usage: /crash [show|delete] (got: {other})"));
                 self.scroll_to_bottom();
             }
         }

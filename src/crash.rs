@@ -150,7 +150,9 @@ fn stamp_for_dir() -> String {
 
 fn build_metadata() -> (String, String) {
     (
-        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown").to_string(),
+        option_env!("VERGEN_GIT_SHA")
+            .unwrap_or("unknown")
+            .to_string(),
         option_env!("VERGEN_BUILD_TIMESTAMP")
             .unwrap_or("unknown")
             .to_string(),
@@ -163,7 +165,11 @@ fn crashes_dir(agent_dir: &Path) -> PathBuf {
 
 /// Write a bundle directory and return its path.
 fn write_bundle(agent_dir: &Path, mut bundle: CrashBundle) -> Result<PathBuf, String> {
-    bundle.recent_operations = bundle.recent_operations.into_iter().map(|op| redact_text(&op)).collect();
+    bundle.recent_operations = bundle
+        .recent_operations
+        .into_iter()
+        .map(|op| redact_text(&op))
+        .collect();
     bundle.panic_message = bundle.panic_message.as_deref().map(redact_text);
     bundle.backtrace = bundle.backtrace.as_deref().map(redact_text);
 
@@ -171,8 +177,7 @@ fn write_bundle(agent_dir: &Path, mut bundle: CrashBundle) -> Result<PathBuf, St
     std::fs::create_dir_all(&dir).map_err(|e| format!("create crash dir: {e}"))?;
     let json =
         serde_json::to_string_pretty(&bundle).map_err(|e| format!("serialize bundle: {e}"))?;
-    std::fs::write(dir.join("bundle.json"), json)
-        .map_err(|e| format!("write bundle.json: {e}"))?;
+    std::fs::write(dir.join("bundle.json"), json).map_err(|e| format!("write bundle.json: {e}"))?;
     let mut report = std::fs::File::create(dir.join("report.txt"))
         .map_err(|e| format!("create report.txt: {e}"))?;
     let _ = report.write_all(bundle.render_report().as_bytes());
@@ -345,10 +350,8 @@ mod tests {
     use super::*;
 
     fn agent_dir(name: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "pi-crash-test-{}-{name}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("pi-crash-test-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("mkdir");
         base
@@ -368,12 +371,16 @@ mod tests {
         let bundle = CrashBundle {
             schema: CRASH_SCHEMA.to_string(),
             kind: "panic".into(),
-            panic_message: Some("boom at ANTHROPIC_API_KEY=sk-ant-api03-bbbbbbbbbbbbbbbbbbbb".into()),
+            panic_message: Some(
+                "boom at ANTHROPIC_API_KEY=sk-ant-api03-bbbbbbbbbbbbbbbbbbbb".into(),
+            ),
             backtrace: None,
             build_git_sha: "testsha".into(),
             build_timestamp: "t".into(),
             session_path: None,
-            recent_operations: vec!["read ~/.env with SECRET_TOKEN=ghp_cccccccccccccccccccc".into()],
+            recent_operations: vec![
+                "read ~/.env with SECRET_TOKEN=ghp_cccccccccccccccccccc".into(),
+            ],
             created_at: utc_stamp(),
         };
         let bundle_dir = write_bundle(&dir, bundle).expect("write");

@@ -115,11 +115,11 @@ pub mod conformance_shapes;
 #[doc(hidden)]
 pub mod connectors;
 pub mod context_files;
+pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;
 #[doc(hidden)]
 pub mod debug;
-pub mod crash;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;
@@ -271,8 +271,8 @@ pub mod session_sqlite;
 pub mod session_store_v2;
 #[doc(hidden)]
 pub mod skills_managed;
-pub mod stats;
 pub mod sse;
+pub mod stats;
 pub mod stream_rules;
 #[doc(hidden)]
 pub mod subagents;
