@@ -1489,6 +1489,66 @@ impl AgentSessionHandle {
         self.session.agent.stream_options_mut().max_tokens = max_tokens;
     }
 
+    /// `/add-dir` driver (bd-cv653.3.12): validate + add an additional
+    /// workspace root on the shared handle and persist the canonical set
+    /// into the session header. Returns a user-facing status line.
+    pub async fn add_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
+        let canonical = crate::workspace::validate_new_root(dir.as_ref())?;
+        let mut workspace = self.workspace.clone().ok_or_else(|| {
+            Error::validation("no workspace handle in this session")
+        })?;
+        let already =
+            workspace.snapshot_or(Path::new(".")).contains_canonical(&canonical);
+        if !already {
+            workspace.add_root(&canonical);
+        }
+        let roots = workspace.additional_roots();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.set_additional_roots(&roots);
+        }
+        let display = canonical.display().to_string();
+        Ok(if already {
+            format!("Already a workspace root: {display}")
+        } else {
+            format!("Workspace root added: {display}")
+        })
+    }
+
+    /// `/remove-dir` driver (bd-cv653.3.12): revoke an additional root on
+    /// the shared handle (immediate for every tool holding a clone) and
+    /// persist. Returns a user-facing status line.
+    pub async fn remove_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
+        let mut workspace = self.workspace.clone().ok_or_else(|| {
+            Error::validation("no workspace handle in this session")
+        })?;
+        let removed = workspace.remove_root(dir.as_ref());
+        if !removed {
+            return Ok(format!(
+                "Not a workspace root: {}",
+                dir.as_ref().display()
+            ));
+        }
+        let roots = workspace.additional_roots();
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut guard = self
+                .session
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            guard.set_additional_roots(&roots);
+        }
+        Ok(format!("Workspace root removed: {}", dir.as_ref().display()))
+    }
+
     /// Return all model messages for the current session path.
     pub async fn messages(&self) -> Result<Vec<Message>> {
         let cx = crate::agent_cx::AgentCx::for_request();
