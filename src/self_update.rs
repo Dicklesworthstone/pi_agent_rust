@@ -49,10 +49,16 @@ impl PackageManager {
             Self::Nix
         } else if path_str.contains("/.cargo/bin/") {
             Self::Cargo
-        } else if path_str.starts_with("/usr/bin/")
-            || path_str.starts_with("/bin/")
-            || path_str.starts_with("/usr/local/bin/dpkg")
+        } else if (path_str.starts_with("/usr/bin/") || path_str.starts_with("/bin/"))
+            && Path::new("/var/lib/dpkg/info").is_dir()
+            && std::process::Command::new("dpkg")
+                .args(["-S", &path_str])
+                .output()
+                .is_ok_and(|out| out.status.success())
         {
+            // A binary in /usr/bin is APT-managed only when dpkg actually
+            // owns it; a manual `sudo cp` install there must stay Manual or
+            // the suggested `apt install --only-upgrade` can never work.
             Self::Apt
         } else {
             Self::Manual
@@ -126,12 +132,11 @@ impl PlatformInfo {
         ));
         candidates.push(format!("pi-{}{}", self.target_triple, self.exe_ext));
 
-        // 4. Archive format naming
-        if self.exe_ext.is_empty() {
-            candidates.push(format!("pi-{}.tar.gz", self.asset_platform));
-        } else {
-            candidates.push(format!("pi-{}.zip", self.asset_platform));
-        }
+        // Archives (pi-<platform>.tar.xz/.zip) are deliberately NOT
+        // candidates: nothing here extracts them, so an archive "install"
+        // could only produce a broken binary and a rollback. Releases must
+        // carry raw per-platform binaries under the names above (the
+        // release pipeline uploads them alongside the archives).
 
         candidates
     }
@@ -558,11 +563,25 @@ ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad *pi_darwin_arm6
     }
 
     #[test]
+    // The suffix checks assert candidate NAMES, not filesystem paths; the
+    // input is already lowercased.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn test_platform_detection_and_candidates() {
         if let Some(plat) = PlatformInfo::current() {
             let candidates = plat.candidate_asset_names("0.2.0");
             assert!(!candidates.is_empty());
             assert!(candidates.iter().any(|c| c.contains("pi")));
+            // No extractor exists: archive candidates would only ever
+            // produce a failed install + rollback.
+            assert!(
+                candidates.iter().all(|c| {
+                    let lower = c.to_ascii_lowercase();
+                    !lower.ends_with(".tar.gz")
+                        && !lower.ends_with(".tar.xz")
+                        && !lower.ends_with(".zip")
+                }),
+                "{candidates:?}"
+            );
         }
     }
 

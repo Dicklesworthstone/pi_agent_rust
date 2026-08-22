@@ -10735,7 +10735,9 @@ fn check_sessions(findings: &mut Vec<Finding>) {
         findings.push(
             Finding::warn(cat, format!("{total} sessions, {corrupt} corrupt"))
                 .with_detail("Some session files are empty or have invalid headers")
-                .with_remediation("Corrupt sessions can be safely deleted"),
+                .with_remediation(
+                    "Move corrupt sessions aside with `pi gc` (trash + grace period) rather than deleting them",
+                ),
         );
     }
 

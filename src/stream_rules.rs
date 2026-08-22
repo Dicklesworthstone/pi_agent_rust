@@ -131,6 +131,19 @@ impl RollingStreamMatcher {
     /// Feed a streaming delta and check for matches.
     /// Returns `Some(StreamRuleMatch)` on the first rule that triggers.
     pub fn feed(&mut self, chunk: &str, channel: StreamChannel) -> Option<StreamRuleMatch> {
+        self.feed_filtered(chunk, channel, |_| true)
+    }
+
+    /// Like [`Self::feed`], but only rules admitted by `admit` participate.
+    /// The coordinator passes cooldown-suppressed rule ids here: a suppressed
+    /// rule's match stays in the rolling buffer, so without the filter it
+    /// would shadow every other rule for the rest of the turn.
+    pub fn feed_filtered(
+        &mut self,
+        chunk: &str,
+        channel: StreamChannel,
+        admit: impl Fn(&str) -> bool,
+    ) -> Option<StreamRuleMatch> {
         // Guard: Tool call argument JSON streams are strictly excluded from TTSR matching
         // to avoid corrupting tool payloads.
         if channel == StreamChannel::ToolCallArgument || chunk.is_empty() {
@@ -149,10 +162,12 @@ impl RollingStreamMatcher {
             self.buffer.drain(..cut_idx);
         }
 
-        let matched_rule = self
-            .compiled_rules
-            .iter()
-            .find_map(|(rule, regex)| regex.find(&self.buffer).map(|mat| (rule, mat.as_str())));
+        let matched_rule = self.compiled_rules.iter().find_map(|(rule, regex)| {
+            if !admit(&rule.id) {
+                return None;
+            }
+            regex.find(&self.buffer).map(|mat| (rule, mat.as_str()))
+        });
 
         if let Some((rule, mat_str)) = matched_rule {
             let screened = screen_secrets(mat_str);
@@ -231,7 +246,25 @@ impl TtsrCoordinator {
 
     /// Process a stream chunk and evaluate if a TTSR action is required.
     pub fn process_chunk(&mut self, chunk: &str, channel: StreamChannel) -> TtsrAction {
-        let Some(rule_match) = self.matcher.feed(chunk, channel) else {
+        // Rules on cooldown are filtered at match time, not after: their
+        // matched text stays in the rolling buffer, and post-hoc dropping
+        // would let one cooling rule shadow every later rule this turn.
+        let cooldowns: Vec<String> = self
+            .rules_by_id
+            .values()
+            .filter(|rule| {
+                rule.cooldown_turns.is_some_and(|cooldown| {
+                    self.cooldown_history
+                        .get(&rule.id)
+                        .is_some_and(|last| self.current_turn.saturating_sub(*last) <= cooldown)
+                })
+            })
+            .map(|rule| rule.id.clone())
+            .collect();
+        let Some(rule_match) = self
+            .matcher
+            .feed_filtered(chunk, channel, |id| !cooldowns.iter().any(|c| c == id))
+        else {
             return TtsrAction::Continue;
         };
 

@@ -290,11 +290,14 @@ impl Default for ReviewOptions {
     }
 }
 
-fn make_finding_key(finding: &ReviewFinding) -> (String, usize, String) {
+fn make_finding_key(finding: &ReviewFinding) -> (String, usize, String, String) {
+    // Title distinguishes co-located findings of one category (a hardcoded
+    // token AND a SQL interpolation on the same line are both "security").
     (
         finding.file.clone(),
         finding.line_start.unwrap_or(0),
         finding.category.clone(),
+        finding.title.clone(),
     )
 }
 
@@ -307,7 +310,7 @@ impl ReviewDeduplicator {
         findings: Vec<ReviewFinding>,
         max_findings: usize,
     ) -> Vec<ReviewFinding> {
-        let mut grouped: BTreeMap<(String, usize, String), ReviewFinding> = BTreeMap::new();
+        let mut grouped: BTreeMap<(String, usize, String, String), ReviewFinding> = BTreeMap::new();
 
         for finding in findings {
             let key = make_finding_key(&finding);
@@ -370,10 +373,16 @@ impl ReviewRuleEngine {
 
         for line in hunk.content.lines() {
             if let Some(added_text) = line.strip_prefix('+') {
-                if !line.starts_with("+++") {
-                    Self::evaluate_line(file, current_line, added_text, findings);
-                    current_line += 1;
+                // Only the `+++ b/...` file header is a non-content line; a
+                // real added line may legitimately start with `++` (e.g.
+                // C's `++i;` becomes `+++i;` in the diff) and must both be
+                // evaluated and counted, or every later line number in the
+                // hunk drifts.
+                if line.starts_with("+++ ") {
+                    continue;
                 }
+                Self::evaluate_line(file, current_line, added_text, findings);
+                current_line += 1;
             } else if !line.starts_with('-') {
                 current_line += 1;
             }
@@ -610,10 +619,23 @@ impl CodeReviewer {
             ReviewVerdict::Ship => {
                 "No blocking or minor issues found. Change is clean and ready to ship.".to_string()
             }
-            ReviewVerdict::ShipWithNits => format!(
-                "Change is safe to ship with {} non-blocking nit(s) to review.",
-                p2 + p3
-            ),
+            ReviewVerdict::ShipWithNits => {
+                // Sub-threshold P0/P1 findings are still on the card; a
+                // summary claiming zero nits next to a P0 reads as a
+                // contradiction.
+                let low_confidence = p0 + p1;
+                if low_confidence > 0 {
+                    format!(
+                        "Change is likely safe to ship: {} non-blocking nit(s), plus {low_confidence} low-confidence P0/P1 finding(s) worth a manual look.",
+                        p2 + p3
+                    )
+                } else {
+                    format!(
+                        "Change is safe to ship with {} non-blocking nit(s) to review.",
+                        p2 + p3
+                    )
+                }
+            }
             ReviewVerdict::Block => format!(
                 "Blocked by {p0} critical (P0) and/or {p1} major (P1) finding(s). Must resolve before shipping."
             ),
@@ -707,8 +729,13 @@ mod tests {
                 file: "src/main.rs".to_string(),
                 line_start: Some(10),
                 line_end: Some(10),
+                // Same title as f1: a re-detection of one finding (rules
+                // emit stable titles) — must dedupe, keeping the higher
+                // severity. A different title at the same location is a
+                // distinct finding and must survive (see
+                // colocated_distinct_findings_both_survive).
                 category: "style".to_string(),
-                title: "Upgraded to P0".to_string(),
+                title: "Nit 1".to_string(),
                 rationale: "Rationale critical".to_string(),
                 suggestion: None,
             },
@@ -730,6 +757,30 @@ mod tests {
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].severity, ReviewSeverity::P0);
         assert_eq!(ranked[1].severity, ReviewSeverity::P1);
+    }
+
+    #[test]
+    fn colocated_distinct_findings_both_survive() {
+        // A hardcoded token AND a SQL interpolation on one line are both
+        // category "security" — dedup by (file, line, category) alone
+        // silently dropped one of them.
+        let base = ReviewFinding {
+            id: "a".to_string(),
+            severity: ReviewSeverity::P0,
+            confidence: 0.9,
+            file: "src/db.rs".to_string(),
+            line_start: Some(7),
+            line_end: Some(7),
+            category: "security".to_string(),
+            title: "Hardcoded secret".to_string(),
+            rationale: "token literal".to_string(),
+            suggestion: None,
+        };
+        let mut other = base.clone();
+        other.id = "b".to_string();
+        other.title = "SQL built with format!".to_string();
+        let ranked = ReviewDeduplicator::dedupe_and_rank(vec![base, other], 10);
+        assert_eq!(ranked.len(), 2, "{ranked:?}");
     }
 
     #[test]

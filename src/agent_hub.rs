@@ -353,17 +353,24 @@ fn append_steer_line(path: &Path, message: &BusMessage) -> Result<()> {
         .map_err(|e| Error::tool("hub", format!("write steer queue {}: {e}", path.display())))
 }
 
-/// Child-side drain: read + truncate the steer file, returning queued bodies
-/// in delivery order. Called by the print-mode steering fetcher.
+/// Child-side drain: consume the steer file, returning queued bodies in
+/// delivery order. Called by the print-mode steering fetcher.
 pub fn drain_steer_file(path: &Path) -> Vec<String> {
-    let Ok(raw) = fs::read_to_string(path) else {
+    // Rename-consume: read-then-truncate loses any line the parent appends
+    // between the read and the truncating write (the parent appends from a
+    // different process). rename is atomic, and a parent append racing the
+    // rename lands wholly in the old file (drained now) or a fresh steer
+    // file (drained next poll) — never destroyed.
+    let draining = path.with_extension("draining");
+    if fs::rename(path, &draining).is_err() {
+        // Nothing queued (file absent) or transient; retry next poll.
         return Vec::new();
-    };
+    }
+    let raw = fs::read_to_string(&draining).unwrap_or_default();
+    let _ = fs::remove_file(&draining);
     if raw.is_empty() {
         return Vec::new();
     }
-    // Truncate after a successful read so frames are consumed exactly once.
-    let _ = fs::write(path, "");
     raw.lines()
         .filter_map(|line| {
             serde_json::from_str::<BusMessage>(line)

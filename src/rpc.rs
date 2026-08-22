@@ -2102,15 +2102,30 @@ pub async fn run(
             }
 
             "retry" => {
-                let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await else {
+                // Retry re-EXECUTES the recovered turn immediately: queueing
+                // it as steering would silently wait for (and then pollute)
+                // the next unrelated prompt.
+                if is_streaming.load(Ordering::SeqCst) {
                     let _ = out_tx.send(response_error(
                         id,
                         "retry",
-                        "session lock failed".to_string(),
+                        "Agent is currently streaming; abort or wait before retrying".to_string(),
                     ));
                     continue;
+                }
+                let text = {
+                    let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
+                    else {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "retry",
+                            "session lock failed".to_string(),
+                        ));
+                        continue;
+                    };
+                    crate::checkpoint::take_last_user_turn(&mut guard.agent)
                 };
-                let Some(text) = crate::checkpoint::take_last_user_turn(&mut guard.agent) else {
+                let Some(text) = text else {
                     let _ = out_tx.send(response_error(
                         id,
                         "retry",
@@ -2118,18 +2133,43 @@ pub async fn run(
                     ));
                     continue;
                 };
-                guard.agent.queue_steering(Message::User(UserMessage {
-                    content: UserContent::Text(text.clone()),
-                    timestamp: 0,
-                }));
                 let _ = out_tx.send(response_ok(
                     id,
                     "retry",
                     Some(json!({
                         "schema": "pi.retry.v1",
-                        "requeued": true,
+                        "rerunning": true,
                         "characters": text.len()
                     })),
+                ));
+                is_streaming.store(true, Ordering::SeqCst);
+                let out_tx = out_tx.clone();
+                let session = Arc::clone(&session);
+                let shared_state = Arc::clone(&shared_state);
+                let is_streaming = Arc::clone(&is_streaming);
+                let is_compacting = Arc::clone(&is_compacting);
+                let abort_handle_slot = Arc::clone(&abort_handle);
+                let retry_abort = retry_abort.clone();
+                let options = options.clone();
+                let prompt_cx = cx.clone();
+                options.runtime_handle.clone().spawn(future_with_current_cx(
+                    prompt_cx.cx().clone(),
+                    async move {
+                        run_prompt_with_retry(
+                            session,
+                            shared_state,
+                            is_streaming,
+                            is_compacting,
+                            abort_handle_slot,
+                            out_tx,
+                            retry_abort,
+                            options,
+                            text,
+                            Vec::new(),
+                            prompt_cx,
+                        )
+                        .await;
+                    },
                 ));
             }
 

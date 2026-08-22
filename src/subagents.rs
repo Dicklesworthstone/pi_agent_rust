@@ -878,6 +878,14 @@ impl ChildRunner {
                     "Failed to launch {}: {error}",
                     self.child_binary.display()
                 ));
+                // Settle the roster entry registered above — otherwise the
+                // hub shows this child as Starting forever and steer keeps
+                // queueing messages to it.
+                if let Some(hub_id) = &result.hub_id
+                    && let Ok(mut reg) = crate::agent_hub::registry().lock()
+                {
+                    reg.settle(hub_id, crate::agent_hub::ChildStatus::Failed);
+                }
                 emit_progress(update, &result);
                 return result;
             }
@@ -894,6 +902,11 @@ impl ChildRunner {
 
         if !child.has_stdout() {
             result.fail("Child stdout was not piped.".to_string());
+            if let Some(hub_id) = &result.hub_id
+                && let Ok(mut reg) = crate::agent_hub::registry().lock()
+            {
+                reg.settle(hub_id, crate::agent_hub::ChildStatus::Failed);
+            }
             return result;
         }
         let stdout = child.take_stdout().expect("stdout checked above");

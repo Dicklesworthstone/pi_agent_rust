@@ -906,8 +906,7 @@ impl SecurityScanTool {
                 .collect();
             previous.retain(|finding| {
                 scope.iter().any(|prefix| {
-                    finding.path == *prefix
-                        || finding.path.starts_with(&format!("{prefix}/"))
+                    finding.path == *prefix || finding.path.starts_with(&format!("{prefix}/"))
                 })
             });
         }

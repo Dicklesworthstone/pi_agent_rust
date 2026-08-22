@@ -329,6 +329,25 @@ impl GarbageCollector {
             return true;
         }
 
+        // Active-session guard: a live holder maintains `<session>.lock` as
+        // a DIRECTORY whose mtime refreshes every 5s (file_lock.rs,
+        // proper-lockfile protocol; a regular `.lock` FILE is a legacy
+        // artifact and does not signal liveness). Trashing a session out
+        // from under an open process would silently redirect its appends
+        // into the trash. 60s bound = 6x the refresh interval.
+        let mut lock_path = path.as_os_str().to_os_string();
+        lock_path.push(".lock");
+        let lock_path = Path::new(&lock_path);
+        if lock_path.is_dir()
+            && fs::metadata(lock_path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|mtime| mtime.elapsed().ok())
+                .is_some_and(|age| age < Duration::from_secs(60))
+        {
+            return true;
+        }
+
         // Inspect session header (first line) for explicit name / pinned marker
         if let Ok(content) = fs::read_to_string(path)
             && let Some(first_line) = content.lines().next()

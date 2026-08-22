@@ -3489,6 +3489,14 @@ impl Agent {
 
         // Phase 1: Emit start events for ALL tools up front.
         for tool_call in tool_calls {
+            // Crash-bundle context (bd-cv653.7.12): the ring is redacted at
+            // capture, so tool names + argument shape are safe and give a
+            // bundle its "what was happening" trail.
+            crate::crash::record_operation(format!(
+                "tool {} ({} arg bytes)",
+                tool_call.name,
+                tool_call.arguments.to_string().len()
+            ));
             on_event(AgentEvent::ToolExecutionStart {
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),

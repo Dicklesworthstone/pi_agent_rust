@@ -4964,14 +4964,19 @@ fn rpc_checkpoint_rewind_fresh_retry_cycle() {
         let new_id = require_response_field_str(&fresh_resp, "newSessionId", "fresh");
         assert!(new_id.starts_with("fresh-"), "{new_id}");
 
-        // Retry: re-issues the last user turn through the steering queue.
+        // Retry: re-EXECUTES the last user turn immediately (a queued-only
+        // retry silently waited for, then polluted, the next prompt).
         let retry = json!({ "id": "cp-retry", "type": "retry" }).to_string();
         let retry_resp = send_recv(&in_tx, &out_rx, &retry, "retry").await;
         assert_ok(&retry_resp, "retry");
         assert_eq!(
-            data_field(&retry_resp, "requeued").and_then(Value::as_bool),
+            data_field(&retry_resp, "rerunning").and_then(Value::as_bool),
             Some(true)
         );
+        // The retried turn is a real run: wait for it to finish so shutdown
+        // doesn't race an in-flight stream.
+        let _idle3 =
+            wait_for_non_streaming_state(&in_tx, &out_rx, "cp-idle-3", "idle after retry").await;
 
         drop(in_tx);
         let _ = server.await;

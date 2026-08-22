@@ -172,16 +172,32 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
         &["worktree", "add", &path.to_string_lossy(), "-b", &id],
     )?;
 
+    // Everything after worktree creation must clean up on failure, or every
+    // failed spawn leaks a worktree + branch with no automatic reaper.
+    let cleanup_on_err = |err: Error| -> Error {
+        let handle = IsoHandle {
+            branch: id.clone(),
+            id: id.clone(),
+            path: path.clone(),
+            repo_root: repo_root.to_path_buf(),
+            baseline: String::new(),
+        };
+        let _ = drop_worktree(&handle);
+        err
+    };
     // Dirty-tree materialization: tracked diff + untracked files.
-    let tracked_patch = git_ok(repo_root, &["diff", "--binary", "HEAD"])?;
+    let tracked_patch =
+        git_ok(repo_root, &["diff", "--binary", "HEAD"]).map_err(&cleanup_on_err)?;
     if !tracked_patch.trim().is_empty() {
         let patch_file = path.join(".pi-iso-parent.patch");
         std::fs::write(&patch_file, &tracked_patch)
-            .map_err(|e| Error::tool("subagent", format!("Failed to stage parent patch: {e}")))?;
-        git_ok(&path, &["apply", &patch_file.to_string_lossy()])?;
+            .map_err(|e| Error::tool("subagent", format!("Failed to stage parent patch: {e}")))
+            .map_err(&cleanup_on_err)?;
+        git_ok(&path, &["apply", &patch_file.to_string_lossy()]).map_err(&cleanup_on_err)?;
         let _ = std::fs::remove_file(&patch_file);
     }
-    let untracked = git_ok(repo_root, &["ls-files", "--others", "--exclude-standard"])?;
+    let untracked = git_ok(repo_root, &["ls-files", "--others", "--exclude-standard"])
+        .map_err(&cleanup_on_err)?;
     for relative in untracked.lines().filter(|line| !line.is_empty()) {
         let source = repo_root.join(relative);
         let target = path.join(relative);
@@ -195,7 +211,7 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
 
     // Commit the materialized baseline so the child's own work is a clean
     // diff against it (and the parent's dirty state never double-applies).
-    git_ok(&path, &["add", "-A"])?;
+    git_ok(&path, &["add", "-A"]).map_err(&cleanup_on_err)?;
     git_ok(
         &path,
         &[
@@ -205,8 +221,12 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
             "-m",
             &format!("pi-iso baseline {id}"),
         ],
-    )?;
-    let baseline = git_ok(&path, &["rev-parse", "HEAD"])?.trim().to_string();
+    )
+    .map_err(&cleanup_on_err)?;
+    let baseline = git_ok(&path, &["rev-parse", "HEAD"])
+        .map_err(&cleanup_on_err)?
+        .trim()
+        .to_string();
 
     Ok(IsoHandle {
         branch: id.clone(),
@@ -339,7 +359,14 @@ pub fn list_mine(repo_root: &Path) -> Result<Vec<WorktreeInfo>> {
     let mut current_branch = String::new();
     let flush = |path: Option<String>, branch: String, out: &mut Vec<WorktreeInfo>| {
         let Some(path) = path else { return };
-        if !path.contains(ISO_PREFIX) {
+        // Match on the BASENAME prefix: a foreign worktree whose path
+        // merely contains "pi-iso-" somewhere must never look like ours
+        // to the reaper.
+        let is_ours = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(ISO_PREFIX));
+        if !is_ours {
             return;
         }
         let age_ms = std::fs::metadata(&path)

@@ -101,6 +101,9 @@ pub struct StatsReport {
     pub messages: u64,
     pub tokens: TokenTotals,
     pub cost: CostTotals,
+    /// NOTE: compactions and tool-call rows are counted per entry and carry
+    /// no provider/model attribution, so --provider/--model filters apply
+    /// only to messages/tokens/cost — these totals stay session-wide.
     pub compactions: u64,
     pub tool_calls_total: u64,
     pub by_provider_model: Vec<ProviderModelRow>,
@@ -185,7 +188,9 @@ struct CostProbe {
 
 /// Model pricing fallback ($/MTok in, out) applied only when a session's
 /// recorded cost is zero but tokens exist (older sessions). Versioned
-/// in-tree; longest-prefix match wins.
+/// in-tree; longest-prefix match wins. Cache read/write tokens are not
+/// priced here (rates are provider-specific), so the fallback undercounts
+/// cache-heavy sessions — recorded costs always win when present.
 const PRICING: &[(&str, f64, f64)] = &[
     ("claude-opus-4", 15.0, 75.0),
     ("claude-opus-3", 15.0, 75.0),
