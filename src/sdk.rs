@@ -322,6 +322,11 @@ pub struct SessionOptions {
     /// the options struct.
     pub tool_factory: Option<Arc<dyn ToolFactory>>,
 
+    /// Optional multi-root workspace handle (bd-cv653.3.12). When set, the
+    /// session's tool registry confines paths to primary + additional roots
+    /// and `/add-dir` // `/remove-dir` mutate the shared set live.
+    pub workspace: Option<crate::workspace::WorkspaceHandle>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -387,7 +392,8 @@ impl Default for SessionOptions {
             session_path: None,
             session_dir: None,
             extension_paths: Vec::new(),
-            extension_policy: None,
+            tool_factory: None,
+            workspace: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
@@ -1887,7 +1893,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
                 Some(std::sync::Arc::new(
                     crate::undo::FileMutationRecorder::default(),
                 )),
-                None,
+                options.workspace.as_ref(),
             )
         },
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
