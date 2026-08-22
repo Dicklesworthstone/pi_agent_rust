@@ -1518,7 +1518,8 @@ impl PackageManager {
                 None,
             )?;
         } else {
-            run_command("npm", ["install", "-g", spec], None)?;
+            run_command("npm", ["install", "-g", spec], None)
+                .map_err(|err| enrich_global_npm_install_error(err, spec))?;
         }
 
         // Basic sanity: installed path exists
@@ -3932,6 +3933,34 @@ fn prune_empty_git_parents(target_dir: &Path, root: &Path) {
         let _ = fs::remove_dir(&dir);
         current = dir.parent().map(PathBuf::from);
     }
+}
+
+/// Attach actionable guidance when a user-scope `npm install -g` fails on a
+/// permissions error (gh #179).
+///
+/// User-scope installs delegate to npm's global prefix (upstream-pi parity),
+/// which distro-packaged npm often points at a root-owned tree (`/usr/lib`
+/// on Arch). The raw npm EACCES wall of text does not tell the user what Pi
+/// expects, so name the fix instead of leaving them to guess.
+fn enrich_global_npm_install_error(err: Error, spec: &str) -> Error {
+    let base = err.to_string();
+    let lowered = base.to_ascii_lowercase();
+    if !(lowered.contains("eacces") || lowered.contains("permission denied")) {
+        return err;
+    }
+    Error::tool(
+        "npm",
+        format!(
+            "{base}\n\nUser-scope installs delegate to `npm install -g` (upstream-pi \
+             parity), so npm's global prefix must be writable by your user. With a \
+             distro-packaged npm whose prefix is root-owned (for example /usr on Arch), \
+             point npm at a user-writable prefix once:\n\
+             \tnpm config set prefix ~/.local\n\
+             (ensure ~/.local/bin is on PATH), then re-run the install. Inside a \
+             project you can use `pi install --local {spec}` instead, which installs \
+             under the project without touching the global prefix."
+        ),
+    )
 }
 
 fn run_command<I, S>(program: &str, args: I, cwd: Option<&Path>) -> Result<()>
@@ -8428,6 +8457,44 @@ mod tests {
         assert!(
             message.contains("digest_mismatch"),
             "expected digest_mismatch error, got: {message}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gh179_tests {
+    use super::*;
+
+    #[test]
+    fn eacces_global_npm_failure_gets_actionable_guidance() {
+        let raw = Error::tool(
+            "npm",
+            "Command failed: npm (exit 243)\nstderr:\nnpm error code EACCES\n\
+             npm error Error: EACCES: permission denied, mkdir '/usr/lib/node_modules/pi-web-access'",
+        );
+        let enriched = enrich_global_npm_install_error(raw, "pi-web-access").to_string();
+        assert!(enriched.contains("EACCES"), "original error must survive");
+        assert!(
+            enriched.contains("npm config set prefix"),
+            "guidance must name the fix: {enriched}"
+        );
+        assert!(
+            enriched.contains("pi install --local pi-web-access"),
+            "guidance must offer the project-scoped alternative: {enriched}"
+        );
+    }
+
+    #[test]
+    fn non_permission_npm_failure_is_left_untouched() {
+        let raw = Error::tool(
+            "npm",
+            "Command failed: npm (exit 1)\nstderr:\nnpm error E404 Not Found",
+        );
+        let before = raw.to_string();
+        let after = enrich_global_npm_install_error(raw, "missing-pkg").to_string();
+        assert_eq!(
+            before, after,
+            "unrelated failures must not gain prefix guidance"
         );
     }
 }
