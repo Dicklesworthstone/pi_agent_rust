@@ -58,6 +58,7 @@ pub enum SlashCommand {
     AddDir,
     RemoveDir,
     Crash,
+    Btw,
 }
 
 impl SlashCommand {
@@ -109,12 +110,13 @@ impl SlashCommand {
             "/approval" => Self::Approval,
             "/handoff" => Self::Handoff,
             "/review" => Self::Review,
+            "/rules" => Self::Rules,
             "/add-dir" => Self::AddDir,
             "/remove-dir" => Self::RemoveDir,
+            "/btw" => Self::Btw,
             "/crash" => Self::Crash,
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
-            "/review" => Self::Review,
             _ => return None,
         };
 
@@ -156,6 +158,7 @@ impl SlashCommand {
   /add-dir <dir>     - Grant access to an additional workspace root
   /remove-dir <dir>  - Revoke an additional workspace root immediately
   /crash [show|delete] - Inspect or clear redacted crash bundles
+  /btw <question>    - Ephemeral side question on the smol role (never persisted)
   /omfg <complaint>  - Record user grievance and draft a candidate stream rule
   /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
   /review [target]   - Run prioritized code review on changes with ship verdict card
@@ -868,6 +871,22 @@ fn build_reload_diagnostics(
             count,
         )
     }
+}
+
+/// Expand a leading `~`/`~/` to `$HOME` for /add-dir and /remove-dir.
+/// `Path::join` on an absolute component replaces the base, so the slash
+/// must be stripped before joining.
+fn expand_home_path(raw: &str) -> std::path::PathBuf {
+    let Ok(home) = std::env::var("HOME") else {
+        return std::path::PathBuf::from(raw);
+    };
+    if raw == "~" {
+        return std::path::PathBuf::from(home);
+    }
+    raw.strip_prefix("~/").map_or_else(
+        || std::path::PathBuf::from(raw),
+        |rest| std::path::PathBuf::from(home).join(rest),
+    )
 }
 
 impl PiApp {
@@ -2336,6 +2355,7 @@ impl PiApp {
             SlashCommand::AddDir => self.handle_slash_add_dir(args),
             SlashCommand::RemoveDir => self.handle_slash_remove_dir(args),
             SlashCommand::Crash => self.handle_slash_crash(args),
+            SlashCommand::Btw => self.handle_slash_btw(args),
             SlashCommand::Omfg => self.handle_slash_omfg(args),
             SlashCommand::Commit => self.handle_slash_commit(args),
             SlashCommand::Review => self.handle_slash_review(args),
@@ -3099,14 +3119,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.scroll_to_bottom();
             return None;
         }
-        let expanded = if let Some(stripped) = raw.strip_prefix('~') {
-            std::env::var("HOME").map_or_else(
-                |_| std::path::PathBuf::from(raw),
-                |home| std::path::PathBuf::from(home).join(stripped),
-            )
-        } else {
-            std::path::PathBuf::from(raw)
-        };
+        let expanded = expand_home_path(raw);
         let canonical = match crate::workspace::validate_new_root(&expanded) {
             Ok(canonical) => canonical,
             Err(err) => {
@@ -3122,17 +3135,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         if !already {
             self.workspace.add_root(&canonical);
         }
-        let mut roots = self.workspace.additional_roots();
-        if !roots.contains(&canonical) {
-            roots.push(canonical.clone());
-        }
-        let persisted = match self.session.try_lock() {
-            Ok(mut guard) => {
-                guard.set_additional_roots(&roots);
-                true
-            }
-            Err(_) => false,
-        };
+        // Persist exactly the live root set: persisting a path the handle
+        // rejected as "already covered" would silently promote it to a real
+        // root on session resume.
+        let roots = self.workspace.additional_roots();
+        let persisted = self.session.try_lock().is_ok_and(|mut guard| {
+            guard.set_additional_roots(&roots);
+            true
+        });
         let display = canonical.display().to_string();
         self.status_message = Some(if already {
             format!("Already a workspace root: {display}")
@@ -3156,7 +3166,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.scroll_to_bottom();
             return None;
         }
-        let canonical = crate::extensions::safe_canonicalize(std::path::Path::new(raw));
+        let canonical = crate::extensions::safe_canonicalize(&expand_home_path(raw));
         if self.workspace.snapshot_or(&self.cwd).primary() == canonical.as_path() {
             self.status_message = Some("Cannot remove the primary working directory".to_string());
             self.scroll_to_bottom();
@@ -3185,6 +3195,61 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// (bd-cv653.7.12). Bare `/crash` lists bundles; `send` is intentionally
     /// absent from auto-transmission — use the bundle path with your own
     /// transport after reviewing the preview.
+    /// `/btw <question>` — ephemeral side question on the smol role
+    /// (bd-cv653.3.16). The answer renders as a system card and is never
+    /// written to the session JSONL: the call builds a throwaway message
+    /// list that shares nothing with the session writer.
+    pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
+        let Some(client) = self.btw_client.clone() else {
+            self.status_message = Some(
+                "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)"
+                    .to_string(),
+            );
+            self.scroll_to_bottom();
+            return None;
+        };
+        let question = args.trim().to_string();
+        if question.is_empty() {
+            self.status_message = Some("Usage: /btw <question>".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+        let context = {
+            let snapshot: Vec<crate::model::Message> =
+                self.agent.try_lock().map_or_else(
+                    |_| Vec::new(),
+                    |agent| agent.messages().to_vec(),
+                );
+            pi::btw::build_context_summary(&snapshot)
+        };
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: format!("(/btw) {question}"),
+            thinking: None,
+            collapsed: false,
+        });
+        self.status_message = Some("(/btw) thinking...".to_string());
+        let runtime = self.runtime_handle.clone();
+        let event_tx = self.event_tx.clone();
+        runtime.spawn(async move {
+            let result = client.ask(&context, &question).await;
+            // Display-only delivery via the UI event channel; the session
+            // writer never sees this message.
+            let msg = match result {
+                Ok(answer) => PiMsg::System(format!("(/btw) {answer}")),
+                Err(err) => PiMsg::AgentError(format!("(/btw) failed: {err}")),
+            };
+            let _ = crate::interactive::enqueue_pi_event(
+                &event_tx,
+                &Cx::for_request(),
+                msg,
+            )
+            .await;
+        });
+        self.scroll_to_bottom();
+        None
+    }
+
     pub(super) fn handle_slash_crash(&mut self, args: &str) -> Option<Cmd> {
         let agent_dir = crate::config::Config::global_dir();
         match args.trim() {

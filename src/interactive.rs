@@ -1659,6 +1659,7 @@ pub async fn run_interactive(
     runtime_handle: RuntimeHandle,
     workspace: WorkspaceHandle,
     ask_tool: Option<crate::ask::AskTool>,
+    btw_client: Option<Arc<pi::btw::BtwClient>>,
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
 ) -> anyhow::Result<()> {
     let should_check_for_updates = config.should_check_for_updates();
@@ -1782,7 +1783,9 @@ pub async fn run_interactive(
             mcp_manager,
         ));
         app.ask_tool = ask_tool;
-        app.set_workspace(workspace);
+        if let Some(client) = btw_client {
+            app.set_btw_client(client);
+        }
         let mut program = Program::new(app)
             .with_alt_screen()
             .with_input_receiver(ui_rx);

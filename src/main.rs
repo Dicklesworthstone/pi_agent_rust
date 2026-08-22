@@ -1543,6 +1543,16 @@ async fn run(
 
     pi::app::validate_rpc_args(&cli)?;
 
+    // Explicit --add-dir roots must be live BEFORE @file arguments are
+    // scope-checked below, or `pi --add-dir /extra "@/extra/notes.md"`
+    // fails with "Cannot read outside the working directory". Restored
+    // session roots are layered later (they need the session open).
+    for dir in &cli.add_dir {
+        let canonical =
+            pi::workspace::validate_new_root(dir).map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
+        workspace.add_root(&canonical);
+    }
+
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
     let initial = pi::app::prepare_initial_message(
@@ -1624,23 +1634,16 @@ async fn run(
     let mut session = Box::pin(Session::new(&cli, &config)).await?;
 
     // Multi-root roots (bd-cv653.3.12): restore persisted additional_roots on
-    // resume, then layer any explicit --add-dir flags on top and persist the
-    // resulting canonical set for future resumes. A vanished restored root
-    // degrades to a warning rather than blocking resume; an explicit
-    // --add-dir failure is fatal.
+    // resume (explicit --add-dir flags were layered above, before @file
+    // scope checks) and persist the resulting canonical set for future
+    // resumes. A vanished restored root degrades to a warning rather than
+    // blocking resume; `add_root` dedups against the explicit flags.
     {
         for root in session.additional_roots() {
             if let Err(err) = pi::workspace::validate_new_root(&root) {
                 eprintln!("Warning: skipping restored workspace root: {err}");
             } else {
                 workspace.add_root(&root);
-            }
-        }
-        if !cli.add_dir.is_empty() {
-            for dir in &cli.add_dir {
-                let canonical = pi::workspace::validate_new_root(dir)
-                    .map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
-                workspace.add_root(&canonical);
             }
         }
         let snapshot = workspace.snapshot_or(&cwd);
@@ -1852,8 +1855,6 @@ async fn run(
             );
         }
     }
-    // The ask tool's picker handler is installed by the interactive host
-    // below; non-interactive sessions resolve via ask_policy (bd-cv653.3.8).
     let ask_tool = enabled_tools.contains(&"ask").then(|| {
         let tool = pi::ask::AskTool::new(pi::ask::AskPolicy::from_config(
             config.ask_policy.as_deref(),
@@ -1862,6 +1863,27 @@ async fn run(
             .agent
             .extend_tools(vec![Box::new(tool.clone()) as Box<dyn pi::tools::Tool>]);
         tool
+    });
+
+    // The /btw side-question client (bd-cv653.3.16): bound to the smol
+    // role when it resolves AND credentials exist; interactive-only.
+    let btw_client = pi::app::resolve_role_model(
+        pi::models::ModelRole::Smol,
+        &cli,
+        &config,
+        &model_registry,
+    )
+    .and_then(|resolution| {
+        let entry = resolution.model_entry;
+        let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
+        let credentialed =
+            !pi::models::model_requires_configured_credential(&entry) || key.is_some();
+        if !credentialed {
+            return None;
+        }
+        pi::providers::create_provider(&entry, None)
+            .ok()
+            .map(|provider| std::sync::Arc::new(pi::btw::BtwClient::new(provider, key)))
     });
 
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
@@ -2271,6 +2293,7 @@ async fn run(
             runtime_handle.clone(),
             workspace.clone(),
             ask_tool,
+            btw_client,
             Some(mcp_manager),
         ))
         .await
@@ -4697,8 +4720,7 @@ fn handle_stats(
 ) -> Result<()> {
     // Test/e2e seam (bd-cv653.7.7): lanes point this at a synthetic corpus.
     let sessions_dir = std::env::var("PI_STATS_SESSIONS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| pi::config::Config::sessions_dir());
+        .map_or_else(|_| pi::config::Config::sessions_dir(), PathBuf::from);
     let files = pi::stats::collect_session_files(&sessions_dir, project);
     let filter = pi::stats::StatsFilter {
         since,
@@ -4882,9 +4904,11 @@ fn handle_commit(
     let status_str = String::from_utf8_lossy(&status_out.stdout);
     let mut changed_files = Vec::new();
     for line in status_str.lines() {
-        let trimmed = line.trim();
-        if trimmed.len() > 3 {
-            let file_path = &trimmed[3..].trim();
+        // Porcelain v1 is fixed-width: `XY<space><path>`. Trimming first
+        // would eat the leading space of an unstaged-only entry (" M path")
+        // and shift the slice into the path itself.
+        if line.len() > 3 {
+            let file_path = &line[3..].trim();
             // Handle renames: R  orig -> new
             let actual_path = if let Some((_, new_p)) = file_path.split_once(" -> ") {
                 new_p.trim()
@@ -5042,7 +5066,16 @@ fn handle_review(
     max_findings: usize,
     out: Option<PathBuf>,
 ) -> Result<()> {
-    let fail_severity = fail_on.and_then(pi::review::ReviewSeverity::parse);
+    // An unparseable --fail-on must not silently disable the gate (CI would
+    // pass with P0 findings present).
+    let fail_severity = match fail_on {
+        None => None,
+        Some(raw) => Some(pi::review::ReviewSeverity::parse(raw).ok_or_else(|| {
+            pi::error::Error::Validation(format!(
+                "Invalid --fail-on value '{raw}'. Expected one of: P0, P1, P2, P3."
+            ))
+        })?),
+    };
     let options = pi::review::ReviewOptions {
         target: target.map(ToString::to_string),
         fail_on: fail_severity,
@@ -8750,6 +8783,7 @@ async fn run_interactive_mode(
     runtime_handle: RuntimeHandle,
     workspace: pi::workspace::WorkspaceHandle,
     ask_tool: Option<pi::ask::AskTool>,
+    btw_client: Option<Arc<pi::btw::BtwClient>>,
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();
@@ -8787,6 +8821,7 @@ async fn run_interactive_mode(
         runtime_handle,
         workspace,
         ask_tool,
+        btw_client,
         mcp_manager,
     )
     .await;
