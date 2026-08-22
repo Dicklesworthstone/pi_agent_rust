@@ -241,6 +241,7 @@ fn push_card_block(
     text: &str,
     detail: Option<&String>,
     diff_styled: bool,
+    group_count: u32,
     palette: &FtuiPalette,
     spinner_frame: usize,
 ) {
@@ -252,11 +253,12 @@ fn push_card_block(
         CardState::Ok => ("✓", ftui::Style::new().fg(palette.accent)),
         CardState::Err => ("✗", ftui::Style::new().bold().fg(palette.error)),
     };
-    let mut rendered = String::with_capacity(text.len() + 2);
-    rendered.push_str(glyph);
-    rendered.push(' ');
-    rendered.push_str(text);
-    lines.push(ftui::text::Line::styled(rendered, style));
+    let head = if group_count > 1 {
+        format!("{glyph} {text} ×{group_count}")
+    } else {
+        format!("{glyph} {text}")
+    };
+    lines.push(ftui::text::Line::styled(head, style));
     if let Some(detail) = detail {
         let dim = ftui::Style::new().dim().fg(palette.muted);
         let added = ftui::Style::new().fg(palette.accent);
@@ -333,6 +335,9 @@ struct TranscriptEntry {
     /// Detail lines are diff content (edit/hashline_edit): style added and
     /// removed markers.
     diff_styled: bool,
+    /// Grouped consecutive successful runs (read-tool-group parity):
+    /// 1 = standalone.
+    group_count: u32,
 }
 /// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
 /// of the bubbletea stack: the card renders into the transcript and the
@@ -717,6 +722,7 @@ impl PiFtuiModel {
             card: None,
             detail: None,
             diff_styled: false,
+            group_count: 1,
         });
     }
 
@@ -731,6 +737,7 @@ impl PiFtuiModel {
             card: Some(CardState::Pending),
             detail: None,
             diff_styled: false,
+            group_count: 1,
         });
     }
     /// Close the last pending tool card named `sanitized_name`, falling
@@ -754,21 +761,31 @@ impl PiFtuiModel {
         sanitized_output: Option<String>,
         diff_styled: bool,
     ) {
-        if let Some(entry) = self
+        let pending_idx = self
             .transcript
-            .iter_mut()
-            .rev()
-            .find(|e| e.card == Some(CardState::Pending) && e.text == sanitized_name)
-        {
-            entry.card = Some(if ok { CardState::Ok } else { CardState::Err });
-            if let Some(output) = sanitized_output {
-                entry.detail = Some(output);
-                entry.diff_styled = diff_styled;
-            }
+            .iter()
+            .rposition(|e| e.card == Some(CardState::Pending) && e.text == sanitized_name);
+        let Some(idx) = pending_idx else {
+            let mark = if ok { "✓" } else { "✗" };
+            self.push_entry(EntryRole::System, format!("{mark} {sanitized_name}"));
             return;
+        };
+        self.transcript[idx].card = Some(if ok { CardState::Ok } else { CardState::Err });
+        if let Some(output) = sanitized_output {
+            self.transcript[idx].detail = Some(output);
+            self.transcript[idx].diff_styled = diff_styled;
         }
-        let mark = if ok { "✓" } else { "✗" };
-        self.push_entry(EntryRole::System, format!("{mark} {sanitized_name}"));
+        // Read-call grouping (bd-cv653.9.2, read-tool-group parity): a
+        // successful read DIRECTLY following another successful read card
+        // collapses into it with a ×N counter — agent turns batch many
+        // reads, and one line per file drowns the transcript.
+        if ok && sanitized_name == "read" && idx > 0 {
+            let prev = &self.transcript[idx - 1];
+            if prev.card == Some(CardState::Ok) && prev.text == "read" {
+                self.transcript[idx - 1].group_count += 1;
+                self.transcript.remove(idx);
+            }
+        }
     }
 
     /// Fold a bash result preview into the still-pending bash card
@@ -1634,6 +1651,7 @@ impl PiFtuiModel {
                     &entry.text,
                     entry.detail.as_ref(),
                     entry.diff_styled,
+                    entry.group_count,
                     &palette,
                     self.spinner.current_frame,
                 );
@@ -4245,6 +4263,58 @@ mod tests {
         assert_eq!(
             submit_rx.try_recv().expect("routed"),
             UiCommand::Prompt(String::from("hi"))
+        );
+    }
+    #[test]
+    fn consecutive_reads_group_with_counter() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        for _ in 0..3 {
+            sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+                name: "read".into(),
+                tool_id: "t".into(),
+            }));
+            sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+                name: "read".into(),
+                tool_id: "t".into(),
+                is_error: false,
+                output: None,
+            }));
+        }
+        let read_cards: Vec<_> = sim
+            .model()
+            .transcript
+            .iter()
+            .filter(|e| e.text == "read")
+            .collect();
+        assert_eq!(read_cards.len(), 1, "reads must collapse into one card");
+        assert_eq!(read_cards[0].group_count, 3);
+        // A non-read entry between runs splits the group.
+        sim.send(PiFtuiMsg::Agent(PiMsg::System(String::from("note"))));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "read".into(),
+            tool_id: "t2".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "read".into(),
+            tool_id: "t2".into(),
+            is_error: false,
+            output: None,
+        }));
+        assert_eq!(
+            sim.model()
+                .transcript
+                .iter()
+                .filter(|e| e.text == "read")
+                .count(),
+            2,
+            "intervening entry must split the group"
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 16), 60, 16);
+        assert!(
+            rendered.contains("×3"),
+            "group counter missing: {rendered:?}"
         );
     }
 }
