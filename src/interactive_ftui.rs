@@ -2152,6 +2152,11 @@ async fn run_bash_ui_command(
     exclude: bool,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<String> {
+    // Bracket the run with AgentStart/AgentDone (submit_bash_command
+    // parity: bubbletea flips to ToolRunning so the status region shows the
+    // running tool and the editor gates input). Without AgentStart the
+    // model stays Ready and "running bash" never renders.
+    let _ = agent_tx.send(PiMsg::AgentStart);
     let _ = agent_tx.send(PiMsg::ToolStart {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
@@ -2186,6 +2191,11 @@ async fn run_bash_ui_command(
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
         is_error: false,
+    });
+    let _ = agent_tx.send(PiMsg::AgentDone {
+        usage: None,
+        stop_reason: crate::model::StopReason::Stop,
+        error_message: None,
     });
     output
 }
