@@ -810,8 +810,9 @@ impl PiFtuiModel {
     /// commands the preview can honor are wired). Returns true when the
     /// input was consumed as a command (including local errors).
     fn route_slash_command(&mut self, clean: &str) -> bool {
-        if let Some(rest) = clean.strip_prefix("/model") {
-            self.route_model_command(rest.trim());
+        // Case-insensitive like SlashCommand::parse in the bubbletea stack.
+        if clean.len() >= 6 && clean[..6].eq_ignore_ascii_case("/model") {
+            self.route_model_command(clean[6..].trim());
             return true;
         }
         self.route_slash_command_tail(clean)
@@ -856,11 +857,14 @@ impl PiFtuiModel {
 
     /// Remaining slash routing after `/model`.
     fn route_slash_command_tail(&mut self, clean: &str) -> bool {
-        if clean == "/exit" || clean == "/quit" {
+        // Case-insensitive tokens (SlashCommand::parse parity): compare on
+        // an ASCII-lowercased copy; args keep their original case.
+        let canon = clean.to_ascii_lowercase();
+        if canon == "/exit" || canon == "/quit" || canon == "/q" {
             self.pending_quit = true;
             return true;
         }
-        if clean == "/compact" {
+        if canon == "/compact" {
             self.push_entry(
                 EntryRole::System,
                 String::from("compacting conversation ..."),
@@ -868,7 +872,7 @@ impl PiFtuiModel {
             self.send_command(UiCommand::Compact);
             return true;
         }
-        if clean == "/theme" {
+        if canon == "/theme" {
             self.picker = Some(PickerOverlay {
                 title: String::from("Theme (Enter to apply, Esc to close)"),
                 items: vec![String::from("dark"), String::from("light")],
@@ -878,7 +882,7 @@ impl PiFtuiModel {
             });
             return true;
         }
-        if clean == "/resume" {
+        if canon == "/resume" || canon == "/r" {
             if self.available_sessions.is_empty() {
                 self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
             } else {
@@ -897,7 +901,7 @@ impl PiFtuiModel {
             }
             return true;
         }
-        if clean == "/help" {
+        if canon == "/help" || canon == "/h" || canon == "/?" {
             self.push_entry(
                 EntryRole::System,
                 String::from(
@@ -910,7 +914,7 @@ impl PiFtuiModel {
             return true;
         }
         let (cmd_name, cmd_args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
-        match cmd_name {
+        match cmd_name.to_ascii_lowercase().as_str() {
             "/new" => {
                 self.send_command(UiCommand::NewSession);
                 return true;
@@ -3514,5 +3518,38 @@ mod tests {
         let transcript = &sim.model().transcript;
         assert!(!transcript.iter().any(|e| e.text.contains("earlier note")));
         assert!(transcript.iter().any(|e| e.text == "Conversation cleared"));
+    }
+    #[test]
+    fn slash_commands_are_case_insensitive_with_aliases() {
+        // Token matching lowercases like SlashCommand::parse; aliases /q,
+        // /r, /h, /? and /m ride along for free. /Q LAST: Cmd::quit ends
+        // simulated input processing.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        // Bare /M with no models errors locally instead of reaching a driver.
+        type_str(&mut sim, "/M");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("no models available")),
+            "uppercase /M must hit the model path"
+        );
+        type_str(&mut sim, "/H");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("ftui preview commands")),
+            "uppercase /H must show help"
+        );
+        type_str(&mut sim, "/Q");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().pending_quit, "uppercase /Q must quit");
     }
 }
