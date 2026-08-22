@@ -1,7 +1,6 @@
 //! Integration tests for retention-policy garbage collection (`pi gc`) (bd-cv653.7.11).
 
 use std::fs;
-use std::path::PathBuf;
 use tempfile::tempdir;
 
 use pi::gc::{
@@ -48,7 +47,7 @@ fn test_gc_plan_preserves_pinned_and_named_sessions() {
         dry_run: true,
         empty_trash: false,
         restore_target: None,
-        custom_sessions_dir: Some(sessions_dir.clone()),
+        custom_sessions_dir: Some(sessions_dir),
         custom_trash_dir: None,
         custom_ledger_path: None,
     };
@@ -147,9 +146,9 @@ fn test_gc_dry_run_and_live_sweep_with_trash_and_ledger() {
         dry_run: false,
         empty_trash: true,
         restore_target: None,
-        custom_sessions_dir: Some(sessions_dir.clone()),
-        custom_trash_dir: Some(trash_dir.clone()),
-        custom_ledger_path: Some(ledger_file.clone()),
+        custom_sessions_dir: Some(sessions_dir),
+        custom_trash_dir: Some(trash_dir),
+        custom_ledger_path: Some(ledger_file),
     };
 
     let empty_res = GarbageCollector::run(&empty_options).expect("empty trash");

@@ -1635,9 +1635,9 @@ async fn run(
             }
         }
         let snapshot = workspace.snapshot_or(&cwd);
-        let additional = snapshot.additional().to_vec();
+        let additional = snapshot.additional();
         if !additional.is_empty() || !cli.add_dir.is_empty() {
-            session.set_additional_roots(&additional);
+            session.set_additional_roots(additional);
         }
     }
 
@@ -1824,7 +1824,7 @@ async fn run(
                             .with_timeout(std::time::Duration::from_secs(
                                 config.advisor_timeout_secs(),
                             ))
-                            .with_api_key(key.clone()),
+                            .with_api_key(key),
                     );
                 }
                 Err(err) => {
@@ -2244,7 +2244,7 @@ async fn run(
             .collect::<Vec<_>>();
         let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
 
-        run_interactive_mode(
+        Box::pin(run_interactive_mode(
             agent_session,
             initial,
             messages,
@@ -2261,7 +2261,7 @@ async fn run(
             workspace.clone(),
             ask_tool,
             Some(mcp_manager),
-        )
+        ))
         .await
     } else {
         // Agent-hub steering (bd-cv653.5.3): when this process is a subagent
@@ -2279,7 +2279,9 @@ async fn run(
                                 content: pi::model::UserContent::Text(body),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_millis() as i64),
+                                    .map_or(0, |d| {
+                                        i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+                                    }),
                             })
                         })
                         .collect()
@@ -2394,23 +2396,6 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 all,
                 bead.as_deref(),
                 message.as_deref(),
-            )?;
-        }
-        cli::Commands::Stats {
-            since,
-            until,
-            project,
-            provider,
-            model,
-            format,
-        } => {
-            handle_stats(
-                since,
-                until,
-                project.as_deref(),
-                provider,
-                model,
-                &format,
             )?;
         }
         cli::Commands::SelfUpdate { version, check } => {
@@ -4678,39 +4663,6 @@ async fn handle_handoff(
     Ok(())
 }
 
-/// `pi stats [--since TS] [--until TS] [--project NAME] [--provider P]
-/// [--model M] [--format text|json|markdown]` (bd-cv653.7.7): aggregate
-/// local session usage. All data stays local — no network.
-fn handle_stats(
-    since: Option<String>,
-    until: Option<String>,
-    project: Option<&str>,
-    provider: Option<String>,
-    model: Option<String>,
-    format: &str,
-) -> Result<()> {
-    // Test/e2e seam (bd-cv653.7.7): lanes point this at a synthetic corpus.
-    let sessions_dir = std::env::var("PI_STATS_SESSIONS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| pi::config::Config::sessions_dir());
-    let files = pi::stats::collect_session_files(&sessions_dir, project);
-    let filter = pi::stats::StatsFilter {
-        since,
-        until,
-        provider,
-        model,
-    };
-    let report = pi::stats::aggregate(&files, &filter);
-    let rendered = match format {
-        "json" => serde_json::to_string_pretty(&report)
-            .map_err(|e| anyhow::anyhow!("stats serialization failed: {e}"))?,
-        "markdown" | "md" => pi::stats::render_markdown(&report),
-        _ => pi::stats::render_text(&report),
-    };
-    println!("{rendered}");
-    Ok(())
-}
-
 /// `pi rules list|add|remove|test|export|import` (bd-cv653.3.4):
 /// user-facing stream rules manager.
 fn handle_rules(cwd: &Path, command: &cli::RulesCommands) -> Result<()> {
@@ -4897,10 +4849,10 @@ fn handle_commit(
     // 3. Check for conflict markers in changed files
     for file in &changed_files {
         let p = cwd.join(file);
-        if p.is_file() {
-            if let Ok(content) = fs::read_to_string(&p) {
-                pi::commit_split::ConflictScanner::check_content(&content, file)?;
-            }
+        if p.is_file()
+            && let Ok(content) = fs::read_to_string(&p)
+        {
+            pi::commit_split::ConflictScanner::check_content(&content, file)?;
         }
     }
 
@@ -4994,12 +4946,10 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
             println!("Latest release  : v{latest_version}");
             if is_newer {
                 println!("An update is available (v{current_version} -> v{latest_version}).");
-                if manager != pi::self_update::PackageManager::Manual {
-                    if let Some(cmd) = manager.upgrade_command() {
-                        println!("Pi is installed via package manager. Run `{cmd}` to update.");
-                    }
-                } else {
+                if manager == pi::self_update::PackageManager::Manual {
                     println!("Run `pi self-update` to perform an in-place upgrade.");
+                } else if let Some(cmd) = manager.upgrade_command() {
+                    println!("Pi is installed via package manager. Run `{cmd}` to update.");
                 }
             } else {
                 println!("You are on the latest version.");
@@ -5078,7 +5028,8 @@ fn handle_review(
 }
 
 /// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.
-#[allow(clippy::too_many_arguments)]
+// The bools mirror independent `pi gc` CLI flags one-to-one.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn handle_gc(
     older_than: &str,
     keep_last: usize,

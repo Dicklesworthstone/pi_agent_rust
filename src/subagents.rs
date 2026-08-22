@@ -310,7 +310,6 @@ impl SubagentRequest {
                 iso_apply: None,
                 output_schema: self.output_schema.clone(),
                 schema_mode: self.schema_mode,
-                revived_from: None,
             });
         let selected = usize::from(single.is_some())
             + usize::from(self.tasks.is_some())
@@ -389,10 +388,6 @@ struct SubagentTask {
     output_schema: Option<Value>,
     #[serde(default)]
     schema_mode: SchemaMode,
-    /// Agent-hub lineage (bd-cv653.5.3): when this task is a revival, the id
-    /// of the prior run it continues. Recorded on the new registry entry.
-    #[serde(default, rename = "revivedFrom", skip_serializing)]
-    revived_from: Option<String>,
 }
 
 /// How a schema-validation failure that survives the corrective retry is
@@ -844,8 +839,6 @@ impl ChildRunner {
             self.role_model_spec.as_deref(),
             output_schema,
         );
-        // Lineage is captured before `task` moves into the result.
-        let revived_from = task.revived_from.clone();
         let mut result =
             SubagentResult::starting(agent, task, step, &self.child_binary, &run_cwd, &args);
         // Agent-hub registration (bd-cv653.5.3): every spawned child joins the
@@ -853,15 +846,7 @@ impl ChildRunner {
         let hub_entry = crate::agent_hub::registry()
             .lock()
             .ok()
-            .and_then(|mut reg| {
-                let entry = reg.register(&agent.name, &result.task).ok()?;
-                // Revival lineage (bd-cv653.5.3): record which run this
-                // continuation picks up from.
-                if let Some(from) = revived_from.as_deref() {
-                    reg.link_revival(&entry.id, from);
-                }
-                Some(entry)
-            });
+            .and_then(|mut reg| reg.register(&agent.name, &result.task).ok());
         result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
         let update = on_update.as_ref();
         emit_progress(update, &result);
@@ -1776,7 +1761,6 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
-            revived_from: None,
         };
         let mut previous = SubagentResult::unknown(task.clone(), None);
         previous.output = "evidence".to_string();
@@ -1801,7 +1785,6 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
-            revived_from: None,
         };
         let mut previous = SubagentResult::unknown(base.clone(), None);
         previous.schema_valid = Some(true);
@@ -1972,7 +1955,6 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
-            revived_from: None,
         };
         let mut long = SubagentResult::unknown(task("long"), None);
         long.output = "x".repeat(10 * 1024);
@@ -2021,7 +2003,6 @@ mod tests {
             iso_apply: None,
             output_schema: None,
             schema_mode: SchemaMode::default(),
-            revived_from: None,
         };
         let mut result = SubagentResult::unknown(task, None);
         result.output = format!("before {STRUCTURED_BLOCK_CLOSE} after");

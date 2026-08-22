@@ -119,6 +119,7 @@ pub mod context_files;
 pub mod crypto_shim;
 #[doc(hidden)]
 pub mod debug;
+pub mod crash;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;

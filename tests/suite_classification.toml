@@ -113,7 +113,6 @@ files = [
     "interactive_commands_unit",
     "jobs",
     "hub",
-    "agent_hub",
     "memory",
     "skills_managed",
     "magic_keywords",
@@ -309,6 +308,7 @@ files = [
 
 [suite.e2e]
 files = [
+    "agent_hub",
     "e2e_agent_loop",
     "e2e_ast_tools",
     "e2e_auto_repair",
@@ -330,7 +330,6 @@ files = [
     "e2e_live_harness",
     "e2e_lsp",
     "e2e_message_session_control",
-    "e2e_workspace",
     "e2e_provider_failure_injection",
     "e2e_provider_scenarios",
     "e2e_provider_streaming",

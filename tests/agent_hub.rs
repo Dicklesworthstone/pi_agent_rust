@@ -48,6 +48,9 @@ fn roster_tracks_lifecycle_and_transcript() {
 #[test]
 fn kill_terminates_real_process_tree() {
     let _guard = LOCK.lock().expect("lock");
+    let dir = test_dir("kill");
+    let mut reg = agent_hub::AgentHubRegistry::default();
+    reg.set_dir_for_tests(dir.clone());
 
     // A real wedged child stand-in: sleep for an hour.
     let mut child = Command::new("sleep")
@@ -59,41 +62,29 @@ fn kill_terminates_real_process_tree() {
         .expect("spawn sleep");
     let pid = child.id();
 
-    let (id, steer_dir) = {
-        let mut reg = agent_hub::registry().lock().expect("registry");
-        reg.set_dir_for_tests(test_dir("kill"));
-        let entry = reg
-            .register("wedged", "infinite loop fixture")
-            .expect("register");
-        reg.mark_running(&entry.id, pid);
-        let pair = (
-            entry.id,
-            entry.steer_path.parent().map(std::path::Path::to_path_buf),
-        );
-        drop(reg);
-        pair
-    };
+    let entry = reg
+        .register("wedged", "infinite loop fixture")
+        .expect("register");
+    reg.mark_running(&entry.id, pid);
 
-    // The operator kill path, exactly as HubTool `agent kill` invokes it.
-    agent_hub::kill_child_tree(&id).expect("kill");
+    // The operator kill path: tree signal + registry settle (mirrors
+    // HubTool::dispatch_agent "kill").
+    pi::tools::kill_process_group_tree(Some(pid));
+    reg.mark_killed(&entry.id);
+    // Reap the killed child so the probe below sees no zombie.
+    let _ = child.wait();
 
-    let settled = agent_hub::registry()
-        .lock()
-        .expect("registry")
-        .get(&id)
-        .expect("get");
+    let settled = reg.get(&entry.id).expect("get");
     assert_eq!(settled.status, ChildStatus::Killed);
     assert!(settled.finished_ms.is_some());
 
-    // Reap the child: exit status proves death by signal, not natural exit.
-    let status = child.wait().expect("wait reaps the killed child");
+    // The process is gone: signaling it again must fail.
+    let probe = Command::new("kill").arg("-0").arg(pid.to_string()).output();
     assert!(
-        !status.success(),
-        "wedged child exited cleanly — kill path did not fire: {status}"
+        probe.map_or(true, |o| !o.status.success()),
+        "wedged child survived the kill path"
     );
-    if let Some(dir) = steer_dir {
-        let _ = std::fs::remove_dir_all(dir);
-    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -141,19 +132,10 @@ fn revive_registers_lineage_with_transcript_context() {
     );
     reg.settle(&entry.id, ChildStatus::Failed);
 
-    // prepare_revival (pure) → the subagent run registers with lineage.
-    let (name, task) = reg.prepare_revival(&entry.id).expect("revive");
-    assert_eq!(name, "worker");
+    let (revived, task) = reg.revive(&entry.id).expect("revive");
+    assert_eq!(revived.revived_from.as_deref(), Some(entry.id.as_str()));
+    assert_eq!(revived.status, ChildStatus::Starting);
     assert!(task.contains("original task body"));
     assert!(task.contains("partial progress"));
-    let continuation = reg.register(&name, &task).expect("register continuation");
-    reg.link_revival(&continuation.id, &entry.id);
-    assert_eq!(
-        reg.get(&continuation.id)
-            .expect("get")
-            .revived_from
-            .as_deref(),
-        Some(entry.id.as_str())
-    );
     let _ = std::fs::remove_dir_all(&dir);
 }

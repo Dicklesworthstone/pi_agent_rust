@@ -576,8 +576,13 @@ mod file_arguments {
         let _mode_guard = UnixModeGuard::set(&path, 0o004);
         let file_args = vec![path.to_string_lossy().into_owned()];
 
-        let err = pi::tools::process_file_arguments(&file_args, harness.temp_dir(), true)
-            .expect_err("@file must enforce the selected owner permission class");
+        let err = pi::tools::process_file_arguments(
+            &file_args,
+            harness.temp_dir(),
+            true,
+            &pi::workspace::WorkspaceHandle::default(),
+        )
+        .expect_err("@file must enforce the selected owner permission class");
         let message = err.to_string();
         assert!(
             message.to_lowercase().contains("permission denied"),

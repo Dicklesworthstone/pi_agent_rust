@@ -47,96 +47,12 @@ pub trait TokenCounter: Send + Sync {
 #[cfg(feature = "bpe-tokens")]
 pub struct BpeCounter;
 
-/// Compressed table loader (bd-w8q6u): tiktoken-rs embeds the raw
-/// `.tiktoken` text (o200k 3.6 MiB + cl100k 1.7 MiB) via `include_str!`,
-/// which lands uncompressed in `__TEXT,__const`. We vendor the same tables
-/// gzip-compressed (2.4 MiB total) and inflate once at first use, cutting
-/// the bpe-tokens feature's binary cost roughly in half. Table bytes are
-/// byte-identical to tiktoken-rs 0.12.0 `assets/`; the pattern strings and
-/// special-token maps mirror `tiktoken_ext::openai_public` for that version.
-#[cfg(feature = "bpe-tokens")]
-mod compressed_tables {
-    use std::io::Read;
-    use std::sync::OnceLock;
-
-    // tiktoken-rs's `HashMap` alias is rustc-hash's FxHashMap; match it.
-    use rustc_hash::FxHashMap as HashMap;
-    use tiktoken_rs::CoreBPE;
-
-    const O200K_GZ: &[u8] = include_bytes!("../assets/tokenizer/o200k_base.tiktoken.gz");
-    const CL100K_GZ: &[u8] = include_bytes!("../assets/tokenizer/cl100k_base.tiktoken.gz");
-
-    /// cl100k pattern (tiktoken-rs 0.12.0 `openai_public::cl100k_base`).
-    const CL100K_PAT: &str = "'(?i:[sdmt]|ll|ve|re)|[^\\r\\n\\p{L}\\p{N}]?+\\p{L}++|\\p{N}{1,3}+| ?[^\\s\\p{L}\\p{N}]++[\\r\\n]*+|\\s++$|\\s*[\\r\\n]|\\s+(?!\\S)|\\s";
-
-    static O200K: OnceLock<CoreBPE> = OnceLock::new();
-    static CL100K: OnceLock<CoreBPE> = OnceLock::new();
-
-    fn inflate(gz: &[u8]) -> String {
-        let mut decoder = flate2::read::GzDecoder::new(gz);
-        let mut text = String::new();
-        decoder
-            .read_to_string(&mut text)
-            .expect("vendored tokenizer table is valid gzip");
-        text
-    }
-
-    fn parse_ranks(text: &str) -> HashMap<Vec<u8>, u32> {
-        use base64::Engine;
-        text.lines()
-            .filter_map(|line| {
-                let mut parts = line.split(' ');
-                let raw = parts.next()?;
-                let token = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
-                let rank: u32 = parts.next()?.parse().ok()?;
-                Some((token, rank))
-            })
-            .collect()
-    }
-
-    fn build(text: &str, pattern: &str, specials: &[(&str, u32)]) -> CoreBPE {
-        let encoder = parse_ranks(text);
-        let special_tokens_encoder: HashMap<String, u32> = specials
-            .iter()
-            .map(|(token, rank)| ((*token).to_string(), *rank))
-            .collect();
-        CoreBPE::new(encoder, special_tokens_encoder, pattern)
-            .expect("vendored tokenizer table parses")
-    }
-
-    pub fn o200k() -> &'static CoreBPE {
-        O200K.get_or_init(|| {
-            build(
-                &inflate(O200K_GZ),
-                tiktoken_rs::O200K_BASE_PAT_STR,
-                &[("<|endoftext|>", 199_999), ("<|endofprompt|>", 200_018)],
-            )
-        })
-    }
-
-    pub fn cl100k() -> &'static CoreBPE {
-        CL100K.get_or_init(|| {
-            build(
-                &inflate(CL100K_GZ),
-                CL100K_PAT,
-                &[
-                    ("<|endoftext|>", 100_257),
-                    ("<|fim_prefix|>", 100_258),
-                    ("<|fim_middle|>", 100_259),
-                    ("<|fim_suffix|>", 100_260),
-                    ("<|endofprompt|>", 100_276),
-                ],
-            )
-        })
-    }
-}
-
 #[cfg(feature = "bpe-tokens")]
 impl TokenCounter for BpeCounter {
     fn count(&self, text: &str, table: TokenTable) -> u64 {
         let bpe = match table {
-            TokenTable::O200k => compressed_tables::o200k(),
-            TokenTable::Cl100k => compressed_tables::cl100k(),
+            TokenTable::O200k => tiktoken_rs::o200k_base_singleton(),
+            TokenTable::Cl100k => tiktoken_rs::cl100k_base_singleton(),
         };
         bpe.encode_with_special_tokens(text).len() as u64
     }

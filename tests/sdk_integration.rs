@@ -28,6 +28,7 @@ use pi::sdk::{
 };
 use pi::session::Session;
 use pi::tools::ToolRegistry;
+use pi::turn_recovery::TurnRecoveryMode;
 use serde_json::json;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -195,7 +196,7 @@ fn run_scripted(
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -1073,7 +1074,7 @@ fn sdk_conformance_session_tool_hooks() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -1163,7 +1164,7 @@ fn sdk_conformance_combined_callback_ordering() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -1280,7 +1281,7 @@ fn sdk_continue_turn_uses_combined_listener_path() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,
@@ -1374,7 +1375,7 @@ fn sdk_continue_turn_with_abort_returns_aborted_message() {
             tool_approval: None,
             keyword_settings: None,
             max_time: None,
-            turn_recovery: Default::default(),
+            turn_recovery: TurnRecoveryMode::default(),
             approval_state: None,
             bash_settings: None,
             secrets: None,

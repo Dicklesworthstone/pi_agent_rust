@@ -3470,10 +3470,6 @@ fn expected_system_prompt(custom: &str) -> String {
 }
 
 fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
-    let cwd = Path::new(".");
-    let config = Config::default();
-    let tools = ToolRegistry::new(enabled, cwd, Some(&config));
-
     fn tool_json(tool: &dyn pi::tools::Tool) -> serde_json::Value {
         json!({
             "name": tool.name(),
@@ -3481,6 +3477,10 @@ fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
             "input_schema": tool.parameters(),
         })
     }
+
+    let cwd = Path::new(".");
+    let config = Config::default();
+    let tools = ToolRegistry::new(enabled, cwd, Some(&config));
 
     // The provider request only carries the live schema: discoverable-tier
     // tools are hidden behind the xdev dispatcher until promoted

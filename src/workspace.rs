@@ -45,15 +45,17 @@ impl PartialEq for WorkspaceHandle {
 }
 
 impl WorkspaceHandle {
-    /// The single-root handle for a session cwd.
+    /// The single-root handle for a session cwd. The primary is stored in
+    /// canonical form so every containment/dedup comparison is
+    /// canonical-vs-canonical (on macOS `/var/...` vs `/private/var/...`
+    /// would otherwise never match).
     #[must_use]
     pub fn single(cwd: &Path) -> Self {
         Self {
-            primary: Some(cwd.to_path_buf()),
+            primary: Some(safe_canonicalize(cwd)),
             additional: Arc::new(RwLock::new(Vec::new())),
         }
     }
-
     /// Add a root (`--add-dir` / `/add-dir` land here). The path is
     /// canonicalized before storage so symlink-resolved confinement checks
     /// compare like against like; duplicates (of the primary or an existing
@@ -185,7 +187,8 @@ impl WorkspaceSnapshot {
     }
 }
 
-/// Validate and canonicalize a user-supplied additional root.
+/// Validate and canonicalize a user-supplied additional root before
+/// [`WorkspaceHandle::add_root`] (bd-cv653.3.12).
 ///
 /// Adding a root grants read/write access, so the target must exist and be
 /// a directory; the returned path is the canonical form to persist in
@@ -208,13 +211,12 @@ pub fn validate_new_root(root: &Path) -> Result<PathBuf> {
     }
     Ok(safe_canonicalize(root))
 }
-
-/// THE unified confinement gate (bd-cv653.3.12).
+/// THE unified confinement gate (bd-cv653.3.12): a canonical path must sit
+/// under one of the allowed roots.
 ///
-/// A canonical path must sit under one of the allowed roots; named refusal
-/// otherwise. Callers must symlink-resolve (`safe_canonicalize`) both the
-/// path and each root before calling so escapes via symlinks cannot pass
-/// the prefix test.
+/// Named refusal otherwise. Callers must symlink-resolve
+/// (`safe_canonicalize`) both the path and each root before calling so
+/// escapes via symlinks cannot pass the prefix test.
 ///
 /// # Errors
 /// Tool error naming the offending path when outside every root.
@@ -240,7 +242,8 @@ pub fn ensure_canonical_path_allowed(
     ))
 }
 
-/// The single containment decision (bd-cv653.3.12).
+/// The single containment decision (bd-cv653.3.12): whether a canonical
+/// path sits under any of the canonical roots.
 ///
 /// Tool enforcement and the extension FS connector both call this so their
 /// prefix semantics cannot drift.
@@ -283,14 +286,12 @@ mod tests {
     #[test]
     fn add_rejects_missing_directory_fails_closed() {
         let primary = dir("reject-primary");
-        let _unused = WorkspaceHandle::single(&primary);
         let missing = std::env::temp_dir().join("pi-workspace-definitely-missing-xyz");
         // add_root itself is infallible (canonicalization degrades to
         // lexical), so fail-closed behavior lives in validate_new_root.
         let err = validate_new_root(&missing).expect_err("missing dir must fail");
         assert!(err.to_string().contains("must be an existing directory"));
     }
-
     #[test]
     fn remove_never_takes_primary_and_matches_canonically() {
         let primary = dir("rm-primary");
@@ -365,8 +366,7 @@ mod tests {
     #[test]
     fn validate_new_root_fails_closed() {
         let primary = dir("validate-primary");
-        let err =
-            validate_new_root(primary.join("missing").as_path()).expect_err("missing denied");
+        let err = validate_new_root(&primary.join("missing")).expect_err("missing denied");
         assert!(err.to_string().contains("must be an existing directory"));
         assert!(
             validate_new_root(Path::new("")).is_err(),

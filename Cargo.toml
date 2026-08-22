@@ -277,7 +277,6 @@ uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
 base64 = "0.23"
 flate2 = "1.1.9"
-rustc-hash = "2.1"
 sha2 = "0.11"
 sha1 = "0.11"
 md-5 = "0.11"

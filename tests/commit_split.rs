@@ -23,8 +23,7 @@ fn test_commit_split_category_priority() {
 
     let plan = CommitPlanner::plan(&[], &files, &options);
     let Ok(plan) = plan else {
-        assert!(false, "plan should succeed");
-        return;
+        panic!("plan should succeed");
     };
 
     assert_eq!(plan.units.len(), 4);
@@ -32,8 +31,7 @@ fn test_commit_split_category_priority() {
 
     // Headline commit should be the source file
     let Some(headline_id) = plan.headline_unit_id else {
-        assert!(false, "headline unit must be present");
-        return;
+        panic!("headline unit must be present");
     };
     assert!(headline_id.contains("lib"));
 }
@@ -93,7 +91,7 @@ fn test_conflict_marker_rejection() {
 
 #[test]
 fn test_diff_parser_hunks_extraction() {
-    let diff = r#"diff --git a/src/commit_split.rs b/src/commit_split.rs
+    let diff = r"diff --git a/src/commit_split.rs b/src/commit_split.rs
 index abc..def 100644
 --- a/src/commit_split.rs
 +++ b/src/commit_split.rs
@@ -101,7 +99,7 @@ index abc..def 100644
 +    pub name: String,
 +    pub value: usize,
  }
-"#;
+";
 
     let hunks = DiffParser::parse_unified_diff(diff);
     let Ok(hunks) = hunks else {
