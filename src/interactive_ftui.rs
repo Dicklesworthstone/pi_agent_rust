@@ -239,9 +239,15 @@ fn push_card_line(
     state: CardState,
     text: &str,
     palette: &FtuiPalette,
+    spinner_frame: usize,
 ) {
+    // Pending cards share the ONE status spinner clock (bd-cv653.9.2
+    // phase-locked feel): every live card shows the same frame each paint.
     let (glyph, style) = match state {
-        CardState::Pending => ("▸", ftui::Style::new().dim().fg(palette.accent)),
+        CardState::Pending => (
+            DOTS[spinner_frame % DOTS.len()],
+            ftui::Style::new().dim().fg(palette.accent),
+        ),
         CardState::Ok => ("✓", ftui::Style::new().fg(palette.accent)),
         CardState::Err => ("✗", ftui::Style::new().bold().fg(palette.error)),
     };
@@ -1404,7 +1410,13 @@ impl PiFtuiModel {
             Vec::with_capacity(self.conversation_line_count());
         for entry in &self.transcript {
             if let Some(state) = entry.card {
-                push_card_line(&mut lines, state, &entry.text, &palette);
+                push_card_line(
+                    &mut lines,
+                    state,
+                    &entry.text,
+                    &palette,
+                    self.spinner.current_frame,
+                );
                 continue;
             }
             push_role_block(&mut lines, entry.role, &entry.text, &palette, &md);
