@@ -1,10 +1,10 @@
 # Performance Budgets
 
-> Generated: 2026-08-21T23:36:42.256Z
+> Generated: 2026-08-22T01:20:02.027Z
 
 > Run ID: not set
 
-> Source commit: 4191408864f8a1af2f90a99a12ab5fbec059ce20
+> Source commit: e64f414cf069cb769f1033ac660a135da56b1e27
 
 > Strict mode: false
 
