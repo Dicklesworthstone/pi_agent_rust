@@ -38,18 +38,16 @@ thread_local! {
     static PANIC_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Mark the current thread's panics as expected-and-recovered for the
-/// duration of `f` (bd-ajg8l #3: background compaction and similar
-/// `catch_unwind` sites must not produce "previous run crashed" bundles).
+/// Marks the current thread's panics as expected-and-recovered.
 ///
-/// Nesting-safe per thread: suppression holds until the outermost guard
-/// drops. The panic hook still runs any previously installed hook? No — it
-/// returns early, silently, because recovery is intentional.
+/// bd-ajg8l #3: background compaction and similar `catch_unwind` sites
+/// must not produce "previous run crashed" bundles. Suppression holds for
+/// the guard's lifetime; the crash hook returns early (no bundle, no
+/// chained hook) because the recovery is intentional.
 #[must_use]
 pub struct SuppressPanicHook;
 
 impl SuppressPanicHook {
-    #[must_use]
     pub fn new() -> Self {
         PANIC_SUPPRESSED.with(|flag| flag.set(true));
         Self
@@ -241,7 +239,7 @@ pub fn install(agent_dir: &Path, session_path: Option<&Path>) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         // Recovered-internal panics (catch_unwind sites) are not crashes.
-        if PANIC_SUPPRESSED.with(|flag| flag.get()) {
+        if PANIC_SUPPRESSED.with(std::cell::Cell::get) {
             return;
         }
         let (sha, ts) = build_metadata();
@@ -497,7 +495,6 @@ mod tests {
         assert!(preview.contains(CRASH_SCHEMA));
         assert!(!preview.contains("ghp_dddddd"), "{preview}");
     }
-
 
     #[test]
     fn suppressed_panics_do_not_write_bundles() {

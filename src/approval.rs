@@ -377,20 +377,22 @@ impl ApprovalState {
         }
 
         // 4. Plan-YOLO mode (--plan-yolo):
-        // Auto-approve in-plan file writes, ask on process/network/bash execution.
+        // Auto-approve IN-PLAN file writes, ask on everything else. "In
+        // plan" is enforced against the approved plan's `Files:` scope —
+        // an approved plan for src/main.rs must not silently authorize a
+        // write to ~/.ssh/authorized_keys or .git/hooks.
         if self.plan_yolo()
             && let Some(plan) = plan_state
+            && plan.mode() == crate::plan::PlanMode::Approved
+            && (effects.writes() || effects.appends())
+            && !effects.processes()
+            && !effects.networks()
+            && plan_covers_target(plan.plan().as_deref(), tool_args)
         {
-            // If plan is approved, file mutations are auto-approved
-            if plan.mode() == crate::plan::PlanMode::Approved
-                && (effects.writes() || effects.appends())
-                && !effects.processes()
-            {
-                return ApprovalEvaluation::AutoApproved {
-                    mode,
-                    reason: "Plan-YOLO auto-approves in-plan file mutations".to_string(),
-                };
-            }
+            return ApprovalEvaluation::AutoApproved {
+                mode,
+                reason: "Plan-YOLO auto-approves in-plan file mutations".to_string(),
+            };
         }
 
         // 5. Graduated approval mode logic.
@@ -470,6 +472,75 @@ impl ApprovalState {
             }),
         }
     }
+}
+
+/// Does the approved plan's `Files:` scope cover this mutation target?
+///
+/// Fail closed: a plan with no parsable `Files:` line, or a tool call with
+/// no `path` argument, is NOT auto-approved — it falls through to the
+/// graduated approval mode (i.e. the user is asked).
+fn plan_covers_target(plan_text: Option<&str>, tool_args: &serde_json::Value) -> bool {
+    let Some(text) = plan_text else { return false };
+    let entries = parse_plan_files(text);
+    if entries.is_empty() {
+        return false;
+    }
+    let Some(path) = tool_args.get("path").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let normalized = path.trim_start_matches("./");
+    entries
+        .iter()
+        .any(|entry| plan_entry_matches(entry, normalized))
+}
+
+/// Extract the file scope from a plan's `Files:` line(s): comma or
+/// whitespace separated entries, case-insensitive key match.
+fn parse_plan_files(plan_text: &str) -> Vec<String> {
+    let mut entries = Vec::new();
+    for line in plan_text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed
+            .strip_prefix("Files:")
+            .or_else(|| trimmed.strip_prefix("files:"))
+        else {
+            continue;
+        };
+        for token in rest.split([',', ' ', '\t']) {
+            let token = token.trim().trim_start_matches("./");
+            if !token.is_empty() {
+                entries.push(token.to_string());
+            }
+        }
+    }
+    entries
+}
+
+/// Match one plan entry against a target path: exact, directory prefix, or
+/// a simple `*` glob (segments must appear in order; anchored at both ends).
+fn plan_entry_matches(entry: &str, path: &str) -> bool {
+    if entry.contains('*') {
+        let segments: Vec<&str> = entry.split('*').collect();
+        let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
+            return false;
+        };
+        if !path.starts_with(first) || !path.ends_with(last) {
+            return false;
+        }
+        let mut cursor = 0usize;
+        for segment in &segments {
+            if segment.is_empty() {
+                continue;
+            }
+            match path[cursor..].find(segment) {
+                Some(found) => cursor += found + segment.len(),
+                None => return false,
+            }
+        }
+        return true;
+    }
+    let dir_prefix = entry.trim_end_matches('/');
+    path == entry || path.starts_with(&format!("{dir_prefix}/"))
 }
 
 #[cfg(test)]
@@ -674,5 +745,47 @@ mod tests {
             None,
         );
         assert!(eval_bash.requires_approval());
+
+        // OUT-OF-PLAN writes are not covered by the approval: a plan for
+        // src/main.rs must not authorize arbitrary filesystem writes.
+        let eval_outside = state.evaluate(
+            "write",
+            &json!({"path": "/Users/x/.ssh/authorized_keys"}),
+            ToolEffects::write(),
+            Some(&plan_state),
+            None,
+        );
+        assert!(eval_outside.requires_approval());
+
+        // A write with no path argument falls through to ask as well.
+        let eval_no_path = state.evaluate(
+            "write",
+            &json!({"content": "x"}),
+            ToolEffects::write(),
+            Some(&plan_state),
+            None,
+        );
+        assert!(eval_no_path.requires_approval());
+    }
+
+    #[test]
+    fn plan_files_scope_matching() {
+        let plan =
+            "Goal: refactor\nFiles: src/main.rs, src/tools/, tests/*.rs\nVerification: cargo test";
+        let files = super::parse_plan_files(plan);
+        assert_eq!(files, vec!["src/main.rs", "src/tools/", "tests/*.rs"]);
+        let covers = |path: &str| super::plan_covers_target(Some(plan), &json!({ "path": path }));
+        assert!(covers("src/main.rs"));
+        assert!(covers("./src/main.rs"), "leading ./ normalized");
+        assert!(covers("src/tools/read.rs"), "directory prefix");
+        assert!(covers("tests/e2e.rs"), "glob");
+        assert!(!covers("src/lib.rs"));
+        assert!(!covers("tests/fixtures/e2e.json"), "glob anchored at end");
+        assert!(!covers("src/main.rs.bak"), "no partial-name match");
+        // No Files: line → fail closed.
+        assert!(!super::plan_covers_target(
+            Some("Goal: x\nVerification: y"),
+            &json!({ "path": "src/main.rs" })
+        ));
     }
 }

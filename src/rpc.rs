@@ -2018,11 +2018,9 @@ pub async fn run(
                     let collapsed = span.len();
                     if !summary.is_empty() {
                         agent_messages.push(Message::User(UserMessage {
-                            content: UserContent::Text(format!(
-                                "[REWIND REPORT: {}]\nThe span since this checkpoint was \
-                                 collapsed into this report. The full span remains in the \
-                                 session tree.\n\n{summary}",
-                                checkpoint.name
+                            content: UserContent::Text(crate::checkpoint::rewind_report_text(
+                                &checkpoint.name,
+                                &summary,
                             )),
                             timestamp: 0,
                         }));
@@ -2031,6 +2029,7 @@ pub async fn run(
                     let outcome = crate::checkpoint::RewindOutcome {
                         schema: crate::checkpoint::CHECKPOINT_SCHEMA.to_string(),
                         checkpoint: checkpoint.name.clone(),
+                        checkpoint_entry_id: checkpoint.entry_id.clone(),
                         collapsed_messages: collapsed,
                         summary: summary.clone(),
                         summary_tokens_estimate: (summary.len() / 4) as u64,
