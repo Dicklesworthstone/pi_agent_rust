@@ -643,31 +643,31 @@ impl PiFtuiModel {
     }
 
     /// Push a pending tool-execution card; the matching [`PiMsg::ToolEnd`]
-    /// flips the LAST pending card with the same name in place.
-    fn push_tool_card(&mut self, name: &str) {
-        let text = sanitize(name).into_owned();
+    /// flips the LAST pending card with the same name in place. `name` must
+    /// already be sanitized — both call sites sanitize exactly once so the
+    /// start/end forms always match.
+    fn push_tool_card(&mut self, sanitized_name: &str) {
         self.transcript.push(TranscriptEntry {
             role: EntryRole::System,
-            text,
+            text: sanitized_name.to_string(),
             card: Some(CardState::Pending),
         });
     }
 
-    /// Close the last pending tool card named `name`, falling back to a
-    /// plain trace line when no matching open card exists.
-    fn finish_tool_card(&mut self, name: &str, ok: bool) {
-        let text = sanitize(name).into_owned();
+    /// Close the last pending tool card named `sanitized_name`, falling
+    /// back to a plain trace line when no matching open card exists.
+    fn finish_tool_card(&mut self, sanitized_name: &str, ok: bool) {
         if let Some(entry) = self
             .transcript
             .iter_mut()
             .rev()
-            .find(|e| e.card == Some(CardState::Pending) && e.text == text)
+            .find(|e| e.card == Some(CardState::Pending) && e.text == sanitized_name)
         {
             entry.card = Some(if ok { CardState::Ok } else { CardState::Err });
             return;
         }
         let mark = if ok { "✓" } else { "✗" };
-        self.push_entry(EntryRole::System, format!("{mark} {text}"));
+        self.push_entry(EntryRole::System, format!("{mark} {sanitized_name}"));
     }
 
     /// Cap for `scroll_from_tail`: can't scroll further up than the content.
@@ -712,6 +712,9 @@ impl PiFtuiModel {
             PiMsg::ToolEnd { name, is_error, .. } => {
                 // The tool card flips to its terminal state in place
                 // (state-tinted seed of the bd-cv653.9.2 card framework).
+                // Sanitize ONCE here, matching ToolStart, so start/end card
+                // names always pair.
+                let name = sanitize(&name).into_owned();
                 self.finish_tool_card(&name, !is_error);
                 self.current_tool = None;
             }
@@ -906,114 +909,75 @@ impl PiFtuiModel {
         self.send_command(UiCommand::Prompt(clean));
     }
 
-    /// Slash-command routing seed (mirrors submit_message's chain; only
-    /// commands the preview can honor are wired). Returns true when the
-    /// input was consumed as a command (including local errors).
+    /// Slash-command routing. Token matching is CASE-INSENSITIVE and
+    /// alias-aware, mirroring `SlashCommand::parse` in the bubbletea stack;
+    /// unknown tokens go to extension dispatch, `/skill:` flows through as
+    /// a prompt. Returns true when the input was consumed as a command
+    /// (including local errors).
     fn route_slash_command(&mut self, clean: &str) -> bool {
-        if let Some(rest) = clean.strip_prefix("/model") {
-            self.route_model_command(rest.trim());
-            return true;
-        }
-        self.route_slash_command_tail(clean)
-    }
-
-    /// `/model` handling: bare opens the picker, `provider/model` switches.
-    fn route_model_command(&mut self, spec: &str) {
-        {
-            if spec.is_empty() {
-                // Bare /model opens the picker over the registry list.
-                if self.available_models.is_empty() {
-                    self.push_entry(
-                        EntryRole::Error,
-                        String::from("no models available; use /model <provider>/<model>"),
-                    );
+        let (token, args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        let args = args.trim();
+        match token.to_ascii_lowercase().as_str() {
+            "/model" | "/m" => {
+                self.route_model_command(args);
+                true
+            }
+            "/exit" | "/quit" | "/q" => {
+                self.pending_quit = true;
+                true
+            }
+            "/compact" => {
+                self.push_entry(
+                    EntryRole::System,
+                    String::from("compacting conversation ..."),
+                );
+                self.send_command(UiCommand::Compact);
+                true
+            }
+            "/theme" => {
+                self.picker = Some(PickerOverlay {
+                    title: String::from("Theme (Enter to apply, Esc to close)"),
+                    items: vec![String::from("dark"), String::from("light")],
+                    values: Vec::new(),
+                    selected: 0,
+                    kind: PickerKind::Theme,
+                });
+                true
+            }
+            "/resume" | "/r" => {
+                if self.available_sessions.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
                 } else {
+                    let (items, values) = self
+                        .available_sessions
+                        .iter()
+                        .map(|(label, path)| (label.clone(), path.clone()))
+                        .unzip();
                     self.picker = Some(PickerOverlay {
-                        title: String::from("Model (Enter to switch, Esc to close)"),
-                        items: self.available_models.clone(),
-                        values: Vec::new(),
+                        title: String::from("Resume session (Enter to load, Esc to close)"),
+                        items,
+                        values,
                         selected: 0,
-                        kind: PickerKind::Model,
+                        kind: PickerKind::Session,
                     });
                 }
-            } else if let Some((provider, model)) = spec.split_once('/')
-                && !provider.is_empty()
-                && !model.is_empty()
-            {
-                self.push_entry(EntryRole::System, format!("switching model to {spec} ..."));
-                self.send_command(UiCommand::SetModel {
-                    provider: provider.to_string(),
-                    model: model.to_string(),
-                });
-            } else {
+                true
+            }
+            "/help" | "/h" | "/?" => {
                 self.push_entry(
-                    EntryRole::Error,
-                    String::from("usage: /model <provider>/<model>"),
+                    EntryRole::System,
+                    String::from(
+                        "ftui preview commands: /model [provider/model], /resume, /compact, \
+                         /theme, /new, /clear, /session, /tree, /thinking [level], \
+                         /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
+                         agent), !!<cmd> (display-only)",
+                    ),
                 );
+                true
             }
-        }
-    }
-
-    /// Remaining slash routing after `/model`.
-    fn route_slash_command_tail(&mut self, clean: &str) -> bool {
-        if clean == "/exit" || clean == "/quit" {
-            self.pending_quit = true;
-            return true;
-        }
-        if clean == "/compact" {
-            self.push_entry(
-                EntryRole::System,
-                String::from("compacting conversation ..."),
-            );
-            self.send_command(UiCommand::Compact);
-            return true;
-        }
-        if clean == "/theme" {
-            self.picker = Some(PickerOverlay {
-                title: String::from("Theme (Enter to apply, Esc to close)"),
-                items: vec![String::from("dark"), String::from("light")],
-                values: Vec::new(),
-                selected: 0,
-                kind: PickerKind::Theme,
-            });
-            return true;
-        }
-        if clean == "/resume" {
-            if self.available_sessions.is_empty() {
-                self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
-            } else {
-                let (items, values) = self
-                    .available_sessions
-                    .iter()
-                    .map(|(label, path)| (label.clone(), path.clone()))
-                    .unzip();
-                self.picker = Some(PickerOverlay {
-                    title: String::from("Resume session (Enter to load, Esc to close)"),
-                    items,
-                    values,
-                    selected: 0,
-                    kind: PickerKind::Session,
-                });
-            }
-            return true;
-        }
-        if clean == "/help" {
-            self.push_entry(
-                EntryRole::System,
-                String::from(
-                    "ftui preview commands: /model [provider/model], /resume, /compact, \
-                     /theme, /new, /clear, /session, /tree, /thinking [level], \
-                     /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
-                     agent), !!<cmd> (display-only)",
-                ),
-            );
-            return true;
-        }
-        let (cmd_name, cmd_args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
-        match cmd_name {
             "/new" => {
                 self.send_command(UiCommand::NewSession);
-                return true;
+                true
             }
             "/clear" | "/cls" => {
                 // Display-only clear (SlashCommand::Clear parity): the
@@ -1026,56 +990,55 @@ impl PiFtuiModel {
                 self.current_tool = None;
                 self.scroll_from_tail = 0;
                 self.push_entry(EntryRole::System, String::from("Conversation cleared"));
-                return true;
+                true
             }
             "/session" | "/info" => {
                 self.send_command(UiCommand::SessionInfo);
-                return true;
+                true
             }
             "/tree" => {
                 self.send_command(UiCommand::TreeSummary);
-                return true;
+                true
             }
             "/thinking" | "/think" | "/t" => {
-                let value = cmd_args.trim();
-                if value.is_empty() {
+                if args.is_empty() {
                     self.send_command(UiCommand::SetThinking(None));
                     return true;
                 }
-                match value.parse::<crate::model::ThinkingLevel>() {
+                match args.parse::<crate::model::ThinkingLevel>() {
                     Ok(level) => self.send_command(UiCommand::SetThinking(Some(level))),
                     Err(err) => self.push_entry(EntryRole::Error, err),
                 }
-                return true;
+                true
             }
             "/name" => {
-                let name = cmd_args.trim();
-                if name.is_empty() {
+                if args.is_empty() {
                     self.push_entry(EntryRole::Error, String::from("Usage: /name <name>"));
                 } else {
-                    self.send_command(UiCommand::SetName(name.to_string()));
+                    self.send_command(UiCommand::SetName(args.to_string()));
                 }
-                return true;
+                true
             }
-            _ => {}
-        }
-        if !clean.starts_with("/skill:") {
-            // Anything else may be an extension-registered command; the
-            // driver checks registration and reports unknown ones.
-            let body = clean.trim_start_matches('/');
-            let (name, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
-            if name.is_empty() {
-                self.push_entry(EntryRole::Error, String::from("Unknown command: /"));
-            } else {
-                self.send_command(UiCommand::ExtensionCommand {
-                    name: name.to_string(),
-                    args: args.trim().to_string(),
-                });
+            _ => {
+                if clean.starts_with("/skill:") {
+                    // /skill: inputs flow through to the agent as prompts.
+                    return false;
+                }
+                // Anything else may be an extension-registered command; the
+                // driver checks registration and reports unknown ones.
+                let body = clean.trim_start_matches('/');
+                let (name, ext_args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+                if name.is_empty() {
+                    self.push_entry(EntryRole::Error, String::from("Unknown command: /"));
+                } else {
+                    self.send_command(UiCommand::ExtensionCommand {
+                        name: name.to_string(),
+                        args: ext_args.trim().to_string(),
+                    });
+                }
+                true
             }
-            return true;
         }
-        // /skill: inputs flow through to the agent as prompts.
-        false
     }
 
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
@@ -3670,6 +3633,38 @@ mod tests {
         assert!(
             rendered.contains("✗ edit"),
             "error glyph missing: {rendered:?}"
+        );
+    }
+    #[test]
+    fn slash_commands_are_case_insensitive_with_aliases() {
+        // Token matching lowercases like SlashCommand::parse; aliases /q,
+        // /r, /h, /? and /m ride along for free.
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        type_str(&mut sim, "/Q");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(sim.model().pending_quit, "uppercase /Q must quit");
+        type_str(&mut sim, "/H");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("ftui preview commands")),
+            "uppercase /H must show help"
+        );
+        // Bare /M with no models errors locally instead of reaching a driver.
+        type_str(&mut sim, "/M");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("no models available")),
+            "uppercase /M must hit the model path"
         );
     }
 }

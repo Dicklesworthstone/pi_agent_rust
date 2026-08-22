@@ -56,10 +56,11 @@ pub struct BpeCounter;
 /// special-token maps mirror `tiktoken_ext::openai_public` for that version.
 #[cfg(feature = "bpe-tokens")]
 mod compressed_tables {
-    use std::collections::HashMap;
     use std::io::Read;
     use std::sync::OnceLock;
 
+    // tiktoken-rs's `HashMap` alias is rustc-hash's FxHashMap; match it.
+    use rustc_hash::FxHashMap as HashMap;
     use tiktoken_rs::CoreBPE;
 
     const O200K_GZ: &[u8] = include_bytes!("../assets/tokenizer/o200k_base.tiktoken.gz");
