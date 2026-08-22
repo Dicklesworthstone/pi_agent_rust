@@ -412,6 +412,13 @@ pub enum UiCommand {
     SetThinking(Option<crate::model::ThinkingLevel>),
     /// Set the session display name (`/name <name>`).
     SetName(String),
+    /// Grant access to an additional workspace root
+    /// (`/add-dir <dir>`, bd-cv653.3.12).
+    AddDir { dir: String },
+    /// Revoke an additional workspace root (`/remove-dir <dir>`).
+    RemoveDir { dir: String },
+    /// Crash bundle management (`/crash list|show|delete`, bd-cv653.7.12).
+    Crash { action: String },
 }
 
 /// Match `input` against a slash command name: returns the argument tail for
@@ -1068,6 +1075,32 @@ impl PiFtuiModel {
     /// Remaining slash routing after `/model`.
     fn route_slash_command_tail(&mut self, clean: &str) -> bool {
         // Case-insensitive tokens (SlashCommand::parse parity): compare on
+        if let Some(rest) = strip_command(clean, "/add-dir") {
+            self.push_entry(
+                EntryRole::System,
+                format!("adding workspace root {} ...", rest.trim()),
+            );
+            self.send_command(UiCommand::AddDir {
+                dir: rest.trim().to_string(),
+            });
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/remove-dir") {
+            self.push_entry(
+                EntryRole::System,
+                format!("removing workspace root {} ...", rest.trim()),
+            );
+            self.send_command(UiCommand::RemoveDir {
+                dir: rest.trim().to_string(),
+            });
+            return true;
+        }
+        if let Some(rest) = strip_command(clean, "/crash") {
+            self.send_command(UiCommand::Crash {
+                action: rest.trim().to_ascii_lowercase(),
+            });
+            return true;
+        }
         // an ASCII-lowercased copy; args keep their original case.
         let canon = clean.to_ascii_lowercase();
         if canon == "/exit" || canon == "/quit" || canon == "/q" {
@@ -3996,5 +4029,36 @@ mod tests {
             "error glyph missing: {rendered:?}"
         );
         assert!(rendered.contains("line-one"), "folded detail missing");
+    }
+    #[test]
+    fn agent_error_pins_banner_and_send_dismisses() {
+        let (_agent_tx, rx) = mpsc::channel();
+        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
+        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentError(String::from("boom"))));
+        assert_eq!(
+            sim.model().error_banner.as_deref(),
+            Some("boom"),
+            "AgentError pins the banner"
+        );
+        // Not duplicated into the transcript.
+        assert!(
+            !sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.text.contains("boom"))
+        );
+        let rendered = buffer_text(sim.capture_frame(60, 12), 60, 12);
+        assert!(rendered.contains("✗ boom"), "banner missing: {rendered:?}");
+        // The next sent input dismisses it and still routes the prompt.
+        type_str(&mut sim, "hi");
+        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
+        assert_eq!(sim.model().error_banner, None, "send must dismiss");
+        assert_eq!(
+            submit_rx.try_recv().expect("routed"),
+            UiCommand::Prompt(String::from("hi"))
+        );
     }
 }
