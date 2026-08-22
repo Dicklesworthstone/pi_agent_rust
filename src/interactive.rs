@@ -2342,6 +2342,9 @@ pub struct PiApp {
     /// Set to false when the user manually scrolls up; re-enabled when they
     /// scroll back to the bottom or a new user message is submitted.
     follow_stream_tail: bool,
+    /// `/btw` side-question client on the smol role (bd-cv653.3.16);
+    /// `None` when the role does not resolve or lacks credentials.
+    btw_client: Option<Arc<pi::btw::BtwClient>>,
     spinner: SpinnerModel,
     agent_state: AgentState,
 
@@ -2516,6 +2519,11 @@ impl PiApp {
         &self.workspace
     }
 
+
+    /// Attach the `/btw` side-question client (bd-cv653.3.16).
+    pub fn set_btw_client(&mut self, client: Arc<pi::btw::BtwClient>) {
+        self.btw_client = Some(client);
+    }
     fn initial_window_size_cmd() -> Cmd {
         Cmd::new(|| {
             let (width, height) = terminal::size().unwrap_or((80, 24));
@@ -2712,6 +2720,7 @@ impl PiApp {
             injected_queue: Arc::clone(&injected_queue),
             conversation_viewport,
             follow_stream_tail: true,
+            btw_client: None,
             spinner,
             agent_state: AgentState::Idle,
             term_width,

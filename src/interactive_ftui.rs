@@ -3131,6 +3131,7 @@ mod tests {
             name: "bash".into(),
             tool_id: "t1".into(),
             is_error: false,
+            output: None,
         }));
         let rendered = buffer_text(sim.capture_frame(40, 8), 40, 8);
         assert!(
@@ -3146,6 +3147,7 @@ mod tests {
             name: "edit".into(),
             tool_id: "t2".into(),
             is_error: true,
+            output: None,
         }));
         assert!(
             sim.model()
@@ -4178,6 +4180,7 @@ mod tests {
             name: "bash".into(),
             tool_id: "t1".into(),
             is_error: false,
+            output: None,
         }));
         assert!(
             sim.model()
@@ -4194,6 +4197,7 @@ mod tests {
             name: "edit".into(),
             tool_id: "t2".into(),
             is_error: true,
+            output: None,
         }));
         assert!(
             sim.model()
