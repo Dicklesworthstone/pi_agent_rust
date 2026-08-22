@@ -35,7 +35,7 @@
             {
               "content": [
                 {
-                  "text": "Reply with: 😀 你好 שלום",
+                  "text": "Reply with: \ud83d\ude00 \u4f60\u597d \u05e9\u05dc\u05d5\u05dd",
                   "type": "text"
                 }
               ],
@@ -44,7 +44,12 @@
           ],
           "model": "claude-sonnet-4-20250514",
           "stream": true,
-          "system": "You are a test harness model. Follow instructions precisely and deterministically.",
+          "system": [
+            {
+              "text": "You are a test harness model. Follow instructions precisely and deterministically.",
+              "type": "text"
+            }
+          ],
           "temperature": 0.0
         }
       },
@@ -110,8 +115,8 @@
         ],
         "body_chunks": [
           "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-20250514\",\"id\":\"msg_01MthdmJLQ1FHZ6BAP6jHBAg\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":35,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"cache_creation\":{\"ephemeral_5m_input_tokens\":0,\"ephemeral_1h_input_tokens\":0},\"output_tokens\":8,\"service_tier\":\"standard\"}}        }\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}            }\n\n",
-          "event: ping\ndata: {\"type\": \"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"😀 你好 ש\"}     }\n\n",
-          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"לום\"}              }\n\n",
+          "event: ping\ndata: {\"type\": \"ping\"}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\ud83d\ude00 \u4f60\u597d \u05e9\"}     }\n\n",
+          "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"\u05dc\u05d5\u05dd\"}              }\n\n",
           "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0         }\n\n",
           "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":35,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":13}      }\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"         }\n\n"
         ]
