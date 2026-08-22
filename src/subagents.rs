@@ -885,10 +885,10 @@ impl ChildRunner {
         let mut child = ChildProcessGuard::new(child);
         result.pid = Some(child.id());
         result.status = SubagentStatus::Running;
-        if let Some(hub_id) = &result.hub_id {
-            if let Ok(mut reg) = crate::agent_hub::registry().lock() {
-                reg.mark_running(hub_id, child.id());
-            }
+        if let Some(hub_id) = &result.hub_id
+            && let Ok(mut reg) = crate::agent_hub::registry().lock()
+        {
+            reg.mark_running(hub_id, child.id());
         }
         emit_progress(update, &result);
 
@@ -948,19 +948,19 @@ impl ChildRunner {
         child.disarm();
         // Hub settle (bd-cv653.5.3): operator kill (already recorded) beats
         // exit-code inference; otherwise map the run outcome.
-        if let Some(hub_id) = &result.hub_id {
-            if let Ok(mut reg) = crate::agent_hub::registry().lock() {
-                let prior = reg.get(hub_id).map(|entry| entry.status);
-                if prior != Some(crate::agent_hub::ChildStatus::Killed) {
-                    let status = match result.status {
-                        SubagentStatus::Completed => Some(crate::agent_hub::ChildStatus::Done),
-                        SubagentStatus::Cancelled => Some(crate::agent_hub::ChildStatus::Cancelled),
-                        SubagentStatus::Failed => Some(crate::agent_hub::ChildStatus::Failed),
-                        SubagentStatus::Starting | SubagentStatus::Running => None,
-                    };
-                    if let Some(status) = status {
-                        reg.settle(hub_id, status);
-                    }
+        if let Some(hub_id) = &result.hub_id
+            && let Ok(mut reg) = crate::agent_hub::registry().lock()
+        {
+            let prior = reg.get(hub_id).map(|entry| entry.status);
+            if prior != Some(crate::agent_hub::ChildStatus::Killed) {
+                let status = match result.status {
+                    SubagentStatus::Completed => Some(crate::agent_hub::ChildStatus::Done),
+                    SubagentStatus::Cancelled => Some(crate::agent_hub::ChildStatus::Cancelled),
+                    SubagentStatus::Failed => Some(crate::agent_hub::ChildStatus::Failed),
+                    SubagentStatus::Starting | SubagentStatus::Running => None,
+                };
+                if let Some(status) = status {
+                    reg.settle(hub_id, status);
                 }
             }
         }
@@ -1496,12 +1496,11 @@ fn drain_child_frames(
     while let Ok(frame) = rx.try_recv() {
         // Hub transcript persistence (bd-cv653.5.3): raw stdout frames land
         // in the child's session-scoped transcript file for roster paging.
-        if matches!(frame.kind, PipeKind::Stdout) {
-            if let (Some(hub_id), Ok(mut reg)) =
+        if matches!(frame.kind, PipeKind::Stdout)
+            && let (Some(hub_id), Ok(mut reg)) =
                 (result.hub_id.as_ref(), crate::agent_hub::registry().lock())
-            {
-                reg.append_transcript(hub_id, &frame.line);
-            }
+        {
+            reg.append_transcript(hub_id, &frame.line);
         }
         match frame.kind {
             PipeKind::Stderr => append_bounded_line(&mut result.stderr, &frame.line),

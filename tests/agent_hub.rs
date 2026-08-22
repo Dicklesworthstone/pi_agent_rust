@@ -53,7 +53,7 @@ fn kill_terminates_real_process_tree() {
     reg.set_dir_for_tests(dir.clone());
 
     // A real wedged child stand-in: sleep for an hour.
-    let child = Command::new("sleep")
+    let mut child = Command::new("sleep")
         .arg("3600")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -62,13 +62,17 @@ fn kill_terminates_real_process_tree() {
         .expect("spawn sleep");
     let pid = child.id();
 
-    let entry = reg.register("wedged", "infinite loop fixture").expect("register");
+    let entry = reg
+        .register("wedged", "infinite loop fixture")
+        .expect("register");
     reg.mark_running(&entry.id, pid);
 
     // The operator kill path: tree signal + registry settle (mirrors
     // HubTool::dispatch_agent "kill").
     pi::tools::kill_process_group_tree(Some(pid));
     reg.mark_killed(&entry.id);
+    // Reap the killed child so the probe below sees no zombie.
+    let _ = child.wait();
 
     let settled = reg.get(&entry.id).expect("get");
     assert_eq!(settled.status, ChildStatus::Killed);
@@ -77,7 +81,7 @@ fn kill_terminates_real_process_tree() {
     // The process is gone: signaling it again must fail.
     let probe = Command::new("kill").arg("-0").arg(pid.to_string()).output();
     assert!(
-        probe.map(|o| !o.status.success()).unwrap_or(true),
+        probe.map_or(true, |o| !o.status.success()),
         "wedged child survived the kill path"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -118,9 +122,14 @@ fn revive_registers_lineage_with_transcript_context() {
     let mut reg = agent_hub::AgentHubRegistry::default();
     reg.set_dir_for_tests(dir.clone());
 
-    let entry = reg.register("worker", "original task body").expect("register");
+    let entry = reg
+        .register("worker", "original task body")
+        .expect("register");
     reg.mark_running(&entry.id, 55);
-    reg.append_transcript(&entry.id, "{\"type\":\"message_end\",\"text\":\"partial progress\"}");
+    reg.append_transcript(
+        &entry.id,
+        "{\"type\":\"message_end\",\"text\":\"partial progress\"}",
+    );
     reg.settle(&entry.id, ChildStatus::Failed);
 
     let (revived, task) = reg.revive(&entry.id).expect("revive");

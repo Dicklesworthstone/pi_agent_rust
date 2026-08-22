@@ -1624,18 +1624,18 @@ async fn run(
             if let Err(err) = pi::workspace::validate_new_root(&root) {
                 eprintln!("Warning: skipping restored workspace root: {err}");
             } else {
-                workspace.add_root(root);
+                workspace.add_root(&root);
             }
         }
         if !cli.add_dir.is_empty() {
             for dir in &cli.add_dir {
                 let canonical = pi::workspace::validate_new_root(dir)
                     .map_err(|e| anyhow::anyhow!("--add-dir: {e}"))?;
-                workspace.add_root(canonical);
+                workspace.add_root(&canonical);
             }
         }
         let snapshot = workspace.snapshot_or(&cwd);
-        let additional = snapshot.additional().to_vec();
+        let additional = snapshot.additional();
         if !additional.is_empty() || !cli.add_dir.is_empty() {
             session.set_additional_roots(additional);
         }
@@ -1824,7 +1824,7 @@ async fn run(
                             .with_timeout(std::time::Duration::from_secs(
                                 config.advisor_timeout_secs(),
                             ))
-                            .with_api_key(key.clone()),
+                            .with_api_key(key),
                     );
                 }
                 Err(err) => {
@@ -2244,7 +2244,7 @@ async fn run(
             .collect::<Vec<_>>();
         let title_model_entry = pi::app::titling_model_entry(&cli, &config, &model_registry);
 
-        run_interactive_mode(
+        Box::pin(run_interactive_mode(
             agent_session,
             initial,
             messages,
@@ -2261,7 +2261,7 @@ async fn run(
             workspace.clone(),
             ask_tool,
             Some(mcp_manager),
-        )
+        ))
         .await
     } else {
         // Agent-hub steering (bd-cv653.5.3): when this process is a subagent
@@ -2279,7 +2279,9 @@ async fn run(
                                 content: pi::model::UserContent::Text(body),
                                 timestamp: std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| d.as_millis() as i64),
+                                    .map_or(0, |d| {
+                                        i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+                                    }),
                             })
                         })
                         .collect()
@@ -4847,10 +4849,10 @@ fn handle_commit(
     // 3. Check for conflict markers in changed files
     for file in &changed_files {
         let p = cwd.join(file);
-        if p.is_file() {
-            if let Ok(content) = fs::read_to_string(&p) {
-                pi::commit_split::ConflictScanner::check_content(&content, file)?;
-            }
+        if p.is_file()
+            && let Ok(content) = fs::read_to_string(&p)
+        {
+            pi::commit_split::ConflictScanner::check_content(&content, file)?;
         }
     }
 
@@ -4944,12 +4946,10 @@ async fn handle_self_update(version: Option<&str>, check: bool) -> Result<()> {
             println!("Latest release  : v{latest_version}");
             if is_newer {
                 println!("An update is available (v{current_version} -> v{latest_version}).");
-                if manager != pi::self_update::PackageManager::Manual {
-                    if let Some(cmd) = manager.upgrade_command() {
-                        println!("Pi is installed via package manager. Run `{cmd}` to update.");
-                    }
-                } else {
+                if manager == pi::self_update::PackageManager::Manual {
                     println!("Run `pi self-update` to perform an in-place upgrade.");
+                } else if let Some(cmd) = manager.upgrade_command() {
+                    println!("Pi is installed via package manager. Run `{cmd}` to update.");
                 }
             } else {
                 println!("You are on the latest version.");
@@ -5028,7 +5028,8 @@ fn handle_review(
 }
 
 /// `pi gc` (bd-cv653.7.11): retention-policy pruning for sessions, artifacts, and caches.
-#[allow(clippy::too_many_arguments)]
+// The bools mirror independent `pi gc` CLI flags one-to-one.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn handle_gc(
     older_than: &str,
     keep_last: usize,

@@ -24842,8 +24842,8 @@ mod tests {
         for (name, expected_len, expected_sha256) in [
             (
                 "node:fs",
-                56_871,
-                "2d07554c39973bfda483a57f7b870916af4950581ab890741fe5203c77bddb78",
+                56_916,
+                "5007b4eba74659801fff93fdb60da9b6b83457049459cdb9882ee93550b0be48",
             ),
             (
                 "@mariozechner/pi-ai",

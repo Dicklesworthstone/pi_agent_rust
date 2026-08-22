@@ -8140,7 +8140,7 @@ impl HubTool {
                     .clone()
                     .unwrap_or_else(|| "roster".to_string())
                     .to_ascii_lowercase();
-                self.dispatch_agent(&action, input)?
+                Self::dispatch_agent(&action, input)?
             }
             other => {
                 return Err(Error::validation(format!(
@@ -8154,11 +8154,8 @@ impl HubTool {
 
     /// Agent-hub action group (bd-cv653.5.3): roster / transcript / steer /
     /// kill / revive / send / inbox over this session's subagent children.
-    fn dispatch_agent(
-        &self,
-        action: &str,
-        input: &HubInput,
-    ) -> Result<(String, serde_json::Value)> {
+    #[allow(clippy::too_many_lines)] // Cohesive action dispatcher: one arm per hub op.
+    fn dispatch_agent(action: &str, input: &HubInput) -> Result<(String, serde_json::Value)> {
         let id_required = |action: &str| -> Result<String> {
             input
                 .name
@@ -11592,7 +11589,6 @@ impl LsTool {
         }
     }
     #[cfg(test)]
-
     fn with_after_scope_hook(
         cwd: &Path,
         after_scope_hook: impl Fn() + Send + Sync + 'static,
@@ -12434,7 +12430,7 @@ pub fn kill_process_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, false);
 }
 
-pub(crate) fn kill_process_group_tree(pid: Option<u32>) {
+pub fn kill_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, true);
 }
 
@@ -16190,7 +16186,7 @@ mod tests {
 
         let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
         let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
-        handle.add_root(canonical);
+        handle.add_root(&canonical);
 
         let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
         let outside_path = outside

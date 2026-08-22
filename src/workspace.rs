@@ -45,11 +45,14 @@ impl PartialEq for WorkspaceHandle {
 }
 
 impl WorkspaceHandle {
-    /// The single-root handle for a session cwd.
+    /// The single-root handle for a session cwd. The primary is stored in
+    /// canonical form so every containment/dedup comparison is
+    /// canonical-vs-canonical (on macOS `/var/...` vs `/private/var/...`
+    /// would otherwise never match).
     #[must_use]
     pub fn single(cwd: &Path) -> Self {
         Self {
-            primary: Some(cwd.to_path_buf()),
+            primary: Some(safe_canonicalize(cwd)),
             additional: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -58,8 +61,8 @@ impl WorkspaceHandle {
     /// compare like against like; duplicates (of the primary or an existing
     /// additional root) are ignored. Validate user input with
     /// [`validate_new_root`] first when it must fail loudly.
-    pub fn add_root(&mut self, root: PathBuf) {
-        let canonical = safe_canonicalize(&root);
+    pub fn add_root(&mut self, root: &Path) {
+        let canonical = safe_canonicalize(root);
         if self
             .primary
             .as_ref()
@@ -70,7 +73,7 @@ impl WorkspaceHandle {
         let mut guard = self
             .additional
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !guard.contains(&canonical) {
             guard.push(canonical);
         }
@@ -84,7 +87,7 @@ impl WorkspaceHandle {
         let mut guard = self
             .additional
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = guard.len();
         guard.retain(|existing| existing != &canonical);
         before != guard.len()
@@ -105,10 +108,10 @@ impl WorkspaceHandle {
     /// Canonical additional roots in insertion order (primary excluded).
     #[must_use]
     pub fn additional_roots(&self) -> Vec<PathBuf> {
-        self.additional
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+        self.additional.read().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |guard| guard.clone(),
+        )
     }
 
     /// Whether `path` sits under any configured root. An identity handle
@@ -120,10 +123,10 @@ impl WorkspaceHandle {
             return true;
         }
         let canonical = safe_canonicalize(path);
-        if let Some(primary) = &self.primary {
-            if canonical.starts_with(primary) {
-                return true;
-            }
+        if let Some(primary) = &self.primary
+            && canonical.starts_with(primary)
+        {
+            return true;
         }
         self.additional_roots()
             .iter()
@@ -185,9 +188,11 @@ impl WorkspaceSnapshot {
 }
 
 /// Validate and canonicalize a user-supplied additional root before
-/// [`WorkspaceHandle::add_root`] (bd-cv653.3.12). Adding a root grants
-/// read/write access, so the target must exist and be a directory; the
-/// returned path is the canonical form to persist in session headers.
+/// [`WorkspaceHandle::add_root`] (bd-cv653.3.12).
+///
+/// Adding a root grants read/write access, so the target must exist and be
+/// a directory; the returned path is the canonical form to persist in
+/// session headers.
 ///
 /// # Errors
 /// Validation error naming the offending path when it is empty, missing, or
@@ -207,9 +212,11 @@ pub fn validate_new_root(root: &Path) -> Result<PathBuf> {
     Ok(safe_canonicalize(root))
 }
 /// THE unified confinement gate (bd-cv653.3.12): a canonical path must sit
-/// under one of the allowed roots. Named refusal otherwise. Callers must
-/// symlink-resolve (`safe_canonicalize`) both the path and each root before
-/// calling so escapes via symlinks cannot pass the prefix test.
+/// under one of the allowed roots.
+///
+/// Named refusal otherwise. Callers must symlink-resolve
+/// (`safe_canonicalize`) both the path and each root before calling so
+/// escapes via symlinks cannot pass the prefix test.
 ///
 /// # Errors
 /// Tool error naming the offending path when outside every root.
@@ -236,9 +243,10 @@ pub fn ensure_canonical_path_allowed(
 }
 
 /// The single containment decision (bd-cv653.3.12): whether a canonical
-/// path sits under any of the canonical roots. Tool enforcement and the
-/// extension FS connector both call this so their prefix semantics cannot
-/// drift.
+/// path sits under any of the canonical roots.
+///
+/// Tool enforcement and the extension FS connector both call this so their
+/// prefix semantics cannot drift.
 #[must_use]
 pub fn any_root_contains(roots: &[PathBuf], canonical_path: &Path) -> bool {
     roots
@@ -264,13 +272,13 @@ mod tests {
         let extra = dir("extra");
         let mut handle = WorkspaceHandle::single(&primary);
 
-        handle.add_root(extra.clone());
+        handle.add_root(&extra);
         assert_eq!(handle.additional_roots().len(), 1);
         // Re-adding the same root (nested lexical form) is a no-op.
-        handle.add_root(extra.join("."));
+        handle.add_root(&extra.join("."));
         assert_eq!(handle.additional_roots().len(), 1);
         // The primary never lands in additional.
-        handle.add_root(primary.clone());
+        handle.add_root(&primary);
         assert_eq!(handle.additional_roots().len(), 1);
         assert_eq!(handle.roots().len(), 2);
     }
@@ -289,12 +297,12 @@ mod tests {
         let primary = dir("rm-primary");
         let extra = dir("rm-extra");
         let mut handle = WorkspaceHandle::single(&primary);
-        handle.add_root(extra.clone());
+        handle.add_root(&extra);
 
         assert!(handle.remove_root(&extra));
         assert!(handle.additional_roots().is_empty());
         // Dot-segment lexical form still matches canonically.
-        handle.add_root(extra.clone());
+        handle.add_root(&extra);
         assert!(handle.remove_root(&extra.join("sub").join("..")));
         assert!(!handle.remove_root(&primary), "primary removal refused");
         assert!(handle.is_within(&primary));
@@ -305,7 +313,7 @@ mod tests {
         let primary = dir("contain-primary");
         let extra = dir("contain-extra");
         let mut handle = WorkspaceHandle::single(&primary);
-        handle.add_root(extra.clone());
+        handle.add_root(&extra);
 
         let inside_primary = safe_canonicalize(primary.join("a.txt").as_path());
         let inside_extra = safe_canonicalize(extra.join("b.txt").as_path());
@@ -337,7 +345,7 @@ mod tests {
         let snapshot = handle.snapshot_or(&cwd);
         assert_eq!(snapshot.primary(), cwd.as_path());
         assert!(snapshot.additional().is_empty());
-        assert_eq!(snapshot.all(), vec![cwd.clone()]);
+        assert_eq!(snapshot.all(), vec![cwd]);
     }
 
     #[test]
@@ -345,7 +353,7 @@ mod tests {
         let primary = dir("shared-primary");
         let extra = dir("shared-extra");
         let mut handle = WorkspaceHandle::single(&primary);
-        handle.add_root(extra.clone());
+        handle.add_root(&extra);
 
         let cloned = handle.clone();
         let inside_extra = safe_canonicalize(extra.join("f.txt").as_path());
