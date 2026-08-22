@@ -392,12 +392,12 @@ impl Default for SessionOptions {
             session_path: None,
             session_dir: None,
             extension_paths: Vec::new(),
+            extension_policy: None,
             tool_factory: None,
             workspace: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
-            tool_factory: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
@@ -460,6 +460,9 @@ pub struct AgentSessionHandle {
     /// resolve pending cards via `respond_ui` — without it the tool falls
     /// back to its non-interactive policy.
     ask_tool: Option<crate::ask::AskTool>,
+    /// Multi-root workspace handle when the session was created with one
+    /// (bd-cv653.3.12). Clones share the live root set.
+    workspace: Option<crate::workspace::WorkspaceHandle>,
 }
 
 /// Snapshot of the current agent session state.
@@ -1260,6 +1263,7 @@ impl AgentSessionHandle {
             session,
             listeners,
             ask_tool: None,
+            workspace: None,
         }
     }
 
@@ -1269,6 +1273,13 @@ impl AgentSessionHandle {
     #[must_use]
     pub fn ask_tool(&self) -> Option<crate::ask::AskTool> {
         self.ask_tool.clone()
+    }
+
+    /// Multi-root workspace handle, when the session was created with one
+    /// (bd-cv653.3.12). Clones share the live root set.
+    #[must_use]
+    pub fn workspace(&self) -> Option<crate::workspace::WorkspaceHandle> {
+        self.workspace.clone()
     }
 
     /// Send one user prompt through the agent loop.
@@ -2013,11 +2024,11 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     listeners.on_tool_start = options.on_tool_start;
     listeners.on_tool_end = options.on_tool_end;
     listeners.on_stream_event = options.on_stream_event;
-
     Ok(AgentSessionHandle {
         session: agent_session,
         listeners,
         ask_tool: ask_tool_handle,
+        workspace: options.workspace.clone(),
     })
 }
 
