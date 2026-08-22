@@ -502,6 +502,52 @@ impl PackageManager {
         self.resolve_package_resources_with_roots_blocking(&roots)
     }
 
+    /// Light extension-only discovery for the SDK's session auto-load:
+    /// configured packages via the blocking fast path plus auto-discovered
+    /// extension dirs (global + project) with settings override filtering.
+    /// Never installs or touches the network — npm/git package sources
+    /// contribute only when already installed (fast-path `Ok(None)`
+    /// degrades to the auto dirs alone). Only enabled entries are returned.
+    #[must_use]
+    pub fn discover_extensions_blocking(&self) -> Vec<PathBuf> {
+        let roots = ResolveRoots::from_env(&self.cwd);
+        let mut out = Vec::new();
+
+        if let Ok(Some(resolved)) = self.resolve_package_resources_with_roots_blocking(&roots) {
+            out.extend(
+                resolved
+                    .extensions
+                    .into_iter()
+                    .filter(|r| r.enabled)
+                    .map(|r| r.path),
+            );
+        }
+
+        if let (Ok(global), Ok(project)) = (
+            read_settings_snapshot(&roots.global_settings_path),
+            read_project_settings_snapshot(&roots),
+        ) {
+            let mut accumulator = ResourceAccumulator::new();
+            self.add_auto_discovered_resources(
+                &mut accumulator,
+                &global,
+                &project,
+                &roots.global_base_dir,
+                &roots.project_base_dir,
+                roots.project_settings_enabled,
+            );
+            out.extend(
+                accumulator
+                    .into_resolved_paths()
+                    .extensions
+                    .into_iter()
+                    .filter(|r| r.enabled)
+                    .map(|r| r.path),
+            );
+        }
+        out
+    }
+
     fn resolve_package_resources_with_roots_blocking(
         &self,
         roots: &ResolveRoots,

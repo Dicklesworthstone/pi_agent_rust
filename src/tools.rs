@@ -225,8 +225,8 @@ pub struct ToolUpdate {
 /// Default maximum lines for truncation.
 pub const DEFAULT_MAX_LINES: usize = 2000;
 
-/// Default maximum bytes for truncation.
-pub const DEFAULT_MAX_BYTES: usize = 1_000_000; // 1MB
+/// Default maximum bytes for truncation. 对齐 TS `truncate.ts:12` (`50 * 1024`)。
+pub const DEFAULT_MAX_BYTES: usize = 50 * 1024; // 50KB
 
 /// Maximum line length for grep results.
 pub const GREP_MAX_LINE_LENGTH: usize = 500;
@@ -2942,6 +2942,16 @@ impl ScopedScanRoot {
         };
 
         let relative = normalize_scanner_relative_path(&relative)?;
+        // A file root maps the file itself to an empty relative path; joining
+        // "" would append a trailing slash ("file.txt/"), making the result
+        // unreadable. Keep the root as-is in that case.
+        if relative.as_os_str().is_empty() {
+            return Ok(ScopedScanOutputPath {
+                read_path: self.io_path(),
+                logical_path: self.logical_path.clone(),
+                relative,
+            });
+        }
         Ok(ScopedScanOutputPath {
             read_path: self.io_path().join(&relative),
             logical_path: self.logical_path.join(&relative),
@@ -4465,7 +4475,7 @@ where
         let original_permissions = expected_target_identity.map(|(_, _, mode)| {
             use std::os::unix::fs::PermissionsExt as _;
 
-            std::fs::Permissions::from_mode(mode)
+            std::fs::Permissions::from_mode(mode as u32)
         });
 
         // The pathname stored by `NamedTempFile` is not descriptor-relative.
@@ -4562,8 +4572,8 @@ where
                 let source_file = std::fs::File::from(source_descriptor);
                 let source_metadata = source_file.metadata()?;
                 if !source_metadata.is_file()
-                    || source_metadata.dev() != expected_dev
-                    || source_metadata.ino() != expected_ino
+                    || source_metadata.dev() != expected_dev as u64
+                    || source_metadata.ino() != expected_ino as u64
                 {
                     return Err(std::io::Error::other(
                         "file changed since it was read; re-read it and retry the edit",
@@ -6402,6 +6412,12 @@ pub(crate) async fn run_bash_command(
     cmd.arg("-c")
         .arg(&command)
         .current_dir(cwd)
+        // 宿主运行时变量不得泄入模型驱动的 shell(pi-web #487
+        // project-command-env 同款清洗:PORT / NODE_ENV / NEXT_*;Windows
+        // 环境键不区分大小写)。上游 TS 经 bash operations 包装实现,本 fork
+        // 的首要消费者是嵌入宿主,故在工具边界无条件生效。
+        .env_clear()
+        .envs(std::env::vars().filter(|(name, _)| !is_host_runtime_env_var(name)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -8658,7 +8674,8 @@ fn fuzzy_find_text_with_normalized(
 ) -> FuzzyMatchResult {
     use std::borrow::Cow;
 
-    // First, try exact match (fastest path)
+    // 精确匹配优先(TS 对齐);失败时回退到 Unicode 归一化 fuzzy 匹配(Rust 增强,
+    // 处理 smart-quotes/em-dashes 等 Unicode 变体——比 TS 更宽松但不破坏精确匹配语义)。
     if let Some(index) = content.find(old_text) {
         return FuzzyMatchResult {
             found: true,
@@ -10227,6 +10244,56 @@ impl Tool for GrepTool {
                 )
             })?;
         let scan_io_path = scoped_root.io_path();
+        // A file search root cannot be a child's cwd (spawning with a file as
+        // cwd fails with ENOENT/ENOTDIR), so run the scanner from the file's
+        // parent and pass the file's canonical path as the operand. ripgrep
+        // then emits absolute paths that `map_child_output` can resolve against
+        // both the descriptor root and the logical root.
+        //
+        // Directory roots scan from the pinned root with a "." operand on
+        // Linux. On macOS/BSD, where fdescfs cannot traverse a directory fd,
+        // the scanner runs from the canonical workspace root and receives the
+        // search root as a workspace-relative operand: explicit absolute
+        // operands bypass ignore filtering in ripgrep, while the relative
+        // spelling keeps workspace .gitignore patterns effective (matching
+        // the TS implementation, which spawns rg from the workspace cwd).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let (child_cwd, child_operand) = if is_directory {
+            (scan_io_path.clone(), scoped_root.child_operand())
+        } else {
+            let parent = scan_io_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| Error::tool("grep", "search root has no parent"))?;
+            (parent, scoped_root.logical_path().to_path_buf())
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let (child_cwd, child_operand) = if is_directory {
+            let workspace = cwd_scope.logical_path().to_path_buf();
+            let operand = scoped_root
+                .logical_path()
+                .strip_prefix(&workspace)
+                .ok()
+                .filter(|relative| !relative.as_os_str().is_empty())
+                .map_or_else(|| PathBuf::from("."), PathBuf::from);
+            (workspace, operand)
+        } else {
+            let parent = scan_io_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| Error::tool("grep", "search root has no parent"))?;
+            (parent, scoped_root.logical_path().to_path_buf())
+        };
+        // Workspace root the scanner resolves its relative output paths
+        // against (non-Linux only; Linux scanners emit paths relative to the
+        // pinned scan root or absolute /proc/self/fd paths).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let scanner_workspace: Option<&std::path::Path> = None;
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let scanner_workspace: Option<std::path::PathBuf> =
+            Some(cwd_scope.logical_path().to_path_buf());
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let scanner_workspace = scanner_workspace.as_deref();
         if is_directory {
             ensure_recursive_scan_access(
                 &scan_io_path,
@@ -12545,6 +12612,19 @@ fn collect_process_tree(
 /// the requested program, preserving argv, cwd, stdio, and the process id that
 /// later becomes the isolated process-group leader.
 pub(crate) const SIGPIPE_TRAMPOLINE_EXEC_FAILURE_PREFIX: &str = "pi-sigpipe-reset: exec failed:";
+
+
+/// 宿主运行时环境变量判定(pi-web #487 project-command-env 同款清洗):
+/// PORT / NODE_ENV / NEXT_*(Windows 键不区分大小写)。bash 工具 spawn 边界
+/// 剥除,防嵌入宿主的端口/构建态泄入模型驱动的 shell。
+pub(crate) fn is_host_runtime_env_var(name: &str) -> bool {
+    if cfg!(windows) {
+        let upper = name.to_uppercase();
+        upper == "PORT" || upper == "NODE_ENV" || upper.starts_with("NEXT_")
+    } else {
+        name == "PORT" || name == "NODE_ENV" || name.starts_with("NEXT_")
+    }
+}
 
 pub(crate) fn command_with_default_sigpipe(program: impl AsRef<OsStr>) -> std::io::Result<Command> {
     command_with_default_sigpipe_for_cwd(program.as_ref(), None)
@@ -14885,7 +14965,21 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[allow(clippy::too_many_lines)]
     async fn assert_scoped_scan_roots_survive_after_open_replacement(tmp: &Path) {
+        #[allow(unused_imports)]
         use std::os::unix::fs::symlink;
+
+        // The pinned-descriptor snapshot semantics this asserts (a scanner
+        // child keeps reading the opened inode after its path is renamed and
+        // replaced by a symlink) rely on Linux procfs descriptor traversal.
+        // macOS/BSD fdescfs cannot traverse a directory fd by path (nor can a
+        // child re-enter it without fchdir, which needs unsafe pre_exec that
+        // this crate forbids), so non-Linux children scan the canonical path
+        // and this race assertion cannot hold there.
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = tmp;
+            return;
+        }
 
         let outside = tempfile::tempdir().expect("create outside scan fixture");
 
@@ -15470,6 +15564,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn host_runtime_env_var_predicate() {
+        assert!(is_host_runtime_env_var("PORT"));
+        assert!(is_host_runtime_env_var("NODE_ENV"));
+        assert!(is_host_runtime_env_var("NEXT_PUBLIC_FOO"));
+        assert!(is_host_runtime_env_var("NEXT_TELEMETRY_DEBUG"));
+        assert!(!is_host_runtime_env_var("PATH"));
+        assert!(!is_host_runtime_env_var("NEXTFILE"));
+        assert!(!is_host_runtime_env_var("MY_PORT"));
+        assert!(!is_host_runtime_env_var("NODE_ENVIRONMENT"));
+    }
+
     async fn assert_side_effect_tools_remain_uncached(tmp: &Path) {
         let side_effect_stats_before = tool_output_cache_stats_for_tests();
         let write_tool = WriteTool::new(tmp);
@@ -15498,6 +15604,8 @@ mod tests {
             )
             .await
             .expect("edit side-effect file");
+
+
 
         let bash_tool = BashTool::new(tmp);
         bash_tool

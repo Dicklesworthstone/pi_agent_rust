@@ -1028,6 +1028,7 @@ pub fn create_provider(
                     .with_provider_name(entry.model.provider.clone())
                     .with_base_url(normalize_anthropic_base(&entry.model.base_url))
                     .with_compat(entry.compat.clone())
+                    .with_max_tokens(Some(entry.model.max_tokens))
                     .with_client(client),
             ))
         }

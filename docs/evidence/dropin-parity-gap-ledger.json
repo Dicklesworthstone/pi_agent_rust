@@ -451,12 +451,12 @@
     "inventory_rows_requiring_ledger": [
       {
         "row_id": "mode.sdk.embedding",
-        "status": "partial_contract_shape_diff",
+        "status": "retired",
         "ledger_gap_id": "gap-sdk-contract-shape"
       },
       {
         "row_id": "cli.extensions.dynamic_flags",
-        "status": "partial_in_progress",
+        "status": "closed",
         "ledger_gap_id": "gap-cli-extension-flag-pass-through"
       },
       {

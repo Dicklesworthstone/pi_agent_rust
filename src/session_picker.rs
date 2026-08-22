@@ -759,6 +759,7 @@ mod tests {
             last_modified_ms: 1000,
             size_bytes: 100,
             name: None,
+            ..Default::default()
         }
     }
 
@@ -820,6 +821,7 @@ mod tests {
                 last_modified_ms: 1000,
                 size_bytes: 100,
                 name: None,
+                ..Default::default()
             },
             SessionMeta {
                 path: "/test/b.jsonl".to_string(),
@@ -830,6 +832,7 @@ mod tests {
                 last_modified_ms: 2000,
                 size_bytes: 200,
                 name: Some("Test session".to_string()),
+                ..Default::default()
             },
         ];
 
@@ -857,6 +860,7 @@ mod tests {
                 last_modified_ms: 1000,
                 size_bytes: 100,
                 name: None,
+                ..Default::default()
             },
             SessionMeta {
                 path: "/test/b.jsonl".to_string(),
@@ -867,6 +871,7 @@ mod tests {
                 last_modified_ms: 2000,
                 size_bytes: 200,
                 name: None,
+                ..Default::default()
             },
         ];
 
@@ -928,6 +933,7 @@ mod tests {
                 last_modified_ms: 1000,
                 size_bytes: 100,
                 name: None,
+                ..Default::default()
             },
             SessionMeta {
                 path: "/test/b.jsonl".to_string(),
@@ -938,6 +944,7 @@ mod tests {
                 last_modified_ms: 2000,
                 size_bytes: 200,
                 name: None,
+                ..Default::default()
             },
         ];
 
@@ -962,6 +969,7 @@ mod tests {
                 last_modified_ms: 1000,
                 size_bytes: 100,
                 name: None,
+                ..Default::default()
             },
             SessionMeta {
                 path: "/test/b.jsonl".to_string(),
@@ -972,6 +980,7 @@ mod tests {
                 last_modified_ms: 2000,
                 size_bytes: 200,
                 name: Some("chosen".to_string()),
+                ..Default::default()
             },
         ];
 
@@ -993,6 +1002,7 @@ mod tests {
             last_modified_ms: 1000,
             size_bytes: 100,
             name: None,
+            ..Default::default()
         }];
 
         let mut esc_picker = SessionPicker::new(sessions.clone());
@@ -1024,6 +1034,7 @@ mod tests {
             last_modified_ms: 1000,
             size_bytes: 100,
             name: Some("demo".to_string()),
+            ..Default::default()
         }];
         let mut populated = SessionPicker::new(sessions);
         populated.update(key_msg(KeyType::CtrlD, vec![]));
@@ -1044,6 +1055,7 @@ mod tests {
             last_modified_ms: 1000,
             size_bytes: 100,
             name: Some("unicode".to_string()),
+            ..Default::default()
         }];
 
         let view = SessionPicker::new(sessions).view();

@@ -37,10 +37,82 @@ use std::pin::Pin;
 // ============================================================================
 
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
+/// 历史默认值(4096);对齐 TS 后仅在调用方显式设置时发送 max_tokens,故此常量不再被引用。
+#[allow(dead_code)]
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 const MAX_API_ERROR_BODY_BYTES: usize = 64 * 1024;
 const OPENROUTER_DEFAULT_HTTP_REFERER: &str = "https://github.com/Dicklesworthstone/pi_agent_rust";
 const OPENROUTER_DEFAULT_X_TITLE: &str = "Pi Agent Rust";
+
+/// 对齐 TS `normalizeMistralToolId`:去除非字母数字,补齐/截断到恰好 9 字符。
+fn normalize_mistral_tool_id(id: &str) -> String {
+    let alnum: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    const PADDING: &str = "ABCDEFGHI";
+    if alnum.len() < 9 {
+        format!("{alnum}{}", &PADDING[..9 - alnum.len()])
+    } else {
+        alnum.chars().take(9).collect()
+    }
+}
+
+/// 对齐 TS `normalizeToolCallId`(per-request)。确定性归一化——同一原始 ID 每次
+/// 产生相同结果,因此 assistant 的 tool_call 与对应 toolResult 天然匹配(等价于
+/// transformMessages 的 toolCallIdMap)。
+///
+/// - Mistral:9 字符规则
+/// - 管道分隔 Responses API ID(`call_xxx|…`,可超 400 字符):取 callId 部分,
+///   清洗为 `[a-zA-Z0-9_-]` 并截断到 40
+/// - OpenAI:截断到 40
+/// - GitHub Copilot + Claude:清洗并截断到 64(Anthropic ID 格式)
+fn normalize_tool_call_id<'a>(
+    id: &'a str,
+    provider: &str,
+    model: &str,
+    requires_mistral: bool,
+) -> Cow<'a, str> {
+    if requires_mistral {
+        let normalized = normalize_mistral_tool_id(id);
+        return if normalized == id {
+            Cow::Borrowed(id)
+        } else {
+            Cow::Owned(normalized)
+        };
+    }
+    if id.contains('|') {
+        let call_id = id.split('|').next().unwrap_or(id);
+        let sanitized: String = call_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let truncated: String = sanitized.chars().take(40).collect();
+        return if truncated == id {
+            Cow::Borrowed(id)
+        } else {
+            Cow::Owned(truncated)
+        };
+    }
+    if provider == "openai" {
+        let truncated: String = id.chars().take(40).collect();
+        return if truncated == id {
+            Cow::Borrowed(id)
+        } else {
+            Cow::Owned(truncated)
+        };
+    }
+    if provider == "github-copilot" && model.to_lowercase().contains("claude") {
+        let sanitized: String = id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let truncated: String = sanitized.chars().take(64).collect();
+        return if truncated == id {
+            Cow::Borrowed(id)
+        } else {
+            Cow::Owned(truncated)
+        };
+    }
+    Cow::Borrowed(id)
+}
 
 /// Map a role string (which may come from compat config at runtime) to a `Cow<'_, str>`.
 ///
@@ -258,9 +330,13 @@ impl OpenAIProvider {
             || self.provider.eq_ignore_ascii_case("deepseek");
         let base_is_deepseek = self.base_url.to_ascii_lowercase().contains("deepseek.com");
         if provider_is_deepseek || base_is_deepseek {
-            Some(ReasoningStyle::DeepSeek)
-        } else {
-            None
+            return Some(ReasoningStyle::DeepSeek);
+        }
+        // 对齐 TS `compat.thinkingFormat === "zai"` / `"qwen"`。
+        match self.compat.as_ref().and_then(|c| c.thinking_format.as_deref()) {
+            Some("zai") => Some(ReasoningStyle::Zai),
+            Some("qwen") => Some(ReasoningStyle::Qwen),
+            _ => None,
         }
     }
 
@@ -274,12 +350,52 @@ impl OpenAIProvider {
         context: &'a Context<'_>,
         options: &StreamOptions,
     ) -> OpenAIRequest<'a> {
-        let system_role = self
+        // 对齐 TS `useDeveloperRole = model.reasoning && compat.supportsDeveloperRole`:
+        // 推理模型且支持时用 `developer` 角色(o1/o3 系列);显式 system_role_name
+        // 覆盖优先(catalog 配置,借用 self 生命周期)。
+        let explicit_role = self.compat.as_ref().and_then(|c| c.system_role_name.as_deref());
+        let system_role: &str = match explicit_role {
+            Some(role) => role,
+            None => {
+                let use_developer = self.reasoning
+                    && self
+                        .compat
+                        .as_ref()
+                        .and_then(|c| c.supports_developer_role)
+                        .unwrap_or(false);
+                if use_developer { "developer" } else { "system" }
+            }
+        };
+        let requires_thinking_as_text = self
             .compat
             .as_ref()
-            .and_then(|c| c.system_role_name.as_deref())
-            .unwrap_or("system");
-        let messages = Self::build_messages_with_role(context, system_role);
+            .and_then(|c| c.requires_thinking_as_text)
+            .unwrap_or(false);
+        let requires_mistral_tool_ids = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.requires_mistral_tool_ids)
+            .unwrap_or(false);
+        let requires_tool_result_name = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.requires_tool_result_name)
+            .unwrap_or(false);
+        let requires_assistant_after_tool_result = self
+            .compat
+            .as_ref()
+            .and_then(|c| c.requires_assistant_after_tool_result)
+            .unwrap_or(false);
+        let messages = Self::build_messages_with_role(
+            context,
+            &system_role,
+            requires_thinking_as_text,
+            &self.provider,
+            &self.model,
+            requires_mistral_tool_ids,
+            requires_tool_result_name,
+            requires_assistant_after_tool_result,
+        );
 
         let tools_supported = self
             .compat
@@ -287,10 +403,35 @@ impl OpenAIProvider {
             .and_then(|c| c.supports_tools)
             .unwrap_or(true);
 
-        let tools: Option<Vec<OpenAITool<'a>>> = if context.tools.is_empty() || !tools_supported {
+        let tools: Option<Vec<OpenAITool<'a>>> = if !tools_supported {
             None
+        } else if context.tools.is_empty() {
+            // 对齐 TS:tools 为空但历史含 tool_call/tool_result 时发空 `tools:[]`
+            // (Anthropic-via-LiteLLM/proxy 要求 tools 参数在场)。
+            let has_tool_history = context.messages.iter().any(|m| match m {
+                Message::ToolResult(_) => true,
+                Message::Assistant(a) => a.content.iter().any(|b| matches!(b, ContentBlock::ToolCall(_))),
+                _ => false,
+            });
+            if has_tool_history {
+                Some(Vec::new())
+            } else {
+                None
+            }
         } else {
-            Some(context.tools.iter().map(convert_tool_to_openai).collect())
+            // 对齐 TS `supportsStrictMode !== false`:默认包含 `strict:false`。
+            let supports_strict_mode = self
+                .compat
+                .as_ref()
+                .and_then(|c| c.supports_strict_mode)
+                .unwrap_or(true);
+            Some(
+                context
+                    .tools
+                    .iter()
+                    .map(|t| convert_tool_to_openai(t, supports_strict_mode))
+                    .collect(),
+            )
         };
 
         // Determine which max-tokens field to populate based on compat config.
@@ -300,7 +441,8 @@ impl OpenAIProvider {
             .and_then(|c| c.max_tokens_field.as_deref())
             .is_some_and(|f| f == "max_completion_tokens");
 
-        let token_limit = options.max_tokens.or(Some(DEFAULT_MAX_TOKENS));
+        // 对齐 TS:仅当调用方显式设置 max_tokens 时才发送该字段;否则省略,由 API 应用模型默认。
+        let token_limit = options.max_tokens;
         let (max_tokens, max_completion_tokens) = if use_alt_field {
             (None, token_limit)
         } else {
@@ -362,6 +504,7 @@ impl OpenAIProvider {
             stream_options,
             thinking,
             reasoning_effort,
+            enable_thinking,
         }
     }
 
@@ -374,7 +517,54 @@ impl OpenAIProvider {
         let mut value = serde_json::to_value(request)
             .map_err(|e| Error::api(format!("Failed to serialize OpenAI request: {e}")))?;
         self.apply_openrouter_routing_overrides(&mut value)?;
+        self.maybe_add_openrouter_anthropic_cache_control(&mut value);
         Ok(value)
+    }
+
+    /// 对齐 TS `maybeAddOpenRouterAnthropicCacheControl`:
+    /// OpenRouter + Anthropic 模型时,向最后一条 user/assistant 消息的最后一个
+    /// 文本 part 注入 `cache_control: {type:"ephemeral"}`(Anthropic 风格缓存需要
+    /// 文本 part 上的 breakpoint)。
+    fn maybe_add_openrouter_anthropic_cache_control(&self, request: &mut serde_json::Value) {
+        if !self.provider.eq_ignore_ascii_case("openrouter")
+            || !self.model.starts_with("anthropic/")
+        {
+            return;
+        }
+        let Some(messages) = request
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+        else {
+            return;
+        };
+        for msg in messages.iter_mut().rev() {
+            let role = msg.get("role").and_then(|r| r.as_str());
+            if role != Some("user") && role != Some("assistant") {
+                continue;
+            }
+            let Some(content) = msg.get_mut("content") else {
+                continue;
+            };
+            if let Some(text) = content.as_str() {
+                // 字符串 content → 替换为数组并附加 cache_control。
+                let text = text.to_string();
+                *content = serde_json::json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+                return;
+            }
+            if let Some(parts) = content.as_array_mut() {
+                for part in parts.iter_mut().rev() {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        if let Some(obj) = part.as_object_mut() {
+                            obj.insert(
+                                "cache_control".to_string(),
+                                serde_json::json!({ "type": "ephemeral" }),
+                            );
+                        }
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn apply_openrouter_routing_overrides(&self, request: &mut serde_json::Value) -> Result<()> {
@@ -408,9 +598,16 @@ impl OpenAIProvider {
     }
 
     /// Build the messages array with system prompt prepended using the given role name.
+    #[allow(clippy::too_many_arguments)]
     fn build_messages_with_role<'a>(
         context: &'a Context<'_>,
         system_role: &'a str,
+        requires_thinking_as_text: bool,
+        provider: &'a str,
+        model: &'a str,
+        requires_mistral_tool_ids: bool,
+        requires_tool_result_name: bool,
+        requires_assistant_after_tool_result: bool,
     ) -> Vec<OpenAIMessage<'a>> {
         let mut messages = Vec::with_capacity(context.messages.len() + 1);
 
@@ -421,12 +618,22 @@ impl OpenAIProvider {
                 content: Some(OpenAIContent::Text(Cow::Borrowed(system))),
                 tool_calls: None,
                 tool_call_id: None,
+                name: None,
+                reasoning_details: None,
             });
         }
 
         // Convert conversation messages
         for message in context.messages.iter() {
-            messages.extend(convert_message_to_openai(message));
+            messages.extend(convert_message_to_openai(
+                message,
+                requires_thinking_as_text,
+                provider,
+                model,
+                requires_mistral_tool_ids,
+                requires_tool_result_name,
+                requires_assistant_after_tool_result,
+            ));
         }
 
         messages
@@ -1000,8 +1207,23 @@ where
             self.partial.usage.input = usage
                 .prompt_cache_miss_tokens
                 .unwrap_or_else(|| usage.prompt_tokens.saturating_sub(cached));
-            self.partial.usage.output = usage.completion_tokens.unwrap_or(0);
-            self.partial.usage.total_tokens = usage.total_tokens;
+            // 对齐 TS `outputTokens = completion_tokens + reasoning_tokens`。
+            let reasoning = usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|d| d.reasoning_tokens)
+                .unwrap_or(0);
+            let output = usage.completion_tokens.unwrap_or(0) + reasoning;
+            self.partial.usage.output = output;
+            // 对齐 TS:本地计算 totalTokens = input + outputTokens + cachedTokens
+            // (Groq 等不把 reasoning_tokens 并入 total_tokens)。用 saturating 防
+            // proptest 构造的极端 token 值溢出(真实响应远小于 u64::MAX)。
+            self.partial.usage.total_tokens = self
+                .partial
+                .usage
+                .input
+                .saturating_add(output)
+                .saturating_add(self.partial.usage.cache_read);
         }
 
         if let Some(error) = chunk.error {
@@ -1020,6 +1242,8 @@ where
                 && choice.finish_reason.is_none()
                 && choice.delta.content.is_none()
                 && choice.delta.reasoning_content.is_none()
+                && choice.delta.reasoning.is_none()
+                && choice.delta.reasoning_text.is_none()
                 && choice.delta.tool_calls.is_none()
             {
                 self.ensure_started();
@@ -1060,6 +1284,8 @@ where
         if delta.content.is_some()
             || delta.tool_calls.is_some()
             || delta.reasoning_content.is_some()
+            || delta.reasoning.is_some()
+            || delta.reasoning_text.is_some()
         {
             self.ensure_started();
         }
@@ -1071,7 +1297,18 @@ where
         }
 
         // Handle reasoning content (e.g. DeepSeek R1)
-        if let Some(reasoning) = delta.reasoning_content {
+        // 对齐 TS:首个非空(空串视为缺失)的 reasoning_content / reasoning / reasoning_text;
+        // 空 reasoning(keepalive)不触发 ThinkingStart/Delta。
+        let reasoning = [
+            delta.reasoning_content.as_deref(),
+            delta.reasoning.as_deref(),
+            delta.reasoning_text.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|r| !r.is_empty())
+        .map(|r| r.to_string());
+        if let Some(reasoning) = reasoning {
             // Update partial content
             let last_is_thinking =
                 matches!(self.partial.content.last(), Some(ContentBlock::Thinking(_)));
@@ -1104,8 +1341,10 @@ where
         }
 
         // Handle text content
-
-        if let Some(content) = delta.content {
+        // 对齐 TS `choice.delta.content.length > 0`:空串(keepalive)不触发 TextStart/Delta。
+        if let Some(content) = delta.content
+            && !content.is_empty()
+        {
             // Update partial content
 
             let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
@@ -1253,13 +1492,49 @@ where
             }
         }
 
+        // 对齐 TS:入站 `reasoning_details[].type === "reasoning.encrypted"` 附到匹配的
+        // tool_call 的 thoughtSignature(JSON 字符串化)。
+        if let Some(details) = delta.reasoning_details {
+            for detail in details {
+                if detail.kind == "reasoning.encrypted"
+                    && let Some(id) = detail.id
+                    && let Some(data) = detail.data
+                {
+                    // 匹配同 index 下已累积的 tool_call(按 id)。
+                    for (state_idx, tc_state) in self.tool_calls.iter().enumerate() {
+                        if tc_state.id == id {
+                            if let Some(ContentBlock::ToolCall(block)) = self
+                                .partial
+                                .content
+                                .get_mut(tc_state.content_index)
+                            {
+                                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&data)
+                                    && let Some(obj) = value.as_object()
+                                {
+                                    let mut detail_obj = obj.clone();
+                                    detail_obj.insert("type".to_string(), serde_json::json!("reasoning.encrypted"));
+                                    detail_obj.insert("id".to_string(), serde_json::json!(id.clone()));
+                                    block.thought_signature = Some(
+                                        serde_json::to_string(&detail_obj).unwrap_or(data.clone()),
+                                    );
+                                }
+                            }
+                            let _ = state_idx;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Handle finish reason (MUST happen after delta processing to capture final chunks)
 
         if let Some(reason) = choice.finish_reason {
             self.partial.stop_reason = match reason.as_str() {
                 "length" => StopReason::Length,
 
-                "tool_calls" => StopReason::ToolUse,
+                // 对齐 TS:`tool_calls` 与遗留的 `function_call` 都映射为 ToolUse。
+                "tool_calls" | "function_call" => StopReason::ToolUse,
 
                 "content_filter" | "error" => StopReason::Error,
 
@@ -1362,6 +1637,10 @@ enum ReasoningStyle {
     /// DeepSeek: `thinking: {type: enabled|disabled}` + `reasoning_effort`
     /// (`high`|`max`). Mirrors the legacy `@earendil-works/pi-ai` `thinkingFormat`.
     DeepSeek,
+    /// Z.ai: `thinking: {type: enabled|disabled}`(二进制)。
+    Zai,
+    /// Qwen: `enable_thinking: bool`。
+    Qwen,
 }
 
 #[derive(Debug, Serialize)]
@@ -1372,7 +1651,14 @@ struct OpenAIMessage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAIToolCallRef<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<&'a str>,
+    tool_call_id: Option<Cow<'a, str>>,
+    /// 对齐 TS `requiresToolResultName`:tool 消息的 `name` 字段。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<Cow<'a, str>>,
+    /// 对齐 TS `reasoning_details`:出站时把 tool_call 的 thoughtSignature 解析回
+    /// `reasoning_details`(OpenAI Responses 加密推理回放契约)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_details: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1399,7 +1685,8 @@ struct OpenAIImageUrl<'a> {
 
 #[derive(Debug, Serialize)]
 struct OpenAIToolCallRef<'a> {
-    id: &'a str,
+    /// Cow:ID 归一化(`normalizeToolCallId`)产生 owned String。
+    id: Cow<'a, str>,
     r#type: &'static str,
     function: OpenAIFunctionRef<'a>,
 }
@@ -1421,6 +1708,14 @@ struct OpenAIFunction<'a> {
     name: &'a str,
     description: &'a str,
     parameters: &'a serde_json::Value,
+    /// 对齐 TS `strict: false`;`supportsStrictMode === false` 时省略该字段。
+    #[serde(skip_serializing_if = "not_strict")]
+    strict: bool,
+}
+
+/// `strict:false` 省略条件(仅当 supportsStrictMode=false 时省略)。
+fn not_strict(value: &bool) -> bool {
+    !*value
 }
 
 // ============================================================================
@@ -1450,6 +1745,14 @@ struct OpenAIDelta {
     content: Option<String>,
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// 对齐 TS:部分 provider(llama.cpp / chutes.ai)把推理放在 `reasoning` 或 `reasoning_text`。
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    reasoning_text: Option<String>,
+    /// 对齐 TS `reasoning_details`(OpenAI Responses 风格的加密推理 blob)。
+    #[serde(default)]
+    reasoning_details: Option<Vec<OpenAIReasoningDetail>>,
     #[serde(default)]
     tool_calls: Option<Vec<OpenAIToolCallDelta>>,
 }
@@ -1461,6 +1764,17 @@ struct OpenAIToolCallDelta {
     id: Option<String>,
     #[serde(default)]
     function: Option<OpenAIFunctionDelta>,
+}
+
+/// 对齐 TS `reasoning_details[].type === "reasoning.encrypted"`。
+#[derive(Debug, Deserialize)]
+struct OpenAIReasoningDetail {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1484,12 +1798,22 @@ struct OpenAIUsage {
     /// When present it is the authoritative source for `usage.input`.
     #[serde(default)]
     prompt_cache_miss_tokens: Option<u64>,
+    /// 对齐 TS:o1/DeepSeek-R1/gpt-oss 等在 `completion_tokens_details.reasoning_tokens`
+    /// 报告推理 token;输出计费须把其并入 output。
+    #[serde(default)]
+    completion_tokens_details: Option<OpenAICompletionTokensDetails>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAIPromptTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAICompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1503,62 +1827,93 @@ struct OpenAIChunkError {
 // ============================================================================
 
 #[allow(clippy::too_many_lines)]
-fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+fn convert_message_to_openai<'a>(
+    message: &'a Message,
+    requires_thinking_as_text: bool,
+    provider: &'a str,
+    model: &'a str,
+    requires_mistral_tool_ids: bool,
+    requires_tool_result_name: bool,
+    requires_assistant_after_tool_result: bool,
+) -> Vec<OpenAIMessage<'a>> {
     match message {
         Message::User(user) => vec![OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(convert_user_content(&user.content)),
             tool_calls: None,
             tool_call_id: None,
+            name: None,
+            reasoning_details: None,
         }],
         Message::Custom(custom) => vec![OpenAIMessage {
             role: Cow::Borrowed("user"),
             content: Some(OpenAIContent::Text(Cow::Borrowed(&custom.content))),
             tool_calls: None,
             tool_call_id: None,
+            name: None,
+            reasoning_details: None,
         }],
         Message::Assistant(assistant) => {
             let mut messages = Vec::new();
 
-            // Collect text content
+            // Collect text content. 对齐 TS requiresThinkingAsText:把非空 Thinking
+            // 块并入文本(Mistral 等不接受独立 thinking 块)。
             let text: String = assistant
                 .content
                 .iter()
                 .filter_map(|b| match b {
                     ContentBlock::Text(t) => Some(t.text.as_str()),
+                    ContentBlock::Thinking(t)
+                        if requires_thinking_as_text && !t.thinking.is_empty() =>
+                    {
+                        Some(t.thinking.as_str())
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
 
             // Collect tool calls
+            let mut reasoning_details: Vec<serde_json::Value> = Vec::new();
             let tool_calls: Vec<OpenAIToolCallRef<'_>> = assistant
                 .content
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::ToolCall(tc) => Some(OpenAIToolCallRef {
-                        id: &tc.id,
-                        r#type: "function",
-                        function: OpenAIFunctionRef {
-                            name: &tc.name,
-                            arguments: tc.arguments.to_string(),
-                        },
-                    }),
+                    ContentBlock::ToolCall(tc) => {
+                        // 对齐 TS:有 thoughtSignature 的 tool_call 解析回 reasoning_details。
+                        if let Some(sig) = &tc.thought_signature
+                            && let Ok(detail) = serde_json::from_str::<serde_json::Value>(sig)
+                        {
+                            reasoning_details.push(detail);
+                        }
+                        Some(OpenAIToolCallRef {
+                            // 对齐 TS:出站 tool_call ID 归一化。
+                            id: normalize_tool_call_id(
+                                &tc.id,
+                                provider,
+                                model,
+                                requires_mistral_tool_ids,
+                            ),
+                            r#type: "function",
+                            function: OpenAIFunctionRef {
+                                name: &tc.name,
+                                arguments: tc.arguments.to_string(),
+                            },
+                        })
+                    }
                     _ => None,
                 })
                 .collect();
 
-            let content = if text.is_empty() {
-                // Send empty string instead of omitting the field. Some
-                // OpenAI-compatible providers (e.g. GLM via Ollama Cloud) reject
-                // requests where assistant messages have no content field.
-                // An empty string is valid per the OpenAI spec and accepted
-                // by all known providers.
-                Some(OpenAIContent::Text(Cow::Borrowed("")))
-            } else {
-                Some(OpenAIContent::Text(Cow::Owned(text)))
-            };
+            // 对齐 TS:无 content 且无 tool_calls 的空 assistant 消息(中止轮次)整体跳过
+            // (Mistral 显式拒绝 "either content or tool_calls, but not none")。
+            if text.is_empty() && tool_calls.is_empty() {
+                return Vec::new();
+            }
 
+            let content = Some(OpenAIContent::Text(Cow::Owned(text)));
             let tool_calls = if tool_calls.is_empty() {
                 None
             } else {
@@ -1570,6 +1925,13 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 content,
                 tool_calls,
                 tool_call_id: None,
+                name: None,
+                // 对齐 TS:仅在存在带 thoughtSignature 的工具调用时发送 reasoning_details。
+                reasoning_details: if reasoning_details.is_empty() {
+                    None
+                } else {
+                    Some(reasoning_details)
+                },
             });
 
             messages
@@ -1608,7 +1970,20 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                 role: Cow::Borrowed("tool"),
                 content: text_content,
                 tool_calls: None,
-                tool_call_id: Some(&result.tool_call_id),
+                // 对齐 TS:归一化 assistant 侧后,toolResult 侧须用同一归一化 ID 配对。
+                tool_call_id: Some(normalize_tool_call_id(
+                    &result.tool_call_id,
+                    provider,
+                    model,
+                    requires_mistral_tool_ids,
+                )),
+                // 对齐 TS `requiresToolResultName`:Mistral 等要求 tool 消息带 name。
+                name: if requires_tool_result_name {
+                    Some(Cow::Borrowed(&result.tool_name))
+                } else {
+                    None
+                },
+                reasoning_details: None,
             }];
 
             if !image_parts.is_empty() {
@@ -1616,11 +1991,27 @@ fn convert_message_to_openai(message: &Message) -> Vec<OpenAIMessage<'_>> {
                     text: Cow::Borrowed("Attached image(s) from tool result:"),
                 }];
                 parts.extend(image_parts);
+                // 对齐 TS `requiresAssistantAfterToolResult`:图片结果后合成 assistant bridge
+                // (避免连续两条 user 消息)。
+                if requires_assistant_after_tool_result {
+                    messages.push(OpenAIMessage {
+                        role: Cow::Borrowed("assistant"),
+                        content: Some(OpenAIContent::Text(Cow::Borrowed(
+                            "I have processed the tool results.",
+                        ))),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_details: None,
+                    });
+                }
                 messages.push(OpenAIMessage {
                     role: Cow::Borrowed("user"),
                     content: Some(OpenAIContent::Parts(parts)),
                     tool_calls: None,
                     tool_call_id: None,
+                    name: None,
+                    reasoning_details: None,
                 });
             }
 
@@ -1657,13 +2048,15 @@ fn convert_user_content(content: &UserContent) -> OpenAIContent<'_> {
     }
 }
 
-fn convert_tool_to_openai(tool: &ToolDef) -> OpenAITool<'_> {
+fn convert_tool_to_openai(tool: &ToolDef, supports_strict_mode: bool) -> OpenAITool<'_> {
     OpenAITool {
         r#type: "function",
         function: OpenAIFunction {
             name: &tool.name,
             description: &tool.description,
             parameters: &tool.parameters,
+            // 对齐 TS `...(supportsStrictMode !== false && { strict: false })`。
+            strict: supports_strict_mode,
         },
     }
 }
@@ -1763,7 +2156,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_openai(&message);
+        let converted = convert_message_to_openai(&message, false, "openai", "gpt-4o", false, false, false);
         assert_eq!(converted.len(), 1);
         assert_eq!(converted[0].role, "user");
     }
@@ -1781,7 +2174,7 @@ mod tests {
             }),
         };
 
-        let converted = convert_tool_to_openai(&tool);
+        let converted = convert_tool_to_openai(&tool, true);
         assert_eq!(converted.r#type, "function");
         assert_eq!(converted.function.name, "test_tool");
         assert_eq!(converted.function.description, "A test tool");

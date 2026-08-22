@@ -1,3 +1,16 @@
+> **Fork positioning**: this is the **Rust version** of [earendil-works/pi](https://github.com/earendil-works/pi)
+> (TypeScript SDK `@earendil-works/pi-coding-agent`), continuously tracking upstream.
+>
+> The fork fills the in_process `AgentSessionHandle` with equivalents of the TS SDK
+> `AgentSessionLike` interface (get_session_stats / get_last_assistant_text /
+> set_auto_compaction / compact_with_instructions / bash, …), so the Rust engine's
+> capabilities match the original TS SDK.
+>
+> Alignment progress is tracked in [sdk-mapping.md](docs/sdk-mapping.md)
+> (中文版: [sdk-mapping.zh-CN.md](docs/sdk-mapping.zh-CN.md)).
+
+---
+
 <p align="center">
   <img src="pi_agent_rust_illustration.webp" alt="Pi Agent Rust" width="600"/>
 </p>

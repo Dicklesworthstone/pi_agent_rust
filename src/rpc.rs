@@ -5295,20 +5295,20 @@ async fn export_html_snapshot(
 }
 
 #[derive(Debug, Clone)]
-struct BashRpcResult {
-    output: String,
-    exit_code: i32,
-    cancelled: bool,
-    truncated: bool,
-    full_output_path: Option<String>,
+pub(crate) struct BashRpcResult {
+    pub(crate) output: String,
+    pub(crate) exit_code: i32,
+    pub(crate) cancelled: bool,
+    pub(crate) truncated: bool,
+    pub(crate) full_output_path: Option<String>,
 }
 
-enum BashRpcStreamFrame {
+pub(crate) enum BashRpcStreamFrame {
     Chunk(Vec<u8>),
     Error(String),
 }
 
-fn pump_bash_rpc_stream(
+pub(crate) fn pump_bash_rpc_stream(
     mut reader: impl std::io::Read,
     tx: std::sync::mpsc::SyncSender<BashRpcStreamFrame>,
     stream_name: &'static str,
@@ -5527,7 +5527,7 @@ async fn ingest_bash_rpc_chunk(
     }
 }
 
-async fn ingest_bash_rpc_frame(
+pub(crate) async fn ingest_bash_rpc_frame(
     frame: BashRpcStreamFrame,
     chunks: &mut VecDeque<Vec<u8>>,
     chunks_bytes: &mut usize,
@@ -5595,7 +5595,7 @@ fn bash_rpc_capture_error_message(
     error_message
 }
 
-async fn run_bash_rpc(
+pub(crate) async fn run_bash_rpc(
     cwd: &std::path::Path,
     command: &str,
     mut abort_rx: oneshot::Receiver<()>,

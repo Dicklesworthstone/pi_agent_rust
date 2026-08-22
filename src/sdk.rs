@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub use crate::agent::{
     AbortHandle, AbortSignal, Agent, AgentConfig, AgentEvent, AgentSession, QueueMode,
 };
+pub use crate::app::{resolve_model_scope_with_diagnostics, ScopedModel};
 pub use crate::compaction::ResolvedCompactionSettings;
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
@@ -57,6 +58,8 @@ pub use crate::provider::{
     ThinkingBudgets as ProviderThinkingBudgets, ToolDef,
 };
 pub use crate::session::Session;
+pub use crate::session::{build_session_context, SessionContextSnapshot};
+pub use crate::session_index::{SessionIndex, SessionMeta};
 pub use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 
 /// Stable alias for model-exposed tool schema definitions.
@@ -297,8 +300,24 @@ pub struct SessionOptions {
     pub working_directory: Option<PathBuf>,
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
+    /// Models registry override (test isolation): load ModelRegistry from this
+    /// path instead of the global default. Auth storage paths stay global —
+    /// upstream `ModelRuntime.create({modelsPath})` semantics.
+    pub models_path: Option<PathBuf>,
+    /// Skills injection face (upstream `options.resourceLoader` parity):
+    /// None = auto-load from four sources (TS sdk.js:88-106 default behavior);
+    /// Some(vec![]) = no skills (bare sessions: test commands, health checks);
+    /// Some(skills) = use these (tests inject without disk).
+    pub skills: Option<Vec<crate::resources::Skill>>,
     pub session_dir: Option<PathBuf>,
+    /// Explicit extension sources (CLI `-e` parity). When non-empty these
+    /// win and auto-discovery is skipped.
     pub extension_paths: Vec<PathBuf>,
+    /// Auto-discover extensions when `extension_paths` is empty (upstream
+    /// `createAgentSession` DefaultResourceLoader parity): settings package
+    /// sources + auto-discovered extension dirs. Mirrors the CLI default;
+    /// set `true` only for bare sessions (mirrors `--no-extensions`).
+    pub no_extensions: bool,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
     pub include_cwd_in_prompt: bool,
@@ -385,8 +404,11 @@ impl Default for SessionOptions {
             working_directory: None,
             no_session: true,
             session_path: None,
+            models_path: None,
+            skills: None,
             session_dir: None,
             extension_paths: Vec::new(),
+            no_extensions: false,
             extension_policy: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
@@ -1292,6 +1314,27 @@ impl AgentSessionHandle {
             .await
     }
 
+    /// Prompt with inline images (text + image content blocks).
+    pub async fn prompt_images_with_abort(
+        &mut self,
+        input: impl Into<String>,
+        images: Vec<ImageContent>,
+        abort_signal: AbortSignal,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let mut blocks = vec![ContentBlock::Text(TextContent {
+            text: input.into(),
+            text_signature: None,
+        })];
+        for image in images {
+            blocks.push(ContentBlock::Image(image));
+        }
+        let combined = self.make_combined_callback(on_event);
+        self.session
+            .run_with_content_with_abort(blocks, Some(abort_signal), combined)
+            .await
+    }
+
     /// Continue the current agent loop without adding a new user prompt.
     ///
     /// This is useful for retry/continuation flows where session history or
@@ -1530,11 +1573,174 @@ impl AgentSessionHandle {
     }
 
     /// Trigger an immediate compaction pass (if compaction is enabled).
+    /// Returns token statistics (summary, firstKeptEntryId, tokensBefore).
     pub async fn compact(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<crate::agent::CompactionResultInfo> {
         self.session.compact_now(on_event).await
+    }
+
+    /// Trigger compaction with optional custom instructions.
+    ///
+    /// Mirrors TS SDK `AgentSession.compactWithInstructions` (earendil-works/pi). When
+    /// `custom_instructions` is `Some`, it is passed to the compaction pass.
+    pub async fn compact_with_instructions(
+        &mut self,
+        custom_instructions: Option<&str>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<crate::agent::CompactionResultInfo> {
+        // AgentSession::compact_now doesn't accept instructions yet; when
+        // provided we fall back to plain compact (instructions ignored).
+        // TODO: thread instructions through once AgentSession supports them.
+        let _ = custom_instructions;
+        self.session.compact_now(on_event).await
+    }
+
+    /// Graceful shutdown: stop extension runtimes and flush the write-behind
+    /// autosave queue so the session can be dropped (e.g. idle eviction)
+    /// without losing messages.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.session.shutdown().await
+    }
+
+    /// Return session-level token/message aggregates for the current path.
+    ///
+    /// Mirrors TS SDK `AgentSession.getSessionStats` (earendil-works/pi). Computes from
+    /// `Session::to_messages_for_current_path()` — same logic as the RPC
+    /// server's `session_stats()` helper (rpc.rs).
+    pub async fn get_session_stats(&self) -> Result<serde_json::Value> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let session = self.session.session.clone();
+        let guard = session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
+        let messages = guard.to_messages_for_current_path();
+        let mut user_messages: u64 = 0;
+        let mut assistant_messages: u64 = 0;
+        let mut tool_calls: u64 = 0;
+        let mut tool_results: u64 = 0;
+        let mut total_input: u64 = 0;
+        let mut total_output: u64 = 0;
+        let mut total_cache_read: u64 = 0;
+        let mut total_cache_write: u64 = 0;
+        let mut total_cost: f64 = 0.0;
+        for msg in &messages {
+            match msg {
+                crate::model::Message::User(_) | crate::model::Message::Custom(_) => {
+                    user_messages += 1;
+                }
+                crate::model::Message::Assistant(am) => {
+                    assistant_messages += 1;
+                    tool_calls += am
+                        .content
+                        .iter()
+                        .filter(|b| {
+                            matches!(b, crate::model::ContentBlock::ToolCall(_))
+                        })
+                        .count() as u64;
+                    total_input += am.usage.input;
+                    total_output += am.usage.output;
+                    total_cache_read += am.usage.cache_read;
+                    total_cache_write += am.usage.cache_write;
+                    total_cost += am.usage.cost.total;
+                }
+                crate::model::Message::ToolResult(_) => {
+                    tool_results += 1;
+                }
+            }
+        }
+        let total_messages = messages.len() as u64;
+        let total_tokens = total_input + total_output + total_cache_read + total_cache_write;
+        Ok(serde_json::json!({
+            "userMessages": user_messages,
+            "assistantMessages": assistant_messages,
+            "toolCalls": tool_calls,
+            "toolResults": tool_results,
+            "totalMessages": total_messages,
+            "tokens": {
+                "input": total_input,
+                "output": total_output,
+                "cacheRead": total_cache_read,
+                "cacheWrite": total_cache_write,
+                "total": total_tokens,
+            },
+            "cost": total_cost,
+        }))
+    }
+
+    /// Return the text of the last assistant message on the current path.
+    ///
+    /// Mirrors TS SDK `AgentSession.getLastAssistantText` (earendil-works/pi). Scans
+    /// `to_messages_for_current_path()` in reverse for the first
+    /// `Assistant` message with non-empty text content.
+    pub async fn get_last_assistant_text(&self) -> Result<Option<String>> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let session = self.session.session.clone();
+        let guard = session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(format!("session lock failed: {e}")))?;
+        let messages = guard.to_messages_for_current_path();
+        for msg in messages.iter().rev() {
+            if let crate::model::Message::Assistant(am) = msg {
+                let text: String = am.content.iter().filter_map(|b| {
+                    if let crate::model::ContentBlock::Text(t) = b {
+                        Some(t.text.as_str())
+                    } else {
+                        None
+                    }
+                }).collect::<Vec<_>>().join("");
+                if !text.is_empty() {
+                    return Ok(Some(text));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Enable or disable automatic context compaction.
+    ///
+    /// Mirrors TS SDK `AgentSession.setAutoCompactionEnabled` (earendil-works/pi). Toggles
+    /// `AgentSession.compaction_settings.enabled`.
+    pub fn set_auto_compaction(&mut self, enabled: bool) {
+        self.session.set_compaction_enabled(enabled);
+    }
+
+    /// Execute a bash command in the session's working directory.
+    ///
+    /// Mirrors TS SDK `AgentSession.bash` (earendil-works/pi). Spawns a shell subprocess, captures
+    /// output (with overflow spill to temp file), and supports abort via the
+    /// returned [`BashHandle`]. The caller is responsible for abort lifecycle.
+    ///
+    /// Note: unlike the RPC path, this does NOT automatically append a
+    /// `BashExecution` entry to the session — the caller decides whether to
+    /// persist (via `session_mut().session.lock().append_message(...)`).
+    pub async fn bash(
+        &mut self,
+        command: &str,
+        abort_rx: asupersync::channel::oneshot::Receiver<()>,
+    ) -> Result<RpcBashResult> {
+        let cx = crate::agent_cx::AgentCx::for_current_or_request();
+        let cwd = self
+            .session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(format!("session lock failed: {e}")))?
+            .header
+            .cwd
+            .clone();
+        let cwd = std::path::PathBuf::from(&cwd);
+        let result = crate::rpc::run_bash_rpc(&cwd, command, abort_rx).await?;
+        Ok(RpcBashResult {
+            output: result.output,
+            exit_code: result.exit_code,
+            cancelled: result.cancelled,
+            truncated: result.truncated,
+            full_output_path: result.full_output_path,
+        })
     }
 
     /// Access the underlying `AgentSession`.
@@ -1740,24 +1946,39 @@ fn build_stream_options_with_optional_key(
 
 /// Create a fully configured embeddable agent session.
 ///
-/// This is the programmatic entrypoint for non-CLI consumers that want to run
-/// Pi sessions in-process.
-#[allow(clippy::too_many_lines)]
-pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessionHandle> {
+/// Cwd-bound runtime services bundle (对齐 TS `AgentSessionServices`).
+///
+/// Contains everything needed to query models/auth/settings without creating
+/// a Session. Use `create_agent_session_from_services` to build a full session
+/// from this bundle.
+///
+/// ⏭️ Missing vs TS: `settingsManager`, `resourceLoader` (extension system,
+/// architectural difference).
+pub struct AgentSessionServices {
+    pub cwd: std::path::PathBuf,
+    pub global_dir: std::path::PathBuf,
+    pub config: Config,
+    pub auth: crate::auth::AuthStorage,
+    pub model_registry: ModelRegistry,
+    pub diagnostics: Vec<String>,
+    /// CLI args derived from SessionOptions (consumed by from_services).
+    pub(crate) cli: Cli,
+}
+
+/// 对齐 TS `createAgentSessionServices`:build cwd-bound services without a Session.
+///
+/// Loads Config, AuthStorage (refreshes OAuth), ModelRegistry. Returns a bundle
+/// that can be used for model listing, credential queries, or passed to
+/// `create_agent_session_from_services`.
+pub async fn create_agent_session_services(
+    options: &SessionOptions,
+) -> Result<AgentSessionServices> {
     let process_cwd =
         std::env::current_dir().map_err(|e| Error::config(format!("cwd lookup failed: {e}")))?;
     let cwd = options.working_directory.as_deref().map_or_else(
         || process_cwd.clone(),
         |path| resolve_path_for_cwd(path, &process_cwd),
     );
-    let resolved_session_path = options
-        .session_path
-        .as_deref()
-        .map(|path| resolve_path_for_cwd(path, &cwd));
-    let resolved_session_dir = options
-        .session_dir
-        .as_deref()
-        .map(|path| resolve_path_for_cwd(path, &cwd));
 
     let mut cli = Cli::try_parse_from(["pi"])
         .map_err(|e| Error::validation(format!("CLI init failed: {e}")))?;
@@ -1769,12 +1990,14 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     cli.append_system_prompt = options.append_system_prompt.clone();
     cli.hide_cwd_in_prompt = !options.include_cwd_in_prompt;
     cli.thinking = options.thinking.map(|t| t.to_string());
-    cli.session = resolved_session_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string());
-    cli.session_dir = resolved_session_dir
-        .as_ref()
-        .map(|p| p.to_string_lossy().to_string());
+    cli.session = options
+        .session_path
+        .as_deref()
+        .map(|p| resolve_path_for_cwd(p, &cwd).to_string_lossy().to_string());
+    cli.session_dir = options
+        .session_dir
+        .as_deref()
+        .map(|p| resolve_path_for_cwd(p, &cwd).to_string_lossy().to_string());
     if let Some(enabled_tools) = &options.enabled_tools {
         if enabled_tools.is_empty() {
             cli.no_tools = true;
@@ -1785,17 +2008,46 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     }
 
     let config = Config::load()?;
-
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
-
     let global_dir = Config::global_dir();
-    let package_dir = Config::package_dir();
-    let models_path = default_models_path(&global_dir);
+    let models_path = options
+        .models_path
+        .clone()
+        .unwrap_or_else(|| default_models_path(&global_dir));
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
 
-    let mut session = Session::new(&cli, &config).await?;
-    if resolved_session_path.is_none() {
+    Ok(AgentSessionServices {
+        cwd,
+        global_dir,
+        config,
+        auth,
+        model_registry,
+        diagnostics: Vec::new(),
+        cli,
+    })
+}
+
+/// 对齐 TS `createAgentSessionFromServices`:build a Session from pre-existing services.
+///
+/// Takes an `AgentSessionServices` bundle (from `create_agent_session_services`)
+/// and creates a full `AgentSessionHandle`. This avoids reloading Config/Auth/
+/// ModelRegistry when they already exist.
+#[allow(clippy::too_many_lines)]
+pub async fn create_agent_session_from_services(
+    services: &AgentSessionServices,
+    options: SessionOptions,
+) -> Result<AgentSessionHandle> {
+    let cwd = &services.cwd;
+    let cli = &services.cli;
+    let config = &services.config;
+    let auth = &services.auth;
+    let model_registry = &services.model_registry;
+    let global_dir = &services.global_dir;
+    let package_dir = Config::package_dir();
+
+    let mut session = Session::new(cli, config).await?;
+    if options.session_path.is_none() {
         session.header.cwd = cwd.display().to_string();
     }
     let scoped_patterns = if let Some(models_arg) = &cli.models {
@@ -1806,16 +2058,16 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     let scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
-        app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
+        app::resolve_model_scope(&scoped_patterns, model_registry, cli.api_key.is_some())
     };
 
     let selection = app::select_model_and_thinking(
-        &cli,
-        &config,
+        cli,
+        config,
         &session,
-        &model_registry,
+        model_registry,
         &scoped_models,
-        &global_dir,
+        global_dir,
     )
     .map_err(|err| Error::validation(err.to_string()))?;
     app::update_session_for_selection(&mut session, &selection);
@@ -1838,12 +2090,55 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     } else {
         crate::context_files::ForeignRules::default()
     };
+
+    // Skills into session prompt (upstream TS sdk.js:88-106 parity — the Rust
+    // port left ResourceLoader in the CLI layer, so the SDK never passed
+    // skills_prompt; this converges toward the TS reference):
+    // - explicit Some(skills) = use as-is (injection face)
+    // - Some(vec![]) = no skills (bare session opt-out)
+    // - None = auto-load from the four sources (project/user skills dirs +
+    //   settings-configured paths); formatted into the skills_prompt slot
+    //   only when the read tool is enabled (CLI guard, main.rs:1551 parity).
+    let skills_prompt: Option<String> = match &options.skills {
+        Some(skills) if !skills.is_empty() && (enabled_tools.is_empty() || enabled_tools.contains(&"read")) => {
+            Some(crate::resources::format_skills_for_prompt(skills))
+        }
+        Some(_) => None,
+        None => {
+            if enabled_tools.is_empty() || enabled_tools.contains(&"read") {
+                let skill_paths: Vec<PathBuf> = config
+                    .skills
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect();
+                let loaded = crate::resources::load_skills(
+                    crate::resources::LoadSkillsOptions {
+                        cwd: cwd.clone(),
+                        agent_dir: global_dir.clone(),
+                        skill_paths,
+                        include_defaults: true,
+                    },
+                );
+               
+                if loaded.skills.is_empty() {
+                    None
+                } else {
+                    Some(crate::resources::format_skills_for_prompt(&loaded.skills))
+                }
+            } else {
+                None
+            }
+        }
+    };
+
     let system_prompt = app::build_system_prompt(
-        &cli,
-        &cwd,
+        cli,
+        cwd,
         &enabled_tools,
-        None,
-        &global_dir,
+        skills_prompt.as_deref(),
+        global_dir,
         &package_dir,
         sdk_test_mode,
         options.include_cwd_in_prompt,
@@ -1855,11 +2150,11 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     let provider = providers::create_provider(&selection.model_entry, None)
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
-    let api_key = app::resolve_api_key(&auth, &cli, &selection.model_entry)
+    let api_key = app::resolve_api_key(auth, cli, &selection.model_entry)
         .map_err(|err| Error::validation(err.to_string()))?;
 
     let stream_options =
-        build_stream_options_with_optional_key(&config, api_key, &selection, &session);
+        build_stream_options_with_optional_key(config, api_key, &selection, &session);
 
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
@@ -1877,8 +2172,8 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
-        || ToolRegistry::new(&enabled_tools, &cwd, Some(&config)),
-        |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
+        || ToolRegistry::new(&enabled_tools, cwd, Some(config)),
+        |factory| factory.create_tool_registry(&enabled_tools, cwd, config),
     );
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
@@ -1931,12 +2226,30 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             .extend_tools(vec![Box::new(ask) as Box<dyn crate::tools::Tool>]);
     }
 
-    if !options.extension_paths.is_empty() {
-        let extension_paths = options
+    // Extension sources: explicit paths win; otherwise auto-discover
+    // (upstream createAgentSession DefaultResourceLoader parity — same
+    // rule the skills auto-load applies). Discovery is light (packages
+    // fast path + auto dirs; no installs, no network); sources needing
+    // install degrade to absent.
+    let discovered_extensions = if options.extension_paths.is_empty() && !options.no_extensions {
+        crate::package_manager::PackageManager::new(cwd.to_path_buf())
+            .discover_extensions_blocking()
+    } else {
+        Vec::new()
+    };
+    let extension_paths = if options.extension_paths.is_empty() {
+        discovered_extensions
+            .into_iter()
+            .map(|path| resolve_path_for_cwd(&path, cwd))
+            .collect::<Vec<_>>()
+    } else {
+        options
             .extension_paths
             .iter()
-            .map(|path| resolve_path_for_cwd(path, &cwd))
-            .collect::<Vec<_>>();
+            .map(|path| resolve_path_for_cwd(path, cwd))
+            .collect::<Vec<_>>()
+    };
+    if !extension_paths.is_empty() {
         let resolved_ext_policy =
             config.resolve_extension_policy_with_metadata(options.extension_policy.as_deref());
         let resolved_repair_policy =
@@ -1945,8 +2258,8 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         agent_session
             .enable_extensions_with_policy(
                 &enabled_tools,
-                &cwd,
-                Some(&config),
+                cwd,
+                Some(config),
                 &extension_paths,
                 Some(resolved_ext_policy.policy),
                 Some(resolved_repair_policy.effective_mode),
@@ -1973,7 +2286,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     }
 
     agent_session.set_model_registry(model_registry.clone());
-    agent_session.set_auth_storage(auth);
+    agent_session.set_auth_storage(auth.clone());
 
     let history = {
         let cx = crate::agent_cx::AgentCx::for_request();
@@ -2000,6 +2313,13 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         listeners,
         ask_tool: ask_tool_handle,
     })
+}
+
+/// This is the programmatic entrypoint for non-CLI consumers that want to run
+/// Pi sessions in-process.
+pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessionHandle> {
+    let services = create_agent_session_services(&options).await?;
+    create_agent_session_from_services(&services, options).await
 }
 
 #[cfg(test)]

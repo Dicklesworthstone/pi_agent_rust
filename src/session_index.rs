@@ -19,7 +19,7 @@ const MAX_JSONL_LINE_BYTES: usize = 100 * 1024 * 1024;
 // recovery when a process is killed while updating the session index.
 const SESSION_INDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SessionMeta {
     pub path: String,
     pub id: String,
@@ -29,6 +29,14 @@ pub struct SessionMeta {
     pub last_modified_ms: i64,
     pub size_bytes: u64,
     pub name: Option<String>,
+    /// 第一个 user 消息的文本(对齐 TS SessionInfo.firstMessage);无则 "(no messages)"。
+    pub first_message: String,
+    /// `header.parentSession`,用于派生 parentSessionId(对齐 TS SessionInfo.parentSessionPath)。
+    pub parent_session_path: Option<String>,
+    /// 语义"修改时间":最后一条 user/assistant 消息的时间(优先 message.timestamp 数值,
+    /// 否则 entry timestamp ISO 解析);无消息则回退 header 时间,再无回退 file mtime。
+    /// 与 `last_modified_ms`(file mtime,增量索引用)区分。
+    pub modified_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -78,6 +86,8 @@ impl SessionIndex {
         header: &SessionHeader,
         message_count: u64,
         name: Option<String>,
+        first_message: String,
+        activity_ms: i64,
     ) -> Result<()> {
         let (last_modified_ms, size_bytes) = session_file_stats(path)?;
         let meta = SessionMeta {
@@ -89,6 +99,9 @@ impl SessionIndex {
             last_modified_ms,
             size_bytes,
             name,
+            first_message,
+            parent_session_path: header.parent_session.clone(),
+            modified_ms: derive_modified_ms(activity_ms, header, last_modified_ms),
         };
         self.upsert_meta(meta)
     }
@@ -130,8 +143,8 @@ impl SessionIndex {
             let (sql, params): (&str, Vec<Value>) = cwd.map_or_else(
                 || {
                     (
-                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
-                         FROM sessions ORDER BY last_modified_ms DESC",
+                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name,first_message,parent_session_path,modified_ms
+                         FROM sessions ORDER BY modified_ms DESC",
                         vec![],
                     )
                 },
@@ -449,6 +462,8 @@ pub(crate) fn enqueue_session_index_snapshot_update(
     header: &SessionHeader,
     message_count: u64,
     name: Option<String>,
+    first_message: String,
+    activity_ms: i64,
 ) {
     let sessions_root = sessions_root.to_path_buf();
     let path = path.to_path_buf();
@@ -459,6 +474,8 @@ pub(crate) fn enqueue_session_index_snapshot_update(
         &header,
         message_count,
         name,
+        first_message,
+        activity_ms,
     ) {
         tracing::warn!(
             sessions_root = %sessions_root.display(),
@@ -479,10 +496,33 @@ fn init_schema(conn: &SqliteConnection) -> Result<()> {
             message_count INTEGER NOT NULL,
             last_modified_ms INTEGER NOT NULL,
             size_bytes INTEGER NOT NULL,
-            name TEXT
+            name TEXT,
+            first_message TEXT NOT NULL DEFAULT '(no messages)',
+            parent_session_path TEXT,
+            modified_ms INTEGER NOT NULL DEFAULT 0
         )",
     )
     .map_err(|e| Error::session(format!("Create sessions table: {e}")))?;
+
+    // 向后兼容:旧库无新列 → ALTER ADD COLUMN
+    for (col, col_def) in [
+        ("first_message", "TEXT NOT NULL DEFAULT '(no messages)'"),
+        ("parent_session_path", "TEXT"),
+        ("modified_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        let rows = conn
+            .query_sync("PRAGMA table_info(sessions)", &[])
+            .map_err(|e| Error::session(format!("PRAGMA table_info: {e}")))?;
+        let col_exists = rows.iter().any(|row| {
+            row.get_named::<String>("name")
+                .map(|n| n == col)
+                .unwrap_or(false)
+        });
+        if !col_exists {
+            conn.execute_raw(&format!("ALTER TABLE sessions ADD COLUMN {col} {col_def}"))
+                .map_err(|e| Error::session(format!("ALTER TABLE ADD {col}: {e}")))?;
+        }
+    }
 
     conn.execute_raw(
         "CREATE TABLE IF NOT EXISTS meta (
@@ -499,8 +539,8 @@ fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
     let message_count = sqlite_i64_from_u64("message_count", meta.message_count)?;
     let size_bytes = sqlite_i64_from_u64("size_bytes", meta.size_bytes)?;
     conn.execute_sync(
-        "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+        "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name,first_message,parent_session_path,modified_ms)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
          ON CONFLICT(path) DO UPDATE SET
            id=excluded.id,
            cwd=excluded.cwd,
@@ -508,7 +548,10 @@ fn upsert_meta_row(conn: &SqliteConnection, meta: SessionMeta) -> Result<()> {
            message_count=excluded.message_count,
            last_modified_ms=excluded.last_modified_ms,
            size_bytes=excluded.size_bytes,
-           name=excluded.name",
+           name=excluded.name,
+           first_message=excluded.first_message,
+           parent_session_path=excluded.parent_session_path,
+           modified_ms=excluded.modified_ms",
         &[
             Value::from(meta.path),
             Value::from(meta.id),
@@ -591,6 +634,15 @@ fn row_to_meta(row: &fsqlite::Row) -> Result<SessionMeta> {
     })
 }
 
+/// modified = 最后消息活动时间;无活动回退 header 时间戳,再回退文件 mtime。
+fn derive_modified_ms(activity_ms: i64, header: &SessionHeader, last_modified_ms: i64) -> i64 {
+    if activity_ms > 0 {
+        activity_ms
+    } else {
+        parse_iso_to_millis(&header.timestamp).unwrap_or(last_modified_ms)
+    }
+}
+
 fn build_meta(
     path: &Path,
     header: &SessionHeader,
@@ -599,7 +651,7 @@ fn build_meta(
     header
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
-    let (message_count, name) = session_stats(entries);
+    let (message_count, name, first_message, activity_ms) = session_stats(entries);
     let (last_modified_ms, size_bytes) = session_file_stats(path)?;
     Ok(SessionMeta {
         path: path.display().to_string(),
@@ -610,6 +662,9 @@ fn build_meta(
         last_modified_ms,
         size_bytes,
         name,
+        first_message,
+        parent_session_path: header.parent_session.clone(),
+        modified_ms: derive_modified_ms(activity_ms, header, last_modified_ms),
     })
 }
 
@@ -668,6 +723,47 @@ struct PartialEntry {
     r#type: String,
     #[serde(default)]
     name: Option<String>,
+    /// message-type entry 的 message 子对象(role/content/timestamp)。
+    #[serde(default)]
+    message: Option<PartialMessage>,
+}
+
+#[derive(Deserialize)]
+struct PartialMessage {
+    #[serde(default)]
+    role: Option<String>,
+    /// string 或 array-of-blocks(含 {type:"text", text:...})。
+    #[serde(default)]
+    content: Option<serde_json::Value>,
+    /// 数值时间戳(epoch ms,对齐 TS message.timestamp)。
+    #[serde(default)]
+    timestamp: Option<f64>,
+}
+
+/// 对齐 TS `extractTextContent`:string 原样;array 过滤 `type==="text"` → join `" "`。
+fn extract_text_content(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() { None } else { Some(s.clone()) }
+        }
+        serde_json::Value::Array(blocks) => {
+            let texts: Vec<&str> = blocks.iter()
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if texts.is_empty() { None } else { Some(texts.join(" ")) }
+        }
+        _ => None,
+    }
+}
+
+/// ISO 8601 → epoch ms(仅解析 header/entry timestamp 的常见格式)。
+fn parse_iso_to_millis(timestamp: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_str(timestamp, "%+")
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(timestamp))
+        .ok()
+        .map(|dt| dt.timestamp_millis())
 }
 
 fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
@@ -699,7 +795,24 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
     })? {
         if let Ok(entry) = serde_json::from_str::<PartialEntry>(&line_buf) {
             match entry.r#type.as_str() {
-                "message" => message_count += 1,
+                "message" => {
+                    message_count += 1;
+                    if let Some(message) = &entry.message
+                        && let Some(content) = &message.content
+                    {
+                        if first_message.is_none()
+                            && message.role.as_deref() == Some("user")
+                        {
+                            first_message = extract_text_content(content);
+                        }
+                        if let Some(ts) = message.timestamp
+                            && ts > 0.0
+                            && matches!(message.role.as_deref(), Some("user") | Some("assistant"))
+                        {
+                            max_activity_ms = Some(max_activity_ms.unwrap_or(0).max(ts as i64));
+                        }
+                    }
+                }
                 "session_info" if entry.name.is_some() => {
                     name = entry.name;
                 }
@@ -721,11 +834,16 @@ fn build_meta_from_jsonl(path: &Path) -> Result<SessionMeta> {
         path: path.display().to_string(),
         id: header.id,
         cwd: header.cwd,
-        timestamp: header.timestamp,
+        timestamp: header.timestamp.clone(),
         message_count,
         last_modified_ms,
         size_bytes,
         name,
+        first_message: first_message.unwrap_or_else(|| "(no messages)".to_string()),
+        parent_session_path: header.parent_session.clone(),
+        modified_ms: max_activity_ms.unwrap_or_else(|| {
+            parse_iso_to_millis(&header.timestamp).unwrap_or(last_modified_ms)
+        }),
     })
 }
 
@@ -745,30 +863,67 @@ fn build_meta_from_sqlite(path: &Path) -> Result<SessionMeta> {
         path: path.display().to_string(),
         id: header.id,
         cwd: header.cwd,
-        timestamp: header.timestamp,
+        timestamp: header.timestamp.clone(),
         message_count: meta.message_count,
         last_modified_ms,
         size_bytes,
         name: meta.name,
+        first_message: "(no messages)".to_string(),
+        parent_session_path: header.parent_session.clone(),
+        modified_ms: parse_iso_to_millis(&header.timestamp).unwrap_or(last_modified_ms),
     })
 }
 
-fn session_stats<T>(entries: &[T]) -> (u64, Option<String>)
+pub(crate) fn session_stats<T>(entries: &[T]) -> (u64, Option<String>, String, i64)
 where
     T: Borrow<SessionEntry>,
 {
+    use crate::model::{ContentBlock, UserContent};
     let mut message_count = 0u64;
     let mut name = None;
+    let mut first_message = "(no messages)".to_string();
+    let mut max_activity_ms: Option<i64> = None;
     for entry in entries {
-        match entry.borrow() {
-            SessionEntry::Message(_) => message_count += 1,
-            SessionEntry::SessionInfo(info) if info.name.is_some() => {
+        let SessionEntry::Message(msg) = entry.borrow() else {
+            if let SessionEntry::SessionInfo(info) = entry.borrow()
+                && info.name.is_some()
+            {
                 name.clone_from(&info.name);
+            }
+            continue;
+        };
+        message_count += 1;
+        match &msg.message {
+            SessionMessage::User { content, timestamp } => {
+                if first_message == "(no messages)" {
+                    let text = match content {
+                        UserContent::Text(s) => {
+                            let t = s.trim();
+                            if t.is_empty() { None } else { Some(s.clone()) }
+                        }
+                        UserContent::Blocks(blocks) => {
+                            let texts: Vec<&str> = blocks.iter()
+                                .filter_map(|b| match b {
+                                    ContentBlock::Text(t) => Some(t.text.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            if texts.is_empty() { None } else { Some(texts.join(" ")) }
+                        }
+                    };
+                    if let Some(t) = text { first_message = t; }
+                }
+                if let Some(ts) = timestamp {
+                    max_activity_ms = Some(max_activity_ms.unwrap_or(0).max(*ts));
+                }
+            }
+            SessionMessage::Assistant { message } => {
+                max_activity_ms = Some(max_activity_ms.unwrap_or(0).max(message.timestamp));
             }
             _ => {}
         }
     }
-    (message_count, name)
+    (message_count, name, first_message, max_activity_ms.unwrap_or(0))
 }
 
 #[cfg(feature = "sqlite-sessions")]
@@ -1216,9 +1371,14 @@ mod tests {
             .log()
             .info("verify", format!("listed {} sessions", sessions.len()));
         assert!(sessions.len() >= 2);
-        assert_eq!(sessions[0].id, "id-b");
-        assert_eq!(sessions[1].id, "id-a");
-        assert!(sessions[0].last_modified_ms >= sessions[1].last_modified_ms);
+        // 排序现在按 modified_ms(消息时间)降序;两条 user 消息在同一毫秒内创建,
+        // modified_ms 可能相等 → 顺序不稳定。改为断言降序关系而非固定顺序。
+        assert!(
+            sessions[0].modified_ms >= sessions[1].modified_ms,
+            "sessions must be sorted by modified_ms descending: {} vs {}",
+            sessions[0].modified_ms,
+            sessions[1].modified_ms
+        );
     }
 
     #[test]
@@ -1425,7 +1585,7 @@ mod tests {
 
     #[test]
     fn session_stats_empty_entries() {
-        let (count, name) = session_stats::<SessionEntry>(&[]);
+        let (count, name, _, _) = session_stats::<SessionEntry>(&[]);
         assert_eq!(count, 0);
         assert!(name.is_none());
     }
@@ -1437,7 +1597,7 @@ mod tests {
             make_session_info_entry(Some("m1".to_string()), "info1", None),
             make_user_entry(Some("info1".to_string()), "m2", "world"),
         ];
-        let (count, name) = session_stats(&entries);
+        let (count, name, _, _) = session_stats(&entries);
         assert_eq!(count, 2);
         assert!(name.is_none());
     }
@@ -1449,7 +1609,7 @@ mod tests {
             make_user_entry(Some("info1".to_string()), "m1", "msg"),
             make_session_info_entry(Some("m1".to_string()), "info2", Some("Final Name")),
         ];
-        let (count, name) = session_stats(&entries);
+        let (count, name, _, _) = session_stats(&entries);
         assert_eq!(count, 1);
         assert_eq!(name.as_deref(), Some("Final Name"));
     }
@@ -1460,7 +1620,7 @@ mod tests {
             make_session_info_entry(None, "info1", Some("My Session")),
             make_session_info_entry(Some("info1".to_string()), "info2", None),
         ];
-        let (_, name) = session_stats(&entries);
+        let (_, name, _, _) = session_stats(&entries);
         // None doesn't overwrite previous name because of `if info.name.is_some()`
         assert_eq!(name.as_deref(), Some("My Session"));
     }
@@ -1531,7 +1691,7 @@ mod tests {
         let index = SessionIndex::for_sessions_root(&root);
         let header = make_header("sqlite-id", "sqlite-cwd");
         index
-            .index_session_snapshot(&path, &header, 3, Some("sqlite session".to_string()))
+            .index_session_snapshot(&path, &header, 3, Some("sqlite session".to_string()), "(no messages)".to_string(), 0)
             .expect("index sqlite snapshot");
 
         let listed = index
@@ -1563,6 +1723,8 @@ mod tests {
             &header,
             3,
             Some("Queued Session".to_string()),
+            "(no messages)".to_string(),
+            0,
         );
 
         let index = SessionIndex::for_sessions_root(&root);
@@ -1983,6 +2145,7 @@ mod tests {
                     last_modified_ms: 1,
                     size_bytes: 1,
                     name: None,
+                    ..Default::default()
                 }],
                 Vec::new(),
             )
@@ -2037,6 +2200,7 @@ mod tests {
                     last_modified_ms: 1,
                     size_bytes: 1,
                     name: None,
+                    ..Default::default()
                 }],
                 Vec::new(),
             )
@@ -2485,7 +2649,7 @@ mod tests {
 
         let header = make_header("id-overflow", "cwd-overflow");
         let err = index
-            .index_session_snapshot(&path, &header, (i64::MAX as u64) + 1, None)
+            .index_session_snapshot(&path, &header, (i64::MAX as u64) + 1, None, "(no messages)".to_string(), 0)
             .expect_err("out-of-range message_count should error");
         assert!(
             matches!(err, Error::Session(ref msg) if msg.contains("message_count exceeds SQLite INTEGER range")),
@@ -2521,8 +2685,8 @@ mod tests {
                     for (idx, row) in rows.iter().enumerate() {
                         let path = format!("/tmp/pi-session-index-{idx}.jsonl");
                         conn.execute_sync(
-                            "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
-                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+                            "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name,first_message,parent_session_path,modified_ms)
+                             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,NULL,?6)",
                             &[
                                 Value::from(path),
                                 Value::from(row.id.clone()),
@@ -2553,7 +2717,7 @@ mod tests {
             let listed = listed.expect("list all sessions");
             prop_assert_eq!(listed.len(), rows.len());
             for pair in listed.windows(2) {
-                prop_assert!(pair[0].last_modified_ms >= pair[1].last_modified_ms);
+                prop_assert!(pair[0].modified_ms >= pair[1].modified_ms);
             }
 
             for meta in &listed {
@@ -2584,7 +2748,7 @@ mod tests {
             prop_assert_eq!(filtered.len(), expected_filtered);
             prop_assert!(filtered.iter().all(|meta| meta.cwd.as_str().eq("cwd-a")));
             for pair in filtered.windows(2) {
-                prop_assert!(pair[0].last_modified_ms >= pair[1].last_modified_ms);
+                prop_assert!(pair[0].modified_ms >= pair[1].modified_ms);
             }
         }
     }
@@ -2611,7 +2775,7 @@ mod tests {
 
             let mut header = make_header(&id, &cwd);
             header.timestamp = timestamp.clone();
-            let index_result = index.index_session_snapshot(&path, &header, message_count, name.clone());
+            let index_result = index.index_session_snapshot(&path, &header, message_count, name.clone(), "(no messages)".to_string(), 0);
             if message_count > i64::MAX as u64 {
                 prop_assert!(
                     index_result.is_err(),

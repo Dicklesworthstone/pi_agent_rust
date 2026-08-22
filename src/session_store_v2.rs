@@ -833,6 +833,38 @@ fn validate_private_directory_entry(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Metadata-only counterpart of [`validate_private_directory_entry`] for
+/// read-only inspection paths that must not open (or require search access to)
+/// the tree. Uses `symlink_metadata` so links and non-private dirs are still
+/// rejected without touching a mode-0o000 directory the current user may not
+/// be able to open.
+fn validate_private_directory_entry_metadata(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| Error::Io(Box::new(err)))?;
+    if metadata.file_type().is_symlink() {
+        return Err(Error::session(format!(
+            "session-store directory must not be a symlink: {}",
+            path.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(Error::session(format!(
+            "session-store directory is not a directory: {}",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(Error::session(format!(
+                "session-store directory has non-private permissions: {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn regular_file_len(path: &Path) -> Result<u64> {
     let file = open_regular_file_for_read(path)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", path.display())))?;
@@ -2475,13 +2507,15 @@ impl SessionStoreV2 {
             }
         }
         // Healthy resume deliberately does not require listing access to these
-        // unrelated trees. Still reject links, special files, and non-private
-        // directories from metadata; consumers perform a descriptor-backed
+        // unrelated trees. Only metadata (via symlink_metadata) is used to
+        // reject links/special files/non-private dirs, so a read-only inspection
+        // stays possible even when these trees are mode 0o000 (as session.rs
+        // v2_healthy_open tests assert). Consumers perform a descriptor-backed
         // open when they actually use one of these surfaces.
         for child in ["checkpoints", "migrations", "tmp"] {
             let path = root.join(child);
             if path_entry_exists(&path)? {
-                validate_private_directory_entry(&path)?;
+                validate_private_directory_entry_metadata(&path)?;
             }
         }
 

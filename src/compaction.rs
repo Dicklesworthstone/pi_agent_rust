@@ -963,6 +963,20 @@ struct ContextUsageEstimate {
     last_usage_index: Option<usize>,
 }
 
+/// Estimate the compressed context size of a session's current path
+/// (post-compaction usage: compaction summary + kept messages). Uses the
+/// same estimation chain as `prepare_compaction`'s `tokens_before`.
+pub fn estimate_current_path_tokens(session: &crate::session::Session) -> u64 {
+    let path_entries = session.entries_for_current_path();
+    let mut usage_messages = Vec::with_capacity(path_entries.len());
+    for entry in path_entries {
+        if let Some(msg) = message_from_entry(entry) {
+            usage_messages.push(msg);
+        }
+    }
+    estimate_context_tokens(&usage_messages).tokens
+}
+
 fn estimate_context_tokens(messages: &[SessionMessage]) -> ContextUsageEstimate {
     let mut last_usage: Option<(&Usage, usize)> = None;
     for (idx, msg) in messages.iter().enumerate().rev() {

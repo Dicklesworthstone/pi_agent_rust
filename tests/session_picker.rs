@@ -183,6 +183,7 @@ fn session_picker_navigation_down_up() {
             last_modified_ms: 1000,
             size_bytes: 100,
             name: None,
+            ..Default::default()
         },
         SessionMeta {
             path: "/tmp/b.jsonl".to_string(),
@@ -193,6 +194,7 @@ fn session_picker_navigation_down_up() {
             last_modified_ms: 2000,
             size_bytes: 200,
             name: None,
+            ..Default::default()
         },
     ];
 
@@ -235,6 +237,7 @@ fn session_picker_navigation_with_jk() {
             last_modified_ms: 1000,
             size_bytes: 100,
             name: None,
+            ..Default::default()
         },
         SessionMeta {
             path: "/tmp/b.jsonl".to_string(),
@@ -245,6 +248,7 @@ fn session_picker_navigation_with_jk() {
             last_modified_ms: 2000,
             size_bytes: 200,
             name: None,
+            ..Default::default()
         },
     ];
 
@@ -279,6 +283,7 @@ fn session_picker_enter_sets_chosen_path() {
         last_modified_ms: 1000,
         size_bytes: 100,
         name: None,
+        ..Default::default()
     }];
 
     let mut picker = SessionPicker::new(sessions);
@@ -299,6 +304,7 @@ fn session_picker_cancel_sets_flag() {
         last_modified_ms: 1000,
         size_bytes: 100,
         name: None,
+        ..Default::default()
     }];
 
     let mut picker = SessionPicker::new(sessions);

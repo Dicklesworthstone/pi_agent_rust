@@ -289,6 +289,34 @@ impl Provider for CopilotProvider {
             "vscode-chat".to_string(),
         );
 
+        // 对齐 TS:`X-Initiator` 表示请求是用户发起还是 agent 发起(无前序消息默认 user)。
+        let last_message = context.messages.last();
+        let is_agent_call = last_message
+            .map(|m| !matches!(m, crate::model::Message::User(_)))
+            .unwrap_or(false);
+        copilot_options.headers.insert(
+            "X-Initiator".to_string(),
+            if is_agent_call { "agent" } else { "user" }.to_string(),
+        );
+        copilot_options
+            .headers
+            .insert("Openai-Intent".to_string(), "conversation-edits".to_string());
+
+        // 对齐 TS:Copilot 发送图片时需要 `Copilot-Vision-Request: true`。
+        let has_images = context.messages.iter().any(|m| match m {
+            crate::model::Message::User(u) => matches!(&u.content, crate::model::UserContent::Blocks(blocks) if blocks.iter().any(|b| matches!(b, crate::model::ContentBlock::Image(_)))),
+            crate::model::Message::ToolResult(tr) => tr
+                .content
+                .iter()
+                .any(|b| matches!(b, crate::model::ContentBlock::Image(_))),
+            _ => false,
+        });
+        if has_images {
+            copilot_options
+                .headers
+                .insert("Copilot-Vision-Request".to_string(), "true".to_string());
+        }
+
         inner.stream(context, &copilot_options).await
     }
 }

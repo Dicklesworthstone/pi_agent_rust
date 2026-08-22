@@ -689,8 +689,14 @@ pub fn select_model_and_thinking(
             .and_then(parse_thinking_level_opt);
     }
 
+    // Default "medium" matches upstream pi (TS DEFAULT_THINKING_LEVEL,
+    // coding-agent dist/core/defaults.js). The previous XHigh default made
+    // every reasoning-capable custom provider start at maximum thinking when
+    // the caller left the level unspecified — heavier requests and, via some
+    // gateways, runs that never settle (turn finished on the event line while
+    // the prompt future stayed pending).
     let thinking_level =
-        model_entry.clamp_thinking_level(thinking_level.unwrap_or(model::ThinkingLevel::XHigh));
+        model_entry.clamp_thinking_level(thinking_level.unwrap_or(model::ThinkingLevel::Medium));
 
     Ok(ModelSelection {
         model_entry,
@@ -1246,6 +1252,16 @@ pub fn resolve_model_scope(
     registry: &ModelRegistry,
     allow_missing_keys: bool,
 ) -> Vec<ScopedModel> {
+    resolve_model_scope_with_diagnostics(patterns, registry, allow_missing_keys).0
+}
+
+/// 对齐 TS `resolveModelScopeWithDiagnostics`:返回 (scoped_models, warnings)。
+/// warnings 是人可读的诊断消息(pattern 无效 / 无匹配等),替代 eprintln!。
+pub fn resolve_model_scope_with_diagnostics(
+    patterns: &[String],
+    registry: &ModelRegistry,
+    allow_missing_keys: bool,
+) -> (Vec<ScopedModel>, Vec<String>) {
     let available_models = if allow_missing_keys {
         registry.models().to_vec()
     } else {
@@ -1253,6 +1269,7 @@ pub fn resolve_model_scope(
     };
 
     let mut scoped_models: Vec<ScopedModel> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
     for pattern in patterns {
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
@@ -1268,7 +1285,7 @@ pub fn resolve_model_scope(
             let glob = match Pattern::new(&glob_pattern.to_lowercase()) {
                 Ok(glob) => glob,
                 Err(err) => {
-                    eprintln!("Warning: Invalid model pattern \"{pattern}\": {err}");
+                    warnings.push(format!("Invalid model pattern \"{pattern}\": {err}"));
                     continue;
                 }
             };
@@ -1293,14 +1310,14 @@ pub fn resolve_model_scope(
             }
 
             if !matched_any {
-                eprintln!("Warning: No models match pattern \"{pattern}\"");
+                warnings.push(format!("No models match pattern \"{pattern}\""));
             }
             continue;
         }
 
         let parsed = parse_model_pattern(pattern, &available_models);
         if let Some(warning) = parsed.warning {
-            eprintln!("Warning: {warning}");
+            warnings.push(warning);
         }
 
         if let Some(model) = parsed.model {
@@ -1314,11 +1331,11 @@ pub fn resolve_model_scope(
                 });
             }
         } else {
-            eprintln!("Warning: No models match pattern \"{pattern}\"");
+            warnings.push(format!("No models match pattern \"{pattern}\""));
         }
     }
 
-    scoped_models
+    (scoped_models, warnings)
 }
 
 fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> ParsedModelResult {

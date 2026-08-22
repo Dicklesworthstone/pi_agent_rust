@@ -1843,8 +1843,8 @@ build_from_source() {
       err "--source-dir does not contain Cargo.toml: $src_dir"
       return 1
     fi
-    if ! grep -q '^name *= *"pi_agent_rust"' "$src_dir/Cargo.toml"; then
-      err "--source-dir Cargo.toml package name is not pi_agent_rust: $src_dir"
+    if ! grep -q '^name *= *"picrab"' "$src_dir/Cargo.toml"; then
+      err "--source-dir Cargo.toml package name is not picrab: $src_dir"
       return 1
     fi
   else

@@ -2559,6 +2559,32 @@ pub fn resolve_aws_credentials(auth: &AuthStorage) -> Option<AwsResolvedCredenti
     resolve_aws_credentials_with_env(auth, |var| std::env::var(var).ok())
 }
 
+/// Env-injectable variant for availability checks (`model_entry_is_ready`) and
+/// tests: same chain as `resolve_aws_credentials`, with the environment lookup
+/// supplied by the caller (avoids std::env mutation races in parallel tests).
+pub(crate) fn resolve_aws_credentials_with_env_lookup<F>(
+    auth: Option<&AuthStorage>,
+    env: &mut F,
+) -> Option<AwsResolvedCredentials>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    // No auth storage reachable (missing/unreadable auth.json): still honor the
+    // env lanes by resolving against an empty store.
+    let owned;
+    let auth: &AuthStorage = match auth {
+        Some(a) => a,
+        None => {
+            owned = AuthStorage {
+                path: PathBuf::new(),
+                entries: HashMap::new(),
+            };
+            &owned
+        }
+    };
+    resolve_aws_credentials_with_env_policy(auth, |var| env(var), true)
+}
+
 fn preferred_non_empty_env<F>(env: &mut F, primary: &str, fallback: &str) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
@@ -3519,6 +3545,29 @@ pub struct SapResolvedCredentials {
 /// stored credentials.
 pub fn resolve_sap_credentials(auth: &AuthStorage) -> Option<SapResolvedCredentials> {
     resolve_sap_credentials_with_env(auth, |var| std::env::var(var).ok())
+}
+
+/// Env-injectable variant for availability checks (`model_entry_is_ready`) and
+/// tests: same chain, caller-supplied environment lookup.
+pub(crate) fn resolve_sap_credentials_with_env_lookup<F>(
+    auth: Option<&AuthStorage>,
+    env: &mut F,
+) -> Option<SapResolvedCredentials>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let owned;
+    let auth: &AuthStorage = match auth {
+        Some(a) => a,
+        None => {
+            owned = AuthStorage {
+                path: PathBuf::new(),
+                entries: HashMap::new(),
+            };
+            &owned
+        }
+    };
+    resolve_sap_credentials_with_env(auth, |var| env(var))
 }
 
 fn resolve_sap_credentials_with_env<F>(

@@ -1486,6 +1486,12 @@ impl Agent {
         &self.messages
     }
 
+    /// Base tool registry (get_tools RPC face: names + descriptions).
+    #[must_use]
+    pub fn tools(&self) -> &ToolRegistry {
+        &self.tools
+    }
+
     /// Clear the message history.
     pub fn clear_messages(&mut self) {
         self.messages.clear();
@@ -1637,6 +1643,17 @@ impl Agent {
             }
         };
 
+        // 对齐 TS `transformMessages`:为孤儿 tool_call(无后续 toolResult)合成
+        // {role:toolResult, content:"No result provided", isError:true},并跳过
+        // error/aborted 的不完整 assistant 轮次。防回放时上游 API 硬 400
+        // (Anthropic/OpenAI strict 要求每个 tool_use 必须有对应 tool_result)。
+        let messages = Cow::Owned(Self::transform_messages_for_replay(
+            &messages,
+            self.provider.name(),
+            self.provider.api(),
+            self.provider.model_id(),
+        ));
+
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
         // Load modes (bd-cv653.1.6): discoverable-tier tools are excluded
         // until promoted; the generation counter invalidates on promotion.
@@ -1678,6 +1695,112 @@ impl Agent {
             messages,
             tools,
         }
+    }
+
+    /// 对齐 TS `transformMessages`(两遍融合为单遍,避免双重 clone):
+    /// 同时完成——跨 provider thinking→text 转换 + 孤儿 tool_call 合成 +
+    /// 跳过 error/aborted assistant。
+    fn transform_messages_for_replay(
+        messages: &[Message],
+        current_provider: &str,
+        current_api: &str,
+        current_model: &str,
+    ) -> Vec<Message> {
+        let now = Utc::now().timestamp_millis();
+        let synthetic = |id: String, name: String| {
+            Message::tool_result(ToolResultMessage {
+                tool_call_id: id,
+                tool_name: name,
+                content: vec![ContentBlock::Text(TextContent::new("No result provided"))],
+                details: None,
+                is_error: true,
+                timestamp: now,
+            })
+        };
+
+        let mut result: Vec<Message> = Vec::with_capacity(messages.len());
+        let mut pending: Vec<(String, String)> = Vec::new();
+        let mut seen_result_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for msg in messages {
+            match msg {
+                Message::Assistant(a) => {
+                    // ── 第一遍逻辑:冲刷上一条孤儿 + 跳过 errored ──
+                    if !pending.is_empty() {
+                        for (id, name) in pending.drain(..) {
+                            if !seen_result_ids.contains(&id) {
+                                result.push(synthetic(id, name));
+                            }
+                        }
+                        seen_result_ids.clear();
+                    }
+                    if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        continue;
+                    }
+
+                    // ── 融合:thinking 转换 + tool_call 记录 + clone(单次)──
+                    let is_same_model = a.provider == current_provider
+                        && a.api == current_api
+                        && a.model == current_model;
+                    let transformed_content: Vec<ContentBlock> = a
+                        .content
+                        .iter()
+                        .flat_map(|block| match block {
+                            ContentBlock::Thinking(t) => {
+                                if is_same_model && t.thinking_signature.is_some() {
+                                    return vec![block.clone()];
+                                }
+                                if t.thinking.trim().is_empty() {
+                                    return vec![];
+                                }
+                                if is_same_model {
+                                    return vec![block.clone()];
+                                }
+                                vec![ContentBlock::Text(TextContent::new(&t.thinking))]
+                            }
+                            _ => vec![block.clone()],
+                        })
+                        .collect();
+
+                    let tool_calls: Vec<(String, String)> = a
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::ToolCall(tc) => Some((tc.id.clone(), tc.name.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    if !tool_calls.is_empty() {
+                        pending = tool_calls;
+                        seen_result_ids.clear();
+                    }
+
+                    let mut cloned = (**a).clone();
+                    cloned.content = transformed_content;
+                    result.push(Message::Assistant(Arc::new(cloned)));
+                }
+                Message::ToolResult(tr) => {
+                    seen_result_ids.insert(tr.tool_call_id.clone());
+                    result.push(msg.clone());
+                }
+                Message::User(_) => {
+                    if !pending.is_empty() {
+                        for (id, name) in pending.drain(..) {
+                            if !seen_result_ids.contains(&id) {
+                                result.push(synthetic(id, name));
+                            }
+                        }
+                        seen_result_ids.clear();
+                    }
+                    result.push(msg.clone());
+                }
+                Message::Custom(_) => {
+                    result.push(msg.clone());
+                }
+            }
+        }
+        // TS 不在末尾冲刷(agent 流程保证 tool_call 后必跟 result)。
+        result
     }
 
     /// Run the agent with a user message.
@@ -3452,7 +3575,9 @@ impl Agent {
             });
         }
 
-        // Phase 2: Execute tools in contiguous compatible-effect batches.
+        // 工具执行策略:effect-batch + 并行执行(Rust 增强性能;TS 为串行但并行更高效
+        // 且 abort/steering 检查在 batch 间生效)。保留并行是因为串行模式引入了 abort
+        // 测试挂起(repeated_abort_then_resume)。
         let effect_plan = tool_calls
             .iter()
             .map(|tool_call| {
@@ -4069,7 +4194,10 @@ impl Agent {
 
         let tool_name = tool_call.name.clone();
         let tool_id = tool_call.id.clone();
-        let tool_args = tool_call.arguments.clone();
+        // 对齐 TS AJV `validateToolArguments(tool, toolCall, { coerceTypes: true })`:
+        // LLM 偶发输出字符串形式的数字(`{"offset":"5"}`),TS 会强制为数字 `5`。
+        // Rust 逐属性按 schema 类型做轻量级 coercion。
+        let tool_args = coerce_tool_arguments(&tool_call.arguments, &tool.parameters());
         let on_event = Arc::clone(&on_event);
 
         let update_callback = move |update: ToolUpdate| {
@@ -9454,6 +9582,33 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 }
 
+/// Compaction result info surfaced to embedders (upstream RPC
+/// compaction_result payload: summary + tokensBefore/estimatedTokensAfter).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CompactionResultInfo {
+    pub summary: String,
+    pub first_kept_entry_id: String,
+    pub tokens_before: u64,
+    /// Post-compaction context estimate (summary + kept messages), same
+    /// estimation chain as `tokens_before`.
+    pub estimated_tokens_after: u64,
+    pub details: Option<serde_json::Value>,
+}
+
+impl CompactionResultInfo {
+    /// No-op compaction result (disabled / nothing to compact / cancelled
+    /// by extension policy).
+    fn no_op() -> Self {
+        Self {
+            summary: String::new(),
+            first_kept_entry_id: String::new(),
+            tokens_before: 0,
+            estimated_tokens_after: 0,
+            details: None,
+        }
+    }
+}
+
 impl AgentSession {
     pub const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
         match mode {
@@ -9593,6 +9748,16 @@ impl AgentSession {
         self.auth_storage = Some(auth);
     }
 
+    /// 只读访问已注入的 ModelRegistry(可能为 None:未注入或通过 sdk 创建后未保留)。
+    pub fn model_registry(&self) -> Option<&ModelRegistry> {
+        self.model_registry.as_ref()
+    }
+
+    /// 只读访问已注入的 AuthStorage(可能为 None)。
+    pub fn auth_storage(&self) -> Option<&AuthStorage> {
+        self.auth_storage.as_ref()
+    }
+
     #[must_use]
     pub fn with_api_key_override(mut self, api_key: Option<String>) -> Self {
         self.set_api_key_override(api_key);
@@ -9656,6 +9821,11 @@ impl AgentSession {
     /// The resolved compaction settings this session was constructed with.
     pub const fn compaction_settings(&self) -> &ResolvedCompactionSettings {
         &self.compaction_settings
+    }
+
+    /// Enable or disable automatic context compaction.
+    pub fn set_compaction_enabled(&mut self, enabled: bool) {
+        self.compaction_settings.enabled = enabled;
     }
 
     pub async fn set_provider_model(&mut self, provider_id: &str, model_id: &str) -> Result<()> {
@@ -9942,11 +10112,30 @@ impl AgentSession {
         self.save_enabled
     }
 
+    /// Graceful shutdown for embedders evicting a session: stop extension
+    /// runtimes, then drain the write-behind autosave queue (CLI main.rs
+    /// shutdown path lifted onto the session face). Without this flush,
+    /// dropping an idle session loses coalesced-but-unpersisted messages.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        if let Some(ref ext) = self.extensions {
+            ext.shutdown().await;
+        }
+        if self.save_enabled {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            if let Ok(mut guard) =
+                OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx()).await
+            {
+                guard.flush_autosave_on_shutdown().await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Force-run compaction synchronously (used by `/compact` slash command).
     pub async fn compact_now(
         &mut self,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<()> {
+    ) -> Result<CompactionResultInfo> {
         self.compact_synchronous(Arc::new(on_event)).await
     }
 
@@ -10347,9 +10536,9 @@ impl AgentSession {
     }
 
     /// Run compaction synchronously (inline), blocking until completion.
-    async fn compact_synchronous(&self, on_event: AgentEventHandler) -> Result<()> {
+    async fn compact_synchronous(&self, on_event: AgentEventHandler) -> Result<CompactionResultInfo> {
         if !self.compaction_settings.enabled {
-            return Ok(());
+            return Ok(CompactionResultInfo::no_op());
         }
 
         let (entries, preparation) = {
@@ -10388,6 +10577,7 @@ impl AgentSession {
             if let Some(compaction) = before_outcome.compaction {
                 self.extensions_is_compacting
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                let tokens_before = compaction.tokens_before;
                 let apply_result = self
                     .apply_compaction_entry(
                         compaction.summary.clone(),
@@ -10413,7 +10603,11 @@ impl AgentSession {
                     will_retry: false,
                     error_message: None,
                 });
-                return Ok(());
+                return Ok(CompactionResultInfo {
+                    tokens_before,
+                    estimated_tokens_after: self.estimate_current_path_tokens().await,
+                    ..CompactionResultInfo::no_op()
+                });
             }
             self.extensions_is_compacting
                 .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -10432,8 +10626,19 @@ impl AgentSession {
 
             match compaction_result {
                 Ok(result) => {
+                    let info = CompactionResultInfo {
+                        summary: result.summary.clone(),
+                        first_kept_entry_id: result.first_kept_entry_id.clone(),
+                        tokens_before: result.tokens_before,
+                        estimated_tokens_after: 0,
+                        details: None,
+                    };
                     self.apply_compaction_result(result, Arc::clone(&on_event))
                         .await?;
+                    return Ok(CompactionResultInfo {
+                        estimated_tokens_after: self.estimate_current_path_tokens().await,
+                        ..info
+                    });
                 }
                 Err(e) => {
                     on_event(AgentEvent::AutoCompactionEnd {
@@ -10446,7 +10651,17 @@ impl AgentSession {
                 }
             }
         }
-        Ok(())
+        Ok(CompactionResultInfo::no_op())
+    }
+
+    /// Post-compaction context estimate (summary + kept messages) from the
+    /// session's current path; 0 when the session lock is unavailable.
+    async fn estimate_current_path_tokens(&self) -> u64 {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        match self.session.lock(cx.cx()).await {
+            Ok(guard) => compaction::estimate_current_path_tokens(&guard),
+            Err(_) => 0,
+        }
     }
 
     fn resolve_extension_policy_for_enable(
@@ -12241,6 +12456,83 @@ const TRUNCATED_TOOL_CALL_ERROR: &str = "Model output truncated before tool call
 /// null, so this does not misjudge argument-less tools.
 fn is_complete_tool_call(tool_call: &ToolCall) -> bool {
     !tool_call.name.trim().is_empty() && !tool_call.arguments.is_null()
+}
+
+/// 对齐 TS AJV `coerceTypes: true`:按 schema 类型把字符串形态的值强制为目标类型。
+///
+/// - `integer` / `number`: `"5"` → `5`(解析失败保留原值)
+/// - `boolean`: `"true"` / `"false"` → `true` / `false`; `1` / `0` → `true` / `false`
+///
+/// 递归处理 `properties` 内的嵌套对象;数组元素的 `items` schema 也递归。
+fn coerce_tool_arguments(args: &serde_json::Value, schema: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = args.as_object() else {
+        return args.clone();
+    };
+    let Some(props) = schema.get("properties").and_then(|p| p.as_object()) else {
+        return args.clone();
+    };
+    let mut out = obj.clone();
+    for (key, value) in &mut out {
+        if let Some(prop_schema) = props.get(key) {
+            *value = coerce_value(value, prop_schema);
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+fn coerce_value(value: &serde_json::Value, schema: &serde_json::Value) -> serde_json::Value {
+    let Some(target_type) = schema.get("type").and_then(|t| t.as_str()) else {
+        // 嵌套对象递归
+        if value.is_object() {
+            return coerce_tool_arguments(value, schema);
+        }
+        return value.clone();
+    };
+    match target_type {
+        "integer" | "number" => {
+            if let Some(s) = value.as_str() {
+                if let Ok(n) = s.parse::<f64>() {
+                    if target_type == "integer" && n.fract() == 0.0 {
+                        return serde_json::json!(n as i64);
+                    }
+                    return serde_json::json!(n);
+                }
+            }
+            value.clone()
+        }
+        "boolean" => match value {
+            serde_json::Value::String(s) if s.eq_ignore_ascii_case("true") => {
+                serde_json::json!(true)
+            }
+            serde_json::Value::String(s) if s.eq_ignore_ascii_case("false") => {
+                serde_json::json!(false)
+            }
+            serde_json::Value::Number(n) if n.as_i64() == Some(1) => serde_json::json!(true),
+            serde_json::Value::Number(n) if n.as_i64() == Some(0) => serde_json::json!(false),
+            _ => value.clone(),
+        },
+        "object" => {
+            if value.is_object() {
+                coerce_tool_arguments(value, schema)
+            } else {
+                value.clone()
+            }
+        }
+        "array" => {
+            if let Some(arr) = value.as_array()
+                && let Some(items_schema) = schema.get("items")
+            {
+                let coerced: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|item| coerce_value(item, items_schema))
+                    .collect();
+                serde_json::Value::Array(coerced)
+            } else {
+                value.clone()
+            }
+        }
+        _ => value.clone(),
+    }
 }
 
 /// Whether `message` represents a response the provider truncated at its token

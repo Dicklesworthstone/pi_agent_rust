@@ -263,8 +263,14 @@ pub enum InputType {
 }
 
 /// Model pricing per million tokens.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// 所有字段 `#[serde(default)]`(默认 0.0),对齐上游 TS 运行时宽容:
+/// JS 里缺字段当 undefined → `|| 0` 兜底,不会让 models.json 加载失败。
+/// Rust serde 默认严格(缺必填字段 → 整个 ModelsConfig 解析失败 → 所有自定义
+/// 模型丢失)。加 default 后,catalog/models.dev 导入的残缺 cost(无缓存计费
+/// 的模型缺 cacheRead/cacheWrite)也能正常反序列化。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct ModelCost {
     pub input: f64,
     pub output: f64,

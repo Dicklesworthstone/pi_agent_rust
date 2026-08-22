@@ -30,6 +30,37 @@ const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 const ANTHROPIC_OAUTH_TOKEN_PREFIX: &str = "sk-ant-oat";
+/// 对齐 TS `claudeCodeTools`:Claude Code 2.x 工具名的规范大小写(OAuth 隐身模式)。
+const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// 对齐 TS `toClaudeCodeName`:`name` 与 CC 工具名大小写不敏感匹配时取规范大小写。
+fn to_claude_code_name(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    CLAUDE_CODE_TOOLS
+        .iter()
+        .find(|t| t.to_ascii_lowercase() == lower)
+        .copied()
+        .unwrap_or(name)
+}
+
 /// Beta flags added when using Anthropic OAuth bearer tokens.
 /// Override via `PI_ANTHROPIC_BETA_FLAGS`.
 const ANTHROPIC_OAUTH_BETA_FLAGS: &str = "claude-code-20250219,oauth-2025-04-20";
@@ -339,6 +370,8 @@ pub struct AnthropicProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    /// 目录中的 `model.maxTokens`。对齐 TS `model.maxTokens / 3` 的 max_tokens 默认值。
+    max_tokens: Option<u32>,
 }
 
 /// Whether an Anthropic(-compatible) model on the `anthropic-messages`
@@ -441,7 +474,15 @@ impl AnthropicProvider {
             base_url: ANTHROPIC_API_URL.to_string(),
             provider: "anthropic".to_string(),
             compat: None,
+            max_tokens: None,
         }
+    }
+
+    /// 目录中的 `model.maxTokens`。对齐 TS max_tokens 默认值 `model.maxTokens / 3`。
+    #[must_use]
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     /// Override the provider name reported in streamed events.
@@ -484,7 +525,7 @@ impl AnthropicProvider {
         let mut messages: Vec<AnthropicMessage<'_>> = context
             .messages
             .iter()
-            .map(convert_message_to_anthropic)
+            .map(|m| convert_message_to_anthropic(m, is_oauth_token))
             .collect();
 
         // Prompt-cache breakpoints. One marker on the system block, one on the
@@ -567,7 +608,10 @@ impl AnthropicProvider {
             }
         };
 
-        let mut max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        // 对齐 TS `options?.maxTokens || (model.maxTokens / 3) | 0`:
+        // 未显式提供时,默认取目录 `maxTokens / 3`(整数截断);目录缺失回退历史常量。
+        let model_default = self.max_tokens.map(|m| m / 3);
+        let mut max_tokens = options.max_tokens.or(model_default).unwrap_or(DEFAULT_MAX_TOKENS);
         if let Some(budget) = thinking.as_ref().and_then(|t| t.budget_tokens)
             && max_tokens <= budget
         {
@@ -584,6 +628,63 @@ impl AnthropicProvider {
         } else {
             options.temperature
         };
+
+        // 对齐 TS getCacheControl:retention≠None 时构造 `{type:"ephemeral", ttl?:"1h"}`;
+        // `ttl:"1h"` 仅 long + api.anthropic.com。
+        let cache_control = match options.cache_retention {
+            CacheRetention::None => None,
+            retention => {
+                let ttl = if matches!(retention, CacheRetention::Long)
+                    && self.base_url.contains("api.anthropic.com")
+                {
+                    Some("1h")
+                } else {
+                    None
+                };
+                Some(AnthropicCacheControl {
+                    r#type: "ephemeral",
+                    ttl,
+                })
+            }
+        };
+
+        // 对齐 TS:OAuth token(`sk-ant-oat…`)时,系统提示必须前缀 Claude Code 身份,
+        // 否则 API 可能拒绝或降级请求。`sanitizeSurrogates` 在 Rust 中天然满足
+        // (UTF-8 不产生孤立代理对)。
+        let system = if is_oauth_token {
+            let mut blocks = vec![AnthropicSystemBlock {
+                text: "You are Claude Code, Anthropic's official CLI for Claude.",
+                cache_control: cache_control.clone(),
+            }];
+            if let Some(prompt) = context.system_prompt.as_deref() {
+                blocks.push(AnthropicSystemBlock {
+                    text: prompt,
+                    cache_control: cache_control.clone(),
+                });
+            }
+            Some(blocks)
+        } else {
+            context
+                .system_prompt
+                .as_deref()
+                .map(|prompt| vec![AnthropicSystemBlock {
+                    text: prompt,
+                    cache_control: cache_control.clone(),
+                }])
+        };
+
+        // 对齐 TS:最后一条 user 消息的末 Text block 标注 cache_control(缓存对话历史)。
+        if let Some(cc) = &cache_control {
+            if let Some(msg) = messages.last_mut() {
+                if msg.role == "user" {
+                    if let Some(block) = msg.content.last_mut() {
+                        if let AnthropicContent::Text { cache_control: cc_field, .. } = block {
+                            *cc_field = Some(cc.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         AnthropicRequest {
             model: &self.model,
@@ -708,6 +809,7 @@ impl Provider for AnthropicProvider {
         }
 
         let mut beta_flags: Vec<String> = Vec::new();
+        // 对齐 TS:streaming beta flags 无条件发送(OAuth 时在 oauth flags 之后)。
         if anthropic_bearer_token {
             beta_flags.push(anthropic_oauth_beta_flags());
         }
@@ -1089,11 +1191,17 @@ where
             AnthropicDelta::SignatureDelta { signature } => {
                 // The Anthropic API sends signature_delta for thinking blocks
                 // to deliver the thinking_signature required for multi-turn
-                // extended thinking conversations.
+                // extended thinking conversations. 累积(对齐 TS
+                // `block.thinkingSignature += event.delta.signature`),而非覆盖——
+                // 多片段签名覆盖会只保留最后一片,导致回放签名无效。
                 if let Some(sig) = signature
                     && let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx)
                 {
-                    t.thinking_signature = Some(sig);
+                    let accumulated = match &t.thinking_signature {
+                        Some(existing) => format!("{existing}{sig}"),
+                        None => sig,
+                    };
+                    t.thinking_signature = Some(accumulated);
                 }
                 None
             }
@@ -1175,6 +1283,9 @@ where
                 "tool_use" => StopReason::ToolUse,
                 "pause_turn" => StopReason::PauseTurn,
                 "refusal" => StopReason::Refusal,
+                // 对齐 TS mapStopReason:`sensitive`(安全过滤)→ error。
+                // 此前落入 unknown 分支返回 Err 中止流;现映射为 Error 产出错误消息。
+                "sensitive" => StopReason::Error,
                 unknown => {
                     return Err(Error::provider(
                         "anthropic",
@@ -1186,7 +1297,19 @@ where
         }
 
         if let Some(u) = usage {
-            self.partial.usage.output = u.output_tokens;
+            // 对齐 TS:仅在字段非 null 时更新,缺失保留 message_start 的值。
+            if let Some(input) = u.input_tokens {
+                self.partial.usage.input = input;
+            }
+            if let Some(output) = u.output_tokens {
+                self.partial.usage.output = output;
+            }
+            if let Some(cache_read) = u.cache_read_input_tokens {
+                self.partial.usage.cache_read = cache_read;
+            }
+            if let Some(cache_write) = u.cache_creation_input_tokens {
+                self.partial.usage.cache_write = cache_write;
+            }
             self.recompute_total_tokens();
         }
 
@@ -1202,6 +1325,7 @@ where
 pub struct AnthropicRequest<'a> {
     model: &'a str,
     messages: Vec<AnthropicMessage<'a>>,
+    /// 对齐 TS:`system` 始终为 block 数组(可携带 `cache_control`)。
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<Vec<AnthropicSystemBlock<'a>>>,
     max_tokens: u32,
@@ -1214,6 +1338,23 @@ pub struct AnthropicRequest<'a> {
     thinking: Option<AnthropicThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_config: Option<AnthropicOutputConfig>,
+}
+
+/// 对齐 TS `cache_control: { type: "ephemeral", ttl?: "1h" }`。
+/// `ttl:"1h"` 仅在 `retention==="long"` 且 base_url 含 `api.anthropic.com` 时附加。
+#[derive(Debug, Serialize, Clone, PartialEq)]
+struct AnthropicCacheControl {
+    r#type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<&'static str>,
+}
+
+/// `system` 数组的一个文本 block(可携带 cache_control)。
+#[derive(Debug, Serialize, PartialEq)]
+struct AnthropicSystemBlock<'a> {
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
 }
 
 /// Thinking configuration. Two shapes share this struct:
@@ -1379,7 +1520,16 @@ struct AnthropicUsage {
 
 #[derive(Debug, Deserialize)]
 struct AnthropicDeltaUsage {
-    output_tokens: u64,
+    /// 对齐 TS:各字段可为 null(代理/中继在 message_delta 中可能省略部分字段);
+    /// 缺失时保留 message_start 的值。
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u64>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u64>,
 }
 
 /// Content block type from `content_block_start`.
@@ -1453,7 +1603,10 @@ struct AnthropicError {
 // Conversion Functions
 // ============================================================================
 
-fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
+fn convert_message_to_anthropic(
+    message: &Message,
+    is_oauth_token: bool,
+) -> AnthropicMessage<'_> {
     match message {
         Message::User(user) => AnthropicMessage {
             role: "user",
@@ -1471,7 +1624,7 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage<'_> {
             content: assistant
                 .content
                 .iter()
-                .filter_map(convert_content_block_to_anthropic)
+                .filter_map(|b| convert_content_block_to_anthropic(b, is_oauth_token))
                 .collect(),
         },
         Message::ToolResult(result) => AnthropicMessage {
@@ -1529,7 +1682,10 @@ fn convert_user_content(content: &UserContent) -> Vec<AnthropicContent<'_>> {
     }
 }
 
-fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicContent<'_>> {
+fn convert_content_block_to_anthropic(
+    block: &ContentBlock,
+    is_oauth_token: bool,
+) -> Option<AnthropicContent<'_>> {
     match block {
         ContentBlock::Text(t) => Some(AnthropicContent::Text {
             text: &t.text,
@@ -1537,7 +1693,12 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
         }),
         ContentBlock::ToolCall(tc) => Some(AnthropicContent::ToolUse {
             id: &tc.id,
-            name: &tc.name,
+            // 对齐 TS:OAuth 时 assistant tool_use 名映射为 CC 规范大小写。
+            name: if is_oauth_token {
+                to_claude_code_name(&tc.name)
+            } else {
+                &tc.name
+            },
             input: &tc.arguments,
         }),
         // Thinking blocks must be echoed back with their signature for
@@ -1577,7 +1738,12 @@ fn is_foreign_reasoning_signature(signature: &str) -> bool {
 
 fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool<'_> {
     AnthropicTool {
-        name: &tool.name,
+        // 对齐 TS:OAuth 时工具名映射为 CC 规范大小写。
+        name: if is_oauth_token {
+            to_claude_code_name(&tool.name)
+        } else {
+            &tool.name
+        },
         description: &tool.description,
         input_schema: &tool.parameters,
         cache_control: None,
@@ -1662,7 +1828,7 @@ mod tests {
             timestamp: 0,
         });
 
-        let converted = convert_message_to_anthropic(&message);
+        let converted = convert_message_to_anthropic(&message, false);
         assert_eq!(converted.role, "user");
         assert_eq!(converted.content.len(), 1);
     }
@@ -2702,7 +2868,11 @@ mod tests {
                 .map(String::as_str),
             Some(ANTHROPIC_API_VERSION)
         );
-        assert!(!captured.headers.contains_key("anthropic-beta"));
+        // 对齐 TS:streaming beta flags 无条件发送。
+        assert_eq!(
+            captured.headers.get("anthropic-beta").map(String::as_str),
+            Some(ANTHROPIC_STREAMING_BETA_FLAGS)
+        );
         assert!(captured.body.contains("\"stream\":true"));
     }
 
@@ -2710,9 +2880,10 @@ mod tests {
     fn test_stream_adds_prompt_caching_beta_header_when_enabled() {
         let captured = run_stream_and_capture_headers(CacheRetention::Short)
             .expect("captured request for beta header");
+        let expected = format!("{ANTHROPIC_STREAMING_BETA_FLAGS},prompt-caching-2024-07-31");
         assert_eq!(
             captured.headers.get("anthropic-beta").map(String::as_str),
-            Some("prompt-caching-2024-07-31")
+            Some(expected.as_str())
         );
         // Short retention: breakpoint marker present, no ttl anywhere.
         assert!(captured.body.contains("\"cache_control\""));
@@ -2817,7 +2988,11 @@ mod tests {
                 .headers
                 .contains_key("anthropic-dangerous-direct-browser-access")
         );
-        assert!(!captured.headers.contains_key("anthropic-beta"));
+        // 对齐 TS:streaming beta flags 无条件发送(非 OAuth 亦含)。
+        assert_eq!(
+            captured.headers.get("anthropic-beta").map(String::as_str),
+            Some(ANTHROPIC_STREAMING_BETA_FLAGS)
+        );
         assert_eq!(
             captured.headers.get("x-msh-platform").map(String::as_str),
             Some("kimi_cli")
