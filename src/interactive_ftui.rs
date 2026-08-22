@@ -3603,4 +3603,61 @@ mod tests {
         assert!(!transcript.iter().any(|e| e.text.contains("earlier note")));
         assert!(transcript.iter().any(|e| e.text == "Conversation cleared"));
     }
+    #[test]
+    fn tool_card_flips_pending_to_terminal_in_place() {
+        let (_tx, model) = new_model();
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .last()
+                .and_then(|e| e.card.as_ref())
+                .is_some_and(|c| *c == CardState::Pending),
+            "ToolStart must open a pending card"
+        );
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "bash".into(),
+            tool_id: "t1".into(),
+            is_error: false,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .filter(|e| e.card.is_some())
+                .all(|e| e.card == Some(CardState::Ok)),
+            "successful ToolEnd flips the card to Ok in place"
+        );
+        // An errored run opens and closes its own Err card.
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
+            name: "edit".into(),
+            tool_id: "t2".into(),
+        }));
+        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
+            name: "edit".into(),
+            tool_id: "t2".into(),
+            is_error: true,
+        }));
+        assert!(
+            sim.model()
+                .transcript
+                .iter()
+                .any(|e| e.card == Some(CardState::Err))
+        );
+        let rendered = buffer_text(sim.capture_frame(40, 12), 40, 12);
+        assert!(
+            rendered.contains("✓ bash"),
+            "ok glyph missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("✗ edit"),
+            "error glyph missing: {rendered:?}"
+        );
+    }
 }
