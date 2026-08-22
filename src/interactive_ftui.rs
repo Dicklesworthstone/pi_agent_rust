@@ -811,8 +811,11 @@ impl PiFtuiModel {
     /// input was consumed as a command (including local errors).
     fn route_slash_command(&mut self, clean: &str) -> bool {
         // Case-insensitive like SlashCommand::parse in the bubbletea stack.
-        if clean.len() >= 6 && clean[..6].eq_ignore_ascii_case("/model") {
-            self.route_model_command(clean[6..].trim());
+        // Token-exact: /model and /m route here; /mode or /modelx fall
+        // through to the tail (extension dispatch), matching bubbletea.
+        let (token, rest) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        if token.eq_ignore_ascii_case("/model") || token.eq_ignore_ascii_case("/m") {
+            self.route_model_command(rest.trim());
             return true;
         }
         self.route_slash_command_tail(clean)
