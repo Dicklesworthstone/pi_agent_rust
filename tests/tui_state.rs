@@ -1670,6 +1670,7 @@ fn tui_state_tool_end_appends_tool_output_message() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "Tool read output:");
@@ -1714,6 +1715,7 @@ fn tui_state_tool_update_with_diff_details_appends_diff_block() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1768,6 +1770,7 @@ fn tui_state_tool_update_with_large_diff_shows_truncation_indicator() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "collapsed");
@@ -1838,6 +1841,7 @@ fn tui_state_tool_update_with_diff_without_replace_message_uses_generic_header()
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1885,6 +1889,7 @@ fn tui_state_tool_update_with_details_and_no_content_renders_pretty_json() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1928,6 +1933,7 @@ fn tui_state_tool_output_over_threshold_auto_collapses_with_preview() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -1973,6 +1979,7 @@ fn tui_state_tool_output_at_threshold_stays_expanded() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2014,6 +2021,7 @@ fn tui_state_expand_tools_reexpands_auto_collapsed_blocks() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "collapsed");
@@ -2077,6 +2085,7 @@ fn tui_state_expand_tools_toggles_tool_output_visibility() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "Tool read output:");
@@ -2142,6 +2151,7 @@ fn tui_state_terminal_show_images_false_hides_images_in_tool_output() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2200,6 +2210,7 @@ fn tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output()
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2270,6 +2281,7 @@ fn tui_state_terminal_show_images_false_reports_multiple_hidden_images() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -2324,6 +2336,7 @@ fn tui_state_terminal_show_images_false_still_renders_tool_output_when_only_imag
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -4619,6 +4632,7 @@ fn tui_state_tool_progress_reset_on_new_tool_start() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     let step = apply_pi(
@@ -5547,6 +5561,7 @@ fn tui_grad_diff_pure_addition_renders_only_plus_lines() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5593,6 +5608,7 @@ fn tui_grad_diff_pure_removal_renders_only_minus_lines() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5639,6 +5655,7 @@ fn tui_grad_diff_multiline_replacement_preserves_context() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5684,6 +5701,7 @@ fn tui_grad_diff_tool_error_omits_diff() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: true,
+            output: None,
         },
     );
 
@@ -5729,6 +5747,7 @@ fn tui_grad_diff_no_diff_key_shows_plain_output() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5854,6 +5873,7 @@ fn tui_grad_collapse_multiple_tools_mixed_sizes() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     apply_pi(
@@ -5896,6 +5916,7 @@ fn tui_grad_collapse_multiple_tools_mixed_sizes() {
             name: "bash".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -5942,6 +5963,7 @@ fn tui_grad_collapse_global_toggle_affects_all_tool_blocks() {
                 name: "read".to_string(),
                 tool_id: format!("tool-{i}"),
                 is_error: false,
+                output: None,
             },
         );
     }
@@ -6003,6 +6025,7 @@ fn tui_grad_collapse_auto_collapsed_shows_preview_line_count() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6055,6 +6078,7 @@ fn tui_grad_image_default_config_shows_images() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6116,6 +6140,7 @@ fn tui_grad_image_mixed_content_with_show_images_false_preserves_text() {
             name: "bash".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6162,6 +6187,7 @@ fn tui_grad_integration_multiple_tools_in_sequence() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6198,6 +6224,7 @@ fn tui_grad_integration_multiple_tools_in_sequence() {
             name: "edit".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6230,6 +6257,7 @@ fn tui_grad_integration_multiple_tools_in_sequence() {
             name: "bash".to_string(),
             tool_id: "tool-3".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6285,6 +6313,7 @@ fn tui_grad_integration_branching_with_tool_diffs() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6329,6 +6358,7 @@ fn tui_grad_integration_tool_error_then_success_sequence() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: true,
+            output: None,
         },
     );
 
@@ -6365,6 +6395,7 @@ fn tui_grad_integration_tool_error_then_success_sequence() {
             name: "edit".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6417,6 +6448,7 @@ fn tui_grad_integration_diff_with_collapse_toggle() {
             name: "edit".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -6972,6 +7004,7 @@ fn tui_state_tool_error_output_collapse_toggle() {
             name: "bash".to_string(),
             tool_id: "tool-err-1".to_string(),
             is_error: true,
+            output: None,
         },
     );
     // Error tool output is shown.
@@ -7023,6 +7056,7 @@ fn tui_state_multiple_tool_blocks_collapse_together() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7057,6 +7091,7 @@ fn tui_state_multiple_tool_blocks_collapse_together() {
             name: "grep".to_string(),
             tool_id: "tool-2".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7119,6 +7154,7 @@ fn tui_state_thinking_and_tool_toggles_independent() {
             name: "read".to_string(),
             tool_id: "tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -7379,6 +7415,7 @@ fn tui_perf_memory_pressure_forces_degraded() {
             name: "read".to_string(),
             tool_id: "perf-tool-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
@@ -9561,6 +9598,7 @@ fn tui_perf_e2e_degradation_under_load() {
                 name: format!("read-{idx}"),
                 tool_id: format!("e2e-tool-{idx}"),
                 is_error: false,
+                output: None,
             },
         );
     }
@@ -10039,6 +10077,7 @@ fn tui_tool_invocation_summary_visible_in_status_and_transcript() {
             name: "bash".to_string(),
             tool_id: "tool-cmd-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
     // The transcript block records what ran alongside its output.
@@ -10115,6 +10154,7 @@ fn tui_tool_invocation_summary_never_mislabels_interleaved_tools() {
             name: "bash".to_string(),
             tool_id: "par-a".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "output-from-A");
@@ -10140,6 +10180,7 @@ fn tui_tool_invocation_summary_never_mislabels_interleaved_tools() {
             name: "bash".to_string(),
             tool_id: "par-b".to_string(),
             is_error: false,
+            output: None,
         },
     );
     assert_after_contains(&harness, &step, "output-from-B");
@@ -10186,6 +10227,7 @@ fn tui_tool_output_ansi_escapes_are_sanitized() {
             name: "bash".to_string(),
             tool_id: "ansi-1".to_string(),
             is_error: false,
+            output: None,
         },
     );
 
