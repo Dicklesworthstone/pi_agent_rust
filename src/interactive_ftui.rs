@@ -232,79 +232,11 @@ impl EntryRole {
     }
 }
 
-/// Render one tool-card line: state glyph plus the sanitized tool name in
-/// the state's tint (pending dims, ok settles in accent, errors shout).
-fn push_card_line(
-    lines: &mut Vec<ftui::text::Line<'static>>,
-    state: CardState,
-    text: &str,
-    palette: &FtuiPalette,
-    spinner_frame: usize,
-) {
-    // Pending cards share the ONE status spinner clock (bd-cv653.9.2
-    // phase-locked feel): every live card shows the same frame each paint.
-    let (glyph, style) = match state {
-        CardState::Pending => (
-            DOTS[spinner_frame % DOTS.len()],
-            ftui::Style::new().dim().fg(palette.accent),
-        ),
-        CardState::Ok => ("✓", ftui::Style::new().fg(palette.accent)),
-        CardState::Err => ("✗", ftui::Style::new().bold().fg(palette.error)),
-    };
-    let mut rendered = String::with_capacity(text.len() + 2);
-    rendered.push_str(glyph);
-    rendered.push(' ');
-    rendered.push_str(text);
-    lines.push(ftui::text::Line::styled(rendered, style));
-}
-
-/// Render one role block: assistant content as markdown, everything else
-/// with the role prefix on the first line and role style throughout.
-fn push_role_block(
-    lines: &mut Vec<ftui::text::Line<'static>>,
-    role: EntryRole,
-    content: &str,
-    palette: &FtuiPalette,
-    md: &ftui_extras::markdown::MarkdownRenderer,
-) {
-    if role == EntryRole::Assistant {
-        let rendered = md.render(content);
-        lines.extend(rendered.lines().iter().cloned());
-        return;
-    }
-    let style = role.style(palette);
-    let prefix = role.prefix();
-    let indent = " ".repeat(prefix.chars().count());
-    for (i, line) in content.lines().enumerate() {
-        let lead = if i == 0 { prefix } else { indent.as_str() };
-        let mut rendered = String::with_capacity(lead.len() + line.len());
-        rendered.push_str(lead);
-        rendered.push_str(line);
-        lines.push(ftui::text::Line::styled(rendered, style));
-    }
-    if content.is_empty() {
-        lines.push(ftui::text::Line::styled(prefix.to_string(), style));
-    }
-}
-
-/// Live state of a tool-execution card (bd-cv653.9.2 seed): a pending card
-/// flips to its terminal state IN PLACE when the tool ends, mirroring omp's
-/// state-tinted tool boxes. Full bordered widgets land with the widget-grade
-/// card framework slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CardState {
-    Pending,
-    Ok,
-    Err,
-}
-
 /// One sanitized conversation entry (message, note, card, or error).
 #[derive(Debug)]
 struct TranscriptEntry {
     role: EntryRole,
     text: String,
-    /// Set for tool-execution cards; `None` renders as a plain role block.
-    card: Option<CardState>,
 }
 
 /// An ask-tool card being answered (bd-cv653.3.8), mirroring the inline flow
@@ -635,39 +567,7 @@ impl PiFtuiModel {
     }
 
     fn push_entry(&mut self, role: EntryRole, text: String) {
-        self.transcript.push(TranscriptEntry {
-            role,
-            text,
-            card: None,
-        });
-    }
-
-    /// Push a pending tool-execution card; the matching [`PiMsg::ToolEnd`]
-    /// flips the LAST pending card with the same name in place. `name` must
-    /// already be sanitized — both call sites sanitize exactly once so the
-    /// start/end forms always match.
-    fn push_tool_card(&mut self, sanitized_name: &str) {
-        self.transcript.push(TranscriptEntry {
-            role: EntryRole::System,
-            text: sanitized_name.to_string(),
-            card: Some(CardState::Pending),
-        });
-    }
-
-    /// Close the last pending tool card named `sanitized_name`, falling
-    /// back to a plain trace line when no matching open card exists.
-    fn finish_tool_card(&mut self, sanitized_name: &str, ok: bool) {
-        if let Some(entry) = self
-            .transcript
-            .iter_mut()
-            .rev()
-            .find(|e| e.card == Some(CardState::Pending) && e.text == sanitized_name)
-        {
-            entry.card = Some(if ok { CardState::Ok } else { CardState::Err });
-            return;
-        }
-        let mark = if ok { "✓" } else { "✗" };
-        self.push_entry(EntryRole::System, format!("{mark} {sanitized_name}"));
+        self.transcript.push(TranscriptEntry { role, text });
     }
 
     /// Cap for `scroll_from_tail`: can't scroll further up than the content.
@@ -705,17 +605,14 @@ impl PiFtuiModel {
                 self.thinking.push_str(&sanitize(&delta));
             }
             PiMsg::ToolStart { name, .. } => {
-                let name = sanitize(&name).into_owned();
-                self.current_tool = Some(name.clone());
-                self.push_tool_card(&name);
+                self.current_tool = Some(sanitize(&name).into_owned());
             }
             PiMsg::ToolEnd { name, is_error, .. } => {
-                // The tool card flips to its terminal state in place
-                // (state-tinted seed of the bd-cv653.9.2 card framework).
-                // Sanitize ONCE here, matching ToolStart, so start/end card
-                // names always pair.
-                let name = sanitize(&name).into_owned();
-                self.finish_tool_card(&name, !is_error);
+                // Durable trace: one line per tool run (the full collapsible
+                // tool cards of the bubbletea stack come with the view port).
+                let mark = if is_error { "✗" } else { "✓" };
+                let text = format!("{mark} {}", sanitize(&name));
+                self.push_entry(EntryRole::System, text);
                 self.current_tool = None;
             }
             PiMsg::TodoSummary { summary } => {
@@ -909,75 +806,114 @@ impl PiFtuiModel {
         self.send_command(UiCommand::Prompt(clean));
     }
 
-    /// Slash-command routing. Token matching is CASE-INSENSITIVE and
-    /// alias-aware, mirroring `SlashCommand::parse` in the bubbletea stack;
-    /// unknown tokens go to extension dispatch, `/skill:` flows through as
-    /// a prompt. Returns true when the input was consumed as a command
-    /// (including local errors).
+    /// Slash-command routing seed (mirrors submit_message's chain; only
+    /// commands the preview can honor are wired). Returns true when the
+    /// input was consumed as a command (including local errors).
     fn route_slash_command(&mut self, clean: &str) -> bool {
-        let (token, args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
-        let args = args.trim();
-        match token.to_ascii_lowercase().as_str() {
-            "/model" | "/m" => {
-                self.route_model_command(args);
-                true
-            }
-            "/exit" | "/quit" | "/q" => {
-                self.pending_quit = true;
-                true
-            }
-            "/compact" => {
-                self.push_entry(
-                    EntryRole::System,
-                    String::from("compacting conversation ..."),
-                );
-                self.send_command(UiCommand::Compact);
-                true
-            }
-            "/theme" => {
-                self.picker = Some(PickerOverlay {
-                    title: String::from("Theme (Enter to apply, Esc to close)"),
-                    items: vec![String::from("dark"), String::from("light")],
-                    values: Vec::new(),
-                    selected: 0,
-                    kind: PickerKind::Theme,
-                });
-                true
-            }
-            "/resume" | "/r" => {
-                if self.available_sessions.is_empty() {
-                    self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
+        if let Some(rest) = clean.strip_prefix("/model") {
+            self.route_model_command(rest.trim());
+            return true;
+        }
+        self.route_slash_command_tail(clean)
+    }
+
+    /// `/model` handling: bare opens the picker, `provider/model` switches.
+    fn route_model_command(&mut self, spec: &str) {
+        {
+            if spec.is_empty() {
+                // Bare /model opens the picker over the registry list.
+                if self.available_models.is_empty() {
+                    self.push_entry(
+                        EntryRole::Error,
+                        String::from("no models available; use /model <provider>/<model>"),
+                    );
                 } else {
-                    let (items, values) = self
-                        .available_sessions
-                        .iter()
-                        .map(|(label, path)| (label.clone(), path.clone()))
-                        .unzip();
                     self.picker = Some(PickerOverlay {
-                        title: String::from("Resume session (Enter to load, Esc to close)"),
-                        items,
-                        values,
+                        title: String::from("Model (Enter to switch, Esc to close)"),
+                        items: self.available_models.clone(),
+                        values: Vec::new(),
                         selected: 0,
-                        kind: PickerKind::Session,
+                        kind: PickerKind::Model,
                     });
                 }
-                true
-            }
-            "/help" | "/h" | "/?" => {
+            } else if let Some((provider, model)) = spec.split_once('/')
+                && !provider.is_empty()
+                && !model.is_empty()
+            {
+                self.push_entry(EntryRole::System, format!("switching model to {spec} ..."));
+                self.send_command(UiCommand::SetModel {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                });
+            } else {
                 self.push_entry(
-                    EntryRole::System,
-                    String::from(
-                        "ftui preview commands: /model [provider/model], /resume, /compact, \
-                         /theme, /new, /clear, /session, /tree, /thinking [level], \
-                         /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
-                         agent), !!<cmd> (display-only)",
-                    ),
+                    EntryRole::Error,
+                    String::from("usage: /model <provider>/<model>"),
                 );
-                true
             }
+        }
+    }
+
+    /// Remaining slash routing after `/model`.
+    fn route_slash_command_tail(&mut self, clean: &str) -> bool {
+        if clean == "/exit" || clean == "/quit" {
+            self.pending_quit = true;
+            return true;
+        }
+        if clean == "/compact" {
+            self.push_entry(
+                EntryRole::System,
+                String::from("compacting conversation ..."),
+            );
+            self.send_command(UiCommand::Compact);
+            return true;
+        }
+        if clean == "/theme" {
+            self.picker = Some(PickerOverlay {
+                title: String::from("Theme (Enter to apply, Esc to close)"),
+                items: vec![String::from("dark"), String::from("light")],
+                values: Vec::new(),
+                selected: 0,
+                kind: PickerKind::Theme,
+            });
+            return true;
+        }
+        if clean == "/resume" {
+            if self.available_sessions.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("no saved sessions found"));
+            } else {
+                let (items, values) = self
+                    .available_sessions
+                    .iter()
+                    .map(|(label, path)| (label.clone(), path.clone()))
+                    .unzip();
+                self.picker = Some(PickerOverlay {
+                    title: String::from("Resume session (Enter to load, Esc to close)"),
+                    items,
+                    values,
+                    selected: 0,
+                    kind: PickerKind::Session,
+                });
+            }
+            return true;
+        }
+        if clean == "/help" {
+            self.push_entry(
+                EntryRole::System,
+                String::from(
+                    "ftui preview commands: /model [provider/model], /resume, /compact, \
+                     /theme, /new, /clear, /session, /tree, /thinking [level], \
+                     /name <name>, /exit, /help, !<cmd> (runs + sends output to the \
+                     agent), !!<cmd> (display-only)",
+                ),
+            );
+            return true;
+        }
+        let (cmd_name, cmd_args) = clean.split_once(char::is_whitespace).unwrap_or((clean, ""));
+        match cmd_name {
             "/new" => {
                 self.send_command(UiCommand::NewSession);
-                true
+                return true;
             }
             "/clear" | "/cls" => {
                 // Display-only clear (SlashCommand::Clear parity): the
@@ -990,55 +926,56 @@ impl PiFtuiModel {
                 self.current_tool = None;
                 self.scroll_from_tail = 0;
                 self.push_entry(EntryRole::System, String::from("Conversation cleared"));
-                true
+                return true;
             }
             "/session" | "/info" => {
                 self.send_command(UiCommand::SessionInfo);
-                true
+                return true;
             }
             "/tree" => {
                 self.send_command(UiCommand::TreeSummary);
-                true
+                return true;
             }
             "/thinking" | "/think" | "/t" => {
-                if args.is_empty() {
+                let value = cmd_args.trim();
+                if value.is_empty() {
                     self.send_command(UiCommand::SetThinking(None));
                     return true;
                 }
-                match args.parse::<crate::model::ThinkingLevel>() {
+                match value.parse::<crate::model::ThinkingLevel>() {
                     Ok(level) => self.send_command(UiCommand::SetThinking(Some(level))),
                     Err(err) => self.push_entry(EntryRole::Error, err),
                 }
-                true
+                return true;
             }
             "/name" => {
-                if args.is_empty() {
+                let name = cmd_args.trim();
+                if name.is_empty() {
                     self.push_entry(EntryRole::Error, String::from("Usage: /name <name>"));
                 } else {
-                    self.send_command(UiCommand::SetName(args.to_string()));
+                    self.send_command(UiCommand::SetName(name.to_string()));
                 }
-                true
+                return true;
             }
-            _ => {
-                if clean.starts_with("/skill:") {
-                    // /skill: inputs flow through to the agent as prompts.
-                    return false;
-                }
-                // Anything else may be an extension-registered command; the
-                // driver checks registration and reports unknown ones.
-                let body = clean.trim_start_matches('/');
-                let (name, ext_args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
-                if name.is_empty() {
-                    self.push_entry(EntryRole::Error, String::from("Unknown command: /"));
-                } else {
-                    self.send_command(UiCommand::ExtensionCommand {
-                        name: name.to_string(),
-                        args: ext_args.trim().to_string(),
-                    });
-                }
-                true
-            }
+            _ => {}
         }
+        if !clean.starts_with("/skill:") {
+            // Anything else may be an extension-registered command; the
+            // driver checks registration and reports unknown ones.
+            let body = clean.trim_start_matches('/');
+            let (name, args) = body.split_once(char::is_whitespace).unwrap_or((body, ""));
+            if name.is_empty() {
+                self.push_entry(EntryRole::Error, String::from("Unknown command: /"));
+            } else {
+                self.send_command(UiCommand::ExtensionCommand {
+                    name: name.to_string(),
+                    args: args.trim().to_string(),
+                });
+            }
+            return true;
+        }
+        // /skill: inputs flow through to the agent as prompts.
+        false
     }
 
     fn handle_picker_key(&mut self, key: &ftui::KeyEvent) {
@@ -1371,18 +1308,28 @@ impl PiFtuiModel {
         let palette = self.palette;
         let mut lines: Vec<ftui::text::Line<'static>> =
             Vec::with_capacity(self.conversation_line_count());
-        for entry in &self.transcript {
-            if let Some(state) = entry.card {
-                push_card_line(
-                    &mut lines,
-                    state,
-                    &entry.text,
-                    &palette,
-                    self.spinner.current_frame,
-                );
-                continue;
+        let mut push_block = |role: EntryRole, content: &str| {
+            if role == EntryRole::Assistant {
+                let rendered = md.render(content);
+                lines.extend(rendered.lines().iter().cloned());
+                return;
             }
-            push_role_block(&mut lines, entry.role, &entry.text, &palette, &md);
+            let style = role.style(&palette);
+            let prefix = role.prefix();
+            let indent = " ".repeat(prefix.chars().count());
+            for (i, line) in content.lines().enumerate() {
+                let lead = if i == 0 { prefix } else { indent.as_str() };
+                let mut rendered = String::with_capacity(lead.len() + line.len());
+                rendered.push_str(lead);
+                rendered.push_str(line);
+                lines.push(ftui::text::Line::styled(rendered, style));
+            }
+            if content.is_empty() {
+                lines.push(ftui::text::Line::styled(prefix.to_string(), style));
+            }
+        };
+        for entry in &self.transcript {
+            push_block(entry.role, &entry.text);
         }
         if !self.streaming.is_empty() {
             // Streaming fragments may end mid-construct; the streaming
@@ -2205,11 +2152,6 @@ async fn run_bash_ui_command(
     exclude: bool,
     agent_tx: &Sender<PiMsg>,
 ) -> Option<String> {
-    // Bracket the run with AgentStart/AgentDone (submit_bash_command
-    // parity: bubbletea flips to ToolRunning so the status region shows the
-    // running tool and the editor gates input). Without AgentStart the
-    // model stays Ready and "running bash" never renders.
-    let _ = agent_tx.send(PiMsg::AgentStart);
     let _ = agent_tx.send(PiMsg::ToolStart {
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
@@ -2244,11 +2186,6 @@ async fn run_bash_ui_command(
         name: String::from("bash"),
         tool_id: String::from("ftui-bash"),
         is_error: false,
-    });
-    let _ = agent_tx.send(PiMsg::AgentDone {
-        usage: None,
-        stop_reason: crate::model::StopReason::Stop,
-        error_message: None,
     });
     output
 }
@@ -3577,94 +3514,5 @@ mod tests {
         let transcript = &sim.model().transcript;
         assert!(!transcript.iter().any(|e| e.text.contains("earlier note")));
         assert!(transcript.iter().any(|e| e.text == "Conversation cleared"));
-    }
-    #[test]
-    fn tool_card_flips_pending_to_terminal_in_place() {
-        let (_tx, model) = new_model();
-        let mut sim = ProgramSimulator::new(model);
-        sim.init();
-        sim.send(PiFtuiMsg::Agent(PiMsg::AgentStart));
-        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
-            name: "bash".into(),
-            tool_id: "t1".into(),
-        }));
-        assert!(
-            sim.model()
-                .transcript
-                .last()
-                .and_then(|e| e.card.as_ref())
-                .is_some_and(|c| *c == CardState::Pending),
-            "ToolStart must open a pending card"
-        );
-        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
-            name: "bash".into(),
-            tool_id: "t1".into(),
-            is_error: false,
-        }));
-        assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .filter(|e| e.card.is_some())
-                .all(|e| e.card == Some(CardState::Ok)),
-            "successful ToolEnd flips the card to Ok in place"
-        );
-        // An errored run opens and closes its own Err card.
-        sim.send(PiFtuiMsg::Agent(PiMsg::ToolStart {
-            name: "edit".into(),
-            tool_id: "t2".into(),
-        }));
-        sim.send(PiFtuiMsg::Agent(PiMsg::ToolEnd {
-            name: "edit".into(),
-            tool_id: "t2".into(),
-            is_error: true,
-        }));
-        assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .any(|e| e.card == Some(CardState::Err))
-        );
-        let rendered = buffer_text(sim.capture_frame(40, 12), 40, 12);
-        assert!(
-            rendered.contains("✓ bash"),
-            "ok glyph missing: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("✗ edit"),
-            "error glyph missing: {rendered:?}"
-        );
-    }
-    #[test]
-    fn slash_commands_are_case_insensitive_with_aliases() {
-        // Token matching lowercases like SlashCommand::parse; aliases /q,
-        // /r, /h, /? and /m ride along for free.
-        let (_agent_tx, rx) = mpsc::channel();
-        let (submit_tx, submit_rx) = mpsc::channel::<UiCommand>();
-        let model = PiFtuiModel::new(rx).with_submit_channel(submit_tx);
-        let mut sim = ProgramSimulator::new(model);
-        sim.init();
-        type_str(&mut sim, "/Q");
-        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert!(sim.model().pending_quit, "uppercase /Q must quit");
-        type_str(&mut sim, "/H");
-        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .any(|e| e.text.contains("ftui preview commands")),
-            "uppercase /H must show help"
-        );
-        // Bare /M with no models errors locally instead of reaching a driver.
-        type_str(&mut sim, "/M");
-        sim.inject_event(key(KeyCode::Enter, Modifiers::empty()));
-        assert!(
-            sim.model()
-                .transcript
-                .iter()
-                .any(|e| e.text.contains("no models available")),
-            "uppercase /M must hit the model path"
-        );
     }
 }
