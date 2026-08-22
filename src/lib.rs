@@ -268,7 +268,7 @@ pub mod session_sqlite;
 pub mod session_store_v2;
 #[doc(hidden)]
 pub mod skills_managed;
-#[doc(hidden)]
+pub mod stats;
 pub mod sse;
 pub mod stream_rules;
 #[doc(hidden)]
