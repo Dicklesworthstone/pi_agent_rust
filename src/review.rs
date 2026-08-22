@@ -519,15 +519,14 @@ impl CodeReviewer {
         let target_name = target.unwrap_or("uncommitted");
 
         let mut cmd = Command::new("git");
+        // `--end-of-options` keeps a target like `--output=/tmp/x` from
+        // being parsed as a git option (argument injection).
         match target {
             None | Some("uncommitted") => {
                 cmd.args(["diff", "HEAD"]);
             }
-            Some(t) if t.contains("..") => {
-                cmd.arg("diff").arg(t);
-            }
             Some(t) => {
-                cmd.args(["diff", t]);
+                cmd.args(["diff", "--end-of-options", t]);
             }
         }
         cmd.current_dir(cwd);
@@ -537,6 +536,16 @@ impl CodeReviewer {
                 "Failed to execute git diff for review: {e}"
             ))))
         })?;
+        // A failed diff (bad ref, no commits yet) must not read as an empty
+        // diff — that would yield a vacuous "SHIP — clean change" verdict.
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::Validation(format!(
+                "git diff failed for review target {:?}: {}",
+                target.unwrap_or("HEAD"),
+                stderr.trim()
+            )));
+        }
 
         let diff_str = String::from_utf8_lossy(&output.stdout).to_string();
         let all_hunks = DiffParser::parse_unified_diff(&diff_str).unwrap_or_default();

@@ -6153,6 +6153,7 @@ fn tui_grad_image_mixed_content_with_show_images_false_preserves_text() {
 // ─── TUI Graduation: Integration (cross-feature) ───────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn tui_grad_integration_multiple_tools_in_sequence() {
     let harness = TestHarness::new("tui_grad_integration_multiple_tools_in_sequence");
     let mut app = build_app(&harness, Vec::new());
@@ -9915,6 +9916,7 @@ fn run_tool_cycle(harness: &TestHarness, app: &mut PiApp, idx: usize, output_lin
             name: "bash".to_string(),
             tool_id,
             is_error: false,
+            output: None,
         },
     );
 }

@@ -396,7 +396,13 @@ fn tail_bytes(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
     }
-    let start = text.len() - max;
+    // Transcripts carry raw child output (emoji/CJK are common); a byte
+    // offset inside a multibyte char would panic on slicing. Round forward
+    // to the next char boundary before searching for the line break.
+    let mut start = text.len() - max;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
     let boundary = text[start..].find('\n').map_or(start, |i| start + i + 1);
     text[boundary.min(text.len())..].to_string()
 }
@@ -407,6 +413,20 @@ mod tests {
 
     fn fresh_registry() -> AgentHubRegistry {
         AgentHubRegistry::default()
+    }
+
+    #[test]
+    fn tail_bytes_never_splits_multibyte_chars() {
+        // "é" is 2 bytes; a cut landing inside it must not panic.
+        let text = "aé\nbé\ncé";
+        for max in 0..=text.len() {
+            let tail = tail_bytes(text, max);
+            assert!(text.ends_with(&tail), "max={max} tail={tail:?}");
+        }
+        let emoji = "🙂".repeat(50);
+        for max in [1, 2, 3, 5, 7, 33] {
+            let _ = tail_bytes(&emoji, max);
+        }
     }
 
     #[test]

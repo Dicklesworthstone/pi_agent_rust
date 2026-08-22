@@ -595,7 +595,15 @@ impl GarbageCollector {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let dest_path = run_trash_subdir.join(&file_name);
+            // Same-named sessions from different project dirs land in one
+            // flat run dir; `fs::rename` would silently clobber the earlier
+            // one (permanent loss). Uniquify instead.
+            let mut dest_path = run_trash_subdir.join(&file_name);
+            let mut suffix = 1u32;
+            while dest_path.exists() {
+                dest_path = run_trash_subdir.join(format!("{file_name}.{suffix}"));
+                suffix += 1;
+            }
 
             // Move to trash
             match fs::rename(&item.path, &dest_path) {
@@ -752,7 +760,12 @@ impl GarbageCollector {
                     0
                 };
 
-                let res = if path.is_dir() {
+                // Second line of defense: this is the only permanently
+                // destructive gc path, so it must respect dry-run even if a
+                // caller wires the options up wrong.
+                let res = if options.dry_run {
+                    Ok(())
+                } else if path.is_dir() {
                     fs::remove_dir_all(&path)
                 } else {
                     fs::remove_file(&path)
@@ -770,21 +783,23 @@ impl GarbageCollector {
             }
         }
 
-        Self::record_ledger(
-            ledger_path,
-            &GcLedgerRecord {
-                schema: GC_LEDGER_SCHEMA.to_string(),
-                timestamp_ms: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
-                original_path: trash_dir.display().to_string(),
-                trash_path: None,
-                store: GcStoreKind::Trash,
-                size_bytes: pruned_bytes,
-                action: "emptied_trash".to_string(),
-                reason: "User requested permanent trash purge".to_string(),
-            },
-        );
+        if !options.dry_run {
+            Self::record_ledger(
+                ledger_path,
+                &GcLedgerRecord {
+                    schema: GC_LEDGER_SCHEMA.to_string(),
+                    timestamp_ms: SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX)),
+                    original_path: trash_dir.display().to_string(),
+                    trash_path: None,
+                    store: GcStoreKind::Trash,
+                    size_bytes: pruned_bytes,
+                    action: "emptied_trash".to_string(),
+                    reason: "User requested permanent trash purge".to_string(),
+                },
+            );
+        }
 
         let sessions_dir = options
             .custom_sessions_dir

@@ -4367,9 +4367,12 @@ const fn stat_replacement_identity(metadata: &rustix::fs::Stat) -> (u64, u64, u3
 // identity-checked cleanup sequence together: splitting this security-critical
 // transaction across helpers would make its ordering invariants harder to audit.
 #[allow(clippy::too_many_lines)]
+/// `allowed_roots` is the workspace's canonical root set (primary cwd plus
+/// any `/add-dir` roots); the replacement parent must live under one of
+/// them. A single-root caller passes `&[cwd]`.
 fn atomic_replace_file_with<F>(
     target: &Path,
-    cwd: &Path,
+    allowed_roots: &[PathBuf],
     contents: &[u8],
     expected_source: Option<AtomicContentExpectation>,
     before_persist: F,
@@ -4383,9 +4386,8 @@ where
     {
         use std::os::unix::fs::MetadataExt as _;
 
-        let canonical_cwd = std::fs::canonicalize(cwd)?;
         let canonical_parent = std::fs::canonicalize(parent)?;
-        if !canonical_parent.starts_with(&canonical_cwd) {
+        if !atomic_parent_within_roots(&canonical_parent, allowed_roots) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
@@ -4648,9 +4650,8 @@ where
             .ok()
             .filter(std::fs::Metadata::is_file)
             .map(|metadata| metadata.permissions());
-        let canonical_cwd = strip_unc_prefix(std::fs::canonicalize(cwd)?);
         let canonical_parent = strip_unc_prefix(std::fs::canonicalize(parent)?);
-        if !canonical_parent.starts_with(&canonical_cwd) {
+        if !atomic_parent_within_roots(&canonical_parent, allowed_roots) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
@@ -4688,7 +4689,7 @@ where
             ));
         }
         if let Some(expectation) = expected_source {
-            let source = open_regular_file_within_roots_with(target, &[cwd.to_path_buf()], || {})?;
+            let source = open_regular_file_within_roots_with(target, allowed_roots, || {})?;
             ensure_atomic_source_unchanged(source, expectation)?;
 
             let parent_after_digest = strip_unc_prefix(std::fs::canonicalize(parent)?);
@@ -4704,17 +4705,38 @@ where
     }
 }
 
-fn atomic_replace_file(target: &Path, cwd: &Path, contents: &[u8]) -> std::io::Result<()> {
-    atomic_replace_file_with(target, cwd, contents, None, || {})
+/// Containment for the atomic-replacement parent against the canonical
+/// workspace roots. Each root is canonicalized here so a caller passing a
+/// raw cwd (symlinked `/var` → `/private/var` on macOS) still matches.
+fn atomic_parent_within_roots(canonical_parent: &Path, allowed_roots: &[PathBuf]) -> bool {
+    allowed_roots.iter().any(|root| {
+        let canonical_root =
+            std::fs::canonicalize(root).map_or_else(|_| root.clone(), strip_unc_prefix);
+        canonical_parent.starts_with(&canonical_root)
+    })
+}
+
+fn atomic_replace_file(
+    target: &Path,
+    allowed_roots: &[PathBuf],
+    contents: &[u8],
+) -> std::io::Result<()> {
+    atomic_replace_file_with(target, allowed_roots, contents, None, || {})
 }
 
 fn atomic_replace_file_if_unchanged(
     target: &Path,
-    cwd: &Path,
+    allowed_roots: &[PathBuf],
     contents: &[u8],
     expected_source: AtomicContentExpectation,
 ) -> std::io::Result<()> {
-    atomic_replace_file_with(target, cwd, contents, Some(expected_source), || {})
+    atomic_replace_file_with(
+        target,
+        allowed_roots,
+        contents,
+        Some(expected_source),
+        || {},
+    )
 }
 
 fn escape_file_tag_attribute(value: &str) -> String {
@@ -5288,7 +5310,7 @@ impl ToolRegistry {
                 "jobs" => tools.push(Box::new(JobsTool)),
                 "hub" => tools.push(Box::new(HubTool::new(cwd))),
                 "security_scan" => {
-                    tools.push(Box::new(crate::security_scan::SecurityScanTool::new(cwd)))
+                    tools.push(Box::new(crate::security_scan::SecurityScanTool::new(cwd)));
                 }
                 "web_search" => tools.push(Box::new(crate::web_search::WebSearchTool::new())),
                 "eval" => tools.push(Box::new(crate::eval::EvalTool::new(cwd))),
@@ -9219,7 +9241,10 @@ impl Tool for EditTool {
 
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
         let absolute_path_clone = absolute_path.clone();
-        let cwd_clone = self.cwd.clone();
+        // Full canonical root set (primary + /add-dir roots) so mutations in
+        // additional workspace roots are not rejected by the atomic-replace
+        // containment check.
+        let cwd_clone = self.workspace.snapshot_or(&self.cwd).all();
         let final_content_bytes = final_content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
         if let Some(recorder) = &self.mutation_recorder {
@@ -9449,7 +9474,10 @@ impl Tool for WriteTool {
 
         // Write atomically using tempfile on a blocking thread
         let path_clone = path.clone();
-        let cwd_clone = self.cwd.clone();
+        // Full canonical root set (primary + /add-dir roots) so mutations in
+        // additional workspace roots are not rejected by the atomic-replace
+        // containment check.
+        let cwd_clone = self.workspace.snapshot_or(&self.cwd).all();
         let content_bytes = input.content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
         if let Some(recorder) = &self.mutation_recorder {
@@ -13527,7 +13555,10 @@ impl Tool for HashlineEditTool {
 
         // Atomic write (same pattern as EditTool)
         let absolute_path_clone = absolute_path.clone();
-        let cwd_clone = self.cwd.clone();
+        // Full canonical root set (primary + /add-dir roots) so mutations in
+        // additional workspace roots are not rejected by the atomic-replace
+        // containment check.
+        let cwd_clone = self.workspace.snapshot_or(&self.cwd).all();
         let final_content_bytes = final_content.into_bytes();
         let before_persist_hook = self.before_persist_hook.clone();
         if let Some(recorder) = &self.mutation_recorder {
@@ -13694,10 +13725,16 @@ mod tests {
         std::fs::write(&outside_target, "outside sentinel\n").expect("write outside sentinel");
         let displaced_parent = cwd.join("parent-original");
 
-        let result = atomic_replace_file_with(&target, &cwd, b"replacement\n", None, || {
-            std::fs::rename(&parent, &displaced_parent).expect("displace validated parent");
-            symlink(&outside_parent, &parent).expect("redirect parent path outside cwd");
-        });
+        let result = atomic_replace_file_with(
+            &target,
+            std::slice::from_ref(&cwd),
+            b"replacement\n",
+            None,
+            || {
+                std::fs::rename(&parent, &displaced_parent).expect("displace validated parent");
+                symlink(&outside_parent, &parent).expect("redirect parent path outside cwd");
+            },
+        );
 
         let error = result.expect_err("a changed parent pathname must be reported");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
@@ -16176,6 +16213,40 @@ mod tests {
             assert!(!out.is_error);
         });
     }
+    #[test]
+    fn write_tool_persists_inside_additional_root() {
+        // /add-dir grants read AND write: the atomic-replace containment
+        // check must accept parents under any workspace root, not only the
+        // primary cwd (regression: every write/edit in an added root failed
+        // with "parent escaped the working directory").
+        let primary = tempfile::tempdir().unwrap();
+        let extra = tempfile::tempdir().unwrap();
+        std::fs::write(extra.path().join("extra.txt"), "before").unwrap();
+
+        let mut handle = crate::workspace::WorkspaceHandle::single(primary.path());
+        let canonical = crate::workspace::validate_new_root(extra.path()).unwrap();
+        handle.add_root(&canonical);
+        let extra_path = extra.path().join("extra.txt").to_string_lossy().to_string();
+
+        asupersync::test_utils::run_test(|| {
+            let tool = WriteTool::new(primary.path()).with_workspace(handle.clone());
+            let extra_path = extra_path.clone();
+            async move {
+                tool.execute(
+                    "t",
+                    serde_json::json!({ "path": extra_path, "content": "after" }),
+                    None,
+                )
+                .await
+                .unwrap();
+            }
+        });
+        assert_eq!(
+            std::fs::read_to_string(extra.path().join("extra.txt")).unwrap(),
+            "after"
+        );
+    }
+
     #[test]
     fn read_tool_spans_additional_roots_and_revokes_on_removal() {
         // Multi-root acceptance (bd-cv653.3.12): read succeeds in the

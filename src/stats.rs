@@ -8,6 +8,7 @@
 //! JSON output conforms to `pi.stats.v1`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
@@ -16,9 +17,11 @@ use serde::Serialize;
 /// Schema tag for the JSON renderer.
 pub const STATS_SCHEMA: &str = "pi.stats.v1";
 
-/// Filters applied while aggregating. `since`/`until` compare against the
-/// RFC 3339 entry timestamps lexicographically (identical formatting across
-/// Pi-written sessions), so day-level windows work without parsing.
+/// Filters applied while aggregating.
+///
+/// `since`/`until` compare against the RFC 3339 entry timestamps
+/// lexicographically (identical formatting across Pi-written sessions), so
+/// day-level windows work without parsing.
 #[derive(Debug, Clone, Default)]
 pub struct StatsFilter {
     pub since: Option<String>,
@@ -37,10 +40,14 @@ impl StatsFilter {
         {
             return false;
         }
-        if let Some(until) = &self.until
-            && ts > until.as_str()
-        {
-            return false;
+        if let Some(until) = &self.until {
+            // A day-prefix bound (`--until 2026-08-21`) is inclusive of that
+            // whole day: compare only the prefix so `2026-08-21T10:00` is not
+            // lexicographically "greater" than its own day.
+            let ts_prefix = ts.get(..until.len()).unwrap_or(ts);
+            if ts_prefix > until.as_str() {
+                return false;
+            }
         }
         true
     }
@@ -76,7 +83,7 @@ pub struct CostTotals {
     pub total: f64,
 }
 
-fn add_tokens(totals: &mut TokenTotals, t: &TokenTotals) {
+const fn add_tokens(totals: &mut TokenTotals, t: &TokenTotals) {
     totals.input += t.input;
     totals.output += t.output;
     totals.cache_read += t.cache_read;
@@ -133,6 +140,15 @@ struct LineProbe {
     kind: String,
     #[serde(default)]
     timestamp: Option<String>,
+    /// Message payload: session lines nest role/provider/model/usage under
+    /// a `"message"` object (see `session::MessageEntry`), with camelCase
+    /// role tags (`"toolResult"`).
+    #[serde(default)]
+    message: Option<MessageProbe>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct MessageProbe {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -184,17 +200,18 @@ const PRICING: &[(&str, f64, f64)] = &[
     ("o3", 2.00, 8.00),
 ];
 
+#[allow(clippy::cast_precision_loss)] // token counts are far below 2^52
 fn price_fallback(model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
     let mut best: Option<(&&str, f64, f64)> = None;
     for (prefix, pin, pout) in PRICING {
-        if model.starts_with(prefix) && best.map_or(true, |(b, _, _)| prefix.len() > b.len()) {
+        if model.starts_with(prefix) && best.is_none_or(|(b, _, _)| prefix.len() > b.len()) {
             best = Some((prefix, *pin, *pout));
         }
     }
     let Some((_, pin, pout)) = best else {
         return 0.0;
     };
-    (tokens_in as f64 / 1_000_000.0) * pin + (tokens_out as f64 / 1_000_000.0) * pout
+    (tokens_in as f64 / 1_000_000.0).mul_add(pin, (tokens_out as f64 / 1_000_000.0) * pout)
 }
 
 /// Internal accumulator mirroring [`StatsReport`] buckets.
@@ -225,14 +242,14 @@ impl Accumulator {
         match probe.kind.as_str() {
             "compaction" => self.compactions += 1,
             "message" => {
-                if probe.role.as_deref() == Some("toolresult") {
-                    if let Some(tool) = probe.tool_name.as_deref() {
-                        *self.tool_calls.entry(tool.to_string()).or_insert(0) += 1;
-                        self.tool_calls_total_hint();
-                    }
+                let msg = probe.message.unwrap_or_default();
+                if msg.role.as_deref() == Some("toolResult")
+                    && let Some(tool) = msg.tool_name.as_deref()
+                {
+                    *self.tool_calls.entry(tool.to_string()).or_insert(0) += 1;
                 }
-                if probe.role.as_deref() == Some("assistant") {
-                    if !filter.admits_model(probe.provider.as_deref(), probe.model.as_deref()) {
+                if msg.role.as_deref() == Some("assistant") {
+                    if !filter.admits_model(msg.provider.as_deref(), msg.model.as_deref()) {
                         return;
                     }
                     if !*session_counted {
@@ -241,7 +258,7 @@ impl Accumulator {
                     }
                     self.messages += 1;
 
-                    let usage = probe.usage.unwrap_or_default();
+                    let usage = msg.usage.unwrap_or_default();
                     let tokens = TokenTotals {
                         input: usage.input,
                         output: usage.output,
@@ -254,7 +271,7 @@ impl Accumulator {
                         recorded
                     } else {
                         price_fallback(
-                            probe.model.as_deref().unwrap_or_default(),
+                            msg.model.as_deref().unwrap_or_default(),
                             tokens.input,
                             tokens.output,
                         )
@@ -264,12 +281,12 @@ impl Accumulator {
                     self.cost += cost;
 
                     let key = (
-                        probe.provider.clone().unwrap_or_else(|| "unknown".into()),
-                        probe.model.clone().unwrap_or_else(|| "unknown".into()),
+                        msg.provider.unwrap_or_else(|| "unknown".into()),
+                        msg.model.unwrap_or_else(|| "unknown".into()),
                     );
                     *self.pm_messages.entry(key.clone()).or_insert(0) += 1;
                     add_tokens(self.pm_tokens.entry(key.clone()).or_default(), &tokens);
-                    *self.pm_cost.entry(key).or_insert(0.0) += cost;
+                    *self.pm_cost.entry(key).or_default() += cost;
 
                     let day = probe
                         .timestamp
@@ -285,10 +302,6 @@ impl Accumulator {
             _ => {}
         }
     }
-
-    fn tool_calls_total_hint(&mut self) {
-        // tool_calls_total is derived at finish(); nothing to do here.
-    }
 }
 
 /// Aggregate one session JSONL file into `acc`.
@@ -299,7 +312,9 @@ fn accumulate_file(acc: &mut Accumulator, path: &Path, filter: &StatsFilter) {
     let reader = BufReader::new(file);
     let mut counted = false;
     for line in reader.lines() {
-        let Ok(line) = line else { break };
+        // A single bad line (invalid UTF-8, transient IO error) must not
+        // discard the rest of the session file.
+        let Ok(line) = line else { continue };
         acc.ingest_line(filter, &line, &mut counted);
     }
 }
@@ -416,41 +431,45 @@ fn finish(acc: Accumulator) -> StatsReport {
 #[must_use]
 pub fn render_text(report: &StatsReport) -> String {
     let mut out = String::new();
-    out.push_str(&format!(
-        "Sessions: {}  Messages: {}  Compactions: {}\n",
+    let _ = writeln!(
+        out,
+        "Sessions: {}  Messages: {}  Compactions: {}",
         report.sessions, report.messages, report.compactions
-    ));
-    out.push_str(&format!(
-        "Tokens: in {}  out {}  cache-r {}  cache-w {}  total {}\n",
+    );
+    let _ = writeln!(
+        out,
+        "Tokens: in {}  out {}  cache-r {}  cache-w {}  total {}",
         report.tokens.input,
         report.tokens.output,
         report.tokens.cache_read,
         report.tokens.cache_write,
         report.tokens.total
-    ));
-    out.push_str(&format!("Cost: ${:.4}\n", report.cost.total));
+    );
+    let _ = writeln!(out, "Cost: ${:.4}", report.cost.total);
     if !report.by_provider_model.is_empty() {
         out.push_str("\nBy provider/model:\n");
         for row in &report.by_provider_model {
-            out.push_str(&format!(
-                "  {:<12} {:<28} msgs {:<6} tok {}  ${:.4}\n",
+            let _ = writeln!(
+                out,
+                "  {:<12} {:<28} msgs {:<6} tok {}  ${:.4}",
                 row.provider, row.model, row.messages, row.tokens.total, row.cost.total
-            ));
+            );
         }
     }
     if !report.by_day.is_empty() {
         out.push_str("\nBy day:\n");
         for row in &report.by_day {
-            out.push_str(&format!(
-                "  {}  msgs {:<6} tok {}  ${:.4}\n",
+            let _ = writeln!(
+                out,
+                "  {}  msgs {:<6} tok {}  ${:.4}",
                 row.day, row.messages, row.tokens.total, row.cost.total
-            ));
+            );
         }
     }
     if !report.tool_calls.is_empty() {
         out.push_str("\nTop tools:\n");
         for row in report.tool_calls.iter().take(10) {
-            out.push_str(&format!("  {:<20} {}\n", row.tool, row.count));
+            let _ = writeln!(out, "  {:<20} {}", row.tool, row.count);
         }
     }
     out
@@ -460,8 +479,9 @@ pub fn render_text(report: &StatsReport) -> String {
 #[must_use]
 pub fn render_markdown(report: &StatsReport) -> String {
     let mut out = String::from("# pi stats\n\n");
-    out.push_str(&format!(
-        "- Sessions: {}\n- Messages: {}\n- Tokens (in/out/total): {} / {} / {}\n- Cost: ${:.4}\n- Compactions: {}\n",
+    let _ = writeln!(
+        out,
+        "- Sessions: {}\n- Messages: {}\n- Tokens (in/out/total): {} / {} / {}\n- Cost: ${:.4}\n- Compactions: {}",
         report.sessions,
         report.messages,
         report.tokens.input,
@@ -469,14 +489,15 @@ pub fn render_markdown(report: &StatsReport) -> String {
         report.tokens.total,
         report.cost.total,
         report.compactions
-    ));
+    );
     if !report.by_provider_model.is_empty() {
         out.push_str("\n| provider | model | messages | tokens | cost |\n|---|---|---|---|---|\n");
         for row in &report.by_provider_model {
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | ${:.4} |\n",
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | ${:.4} |",
                 row.provider, row.model, row.messages, row.tokens.total, row.cost.total
-            ));
+            );
         }
     }
     out
@@ -494,8 +515,10 @@ mod tests {
         tout: u64,
         cost: f64,
     ) -> String {
+        // Mirrors the real writer shape (session::MessageEntry): payload
+        // fields nest under "message" with camelCase role tags.
         format!(
-            r#"{{"type":"message","id":"m1","parent_id":null,"timestamp":"{ts}","role":"assistant","content":[],"api":"api","provider":"{provider}","model":"{model}","usage":{{"input":{tin},"output":{tout},"cacheRead":0,"cacheWrite":0,"totalTokens":{},"cost":{{"input":{cost},"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":{cost}}}}}}}"#,
+            r#"{{"type":"message","id":"m1","parentId":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[],"api":"api","provider":"{provider}","model":"{model}","usage":{{"input":{tin},"output":{tout},"cacheRead":0,"cacheWrite":0,"totalTokens":{},"cost":{{"input":{cost},"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":{cost}}}}}}}}}"#,
             tin + tout
         )
     }
@@ -517,7 +540,7 @@ mod tests {
             &[
                 assistant_line("anthropic", "claude-sonnet-4-5", "2026-08-20T10:00:00Z", 100, 200, 0.01),
                 assistant_line("openai", "gpt-4o", "2026-08-21T11:00:00Z", 300, 400, 0.02),
-                r#"{"type":"message","timestamp":"2026-08-21T11:05:00Z","role":"toolresult","toolName":"read","content":[]}"#.into(),
+                r#"{"type":"message","timestamp":"2026-08-21T11:05:00Z","message":{"role":"toolResult","toolName":"read","content":[]}}"#.into(),
                 r#"{"type":"compaction","summary":"s","firstKeptEntryId":"x","tokensBefore":9}"#.into(),
             ],
         );
@@ -544,10 +567,67 @@ mod tests {
     }
 
     #[test]
+    fn probe_matches_real_session_writer_shape() {
+        // Guard against writer/reader schema drift: build the line from the
+        // REAL session serializer (SessionMessage), not a hand-written
+        // fixture. This is exactly the drift that once made every real
+        // session aggregate to zero.
+        let assistant = crate::session::SessionMessage::Assistant {
+            message: crate::model::AssistantMessage {
+                content: Vec::new(),
+                api: "api".into(),
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4-5".into(),
+                usage: crate::model::Usage {
+                    input: 7,
+                    output: 11,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total_tokens: 18,
+                    cost: crate::model::Cost {
+                        total: 0.5,
+                        ..Default::default()
+                    },
+                },
+                stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            },
+        };
+        let tool_result = crate::session::SessionMessage::ToolResult {
+            tool_call_id: "t1".into(),
+            tool_name: "read".into(),
+            content: Vec::new(),
+            details: None,
+            is_error: false,
+            timestamp: None,
+        };
+        let wrap = |msg: &crate::session::SessionMessage| {
+            format!(
+                r#"{{"type":"message","id":"m","timestamp":"2026-08-20T10:00:00.000Z","message":{}}}"#,
+                serde_json::to_string(msg).unwrap()
+            )
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let f = write_session(
+            &tmp.path().join("proj"),
+            "s.jsonl",
+            &[wrap(&assistant), wrap(&tool_result)],
+        );
+        let report = aggregate(&[f], &StatsFilter::default());
+        assert_eq!(report.messages, 1, "assistant message admitted");
+        assert_eq!(report.tokens.input, 7);
+        assert_eq!(report.tokens.output, 11);
+        assert!((report.cost.total - 0.5).abs() < 1e-9);
+        assert_eq!(report.tool_calls_total, 1, "toolResult admitted");
+    }
+
+    #[test]
     fn filters_compose_day_and_provider() {
         let tmp = tempfile::tempdir().unwrap();
         let f = write_session(
-            &tmp.path(),
+            tmp.path(),
             "s.jsonl",
             &[
                 assistant_line(
@@ -582,6 +662,17 @@ mod tests {
     }
 
     #[test]
+    fn until_day_prefix_is_inclusive() {
+        let filter = StatsFilter {
+            until: Some("2026-08-21".into()),
+            ..Default::default()
+        };
+        assert!(filter.admits_timestamp(Some("2026-08-21T10:00:00Z")));
+        assert!(filter.admits_timestamp(Some("2026-08-20T00:00:00Z")));
+        assert!(!filter.admits_timestamp(Some("2026-08-22T00:00:00Z")));
+    }
+
+    #[test]
     fn pricing_fallback_applies_when_recorded_cost_zero() {
         let tmp = tempfile::tempdir().unwrap();
         // 1M in / 1M out on sonnet-4 => $3 + $15 = $18 via fallback.
@@ -593,7 +684,7 @@ mod tests {
             1_000_000,
             0.0,
         );
-        let f = write_session(&tmp.path(), "s.jsonl", &[line]);
+        let f = write_session(tmp.path(), "s.jsonl", &[line]);
         let report = aggregate(&[f], &StatsFilter::default());
         assert!(
             (report.cost.total - 18.0).abs() < 1e-6,

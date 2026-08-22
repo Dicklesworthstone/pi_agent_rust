@@ -1494,11 +1494,13 @@ impl AgentSessionHandle {
     /// into the session header. Returns a user-facing status line.
     pub async fn add_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
         let canonical = crate::workspace::validate_new_root(dir.as_ref())?;
-        let mut workspace = self.workspace.clone().ok_or_else(|| {
-            Error::validation("no workspace handle in this session")
-        })?;
-        let already =
-            workspace.snapshot_or(Path::new(".")).contains_canonical(&canonical);
+        let mut workspace = self
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
+        let already = workspace
+            .snapshot_or(Path::new("."))
+            .contains_canonical(&canonical);
         if !already {
             workspace.add_root(&canonical);
         }
@@ -1525,15 +1527,13 @@ impl AgentSessionHandle {
     /// the shared handle (immediate for every tool holding a clone) and
     /// persist. Returns a user-facing status line.
     pub async fn remove_workspace_root(&mut self, dir: impl AsRef<Path>) -> Result<String> {
-        let mut workspace = self.workspace.clone().ok_or_else(|| {
-            Error::validation("no workspace handle in this session")
-        })?;
+        let mut workspace = self
+            .workspace
+            .clone()
+            .ok_or_else(|| Error::validation("no workspace handle in this session"))?;
         let removed = workspace.remove_root(dir.as_ref());
         if !removed {
-            return Ok(format!(
-                "Not a workspace root: {}",
-                dir.as_ref().display()
-            ));
+            return Ok(format!("Not a workspace root: {}", dir.as_ref().display()));
         }
         let roots = workspace.additional_roots();
         let cx = crate::agent_cx::AgentCx::for_request();
@@ -1546,7 +1546,10 @@ impl AgentSessionHandle {
                 .map_err(|e| Error::session(e.to_string()))?;
             guard.set_additional_roots(&roots);
         }
-        Ok(format!("Workspace root removed: {}", dir.as_ref().display()))
+        Ok(format!(
+            "Workspace root removed: {}",
+            dir.as_ref().display()
+        ))
     }
 
     /// Return all model messages for the current session path.

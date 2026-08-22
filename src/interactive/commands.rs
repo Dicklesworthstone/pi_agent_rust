@@ -3215,11 +3215,10 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         }
         let context = {
-            let snapshot: Vec<crate::model::Message> =
-                self.agent.try_lock().map_or_else(
-                    |_| Vec::new(),
-                    |agent| agent.messages().to_vec(),
-                );
+            let snapshot: Vec<crate::model::Message> = self
+                .agent
+                .try_lock()
+                .map_or_else(|_| Vec::new(), |agent| agent.messages().to_vec());
             pi::btw::build_context_summary(&snapshot)
         };
         self.messages.push(ConversationMessage {
@@ -3239,12 +3238,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 Ok(answer) => PiMsg::System(format!("(/btw) {answer}")),
                 Err(err) => PiMsg::AgentError(format!("(/btw) failed: {err}")),
             };
-            let _ = crate::interactive::enqueue_pi_event(
-                &event_tx,
-                &Cx::for_request(),
-                msg,
-            )
-            .await;
+            let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
         });
         self.scroll_to_bottom();
         None

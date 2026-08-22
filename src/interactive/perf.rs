@@ -889,11 +889,14 @@ impl PiApp {
             return None;
         };
         // Agent-side reset is synchronous; only the session log spawns.
+        // uuid suffix: a bare millisecond stamp can collide across rapid
+        // calls, defeating the cache-reset purpose.
         let new_id = format!(
-            "fresh-{}",
+            "fresh-{}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_millis())
+                .map_or(0, |d| d.as_millis()),
+            uuid::Uuid::new_v4().simple()
         );
         agent_guard.stream_options_mut().session_id = Some(new_id.clone());
         let messages_len = agent_guard.messages().len();

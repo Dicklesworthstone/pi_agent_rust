@@ -2264,9 +2264,13 @@ pub async fn compact_auto(
 #[must_use]
 pub fn shake_projection(preparation: &CompactionPreparation) -> ShakeProjection {
     let summary = build_shake_summary(preparation);
+    // The post-shake context is the shake summary PLUS the kept-recent span;
+    // projecting the summary alone accepts borderline shakes that re-trip
+    // the threshold on the very next turn.
+    let kept_estimate = u64::from(preparation.settings.keep_recent_tokens);
     ShakeProjection {
         tokens_before: preparation.tokens_before,
-        projected_tokens: (summary.len() / CHARS_PER_TOKEN_ESTIMATE) as u64,
+        projected_tokens: (summary.len() / CHARS_PER_TOKEN_ESTIMATE) as u64 + kept_estimate,
     }
 }
 

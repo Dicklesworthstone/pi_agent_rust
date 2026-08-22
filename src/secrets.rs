@@ -131,7 +131,9 @@ fn rules() -> &'static Vec<Rule> {
             Rule {
                 name: "dsn",
                 regex: regex::Regex::new(
-                    r"(?i)(postgres|mysql|mongodb|redis|amqp)://[^\s/:@]+:[^\s/@]+@",
+                    // Non-capturing: group 1 is reserved for "the value to
+                    // vault" (see `scan`); the whole DSN is the secret here.
+                    r"(?i)(?:postgres|mysql|mongodb|redis|amqp)://[^\s/:@]+:[^\s/@]+@",
                 )
                 .expect("rule"),
                 label: "dsn",
@@ -165,7 +167,12 @@ pub struct Detection {
 pub fn scan(text: &str, extra_patterns: &[regex::Regex]) -> Vec<Detection> {
     let mut out = Vec::new();
     for rule in rules() {
-        for m in rule.regex.find_iter(text) {
+        for caps in rule.regex.captures_iter(text) {
+            // When a rule isolates the value in group 1 (the KEY=value
+            // assignment shape), vault only the value: vaulting the whole
+            // `KEY=value` corrupts inbound restores (`export X=KEY=value`)
+            // and leaves a bare echo of the value unmasked.
+            let m = caps.get(1).or_else(|| caps.get(0)).expect("match group 0");
             out.push(Detection {
                 start: m.start(),
                 end: m.end(),
@@ -238,10 +245,15 @@ impl SecretVault {
     }
 
     /// Mask any real values in `text` back to placeholders (echo hygiene).
+    /// Longest value first: when one vaulted value is a substring of
+    /// another, masking the shorter one first would leave fragments of the
+    /// longer secret exposed (HashMap order is arbitrary).
     #[must_use]
     pub fn mask(&self, text: &str) -> String {
+        let mut pairs: Vec<(&String, &String)> = self.by_placeholder.iter().collect();
+        pairs.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(b.0)));
         let mut out = text.to_string();
-        for (placeholder, real) in &self.by_placeholder {
+        for (placeholder, real) in pairs {
             if out.contains(real.as_str()) {
                 out = out.replace(real.as_str(), placeholder);
             }
@@ -394,6 +406,24 @@ mod tests {
         assert!(err.to_string().contains("PI_SECRET_BLOCK"), "{err}");
         assert!(gate_outbound("clean text", SecretsMode::Block, &[]).is_ok());
         assert!(gate_outbound("sk-aaaaaaaaaaaaaaaaaaaaaaaa", SecretsMode::Off, &[]).is_ok());
+    }
+
+    #[test]
+    fn generic_assignment_vaults_only_the_value() {
+        let mut vault = SecretVault::default();
+        let (out, _) = obfuscate("API_KEY=hunter2hunter2hunter2", &mut vault, &[]);
+        assert!(
+            out.starts_with("API_KEY=<pi-secret:"),
+            "key name must survive, only the value is vaulted: {out}"
+        );
+        // Restore of a model-written command must expand to the bare value.
+        let restored = vault.restore("export TOKEN=<pi-secret:000001>");
+        assert_eq!(restored, "export TOKEN=hunter2hunter2hunter2");
+        // Echo hygiene must catch the bare value too.
+        assert_eq!(vault.mask("hunter2hunter2hunter2"), "<pi-secret:000001>");
+        // A whole-match rule (DSN) still vaults the full credential.
+        let (dsn_out, _) = obfuscate("postgres://user:pw@host/db", &mut vault, &[]);
+        assert!(dsn_out.starts_with("<pi-secret:"), "{dsn_out}");
     }
 
     #[test]

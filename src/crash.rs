@@ -15,6 +15,7 @@
 //! the signal name plus the redacted operation ring (no backtrace).
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -81,7 +82,7 @@ pub fn redact_text(text: &str) -> String {
         let safe_start = first.start.min(text.len());
         let safe_end = end.min(text.len()).max(safe_start);
         out.push_str(&text[cursor..safe_start]);
-        out.push_str(&format!("[REDACTED:{}]", first.rule));
+        let _ = write!(out, "[REDACTED:{}]", first.rule);
         cursor = safe_end;
         index = lookahead;
     }
@@ -115,24 +116,25 @@ impl CrashBundle {
     pub fn render_report(&self) -> String {
         let mut out = format!("pi crash bundle ({})\n", self.kind);
         if let Some(message) = &self.panic_message {
-            out.push_str(&format!("panic: {message}\n"));
+            let _ = writeln!(out, "panic: {message}");
         }
         if let Some(backtrace) = &self.backtrace {
             out.push_str("\nbacktrace:\n");
             out.push_str(backtrace);
             out.push('\n');
         }
-        out.push_str(&format!(
-            "build: {} @ {}\nsession: {}\ncreated: {}\n",
+        let _ = writeln!(
+            out,
+            "build: {} @ {}\nsession: {}\ncreated: {}",
             self.build_git_sha,
             self.build_timestamp,
             self.session_path.as_deref().unwrap_or("(none)"),
             self.created_at
-        ));
+        );
         if !self.recent_operations.is_empty() {
             out.push_str("\nrecent operations (redacted):\n");
             for op in &self.recent_operations {
-                out.push_str(&format!("  - {op}\n"));
+                let _ = writeln!(out, "  - {op}");
             }
         }
         out
@@ -175,6 +177,13 @@ fn write_bundle(agent_dir: &Path, mut bundle: CrashBundle) -> Result<PathBuf, St
 
     let dir = crashes_dir(agent_dir).join(stamp_for_dir());
     std::fs::create_dir_all(&dir).map_err(|e| format!("create crash dir: {e}"))?;
+    // Bundles carry backtraces and the operations ring; keep them
+    // owner-only like session JSONLs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     let json =
         serde_json::to_string_pretty(&bundle).map_err(|e| format!("serialize bundle: {e}"))?;
     std::fs::write(dir.join("bundle.json"), json).map_err(|e| format!("write bundle.json: {e}"))?;
@@ -186,12 +195,12 @@ fn write_bundle(agent_dir: &Path, mut bundle: CrashBundle) -> Result<PathBuf, St
 
 /// Install the panic hook (chaining any previously installed hook) and start
 /// the fatal-signal watcher thread. Idempotent.
-pub fn install(agent_dir: &Path, session_path: Option<PathBuf>) {
+pub fn install(agent_dir: &Path, session_path: Option<&Path>) {
     if INSTALLED.swap(true, Ordering::SeqCst) {
         return;
     }
     let agent_dir = agent_dir.to_path_buf();
-    let session_path_redacted = session_path.as_deref().map(|p| p.display().to_string());
+    let session_path_redacted = session_path.map(|p| redact_text(&p.display().to_string()));
     let hook_session = session_path_redacted.clone();
     let hook_dir = agent_dir.clone();
     let previous = std::panic::take_hook();
@@ -216,33 +225,36 @@ pub fn install(agent_dir: &Path, session_path: Option<PathBuf>) {
 }
 
 fn payload_of(info: &std::panic::PanicHookInfo<'_>) -> String {
-    if let Some(payload) = info.payload().downcast_ref::<&str>() {
-        (*payload).to_string()
-    } else if let Some(payload) = info.payload().downcast_ref::<String>() {
-        payload.clone()
-    } else {
-        "unknown panic payload".into()
-    }
+    info.payload().downcast_ref::<&str>().map_or_else(
+        || {
+            info.payload()
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "unknown panic payload".into())
+        },
+        |payload| (*payload).to_string(),
+    )
 }
 
 /// Best-effort fatal-signal watcher: writes a minimal bundle naming the
 /// signal with redacted ring context. See module docs for the coverage
 /// caveat under `forbid(unsafe_code)`.
 fn spawn_signal_watcher(agent_dir: PathBuf, session_path: Option<String>) {
+    // SIGSEGV/SIGILL/SIGFPE are forbidden by signal-hook's safe registry
+    // (registration panics, not errors) — the module docs already scope
+    // segfault coverage as best-effort-absent under `forbid(unsafe_code)`.
     let watched = [
         signal_hook::consts::signal::SIGABRT,
         signal_hook::consts::signal::SIGBUS,
-        signal_hook::consts::signal::SIGSEGV,
     ];
     let Ok(mut signals) = signal_hook::iterator::Signals::new(watched) else {
         tracing::warn!(event = "pi.crash.watch", "signal watcher unavailable");
         return;
     };
-    let mut signals = signals;
     std::thread::Builder::new()
         .name("pi-crash-watch".into())
         .spawn(move || {
-            for signal in signals.forever() {
+            if let Some(signal) = signals.forever().next() {
                 let (sha, ts) = build_metadata();
                 let bundle = CrashBundle {
                     schema: CRASH_SCHEMA.to_string(),
@@ -256,6 +268,12 @@ fn spawn_signal_watcher(agent_dir: PathBuf, session_path: Option<String>) {
                     created_at: utc_stamp(),
                 };
                 let _ = write_bundle(&agent_dir, bundle);
+                // Fatal signals must stay fatal: signal-hook's iterator
+                // replaces the default disposition, so without this the
+                // process would survive SIGABRT/SIGBUS (and a hardware
+                // SIGBUS would re-deliver forever). Record, then die the
+                // way the default handler would have.
+                let _ = signal_hook::low_level::emulate_default_handler(signal);
             }
         })
         .ok();

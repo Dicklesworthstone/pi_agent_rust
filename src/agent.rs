@@ -1804,16 +1804,14 @@ impl Agent {
         for message in context.messages.to_mut().iter_mut() {
             match message {
                 Message::User(user) => {
-                    if let UserContent::Text(text) = &mut user.content {
-                        *text = Self::secrets_transform_text(
-                            text,
-                            &mut self.secrets_vault,
-                            mode,
-                            &extra,
-                            &mut total,
-                            &mut labels,
-                        )?;
-                    }
+                    Self::secrets_transform_user_content(
+                        &mut user.content,
+                        &mut self.secrets_vault,
+                        mode,
+                        &extra,
+                        &mut total,
+                        &mut labels,
+                    )?;
                 }
                 Message::Assistant(assistant) => {
                     let assistant_mut = Arc::make_mut(assistant);
@@ -1893,6 +1891,35 @@ impl Agent {
         Ok(out)
     }
 
+    /// Outbound secret hygiene for a user message. Attachment-carrying
+    /// messages (`Blocks`: text + images) must get the same treatment as
+    /// plain text — that is the shape the interactive app sends whenever an
+    /// attachment exists.
+    fn secrets_transform_user_content(
+        content: &mut UserContent,
+        vault: &mut crate::secrets::SecretVault,
+        mode: crate::secrets::SecretsMode,
+        extra: &[regex::Regex],
+        total: &mut usize,
+        labels: &mut Vec<String>,
+    ) -> Result<()> {
+        match content {
+            UserContent::Text(text) => {
+                *text = Self::secrets_transform_text(text, vault, mode, extra, total, labels)?;
+            }
+            UserContent::Blocks(blocks) => {
+                for block in blocks.iter_mut() {
+                    if let ContentBlock::Text(t) = block {
+                        t.text = Self::secrets_transform_text(
+                            &t.text, vault, mode, extra, total, labels,
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn build_abort_message(&self, partial: Option<&AssistantMessage>) -> AssistantMessage {
         let mut message = partial.cloned().unwrap_or_else(|| AssistantMessage {
             content: Vec::new(),
@@ -1934,9 +1961,26 @@ impl Agent {
         message
     }
 
-    /// The main agent loop.
-    #[allow(clippy::too_many_lines)]
+    /// The main agent loop. Magic keywords (bd-cv653.3.6) mutate the
+    /// thinking level and system prompt for *this turn only*; snapshot and
+    /// restore them here so a single `ultrathink` does not pin every later
+    /// turn at max thinking and directives do not accrete forever.
     async fn run_loop(
+        &mut self,
+        prompts: Vec<Message>,
+        on_event: AgentEventHandler,
+        abort: Option<AbortSignal>,
+    ) -> Result<AssistantMessage> {
+        let saved_thinking = self.config.stream_options.thinking_level;
+        let saved_system_prompt = self.config.system_prompt.clone();
+        let result = self.run_loop_inner(prompts, on_event, abort).await;
+        self.config.stream_options.thinking_level = saved_thinking;
+        self.config.system_prompt = saved_system_prompt;
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn run_loop_inner(
         &mut self,
         prompts: Vec<Message>,
         on_event: AgentEventHandler,
@@ -3758,12 +3802,14 @@ impl Agent {
             }
         }
         if let Some(details) = &mut output.details
-            && let Some(text) = serde_json::to_string(details)
-                .ok()
-                .filter(|text| text.contains("<pi-secret:"))
+            && let Some(text) = serde_json::to_string(details).ok()
         {
+            // Mask maps real secret values back to placeholders; only
+            // re-parse when something actually changed.
             let masked = self.secrets_vault.mask(&text);
-            if let Ok(value) = serde_json::from_str(&masked) {
+            if masked != text
+                && let Ok(value) = serde_json::from_str(&masked)
+            {
                 *details = value;
             }
         }

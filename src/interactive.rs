@@ -1783,6 +1783,10 @@ pub async fn run_interactive(
             mcp_manager,
         ));
         app.ask_tool = ask_tool;
+        // The live multi-root handle must reach the app (bd-cv653.3.12) —
+        // without it /add-dir, @-file scope, and autocomplete run on a
+        // disconnected default handle.
+        app.set_workspace(workspace);
         if let Some(client) = btw_client {
             app.set_btw_client(client);
         }
@@ -2521,7 +2525,6 @@ impl PiApp {
     pub const fn workspace(&self) -> &WorkspaceHandle {
         &self.workspace
     }
-
 
     /// Attach the `/btw` side-question client (bd-cv653.3.16).
     pub fn set_btw_client(&mut self, client: Arc<pi::btw::BtwClient>) {

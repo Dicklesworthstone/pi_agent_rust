@@ -970,8 +970,17 @@ impl ChildRunner {
         // and apply per `iso_apply` (keep/apply/drop). A conflicting apply
         // reports files and leaves the worktree — never force.
         if let Some(handle) = iso_handle {
-            let mode = crate::worktree_iso::IsoApplyMode::parse(iso_apply.as_deref())
+            let mut mode = crate::worktree_iso::IsoApplyMode::parse(iso_apply.as_deref())
                 .unwrap_or(crate::worktree_iso::IsoApplyMode::Apply);
+            // Never auto-apply the half-finished edits of a failed or
+            // cancelled child into the parent tree — that is exactly the
+            // state isolation exists to contain. Keep the worktree so the
+            // patch stays inspectable.
+            if mode == crate::worktree_iso::IsoApplyMode::Apply
+                && !matches!(result.status, SubagentStatus::Completed)
+            {
+                mode = crate::worktree_iso::IsoApplyMode::Keep;
+            }
             let mut outcome = crate::worktree_iso::IsoOutcome {
                 schema: crate::worktree_iso::ISO_SCHEMA.to_string(),
                 worktree_path: handle.path.display().to_string(),

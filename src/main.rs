@@ -1867,24 +1867,20 @@ async fn run(
 
     // The /btw side-question client (bd-cv653.3.16): bound to the smol
     // role when it resolves AND credentials exist; interactive-only.
-    let btw_client = pi::app::resolve_role_model(
-        pi::models::ModelRole::Smol,
-        &cli,
-        &config,
-        &model_registry,
-    )
-    .and_then(|resolution| {
-        let entry = resolution.model_entry;
-        let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
-        let credentialed =
-            !pi::models::model_requires_configured_credential(&entry) || key.is_some();
-        if !credentialed {
-            return None;
-        }
-        pi::providers::create_provider(&entry, None)
-            .ok()
-            .map(|provider| std::sync::Arc::new(pi::btw::BtwClient::new(provider, key)))
-    });
+    let btw_client =
+        pi::app::resolve_role_model(pi::models::ModelRole::Smol, &cli, &config, &model_registry)
+            .and_then(|resolution| {
+                let entry = resolution.model_entry;
+                let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
+                let credentialed =
+                    !pi::models::model_requires_configured_credential(&entry) || key.is_some();
+                if !credentialed {
+                    return None;
+                }
+                pi::providers::create_provider(&entry, None)
+                    .ok()
+                    .map(|provider| std::sync::Arc::new(pi::btw::BtwClient::new(provider, key)))
+            });
 
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
     // .agents > global > foreign), eagerly connect already-acknowledged

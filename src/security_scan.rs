@@ -172,20 +172,34 @@ pub fn load_rule_packs(project_root: &Path) -> Result<Vec<RulePack>> {
 
 /// Scope a scan: explicit paths, or the project root. Directories walk
 /// gitignore-respecting file lists via the repo's ignore machinery.
-fn scope_files(cwd: &Path, paths: &[String]) -> Vec<PathBuf> {
+fn scope_files(cwd: &Path, paths: &[String]) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     let roots: Vec<PathBuf> = if paths.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
-        paths.iter().map(|p| cwd.join(p)).collect()
+        paths
+            .iter()
+            .map(|p| confine_to_cwd(cwd, p, "paths"))
+            .collect::<Result<Vec<_>>>()?
     };
     for root in roots {
+        // A mistyped scope must not yield a false-clean "0 findings".
+        if !root.exists() {
+            return Err(Error::validation(format!(
+                "security_scan scope path does not exist: {}",
+                root.display()
+            )));
+        }
         if root.is_file() {
             files.push(root);
         } else if root.is_dir() {
+            // `.hidden(false)` so dotfiles are scanned: `.env`, `.npmrc`,
+            // `.aws/credentials` and CI workflow files are the classic
+            // secret carriers. `.git/` itself is still skipped below.
             let walker = ignore::WalkBuilder::new(&root)
-                .hidden(true)
+                .hidden(false)
                 .git_ignore(true)
+                .filter_entry(|entry| entry.file_name() != ".git")
                 .build();
             for entry in walker.flatten() {
                 let path = entry.path();
@@ -197,7 +211,7 @@ fn scope_files(cwd: &Path, paths: &[String]) -> Vec<PathBuf> {
     }
     files.sort();
     files.dedup();
-    files
+    Ok(files)
 }
 
 /// Run compiled rules over one file, returning findings with paths relative
@@ -251,7 +265,7 @@ pub fn run_scan(cwd: &Path, paths: &[String]) -> Result<Vec<Finding>> {
         }
     }
     let mut findings = Vec::new();
-    for file in scope_files(cwd, paths) {
+    for file in scope_files(cwd, paths)? {
         scan_file(cwd, &file, &compiled, &mut findings);
     }
     findings.sort_by(|a, b| {
@@ -287,7 +301,6 @@ pub fn to_sarif(
                     "id": r.id,
                     "shortDescription": { "text": r.message },
                     "defaultConfiguration": { "level": sarif_level(&r.severity) },
-                    "helpUri": null,
                 })
             })
         })
@@ -343,16 +356,50 @@ pub struct Disposition {
     pub at_ms: u64,
 }
 
+/// Resolve a tool-supplied path under `cwd`, refusing absolute paths and
+/// `..` escapes. Without this, `sarifOut: "/Users/x/.zshenv"` would clobber
+/// arbitrary files under a single generic tool approval.
+fn confine_to_cwd(cwd: &Path, raw: &str, field: &str) -> Result<PathBuf> {
+    let candidate = Path::new(raw);
+    if candidate.is_absolute()
+        || candidate
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(Error::validation(format!(
+            "security_scan {field} must be a relative path inside the project (got {raw:?})"
+        )));
+    }
+    Ok(cwd.join(candidate))
+}
+
 fn dispositions_path(project_root: &Path) -> PathBuf {
     project_root.join(".pi").join("security-dispositions.json")
 }
 
-pub fn load_dispositions(project_root: &Path) -> BTreeMap<String, Disposition> {
+/// Missing store → empty map; unparseable store → error.
+///
+/// Silently treating a corrupt store as empty would un-suppress every
+/// finding and, on the next `disposition`, overwrite it — destroying all
+/// prior dispositions.
+pub fn load_dispositions(project_root: &Path) -> Result<BTreeMap<String, Disposition>> {
     let path = dispositions_path(project_root);
-    fs::read_to_string(&path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => {
+            return Err(Error::tool(
+                "security_scan",
+                format!("read {}: {e}", path.display()),
+            ));
+        }
+    };
+    serde_json::from_str(&text).map_err(|e| {
+        Error::validation(format!(
+            "corrupt disposition store {} ({e}); repair or move it aside before scanning",
+            path.display()
+        ))
+    })
 }
 
 pub fn save_dispositions(
@@ -367,8 +414,12 @@ pub fn save_dispositions(
     }
     let text = serde_json::to_string_pretty(dispositions)
         .map_err(|e| Error::validation(format!("serialize dispositions: {e}")))?;
-    fs::write(&path, text)
-        .map_err(|e| Error::tool("security_scan", format!("write {}: {e}", path.display())))
+    // Temp + rename: a crash mid-write must not leave a truncated store.
+    let tmp = path.with_extension("json.tmp");
+    fs::write(&tmp, text)
+        .map_err(|e| Error::tool("security_scan", format!("write {}: {e}", tmp.display())))?;
+    fs::rename(&tmp, &path)
+        .map_err(|e| Error::tool("security_scan", format!("persist {}: {e}", path.display())))
 }
 
 /// Partition findings into active vs dispositioned (status false-positive or
@@ -620,7 +671,7 @@ impl Tool for SecurityScanTool {
 impl SecurityScanTool {
     fn op_plan(&self, input: &ScanInput) -> Result<ToolOutput> {
         let packs = load_rule_packs(&self.cwd)?;
-        let files = scope_files(&self.cwd, &input.paths);
+        let files = scope_files(&self.cwd, &input.paths)?;
         let rule_count: usize = packs.iter().map(|p| p.rules.len()).sum();
         let details = json!({
             "schema": SCAN_SCHEMA,
@@ -655,13 +706,13 @@ impl SecurityScanTool {
         use std::fmt::Write as _;
         let packs = load_rule_packs(&self.cwd)?;
         let findings = run_scan(&self.cwd, &input.paths)?;
-        let dispositions = load_dispositions(&self.cwd);
+        let dispositions = load_dispositions(&self.cwd)?;
         let (active, suppressed) = partition_by_disposition(findings, &dispositions);
         let sarif = to_sarif(&active, &suppressed, &packs);
-        let out_path = input.sarif_out.as_deref().map_or_else(
-            || self.cwd.join(".pi/security-scan.sarif"),
-            |p| self.cwd.join(p),
-        );
+        let out_path = match input.sarif_out.as_deref() {
+            None => self.cwd.join(".pi/security-scan.sarif"),
+            Some(p) => confine_to_cwd(&self.cwd, p, "sarifOut")?,
+        };
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent).map_err(|e| {
                 Error::tool("security_scan", format!("create {}: {e}", parent.display()))
@@ -737,7 +788,7 @@ impl SecurityScanTool {
             .clone()
             .filter(|r| !r.trim().is_empty())
             .ok_or_else(|| Error::validation("security_scan disposition requires reason"))?;
-        let mut dispositions = load_dispositions(&self.cwd);
+        let mut dispositions = load_dispositions(&self.cwd)?;
         dispositions.insert(
             fingerprint.clone(),
             Disposition {
@@ -761,10 +812,10 @@ impl SecurityScanTool {
     }
 
     fn op_compare(&self, input: &ScanInput) -> Result<ToolOutput> {
-        let baseline_path = input.baseline.as_deref().map_or_else(
-            || self.cwd.join(".pi/security-scan.sarif"),
-            |p| self.cwd.join(p),
-        );
+        let baseline_path = match input.baseline.as_deref() {
+            None => self.cwd.join(".pi/security-scan.sarif"),
+            Some(p) => confine_to_cwd(&self.cwd, p, "baseline")?,
+        };
         let text = fs::read_to_string(&baseline_path).map_err(|e| {
             Error::tool(
                 "security_scan",
@@ -773,7 +824,7 @@ impl SecurityScanTool {
         })?;
         let previous = findings_from_sarif(&text);
         let current = run_scan(&self.cwd, &input.paths)?;
-        let dispositions = load_dispositions(&self.cwd);
+        let dispositions = load_dispositions(&self.cwd)?;
         let report = compare(&previous, &current, &dispositions);
         let details = serde_json::to_value(&report)
             .map_err(|e| Error::validation(format!("serialize compare: {e}")))?;

@@ -2064,11 +2064,14 @@ pub async fn run(
                     let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    // uuid suffix: a bare millisecond stamp can collide
+                    // across rapid calls, defeating the cache-reset purpose.
                     let new_id = format!(
-                        "fresh-{}",
+                        "fresh-{}-{}",
                         std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map_or(0, |d| d.as_millis())
+                            .map_or(0, |d| d.as_millis()),
+                        uuid::Uuid::new_v4().simple()
                     );
                     guard.agent.stream_options_mut().session_id = Some(new_id.clone());
                     {
@@ -4844,11 +4847,20 @@ async fn maybe_auto_compact(
         };
 
         let reserve_tokens = options.config.compaction_reserve_tokens();
+        // Carry the configured mode (shake-first/aggressive) and the real
+        // model window: `prepare_compaction` re-checks the threshold against
+        // `context_window_tokens`, so the 128k default would silently disable
+        // auto-compaction for smaller-window models.
         let settings = ResolvedCompactionSettings {
             enabled: true,
             reserve_tokens,
             keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
-            ..Default::default()
+            context_window_tokens: if context_window == 0 {
+                ResolvedCompactionSettings::default().context_window_tokens
+            } else {
+                context_window
+            },
+            mode: options.config.compaction_mode(),
         };
 
         (path_entries, context_window, reserve_tokens, settings)

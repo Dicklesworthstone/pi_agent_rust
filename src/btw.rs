@@ -33,25 +33,16 @@ pub struct BtwClient {
 
 impl BtwClient {
     pub fn new(provider: Arc<dyn Provider>, api_key: Option<String>) -> Self {
-        Self {
-            provider,
-            api_key,
-        }
+        Self { provider, api_key }
     }
 
     /// Ask an ephemeral side question with compact context from the current
     /// conversation tail. Returns only the answer text.
-    pub async fn ask(
-        &self,
-        context_summary: &str,
-        question: &str,
-    ) -> Result<String> {
+    pub async fn ask(&self, context_summary: &str, question: &str) -> Result<String> {
         let user_text = if context_summary.is_empty() {
             question.to_string()
         } else {
-            format!(
-                "Current work context:\n{context_summary}\n\nSide question: {question}"
-            )
+            format!("Current work context:\n{context_summary}\n\nSide question: {question}")
         };
         let context = crate::provider::Context {
             system_prompt: Some(BTW_SYSTEM_PROMPT.to_string().into()),
@@ -72,7 +63,7 @@ impl BtwClient {
         while let Some(event) = stream.next().await {
             match event {
                 Ok(crate::model::StreamEvent::TextDelta { delta, .. }) => {
-                    answer.push_str(&delta)
+                    answer.push_str(&delta);
                 }
                 Ok(crate::model::StreamEvent::Done { .. }) => break,
                 Ok(_) => {}
@@ -80,15 +71,19 @@ impl BtwClient {
             }
         }
         if answer.trim().is_empty() {
-            return Err(crate::error::Error::api("side question returned empty reply"));
+            return Err(crate::error::Error::api(
+                "side question returned empty reply",
+            ));
         }
         Ok(answer)
     }
 }
 
-/// Compact context summary from the live agent message list: the most
-/// recent exchanges, truncated to [`CONTEXT_BUDGET_CHARS`]. Tool noise
-/// (calls/results) is summarized as one-liners so the budget buys prose.
+/// Compact context summary from the live agent message list.
+///
+/// The most recent exchanges, truncated to [`CONTEXT_BUDGET_CHARS`]. Tool
+/// noise (calls/results) is summarized as one-liners so the budget buys
+/// prose.
 #[must_use]
 pub fn build_context_summary(messages: &[Message]) -> String {
     let mut pieces: Vec<String> = Vec::new();
@@ -106,14 +101,12 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                 for block in &assistant.content {
                     match block {
                         crate::model::ContentBlock::Text(t) => {
-                            let piece =
-                                format!("assistant: {}", truncate(&t.text, 400));
+                            let piece = format!("assistant: {}", truncate(&t.text, 400));
                             used += piece.len();
                             pieces.push(piece);
                         }
                         crate::model::ContentBlock::ToolCall(call) => {
-                            let piece =
-                                format!("assistant ran tool {}", call.name);
+                            let piece = format!("assistant ran tool {}", call.name);
                             used += piece.len();
                             pieces.push(piece);
                         }
@@ -134,7 +127,7 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                 used += piece.len();
                 pieces.push(piece);
             }
-            _ => {}
+            Message::Custom(_) => {}
         }
         if used >= CONTEXT_BUDGET_CHARS {
             break;

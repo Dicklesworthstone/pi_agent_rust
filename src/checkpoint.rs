@@ -199,7 +199,18 @@ pub fn apply_rewind_to_active(
     summary: String,
 ) -> RewindOutcome {
     let total = agent.messages().len();
-    let boundary = checkpoint.message_count.min(total);
+    let mut boundary = checkpoint.message_count.min(total);
+    // The recorded count is positional and the active list is renumbered by
+    // compaction/resume, so it can land mid-turn. Truncating there would
+    // leave a trailing assistant `tool_use` without its `tool_result` — the
+    // next request then fails provider validation. Walk back to a user-turn
+    // start so the kept prefix always ends with a completed turn.
+    while boundary > 0
+        && boundary < total
+        && !matches!(agent.messages()[boundary], Message::User(_))
+    {
+        boundary -= 1;
+    }
     let collapsed = total - boundary;
     agent.truncate_messages(boundary);
     if !summary.is_empty() {
@@ -225,7 +236,9 @@ pub fn apply_rewind_to_active(
 /// Reset provider stream state (new session id) with the transcript
 /// untouched. Returns the new session id.
 pub fn fresh_stream_state(agent: &mut crate::agent::Agent, session: &mut Session) -> String {
-    let new_id = format!("fresh-{}", now_ms());
+    // A millisecond stamp alone can collide across rapid calls; the uuid
+    // suffix keeps every /fresh a genuinely new provider session id.
+    let new_id = format!("fresh-{}-{}", now_ms(), uuid::Uuid::new_v4().simple());
     agent.stream_options_mut().session_id = Some(new_id.clone());
     session.append_custom_entry(
         "fresh".to_string(),
@@ -242,10 +255,18 @@ pub fn fresh_stream_state(agent: &mut crate::agent::Agent, session: &mut Session
 /// in the tree; the active context rewinds to just before it).
 #[must_use]
 pub fn take_last_user_turn(agent: &mut crate::agent::Agent) -> Option<String> {
-    let last_user_index = agent
-        .messages()
-        .iter()
-        .rposition(|message| matches!(message, Message::User(_)))?;
+    // Skip synthetic user messages (rewind reports) — retrying one of those
+    // instead of the real prompt would replay bookkeeping text as a turn.
+    let last_user_index = agent.messages().iter().rposition(|message| {
+        matches!(
+            message,
+            Message::User(user)
+                if !matches!(
+                    &user.content,
+                    UserContent::Text(text) if text.starts_with("[REWIND REPORT:")
+                )
+        )
+    })?;
     let text = match &agent.messages()[last_user_index] {
         Message::User(user) => match &user.content {
             UserContent::Text(text) => text.clone(),

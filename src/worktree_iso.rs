@@ -173,7 +173,7 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
     )?;
 
     // Dirty-tree materialization: tracked diff + untracked files.
-    let tracked_patch = git_ok(repo_root, &["diff", "HEAD"])?;
+    let tracked_patch = git_ok(repo_root, &["diff", "--binary", "HEAD"])?;
     if !tracked_patch.trim().is_empty() {
         let patch_file = path.join(".pi-iso-parent.patch");
         std::fs::write(&patch_file, &tracked_patch)
@@ -225,7 +225,10 @@ pub fn isolate(repo_root: &Path, task_id: &str) -> Result<IsoHandle> {
 pub fn collect_diff(handle: &IsoHandle) -> Result<(String, String)> {
     // Stage everything so untracked work appears in the diff.
     git_ok(&handle.path, &["add", "-A"])?;
-    let patch = git_ok(&handle.path, &["diff", "--cached", &handle.baseline])?;
+    let patch = git_ok(
+        &handle.path,
+        &["diff", "--binary", "--cached", &handle.baseline],
+    )?;
     let diff_stat = git_ok(
         &handle.path,
         &["diff", "--cached", "--stat", &handle.baseline],
