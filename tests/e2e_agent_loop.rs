@@ -704,6 +704,7 @@ fn run_scenario(
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -997,6 +998,7 @@ fn context_intelligence_no_mock_harness() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1475,6 +1477,7 @@ fn rpc_partial_tool_call_arguments_grow_during_stream() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
