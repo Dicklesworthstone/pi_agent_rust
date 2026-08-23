@@ -4690,31 +4690,31 @@ fn handle_token(input: &str) -> Result<()> {
 /// `pi profile [--input folded] [--top N]` (bd-cv653.7.12.1): render the
 /// newest (or given) folded profiler snapshot as a top-functions table.
 fn handle_profile(input: Option<&Path>, top: usize) -> Result<()> {
-    let path = match input {
-        Some(path) => path.to_path_buf(),
-        None => {
-            let dir = pi::profiler::profiles_dir(&pi::config::Config::global_dir());
-            let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&dir)
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "no profiles directory ({dir:?}): {e}; run with --profile first"
-                    )
-                })?
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "folded"))
-                .collect();
-            snapshots.sort();
-            snapshots
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("no folded snapshots under {dir:?}"))?
-        }
+    let path = if let Some(path) = input {
+        path.to_path_buf()
+    } else {
+        let dir = pi::profiler::profiles_dir(&pi::config::Config::global_dir());
+        let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "no profiles directory ({}): {e}; run with --profile first",
+                    dir.display()
+                )
+            })?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "folded"))
+            .collect();
+        snapshots.sort();
+        snapshots
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("no folded snapshots under {}", dir.display()))?
     };
     let content = std::fs::read_to_string(&path)
         .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
     let (grand, rows) = pi::profiler::top_from_folded(&content, top);
-    println!("{}: {} samples total", path.display(), grand);
-    println!("{:<6}  {}", "SAMPLES", "INCLUSIVE STACK");
+    println!("{}: {grand} samples total", path.display());
+    println!("{:<6}  INCLUSIVE STACK", "SAMPLES");
     for (stack, count) in &rows {
         let tail = stack.rsplit(';').next().unwrap_or(stack);
         println!("{count:<6}  …{tail}");
