@@ -2,8 +2,9 @@
 //!
 //! Wraps the `pprof` crate behind the opt-in `profiler` feature. Samples at
 //! 99 Hz while the session runs, periodically snapshots **folded** stacks
-//! into `<agent-dir>/profiles/<stamp>.folded` so even hard exits leave the
-//! last window on disk, and supports an SVG flamegraph render.
+//! into `<agent-dir>/profiles/current.folded` (atomic overwrite) so even
+//! hard exits leave the last window on disk, and supports an SVG
+//! flamegraph render.
 //!
 //! Known limitation (inherited from pprof): samples land on the thread that
 //! started the profiler — the async runtime's worker threads are captured
@@ -82,7 +83,7 @@ mod imp {
     pub fn folded_snapshot() -> Result<Vec<String>, String> {
         Err("built without the `profiler` feature".into())
     }
-    pub fn stop() {}
+    pub const fn stop() {}
 }
 
 pub use imp::{folded_snapshot, start, stop};
@@ -90,10 +91,6 @@ pub use imp::{folded_snapshot, start, stop};
 /// Directory where periodic snapshots land.
 pub fn profiles_dir(agent_dir: &Path) -> PathBuf {
     agent_dir.join("profiles")
-}
-
-fn stamp() -> String {
-    chrono::Utc::now().format("%Y%m%dT%H%M%SZ%3f").to_string()
 }
 
 /// Write a folded snapshot under `agent_dir/profiles/`. Returns the path.
@@ -104,24 +101,42 @@ pub fn write_snapshot(agent_dir: &Path) -> Result<PathBuf, String> {
     let dir = profiles_dir(agent_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir profiles: {e}"))?;
     let lines = folded_snapshot()?;
-    let path = dir.join(format!("{}.folded", stamp()));
-    std::fs::write(&path, lines.join("\n")).map_err(|e| format!("write snapshot: {e}"))?;
+    // Samples are cumulative-since-start: one stamped file per interval
+    // accumulates O(n^2) bytes over a long session (and contradicted the
+    // documented "overwrites current.folded" behavior). Overwrite the one
+    // documented target atomically (temp + rename).
+    let path = dir.join("current.folded");
+    let tmp = dir.join(".current.folded.tmp");
+    std::fs::write(&tmp, lines.join("\n")).map_err(|e| format!("write snapshot: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("persist snapshot: {e}"))?;
     Ok(path)
 }
 
-/// Spawn the periodic-snapshot thread: every [`SNAPSHOT_INTERVAL_SECS`] the
-/// current folded state overwrites `profiles/current.folded`, so even a hard
-/// exit leaves the last window on disk. A no-op without the feature.
+/// Spawn the periodic-snapshot thread.
+///
+/// Every [`SNAPSHOT_INTERVAL_SECS`] the current folded state overwrites
+/// `profiles/current.folded`, so even a hard exit leaves the last window
+/// on disk. A no-op without the feature.
 pub fn spawn_snapshot_thread(agent_dir: &Path) {
     let dir = agent_dir.to_path_buf();
     std::thread::Builder::new()
         .name("pi-profile-snap".into())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(
-                SNAPSHOT_INTERVAL_SECS,
-            ));
-            if let Ok(path) = write_snapshot(&dir) {
-                tracing::debug!(event = "pi.profile.snapshot", path = %path.display());
+        .spawn(move || {
+            let mut warned = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(SNAPSHOT_INTERVAL_SECS));
+                match write_snapshot(&dir) {
+                    Ok(path) => {
+                        tracing::debug!(event = "pi.profile.snapshot", path = %path.display());
+                    }
+                    Err(err) if !warned => {
+                        // A full disk / unwritable dir must not silently
+                        // produce an empty run.
+                        warned = true;
+                        tracing::warn!(event = "pi.profile.snapshot", error = %err);
+                    }
+                    Err(_) => {}
+                }
             }
         })
         .ok();

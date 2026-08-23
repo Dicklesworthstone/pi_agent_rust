@@ -102,7 +102,19 @@ fn main() {
     #[cfg(windows)]
     let _ = enable_ansi_support::enable_ansi_support();
 
-    if let Err(err) = main_impl() {
+    let result = main_impl();
+
+    // Final profiler snapshot at normal shutdown: the periodic thread only
+    // fires every 10s, so short runs would otherwise leave nothing on disk
+    // and every run would lose its last window.
+    #[cfg(feature = "profiler")]
+    if std::env::var_os("PI_PROFILE").is_some_and(|v| v != "0" && !v.is_empty())
+        || std::env::args().any(|arg| arg == "--profile")
+    {
+        let _ = pi::profiler::write_snapshot(&pi::config::Config::global_dir());
+    }
+
+    if let Err(err) = result {
         let exit_code = exit_code_for_error(&err);
         print_error_with_hints(&err);
         std::process::exit(exit_code);
@@ -445,7 +457,9 @@ fn main_impl() -> Result<()> {
     // PI_PROFILE=1 and the `profiler` feature. Snapshots land under
     // <agent-dir>/profiles/ every 10s so hard exits keep the last window.
     #[cfg(feature = "profiler")]
-    if cli.profile || std::env::var_os("PI_PROFILE").is_some() {
+    if cli.profile
+        || std::env::var_os("PI_PROFILE").is_some_and(|v| v != "0" && !v.is_empty())
+    {
         match pi::profiler::start() {
             Ok(()) => {
                 tracing::info!(event = "pi.profile.start", hz = pi::profiler::SAMPLE_HZ);

@@ -1518,7 +1518,9 @@ impl PackageManager {
                 None,
             )?;
         } else {
-            run_command("npm", ["install", "-g", spec], None)
+            // `--` so a spec beginning with '-' cannot be parsed as an npm
+            // flag (the prefix/uninstall branches already do this).
+            run_command("npm", ["install", "-g", "--", spec], None)
                 .map_err(|err| enrich_global_npm_install_error(err, spec))?;
         }
 
@@ -3945,7 +3947,10 @@ fn prune_empty_git_parents(target_dir: &Path, root: &Path) {
 fn enrich_global_npm_install_error(err: Error, spec: &str) -> Error {
     let base = err.to_string();
     let lowered = base.to_ascii_lowercase();
-    if !(lowered.contains("eacces") || lowered.contains("permission denied")) {
+    // Match npm's own error code, not bare "permission denied": spawn
+    // failures and unrelated npm output containing those words would
+    // otherwise get prefix-reconfiguration advice that does not apply.
+    if !lowered.contains("eacces") || lowered.contains("failed to spawn") {
         return err;
     }
     Error::tool(
@@ -3956,9 +3961,11 @@ fn enrich_global_npm_install_error(err: Error, spec: &str) -> Error {
              distro-packaged npm whose prefix is root-owned (for example /usr on Arch), \
              point npm at a user-writable prefix once:\n\
              \tnpm config set prefix ~/.local\n\
-             (ensure ~/.local/bin is on PATH), then re-run the install. Inside a \
-             project you can use `pi install --local {spec}` instead, which installs \
-             under the project without touching the global prefix."
+             (ensure ~/.local/bin is on PATH), then re-run the install. NOTE: if you \
+             use nvm or volta, do NOT set a prefix (nvm refuses to run with one) — \
+             switch to a node install owned by your user instead. Inside a project \
+             you can use `pi install --local {spec}` instead, which installs under \
+             the project without touching the global prefix."
         ),
     )
 }
