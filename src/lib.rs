@@ -119,7 +119,9 @@ pub mod context_files;
 pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;
-#[cfg(feature = "profiler")]
+// Always declared: the module is dual-mode internally (its non-feature
+// `imp` degrades to named errors), and main.rs's `pi profile` arm calls
+// its unconditional helpers — gating the declaration broke default builds.
 pub mod profiler;
 #[doc(hidden)]
 pub mod debug;
