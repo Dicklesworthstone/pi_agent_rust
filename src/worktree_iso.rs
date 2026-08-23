@@ -633,7 +633,9 @@ mod tests {
 
         let reaped = reap_stale(&repo, Duration::from_secs(60)).unwrap();
         assert!(
-            !reaped.iter().any(|p| p == &ours.path.to_string_lossy().to_string()),
+            !reaped
+                .iter()
+                .any(|p| p == &ours.path.to_string_lossy().to_string()),
             "live worktree with fresh nested writes must survive the reaper"
         );
         assert!(ours.path.exists(), "worktree must still exist");

@@ -228,10 +228,11 @@ fn price_fallback(
         return 0.0;
     };
     let m = |tokens: u64| tokens as f64 / 1_000_000.0;
-    m(tokens_in) * pin
-        + m(tokens_out) * pout
-        + m(cache_read) * pin * CACHE_READ_RATE
-        + m(cache_write) * pin * CACHE_WRITE_RATE
+    let cache = m(cache_read).mul_add(
+        pin * CACHE_READ_RATE,
+        m(cache_write) * pin * CACHE_WRITE_RATE,
+    );
+    m(tokens_in).mul_add(pin, m(tokens_out).mul_add(pout, cache))
 }
 
 /// Internal accumulator mirroring [`StatsReport`] buckets.
