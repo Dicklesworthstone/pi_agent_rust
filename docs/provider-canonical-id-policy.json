@@ -445,6 +445,13 @@
         "source": "models.dev+opencode"
       },
       {
+        "canonical_id": "orcarouter",
+        "aliases": [
+          "orca"
+        ],
+        "source": "pi-runtime"
+      },
+      {
         "canonical_id": "ovhcloud",
         "aliases": [],
         "source": "models.dev"
@@ -697,6 +704,7 @@
     "novita": "novita-ai",
     "nvidia-nim": "nvidia",
     "open-router": "openrouter",
+    "orca": "orcarouter",
     "pplx": "perplexity",
     "qwen": "alibaba",
     "sap": "sap-ai-core",
@@ -738,8 +746,8 @@
     }
   ],
   "summary": {
-    "total_canonical_ids": 102,
-    "total_aliases": 61,
+    "total_canonical_ids": 103,
+    "total_aliases": 62,
     "retired_provider_ids": 1,
     "normalization": "trim + case-insensitive registered canonical-or-alias match"
   }

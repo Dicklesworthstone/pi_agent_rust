@@ -67,6 +67,7 @@ canonical IDs; `fireworks-ai` and the Azure spellings are aliases.
 | `nim`, `nvidia-nim` | `nvidia` | Pi runtime |
 | `novita` | `novita-ai` | Pi runtime |
 | `open-router` | `openrouter` | Pi runtime |
+| `orca` | `orcarouter` | Pi runtime |
 | `pplx` | `perplexity` | Pi runtime |
 | `qwen` | `alibaba` | Pi alias |
 | `sap` | `sap-ai-core` | opencode |
@@ -74,13 +75,13 @@ canonical IDs; `fireworks-ai` and the Azure spellings are aliases.
 | `together`, `together-ai` | `togetherai` | Pi runtime |
 | `vercel-ai-gateway` | `vercel` | Pi runtime |
 
-Total: 51 aliases across 33 canonical IDs.
+Total: 52 aliases across 34 canonical IDs.
 
-## Canonical ID Registry (94 active IDs)
+## Canonical ID Registry (95 active IDs)
 
 Mirrors the active runtime registry. The machine-readable source is
 [`provider-canonical-id-table.json`](provider-canonical-id-table.json); the
-policy JSON mirrors the same 94 IDs and 51 aliases.
+policy JSON mirrors the same 95 IDs and 52 aliases.
 
 | Canonical ID | Has Aliases | Source(s) |
 |-------------|------------|-----------|
@@ -151,6 +152,7 @@ policy JSON mirrors the same 94 IDs and 51 aliases.
 | openai-codex | yes (codex, chatgpt-codex) | Pi runtime |
 | opencode | no | models.dev + opencode |
 | openrouter | yes (open-router) | models.dev + opencode |
+| orcarouter | yes (orca) | Pi runtime |
 | ovhcloud | no | models.dev |
 | perplexity | yes (pplx) | models.dev |
 | poe | no | models.dev |

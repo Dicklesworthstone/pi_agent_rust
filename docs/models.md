@@ -108,6 +108,7 @@ onboarding modes, generated from `PROVIDER_METADATA` in
 | `cerebras` | Cerebras | - | `CEREBRAS_API_KEY` | openai-compatible preset |
 | `atlascloud` | Atlas Cloud | atlas-cloud, atlas | `ATLASCLOUD_API_KEY`, `ATLAS_CLOUD_API_KEY` | openai-compatible preset |
 | `openrouter` | OpenRouter | open-router | `OPENROUTER_API_KEY` | openai-compatible preset |
+| `orcarouter` | OrcaRouter | orca | `ORCAROUTER_API_KEY` | openai-compatible preset |
 | `mistral` | Mistral AI | mistralai | `MISTRAL_API_KEY` | openai-compatible preset |
 | `moonshotai` | Moonshot AI | moonshot, kimi | `MOONSHOT_API_KEY`, `KIMI_API_KEY` | openai-compatible preset |
 | `alibaba` | Alibaba (Qwen) | dashscope, qwen | `DASHSCOPE_API_KEY`, `QWEN_API_KEY` | openai-compatible preset |

@@ -3,7 +3,7 @@
   "bead_id": "bd-3uqg.9.3.2",
   "generated_at_utc": "2026-08-06T09:40:00Z",
   "generated_by": "manual source reconciliation against src/provider_metadata.rs and auth runtime tests",
-  "description": "Canonical/alias/env-key auth crosswalk covering all 102 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
+  "description": "Canonical/alias/env-key auth crosswalk covering all 103 registered Pi provider IDs. Registration does not imply that every provider has an executable native route. Request-wire authentication is modeled separately from credential acquisition so an OAuth exchange, device flow, external credential, or AWS chain is never mistaken for the header value sent to inference.",
   "provider_row_contract": {
     "auth_method": "Primary request-wire authentication method ID from request_auth_methods.",
     "additional_auth_methods": "Optional additional request-wire method IDs supported when the credential type selects a different wire lane.",
@@ -55,7 +55,7 @@
   "request_auth_methods": {
     "bearer_token": {
       "header": "Authorization: Bearer {API_KEY}",
-      "providers_count": 91,
+      "providers_count": 92,
       "description": "Bearer value on the inference request. How the value was acquired (direct key, OAuth, device flow, external CLI, Bedrock override, or SAP exchange) is modeled separately."
     },
     "x_api_key": {
@@ -169,7 +169,7 @@
     },
     "methods": {
       "direct_api_key": {
-        "providers_count": 94,
+        "providers_count": 95,
         "description": "Complete API key supplied explicitly, through a provider API-key environment variable, or from stored ApiKey auth."
       },
       "oauth_login": {
@@ -588,6 +588,18 @@
       "tier": "oai_compat"
     },
     {
+      "canonical_id": "orcarouter",
+      "aliases": [
+        "orca"
+      ],
+      "env_keys": [
+        "ORCAROUTER_API_KEY"
+      ],
+      "auth_method": "bearer_token",
+      "base_url": "https://api.orcarouter.ai/v1",
+      "tier": "oai_compat"
+    },
+    {
       "canonical_id": "mistral",
       "aliases": [
         "mistralai"
@@ -734,7 +746,7 @@
       "auth_method": "no_auth_required",
       "base_url": "http://127.0.0.1:11434/v1",
       "tier": "local",
-      "notes": "No authentication required \u2014 local inference server"
+      "notes": "No authentication required — local inference server"
     },
     {
       "canonical_id": "lmstudio",
@@ -759,7 +771,7 @@
       "auth_method": "no_auth_required",
       "base_url": "http://127.0.0.1:8080/v1",
       "tier": "local",
-      "notes": "No authentication required \u2014 local inference server"
+      "notes": "No authentication required — local inference server"
     },
     {
       "canonical_id": "mistralrs",
@@ -771,7 +783,7 @@
       "auth_method": "no_auth_required",
       "base_url": "http://127.0.0.1:1234/v1",
       "tier": "local",
-      "notes": "No authentication required \u2014 local inference server"
+      "notes": "No authentication required — local inference server"
     },
     {
       "canonical_id": "ollama-cloud",
@@ -1488,15 +1500,15 @@
   "acceptance_criteria_compliance": {
     "criterion_1": {
       "requirement": "Crosswalk covers canonical IDs, common aliases, env key precedence, and base URL defaults/overrides",
-      "status": "PASS \u2014 all 102 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
+      "status": "PASS — all 103 registered providers listed with canonical_id, aliases, env_keys, request-auth classification, base_url, and tier"
     },
     "criterion_2": {
       "requirement": "Includes high-confusion mappings (azure, azure-cognitive-services, fireworks-ai, qwen, kimi, google-vertex-anthropic)",
-      "status": "PASS \u2014 high_confusion_mappings section covers all 9 high-confusion cases with resolution explanations"
+      "status": "PASS — high_confusion_mappings section covers all 9 high-confusion cases with resolution explanations"
     },
     "criterion_3": {
       "requirement": "Crosswalk references test evidence validating alias and auth resolution behavior",
-      "status": "PASS \u2014 each confusion mapping uses one valid provider_metadata_comprehensive test filter; request and acquisition method references/counts are checked against this schema"
+      "status": "PASS — each confusion mapping uses one valid provider_metadata_comprehensive test filter; request and acquisition method references/counts are checked against this schema"
     }
   }
 }

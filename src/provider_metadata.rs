@@ -259,6 +259,26 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        // OpenAI-compatible meta-router (https://api.orcarouter.ai); one
+        // endpoint fronting 150+ upstream models with an adaptive
+        // `orcarouter/auto` route (gh PR #176).
+        canonical_id: "orcarouter",
+        display_name: Some("OrcaRouter"),
+        aliases: &["orca"],
+        auth_env_keys: &["ORCAROUTER_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.orcarouter.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "mistral",
         display_name: Some("Mistral AI"),
         aliases: &["mistralai"],
