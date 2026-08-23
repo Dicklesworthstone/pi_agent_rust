@@ -478,13 +478,28 @@ mod tests {
 
     #[test]
     fn non_git_refuses_with_named_error() {
-        let dir = std::env::temp_dir().join(format!("pi-iso-nogit-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("pi-iso-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
+
+        // Remote-execution harnesses may resolve temp_dir INSIDE the synced
+        // project tree (which is itself a git work tree). The refusal under
+        // test only applies to genuinely non-git directories — self-skip
+        // when the environment cannot provide one.
+        let inside = git(&dir, &["rev-parse", "--is-inside-work-tree"])
+            .is_ok_and(|output| output.status.success());
+        if inside {
+            eprintln!("skipping: temp_dir resolves inside a git work tree");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+
         let err = isolate(&dir, "x").unwrap_err();
         assert!(
             err.to_string().contains("PI_ISO_NOT_GIT"),
             "expected named refusal: {err}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
