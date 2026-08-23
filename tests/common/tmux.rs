@@ -96,6 +96,11 @@ impl TmuxInstance {
 
     /// Start a new 80x24 tmux session running the given script.
     pub fn start_session(&self, workdir: &Path, script_path: &Path) {
+        // Hardening: concurrent rch/tmp sweeps can reap harness dirs
+        // between creation and launch. A vanished `-c` workdir makes
+        // new-session succeed while the pane dies instantly and silently
+        // (empty captures, has-session false) — recreate defensively.
+        let _ = std::fs::create_dir_all(workdir);
         let workdir_str = workdir.display().to_string();
         let script_str = script_path.display().to_string();
         self.run_checked(

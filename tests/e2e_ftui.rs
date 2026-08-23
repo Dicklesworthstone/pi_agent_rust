@@ -218,7 +218,8 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
     assert!(
         startup_pane.contains("ftui preview stack"),
-        "startup banner never appeared; pane:\n{startup_pane}"
+        "startup banner never appeared; session_alive={}; script:\n{script}\npane:\n{startup_pane}",
+        session.tmux.session_exists()
     );
 
     if mid_activity {
