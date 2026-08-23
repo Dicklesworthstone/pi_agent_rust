@@ -24,6 +24,11 @@ questions; if the context does not contain the answer, say so plainly.";
 /// cheap regardless of transcript size.
 const CONTEXT_BUDGET_CHARS: usize = 4_000;
 const ANSWER_MAX_TOKENS: u32 = 512;
+/// Builds `/btw` clients for resolved model entries (bd-9jgrt). Captured by
+/// the interactive app so `/model smol <spec>` can rebind mid-session.
+pub type BtwClientFactory = std::sync::Arc<
+    dyn Fn(&crate::models::ModelEntry) -> Option<std::sync::Arc<BtwClient>> + Send + Sync,
+>;
 
 /// One-shot client bound to the resolved `smol` role provider.
 pub struct BtwClient {
@@ -34,6 +39,26 @@ pub struct BtwClient {
 impl BtwClient {
     pub fn new(provider: Arc<dyn Provider>, api_key: Option<String>) -> Self {
         Self { provider, api_key }
+    }
+
+    /// Resolve provider + credentials for `entry` and build a client using
+    /// the startup precedence (`--api-key` > stored auth > inline key).
+    /// Returns `None` when credentials are required but missing, or when
+    /// the provider cannot be constructed.
+    pub fn for_model_entry(
+        entry: &crate::models::ModelEntry,
+        cli_api_key: Option<&str>,
+        auth: &crate::auth::AuthStorage,
+    ) -> Option<std::sync::Arc<Self>> {
+        let key = crate::models::resolve_model_key(cli_api_key, auth, entry);
+        let credentialed =
+            !crate::models::model_requires_configured_credential(entry) || key.is_some();
+        if !credentialed {
+            return None;
+        }
+        crate::providers::create_provider(entry, None)
+            .ok()
+            .map(|provider| std::sync::Arc::new(Self::new(provider, key)))
     }
 
     /// Ask an ephemeral side question with compact context from the current
@@ -216,5 +241,32 @@ mod tests {
         // we pin the error string so callers can branch on it.
         let expected = "side question returned empty reply";
         assert_eq!(expected, "side question returned empty reply");
+    }
+
+    #[test]
+    fn for_model_entry_builds_client_for_credential_free_provider() {
+        let entry = crate::models::ad_hoc_model_entry("ollama", "llama3")
+            .expect("ollama ad-hoc entry resolves");
+        let auth = crate::auth::AuthStorage::load(
+            std::env::temp_dir().join(format!("pi-btw-test-auth-{}.json", std::process::id())),
+        )
+        .expect("empty auth storage loads");
+        let client =
+            BtwClient::for_model_entry(&entry, None, &auth).expect("local provider builds");
+        // The Arc is the contract callers hold; a deref proves construction.
+        let _arc: std::sync::Arc<BtwClient> = client;
+    }
+
+    #[test]
+    fn for_model_entry_rejects_credentialed_provider_without_key() {
+        let entry = crate::models::ad_hoc_model_entry("anthropic", "claude-sonnet-4-5")
+            .expect("anthropic ad-hoc entry resolves");
+        assert!(crate::models::model_requires_configured_credential(&entry));
+        let auth = crate::auth::AuthStorage::load(std::env::temp_dir().join(format!(
+            "pi-btw-test-auth-empty-{}.json",
+            std::process::id()
+        )))
+        .expect("empty auth storage loads");
+        assert!(BtwClient::for_model_entry(&entry, None, &auth).is_none());
     }
 }

@@ -1895,17 +1895,22 @@ async fn run(
     let btw_client =
         pi::app::resolve_role_model(pi::models::ModelRole::Smol, &cli, &config, &model_registry)
             .and_then(|resolution| {
-                let entry = resolution.model_entry;
-                let key = pi::models::resolve_model_key(cli.api_key.as_deref(), &auth, &entry);
-                let credentialed =
-                    !pi::models::model_requires_configured_credential(&entry) || key.is_some();
-                if !credentialed {
-                    return None;
-                }
-                pi::providers::create_provider(&entry, None)
-                    .ok()
-                    .map(|provider| std::sync::Arc::new(pi::btw::BtwClient::new(provider, key)))
+                pi::btw::BtwClient::for_model_entry(
+                    &resolution.model_entry,
+                    cli.api_key.as_deref(),
+                    &auth,
+                )
             });
+    // Rebinding factory (bd-9jgrt): lets `/model smol <spec>` rebuild the
+    // /btw client mid-session against fresh on-disk credentials.
+    let btw_api_key = cli.api_key.clone();
+    let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
+        let auth = match pi::auth::AuthStorage::load(pi::config::Config::auth_path()) {
+            Ok(auth) => auth,
+            Err(_) => return None,
+        };
+        pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
+    });
 
     // MCP client (bd-cv653.6.1): discover server configs (CLI > .pi >
     // .agents > global > foreign), eagerly connect already-acknowledged
@@ -2315,6 +2320,7 @@ async fn run(
             workspace.clone(),
             ask_tool,
             btw_client,
+            Some(btw_factory),
             Some(mcp_manager),
         ))
         .await
@@ -8843,6 +8849,7 @@ async fn run_interactive_mode(
     workspace: pi::workspace::WorkspaceHandle,
     ask_tool: Option<pi::ask::AskTool>,
     btw_client: Option<Arc<pi::btw::BtwClient>>,
+    btw_factory: Option<pi::btw::BtwClientFactory>,
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();
@@ -8881,6 +8888,7 @@ async fn run_interactive_mode(
         workspace,
         ask_tool,
         btw_client,
+        btw_factory,
         mcp_manager,
     )
     .await;

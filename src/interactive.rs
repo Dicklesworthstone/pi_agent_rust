@@ -1662,6 +1662,7 @@ pub async fn run_interactive(
     workspace: WorkspaceHandle,
     ask_tool: Option<crate::ask::AskTool>,
     btw_client: Option<Arc<pi::btw::BtwClient>>,
+    btw_factory: Option<pi::btw::BtwClientFactory>,
     mcp_manager: Option<std::sync::Arc<crate::mcp::McpManager>>,
 ) -> anyhow::Result<()> {
     let should_check_for_updates = config.should_check_for_updates();
@@ -1791,6 +1792,9 @@ pub async fn run_interactive(
         app.set_workspace(workspace);
         if let Some(client) = btw_client {
             app.set_btw_client(client);
+        }
+        if let Some(factory) = btw_factory {
+            app.set_btw_factory(factory);
         }
         let mut program = Program::new(app)
             .with_alt_screen()
@@ -2354,6 +2358,9 @@ pub struct PiApp {
     /// `/btw` side-question client on the smol role (bd-cv653.3.16);
     /// `None` when the role does not resolve or lacks credentials.
     btw_client: Option<Arc<pi::btw::BtwClient>>,
+    /// Rebinds the `/btw` client when `/model smol <spec>` changes the role
+    /// (bd-9jgrt); absent on surfaces without startup auth context.
+    btw_factory: Option<pi::btw::BtwClientFactory>,
     spinner: SpinnerModel,
     agent_state: AgentState,
 
@@ -2537,6 +2544,22 @@ impl PiApp {
     /// Attach the `/btw` side-question client (bd-cv653.3.16).
     pub fn set_btw_client(&mut self, client: Arc<pi::btw::BtwClient>) {
         self.btw_client = Some(client);
+    }
+
+    /// Install the factory used to rebind the `/btw` client on smol-role
+    /// change (bd-9jgrt).
+    pub fn set_btw_factory(&mut self, factory: pi::btw::BtwClientFactory) {
+        self.btw_factory = Some(factory);
+    }
+
+    /// Rebuild the `/btw` side-question client for `entry` (bd-9jgrt).
+    /// Returns `None` when no factory is installed (rebind unsupported on
+    /// this surface); `Some(true)` when rebound; `Some(false)` when the
+    /// factory could not serve the entry (previous binding kept).
+    fn rebuild_btw_client(&mut self, entry: &crate::models::ModelEntry) -> Option<bool> {
+        let client = (self.btw_factory.as_ref()?)(entry)?;
+        self.btw_client = Some(client);
+        Some(true)
     }
     fn initial_window_size_cmd() -> Cmd {
         Cmd::new(|| {
@@ -2735,6 +2758,7 @@ impl PiApp {
             conversation_viewport,
             follow_stream_tail: true,
             btw_client: None,
+            btw_factory: None,
             spinner,
             agent_state: AgentState::Idle,
             term_width,

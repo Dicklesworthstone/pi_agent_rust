@@ -2861,6 +2861,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.status_message = Some(format!("Model not found: {pattern}"));
             return None;
         };
+        // Borrow for the /btw rebinding decision BEFORE `entry.model.id`
+        // moves out below (E0382, bd-9jgrt).
+        let btw_rebinding = self.rebuild_btw_client(&entry);
         let provider = entry.model.provider.clone();
         let model_id = entry.model.id;
         self.role_model_overrides
@@ -2872,14 +2875,23 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 Some(role.as_str().to_string()),
             );
         }
-        // /btw binds its smol-role client (provider + credentials) at
-        // startup; rebuilding it here needs the auth/provider factory that
-        // lives in main. Say so instead of silently using the old binding.
+        // Rebind the /btw smol-role client when the role changes (bd-9jgrt).
+        // Without the factory (non-startup surfaces) disclose the stale bind
+        // instead of silently serving questions through the old provider.
         self.status_message = Some(if role == ModelRole::Smol {
-            format!(
-                "Role {role} set to {provider}/{model_id} (note: /btw keeps its \
-                 startup binding until restart)"
-            )
+            match btw_rebinding {
+                Some(true) => {
+                    format!("Role {role} set to {provider}/{model_id} (/btw rebound)")
+                }
+                Some(false) => format!(
+                    "Role {role} set to {provider}/{model_id} (/btw rebinding failed; \
+                     keeping previous binding)"
+                ),
+                None => format!(
+                    "Role {role} set to {provider}/{model_id} (/btw keeps its \
+                     startup binding until restart)"
+                ),
+            }
         } else {
             format!("Role {role} set to {provider}/{model_id}")
         });
