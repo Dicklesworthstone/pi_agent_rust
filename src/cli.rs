@@ -103,6 +103,7 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "append-system-prompt"
         | "session"
         | "session-dir"
+        | "add-dir"
         | "session-durability"
         | "mode"
         | "tools"
