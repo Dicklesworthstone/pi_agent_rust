@@ -530,6 +530,7 @@ async fn run_flight_session(
             ..StreamOptions::default()
         },
         block_images: false,
+        model_accepts_images: true,
         fail_closed_hooks: true,
         tool_approval: None,
         keyword_settings: None,
@@ -669,6 +670,7 @@ async fn run_cancelled_pressure_session(
             ..StreamOptions::default()
         },
         block_images: false,
+        model_accepts_images: true,
         fail_closed_hooks: true,
         tool_approval: None,
         keyword_settings: None,

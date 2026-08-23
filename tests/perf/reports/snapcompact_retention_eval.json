@@ -1,0 +1,19 @@
+{
+  "schema": "pi.compaction.snapcompact_eval.v1",
+  "generatedUtc": "2026-08-23T19:40:20Z",
+  "correlationId": "snapcompact-20260823T193504Z-32104",
+  "bead": "bd-cv653.7.6",
+  "lanes": {
+    "unit": {
+      "status": "pass"
+    },
+    "vcr": {
+      "status": "pass"
+    },
+    "retentionEval": {
+      "status": "NOT_REQUESTED"
+    }
+  },
+  "status": "NO_DATA",
+  "recommendation": "keep_default_off_until_live_eval_passes"
+}

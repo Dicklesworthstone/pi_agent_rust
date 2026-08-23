@@ -5445,9 +5445,8 @@ impl Session {
             if let Some(message) = session_message_to_model(&summary_message) {
                 // Snapcompact (bd-cv653.7.6): attach rasterized frames stored in
                 // this entry's details so vision-capable models can consume them.
-                let payload = crate::compaction_snap::frames_from_details(
-                    compaction.details.as_ref(),
-                );
+                let payload =
+                    crate::compaction_snap::frames_from_details(compaction.details.as_ref());
                 rebuild.messages.push(crate::compaction_snap::attach_frames(
                     message,
                     payload.as_ref(),

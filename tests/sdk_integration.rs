@@ -192,6 +192,7 @@ fn run_scripted(
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1070,6 +1071,7 @@ fn sdk_conformance_session_tool_hooks() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1160,6 +1162,7 @@ fn sdk_conformance_combined_callback_ordering() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1277,6 +1280,7 @@ fn sdk_continue_turn_uses_combined_listener_path() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1371,6 +1375,7 @@ fn sdk_continue_turn_with_abort_returns_aborted_message() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,

@@ -236,6 +236,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
         approval_state: None,
         bash_settings: None,
         secrets: None,
+        model_accepts_images: true,
     };
     Agent::new(provider, tools, config)
 }
@@ -1416,6 +1417,7 @@ fn repeated_interruption_cycles_no_corruption() {
                 approval_state: None,
                 bash_settings: None,
                 secrets: None,
+                model_accepts_images: true,
             };
             let agent = Agent::new(provider, tools, config);
             let mut agent_session = AgentSession::new(
@@ -1545,6 +1547,7 @@ fn session_resume_after_interruption() {
             approval_state: None,
             bash_settings: None,
             secrets: None,
+            model_accepts_images: true,
         };
         let agent1 = Agent::new(provider1, tools, config.clone());
         let mut session1 = AgentSession::new(
@@ -1987,6 +1990,7 @@ fn partial_write_tool_failure_recovers_without_state_corruption() {
                 approval_state: None,
                 bash_settings: None,
                 secrets: None,
+                model_accepts_images: true,
             },
         );
         let session = make_session(&harness);

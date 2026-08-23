@@ -671,11 +671,13 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
     );
     obj.insert(
         "renderMode".to_string(),
-        Value::String(match settings.render_mode {
-            CompactionRenderMode::Text => "text",
-            CompactionRenderMode::SnapCompact => "snapcompact",
-        }
-        .to_string()),
+        Value::String(
+            match settings.render_mode {
+                CompactionRenderMode::Text => "text",
+                CompactionRenderMode::SnapCompact => "snapcompact",
+            }
+            .to_string(),
+        ),
     );
     Value::Object(obj)
 }
@@ -798,19 +800,18 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
     Ok(ResolvedCompactionSettings {
         enabled,
         mode: AutoCompactionMode::default(),
-        render_mode: obj.get("renderMode").map_or(
-            Ok(CompactionRenderMode::default()),
-            |value| {
-                value.as_str().ok_or_else(|| {
+        render_mode: match obj.get("renderMode") {
+            None => CompactionRenderMode::default(),
+            Some(value) => value
+                .as_str()
+                .ok_or_else(|| {
                     Error::validation(
                         "compaction preparation: `settings.renderMode` must be a string",
                     )
-                })
-                .and_then(|s| {
-                    s.parse::<CompactionRenderMode>().map_err(Error::validation)
-                })
-            },
-        )?,
+                })?
+                .parse::<CompactionRenderMode>()
+                .map_err(Error::validation)?,
+        },
         context_window_tokens: preparation_settings_u32(
             obj,
             "contextWindowTokens",
@@ -2101,34 +2102,37 @@ async fn generate_llm_summary(
 /// Attach file-operation lists and cut-point metadata to a finished summary.
 fn finish_compaction(preparation: CompactionPreparation, mut summary: String) -> CompactionResult {
     let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+    summary.push_str(&format_file_operations(&read_files, &modified_files));
     let details = CompactionDetails {
-        read_files: read_files.clone(),
-        modified_files: modified_files.clone(),
+        read_files,
+        modified_files,
         mode: None,
     };
 
-    let snap_payload =
-        if matches!(preparation.settings.render_mode, CompactionRenderMode::SnapCompact) {
-            let model_messages: Vec<crate::model::Message> = preparation
-                .messages_to_summarize
-                .iter()
-                .filter_map(session_message_to_model)
-                .collect();
-            let transcript = serialize_conversation(&model_messages);
-            let frames = crate::compaction_snap::render_frames(&transcript);
-            (!frames.is_empty()).then(|| {
-                tracing::info!(
-                    target: "snapcompact",
-                    frame_count = frames.len(),
-                    source_chars = transcript.chars().count(),
-                    reason_code = "snapcompact_frames_generated",
-                    "Rasterized compacted span into deterministic PNG frames"
-                );
-                crate::compaction_snap::SnapPayload::new(frames)
-            })
-        } else {
-            None
-        };
+    let snap_payload = if matches!(
+        preparation.settings.render_mode,
+        CompactionRenderMode::SnapCompact
+    ) {
+        let model_messages: Vec<crate::model::Message> = preparation
+            .messages_to_summarize
+            .iter()
+            .filter_map(session_message_to_model)
+            .collect();
+        let transcript = serialize_conversation(&model_messages);
+        let frames = crate::compaction_snap::render_frames(&transcript);
+        (!frames.is_empty()).then(|| {
+            tracing::info!(
+                target: "snapcompact",
+                frame_count = frames.len(),
+                source_chars = transcript.chars().count(),
+                reason_code = "snapcompact_frames_generated",
+                "Rasterized compacted span into deterministic PNG frames"
+            );
+            crate::compaction_snap::SnapPayload::new(frames)
+        })
+    } else {
+        None
+    };
 
     CompactionResult {
         summary,
@@ -4267,6 +4271,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -4325,6 +4330,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::ShakeFirst,
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -4350,6 +4356,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 12_800,
             mode: AutoCompactionMode::Aggressive,
+            render_mode: CompactionRenderMode::default(),
         };
         assert_eq!(settings.with_mode_applied().keep_recent_tokens, 6_400);
 
@@ -4384,6 +4391,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let first_kept = prep.first_kept_entry_id.clone();
@@ -4426,6 +4434,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let result = compact_shake(prep);
@@ -4447,6 +4456,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
 
         // Tool-heavy span: shake reclaims nearly everything -> no escalation.
@@ -4502,6 +4512,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -4597,6 +4608,7 @@ mod tests {
             reserve_tokens: 0,
             keep_recent_tokens: 100,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
 
         let prep = prepare_compaction(&entries, settings).expect("should compact");
@@ -4660,6 +4672,7 @@ mod tests {
             reserve_tokens: 0,
             keep_recent_tokens: 150,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
 
         // We use prepare_compaction as the entry point
@@ -5113,6 +5126,7 @@ mod tests {
                     reserve_tokens: 16_384,
                     keep_recent_tokens: 20_000,
                     mode: AutoCompactionMode::default(),
+                    render_mode: CompactionRenderMode::default(),
                 };
                 assert!(!should_compact(ctx_tokens, window, &settings));
             }
@@ -5130,6 +5144,7 @@ mod tests {
                     reserve_tokens: reserve,
                     keep_recent_tokens: 20_000,
                     mode: AutoCompactionMode::default(),
+                    render_mode: CompactionRenderMode::default(),
                 };
                 let threshold = u64::from(window).saturating_sub(u64::from(reserve));
                 let result = should_compact(ctx_tokens, window, &settings);

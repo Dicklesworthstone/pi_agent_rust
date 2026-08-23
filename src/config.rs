@@ -2922,6 +2922,7 @@ mod tests {
                 enabled: Some(true),
                 reserve_tokens: Some(1000),
                 keep_recent_tokens: Some(2000),
+                mode: None,
             }),
             ..Config::default()
         };
@@ -3919,7 +3920,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let base = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None };
                 let result = merge_compaction(Some(base.clone()), None).unwrap();
                 assert_eq!(result.enabled, base.enabled);
                 assert_eq!(result.reserve_tokens, base.reserve_tokens);
@@ -3932,7 +3933,7 @@ mod tests {
                 reserve in prop::option::of(1u32..100_000),
                 keep in prop::option::of(1u32..100_000),
             ) {
-                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep };
+                let other = CompactionSettings { enabled, reserve_tokens: reserve, keep_recent_tokens: keep, mode: None };
                 let result = merge_compaction(None, Some(other.clone())).unwrap();
                 assert_eq!(result.enabled, other.enabled);
                 assert_eq!(result.reserve_tokens, other.reserve_tokens);
@@ -3946,8 +3947,8 @@ mod tests {
                 o_en in prop::option::of(any::<bool>()),
                 o_res in prop::option::of(1u32..100_000),
             ) {
-                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None };
-                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None };
+                let base = CompactionSettings { enabled: b_en, reserve_tokens: b_res, keep_recent_tokens: None, mode: None };
+                let other = CompactionSettings { enabled: o_en, reserve_tokens: o_res, keep_recent_tokens: None, mode: None };
                 let result = merge_compaction(Some(base), Some(other)).unwrap();
                 assert_eq!(result.enabled, o_en.or(b_en));
                 assert_eq!(result.reserve_tokens, o_res.or(b_res));

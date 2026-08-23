@@ -1945,6 +1945,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         system_prompt: Some(system_prompt),
         max_tool_iterations: options.max_tool_iterations,
         stream_options,
+        block_images: config.image_block_images(),
         model_accepts_images: selection
             .model_entry
             .model
@@ -2373,6 +2374,7 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
@@ -2545,6 +2547,7 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
@@ -2935,6 +2938,7 @@ mod tests {
             reserve_tokens: 1_234,
             keep_recent_tokens: 4_321,
             mode: crate::compaction::AutoCompactionMode::default(),
+            render_mode: crate::compaction::CompactionRenderMode::default(),
         };
         let options = SessionOptions {
             compaction_settings: Some(custom.clone()),

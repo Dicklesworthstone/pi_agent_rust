@@ -711,6 +711,7 @@ impl fmt::Debug for AgentConfig {
             .field("max_tool_iterations", &self.max_tool_iterations)
             .field("stream_options", &self.stream_options)
             .field("block_images", &self.block_images)
+            .field("model_accepts_images", &self.model_accepts_images)
             .field("fail_closed_hooks", &self.fail_closed_hooks)
             .field("tool_approval", &self.tool_approval.is_some())
             .field("keyword_settings", &self.keyword_settings)
@@ -13550,6 +13551,7 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: true,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
@@ -13589,6 +13591,7 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
@@ -13789,6 +13792,7 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options,
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,
@@ -14543,6 +14547,7 @@ mod tests {
                     modified_files: vec!["src/agent.rs".to_string()],
                     mode: None,
                 },
+                snap_payload: None,
             };
 
             agent_session
@@ -14605,6 +14610,7 @@ mod tests {
                 reserve_tokens: 10,
                 keep_recent_tokens: 30,
                 mode: compaction::AutoCompactionMode::default(),
+                render_mode: compaction::CompactionRenderMode::default(),
             };
 
             {
@@ -14707,6 +14713,7 @@ mod tests {
                 reserve_tokens: 10,
                 keep_recent_tokens: 30,
                 mode: compaction::AutoCompactionMode::default(),
+                render_mode: compaction::CompactionRenderMode::default(),
             };
 
             {
