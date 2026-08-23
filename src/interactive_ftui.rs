@@ -232,9 +232,54 @@ impl EntryRole {
     }
 }
 
+/// Word-level pairing for one removed/added line couplet: returns the
+/// shared framing and the changed middles as `(prefix, removed_middle,
+/// added_middle, suffix)` with whitespace normalized to single spaces.
+/// `None` when the lines are word-identical or share no framing on either
+/// side (a bare middle would not read as a focused change).
+fn word_diff_parts(removed: &str, added: &str) -> Option<(String, String, String, String)> {
+    let rem_words: Vec<&str> = removed.split_whitespace().collect();
+    let add_words: Vec<&str> = added.split_whitespace().collect();
+    if rem_words.is_empty() || add_words.is_empty() {
+        return None;
+    }
+    let mut pre = 0;
+    while pre < rem_words.len() && pre < add_words.len() && rem_words[pre] == add_words[pre] {
+        pre += 1;
+    }
+    let mut suf = 0;
+    while suf < rem_words.len() - pre
+        && suf < add_words.len() - pre
+        && rem_words[rem_words.len() - 1 - suf] == add_words[add_words.len() - 1 - suf]
+    {
+        suf += 1;
+    }
+    let rem_mid = &rem_words[pre..rem_words.len() - suf];
+    let add_mid = &add_words[pre..add_words.len() - suf];
+    if rem_mid.is_empty() && add_mid.is_empty() {
+        return None;
+    }
+    if pre == 0 && suf == 0 {
+        return None;
+    }
+    let join = |words: &[&str]| words.join(" ");
+    let prefix = if pre > 0 {
+        format!("{} ", join(&rem_words[..pre]))
+    } else {
+        String::new()
+    };
+    let suffix = if suf > 0 {
+        format!(" {}", join(&rem_words[rem_words.len() - suf..]))
+    } else {
+        String::new()
+    };
+    Some((prefix, join(rem_mid), join(add_mid), suffix))
+}
+
 /// Render one tool-card block: state glyph + name on the head line (the
 /// glyph is the SHARED spinner frame while pending), then the folded
-/// result detail as dim indented lines.
+/// result detail. Diff cards pair consecutive -/+ lines and emphasize the
+/// changed words; everything else renders dim indented lines.
 fn push_card_block(
     lines: &mut Vec<ftui::text::Line<'static>>,
     state: CardState,
@@ -259,26 +304,46 @@ fn push_card_block(
         format!("{glyph} {text}")
     };
     lines.push(ftui::text::Line::styled(head, style));
-    if let Some(detail) = detail {
-        let dim = ftui::Style::new().dim().fg(palette.muted);
-        let added = ftui::Style::new().fg(palette.accent);
-        let removed = ftui::Style::new().fg(palette.error);
-        for line in detail.lines() {
-            // Diff cards (edit/hashline_edit): word-level styling comes
-            // with the dedicated widget; the seed colors whole added and
-            // removed lines (markers kept) so the shape of a change reads
-            // at a glance.
-            let line_style = if diff_styled {
-                match line.as_bytes().first() {
-                    Some(b'+') => added,
-                    Some(b'-') => removed,
-                    _ => dim,
-                }
-            } else {
-                dim
-            };
-            lines.push(ftui::text::Line::styled(format!("  {line}"), line_style));
+    let Some(detail) = detail else {
+        return;
+    };
+    let dim = |s: String| ftui::text::Span::styled(s, ftui::Style::new().dim().fg(palette.muted));
+    let added_span = |s: String| ftui::text::Span::styled(s, ftui::Style::new().fg(palette.accent));
+    let removed_span =
+        |s: String| ftui::text::Span::styled(s, ftui::Style::new().fg(palette.error));
+    let body = detail.lines().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < body.len() {
+        let line = body[i];
+        // Pair a removed line immediately followed by an added line and
+        // emphasize only the changed middle words (markers kept).
+        if diff_styled
+            && line.starts_with('-')
+            && i + 1 < body.len()
+            && body[i + 1].starts_with('+')
+            && let Some((prefix, rem_mid, add_mid, suffix)) =
+                word_diff_parts(&line[1..], &body[i + 1][1..])
+        {
+            lines.push(ftui::text::Line::from_spans(vec![
+                removed_span(format!("- {prefix}")),
+                removed_span(rem_mid),
+                dim(suffix.clone()),
+            ]));
+            lines.push(ftui::text::Line::from_spans(vec![
+                added_span(format!("+ {prefix}")),
+                added_span(add_mid),
+                dim(suffix),
+            ]));
+            i += 2;
+            continue;
         }
+        let span = match diff_styled.then(|| line.as_bytes().first().copied()) {
+            Some(Some(b'+')) => added_span(format!("  {line}")),
+            Some(Some(b'-')) => removed_span(format!("  {line}")),
+            _ => dim(format!("  {line}")),
+        };
+        lines.push(ftui::text::Line::from_spans(vec![span]));
+        i += 1;
     }
 }
 
@@ -4315,6 +4380,31 @@ mod tests {
         assert!(
             rendered.contains("×3"),
             "group counter missing: {rendered:?}"
+        );
+    }
+    #[test]
+    fn word_diff_parts_pairs_shared_framing() {
+        let (prefix, removed_mid, added_mid, suffix) =
+            word_diff_parts("foo bar baz", "foo qux baz").expect("paired");
+        assert_eq!(prefix, "foo ");
+        assert_eq!(removed_mid, "bar");
+        assert_eq!(added_mid, "qux");
+        assert_eq!(suffix, " baz");
+    }
+
+    #[test]
+    fn word_diff_parts_rejects_unframed_and_identical() {
+        // Word-identical lines are a no-change pair.
+        assert!(word_diff_parts("same line", "same line").is_none());
+        // Nothing shared: a bare middle would not read as a focused change.
+        assert!(word_diff_parts("alpha beta", "gamma delta").is_none());
+        // Prefix-only framing still pairs, with an empty suffix.
+        let (prefix, removed_mid, added_mid, suffix) =
+            word_diff_parts("keep a", "keep b").expect("paired");
+        assert_eq!(prefix, "keep ");
+        assert_eq!(
+            (removed_mid.as_str(), added_mid.as_str(), suffix.as_str()),
+            ("a", "b", "")
         );
     }
 }
