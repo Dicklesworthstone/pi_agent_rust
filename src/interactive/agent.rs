@@ -3762,3 +3762,73 @@ mod stream_delta_batcher_tests {
         );
     }
 }
+
+/// Coverage rule (bd-cv653.9.2 renderer registry): every core builtin that
+/// carries a derivable one-line summary must produce one, and tools without
+/// one stay on the generic fallback card. Also pins the hostile-input
+/// clipping contract (first line only, control characters dropped).
+#[cfg(test)]
+mod tool_invocation_summary_coverage {
+    use super::tool_invocation_summary;
+
+    #[test]
+    fn path_tools_summarize_the_target() {
+        let args = serde_json::json!({ "path": "src/main.rs" });
+        for name in ["read", "write", "edit", "hashline_edit", "ls"] {
+            let summary =
+                tool_invocation_summary(name, &args).unwrap_or_else(|| panic!("{name} uncovered"));
+            assert!(
+                summary.contains("src/main.rs"),
+                "{name}: head must cite the target path: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    fn bash_elides_multiline_commands_to_the_safe_first_line() {
+        let args = serde_json::json!({ "command": "cargo test\nrm -rf /tmp/second-line" });
+        let summary = tool_invocation_summary("bash", &args).expect("bash covered");
+        assert!(summary.starts_with("cargo test"), "head: {summary}");
+        assert!(summary.ends_with('…'), "multiline must elide: {summary}");
+        assert!(
+            !summary.contains("second-line"),
+            "elided lines must not leak"
+        );
+    }
+
+    #[test]
+    fn search_tools_cite_pattern_and_scope() {
+        let scoped = tool_invocation_summary(
+            "grep",
+            &serde_json::json!({ "pattern": "TODO", "path": "src" }),
+        )
+        .expect("grep scoped");
+        assert!(
+            scoped.contains("TODO") && scoped.contains("in src"),
+            "{scoped}"
+        );
+        let bare = tool_invocation_summary("grep", &serde_json::json!({ "pattern": "TODO" }))
+            .expect("grep bare");
+        assert_eq!(bare, "TODO");
+    }
+
+    #[test]
+    fn hostile_command_has_control_characters_dropped() {
+        let args = serde_json::json!({ "command": "echo \u{1b}[31mred\u{1b}[0m" });
+        let summary = tool_invocation_summary("bash", &args).expect("bash covered");
+        assert!(
+            !summary.contains('\x1b'),
+            "ESC must be stripped: {summary:?}"
+        );
+    }
+
+    #[test]
+    fn tools_without_derivable_summary_stay_none() {
+        for name in ["ask", "todo", "web_search", "submit_plan", "xdev"] {
+            assert!(
+                tool_invocation_summary(name, &serde_json::json!({})).is_none(),
+                "{name} must stay on the generic fallback card"
+            );
+        }
+    }
+}
