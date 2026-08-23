@@ -869,9 +869,11 @@ impl PiFtuiModel {
     /// open bash card exists (caller falls back to a plain block).
     fn fold_bash_detail(&mut self, sanitized_display: &str) -> bool {
         const MAX_DETAIL_LINES: usize = 8;
-        let Some(entry) = self.transcript.iter_mut().rev().find(|e| {
-            e.card == Some(CardState::Pending) && e.pair_key.as_deref() == Some("ftui-bash")
-        }) else {
+        let Some(entry) =
+            self.transcript.iter_mut().rev().find(|e| {
+                e.card == Some(CardState::Pending) && e.tool_name.as_deref() == Some("bash")
+            })
+        else {
             return false;
         };
         let total = sanitized_display.lines().count();
@@ -928,7 +930,7 @@ impl PiFtuiModel {
                 // summary when one arrives.
                 let pair = sanitize(&tool_id).into_owned();
                 self.current_tool = Some(name.clone());
-                self.push_tool_card(&pair, &name);
+                self.push_tool_card(&pair, &name, &name);
             }
             PiMsg::ToolInvocation { tool_id, summary } => {
                 // The invocation summary REPLACES the card head (omp
