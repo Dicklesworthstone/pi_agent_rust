@@ -1880,16 +1880,13 @@ pub async fn run(
                     let result_data = compact_res?;
 
                     let details_value = compaction_details_to_value(&result_data.details)?;
-                    let details_value = result_data
-                        .snap_payload
-                        .as_ref()
-                        .map(|payload| {
-                            crate::compaction_snap::payload_to_details(
-                                Some(details_value),
-                                payload,
-                            )
-                        })
-                        .unwrap_or(details_value);
+                    let details_value = match result_data.snap_payload.as_ref() {
+                        Some(payload) => crate::compaction_snap::payload_to_details(
+                            Some(details_value),
+                            payload,
+                        ),
+                        None => details_value,
+                    };
 
                     let (messages, tokens_after) = {
                         let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
@@ -4910,6 +4907,7 @@ async fn maybe_auto_compact(
                 context_window
             },
             mode: options.config.compaction_mode(),
+            render_mode: options.config.compaction_render_mode(),
         };
 
         (path_entries, context_window, reserve_tokens, settings)
@@ -4964,13 +4962,12 @@ async fn maybe_auto_compact(
                 }
             };
 
-            let details_value = result
-                .snap_payload
-                .as_ref()
-                .map(|payload| {
+            let details_value = match result.snap_payload.as_ref() {
+                Some(payload) => {
                     crate::compaction_snap::payload_to_details(Some(details_value), payload)
-                })
-                .unwrap_or(details_value);
+                }
+                None => details_value,
+            };
 
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
                 return;
@@ -8490,6 +8487,7 @@ export default function init(pi) {
                 enabled: Some(true),
                 reserve_tokens: Some(2),
                 keep_recent_tokens: Some(1),
+                mode: None,
             });
 
             let auth_dir = tempfile::tempdir().expect("tempdir");

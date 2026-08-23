@@ -200,6 +200,7 @@ fn agent_loop_openai_vcr_basic() {
             approval_state: None,
             bash_settings: None,
             secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -389,6 +390,7 @@ fn agent_loop_anthropic_simple_text() {
             approval_state: None,
             bash_settings: None,
             secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -495,6 +497,7 @@ fn agent_loop_anthropic_error_stream() {
             approval_state: None,
             bash_settings: None,
             secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
@@ -584,6 +587,7 @@ fn agent_loop_anthropic_tool_call_stop() {
             approval_state: None,
             bash_settings: None,
             secrets: None,
+            model_accepts_images: true,
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 

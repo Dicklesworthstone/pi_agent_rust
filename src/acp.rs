@@ -1372,6 +1372,10 @@ fn handle_session_new(
         max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
         stream_options,
         block_images: options.config.image_block_images(),
+        model_accepts_images: model_entry
+            .model
+            .input
+            .contains(&crate::provider::InputType::Image),
         fail_closed_hooks: options.config.fail_closed_hooks(),
         tool_approval: permission_client
             .map(|client| client.handler_for_session(session_id.clone())),
@@ -1390,6 +1394,7 @@ fn handle_session_new(
         reserve_tokens: options.config.compaction_reserve_tokens(),
         keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
         mode: options.config.compaction_mode(),
+        render_mode: options.config.compaction_render_mode(),
         context_window_tokens: if model_entry.model.context_window == 0 {
             ResolvedCompactionSettings::default().context_window_tokens
         } else {
@@ -2449,6 +2454,7 @@ mod tests {
                 max_tool_iterations: 50,
                 stream_options: StreamOptions::default(),
                 block_images: false,
+                model_accepts_images: true,
                 fail_closed_hooks: false,
                 tool_approval: None,
                 keyword_settings: None,

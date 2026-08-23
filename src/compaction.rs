@@ -4267,6 +4267,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -4325,6 +4326,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::ShakeFirst,
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -4350,6 +4352,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 12_800,
             mode: AutoCompactionMode::Aggressive,
+            render_mode: CompactionRenderMode::default(),
         };
         assert_eq!(settings.with_mode_applied().keep_recent_tokens, 6_400);
 
@@ -4384,6 +4387,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let first_kept = prep.first_kept_entry_id.clone();
@@ -4426,6 +4430,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings).expect("prep");
         let result = compact_shake(prep);
@@ -4447,6 +4452,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
 
         // Tool-heavy span: shake reclaims nearly everything -> no escalation.
@@ -4502,6 +4508,7 @@ mod tests {
             reserve_tokens: 1000,
             keep_recent_tokens: 5,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
         let prep = prepare_compaction(&entries, settings);
         assert!(prep.is_some());
@@ -4597,6 +4604,7 @@ mod tests {
             reserve_tokens: 0,
             keep_recent_tokens: 100,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
 
         let prep = prepare_compaction(&entries, settings).expect("should compact");
@@ -4660,6 +4668,7 @@ mod tests {
             reserve_tokens: 0,
             keep_recent_tokens: 150,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         };
 
         // We use prepare_compaction as the entry point
@@ -5113,6 +5122,7 @@ mod tests {
                     reserve_tokens: 16_384,
                     keep_recent_tokens: 20_000,
                     mode: AutoCompactionMode::default(),
+                    render_mode: CompactionRenderMode::default(),
                 };
                 assert!(!should_compact(ctx_tokens, window, &settings));
             }
@@ -5130,6 +5140,7 @@ mod tests {
                     reserve_tokens: reserve,
                     keep_recent_tokens: 20_000,
                     mode: AutoCompactionMode::default(),
+                    render_mode: CompactionRenderMode::default(),
                 };
                 let threshold = u64::from(window).saturating_sub(u64::from(reserve));
                 let result = should_compact(ctx_tokens, window, &settings);

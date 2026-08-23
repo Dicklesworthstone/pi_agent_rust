@@ -210,6 +210,7 @@ fn make_agent(provider: Arc<dyn Provider>, cwd: &std::path::Path, max_iters: usi
             ..StreamOptions::default()
         },
         block_images: false,
+        model_accepts_images: true,
         fail_closed_hooks: false,
         tool_approval: None,
         keyword_settings: None,
@@ -1188,6 +1189,7 @@ fn agent_tool_execution_error_wraps_in_output() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1265,6 +1267,7 @@ fn agent_queue_follow_up_only_at_idle() {
                 ..StreamOptions::default()
             },
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
