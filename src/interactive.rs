@@ -66,6 +66,8 @@ use crate::workspace::WorkspaceHandle;
 use arboard::Clipboard as ArboardClipboard;
 
 mod agent;
+#[cfg(feature = "ftui")]
+pub(crate) use agent::tool_invocation_summary;
 mod commands;
 mod conversation;
 mod ext_session;

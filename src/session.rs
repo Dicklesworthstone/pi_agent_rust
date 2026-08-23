@@ -2987,6 +2987,87 @@ fn session_cold_start_storage_trace(path: &Path) -> Result<SessionColdStartStora
     })
 }
 
+/// Streaming state for rebuilding model messages from a session path.
+///
+/// Tracks checkpoint marker positions so a later `rewind` Custom entry can
+/// replay its collapse: truncate back to the checkpoint boundary and stand
+/// the rewind report in for the span (mirroring what the live rewind did).
+struct PathRebuildState {
+    messages: Vec<Message>,
+    /// checkpoint entry id -> message count when the marker was walked.
+    checkpoint_positions: HashMap<String, usize>,
+}
+
+impl PathRebuildState {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            messages: Vec::with_capacity(capacity),
+            checkpoint_positions: HashMap::new(),
+        }
+    }
+
+    fn append(&mut self, entry: &SessionEntry) {
+        match entry {
+            SessionEntry::Message(msg_entry) => {
+                if let Some(message) = session_message_to_model(&msg_entry.message) {
+                    self.messages.push(message);
+                }
+            }
+            SessionEntry::BranchSummary(summary) => {
+                let summary_message = SessionMessage::BranchSummary {
+                    summary: summary.summary.clone(),
+                    from_id: summary.from_id.clone(),
+                };
+                if let Some(message) = session_message_to_model(&summary_message) {
+                    self.messages.push(message);
+                }
+            }
+            SessionEntry::Custom(custom) => match custom.custom_type.as_str() {
+                "checkpoint" => {
+                    if let Some(id) = &custom.base.id {
+                        self.checkpoint_positions
+                            .insert(id.clone(), self.messages.len());
+                    }
+                }
+                "rewind" => self.apply_rewind(custom),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Replay a durable rewind: entries between the referenced checkpoint
+    /// and this rewind marker collapse into the recorded report. Legacy
+    /// rewind entries (no checkpointEntryId) and rewinds whose checkpoint
+    /// was compacted away degrade to a no-op — the span simply stays.
+    fn apply_rewind(&mut self, custom: &CustomEntry) {
+        let Some(data) = &custom.data else { return };
+        let Some(checkpoint_entry_id) = data.get("checkpointEntryId").and_then(|v| v.as_str())
+        else {
+            return;
+        };
+        let Some(&boundary) = self.checkpoint_positions.get(checkpoint_entry_id) else {
+            return;
+        };
+        self.messages.truncate(boundary);
+        // Positions recorded past the boundary now dangle.
+        self.checkpoint_positions.retain(|_, pos| *pos <= boundary);
+        let name = data
+            .get("checkpoint")
+            .and_then(|v| v.as_str())
+            .unwrap_or("checkpoint");
+        let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        if !summary.is_empty() {
+            self.messages.push(Message::User(crate::model::UserMessage {
+                content: crate::model::UserContent::Text(crate::checkpoint::rewind_report_text(
+                    name, summary,
+                )),
+                timestamp: 0,
+            }));
+        }
+    }
+}
+
 impl Session {
     /// Create a new session from CLI args and config.
     pub async fn new(cli: &Cli, config: &Config) -> Result<Self> {
@@ -5339,30 +5420,14 @@ impl Session {
         Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
     }
 
-    fn append_model_message_for_entry(messages: &mut Vec<Message>, entry: &SessionEntry) {
-        match entry {
-            SessionEntry::Message(msg_entry) => {
-                if let Some(message) = session_message_to_model(&msg_entry.message) {
-                    messages.push(message);
-                }
-            }
-            SessionEntry::BranchSummary(summary) => {
-                let summary_message = SessionMessage::BranchSummary {
-                    summary: summary.summary.clone(),
-                    from_id: summary.from_id.clone(),
-                };
-                if let Some(message) = session_message_to_model(&summary_message) {
-                    messages.push(message);
-                }
-            }
-            _ => {}
-        }
-    }
-
     fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<Message>
     where
         F: Fn(usize) -> &'a SessionEntry,
     {
+        // Rewind durability (bd-cv653.3.7): the walk replays checkpoint →
+        // rewind pairs so a rewound span stays collapsed across every
+        // context rebuild (compaction apply, resume, per-prompt SDK
+        // rebuilds) instead of silently resurrecting.
         let mut last_compaction = None;
         for idx in (0..path_len).rev() {
             if let SessionEntry::Compaction(compaction) = entry_at(idx) {
@@ -5372,13 +5437,13 @@ impl Session {
         }
 
         if let Some((compaction_idx, compaction)) = last_compaction {
-            let mut messages = Vec::with_capacity(path_len);
+            let mut rebuild = PathRebuildState::with_capacity(path_len);
             let summary_message = SessionMessage::CompactionSummary {
                 summary: compaction.summary.clone(),
                 tokens_before: compaction.tokens_before,
             };
             if let Some(message) = session_message_to_model(&summary_message) {
-                messages.push(message);
+                rebuild.messages.push(message);
             }
 
             let has_kept_entry = (0..path_len).any(|idx| {
@@ -5414,17 +5479,17 @@ impl Session {
                         continue;
                     }
                 }
-                Self::append_model_message_for_entry(&mut messages, entry);
+                rebuild.append(entry);
             }
 
-            return messages;
+            return rebuild.messages;
         }
 
-        let mut messages = Vec::with_capacity(path_len);
+        let mut rebuild = PathRebuildState::with_capacity(path_len);
         for idx in 0..path_len {
-            Self::append_model_message_for_entry(&mut messages, entry_at(idx));
+            rebuild.append(entry_at(idx));
         }
-        messages
+        rebuild.messages
     }
 
     /// Find the nearest ancestor that is a fork point (has multiple children)

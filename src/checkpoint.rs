@@ -30,6 +30,12 @@ pub struct Checkpoint {
     /// Active message count at mark time: the rewind span boundary.
     pub message_count: usize,
     pub at_ms: i64,
+    /// Session-tree entry id of the checkpoint marker itself. Derived from
+    /// the tree at mark/find time (never stored inside the entry data);
+    /// rewind entries reference it so context rebuilds can replay the
+    /// collapse durably.
+    #[serde(skip_serializing, default)]
+    pub entry_id: Option<String>,
 }
 
 fn now_ms() -> i64 {
@@ -106,12 +112,16 @@ pub fn mark_checkpoint(
         token_estimate: estimate_tokens(active_messages),
         message_count: active_messages.len(),
         at_ms: now_ms(),
+        entry_id: None,
     };
-    session.append_custom_entry(
+    let entry_id = session.append_custom_entry(
         "checkpoint".to_string(),
         Some(serde_json::to_value(&checkpoint).unwrap_or_default()),
     );
-    checkpoint
+    Checkpoint {
+        entry_id: Some(entry_id),
+        ..checkpoint
+    }
 }
 
 /// Find a checkpoint by name, or the latest when name is None.
@@ -128,8 +138,9 @@ pub fn find_checkpoint(session: &Session, name: Option<&str>) -> Option<Checkpoi
             if custom.custom_type != "checkpoint" {
                 return None;
             }
-            let checkpoint: Checkpoint =
+            let mut checkpoint: Checkpoint =
                 serde_json::from_value(custom.data.clone().unwrap_or_default()).ok()?;
+            checkpoint.entry_id.clone_from(&custom.base.id);
             Some(checkpoint)
         })
         .find(|checkpoint| name.is_none_or(|name| checkpoint.name == name))
@@ -141,6 +152,11 @@ pub fn find_checkpoint(session: &Session, name: Option<&str>) -> Option<Checkpoi
 pub struct RewindOutcome {
     pub schema: String,
     pub checkpoint: String,
+    /// Tree entry id of the checkpoint this rewind collapsed to. Context
+    /// rebuilds (compaction apply, resume, per-prompt SDK rebuilds) use it
+    /// to replay the collapse; absent on legacy entries (no replay).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub checkpoint_entry_id: Option<String>,
     /// Messages collapsed out of the active context.
     pub collapsed_messages: usize,
     /// The report now standing in for the span.
@@ -215,22 +231,30 @@ pub fn apply_rewind_to_active(
     agent.truncate_messages(boundary);
     if !summary.is_empty() {
         agent.add_message(Message::User(UserMessage {
-            content: UserContent::Text(format!(
-                "[REWIND REPORT: {}]\nThe span since this checkpoint was collapsed into \
-                 this report. The full span remains in the session tree.\n\n{summary}",
-                checkpoint.name
-            )),
+            content: UserContent::Text(rewind_report_text(&checkpoint.name, &summary)),
             timestamp: now_ms(),
         }));
     }
     RewindOutcome {
         schema: CHECKPOINT_SCHEMA.to_string(),
         checkpoint: checkpoint.name.clone(),
+        checkpoint_entry_id: checkpoint.entry_id.clone(),
         collapsed_messages: collapsed,
         summary_tokens_estimate: (summary.len() / 4) as u64,
         summary,
         tree_preserved: true,
     }
+}
+
+/// The user-visible rewind report message. One definition shared by the
+/// live rewind paths and the session-tree rebuild so the replayed context
+/// is byte-identical to what the user saw.
+#[must_use]
+pub fn rewind_report_text(checkpoint_name: &str, summary: &str) -> String {
+    format!(
+        "[REWIND REPORT: {checkpoint_name}]\nThe span since this checkpoint was collapsed into \
+         this report. The full span remains in the session tree.\n\n{summary}"
+    )
 }
 
 /// Reset provider stream state (new session id) with the transcript

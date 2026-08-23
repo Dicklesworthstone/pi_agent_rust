@@ -325,3 +325,90 @@ fn max_time_stops_at_turn_boundary() {
     let _ = json!({"schema": "pi.max_time.v1"});
     finish_case(&harness, case);
 }
+
+/// Rewind durability (bd-cv653.3.7 follow-up): a rewound span must stay
+/// collapsed when the active context is REBUILT from the session tree
+/// (compaction apply, resume, per-prompt SDK rebuilds) — previously the
+/// rebuild resurrected the whole span and dropped the report.
+#[test]
+fn rewind_survives_context_rebuild_from_tree() {
+    let harness = TestHarness::new("rewind_survives_context_rebuild_from_tree");
+    let mut session = Session::in_memory();
+
+    // Two foundation turns in the TREE.
+    session.append_message(pi::session::SessionMessage::from(user_text(
+        "foundation one",
+    )));
+    session.append_message(pi::session::SessionMessage::from(user_text(
+        "foundation two",
+    )));
+
+    // Checkpoint marker, then an exploration span of 6 tree messages.
+    let checkpoint = pi::checkpoint::mark_checkpoint(
+        &mut session,
+        "alpha",
+        None,
+        &[user_text("foundation one"), user_text("foundation two")],
+    );
+    let checkpoint_entry_id = checkpoint.entry_id.expect("entry id recorded");
+    for index in 0..3 {
+        session.append_message(pi::session::SessionMessage::from(user_text(&format!(
+            "exploration {index}"
+        ))));
+        session.append_message(pi::session::SessionMessage::from(assistant_text(&format!(
+            "reply {index}"
+        ))));
+    }
+
+    // Durable rewind marker referencing the checkpoint entry.
+    let outcome = pi::checkpoint::RewindOutcome {
+        schema: pi::checkpoint::CHECKPOINT_SCHEMA.to_string(),
+        checkpoint: "alpha".to_string(),
+        checkpoint_entry_id: Some(checkpoint_entry_id),
+        collapsed_messages: 6,
+        summary: "explored three approaches; picked B".to_string(),
+        summary_tokens_estimate: 8,
+        tree_preserved: true,
+    };
+    session.append_custom_entry(
+        "rewind".to_string(),
+        Some(serde_json::to_value(&outcome).expect("serialize outcome")),
+    );
+
+    // Rebuild from the tree: foundation survives, exploration collapses
+    // into the report, post-rewind turns keep accumulating.
+    session.append_message(pi::session::SessionMessage::from(user_text("after rewind")));
+    let rebuilt = session.to_messages_for_current_path();
+    let texts: Vec<String> = rebuilt
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => text.clone(),
+                UserContent::Blocks(_) => String::new(),
+            },
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(rebuilt.len(), 4, "{texts:#?}");
+    assert_eq!(texts[0], "foundation one");
+    assert_eq!(texts[1], "foundation two");
+    assert!(
+        texts[2].starts_with("[REWIND REPORT: alpha]"),
+        "report replayed: {}",
+        texts[2]
+    );
+    assert!(texts[2].contains("picked B"));
+    assert_eq!(texts[3], "after rewind");
+
+    // Legacy rewind entries (no checkpointEntryId) must be a no-op, not a
+    // panic or a bogus truncation.
+    let mut legacy = Session::in_memory();
+    legacy.append_message(pi::session::SessionMessage::from(user_text("only turn")));
+    legacy.append_custom_entry(
+        "rewind".to_string(),
+        Some(serde_json::json!({ "schema": "pi.checkpoint.v1", "summary": "s" })),
+    );
+    assert_eq!(legacy.to_messages_for_current_path().len(), 1);
+
+    finish_case(&harness, "rewind_survives_context_rebuild_from_tree");
+}

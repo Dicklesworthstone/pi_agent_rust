@@ -59,7 +59,7 @@ impl crate::tools::Tool for SubmitPlanTool {
             "properties": {
                 "plan": {
                     "type": "string",
-                    "description": "The full plan: goal, ordered steps, files to touch, and how to verify"
+                    "description": "The full plan: goal, ordered steps, files to touch, and how to verify. Include a `Files:` line listing the paths/globs the plan will modify (e.g. `Files: src/main.rs, src/tools/, tests/*.rs`) — under --plan-yolo only mutations inside that scope are auto-approved."
                 }
             },
             "required": ["plan"]

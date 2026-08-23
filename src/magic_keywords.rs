@@ -111,6 +111,15 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
     let mut chars = message.chars().peekable();
     // Track tag sections by counting open/close of the same tag name.
     let mut tag_depth: i32 = 0;
+    // Which fence char opened the current fenced block: tildes only close
+    // tilde fences and backticks only close backtick fences (CommonMark),
+    // so a ~~~ inside a ``` block stays code.
+    let mut fence_char = '`';
+    // Line-shape tracking for indented code blocks (4+ spaces / tab at
+    // line start): tokens on such a line are keyword-ineligible.
+    let mut line_start = true;
+    let mut leading_spaces = 0usize;
+    let mut line_indented_code = false;
 
     let flush_token = |token: &mut String,
                        state: ScanState,
@@ -151,18 +160,51 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
     };
 
     while let Some(ch) = chars.next() {
+        // Line boundaries reset the indented-code line shape.
+        if ch == '\n' {
+            flush_token(
+                &mut token,
+                if line_indented_code {
+                    ScanState::InlineCode
+                } else {
+                    state
+                },
+                tag_depth,
+                &mut activations,
+                &mut seen,
+            );
+            line_start = true;
+            leading_spaces = 0;
+            line_indented_code = false;
+            continue;
+        }
+        if line_start && (ch == ' ' || ch == '\t') {
+            // CommonMark: 4+ leading spaces (or a tab) opens an indented
+            // code line — keywords there are literal code, not commands.
+            leading_spaces += if ch == '\t' { 4 } else { 1 };
+            if leading_spaces >= 4 {
+                line_indented_code = true;
+            }
+            continue;
+        }
+
         // Fences: ``` toggles fenced state (prose only).
         if ch == '`' {
+            line_start = false;
             let mut backticks = 1;
             while chars.peek() == Some(&'`') {
                 chars.next();
                 backticks += 1;
             }
             if backticks >= 3 {
-                state = match state {
-                    ScanState::FencedCode => ScanState::Prose,
-                    _ => ScanState::FencedCode,
-                };
+                if state == ScanState::FencedCode {
+                    if fence_char == '`' {
+                        state = ScanState::Prose;
+                    }
+                } else {
+                    state = ScanState::FencedCode;
+                    fence_char = '`';
+                }
             } else if state == ScanState::Prose {
                 state = ScanState::InlineCode;
             } else if state == ScanState::InlineCode {
@@ -177,6 +219,40 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             );
             continue;
         }
+
+        // Tilde fences: ~~~ at line start toggles fenced state; matching
+        // fence chars only (a ~~~ inside a ``` block is content).
+        if ch == '~' && line_start {
+            line_start = false;
+            let mut tildes = 1;
+            while chars.peek() == Some(&'~') {
+                chars.next();
+                tildes += 1;
+            }
+            if tildes >= 3 {
+                if state == ScanState::FencedCode {
+                    if fence_char == '~' {
+                        state = ScanState::Prose;
+                    }
+                } else {
+                    state = ScanState::FencedCode;
+                    fence_char = '~';
+                }
+                flush_token(
+                    &mut token,
+                    ScanState::InlineCode,
+                    tag_depth,
+                    &mut activations,
+                    &mut seen,
+                );
+            } else {
+                for _ in 0..tildes {
+                    token.push('~');
+                }
+            }
+            continue;
+        }
+        line_start = false;
 
         // Tag sections: <tag> ... </tag> (prose only, any tag name).
         if state != ScanState::FencedCode && ch == '<' {
@@ -201,7 +277,17 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                 tag.push(next);
                 chars.next();
             }
-            flush_token(&mut token, state, tag_depth, &mut activations, &mut seen);
+            flush_token(
+                &mut token,
+                if line_indented_code {
+                    ScanState::InlineCode
+                } else {
+                    state
+                },
+                tag_depth,
+                &mut activations,
+                &mut seen,
+            );
             if valid {
                 tag_depth = if is_close {
                     (tag_depth - 1).max(0)
@@ -221,14 +307,34 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                 ',' | '.' | '!' | '?' | ':' | ';' | '(' | ')' | '"' | '\''
             );
         if is_boundary {
-            flush_token(&mut token, state, tag_depth, &mut activations, &mut seen);
+            flush_token(
+                &mut token,
+                if line_indented_code {
+                    ScanState::InlineCode
+                } else {
+                    state
+                },
+                tag_depth,
+                &mut activations,
+                &mut seen,
+            );
             continue;
         }
 
         // Paths/URLs: a token containing '/' is never a keyword.
         token.push(ch);
     }
-    flush_token(&mut token, state, tag_depth, &mut activations, &mut seen);
+    flush_token(
+        &mut token,
+        if line_indented_code {
+            ScanState::InlineCode
+        } else {
+            state
+        },
+        tag_depth,
+        &mut activations,
+        &mut seen,
+    );
 
     // Tokens containing '/' (paths/URLs) are ineligible — post-filter.
     activations.retain(|activation| !activation.word.contains('/'));
@@ -290,6 +396,33 @@ mod tests {
         assert!(words("`ultrathink` in backticks").is_empty());
         assert!(words("```\nultrathink\n```").is_empty());
         assert!(words("some `code ultrathink code` here").is_empty());
+    }
+
+    #[test]
+    fn tilde_fences_never_trigger() {
+        assert!(words("~~~\nultrathink\n~~~").is_empty());
+        assert!(
+            words("~~~\nultrathink\n~~~\nthen orchestrate here") == ["orchestrate"],
+            "prose after a closed tilde fence still triggers"
+        );
+        // Fence chars don't cross-close: a ~~~ inside a ``` block is
+        // content, and the ``` fence stays open past it.
+        assert!(words("```\n~~~\nultrathink\n```").is_empty());
+        // Strikethrough tildes mid-line are ordinary prose chars.
+        assert_eq!(words("~~scratch that~~ ultrathink please"), ["ultrathink"]);
+    }
+
+    #[test]
+    fn indented_code_lines_never_trigger() {
+        assert!(words("look at this:\n\n    ultrathink(); // sample code").is_empty());
+        assert!(words("\tultrathink in a tab-indented line").is_empty());
+        // The suppression is per line: prose on the next line triggers.
+        assert_eq!(
+            words("    ultrathink as code\nbut ultrathink here is prose"),
+            ["ultrathink"]
+        );
+        // 1-3 leading spaces are still prose.
+        assert_eq!(words("   ultrathink with three spaces"), ["ultrathink"]);
     }
 
     #[test]

@@ -31,7 +31,40 @@ pub const CRASHES_DIR_NAME: &str = "crashes";
 
 static RING: std::sync::Mutex<Option<VecDeque<String>>> = std::sync::Mutex::new(None);
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    /// Set while running code whose panics are recovered internally
+    /// (`catch_unwind` sites such as background compaction). The panic hook
+    /// skips bundle capture for these — a caught panic is not a crash.
+    static PANIC_SUPPRESSED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
+/// Marks the current thread's panics as expected-and-recovered.
+///
+/// bd-ajg8l #3: background compaction and similar `catch_unwind` sites
+/// must not produce "previous run crashed" bundles. Suppression holds for
+/// the guard's lifetime; the crash hook returns early (no bundle, no
+/// chained hook) because the recovery is intentional.
+#[must_use]
+pub struct SuppressPanicHook;
+
+impl SuppressPanicHook {
+    pub fn new() -> Self {
+        PANIC_SUPPRESSED.with(|flag| flag.set(true));
+        Self
+    }
+}
+
+impl Default for SuppressPanicHook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for SuppressPanicHook {
+    fn drop(&mut self) {
+        PANIC_SUPPRESSED.with(|flag| flag.set(false));
+    }
+}
 /// Record an operation into the redacted-at-capture recent-operations ring
 /// that crash bundles include as context. Cheap; capped at
 /// [`RING_CAPACITY`] entries.
@@ -201,10 +234,14 @@ pub fn install(agent_dir: &Path, session_path: Option<&Path>) {
     }
     let agent_dir = agent_dir.to_path_buf();
     let session_path_redacted = session_path.map(|p| redact_text(&p.display().to_string()));
-    let hook_session = session_path_redacted.clone();
     let hook_dir = agent_dir.clone();
+    let hook_session = session_path_redacted.clone();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // Recovered-internal panics (catch_unwind sites) are not crashes.
+        if PANIC_SUPPRESSED.with(std::cell::Cell::get) {
+            return;
+        }
         let (sha, ts) = build_metadata();
         let message = redact_text(&payload_of(info));
         let bundle = CrashBundle {
@@ -459,6 +496,30 @@ mod tests {
         assert!(!preview.contains("ghp_dddddd"), "{preview}");
     }
 
+    #[test]
+    fn suppressed_panics_do_not_write_bundles() {
+        // bd-ajg8l #3: recovered-internal panics (catch_unwind sites such as
+        // background compaction) must not produce "previous run crashed"
+        // bundles.
+        let dir = agent_dir("suppress");
+        install(&dir, None);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = SuppressPanicHook::new();
+            panic!("recovered internal panic");
+        }));
+        assert!(result.is_err(), "panic must still unwind to the catcher");
+        assert!(
+            list_bundles(&dir).is_empty(),
+            "suppressed panic must not write a bundle"
+        );
+
+        // Unsuppressed panics still capture.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("unrecovered probe");
+        }));
+        assert_eq!(list_bundles(&dir).len(), 1, "unsuppressed panic captures");
+        let _ = delete_all(&dir);
+    }
     #[test]
     fn ring_is_capped() {
         for index in 0..(RING_CAPACITY * 2) {

@@ -184,7 +184,11 @@ impl TmuxInstance {
         let mut last_pane = String::new();
         loop {
             let Some(pane) = self.try_capture_pane() else {
-                if !self.session_exists() || start.elapsed() > timeout {
+                // A loaded worker can fail one capture/has-session probe right
+                // after `new-session -d` before the server finishes settling.
+                // Conclude death only after a short grace period; otherwise
+                // keep polling until the timeout.
+                if !self.session_exists() && start.elapsed() > Duration::from_secs(2) {
                     return last_pane;
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -208,7 +212,7 @@ impl TmuxInstance {
         let mut last_pane = String::new();
         loop {
             let Some(pane) = self.try_capture_pane() else {
-                if !self.session_exists() || start.elapsed() > timeout {
+                if !self.session_exists() && start.elapsed() > Duration::from_secs(2) {
                     return last_pane;
                 }
                 std::thread::sleep(Duration::from_millis(50));

@@ -516,8 +516,7 @@ fn apply_env_capability_permitting_policy_snapshots_process_env() {
     // concurrent env mutation elsewhere in the test binary. Use the same
     // OS-variant + UTF-8 filter as the implementation.
     let (probe_key, probe_value) = std::env::vars_os()
-        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-        .next()
+        .find_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .expect("test process must have at least one UTF-8 env var");
     apply_env_capability(&mut config, &policy);
     assert!(!config.deny_env, "permitting policy must grant env access");
