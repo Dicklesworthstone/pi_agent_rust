@@ -9388,6 +9388,35 @@ mod tests {
         assert!(parsed.1[1].value.is_none());
     }
 
+
+    /// bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1 regression: the
+    /// pre-parser's `known_long_option` allowlist must include every
+    /// top-level flag, or clap never sees it (silently diverted to
+    /// extension-flag extraction). These flags shipped missing and parsed
+    /// as false at runtime despite green unit tests that bypassed the
+    /// pre-parser.
+    #[test]
+    fn parse_cli_args_binds_workspace_crash_and_profile_flags() {
+        let parsed = parse_cli_args(vec![
+            "pi".to_string(),
+            "--add-dir".to_string(),
+            "/tmp/extra-root".to_string(),
+            "--crash-test".to_string(),
+            "--profile".to_string(),
+            "-p".to_string(),
+            "hello".to_string(),
+        ])
+        .expect("parse args")
+        .expect("parsed cli payload");
+
+        assert_eq!(
+            parsed.0.add_dir,
+            vec![std::path::PathBuf::from("/tmp/extra-root")]
+        );
+        assert!(parsed.0.crash_test, "--crash-test must bind");
+        assert!(parsed.0.profile, "--profile must bind");
+        assert!(parsed.0.print);
+    }
     #[test]
     fn apply_extension_cli_flags_ignores_unknown_flags() {
         let manager = pi::extensions::ExtensionManager::new();
