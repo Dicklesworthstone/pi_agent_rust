@@ -205,8 +205,19 @@ const PRICING: &[(&str, f64, f64)] = &[
     ("o3", 2.00, 8.00),
 ];
 
+/// Cache-token multipliers relative to the input rate (Anthropic-style
+/// economics: cached reads are ~10% of input price, 5m writes ~125%).
+const CACHE_READ_RATE: f64 = 0.1;
+const CACHE_WRITE_RATE: f64 = 1.25;
+
 #[allow(clippy::cast_precision_loss)] // token counts are far below 2^52
-fn price_fallback(model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
+fn price_fallback(
+    model: &str,
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_read: u64,
+    cache_write: u64,
+) -> f64 {
     let mut best: Option<(&&str, f64, f64)> = None;
     for (prefix, pin, pout) in PRICING {
         if model.starts_with(prefix) && best.is_none_or(|(b, _, _)| prefix.len() > b.len()) {
@@ -216,7 +227,11 @@ fn price_fallback(model: &str, tokens_in: u64, tokens_out: u64) -> f64 {
     let Some((_, pin, pout)) = best else {
         return 0.0;
     };
-    (tokens_in as f64 / 1_000_000.0).mul_add(pin, (tokens_out as f64 / 1_000_000.0) * pout)
+    let m = |tokens: u64| tokens as f64 / 1_000_000.0;
+    m(tokens_in) * pin
+        + m(tokens_out) * pout
+        + m(cache_read) * pin * CACHE_READ_RATE
+        + m(cache_write) * pin * CACHE_WRITE_RATE
 }
 
 /// Internal accumulator mirroring [`StatsReport`] buckets.
@@ -234,9 +249,26 @@ struct Accumulator {
     day_tokens: BTreeMap<String, TokenTotals>,
     day_cost: BTreeMap<String, f64>,
     tool_calls: BTreeMap<String, u64>,
+    /// (provider, model) of the most recent admitted assistant message —
+    /// attribution anchor for provider-agnostic entries (tool results,
+    /// compactions) when a provider/model filter is active.
+    last_provider_model: Option<(String, String)>,
 }
 
 impl Accumulator {
+    /// Whether the most recent admitted assistant message passes an active
+    /// provider/model filter. `true` when no filter is set or no anchor
+    /// exists yet (unfiltered sessions count everything).
+    fn last_model_admits(&self, filter: &StatsFilter) -> bool {
+        if filter.provider.is_none() && filter.model.is_none() {
+            return true;
+        }
+        match &self.last_provider_model {
+            Some((provider, model)) => filter.admits_model(Some(provider), Some(model)),
+            None => filter.provider.is_none() && filter.model.is_none(),
+        }
+    }
+
     fn ingest_line(&mut self, filter: &StatsFilter, line: &str, session_counted: &mut bool) {
         let Ok(probe) = serde_json::from_str::<LineProbe>(line) else {
             return;
@@ -245,64 +277,71 @@ impl Accumulator {
             return;
         }
         match probe.kind.as_str() {
-            "compaction" => self.compactions += 1,
+            "compaction" => {
+                if self.last_model_admits(filter) {
+                    self.compactions += 1;
+                }
+            }
             "message" => {
                 let msg = probe.message.unwrap_or_default();
                 if msg.role.as_deref() == Some("toolResult")
                     && let Some(tool) = msg.tool_name.as_deref()
+                    && self.last_model_admits(filter)
                 {
                     *self.tool_calls.entry(tool.to_string()).or_insert(0) += 1;
                 }
-                if msg.role.as_deref() == Some("assistant") {
-                    if !filter.admits_model(msg.provider.as_deref(), msg.model.as_deref()) {
-                        return;
-                    }
-                    if !*session_counted {
-                        self.sessions += 1;
-                        *session_counted = true;
-                    }
-                    self.messages += 1;
-
-                    let usage = msg.usage.unwrap_or_default();
-                    let tokens = TokenTotals {
-                        input: usage.input,
-                        output: usage.output,
-                        cache_read: usage.cache_read,
-                        cache_write: usage.cache_write,
-                        total: usage.total_tokens,
-                    };
-                    let recorded = usage.cost.as_ref().map_or(0.0, |c| c.total);
-                    let cost = if recorded > 0.0 {
-                        recorded
-                    } else {
-                        price_fallback(
-                            msg.model.as_deref().unwrap_or_default(),
-                            tokens.input,
-                            tokens.output,
-                        )
-                    };
-
-                    add_tokens(&mut self.tokens, &tokens);
-                    self.cost += cost;
-
-                    let key = (
-                        msg.provider.unwrap_or_else(|| "unknown".into()),
-                        msg.model.unwrap_or_else(|| "unknown".into()),
-                    );
-                    *self.pm_messages.entry(key.clone()).or_insert(0) += 1;
-                    add_tokens(self.pm_tokens.entry(key.clone()).or_default(), &tokens);
-                    *self.pm_cost.entry(key).or_default() += cost;
-
-                    let day = probe
-                        .timestamp
-                        .as_deref()
-                        .and_then(|ts| ts.get(..10))
-                        .unwrap_or_default()
-                        .to_string();
-                    *self.day_messages.entry(day.clone()).or_insert(0) += 1;
-                    add_tokens(self.day_tokens.entry(day.clone()).or_default(), &tokens);
-                    *self.day_cost.entry(day).or_insert(0.0) += cost;
+                if msg.role.as_deref() != Some("assistant") {
+                    return;
                 }
+                if !filter.admits_model(msg.provider.as_deref(), msg.model.as_deref()) {
+                    return;
+                }
+                if !*session_counted {
+                    self.sessions += 1;
+                    *session_counted = true;
+                }
+                self.messages += 1;
+
+                let usage = msg.usage.unwrap_or_default();
+                let tokens = TokenTotals {
+                    input: usage.input,
+                    output: usage.output,
+                    cache_read: usage.cache_read,
+                    cache_write: usage.cache_write,
+                    total: usage.total_tokens,
+                };
+                let recorded = usage.cost.as_ref().map_or(0.0, |c| c.total);
+                let cost = if recorded > 0.0 {
+                    recorded
+                } else {
+                    price_fallback(
+                        msg.model.as_deref().unwrap_or_default(),
+                        tokens.input,
+                        tokens.output,
+                        tokens.cache_read,
+                        tokens.cache_write,
+                    )
+                };
+                add_tokens(&mut self.tokens, &tokens);
+                self.cost += cost;
+
+                let key = (
+                    msg.provider.unwrap_or_else(|| "unknown".into()),
+                    msg.model.unwrap_or_else(|| "unknown".into()),
+                );
+                *self.pm_messages.entry(key.clone()).or_insert(0) += 1;
+                add_tokens(self.pm_tokens.entry(key.clone()).or_default(), &tokens);
+                *self.pm_cost.entry(key).or_default() += cost;
+
+                let day = probe
+                    .timestamp
+                    .as_deref()
+                    .and_then(|ts| ts.get(..10))
+                    .unwrap_or_default()
+                    .to_string();
+                *self.day_messages.entry(day.clone()).or_insert(0) += 1;
+                add_tokens(self.day_tokens.entry(day.clone()).or_default(), &tokens);
+                *self.day_cost.entry(day).or_insert(0.0) += cost;
             }
             _ => {}
         }
