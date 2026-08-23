@@ -6,10 +6,13 @@
 //! hard exits leave the last window on disk, and supports an SVG
 //! flamegraph render.
 //!
-//! Known limitation (inherited from pprof): samples land on the thread that
-//! started the profiler — the async runtime's worker threads are captured
-//! only insofar as they run on that thread. Documented, acceptable for v1
-//! hotspot triage.
+//! Thread coverage: the sampler arms a per-process `ITIMER_PROF` timer with
+//! a process-directed SIGPROF handler, so any thread that does not block
+//! SIGPROF — including async runtime workers — can be interrupted and its
+//! stack captured. This is pinned by the regression test
+//! `samples_capture_frames_from_non_starting_threads` (worker-thread frames
+//! must appear in folded stacks). Sample counts naturally skew toward
+//! CPU-heavy threads, which is exactly what hotspot triage wants.
 
 use std::path::{Path, PathBuf};
 
@@ -174,8 +177,18 @@ pub fn top_from_folded(content: &str, top_n: usize) -> (u64, Vec<(String, u64)>)
 mod tests {
     use super::*;
 
+    /// The profiler state is process-global; parallel tests would drop each
+    /// other's guard mid-sample. Serialize every test that touches it.
+    fn profiler_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+            std::sync::LazyLock::new(std::sync::Mutex::default);
+        LOCK.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn start_snapshot_stop_roundtrip() {
+        let _guard = profiler_test_lock();
         start().expect("start");
         // Busy-spin briefly so the sampler has something to see on this
         // thread.
@@ -187,6 +200,60 @@ mod tests {
         let lines = folded_snapshot().expect("snapshot");
         assert!(!lines.is_empty(), "expected sampled frames");
         stop();
+    }
+
+    /// Distinct worker-loop frames the multi-thread test can look for.
+    #[inline(never)]
+    fn profiler_probe_spin_a() -> u64 {
+        let mut sink = 0u64;
+        for i in 0..60_000_000u64 {
+            sink = sink.wrapping_add(i);
+        }
+        sink
+    }
+
+    #[inline(never)]
+    fn profiler_probe_spin_b() -> u64 {
+        let mut sink = 1u64;
+        for i in 0..60_000_000u64 {
+            sink = sink.wrapping_mul(i | 1);
+        }
+        sink
+    }
+
+    #[test]
+    fn samples_capture_frames_from_non_starting_threads() {
+        let _lock = profiler_test_lock();
+        start().expect("start"); // ubs:ignore test assertion expect
+        let workers: Vec<_> = (0..3)
+            .map(|slot| {
+                std::thread::spawn(move || {
+                    // Distinct call sites per slot so folded stacks carry
+                    // recognizable, thread-independent frame names.
+                    let sink = match slot {
+                        0 => profiler_probe_spin_a(),
+                        _ => {
+                            let mut s = 2u64;
+                            for i in 0..60_000_000u64 {
+                                s = s.wrapping_add(i ^ slot);
+                            }
+                            profiler_probe_spin_b().wrapping_add(s)
+                        }
+                    };
+                    assert_ne!(sink, u64::MAX);
+                })
+            })
+            .collect();
+        for w in workers {
+            w.join().expect("worker joins"); // ubs:ignore test assertion expect
+        }
+        let lines = folded_snapshot().expect("snapshot"); // ubs:ignore test assertion expect
+        stop();
+        let haystack = lines.join("\n");
+        assert!(
+            haystack.contains("profiler_probe_spin_a"),
+            "worker thread A frames missing from folded stacks; lines:\n{haystack}"
+        );
     }
 
     #[test]
