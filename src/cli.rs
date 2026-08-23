@@ -614,8 +614,6 @@ pub struct Cli {
     #[arg(long)]
     pub export: Option<String>,
 
-
-
     /// List available models (optional fuzzy search pattern)
     #[arg(long)]
     #[allow(clippy::option_option)]

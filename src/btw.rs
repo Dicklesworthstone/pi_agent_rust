@@ -105,8 +105,7 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                 for block in &assistant.content {
                     match block {
                         crate::model::ContentBlock::Text(t) => {
-                            message_pieces
-                                .push(format!("assistant: {}", truncate(&t.text, 400)));
+                            message_pieces.push(format!("assistant: {}", truncate(&t.text, 400)));
                         }
                         crate::model::ContentBlock::ToolCall(call) => {
                             message_pieces.push(format!("assistant ran tool {}", call.name));
