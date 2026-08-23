@@ -77,6 +77,11 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "explain-extension-policy"
         | "explain-repair-policy"
         | "no-skills"
+        // bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1: the pre-parser
+        // must pass these through to clap — any top-level long missing from
+        // this match gets silently diverted to extension-flag extraction.
+        | "crash-test"
+        | "profile"
         | "no-prompt-templates"
         | "no-themes"
         | "list-providers"
