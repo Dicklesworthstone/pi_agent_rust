@@ -2872,7 +2872,17 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 Some(role.as_str().to_string()),
             );
         }
-        self.status_message = Some(format!("Role {role} set to {provider}/{model_id}"));
+        // /btw binds its smol-role client (provider + credentials) at
+        // startup; rebuilding it here needs the auth/provider factory that
+        // lives in main. Say so instead of silently using the old binding.
+        self.status_message = Some(if role == ModelRole::Smol {
+            format!(
+                "Role {role} set to {provider}/{model_id} (note: /btw keeps its \
+                 startup binding until restart)"
+            )
+        } else {
+            format!("Role {role} set to {provider}/{model_id}")
+        });
         None
     }
 
@@ -3214,12 +3224,56 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             self.scroll_to_bottom();
             return None;
         }
-        let context = {
-            let snapshot: Vec<crate::model::Message> = self
-                .agent
-                .try_lock()
-                .map_or_else(|_| Vec::new(), |agent| agent.messages().to_vec());
-            pi::btw::build_context_summary(&snapshot)
+        // Context + question get the SAME outbound hygiene as the main
+        // provider path: the live message list carries raw user text (the
+        // vault only rewrites the outbound clone), and the smol role can be
+        // a different vendor entirely. Block mode refuses here too.
+        // Lock scope computes the outcome; self mutations happen after the
+        // guard drops (E0502: scroll/status inside the arm held the agent
+        // guard across mutable self access).
+        enum BtwPrepared {
+            Ready { context: String, question: String },
+            TransformRefused { message: String },
+            AgentBusy,
+        }
+        let prepared = match self.agent.try_lock() {
+            Ok(mut agent) => {
+                let snapshot = agent.messages().to_vec();
+                let summary = pi::btw::build_context_summary(&snapshot);
+                let transformed =
+                    agent
+                        .secrets_transform_outbound_text(&summary)
+                        .and_then(|context| {
+                            agent
+                                .secrets_transform_outbound_text(&question)
+                                .map(|question| (context, question))
+                        });
+                match transformed {
+                    Ok((context, question)) => BtwPrepared::Ready { context, question },
+                    Err(err) => BtwPrepared::TransformRefused {
+                        message: format!("/btw refused: {err}"),
+                    },
+                }
+            }
+            Err(_) => {
+                // Contended agent lock: answer without context, but say so —
+                // a silent empty context reads as a model failure.
+                BtwPrepared::AgentBusy
+            }
+        };
+        let (context, question) = match prepared {
+            BtwPrepared::Ready { context, question } => (context, question),
+            BtwPrepared::TransformRefused { message } => {
+                self.status_message = Some(message);
+                self.scroll_to_bottom();
+                return None;
+            }
+            BtwPrepared::AgentBusy => {
+                self.status_message = Some(String::from(
+                    "(/btw) agent busy — answering without conversation context",
+                ));
+                (String::new(), question.to_string())
+            }
         };
         self.messages.push(ConversationMessage {
             role: MessageRole::System,
@@ -3234,9 +3288,12 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             let result = client.ask(&context, &question).await;
             // Display-only delivery via the UI event channel; the session
             // writer never sees this message.
+            // SystemNote is display-only. PiMsg::System/AgentError reset
+            // live agent state (Idle + dropped abort handle) — an answer
+            // landing mid-turn must not clobber a running stream.
             let msg = match result {
-                Ok(answer) => PiMsg::System(format!("(/btw) {answer}")),
-                Err(err) => PiMsg::AgentError(format!("(/btw) failed: {err}")),
+                Ok(answer) => PiMsg::SystemNote(format!("(/btw) {answer}")),
+                Err(err) => PiMsg::SystemNote(format!("(/btw) failed: {err}")),
             };
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
         });
