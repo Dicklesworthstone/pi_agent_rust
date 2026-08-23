@@ -2426,8 +2426,7 @@ mod hostcall_protocol_equivalence {
         let typed_round_tripped: HostCallPayload = serde_json::from_str(&typed_serialized)?;
         assert_eq!(
             select_hostcall_lane(&typed).expect("typed lane decision"),
-            select_hostcall_lane(&typed_round_tripped)
-                .expect("typed round-trip lane decision")
+            select_hostcall_lane(&typed_round_tripped).expect("typed round-trip lane decision")
         );
         Ok(())
     }
@@ -2442,8 +2441,8 @@ mod hostcall_protocol_equivalence {
                 "code": "tool.does_not_exist",
             }
         }));
-        let err = resolve_hostcall_opcode(&payload)
-            .expect_err("unknown opcode code must be rejected");
+        let err =
+            resolve_hostcall_opcode(&payload).expect_err("unknown opcode code must be rejected");
         let rendered = format!("{err}");
         assert!(
             rendered.contains("Unknown host_call typed opcode code"),
