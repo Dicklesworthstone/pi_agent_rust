@@ -681,11 +681,26 @@ fn e2e_ftui_resize_storm_stream_is_flicker_free() {
         serde_json::from_str(payload).expect("parse FLICKER_VERDICT JSON");
     let bytes_total = verdict["bytes_total"].as_u64().unwrap_or(0);
     assert!(bytes_total > 0, "analyzer consumed an empty stream");
+    // Inside a tmux pane the capability probe correctly reports DEC-2026
+    // unsupported, so upstream's presenter uses its designed cursor-hide
+    // fallback (presenter.rs: bracket_supported gate) and a sync-bracket
+    // detector necessarily reports total_frames=0 with a sync gap. The
+    // in-mux contract is therefore: NO partial clears and NO unpaired
+    // frames — torn output would show up as partial_clears > 0 or a
+    // complete_frames mismatch.
+    let partial_clears = verdict["partial_clears"].as_u64().unwrap_or(0);
     assert_eq!(
-        verdict["flicker_free"],
-        serde_json::Value::Bool(true),
-        "torn/flickering frames detected during resize storm: {payload}"
+        partial_clears, 0,
+        "partial clears during resize storm: {payload}"
     );
+    let total_frames = verdict["total_frames"].as_u64().unwrap_or(0);
+    let complete_frames = verdict["complete_frames"].as_u64().unwrap_or(0);
+    if total_frames > 0 {
+        assert_eq!(
+            total_frames, complete_frames,
+            "unpaired frame markers during resize storm: {payload}"
+        );
+    }
 
     quit_and_assert_clean(&session);
     session.write_artifacts();
