@@ -369,13 +369,7 @@ pub fn list_mine(repo_root: &Path) -> Result<Vec<WorktreeInfo>> {
         if !is_ours {
             return;
         }
-        let age_ms = std::fs::metadata(&path)
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|mtime| mtime.elapsed().ok())
-            .map_or(0, |elapsed| {
-                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-            });
+        let age_ms = worktree_age_ms(Path::new(&path));
         out.push(WorktreeInfo {
             path,
             branch,
@@ -396,6 +390,48 @@ pub fn list_mine(repo_root: &Path) -> Result<Vec<WorktreeInfo>> {
     }
     flush(current_path, current_branch, &mut out);
     Ok(out)
+}
+
+/// Age of a worktree based on the NEWEST modification time anywhere in its
+/// tree (bd-ajg8l #14): the root directory mtime only changes when entries
+/// are added/removed at the top level, so a long-running child writing into
+/// nested paths used to look stale and got reaped mid-run.
+///
+/// Bounded walk (`.git` skipped, 5_000-entry cap) — liveness detection, not
+/// a full audit. Falls back to the root mtime when the walk yields nothing.
+fn worktree_age_ms(path: &Path) -> u64 {
+    fn mtime_elapsed_ms(path: &Path) -> Option<u128> {
+        std::fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|mtime| mtime.elapsed().ok())
+            .map(|elapsed| elapsed.as_millis())
+    }
+
+    let root_age = mtime_elapsed_ms(path).unwrap_or(u128::MAX);
+    let mut newest = root_age;
+    let mut visited = 0usize;
+    let walker = ignore::WalkBuilder::new(path)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+    for entry in walker.flatten() {
+        visited += 1;
+        if visited > 5_000 {
+            break;
+        }
+        if let Some(age) = mtime_elapsed_ms(entry.path())
+            && newest > age
+        {
+            newest = age;
+        }
+    }
+    if visited <= 1 {
+        // Nothing walkable: fall back to the root mtime alone.
+        return u64::try_from(root_age).unwrap_or(u64::MAX);
+    }
+    u64::try_from(newest).unwrap_or(u64::MAX)
 }
 
 /// Reap our stale worktrees (prefix-tagged only; foreign worktrees are
@@ -553,5 +589,53 @@ mod tests {
         let _ = git(&repo, &["branch", "-D", "foreign-branch"]);
         let _ = std::fs::remove_dir_all(&repo);
         let _ = ours;
+    }
+
+    /// bd-ajg8l #14: a long-running child writing into NESTED paths must
+    /// keep the worktree fresh even when the root directory mtime is old.
+    #[test]
+    fn worktree_age_uses_newest_nested_mtime() {
+        let repo = init_repo("fresh-nested");
+        let ours = isolate(&repo, "task-fresh").expect("isolate");
+
+        // Age the root directory far into the past (as if nothing happened
+        // at the top level since creation).
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&ours.path, old).expect("set root mtime");
+
+        // Child activity: write into a nested path NOW. The freshness walk
+        // must find it even though the ROOT mtime says the tree is old.
+        // (The converse — a fully-aged tree reporting old — cannot be
+        // asserted reliably on remote-execution harnesses whose own sync
+        // touches worktree files mid-test.)
+        let nested = ours.path.join("src").join("deep");
+        std::fs::create_dir_all(&nested).expect("mkdir nested");
+        std::fs::write(nested.join("mod.rs"), "child work").expect("write");
+
+        let age = worktree_age_ms(&ours.path);
+        assert!(
+            age < 60_000,
+            "nested writes must keep the worktree fresh, got {age}ms"
+        );
+    }
+
+    #[test]
+    fn reap_stale_spares_fresh_nested_worktrees() {
+        let repo = init_repo("reap-fresh");
+        let ours = isolate(&repo, "task-live").expect("isolate");
+
+        // Root mtime aged; child keeps writing to nested paths.
+        let old = filetime::FileTime::from_unix_time(1_600_000_000, 0);
+        filetime::set_file_mtime(&ours.path, old).expect("set root mtime");
+        let deep = ours.path.join("deeply").join("nested");
+        std::fs::create_dir_all(&deep).expect("mkdir deep");
+        std::fs::write(deep.join("work.txt"), "still running").expect("write");
+
+        let reaped = reap_stale(&repo, Duration::from_secs(60)).unwrap();
+        assert!(
+            !reaped.iter().any(|p| p == &ours.path.to_string_lossy().to_string()),
+            "live worktree with fresh nested writes must survive the reaper"
+        );
+        assert!(ours.path.exists(), "worktree must still exist");
     }
 }
