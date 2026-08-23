@@ -106,6 +106,7 @@ pub mod compaction;
 #[doc(hidden)]
 pub mod compaction_worker;
 #[doc(hidden)]
+pub mod compaction_snap;
 pub mod completions;
 #[doc(hidden)]
 pub mod config;

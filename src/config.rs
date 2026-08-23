@@ -348,6 +348,10 @@ pub struct CompactionSettings {
     pub reserve_tokens: Option<u32>,
     #[serde(alias = "keepRecentTokens")]
     pub keep_recent_tokens: Option<u32>,
+    /// Compaction output rendering: "text" (default) | "snapcompact"
+    /// (bd-cv653.7.6).
+    #[serde(alias = "mode")]
+    pub mode: Option<crate::compaction::CompactionRenderMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1557,6 +1561,7 @@ fn merge_compaction(
             enabled: other.enabled.or(base.enabled),
             reserve_tokens: other.reserve_tokens.or(base.reserve_tokens),
             keep_recent_tokens: other.keep_recent_tokens.or(base.keep_recent_tokens),
+            mode: other.mode.or(base.mode),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

@@ -75,6 +75,33 @@ pub enum AutoCompactionMode {
     Aggressive,
 }
 
+/// Render mode for compaction output (bd-cv653.7.6): plain text summary
+/// (default) or text summary plus deterministic PNG frames rasterized from
+/// the compacted transcript span (snapcompact). Frames are attached to the
+/// compaction entry and only emitted to models that accept image inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum CompactionRenderMode {
+    #[default]
+    #[serde(rename = "text")]
+    Text,
+    #[serde(rename = "snapcompact")]
+    SnapCompact,
+}
+
+impl std::str::FromStr for CompactionRenderMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "text" => Ok(Self::Text),
+            "snapcompact" => Ok(Self::SnapCompact),
+            other => Err(format!(
+                "invalid compaction render mode `{other}` (expected `text` or `snapcompact`)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedCompactionSettings {
     pub enabled: bool,
@@ -82,6 +109,8 @@ pub struct ResolvedCompactionSettings {
     pub reserve_tokens: u32,
     pub keep_recent_tokens: u32,
     pub mode: AutoCompactionMode,
+    /// Snapcompact rendering policy (bd-cv653.7.6).
+    pub render_mode: CompactionRenderMode,
 }
 
 impl ResolvedCompactionSettings {
@@ -114,6 +143,7 @@ impl Default for ResolvedCompactionSettings {
             // 10% of context window
             keep_recent_tokens: 12_800,
             mode: AutoCompactionMode::default(),
+            render_mode: CompactionRenderMode::default(),
         }
     }
 }
@@ -137,6 +167,10 @@ pub struct CompactionResult {
     pub first_kept_entry_id: String,
     pub tokens_before: u64,
     pub details: CompactionDetails,
+    /// Rasterized snapcompact frames; `None` unless
+    /// [`ResolvedCompactionSettings::render_mode`] is
+    /// [`CompactionRenderMode::SnapCompact`].
+    pub snap_payload: Option<crate::compaction_snap::SnapPayload>,
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +669,14 @@ fn compaction_settings_to_value(settings: &ResolvedCompactionSettings) -> Value 
         "keepRecentTokens".to_string(),
         Value::from(settings.keep_recent_tokens),
     );
+    obj.insert(
+        "renderMode".to_string(),
+        Value::String(match settings.render_mode {
+            CompactionRenderMode::Text => "text",
+            CompactionRenderMode::SnapCompact => "snapcompact",
+        }
+        .to_string()),
+    );
     Value::Object(obj)
 }
 
@@ -756,6 +798,19 @@ fn compaction_settings_from_value(value: &Value) -> Result<ResolvedCompactionSet
     Ok(ResolvedCompactionSettings {
         enabled,
         mode: AutoCompactionMode::default(),
+        render_mode: obj.get("renderMode").map_or(
+            Ok(CompactionRenderMode::default()),
+            |value| {
+                value.as_str().ok_or_else(|| {
+                    Error::validation(
+                        "compaction preparation: `settings.renderMode` must be a string",
+                    )
+                })
+                .and_then(|s| {
+                    s.parse::<CompactionRenderMode>().map_err(Error::validation)
+                })
+            },
+        )?,
         context_window_tokens: preparation_settings_u32(
             obj,
             "contextWindowTokens",
@@ -2052,13 +2107,35 @@ fn finish_compaction(preparation: CompactionPreparation, mut summary: String) ->
         mode: None,
     };
 
-    summary.push_str(&format_file_operations(&read_files, &modified_files));
+    let snap_payload =
+        if matches!(preparation.settings.render_mode, CompactionRenderMode::SnapCompact) {
+            let model_messages: Vec<crate::model::Message> = preparation
+                .messages_to_summarize
+                .iter()
+                .filter_map(session_message_to_model)
+                .collect();
+            let transcript = serialize_conversation(&model_messages);
+            let frames = crate::compaction_snap::render_frames(&transcript);
+            (!frames.is_empty()).then(|| {
+                tracing::info!(
+                    target: "snapcompact",
+                    frame_count = frames.len(),
+                    source_chars = transcript.chars().count(),
+                    reason_code = "snapcompact_frames_generated",
+                    "Rasterized compacted span into deterministic PNG frames"
+                );
+                crate::compaction_snap::SnapPayload::new(frames)
+            })
+        } else {
+            None
+        };
 
     CompactionResult {
         summary,
         first_kept_entry_id: preparation.first_kept_entry_id,
         tokens_before: preparation.tokens_before,
         details,
+        snap_payload,
     }
 }
 

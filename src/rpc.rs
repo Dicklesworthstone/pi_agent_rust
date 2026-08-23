@@ -1880,6 +1880,16 @@ pub async fn run(
                     let result_data = compact_res?;
 
                     let details_value = compaction_details_to_value(&result_data.details)?;
+                    let details_value = result_data
+                        .snap_payload
+                        .as_ref()
+                        .map(|payload| {
+                            crate::compaction_snap::payload_to_details(
+                                Some(details_value),
+                                payload,
+                            )
+                        })
+                        .unwrap_or(details_value);
 
                     let (messages, tokens_after) = {
                         let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
@@ -4953,6 +4963,14 @@ async fn maybe_auto_compact(
                     return;
                 }
             };
+
+            let details_value = result
+                .snap_payload
+                .as_ref()
+                .map(|payload| {
+                    crate::compaction_snap::payload_to_details(Some(details_value), payload)
+                })
+                .unwrap_or(details_value);
 
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
                 return;

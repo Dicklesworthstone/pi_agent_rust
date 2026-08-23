@@ -668,6 +668,11 @@ pub struct AgentConfig {
     /// Default stream options.
     pub stream_options: StreamOptions,
 
+    /// Whether the active model accepts image inputs (bd-cv653.7.6).
+    /// When false, snapcompact compaction frames are stripped from the
+    /// outbound context with a logged degradation reason.
+    pub model_accepts_images: bool,
+
     /// Strip image blocks before sending context to providers.
     pub block_images: bool,
 
@@ -752,6 +757,7 @@ impl Default for AgentConfig {
             max_tool_iterations: resolved_max_tool_iterations_default(),
             stream_options: StreamOptions::default(),
             block_images: false,
+            model_accepts_images: true,
             fail_closed_hooks: false,
             tool_approval: None,
             keyword_settings: None,
@@ -1635,6 +1641,17 @@ impl Agent {
             } else {
                 Cow::Borrowed(self.messages.as_slice())
             }
+        };
+
+        // Snapcompact vision gating (bd-cv653.7.6): text-only models never see
+        // rasterized compaction frames; the helper logs the degradation with a
+        // stable reason code and never touches user-pasted images.
+        let messages = if self.config.model_accepts_images {
+            messages
+        } else {
+            let mut owned = messages.into_owned();
+            let _stats = crate::compaction_snap::strip_snapcompact_images(&mut owned, false);
+            std::borrow::Cow::Owned(owned)
         };
 
         // Borrow cached tool defs if available; otherwise build + cache + borrow.
