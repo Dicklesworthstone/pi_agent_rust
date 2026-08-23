@@ -97,7 +97,7 @@ type Rgb = [u8; 3];
 /// Deterministic role palette ("syntax-aware colors"): lines are colored by
 /// their transcript-role prefix (`[User]:`, `[Assistant]:`, tool markers,
 /// markdown headers), matching `serialize_conversation`'s labels.
-const fn color_for_line(line: &str) -> Rgb {
+fn color_for_line(line: &str) -> Rgb {
     const BG_DIM_HEADER: Rgb = [240, 240, 245];
     const USER_AMBER: Rgb = [255, 179, 71];
     const ASSISTANT_SKY: Rgb = [96, 181, 255];
@@ -292,12 +292,10 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 
     // zlib stream via flate2 (miniz_oxide backend: deterministic).
     let mut encoder =
-        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::level(6));
-    let _ = std::io::Write::write_all(&mut encoder, &raw);
-    // SAFETY-free path: finish() returns the inner writer even on error.
-    let idat = encoder
-        .finish()
-        .unwrap_or_else(|_| flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::level(6)).finish().unwrap_or_default());
+        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let idat = std::io::Write::write_all(&mut encoder, &raw)
+        .map(|()| encoder.finish().unwrap_or_default())
+        .unwrap_or_default();
     png_chunk(&mut out, b"IDAT", &idat);
     png_chunk(&mut out, b"IEND", &[]);
     out
@@ -347,12 +345,13 @@ pub fn attach_frames(mut message: Message, payload: Option<&SnapPayload>) -> Mes
     if payload.frames.is_empty() {
         return message;
     }
-    if let Message::User(ref mut user) = message {
-        let text_blocks: Vec<ContentBlock> = match std::mem::take(&mut user.content) {
-            UserContent::Text(text) => vec![ContentBlock::Text(TextContent::new(text))],
-            UserContent::Blocks(blocks) => blocks,
+    if let Message::User(user) = &mut message {
+        let mut blocks = match &user.content {
+            UserContent::Text(text) => {
+                vec![ContentBlock::Text(TextContent::new(text.text.clone()))]
+            }
+            UserContent::Blocks(existing) => existing.clone(),
         };
-        let mut blocks = text_blocks;
         for frame in &payload.frames {
             blocks.push(ContentBlock::Image(ImageContent {
                 data: frame.png.clone(),

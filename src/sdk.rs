@@ -1945,7 +1945,11 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         system_prompt: Some(system_prompt),
         max_tool_iterations: options.max_tool_iterations,
         stream_options,
-        block_images: config.image_block_images(),
+        model_accepts_images: selection
+            .model_entry
+            .model
+            .input
+            .contains(&crate::provider::InputType::Image),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
         keyword_settings: config.keywords.clone(),
@@ -1986,6 +1990,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
             keep_recent_tokens: config.compaction_keep_recent_tokens(),
             context_window_tokens,
             mode: config.compaction_mode(),
+            render_mode: config.compaction_render_mode(),
         }
     });
 

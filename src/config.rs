@@ -939,6 +939,14 @@ impl Config {
             .unwrap_or(true)
     }
 
+    /// Compaction output rendering mode (bd-cv653.7.6). Default: text-only.
+    pub fn compaction_render_mode(&self) -> crate::compaction::CompactionRenderMode {
+        self.compaction
+            .as_ref()
+            .and_then(|c| c.mode)
+            .unwrap_or_default()
+    }
+
     /// Whether automatic session titling is enabled (bd-cv653.3.1).
     /// Default: true — it degrades to a silent no-op without a tiny/smol role.
     pub fn auto_title_enabled(&self) -> bool {
