@@ -187,6 +187,14 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
     }
     script.push_str("export PI_TEST_MODE=1\nexport OPENAI_API_KEY=pi-e2e-sigkill-dummy\n");
+    // Environment forensics: rch execution contexts inherit variables that
+    // can leak through tmux into pi and break startup; dump the pane-side
+    // environment for diffing against a known-good interactive run.
+    let _ = writeln!(
+        script,
+        "env | sort > {}",
+        session.harness.temp_path("wrapper-env.txt").display()
+    );
     let _ = writeln!(
         script,
         "/bin/sh -c 'echo $$ > {pid}; exec {bin} --ftui --no-session \
@@ -213,12 +221,19 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms).expect("chmod sigkill script"); // ubs:ignore test setup expect
     }
+
+    // Full launch: the banner proves raw mode/alt-screen/mouse are active.
+    // Loud assert with environment forensics: wait_for_pane_contains
+    // returns silently on timeout, and the pane-side env dump diffs a
+    // poisoned rch execution context against a known-good interactive run.
     let startup_pane = session
         .tmux
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+    let wrapper_env = std::fs::read_to_string(session.harness.temp_path("wrapper-env.txt"))
+        .unwrap_or_else(|_| String::from("<no dump>"));
     assert!(
         startup_pane.contains("ftui preview stack"),
-        "startup banner never appeared; session_alive={}; script:\n{script}\npane:\n{startup_pane}",
+        "startup banner never appeared; session_alive={}; wrapper_env:\n{wrapper_env}\nscript:\n{script}\npane:\n{startup_pane}",
         session.tmux.session_exists()
     );
 
