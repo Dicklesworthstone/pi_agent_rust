@@ -506,16 +506,16 @@ impl PiApp {
                 .as_ref()
                 .and_then(|tool_id| self.current_tool_summary.get(tool_id))
                 .map_or_else(String::new, |summary| {
-                        let budget = self
-                            .term_width
-                            .saturating_sub(16 + tool.len() + progress_str.len())
-                            .max(12);
-                        let mut clipped: String = summary.chars().take(budget).collect();
-                        if summary.chars().count() > budget {
-                            clipped.push('…');
-                        }
-                        format!(": {clipped}")
-                    });
+                    let budget = self
+                        .term_width
+                        .saturating_sub(16 + tool.len() + progress_str.len())
+                        .max(12);
+                    let mut clipped: String = summary.chars().take(budget).collect();
+                    if summary.chars().count() > budget {
+                        clipped.push('…');
+                    }
+                    format!(": {clipped}")
+                });
             let _ = write!(
                 output,
                 "\n  {} {}{}{} ...\n",

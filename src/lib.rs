@@ -122,7 +122,6 @@ pub mod crypto_shim;
 // Always declared: the module is dual-mode internally (its non-feature
 // `imp` degrades to named errors), and main.rs's `pi profile` arm calls
 // its unconditional helpers — gating the declaration broke default builds.
-pub mod profiler;
 #[doc(hidden)]
 pub mod debug;
 pub mod dialects;
@@ -233,6 +232,7 @@ pub mod pi_wasm;
 pub mod plan;
 #[doc(hidden)]
 pub mod platform;
+pub mod profiler;
 #[doc(hidden)]
 pub mod provider;
 #[doc(hidden)]

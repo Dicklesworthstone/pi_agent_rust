@@ -457,9 +457,7 @@ fn main_impl() -> Result<()> {
     // PI_PROFILE=1 and the `profiler` feature. Snapshots land under
     // <agent-dir>/profiles/ every 10s so hard exits keep the last window.
     #[cfg(feature = "profiler")]
-    if cli.profile
-        || std::env::var_os("PI_PROFILE").is_some_and(|v| v != "0" && !v.is_empty())
-    {
+    if cli.profile || std::env::var_os("PI_PROFILE").is_some_and(|v| v != "0" && !v.is_empty()) {
         match pi::profiler::start() {
             Ok(()) => {
                 tracing::info!(event = "pi.profile.start", hz = pi::profiler::SAMPLE_HZ);

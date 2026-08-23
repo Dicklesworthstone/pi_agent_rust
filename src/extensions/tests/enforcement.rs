@@ -556,7 +556,10 @@ fn apply_env_capability_non_permissive_mode_denies_without_explicit_allow() {
     };
     policy.default_caps.push("env".to_string());
     apply_env_capability(&mut config, &policy);
-    assert!(!config.deny_env, "default_caps env allow must win over mode");
+    assert!(
+        !config.deny_env,
+        "default_caps env allow must win over mode"
+    );
 }
 
 #[test]

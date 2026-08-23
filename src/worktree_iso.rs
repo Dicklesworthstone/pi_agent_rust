@@ -478,8 +478,7 @@ mod tests {
 
     #[test]
     fn non_git_refuses_with_named_error() {
-        let dir =
-            std::env::temp_dir().join(format!("pi-iso-nogit-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("pi-iso-nogit-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dir");
 
         // Remote-execution harnesses may resolve temp_dir INSIDE the synced

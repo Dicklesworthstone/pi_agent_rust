@@ -146,8 +146,7 @@ pub fn spawn_snapshot_thread(agent_dir: &Path) {
 /// inclusive sample count. Each line is `frame;frame;… count`.
 #[must_use]
 pub fn top_from_folded(content: &str, top_n: usize) -> (u64, Vec<(String, u64)>) {
-    let mut totals: std::collections::BTreeMap<String, u64> =
-        std::collections::BTreeMap::new();
+    let mut totals: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
     let mut grand = 0u64;
     for line in content.lines() {
         let Some((stack, count)) = line.rsplit_once(' ') else {
