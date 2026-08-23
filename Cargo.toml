@@ -426,6 +426,9 @@ bpe-tokens = ["dep:tiktoken-rs"]
 # PDF extraction for URL reads (bd-cv653.2.2) — opt-in to keep the default
 # release binary inside the 22 MiB size budget.
 url-pdf = ["dep:pdf-extract"]
+# Sampling profiler (bd-cv653.7.12.1) — opt-in; adds pprof + inferno deps.
+profiler = ["dep:pprof"]
+
 # Interactive terminal front-end (crossterm + charmed_rust stack). Enabled by
 # default so CLI users get an identical `pi` binary with no action required.
 # Disabling it (`--no-default-features`) lets SDK/library consumers compile the
