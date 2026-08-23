@@ -58,7 +58,6 @@ fn actionable_events_use_full_timeout() {
         ExtensionEventName::ToolResult,
         ExtensionEventName::SessionBeforeSwitch,
         ExtensionEventName::SessionBeforeFork,
-        ExtensionEventName::SessionBeforeCompact,
         ExtensionEventName::SessionBeforeTree,
         ExtensionEventName::ResourcesDiscover,
     ];
@@ -73,6 +72,35 @@ fn actionable_events_use_full_timeout() {
             "{event} should use the full default timeout"
         );
     }
+}
+
+#[test]
+fn session_before_compact_uses_dedicated_long_running_timeout() {
+    // gh #178: session_before_compact is actionable AND is the one hook
+    // whose documented contract includes awaiting a real provider request
+    // through the host compaction bridge (`ctx.compact()`), so it gets a
+    // dedicated budget well above the generic actionable timeout. The
+    // planted negative: the post-hoc informational SessionCompact event
+    // must NOT inherit the long budget.
+    let event = ExtensionEventName::SessionBeforeCompact;
+    assert!(!event.is_informational());
+    assert_eq!(
+        event.default_timeout_ms(),
+        EXTENSION_COMPACT_EVENT_TIMEOUT_MS
+    );
+    assert!(
+        EXTENSION_COMPACT_EVENT_TIMEOUT_MS > EXTENSION_EVENT_TIMEOUT_MS,
+        "compact hook budget must exceed the generic event budget"
+    );
+    assert!(
+        EXTENSION_COMPACT_EVENT_TIMEOUT_MS >= EXTENSION_PROVIDER_BUDGET_MS,
+        "compact hook budget must cover at least one full provider-stream budget"
+    );
+    assert_eq!(
+        ExtensionEventName::SessionCompact.default_timeout_ms(),
+        EXTENSION_INFO_EVENT_TIMEOUT_MS,
+        "post-hoc SessionCompact notification must keep the short budget"
+    );
 }
 
 #[test]

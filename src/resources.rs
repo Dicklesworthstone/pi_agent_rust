@@ -2719,6 +2719,49 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_cli_skill_survives_no_skills_flag() {
+        // gh #177: `--no-skills` disables configured/discovered skills
+        // (settings.json `skills` entries included — upstream parity with
+        // pi-mono's resource-loader), while explicit `--skill` paths must
+        // still load. This pins the "still load" half of that contract.
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let skill_path = temp_dir.path().join("SKILL.md");
+            fs::write(
+                &skill_path,
+                "---\nname: explicit-skill\ndescription: Survives --no-skills\n---\nBody.",
+            )
+            .expect("write skill");
+
+            let manager = PackageManager::new(temp_dir.path().to_path_buf());
+            let config = Config::default();
+            let cli = ResourceCliOptions {
+                no_skills: true,
+                no_prompt_templates: true,
+                no_extensions: true,
+                no_themes: true,
+                skill_paths: vec![skill_path.to_string_lossy().to_string()],
+                prompt_paths: Vec::new(),
+                extension_paths: Vec::new(),
+                theme_paths: Vec::new(),
+            };
+
+            let loader = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
+                .await
+                .expect("load resources");
+            assert_eq!(
+                loader
+                    .skills()
+                    .iter()
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["explicit-skill"],
+                "explicit --skill path must load under --no-skills"
+            );
+        });
+    }
+
+    #[test]
     fn test_resource_loader_rejects_invalid_cli_theme_file() {
         run_async(async {
             let temp_dir = tempfile::tempdir().expect("tempdir");

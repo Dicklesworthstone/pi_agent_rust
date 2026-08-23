@@ -269,7 +269,7 @@
       "optional_value": false,
       "default_value": null,
       "env_var": null,
-      "description": "Disable skill discovery",
+      "description": "Disable skill discovery and configured skills (explicit --skill paths still load)",
       "classification": "identical",
       "action": "MATCH",
       "notes": "Both support no-skills flag"

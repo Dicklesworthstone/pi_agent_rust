@@ -534,7 +534,7 @@ pub struct Cli {
     #[arg(long, action = clap::ArgAction::Append)]
     pub skill: Vec<String>,
 
-    /// Disable skill discovery
+    /// Disable skill discovery and configured skills (explicit --skill paths still load)
     #[arg(long)]
     pub no_skills: bool,
 

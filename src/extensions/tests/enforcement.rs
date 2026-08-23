@@ -485,3 +485,68 @@ fn enforcement_machine_custom_config() {
     sm.evaluate(0.10);
     assert_eq!(sm.state(), EnforcementState::Allow);
 }
+
+// ====================================================================
+// gh #174: env-capability snapshot for the PiJS runtime config
+// ====================================================================
+
+#[test]
+fn apply_env_capability_denied_policy_leaves_config_untouched() {
+    let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
+    assert!(config.deny_env, "default config must deny env");
+    // The shipped default policy denies the env capability.
+    let policy = ExtensionPolicy::default();
+    assert!(policy.deny_caps.iter().any(|cap| cap == "env"));
+    apply_env_capability(&mut config, &policy);
+    assert!(config.deny_env, "denying policy must keep env denied");
+    assert!(
+        config.env.is_empty(),
+        "denying policy must not snapshot the process environment"
+    );
+}
+
+#[test]
+fn apply_env_capability_permitting_policy_snapshots_process_env() {
+    let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
+    let policy = ExtensionPolicy {
+        deny_caps: Vec::new(),
+        ..ExtensionPolicy::default()
+    };
+    // Pick a live process variable first so the assertion is not racing
+    // concurrent env mutation elsewhere in the test binary. Use the same
+    // OS-variant + UTF-8 filter as the implementation.
+    let (probe_key, probe_value) = std::env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .next()
+        .expect("test process must have at least one UTF-8 env var");
+    apply_env_capability(&mut config, &policy);
+    assert!(!config.deny_env, "permitting policy must grant env access");
+    assert!(
+        !config.env.is_empty(),
+        "permitting policy must populate the runtime env snapshot (gh #174)"
+    );
+    assert_eq!(config.env.get(&probe_key), Some(&probe_value));
+}
+
+#[test]
+fn apply_env_capability_preserves_caller_supplied_snapshot() {
+    let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
+    config
+        .env
+        .insert("PI_TEST_CALLER_ENV".to_string(), "kept".to_string());
+    let policy = ExtensionPolicy {
+        deny_caps: Vec::new(),
+        ..ExtensionPolicy::default()
+    };
+    apply_env_capability(&mut config, &policy);
+    assert!(!config.deny_env);
+    assert_eq!(
+        config.env.len(),
+        1,
+        "an explicit caller-provided env map must never be widened"
+    );
+    assert_eq!(
+        config.env.get("PI_TEST_CALLER_ENV").map(String::as_str),
+        Some("kept")
+    );
+}

@@ -9602,6 +9602,19 @@ pub const EXTENSION_EVENT_TIMEOUT_MS: u64 = 5_000;
 /// stall the agent for the full general budget. See [`ExtensionEventName::is_informational`].
 pub const EXTENSION_INFO_EVENT_TIMEOUT_MS: u64 = 500;
 
+/// Dedicated cancellation budget for the `session_before_compact` hook (ms).
+///
+/// gh #178: this hook is explicitly allowed to await the host-side
+/// compaction bridge (`ctx.compact()` → `EventsHostcallOp::Compact` → a real
+/// provider request), which routinely takes longer than the generic 5s event
+/// budget. Dispatching it with [`EXTENSION_EVENT_TIMEOUT_MS`] meant a
+/// well-behaved custom-compaction extension timed out mid-request, failed
+/// open, and its replacement compaction was silently discarded. The budget
+/// gives headroom over the provider-stream budget
+/// ([`EXTENSION_PROVIDER_BUDGET_MS`]) for large-context compaction requests;
+/// the underlying provider HTTP timeout still bounds each request.
+pub const EXTENSION_COMPACT_EVENT_TIMEOUT_MS: u64 = 300_000;
+
 /// Default cancellation budget for extension tool execution (ms).
 pub const EXTENSION_TOOL_BUDGET_MS: u64 = 30_000;
 
@@ -9862,7 +9875,12 @@ impl ExtensionEventName {
     /// caller-provided timeout is in play. See [`Self::is_informational`].
     #[must_use]
     pub const fn default_timeout_ms(self) -> u64 {
-        if self.is_informational() {
+        if matches!(self, Self::SessionBeforeCompact) {
+            // gh #178: the one hook whose contract includes awaiting a real
+            // LLM request (`ctx.compact()`); see
+            // [`EXTENSION_COMPACT_EVENT_TIMEOUT_MS`].
+            EXTENSION_COMPACT_EVENT_TIMEOUT_MS
+        } else if self.is_informational() {
             EXTENSION_INFO_EVENT_TIMEOUT_MS
         } else {
             EXTENSION_EVENT_TIMEOUT_MS
@@ -11177,6 +11195,33 @@ impl Clone for JsExtensionRuntimeHandle {
     }
 }
 
+/// Apply the extension policy's `env` capability to a runtime config.
+///
+/// gh #174: production callers construct the runtime with an empty env map,
+/// so every `pi.env.get` / `process.env` read returned `undefined` even when
+/// policy permits env access. When the capability is granted and the caller
+/// supplied no snapshot of its own (tests and conformance runs inject
+/// explicit maps), capture the Pi process environment once at runtime start.
+/// Per-key disclosure is still mediated inside `__pi_env_get_native` (the
+/// policy's `SecretBroker` with its `disclosure_allowlist`, or the default
+/// secret filter), and the JS `process.env` proxy deliberately cannot
+/// enumerate keys, so this only lets policy-permitted lookups observe real
+/// values.
+fn apply_env_capability(config: &mut PiJsRuntimeConfig, policy: &ExtensionPolicy) {
+    if policy.deny_caps.iter().any(|cap| cap == "env") {
+        return;
+    }
+    config.deny_env = false;
+    if config.env.is_empty() {
+        // `std::env::vars()` panics on non-UTF-8 names/values; use the OS
+        // variant and skip entries that cannot be represented as UTF-8
+        // (they could not round-trip through the JS bridge anyway).
+        config.env = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+            .collect();
+    }
+}
+
 impl JsExtensionRuntimeHandle {
     #[allow(clippy::too_many_lines)]
     pub async fn start(
@@ -11236,9 +11281,7 @@ impl JsExtensionRuntimeHandle {
         let policy = policy.unwrap_or_default();
         let runtime_policy = policy.clone();
 
-        if !policy.deny_caps.contains(&"env".to_string()) {
-            config.deny_env = false;
-        }
+        apply_env_capability(&mut config, &policy);
 
         let host = JsRuntimeHost {
             tools,
