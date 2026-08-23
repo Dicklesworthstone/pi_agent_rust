@@ -308,6 +308,10 @@ sysinfo = "0.39.6"
 # feature.
 tiktoken-rs = { version = "0.12.0", optional = true }
 rquickjs = { version = "0.12.2", features = ["futures", "loader"] }
+# Sampling profiler (bd-cv653.7.12.1); opt-in via the `profiler` feature —
+# internal signal handling is wrapped by the crate, keeping this crate's
+# forbid(unsafe_code) intact.
+pprof = { version = "0.14", optional = true, features = ["flamegraph"] }
 swc_common = "26.0.0"
 swc_ecma_codegen = "32.0.0"
 swc_ecma_ast = "29.0.0"

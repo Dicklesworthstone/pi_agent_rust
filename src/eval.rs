@@ -635,9 +635,20 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().expect("tempdir");
+        // A unique sleep duration marks OUR child: `pgrep -f "sleep 60"`
+        // substring-matches any concurrent process mentioning "sleep 60x"
+        // (other agents' polling shells), which made this test fail on
+        // shared machines through no fault of the kill discipline.
+        let marker_secs = 50_000 + std::process::id() % 10_000;
         let kernel_pid = {
             let tool = EvalTool::new(dir.path());
-            let out = run_cell_sync(&tool, "import os\nimport subprocess\npid = os.getpid()\nsubprocess.Popen(['sleep', '60'])").expect("spawn cell");
+            let out = run_cell_sync(
+                &tool,
+                &format!(
+                    "import os\nimport subprocess\npid = os.getpid()\nsubprocess.Popen(['sleep', '{marker_secs}'])"
+                ),
+            )
+            .expect("spawn cell");
             assert!(!out.is_error, "cell: {}", output_text(&out));
             let out = run_cell_sync(&tool, "pid").expect("pid cell");
             let text = output_text(&out);
@@ -657,7 +668,7 @@ mod tests {
         );
         // The kernel's own `sleep` child died with it (tree discipline).
         let survivor = std::process::Command::new("pgrep")
-            .args(["-f", "sleep 60"])
+            .args(["-f", &format!("sleep {marker_secs}")])
             .output()
             .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
         assert!(!survivor, "kernel-spawned sleep survived session end");
