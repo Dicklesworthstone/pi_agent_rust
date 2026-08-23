@@ -119,6 +119,8 @@ pub mod context_files;
 pub mod crash;
 #[doc(hidden)]
 pub mod crypto_shim;
+#[cfg(feature = "profiler")]
+pub mod profiler;
 #[doc(hidden)]
 pub mod debug;
 pub mod dialects;

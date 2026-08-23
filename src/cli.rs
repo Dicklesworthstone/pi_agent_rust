@@ -603,8 +603,18 @@ pub struct Cli {
     /// (bd-cv653.7.12). Hidden smoke hook.
     #[arg(long, hide = true)]
     pub crash_test: bool,
+    /// Start the sampling profiler for this run and write folded stacks
+    /// under <agent-dir>/profiles/ (bd-cv653.7.12.1). Requires the
+    /// `profiler` feature.
+    #[arg(long)]
+    pub profile: bool,
+
+    // === Export & Listing ===
+    /// Export session file to HTML
     #[arg(long)]
     pub export: Option<String>,
+
+
 
     /// List available models (optional fuzzy search pattern)
     #[arg(long)]
@@ -2104,6 +2114,19 @@ pub enum Commands {
     Token {
         /// Text to count, or @file to read from disk
         input: String,
+    },
+
+    /// Render folded profiler stacks (bd-cv653.7.12.1): top functions by
+    /// inclusive samples from a `.folded` snapshot.
+    #[command(name = "profile")]
+    Profile {
+        /// Path to a `.folded` snapshot (defaults to the newest under
+        /// <agent-dir>/profiles/)
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// How many top rows to print
+        #[arg(long, default_value_t = 25)]
+        top: usize,
     },
 
     /// Aggregate local session usage: tokens/cost by provider, model, day;

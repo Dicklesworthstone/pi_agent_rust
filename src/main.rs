@@ -441,6 +441,19 @@ fn main_impl() -> Result<()> {
         pi::crash::record_operation("crash-test injected panic".to_string());
         panic!("pi --crash-test: intentional panic for bundle verification");
     }
+    // Sampling profiler (bd-cv653.7.12.1): opt-in via --profile /
+    // PI_PROFILE=1 and the `profiler` feature. Snapshots land under
+    // <agent-dir>/profiles/ every 10s so hard exits keep the last window.
+    #[cfg(feature = "profiler")]
+    if cli.profile || std::env::var_os("PI_PROFILE").is_some() {
+        match pi::profiler::start() {
+            Ok(()) => {
+                tracing::info!(event = "pi.profile.start", hz = pi::profiler::SAMPLE_HZ);
+                pi::profiler::spawn_snapshot_thread(&crash_agent_dir);
+            }
+            Err(err) => eprintln!("warning: profiler: {err}"),
+        }
+    }
     if cli.rpc && cli.mode.is_none() {
         cli.mode = Some("rpc".to_string());
     }
@@ -2391,6 +2404,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         }
         cli::Commands::Token { input } => {
             handle_token(&input)?;
+        }
+        cli::Commands::Profile { input, top } => {
+            handle_profile(input.as_deref(), top)?;
         }
         cli::Commands::Import {
             from_claude,
@@ -4653,6 +4669,41 @@ fn handle_token(input: &str) -> Result<()> {
     };
     for (table, count) in pi::token_count::count_all_tables(&text) {
         println!("{}: {} tokens", table.as_str(), count);
+    }
+    Ok(())
+}
+
+/// `pi profile [--input folded] [--top N]` (bd-cv653.7.12.1): render the
+/// newest (or given) folded profiler snapshot as a top-functions table.
+fn handle_profile(input: Option<&Path>, top: usize) -> Result<()> {
+    let path = match input {
+        Some(path) => path.to_path_buf(),
+        None => {
+            let dir = pi::profiler::profiles_dir(&pi::config::Config::global_dir());
+            let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&dir)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "no profiles directory ({dir:?}): {e}; run with --profile first"
+                    )
+                })?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "folded"))
+                .collect();
+            snapshots.sort();
+            snapshots
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("no folded snapshots under {dir:?}"))?
+        }
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", path.display()))?;
+    let (grand, rows) = pi::profiler::top_from_folded(&content, top);
+    println!("{}: {} samples total", path.display(), grand);
+    println!("{:<6}  {}", "SAMPLES", "INCLUSIVE STACK");
+    for (stack, count) in &rows {
+        let tail = stack.rsplit(';').next().unwrap_or(stack);
+        println!("{count:<6}  …{tail}");
     }
     Ok(())
 }
