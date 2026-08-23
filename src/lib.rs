@@ -104,9 +104,9 @@ pub mod commit_split;
 #[doc(hidden)]
 pub mod compaction;
 #[doc(hidden)]
-pub mod compaction_worker;
-#[doc(hidden)]
 pub mod compaction_snap;
+#[doc(hidden)]
+pub mod compaction_worker;
 pub mod completions;
 #[doc(hidden)]
 pub mod config;

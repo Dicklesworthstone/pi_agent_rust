@@ -8,12 +8,10 @@
 
 use pi::compaction::CompactionRenderMode;
 use pi::compaction_snap::{
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapFrame, SnapPayload,
-    attach_frames, frames_from_details, png_encode, render_frames, strip_snapcompact_images,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapFrame, SnapPayload, attach_frames,
+    frames_from_details, png_encode, render_frames, strip_snapcompact_images,
 };
-use pi::model::{
-    ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage,
-};
+use pi::model::{ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage};
 
 const FRAME_WIDTH: u32 = 960;
 
@@ -28,7 +26,9 @@ fn sample_transcript() -> String {
     ];
     // Pad past one frame so multi-frame splitting is exercised.
     for i in 0..200 {
-        lines.push(format!("[Assistant]: progress line {i} with some detail text"));
+        lines.push(format!(
+            "[Assistant]: progress line {i} with some detail text"
+        ));
     }
     lines.join("\n")
 }
@@ -56,9 +56,10 @@ fn rendering_is_deterministic_byte_for_byte() {
 }
 
 // Golden hash pins the exact renderer output (font table + palette +
-// geometry + flate2 output). Any intentional visual change requires
-// updating this constant in the same commit, with reviewer-visible diff.
-const GOLDEN_SHA256: &str = "REPLACE_WITH_GENERATED_SHA";
+// geometry + flate2 output), captured from the first verified build of this
+// module. Any intentional visual change requires updating this constant in
+// the same commit, with a reviewer-visible diff of the rendered output.
+const GOLDEN_SHA256: &str = "22a1e7ee20b254d1a4859f1b08c3c45244ba7412b218c08c1b504d2639e68473";
 
 #[test]
 fn golden_hash_matches_committed_renderer_output() {
@@ -85,9 +86,10 @@ fn long_transcripts_split_into_bounded_frames() {
 
 #[test]
 fn non_ascii_and_tabs_render_deterministically_as_placeholders() {
+    // Tab expands to four spaces; non-ASCII collapses to '?'.
     let a = render_frames("[User]: héllo\tworld 日本");
-    let b = render_frames("[User]: h?llo?world ???");
-    assert_eq!(a, b, "non-printables normalize to '?' consistently");
+    let b = render_frames("[User]: h?llo    world ??");
+    assert_eq!(a, b, "non-printables normalize consistently");
 }
 
 /// Reference bitwise IEEE CRC-32 mirroring the implementation contract.
@@ -114,8 +116,7 @@ fn png_output_is_structurally_valid() {
     let mut off = 8;
     let mut saw_idat = false;
     while off < png.len() {
-        let len =
-            u32::from_be_bytes([png[off], png[off + 1], png[off + 2], png[off + 3]]) as usize;
+        let len = u32::from_be_bytes([png[off], png[off + 1], png[off + 2], png[off + 3]]) as usize;
         let kind = &png[off + 4..off + 8];
         let data_start = off + 8;
         let crc_at = data_start + len;
@@ -151,13 +152,14 @@ fn details_round_trip_preserves_payload_and_other_keys() {
     });
     let merged = pi::compaction_snap::payload_to_details(Some(existing), &payload);
 
-    assert_eq!(
-        merged.get("readFiles").and_then(|v| v.as_str()),
-        Some("src/auth.rs"),
-        "unrelated detail keys survive merge"
-    );
-    let extracted =
-        frames_from_details(Some(&merged)).expect("schema-valid payload extracts");
+    // Unrelated detail keys survive the merge alongside the snapcompact key.
+    let files = merged
+        .get("readFiles")
+        .and_then(|v| v.as_array())
+        .expect("readFiles array survives merge");
+    assert_eq!(files[0], "src/auth.rs");
+
+    let extracted = frames_from_details(Some(&merged)).expect("schema-valid payload extracts");
     assert_eq!(
         extracted.schema,
         pi::compaction_snap::SNAPCOMPACT_DETAILS_SCHEMA
@@ -200,8 +202,10 @@ fn attach_frames_places_images_after_text_block() {
     };
     assert_eq!(blocks.len(), 3);
     assert!(matches!(&blocks[0], ContentBlock::Text(t) if t.text.contains("<summary>")));
-    assert!(matches!(&blocks[1], ContentBlock::Image(ImageContent { data, mime_type })
-        if data == "QUFB" && mime_type == "image/png"));
+    assert!(
+        matches!(&blocks[1], ContentBlock::Image(ImageContent { data, mime_type })
+        if data == "QUFB" && mime_type == "image/png")
+    );
     assert_eq!(user.timestamp, 7, "timestamp preserved from source entry");
 
     // No payload → untouched text message (structural; Message lacks PartialEq).
@@ -219,8 +223,14 @@ fn strip_removes_only_compaction_summary_images() {
     let summary = Message::User(UserMessage {
         content: UserContent::Blocks(vec![
             ContentBlock::Text(TextContent::new(summary_body_text())),
-            ContentBlock::Image(ImageContent { data: "QQ==".into(), mime_type: "image/png".into() }),
-            ContentBlock::Image(ImageContent { data: "Qg==".into(), mime_type: "image/png".into() }),
+            ContentBlock::Image(ImageContent {
+                data: "QQ==".into(),
+                mime_type: "image/png".into(),
+            }),
+            ContentBlock::Image(ImageContent {
+                data: "Qg==".into(),
+                mime_type: "image/png".into(),
+            }),
         ]),
         timestamp: 1,
     });
@@ -297,11 +307,13 @@ fn budget_accounting_counts_attached_frame_tokens() {
         },
     });
 
-    let flat_image_chars = 1200_usize * 3; // IMAGE_TOKEN_ESTIMATE × CHARS_PER_TOKEN_ESTIMATE
+    // Images are billed at IMAGE_TOKEN_ESTIMATE (1200 tokens) flat; the
+    // Blocks form adds one trailing-newline char to the text bucket
+    // ("hi\n" → 3 chars ÷ 3 = 1 token vs "hi" → 0), hence 1201 total.
     let delta = estimate_entries_context_tokens(&[&with_image])
         - estimate_entries_context_tokens(&[&text_only]);
     assert_eq!(
-        delta, flat_image_chars as u64,
+        delta, 1201,
         "each attached snapcompact frame must be billed at the documented flat image estimate"
     );
 }

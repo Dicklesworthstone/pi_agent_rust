@@ -21,9 +21,7 @@
 //!   [`SNAPCOMPACT_DETAILS_KEY`] key with a versioned schema, so session
 //!   JSONL/SQLite persistence needs zero format changes.
 
-use crate::model::{
-    ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage,
-};
+use crate::model::{ContentBlock, ImageContent, Message, TextContent, UserContent};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
@@ -33,12 +31,11 @@ pub const SNAPCOMPACT_DETAILS_SCHEMA: &str = "pi.compaction.snapcompact.v1";
 /// Key under `CompactionEntry.details` holding the snapcompact payload.
 pub const SNAPCOMPACT_DETAILS_KEY: &str = "snapcompact";
 
-/// Prefix used on compaction summary messages (mirrors
-/// `session.rs::COMPACTION_SUMMARY_PREFIX`); used to identify which user
-/// messages carry snapcompact frames so stripping only ever touches our own
-/// image blocks, never user-pasted images.
-pub const COMPACTION_SUMMARY_PREFIX: &str =
-    "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+/// Prefix used on compaction summary messages (mirrors `session.rs`).
+///
+/// Identifies which user messages carry snapcompact frames so stripping only
+/// ever touches our own image blocks, never user-pasted images.
+pub const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 
 /// Suffix paired with [`COMPACTION_SUMMARY_PREFIX`].
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
@@ -165,6 +162,10 @@ fn normalize_char(c: char) -> char {
 }
 
 /// Draw one normalized char into the RGB buffer at pixel `(x, y)`.
+///
+/// Casts are bounded: glyph indices are masked to the 95-entry table and
+/// pixel coordinates are derived from module geometry constants.
+#[allow(clippy::cast_possible_truncation)]
 fn draw_glyph(buf: &mut [u8], width: u32, height: u32, x: u32, y: u32, c: char, color: Rgb) {
     let idx = (c as u32).wrapping_sub(0x20) as usize;
     let Some(glyph) = FONT_5X7.get(idx) else {
@@ -198,6 +199,7 @@ fn draw_glyph(buf: &mut [u8], width: u32, height: u32, x: u32, y: u32, c: char, 
 /// [`MAX_FRAME_HEIGHT`] splits across frames at line boundaries. An empty
 /// transcript produces no frames (callers stay text-only).
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn render_frames(transcript: &str) -> Vec<SnapFrame> {
     let mut wrapped: Vec<(String, Rgb)> = Vec::new();
     for raw in transcript.lines() {
@@ -216,20 +218,20 @@ pub fn render_frames(transcript: &str) -> Vec<SnapFrame> {
     let total_frames = wrapped.len().div_ceil(LINES_PER_FRAME as usize).max(1);
     let mut frames = Vec::with_capacity(total_frames);
     for group in wrapped.chunks(LINES_PER_FRAME as usize) {
-        let height = PAD * 2 + (group.len() as u32) * LINE_HEIGHT;
+        let height = PAD * 2 + u32::try_from(group.len()).unwrap_or(u32::MAX) * LINE_HEIGHT;
         let mut buf = vec![0u8; (FRAME_WIDTH * height * 3) as usize];
         // Background fill.
-        for px in buf.chunks_exact_mut(3) {
-            px.copy_from_slice(&BACKGROUND);
+        for px in buf.as_chunks_mut::<3>().0 {
+            *px = BACKGROUND;
         }
         for (li, (line, color)) in group.iter().enumerate() {
-            let y = PAD + (li as u32) * LINE_HEIGHT;
+            let y = PAD + u32::try_from(li).unwrap_or(0) * LINE_HEIGHT;
             for (ci, ch) in line.chars().enumerate() {
                 draw_glyph(
                     &mut buf,
                     FRAME_WIDTH,
                     height,
-                    PAD + (ci as u32) * CHAR_ADVANCE,
+                    PAD + u32::try_from(ci).unwrap_or(0) * CHAR_ADVANCE,
                     y,
                     ch,
                     *color,
@@ -263,10 +265,12 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
-fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+#[allow(clippy::cast_possible_truncation)] // PNG chunk lengths are < u32::MAX by construction
+fn png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
+    let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
+    out.extend_from_slice(&len.to_be_bytes());
     let start = out.len();
-    out.extend_from_slice(kind);
+    out.extend_from_slice(&kind);
     out.extend_from_slice(data);
     let crc = crc32(&out[start..]);
     out.extend_from_slice(&crc.to_be_bytes());
@@ -284,7 +288,7 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     ihdr.extend_from_slice(&width.to_be_bytes());
     ihdr.extend_from_slice(&height.to_be_bytes());
     ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // depth 8, truecolor, no interlace
-    png_chunk(&mut out, b"IHDR", &ihdr);
+    png_chunk(&mut out, *b"IHDR", &ihdr);
 
     // Raw scanlines: each row prefixed with filter byte 0 (None).
     let stride = (width * 3) as usize;
@@ -295,13 +299,12 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
     }
 
     // zlib stream via flate2 (miniz_oxide backend: deterministic).
-    let mut encoder =
-        flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     let idat = std::io::Write::write_all(&mut encoder, &raw)
         .map(|()| encoder.finish().unwrap_or_default())
         .unwrap_or_default();
-    png_chunk(&mut out, b"IDAT", &idat);
-    png_chunk(&mut out, b"IEND", &[]);
+    png_chunk(&mut out, *b"IDAT", &idat);
+    png_chunk(&mut out, *b"IEND", &[]);
     out
 }
 
@@ -310,7 +313,10 @@ pub fn png_encode(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
 /// Merge a snapcompact payload into existing compaction details JSON,
 /// preserving all other keys (readFiles, modifiedFiles, mode, …).
 #[must_use]
-pub fn payload_to_details(existing: Option<serde_json::Value>, payload: &SnapPayload) -> serde_json::Value {
+pub fn payload_to_details(
+    existing: Option<serde_json::Value>,
+    payload: &SnapPayload,
+) -> serde_json::Value {
     use serde_json::Value;
     let mut details = match existing {
         Some(Value::Object(map)) => map,
@@ -425,6 +431,7 @@ pub fn strip_snapcompact_images(messages: &mut [Message], accepts_images: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::UserMessage;
 
     #[test]
     fn geometry_constants_are_consistent() {
@@ -448,8 +455,7 @@ mod tests {
 
     #[test]
     fn strip_only_touches_compaction_summaries() {
-        let summary_text =
-            format!("{COMPACTION_SUMMARY_PREFIX}hello{COMPACTION_SUMMARY_SUFFIX}");
+        let summary_text = format!("{COMPACTION_SUMMARY_PREFIX}hello{COMPACTION_SUMMARY_SUFFIX}");
         let mut messages = vec![
             Message::User(UserMessage {
                 content: UserContent::Blocks(vec![
@@ -496,17 +502,19 @@ mod tests {
     fn frames_roundtrip_through_details() {
         let frames = render_frames("[User]: hello\n[Assistant]: world\n");
         assert!(!frames.is_empty(), "transcript produces frames");
-        let payload = SnapPayload::new(frames.clone());
+        let payload = SnapPayload::new(frames);
         let details = payload_to_details(None, &payload);
-        let extracted =
-            frames_from_details(Some(&details)).expect("payload should extract");
+        let extracted = frames_from_details(Some(&details)).expect("payload should extract");
         assert_eq!(extracted, payload);
 
         // Schema mismatch fails closed; missing details fail closed.
         let mut bad = details.clone();
         if let Some(obj) = bad.get_mut(SNAPCOMPACT_DETAILS_KEY) {
             if let Some(map) = obj.as_object_mut() {
-                map.insert("schema".into(), serde_json::Value::String("other.v9".into()));
+                map.insert(
+                    "schema".into(),
+                    serde_json::Value::String("other.v9".into()),
+                );
             }
         }
         assert!(frames_from_details(Some(&bad)).is_none());
@@ -519,8 +527,22 @@ mod tests {
             content: UserContent::Text("summary body".into()),
             timestamp: 42,
         });
+        // No payload → untouched message (checked before `base` is moved).
+        if let Message::User(u) = attach_frames(base, None) {
+            assert!(
+                matches!(&u.content, UserContent::Text(t) if t == "summary body"),
+                "no payload is a no-op"
+            );
+        }
+
         let payload = SnapPayload::new(render_frames("data"));
-        let attached = attach_frames(base.clone(), Some(&payload));
+        let attached = attach_frames(
+            Message::User(UserMessage {
+                content: UserContent::Text("summary body".into()),
+                timestamp: 42,
+            }),
+            Some(&payload),
+        );
         let Message::User(user) = attached else {
             panic!("expected user message");
         };

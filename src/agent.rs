@@ -711,6 +711,7 @@ impl fmt::Debug for AgentConfig {
             .field("max_tool_iterations", &self.max_tool_iterations)
             .field("stream_options", &self.stream_options)
             .field("block_images", &self.block_images)
+            .field("model_accepts_images", &self.model_accepts_images)
             .field("fail_closed_hooks", &self.fail_closed_hooks)
             .field("tool_approval", &self.tool_approval.is_some())
             .field("keyword_settings", &self.keyword_settings)

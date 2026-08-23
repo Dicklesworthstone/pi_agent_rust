@@ -6,20 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use pi::agent::{Agent, AgentConfig};
 use pi::compaction_snap::{
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapFrame, SnapPayload,
-    attach_frames, strip_snapcompact_images,
-};
-
-use std::sync::{Arc, Mutex};
-
-use pi::agent::{Agent, AgentConfig};
-use pi::compaction_snap::{
-    COMPACTION_SUMMARY_PREFIX, SnapFrame, SnapPayload, attach_frames,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, SnapFrame, SnapPayload, attach_frames,
     strip_snapcompact_images,
 };
-use pi::model::{
-    ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage,
-};
+use pi::model::{ContentBlock, Message, UserContent, UserMessage};
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::tools::ToolRegistry;
 
@@ -157,11 +147,11 @@ fn text_only_model_receives_no_snapcompact_frames() {
 
 fn message_has_summary_text(m: &Message) -> bool {
     matches!(m,
-        Message::User(u) if match &u.content {
-            UserContent::Text(t) => t.contains("<summary>"),
-            UserContent::Blocks(b) => b.first().is_some_and(|blk| matches!(blk,
-                ContentBlock::Text(t) if t.text.starts_with(COMPACTION_SUMMARY_PREFIX))),
-        })
+    Message::User(u) if match &u.content {
+        UserContent::Text(t) => t.contains("<summary>"),
+        UserContent::Blocks(b) => b.first().is_some_and(|blk| matches!(blk,
+            ContentBlock::Text(t) if t.text.starts_with(COMPACTION_SUMMARY_PREFIX))),
+    })
 }
 
 #[test]
