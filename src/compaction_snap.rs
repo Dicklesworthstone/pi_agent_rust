@@ -528,7 +528,7 @@ mod tests {
             timestamp: 42,
         });
         // No payload → untouched message (checked before `base` is moved).
-        if let Message::User(u) = attach_frames(base, None) {
+        if let Message::User(u) = attach_frames(base.clone(), None) {
             assert!(
                 matches!(&u.content, UserContent::Text(t) if t == "summary body"),
                 "no payload is a no-op"
