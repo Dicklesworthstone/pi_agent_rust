@@ -501,10 +501,11 @@ impl PiApp {
             });
             // Show what the tool was asked to do (bash command line, file
             // path, ...) truncated to the terminal width.
-            let invocation_str =
-                self.current_tool_summary
-                    .as_ref()
-                    .map_or_else(String::new, |(_, summary)| {
+            let invocation_str = self
+                .current_tool_id
+                .as_ref()
+                .and_then(|tool_id| self.current_tool_summary.get(tool_id))
+                .map_or_else(String::new, |summary| {
                         let budget = self
                             .term_width
                             .saturating_sub(16 + tool.len() + progress_str.len())

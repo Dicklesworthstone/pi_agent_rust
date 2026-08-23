@@ -508,8 +508,12 @@ fn apply_env_capability_denied_policy_leaves_config_untouched() {
 #[test]
 fn apply_env_capability_permitting_policy_snapshots_process_env() {
     let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
+    // Permissive mode + no deny: the full capability model grants env.
+    // (A bare empty deny list is NOT enough — Prompt/Strict modes deny by
+    // default, mirroring check_exec_capability.)
     let policy = ExtensionPolicy {
         deny_caps: Vec::new(),
+        mode: ExtensionPolicyMode::Permissive,
         ..ExtensionPolicy::default()
     };
     // Pick a live process variable first so the assertion is not racing
@@ -528,6 +532,34 @@ fn apply_env_capability_permitting_policy_snapshots_process_env() {
 }
 
 #[test]
+fn apply_env_capability_non_permissive_mode_denies_without_explicit_allow() {
+    // Strict/Prompt policies without "env" in default_caps must NOT get a
+    // process-env snapshot merely because "env" is absent from deny_caps —
+    // the capability model is deny-by-default outside Permissive mode.
+    for mode in [ExtensionPolicyMode::Strict, ExtensionPolicyMode::Prompt] {
+        let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
+        let policy = ExtensionPolicy {
+            deny_caps: Vec::new(),
+            mode,
+            ..ExtensionPolicy::default()
+        };
+        apply_env_capability(&mut config, &policy);
+        assert!(config.deny_env, "{mode:?} must deny env without an allow");
+        assert!(config.env.is_empty());
+    }
+    // default_caps listing "env" is the explicit allow that overrides mode.
+    let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
+    let mut policy = ExtensionPolicy {
+        deny_caps: Vec::new(),
+        mode: ExtensionPolicyMode::Strict,
+        ..ExtensionPolicy::default()
+    };
+    policy.default_caps.push("env".to_string());
+    apply_env_capability(&mut config, &policy);
+    assert!(!config.deny_env, "default_caps env allow must win over mode");
+}
+
+#[test]
 fn apply_env_capability_preserves_caller_supplied_snapshot() {
     let mut config = crate::extensions_js::PiJsRuntimeConfig::default();
     config
@@ -535,6 +567,7 @@ fn apply_env_capability_preserves_caller_supplied_snapshot() {
         .insert("PI_TEST_CALLER_ENV".to_string(), "kept".to_string());
     let policy = ExtensionPolicy {
         deny_caps: Vec::new(),
+        mode: ExtensionPolicyMode::Permissive,
         ..ExtensionPolicy::default()
     };
     apply_env_capability(&mut config, &policy);

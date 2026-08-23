@@ -2373,7 +2373,13 @@ pub struct PiApp {
     /// interleaved (parallel) tool events can never stamp one tool's command
     /// onto another tool's output block. Shown in the status row and
     /// transcript header. Tuple is `(tool_id, summary)`.
-    current_tool_summary: Option<(String, String)>,
+    /// Invocation summaries keyed by tool_id: parallel batches emit ALL
+    /// ToolStart/ToolInvocation events up front, so a single slot kept only
+    /// the last tool's summary and every other header lost its command line.
+    current_tool_summary: std::collections::HashMap<String, String>,
+    /// tool_id of the most recent ToolStart — the status row shows that
+    /// tool's invocation summary.
+    current_tool_id: Option<String>,
     tool_progress: Option<ToolProgress>,
     pending_tool_output: Option<String>,
     /// Compact `todo_list.v1` footer summary (bd-cv653.3.9), state-driven
@@ -2740,7 +2746,8 @@ impl PiApp {
             thinking_visible,
             tools_expanded: true,
             current_tool: None,
-            current_tool_summary: None,
+            current_tool_summary: std::collections::HashMap::new(),
+            current_tool_id: None,
             tool_progress: None,
             pending_tool_output: None,
             todo_summary: None,

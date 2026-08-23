@@ -468,7 +468,7 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
 /// derived from its arguments (the bash command line, the file path, the
 /// search pattern, ...). Returns `None` for tools without an obvious
 /// one-line summary.
-pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+pub(super) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
@@ -578,19 +578,18 @@ impl PiApp {
                     self.refresh_conversation_viewport(false);
                 }
             }
-            PiMsg::ToolStart { name, .. } => {
+            PiMsg::ToolStart { name, tool_id } => {
                 self.agent_state = AgentState::ToolRunning;
                 self.current_tool = Some(name);
-                // Clear any previous invocation summary: the status row shows
-                // it next to this tool's name without an id check, so a stale
-                // sibling summary must not linger. (Transcript headers are
-                // additionally tool_id-matched at use.)
-                self.current_tool_summary = None;
+                // The status row looks its summary up by THIS id; the map
+                // keeps sibling summaries alive for parallel batches (all
+                // ToolStart/ToolInvocation events arrive up front).
+                self.current_tool_id = Some(tool_id);
                 self.tool_progress = Some(ToolProgress::new());
                 self.pending_tool_output = None;
             }
             PiMsg::ToolInvocation { tool_id, summary } => {
-                self.current_tool_summary = Some((tool_id, summary));
+                self.current_tool_summary.insert(tool_id, summary);
             }
             PiMsg::ToolUpdate {
                 name,
@@ -616,11 +615,7 @@ impl PiApp {
                     // just its output. Matched by tool_id so interleaved
                     // (parallel) tool events cannot stamp one tool's command
                     // onto another tool's output block.
-                    let invocation = self
-                        .current_tool_summary
-                        .as_ref()
-                        .filter(|(summary_tool_id, _)| *summary_tool_id == tool_id)
-                        .map(|(_, summary)| summary);
+                    let invocation = self.current_tool_summary.get(&tool_id);
                     self.pending_tool_output = Some(invocation.map_or_else(
                         || format!("Tool {name} output:\n{output}"),
                         |invocation| {
@@ -633,15 +628,11 @@ impl PiApp {
             PiMsg::ToolEnd { tool_id, .. } => {
                 self.agent_state = AgentState::Processing;
                 self.current_tool = None;
-                // Only clear the invocation summary if it belongs to the tool
-                // that just ended; an interleaved sibling's summary must
-                // survive until its own ToolEnd.
-                if self
-                    .current_tool_summary
-                    .as_ref()
-                    .is_some_and(|(summary_tool_id, _)| *summary_tool_id == tool_id)
-                {
-                    self.current_tool_summary = None;
+                // Drop only THIS tool's summary; interleaved siblings keep
+                // theirs until their own ToolEnd.
+                self.current_tool_summary.remove(&tool_id);
+                if self.current_tool_id.as_deref() == Some(tool_id.as_str()) {
+                    self.current_tool_id = None;
                 }
                 self.tool_progress = None;
                 if let Some(output) = self.pending_tool_output.take() {
@@ -699,6 +690,8 @@ impl PiApp {
 
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.current_tool_id = None;
+                self.current_tool_summary.clear();
                 self.abort_handle = None;
                 self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
@@ -779,6 +772,8 @@ impl PiApp {
                 });
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.current_tool_id = None;
+                self.current_tool_summary.clear();
                 self.abort_handle = None;
                 self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
@@ -812,6 +807,8 @@ impl PiApp {
                 });
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.current_tool_id = None;
+                self.current_tool_summary.clear();
                 self.abort_handle = None;
                 self.extension_streaming.store(false, Ordering::SeqCst);
                 self.extension_compacting.store(false, Ordering::SeqCst);
@@ -908,6 +905,8 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_thinking.clear();
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.current_tool_id = None;
+                self.current_tool_summary.clear();
                 self.abort_handle = None;
                 self.status_message = status;
                 self.message_render_cache.clear();
@@ -958,6 +957,8 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.apply_theme(Theme::resolve(&self.config, &self.cwd));
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
+                self.current_tool_id = None;
+                self.current_tool_summary.clear();
                 self.abort_handle = None;
                 self.status_message = Some(status);
                 if let Some(message) = diagnostics {

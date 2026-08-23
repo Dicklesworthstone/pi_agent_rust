@@ -86,29 +86,30 @@ impl BtwClient {
 /// prose.
 #[must_use]
 pub fn build_context_summary(messages: &[Message]) -> String {
+    // Pieces accumulate newest-first (walking backwards); each message's
+    // OWN pieces are appended in reverse so the final flip restores true
+    // chronological order within a message too. The budget drops the
+    // OLDEST content — the newest exchange is what a side question is
+    // usually about.
     let mut pieces: Vec<String> = Vec::new();
     let mut used = 0usize;
     for message in messages.iter().rev() {
+        let mut message_pieces: Vec<String> = Vec::new();
         match message {
             Message::User(user) => {
                 if let UserContent::Text(text) = &user.content {
-                    let piece = format!("user: {}", truncate(text, 400));
-                    used += piece.len();
-                    pieces.push(piece);
+                    message_pieces.push(format!("user: {}", truncate(text, 400)));
                 }
             }
             Message::Assistant(assistant) => {
                 for block in &assistant.content {
                     match block {
                         crate::model::ContentBlock::Text(t) => {
-                            let piece = format!("assistant: {}", truncate(&t.text, 400));
-                            used += piece.len();
-                            pieces.push(piece);
+                            message_pieces
+                                .push(format!("assistant: {}", truncate(&t.text, 400)));
                         }
                         crate::model::ContentBlock::ToolCall(call) => {
-                            let piece = format!("assistant ran tool {}", call.name);
-                            used += piece.len();
-                            pieces.push(piece);
+                            message_pieces.push(format!("assistant ran tool {}", call.name));
                         }
                         _ => {}
                     }
@@ -119,23 +120,31 @@ pub fn build_context_summary(messages: &[Message]) -> String {
                     crate::model::ContentBlock::Text(t) => Some(t.text.clone()),
                     _ => None,
                 });
-                let piece = format!(
+                message_pieces.push(format!(
                     "tool {}: {}",
                     result.tool_name,
                     truncate(first.as_deref().unwrap_or(""), 160)
-                );
-                used += piece.len();
-                pieces.push(piece);
+                ));
             }
             Message::Custom(_) => {}
         }
-        if used >= CONTEXT_BUDGET_CHARS {
+        let mut over_budget = false;
+        for piece in message_pieces.into_iter().rev() {
+            // +1 for the join separator; stop BEFORE exceeding the budget
+            // so the newest pieces are never tail-truncated later.
+            if used + piece.len() + 1 > CONTEXT_BUDGET_CHARS {
+                over_budget = true;
+                break;
+            }
+            used += piece.len() + 1;
+            pieces.push(piece);
+        }
+        if over_budget {
             break;
         }
     }
     pieces.reverse();
-    let joined = pieces.join("\n");
-    truncate(&joined, CONTEXT_BUDGET_CHARS).to_string()
+    pieces.join("\n")
 }
 
 fn truncate(text: &str, limit: usize) -> &str {

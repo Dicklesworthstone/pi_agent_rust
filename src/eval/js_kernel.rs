@@ -232,19 +232,38 @@ fn run_cell(
         let evaluated: rquickjs::Result<rquickjs::Value<'_>> = ctx.eval(request.code.as_bytes());
         let evaluated = match evaluated {
             Ok(value) => Ok(value),
-            Err(err) => {
-                // Top-level await surfaces as a parse-time exception; retry
-                // with JS_EVAL_FLAG_ASYNC (EvalOptions.promise).
-                if matches!(&err, rquickjs::Error::Exception) {
+            Err(err) if matches!(&err, rquickjs::Error::Exception) => {
+                // ctx.catch() consumes the pending exception, so capture it
+                // ONCE: it decides retry eligibility AND renders the error.
+                // Top-level await surfaces as a parse-time SyntaxError; ONLY
+                // that earns the async-mode retry — re-running on a runtime
+                // throw would re-execute the whole cell, doubling every side
+                // effect that ran before the throw.
+                let caught = ctx.catch();
+                let is_syntax_error = caught.as_exception().is_some_and(|exception| {
+                    exception
+                        .get::<_, String>("name")
+                        .is_ok_and(|name| name == "SyntaxError")
+                });
+                if is_syntax_error {
                     let mut options = rquickjs::context::EvalOptions::default();
                     options.global = true;
                     options.strict = true;
                     options.promise = true;
                     ctx.eval_with_options(request.code.as_bytes(), options)
                 } else {
-                    Err(err)
+                    let detail = caught
+                        .as_exception()
+                        .map_or_else(|| err.to_string(), |exception| format!("{exception}"));
+                    return Phase1::Done(JsCellResponse {
+                        ok: false,
+                        console: String::new(),
+                        result: None,
+                        error: Some(detail),
+                    });
                 }
             }
+            Err(err) => Err(err),
         };
         match evaluated {
             Err(err) => Phase1::Done(error_response(&ctx, &err)),

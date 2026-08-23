@@ -3210,6 +3210,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
     /// written to the session JSONL: the call builds a throwaway message
     /// list that shares nothing with the session writer.
     pub(super) fn handle_slash_btw(&mut self, args: &str) -> Option<Cmd> {
+        // Lock scope computes the outcome; self mutations happen after the
+        // guard drops.
+        enum BtwPrepared {
+            Ready { context: String, question: String },
+            TransformRefused { message: String },
+            AgentBusy,
+        }
         let Some(client) = self.btw_client.clone() else {
             self.status_message = Some(
                 "/btw unavailable: no smol role model configured (set --smol or model_roles.smol)"
@@ -3228,16 +3235,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         // provider path: the live message list carries raw user text (the
         // vault only rewrites the outbound clone), and the smol role can be
         // a different vendor entirely. Block mode refuses here too.
-        // Lock scope computes the outcome; self mutations happen after the
-        // guard drops (E0502: scroll/status inside the arm held the agent
-        // guard across mutable self access).
-        enum BtwPrepared {
-            Ready { context: String, question: String },
-            TransformRefused { message: String },
-            AgentBusy,
-        }
-        let prepared = match self.agent.try_lock() {
-            Ok(mut agent) => {
+        let prepared = self.agent.try_lock().map_or(
+            // Contended agent lock: answer without context, but say so —
+            // a silent empty context reads as a model failure.
+            BtwPrepared::AgentBusy,
+            |mut agent| {
                 let snapshot = agent.messages().to_vec();
                 let summary = pi::btw::build_context_summary(&snapshot);
                 let transformed =
@@ -3254,13 +3256,8 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                         message: format!("/btw refused: {err}"),
                     },
                 }
-            }
-            Err(_) => {
-                // Contended agent lock: answer without context, but say so —
-                // a silent empty context reads as a model failure.
-                BtwPrepared::AgentBusy
-            }
-        };
+            },
+        );
         let (context, question) = match prepared {
             BtwPrepared::Ready { context, question } => (context, question),
             BtwPrepared::TransformRefused { message } => {
@@ -3272,7 +3269,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.status_message = Some(String::from(
                     "(/btw) agent busy — answering without conversation context",
                 ));
-                (String::new(), question.to_string())
+                (String::new(), question)
             }
         };
         self.messages.push(ConversationMessage {

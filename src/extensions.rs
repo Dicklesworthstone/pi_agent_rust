@@ -11208,7 +11208,16 @@ impl Clone for JsExtensionRuntimeHandle {
 /// enumerate keys, so this only lets policy-permitted lookups observe real
 /// values.
 fn apply_env_capability(config: &mut PiJsRuntimeConfig, policy: &ExtensionPolicy) {
+    // Full capability model, mirroring check_exec_capability: global deny →
+    // default_caps allow → mode fallback (Strict/Prompt = deny). A bare
+    // deny-list check would grant a Strict policy without "env" in
+    // deny_caps a full process-env snapshot the mode says to withhold.
     if policy.deny_caps.iter().any(|cap| cap == "env") {
+        return;
+    }
+    let allowed = policy.default_caps.iter().any(|cap| cap == "env")
+        || matches!(policy.mode, ExtensionPolicyMode::Permissive);
+    if !allowed {
         return;
     }
     config.deny_env = false;

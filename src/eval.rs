@@ -35,6 +35,9 @@ struct PyKernel {
     lines: std::sync::Mutex<std::sync::mpsc::Receiver<Option<String>>>,
     next_id: u64,
     cells_run: u64,
+    /// Set by the first kill(): the pid is reaped and may be recycled, so a
+    /// second group-kill must never run.
+    killed: bool,
 }
 
 impl PyKernel {
@@ -97,6 +100,7 @@ impl PyKernel {
             lines: std::sync::Mutex::new(rx),
             next_id: 1,
             cells_run: 0,
+            killed: false,
         })
     }
 
@@ -130,6 +134,13 @@ impl PyKernel {
     }
 
     fn kill(&mut self) {
+        // Guard against double-kill: after the first wait() the pid is
+        // freed and the OS may recycle it — a second group-kill could hit
+        // an innocent process group.
+        if self.killed {
+            return;
+        }
+        self.killed = true;
         // Process-tree discipline: the kernel's own children die with it.
         crate::tools::kill_process_group_tree(Some(self.child.id()));
         let _ = self.child.kill();
@@ -309,6 +320,7 @@ impl EvalTool {
     /// Run one cell: writes the request line, then reads the response on a
     /// blocking thread while this async fn polls with the cell budget. On
     /// timeout the kernel is killed (state loss) and the next cell restarts.
+    #[allow(clippy::too_many_lines)]
     async fn run_py_cell(&self, code: &str, timeout: Duration) -> Result<ToolOutput> {
         // Take the kernel out (or spawn) so the mutex is not held across await.
         let taken = self
@@ -350,6 +362,20 @@ impl EvalTool {
         // pi tools mid-cell and their results resume the kernel.
         let deadline = Instant::now() + timeout;
         let final_line = loop {
+            // Deadline check up front: a cell looping on bridge calls
+            // keeps lines flowing, so the Empty-branch check inside
+            // next_line alone would never fire and the cell could run
+            // forever.
+            if Instant::now() > deadline {
+                kernel.kill();
+                return Err(Error::tool(
+                    "eval",
+                    format!(
+                        "EVAL_TIMEOUT: cell exceeded {}s; kernel discarded —                          state was lost, next cell starts fresh",
+                        timeout.as_secs()
+                    ),
+                ));
+            }
             let line = match kernel.next_line(deadline).await {
                 Ok(Some(line)) => line,
                 Ok(None) => {
@@ -378,8 +404,18 @@ impl EvalTool {
             if trimmed.is_empty() {
                 continue;
             }
-            let parsed: Value = serde_json::from_str(trimmed)
-                .map_err(|err| Error::tool("eval", format!("EVAL_PROTOCOL: {err}")))?;
+            let parsed: Value = match serde_json::from_str(trimmed) {
+                Ok(parsed) => parsed,
+                Err(err) => {
+                    kernel.kill();
+                    return Err(Error::tool(
+                        "eval",
+                        format!(
+                            "EVAL_PROTOCOL: non-protocol output on the kernel channel                              ({err}); kernel discarded — state was lost, next cell                              starts fresh"
+                        ),
+                    ));
+                }
+            };
             if let Some(bridge) = parsed.get("bridge") {
                 let reply = self.run_bridge_call(bridge).await;
                 let line = json!({"bridge_result": reply}).to_string();

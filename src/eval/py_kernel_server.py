@@ -20,11 +20,25 @@ the same tool implementations).
 import ast
 import io
 import json
+import os
 import sys
 import traceback
 
 NAMESPACE = {"__name__": "__main__"}
-_REAL_STDOUT = sys.stdout
+# Protocol-channel protection: the host treats every stdout line as protocol,
+# so cell code (or its subprocesses, which inherit fd 1 by default) writing to
+# the REAL fd 1 would kill the kernel — or worse, forge/desync protocol
+# frames. Duplicate the protocol channel onto a private fd and point fd 1 at
+# /dev/null; `sys.stdout` capture still works because run_cell swaps the
+# Python-level object.
+_REAL_STDOUT = os.fdopen(os.dup(1), "w", encoding="utf-8")
+os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
+sys.stdout = sys.__stdout__ = os.fdopen(1, "w", encoding="utf-8")
+# Likewise protect stdin: a cell subprocess reading fd 0 could steal a
+# bridge_result frame and desync every later call.
+_REAL_STDIN = os.fdopen(os.dup(0), "r", encoding="utf-8")
+os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+sys.stdin = sys.__stdin__ = os.fdopen(0, "r", encoding="utf-8")
 _BRIDGE_CALL = 0
 
 
@@ -40,7 +54,7 @@ def _bridge_call(tool_name, tool_input):
         json.dumps({"bridge": {"call": call_id, "tool": tool_name, "input": tool_input}}) + "\n"
     )
     _REAL_STDOUT.flush()
-    line = sys.stdin.readline()
+    line = _REAL_STDIN.readline()
     if not line:
         raise ToolBridgeError("bridge closed")
     reply = json.loads(line)
@@ -112,7 +126,7 @@ def run_cell(code):
 
 def main():
     while True:
-        line = sys.stdin.readline()
+        line = _REAL_STDIN.readline()
         if not line:
             break
         line = line.strip()
@@ -133,8 +147,8 @@ def main():
                 response["error"] = error
         except Exception as exc:  # noqa: BLE001 - protocol-level failure
             response = {"id": None, "ok": False, "stdout": "", "stderr": "", "error": str(exc)}
-        sys.stdout.write(json.dumps(response) + "\n")
-        sys.stdout.flush()
+        _REAL_STDOUT.write(json.dumps(response) + "\n")
+        _REAL_STDOUT.flush()
 
 
 if __name__ == "__main__":

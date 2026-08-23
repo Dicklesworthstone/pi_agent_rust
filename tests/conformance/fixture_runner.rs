@@ -476,6 +476,9 @@ fn command_value(command: Option<&Commands>) -> Value {
         Some(Commands::Stats { .. }) => json!({
             "name": "stats",
         }),
+        Some(Commands::Profile { .. }) => json!({
+            "name": "profile",
+        }),
         None => Value::Null,
     }
 }

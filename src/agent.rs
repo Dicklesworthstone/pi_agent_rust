@@ -3823,6 +3823,37 @@ impl Agent {
         }
     }
 
+    /// Outbound hygiene for auxiliary provider calls (e.g. /btw side
+    /// questions): apply the same mode gate + obfuscation the main request
+    /// path uses, so text derived from the live message list never carries
+    /// raw secrets to a provider. Errors in block mode when a secret shape
+    /// is present.
+    pub fn secrets_transform_outbound_text(&mut self, text: &str) -> Result<String> {
+        let mode = crate::secrets::SecretsMode::from_setting(
+            self.config.secrets.as_ref().and_then(|s| s.mode.as_deref()),
+        );
+        if mode == crate::secrets::SecretsMode::Off {
+            return Ok(text.to_string());
+        }
+        let extra = crate::secrets::compile_extra_patterns(
+            self.config
+                .secrets
+                .as_ref()
+                .and_then(|s| s.extra_patterns.as_deref())
+                .unwrap_or(&[]),
+        );
+        let mut total = 0usize;
+        let mut labels: Vec<String> = Vec::new();
+        Self::secrets_transform_text(
+            text,
+            &mut self.secrets_vault,
+            mode,
+            &extra,
+            &mut total,
+            &mut labels,
+        )
+    }
+
     /// Export hygiene (bd-cv653.7.9): mask known secret values in arbitrary
     /// text (e.g. transcript exports or shares) back to their placeholders.
     /// A no-op when the secrets vault is disabled or empty.

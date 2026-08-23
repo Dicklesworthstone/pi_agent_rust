@@ -854,10 +854,16 @@ impl PiFtuiModel {
         // successful read DIRECTLY following another successful read card
         // collapses into it with a ×N counter — agent turns batch many
         // reads, and one line per file drowns the transcript.
+        // Group on tool_name, not the displayed head: ToolInvocation
+        // replaces the head with the per-file summary (every read has a
+        // path), so text-based matching never fired in production.
         if ok && display_name == "read" && idx > 0 {
             let prev = &self.transcript[idx - 1];
-            if prev.card == Some(CardState::Ok) && prev.text == "read" {
+            if prev.card == Some(CardState::Ok) && prev.tool_name.as_deref() == Some("read") {
                 self.transcript[idx - 1].group_count += 1;
+                // A grouped card can't show one file's summary as its head:
+                // render the generic name ("read ×N") once merging starts.
+                self.transcript[idx - 1].text = "read".to_string();
                 self.transcript.remove(idx);
             }
         }
@@ -1928,9 +1934,17 @@ fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
         return None;
     }
     let total = text.lines().count();
+    // Byte-cap each kept line too: a multi-megabyte single-line result
+    // (minified JSON, long grep hit) must not land whole in the transcript
+    // and be re-laid-out every frame.
+    const MAX_LINE_CHARS: usize = 300;
     let mut preview = text
         .lines()
         .take(MAX_DETAIL_LINES)
+        .map(|line| match line.char_indices().nth(MAX_LINE_CHARS) {
+            Some((cut, _)) => format!("{}…", &line[..cut]),
+            None => line.to_string(),
+        })
         .collect::<Vec<_>>()
         .join("\n");
     if total > MAX_DETAIL_LINES {
@@ -2333,13 +2347,15 @@ async fn run_extension_command(
         Ok(value) => PiMsg::SystemNote(format!("/{name} → {value}")),
         Err(err) => PiMsg::AgentError(format!("/{name}: {err}")),
     };
-    let _ = agent_tx.send(msg);
+    // ToolEnd before the error: the AgentError sweep settles pending
+    // cards, which would turn this ToolEnd into a duplicate trace line.
     let _ = agent_tx.send(PiMsg::ToolEnd {
         name: format!("/{name}"),
         tool_id: String::from("ftui-ext-command"),
         is_error,
         output: None,
     });
+    let _ = agent_tx.send(msg);
 }
 
 /// Handle a model switch in the driver, reporting the outcome to the UI.
@@ -2782,18 +2798,29 @@ async fn run_bash_ui_command(
             Some(display)
         }
         Err(err) => {
+            // ToolEnd must precede AgentError: the error sweep settles
+            // pending cards, and a card already settled there makes this
+            // ToolEnd fall back to a duplicate trace line.
+            let _ = agent_tx.send(PiMsg::ToolEnd {
+                name: String::from("bash"),
+                tool_id: String::from("ftui-bash"),
+                is_error: true,
+                output: None,
+            });
             let _ = agent_tx.send(PiMsg::AgentError(format!("bash: {err}")));
             None
         }
     };
-    let _ = agent_tx.send(PiMsg::ToolEnd {
-        name: String::from("bash"),
-        tool_id: String::from("ftui-bash"),
-        is_error: output.is_none(),
-        // BashResult already folded the display into the card; a second
-        // detail here would duplicate it.
-        output: None,
-    });
+    if output.is_some() {
+        let _ = agent_tx.send(PiMsg::ToolEnd {
+            name: String::from("bash"),
+            tool_id: String::from("ftui-bash"),
+            is_error: false,
+            // BashResult already folded the display into the card; a second
+            // detail here would duplicate it.
+            output: None,
+        });
+    }
     let _ = agent_tx.send(PiMsg::AgentDone {
         usage: None,
         stop_reason: crate::model::StopReason::Stop,
