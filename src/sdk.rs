@@ -341,6 +341,11 @@ pub struct SessionOptions {
     /// the options struct.
     pub tool_factory: Option<Arc<dyn ToolFactory>>,
 
+    /// Secrets settings for outbound credential hygiene (embedded hosts:
+    /// inject the host's API keys here so the model cannot echo them back
+    /// in its output). None = no secrets configured (outbound passthrough).
+    pub secrets: Option<crate::secrets::SecretsSettings>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -414,6 +419,7 @@ impl Default for SessionOptions {
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             tool_factory: None,
+            secrets: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
@@ -2168,7 +2174,7 @@ pub async fn create_agent_session_from_services(
         turn_recovery: config.turn_recovery_mode(),
         approval_state: None,
         bash_settings: config.bash.clone(),
-        secrets: None,
+        secrets: options.secrets.clone(),
     };
 
     let tools = options.tool_factory.as_ref().map_or_else(
