@@ -6,8 +6,5 @@ fn main() {
         if let Some(long) = a.get_long() {
             println!("{long}");
         }
-        for alias in a.get_visible_aliases().chain(a.get_all_aliases()) {
-            println!("{alias}");
-        }
     }
 }
