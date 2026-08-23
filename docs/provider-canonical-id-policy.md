@@ -75,13 +75,14 @@ canonical IDs; `fireworks-ai` and the Azure spellings are aliases.
 | `together`, `together-ai` | `togetherai` | Pi runtime |
 | `vercel-ai-gateway` | `vercel` | Pi runtime |
 
-Total: 52 aliases across 34 canonical IDs.
+## Canonical ID Registry
 
-## Canonical ID Registry (95 active IDs)
-
-Mirrors the active runtime registry. The machine-readable source is
-[`provider-canonical-id-table.json`](provider-canonical-id-table.json); the
-policy JSON mirrors the same 95 IDs and 52 aliases.
+Mirrors the active runtime registry. The machine-readable sources are
+authoritative for counts:
+[`provider-canonical-id-table.json`](provider-canonical-id-table.json) and
+the `total_canonical_ids` / `total_aliases` fields in
+[`provider-canonical-id-policy.json`](provider-canonical-id-policy.json)
+(hand-maintained counts here drifted every time a provider landed).
 
 | Canonical ID | Has Aliases | Source(s) |
 |-------------|------------|-----------|
