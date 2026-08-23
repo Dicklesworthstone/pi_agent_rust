@@ -1145,8 +1145,25 @@ fn e2e_ftui_wheel_scroll_inside_tmux() {
         .tmux
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
 
-    // Fill the transcript well past one screen.
+    // Fill the transcript well past one screen. A single tall tool output
+    // no longer guarantees overflow: card collapsing (bd-cv653.9.2) can
+    // render it as a short preview, leaving the whole transcript inside
+    // one viewport so max_scroll_from_tail() clamps to zero and wheel-up
+    // becomes a no-op. Send distinct bash passthroughs instead — each
+    // renders its own card head and unique output line, so the transcript
+    // overflows regardless of collapsing behavior.
     session.send_text_and_wait("fill", "!!seq 1 120", "120", COMMAND_TIMEOUT);
+    for i in 1..=12 {
+        // Unique per-iteration labels are the point of the fixture: each
+        // marker both drives and verifies its own transcript entry.
+        let marker = format!("wheel-filler-{i:02}"); // ubs:ignore fixture label — distinct per-iteration marker is required
+        session.send_text_and_wait(
+            "fill",
+            &format!("!!echo {marker}"), // ubs:ignore fixture label — command text must embed the unique marker
+            &marker,
+            COMMAND_TIMEOUT,
+        );
+    }
 
     // Inject SGR mouse wheel-up (button 64) at col 10, row 5 — the byte
     // sequence a wheel event delivers under SGR 1006 mouse reporting:

@@ -2376,3 +2376,119 @@ mod proptest_dispatch {
         });
     }
 }
+
+// ========================================================================
+// bd-3ar8v.4.8: typed opcode protocol + serializer equivalence residuals.
+// Complements the fast-path marshalling proptests in `proptest_dispatch`
+// by pinning the canonical fallback paths and serde round-trip stability.
+// ========================================================================
+
+mod hostcall_protocol_equivalence {
+    use super::*;
+
+    fn tool_read_payload() -> HostCallPayload {
+        HostCallPayload {
+            call_id: "call-equiv-1".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: serde_json::json!({ "name": "read", "input": { "path": "/tmp/a.rs" } }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn serializer_round_trip_preserves_opcode_resolution_and_lane_decision()
+    -> serde_json::Result<()> {
+        let payload = tool_read_payload();
+        let direct = resolve_hostcall_opcode(&payload).expect("direct resolution");
+        let lane_direct = select_hostcall_lane(&payload).expect("direct lane decision");
+
+        let serialized = serde_json::to_string(&payload).expect("payload serializes");
+        let round_tripped: HostCallPayload = serde_json::from_str(&serialized)?;
+        assert_eq!(round_tripped.call_id, payload.call_id);
+        assert_eq!(round_tripped.capability, payload.capability);
+        assert_eq!(round_tripped.method, payload.method);
+        assert_eq!(round_tripped.params, payload.params);
+        assert_eq!(round_tripped.context, payload.context);
+
+        let via_json = resolve_hostcall_opcode(&round_tripped).expect("round-trip resolution");
+        let lane_via_json = select_hostcall_lane(&round_tripped).expect("round-trip lane decision");
+        assert_eq!(direct, via_json);
+        assert_eq!(lane_direct, lane_via_json);
+
+        // A context-typed opcode must survive serialization identically.
+        let mut typed = tool_read_payload();
+        typed.context = hostcall_opcode_context_for_params("tool", &typed.params);
+        assert!(typed.context.is_some(), "tool read derives a typed context");
+        let typed_serialized = serde_json::to_string(&typed).expect("typed payload serializes");
+        let typed_round_tripped: HostCallPayload = serde_json::from_str(&typed_serialized)?;
+        assert_eq!(
+            select_hostcall_lane(&typed).expect("typed lane decision"),
+            select_hostcall_lane(&typed_round_tripped)
+                .expect("typed round-trip lane decision")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_context_opcode_code_is_rejected() {
+        let mut payload = tool_read_payload();
+        payload.context = Some(serde_json::json!({
+            "typed_opcode": {
+                "schema": HOSTCALL_OPCODE_SCHEMA_VERSION,
+                "version": HOSTCALL_OPCODE_VERSION,
+                "code": "tool.does_not_exist",
+            }
+        }));
+        let err = resolve_hostcall_opcode(&payload)
+            .expect_err("unknown opcode code must be rejected");
+        let rendered = format!("{err}");
+        assert!(
+            rendered.contains("Unknown host_call typed opcode code"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    #[test]
+    fn arena_without_opcode_uses_canonical_generic_path() {
+        let params = serde_json::json!({ "url": "https://example.invalid/pick" });
+        let artifacts = HostcallPayloadArena::new("http", &params, None).marshal();
+        assert_eq!(
+            artifacts.telemetry.path,
+            HOSTCALL_MARSHALLING_PATH_CANONICAL_GENERIC
+        );
+        assert!(artifacts.telemetry.fallback_reason.is_none());
+        assert_eq!(
+            artifacts.params_hash,
+            hostcall_params_hash("http", &params),
+            "generic path hash must equal the baseline computation"
+        );
+    }
+
+    #[test]
+    fn arena_shape_miss_falls_back_to_canonical_with_reason() {
+        // The ToolRead fast path requires exactly {"name", "input"}; anything
+        // else must miss the shape and fall back without hashing divergence.
+        let params = serde_json::json!({ "unexpected": true });
+        let artifacts =
+            HostcallPayloadArena::new("tool", &params, Some(CommonHostcallOpcode::ToolRead))
+                .marshal();
+        assert_eq!(
+            artifacts.telemetry.path,
+            HOSTCALL_MARSHALLING_PATH_CANONICAL_FALLBACK
+        );
+        assert_eq!(
+            artifacts.telemetry.fallback_reason.as_deref(),
+            Some(HOSTCALL_MARSHALLING_FALLBACK_OPCODE_SHAPE_MISS)
+        );
+
+        // The baseline hash stays deterministic across repeated marshals.
+        let again =
+            HostcallPayloadArena::new("tool", &params, Some(CommonHostcallOpcode::ToolRead))
+                .marshal();
+        assert_eq!(artifacts.params_hash, again.params_hash);
+        assert_eq!(artifacts.args_shape_hash, again.args_shape_hash);
+    }
+}
