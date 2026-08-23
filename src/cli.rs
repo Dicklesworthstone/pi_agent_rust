@@ -55,6 +55,7 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "__complete",
     "token",
     "stats",
+    "profile",
     "import",
     "grievances",
     "self-update",
