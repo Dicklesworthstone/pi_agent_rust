@@ -394,12 +394,19 @@ struct TranscriptEntry {
     role: EntryRole,
     text: String,
     /// Set for tool-execution cards; `None` renders as a plain role block.
+    /// Pairing key: the sanitized tool_id that ties ToolStart/ToolEnd/
+    /// ToolInvocation events to this card (stable even when the head text
+    /// is later replaced by an invocation summary).
     card: Option<CardState>,
+    pair_key: Option<String>,
     /// Folded result preview for tool cards (sanitized, size-capped).
     detail: Option<String>,
     /// Detail lines are diff content (edit/hashline_edit): style added and
     /// removed markers.
     diff_styled: bool,
+    /// Sanitized tool name (semantic identity: fold-by-tool, diff-styling
+    /// decisions); independent of the displayed head text.
+    tool_name: Option<String>,
     /// Grouped consecutive successful runs (read-tool-group parity):
     /// 1 = standalone.
     group_count: u32,
@@ -785,23 +792,26 @@ impl PiFtuiModel {
             role,
             text,
             card: None,
+            pair_key: None,
             detail: None,
             diff_styled: false,
+            tool_name: None,
             group_count: 1,
         });
     }
 
-    /// Push a pending tool-execution card; the matching [`PiMsg::ToolEnd`]
-    /// flips the LAST pending card with the same name in place. `name` is
-    /// already sanitized (single-sanitize contract: each event path
-    /// sanitizes exactly once so start/end forms always pair).
-    fn push_tool_card(&mut self, sanitized_name: &str) {
+    /// Push a pending tool-execution card keyed by the sanitized tool_id
+    /// (stable across head-text replacement by invocation summaries);
+    /// `display` is the sanitized initial head (the tool name).
+    fn push_tool_card(&mut self, pair_id: &str, display: &str, sanitized_name: &str) {
         self.transcript.push(TranscriptEntry {
             role: EntryRole::System,
-            text: sanitized_name.to_string(),
+            text: display.to_string(),
             card: Some(CardState::Pending),
+            pair_key: Some(pair_id.to_string()),
             detail: None,
             diff_styled: false,
+            tool_name: Some(sanitized_name.to_string()),
             group_count: 1,
         });
     }
@@ -821,18 +831,18 @@ impl PiFtuiModel {
 
     fn finish_tool_card(
         &mut self,
-        sanitized_name: &str,
+        sanitized_pair_id: &str,
+        display_name: &str,
         ok: bool,
         sanitized_output: Option<String>,
         diff_styled: bool,
     ) {
-        let pending_idx = self
-            .transcript
-            .iter()
-            .rposition(|e| e.card == Some(CardState::Pending) && e.text == sanitized_name);
+        let pending_idx = self.transcript.iter().rposition(|e| {
+            e.card == Some(CardState::Pending) && e.pair_key.as_deref() == Some(sanitized_pair_id)
+        });
         let Some(idx) = pending_idx else {
             let mark = if ok { "✓" } else { "✗" };
-            self.push_entry(EntryRole::System, format!("{mark} {sanitized_name}"));
+            self.push_entry(EntryRole::System, format!("{mark} {display_name}"));
             return;
         };
         self.transcript[idx].card = Some(if ok { CardState::Ok } else { CardState::Err });
@@ -844,7 +854,7 @@ impl PiFtuiModel {
         // successful read DIRECTLY following another successful read card
         // collapses into it with a ×N counter — agent turns batch many
         // reads, and one line per file drowns the transcript.
-        if ok && sanitized_name == "read" && idx > 0 {
+        if ok && display_name == "read" && idx > 0 {
             let prev = &self.transcript[idx - 1];
             if prev.card == Some(CardState::Ok) && prev.text == "read" {
                 self.transcript[idx - 1].group_count += 1;
@@ -859,12 +869,9 @@ impl PiFtuiModel {
     /// open bash card exists (caller falls back to a plain block).
     fn fold_bash_detail(&mut self, sanitized_display: &str) -> bool {
         const MAX_DETAIL_LINES: usize = 8;
-        let Some(entry) = self
-            .transcript
-            .iter_mut()
-            .rev()
-            .find(|e| e.card == Some(CardState::Pending) && e.text == "bash")
-        else {
+        let Some(entry) = self.transcript.iter_mut().rev().find(|e| {
+            e.card == Some(CardState::Pending) && e.pair_key.as_deref() == Some("ftui-bash")
+        }) else {
             return false;
         };
         let total = sanitized_display.lines().count();
@@ -914,24 +921,43 @@ impl PiFtuiModel {
             PiMsg::ThinkingDelta(delta) => {
                 self.thinking.push_str(&sanitize(&delta));
             }
-            PiMsg::ToolStart { name, .. } => {
+            PiMsg::ToolStart { name, tool_id, .. } => {
                 let name = sanitize(&name).into_owned();
+                // The card pairs on the sanitized tool_id; the head starts
+                // as the tool name and is later replaced by the invocation
+                // summary when one arrives.
+                let pair = sanitize(&tool_id).into_owned();
                 self.current_tool = Some(name.clone());
-                self.push_tool_card(&name);
+                self.push_tool_card(&pair, &name);
+            }
+            PiMsg::ToolInvocation { tool_id, summary } => {
+                // The invocation summary REPLACES the card head (omp
+                // renderCall description): pairing by tool_id is immune to
+                // the text change.
+                let pair = sanitize(&tool_id).into_owned();
+                let summary = sanitize(&summary).into_owned();
+                if let Some(entry) = self.transcript.iter_mut().rev().find(|e| {
+                    e.card == Some(CardState::Pending)
+                        && e.pair_key.as_deref() == Some(pair.as_str())
+                }) {
+                    entry.text = summary;
+                }
             }
             PiMsg::ToolEnd {
                 name,
+                tool_id,
                 is_error,
                 output,
                 ..
             } => {
                 // The tool card flips to its terminal state in place
-                // (bd-cv653.9.2 card framework). Sanitize ONCE here,
-                // matching ToolStart, so start/end names always pair.
+                // (bd-cv653.9.2 card framework). Sanitize ONCE per field,
+                // matching ToolStart, so start/end always pair.
                 let name = sanitize(&name).into_owned();
+                let pair = sanitize(&tool_id).into_owned();
                 let output = output.map(|o| sanitize(&o).into_owned());
                 let diff_styled = matches!(name.as_str(), "edit" | "hashline_edit");
-                self.finish_tool_card(&name, !is_error, output, diff_styled);
+                self.finish_tool_card(&pair, &name, !is_error, output, diff_styled);
                 self.current_tool = None;
             }
             PiMsg::TodoSummary { summary } => {
@@ -1948,11 +1974,24 @@ pub fn agent_event_to_pi_msgs(event: &crate::agent::AgentEvent) -> Vec<PiMsg> {
         E::ToolExecutionStart {
             tool_call_id,
             tool_name,
+            args,
             ..
-        } => vec![PiMsg::ToolStart {
-            name: tool_name.clone(),
-            tool_id: tool_call_id.clone(),
-        }],
+        } => {
+            let mut msgs = vec![PiMsg::ToolStart {
+                name: tool_name.clone(),
+                tool_id: tool_call_id.clone(),
+            }];
+            // The per-tool registry (tool_invocation_summary) derives the
+            // human head ("Bash: cargo test", "Read src/main.rs") from the
+            // args; absent a derivable summary the card keeps the name.
+            if let Some(summary) = crate::interactive::tool_invocation_summary(tool_name, args) {
+                msgs.push(PiMsg::ToolInvocation {
+                    tool_id: tool_call_id.clone(),
+                    summary,
+                });
+            }
+            msgs
+        }
         E::ToolExecutionEnd {
             tool_call_id,
             tool_name,

@@ -468,7 +468,7 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
 /// derived from its arguments (the bash command line, the file path, the
 /// search pattern, ...). Returns `None` for tools without an obvious
 /// one-line summary.
-fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
