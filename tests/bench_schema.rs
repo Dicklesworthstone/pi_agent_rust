@@ -7406,6 +7406,68 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when a foreign-correlation source row is present"
+    );
+
+    let results_dir = temp_root.join("run/results");
+    let matrix: Value = serde_json::from_str(
+        &fs::read_to_string(results_dir.join("phase1_matrix_validation.json"))
+            .expect("read phase1 matrix artifact"),
+    )
+    .expect("parse phase1 matrix artifact");
+    let scenario_dataset = matrix["source_datasets"]
+        .as_array()
+        .and_then(|datasets| {
+            datasets.iter().find(|dataset| {
+                dataset["correlation_field"].as_str() == Some("orchestration_correlation_id")
+            })
+        })
+        .expect("phase1 scenario source dataset");
+    assert!(
+        scenario_dataset["accepted_record_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the current-correlation control rows must remain admissible"
+    );
+    assert_eq!(
+        scenario_dataset["rejected_record_count"].as_u64(),
+        Some(1),
+        "the single foreign-correlation mutation must be rejected"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false),
+        "mixed lineage must fail the phase1 consumption contract closed"
+    );
+
+    let contract: Value = serde_json::from_str(
+        &fs::read_to_string(results_dir.join("post_generation_evidence_contract.json"))
+            .expect("read post-generation contract"),
+    )
+    .expect("parse post-generation contract");
+    assert_eq!(contract["status"].as_str(), Some("blocked"));
+    assert!(
+        contract["failures"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["reason"].as_str() == Some("mixed_source_lineage")
+                    && failure["source_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("scenario_runner.jsonl"))
+            })
+        }),
+        "post-generation validation must identify the mixed scenario lineage"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_INDEX_STAGE_SAMPLE", "1")]);

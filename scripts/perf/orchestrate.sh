@@ -184,7 +184,8 @@ run_budget_preflight() {
     --expected-correlation-id "$CORRELATION_ID"
     --skip-rch-check
   )
-  python3 "$SCRIPT_DIR/preflight_budget_inputs.py" "${args[@]}" "$@" > "$output_path"
+  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+    python3 "$SCRIPT_DIR/preflight_budget_inputs.py" "${args[@]}" "$@" > "$output_path"
 }
 
 run_artifact_staging_manifest() {
@@ -994,6 +995,8 @@ run_test_suite() {
   PERF_REGRESSION_OUTPUT="$result_dir" \
   PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
   CI_CORRELATION_ID="$CORRELATION_ID" \
+  VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+  VERGEN_GIT_DIRTY="$GIT_DIRTY" \
   RUST_TEST_THREADS="$PARALLELISM" \
     "${CARGO_RUNNER_ARGS[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
     >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \

@@ -1240,9 +1240,37 @@ fn ext_bench_harness() {
     std::fs::create_dir_all(&out_dir).expect("create extension benchmark output dir");
 
     let jsonl_path = out_dir.join("ext_bench_harness.jsonl");
+    let correlation_id = std::env::var("CI_CORRELATION_ID")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let source_commit = std::env::var("VERGEN_GIT_SHA")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let source_dirty = std::env::var("VERGEN_GIT_DIRTY").as_deref() != Ok("false");
+    let generated_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     let jsonl: String = all_results
         .iter()
-        .filter_map(|r| serde_json::to_string(r).ok())
+        .filter_map(|result| {
+            let mut value = serde_json::to_value(result).ok()?;
+            let record = value.as_object_mut()?;
+            record.insert("timestamp".to_string(), Value::String(generated_at.clone()));
+            record.insert(
+                "run_id".to_string(),
+                correlation_id.clone().map_or(Value::Null, Value::String),
+            );
+            record.insert(
+                "correlation_id".to_string(),
+                correlation_id.clone().map_or(Value::Null, Value::String),
+            );
+            record.insert(
+                "source_commit".to_string(),
+                source_commit.clone().map_or(Value::Null, Value::String),
+            );
+            record.insert("source_dirty".to_string(), Value::Bool(source_dirty));
+            serde_json::to_string(&value).ok()
+        })
         .collect::<Vec<_>>()
         .join("\n");
     std::fs::write(&jsonl_path, format!("{jsonl}\n")).expect("write JSONL");
