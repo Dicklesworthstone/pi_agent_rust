@@ -122,6 +122,7 @@ files = [
     "release_evidence_ledger",
     "nrun_evidence_protocol",
     "sequential_budget_gate",
+    "perf_drift_watch",
     "checkpoint",
     "eval",
     "url_router",

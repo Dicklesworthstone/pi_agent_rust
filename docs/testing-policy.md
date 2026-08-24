@@ -935,4 +935,32 @@ For each sample $X_i$ with standardized relative margin $z_i = \frac{T - X_i}{\s
 - **Evaluator Tool**: `examples/sequential_budget_gate.rs`
 - **Verification Gate**: `tests/sequential_budget_gate.rs`
 
+## Performance Budget Regime Drift Watch (RI-DRIFT, DROPIN-R19)
+
+### Purpose & Early Warning Principle
+
+Performance regressions rarely appear instantly without warning; they often exhibit persistent slow creep (e.g. binary size creeping toward 48 MiB) or sudden discrete regime changes across dependency updates. The regime drift monitor runs two complementary statistical detectors over historical budget time-series:
+
+1. **Two-Sided CUSUM (Cumulative Sum)**:
+   - Tracks standardized deviations $z_i = \frac{X_i - \bar{\mu}}{\sigma}$ against allowance parameter $k = 0.5\sigma$.
+   - Positive drift accumulator: $S_n^+ = \max(0, S_{n-1}^+ + z_n - k)$.
+   - Negative drift accumulator: $S_n^- = \max(0, S_{n-1}^- - z_n - k)$.
+   - Alarms when $S_n^+ \ge h = 4.0\sigma$ or $S_n^- \ge h$, indicating steady multi-run drift before gates fail.
+
+2. **Bayesian Online Changepoint Detection (BOCPD)**:
+   - Models run-length probability $P(r_t | x_{1:t})$ with constant hazard function $H(r) = \frac{1}{\lambda}$ ($\lambda = 50$).
+   - Calculates changepoint posterior probability $P(r_t = 0 | x_t) = \frac{H}{H + (1-H) L_{\text{same}}}$.
+   - Alarms when $P(r_t = 0) \ge 0.5$, detecting immediate step-function regime shifts.
+
+3. **Zero Mutation & Advisory Status**:
+   - The detector is purely read-only and advisory, outputting `pi.perf.drift_watch.v1` artifacts consumed by preflight and runpack tools with zero side effects on scheduler, git, or beads state.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/drift-watch-contract.json` (`pi.perf.drift_watch.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/perf-drift-watch.json` (`pi.perf.drift_watch.v1`)
+- **Evaluator Tool**: `examples/perf_drift_watch.rs`
+- **Verification Gate**: `tests/perf_drift_watch.rs`
+
+
 

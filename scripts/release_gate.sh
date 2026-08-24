@@ -4485,6 +4485,72 @@ else
     check_fail "sequential_budget_gate" "sequential gate contract or evidence file missing"
 fi
 
+# Gate 13d: Performance Budget Regime Drift Watch (RI-DRIFT)
+DRIFT_CONTRACT="$PROJECT_ROOT/docs/contracts/drift-watch-contract.json"
+DRIFT_EVIDENCE="$PROJECT_ROOT/docs/evidence/perf-drift-watch.json"
+
+if [ -f "$DRIFT_CONTRACT" ] && [ -f "$DRIFT_EVIDENCE" ]; then
+    if DRIFT_CHECK=$(python3 - "$DRIFT_CONTRACT" "$DRIFT_EVIDENCE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+
+try:
+    with open(contract_path) as f:
+        contract = json.load(f)
+    with open(evidence_path) as f:
+        evidence = json.load(f)
+except Exception as e:
+    print(f"invalid:{e}")
+    sys.exit(0)
+
+if contract.get("schema") != "pi.perf.drift_watch.contract.v1":
+    print("invalid:contract schema mismatch")
+    sys.exit(0)
+
+if evidence.get("schema") != "pi.perf.drift_watch.v1":
+    print("invalid:evidence schema mismatch")
+    sys.exit(0)
+
+analyses = evidence.get("analyses", [])
+if not analyses:
+    print("invalid:empty analyses in drift watch evidence")
+    sys.exit(0)
+
+for an in analyses:
+    status = an.get("drift_status")
+    if status not in ["HEALTHY", "DRIFT_WARNING", "REGIME_SHIFT", "CRITICAL_DRIFT"]:
+        print(f"invalid:unknown status {status} for {an.get('budget_name')}")
+        sys.exit(0)
+
+overall = evidence.get("overall_status")
+print(f"ok:{len(analyses)}:{overall}")
+PY
+); then
+        case "$DRIFT_CHECK" in
+            ok:*)
+                DRIFT_INFO="${DRIFT_CHECK#ok:}"
+                BUDGET_CNT="${DRIFT_INFO%%:*}"
+                OVERALL_ST="${DRIFT_INFO##*:}"
+                check_pass "perf_drift_watch" "monitored $BUDGET_CNT performance budgets (status: $OVERALL_ST, CUSUM+BOCPD)"
+                ;;
+            invalid:*)
+                check_fail "perf_drift_watch" "perf drift watch check failed (${DRIFT_CHECK#invalid:})"
+                ;;
+            *)
+                check_fail "perf_drift_watch" "unexpected drift check output: $DRIFT_CHECK"
+                ;;
+        esac
+    else
+        check_fail "perf_drift_watch" "perf drift watch evaluation failed: $DRIFT_CHECK"
+    fi
+else
+    check_fail "perf_drift_watch" "drift watch contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'

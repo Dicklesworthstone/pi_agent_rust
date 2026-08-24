@@ -171,6 +171,10 @@ name = "sequential_budget_gate"
 path = "examples/sequential_budget_gate.rs"
 
 [[example]]
+name = "perf_drift_watch"
+path = "examples/perf_drift_watch.rs"
+
+[[example]]
 name = "session_workload_bench"
 path = "examples/session_workload_bench.rs"
 

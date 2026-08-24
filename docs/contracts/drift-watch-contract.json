@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "pi.perf.drift_watch.contract.v1",
+  "contract_id": "pi.contract.drift_watch.v1",
+  "title": "Performance Budget Regime Drift & Shift Watch Contract",
+  "version": "1.0.0",
+  "bead_id": "bd-sog97.14",
+  "policy_owner_role": "Release Engineering",
+  "created_at": "2026-08-24T00:11:21Z",
+  "status": "enforced",
+  "description": "Monitors historical performance budget time-series for persistent drift (via CUSUM) and sudden regime changes (via BOCPD), emitting advisory warnings before budget failure gates trip.",
+  "detector_parameters": {
+    "cusum_k": 0.5,
+    "cusum_h": 4.0,
+    "bocpd_hazard_lambda": 50.0,
+    "bocpd_changepoint_threshold": 0.5,
+    "min_baseline_samples": 5
+  },
+  "drift_statuses": [
+    "HEALTHY",
+    "DRIFT_WARNING",
+    "REGIME_SHIFT",
+    "CRITICAL_DRIFT"
+  ],
+  "monitored_budgets": [
+    "startup_version_p95",
+    "binary_size_mb",
+    "context_graph_build_cold_p95",
+    "runtime_intelligence_eval_p95",
+    "ext_cold_load_simple_p95",
+    "tool_call_latency_mean"
+  ]
+}
