@@ -202,6 +202,7 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             };
             Box::new(pi::tools::LearnTool::new(std::sync::Arc::new(store)))
         }
+        "manage_skill" => Box::new(pi::tools::ManageSkillTool),
         "submit_plan" => {
             let state = pi::plan::PlanState::new();
             let initial_mode = case

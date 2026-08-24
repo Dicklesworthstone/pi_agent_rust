@@ -1,0 +1,56 @@
+{
+  "version": "1.0",
+  "tool": "manage_skill",
+  "description": "ManageSkillTool contract for bd-cv653.4.2 and bd-cv653.8.1: read-only managed-tier discovery, required-name validation, and stable operation taxonomy without mutating user-authored skills.",
+  "cases": [
+    {
+      "name": "manage_skill_lists_the_managed_tier",
+      "description": "listing is a read-only happy path whose envelope is stable whether the isolated tier is empty or populated",
+      "requirement_ids": [
+        "MANAGE-SKILL-LIST-1"
+      ],
+      "input": {
+        "op": "list"
+      },
+      "expected": {
+        "content_regex": "(?s).+",
+        "details_exact": {
+          "schema": "pi.managed_skill.v1"
+        }
+      }
+    },
+    {
+      "name": "manage_skill_create_requires_a_name",
+      "description": "the create boundary refuses a missing name before any filesystem mutation",
+      "requirement_ids": [
+        "MANAGE-SKILL-VALIDATION-1"
+      ],
+      "input": {
+        "op": "create",
+        "description": "fixture draft",
+        "content": "fixture body"
+      },
+      "expected": {
+        "content_contains": [
+          "manage_skill create requires name"
+        ]
+      }
+    },
+    {
+      "name": "manage_skill_rejects_unknown_operations",
+      "description": "an unknown operation returns the complete stable operation taxonomy without touching the managed tier",
+      "requirement_ids": [
+        "MANAGE-SKILL-ERR-1"
+      ],
+      "input": {
+        "op": "publish"
+      },
+      "expected": {
+        "content_contains": [
+          "Unknown manage_skill op 'publish'",
+          "expected create, update, delete, or list"
+        ]
+      }
+    }
+  ]
+}

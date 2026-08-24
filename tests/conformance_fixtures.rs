@@ -193,6 +193,7 @@ fixture_test!(test_recall_fixtures, "recall_tool");
 fixture_test!(test_memory_edit_fixtures, "memory_edit_tool");
 fixture_test!(test_reflect_fixtures, "reflect_tool");
 fixture_test!(test_learn_fixtures, "learn_tool");
+fixture_test!(test_manage_skill_fixtures, "manage_skill_tool");
 fixture_test!(test_submit_plan_fixtures, "submit_plan_tool");
 fixture_test!(test_security_scan_fixtures, "security_scan_tool");
 
@@ -257,6 +258,7 @@ fn test_all_fixtures_exist() {
         "memory_edit_tool",
         "reflect_tool",
         "learn_tool",
+        "manage_skill_tool",
         "submit_plan_tool",
         "security_scan_tool",
     ];
