@@ -49,6 +49,68 @@ impl pi::provider::Provider for FixtureReflectProvider {
     }
 }
 
+/// Test-only adapter around the real `pi stats` aggregation and rendering
+/// modules. Stats is a CLI surface rather than an agent Tool, so this keeps it
+/// in the same fixture/logging harness without adding a production tool.
+struct FixtureStatsTool {
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Tool for FixtureStatsTool {
+    fn name(&self) -> &str {
+        "stats"
+    }
+
+    fn label(&self) -> &str {
+        "stats"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic adapter for the pi stats CLI surface"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::read()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let string_field = |name: &str| input.get(name).and_then(Value::as_str).map(str::to_string);
+        let files = pi::stats::collect_session_files(
+            &self.cwd.join("sessions"),
+            input.get("project").and_then(Value::as_str),
+        );
+        let report = pi::stats::aggregate(
+            &files,
+            &pi::stats::StatsFilter {
+                since: string_field("since"),
+                until: string_field("until"),
+                provider: string_field("provider"),
+                model: string_field("model"),
+            },
+        );
+        let text = match input.get("format").and_then(Value::as_str) {
+            Some("json") => serde_json::to_string_pretty(&report)?,
+            Some("markdown" | "md") => pi::stats::render_markdown(&report),
+            _ => pi::stats::render_text(&report),
+        };
+        Ok(pi::tools::ToolOutput {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            details: Some(serde_json::to_value(&report)?),
+            is_error: false,
+        })
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -139,6 +201,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "jobs" => Box::new(pi::tools::JobsTool),
         "hub" => Box::new(pi::tools::HubTool::new(temp_dir.path())),
         "eval" => Box::new(pi::eval::EvalTool::new(temp_dir.path())),
+        "stats" => Box::new(FixtureStatsTool {
+            cwd: temp_dir.path().to_path_buf(),
+        }),
         "github" => {
             #[cfg(unix)]
             let gh_path = "/bin/sh";

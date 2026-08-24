@@ -31,6 +31,7 @@ from preflight_budget_inputs import (
     inspect_direct_artifact,
     iso_now,
     load_evidence_cache_entries,
+    parse_utc_timestamp,
     read_json,
     resolve_cache_dir,
     resolve_target_dir,
@@ -603,6 +604,7 @@ def run_self_test() -> int:
             "cache_profile": "perf",
             "cache_ttl_hours": 24.0,
             "run_id": "self-test-run",
+            "expected_correlation_id": None,
             "update_evidence_cache": update_cache,
         }
 
@@ -715,6 +717,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--run-id", help="Run/correlation ID to store when updating the evidence cache.")
     parser.add_argument(
+        "--expected-correlation-id",
+        help="When set, embedded correlation_id (or run_id fallback) must match this value.",
+    )
+    parser.add_argument(
         "--update-evidence-cache",
         action="store_true",
         help="Copy present direct artifacts into the evidence cache and refresh index.json.",
@@ -762,6 +768,8 @@ def main(argv: list[str]) -> int:
         or "perf",
         cache_ttl_hours=args.cache_ttl_hours,
         run_id=args.run_id or run_id_from_env(),
+        expected_correlation_id=args.expected_correlation_id
+        or os.environ.get("PI_PERF_EXPECTED_CORRELATION_ID"),
         update_evidence_cache=args.update_evidence_cache,
     )
     text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"

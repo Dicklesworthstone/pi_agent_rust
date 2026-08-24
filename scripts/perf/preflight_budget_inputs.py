@@ -1773,6 +1773,132 @@ def run_self_test() -> int:
             encoding="utf-8",
         )
 
+    provenance_root = Path(tempfile.mkdtemp(prefix="pi-perf-direct-provenance-"))
+    provenance_now = utc_now()
+    fresh_timestamp = provenance_now.isoformat().replace("+00:00", "Z")
+    expected_commit = "a" * 40
+    expected_correlation = "allowed-run"
+
+    stale_embedded = provenance_root / "stale.json"
+    stale_embedded.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": "2000-01-01T00:00:00Z",
+                "run_id": expected_correlation,
+                "correlation_id": expected_correlation,
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_inspection = inspect_direct_artifact(
+        stale_embedded,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert stale_inspection["is_fresh"] is False, stale_inspection
+    assert stale_inspection["freshness_reason"] == "embedded_timestamp_stale", (
+        stale_inspection
+    )
+    assert stale_inspection["mtime_age_hours"] < 1.0, stale_inspection
+
+    fresh_embedded = provenance_root / "fresh.json"
+    fresh_embedded.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": fresh_timestamp,
+                "source_commit": expected_commit,
+                "source_dirty": False,
+                "run_id": "timestamp-derived-run-id",
+                "correlation_id": expected_correlation,
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_mtime = provenance_now.timestamp() - (48.0 * 3600.0)
+    os.utime(fresh_embedded, (old_mtime, old_mtime))
+    fresh_inspection = inspect_direct_artifact(
+        fresh_embedded,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert fresh_inspection["is_fresh"] is True, fresh_inspection
+    assert fresh_inspection["freshness_basis"] == "embedded_timestamp", fresh_inspection
+    assert fresh_inspection["mtime_age_hours"] > 24.0, fresh_inspection
+
+    mutation_cases = (
+        ("wrong-commit", {"source_commit": "b" * 40}, "source_commit_mismatch"),
+        ("dirty", {"source_dirty": True}, "source_dirty_not_false"),
+        (
+            "wrong-correlation",
+            {"correlation_id": "different-run"},
+            "correlation_id_mismatch",
+        ),
+        (
+            "malformed-time",
+            {"generated_at": "definitely-not-a-timestamp"},
+            "malformed_embedded_timestamp",
+        ),
+    )
+    base_payload = json.loads(fresh_embedded.read_text(encoding="utf-8"))
+    for name, mutation, expected_failure in mutation_cases:
+        path = provenance_root / f"{name}.json"
+        payload = {**base_payload, **mutation}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        inspection = inspect_direct_artifact(
+            path,
+            24.0,
+            provenance_now,
+            expected_git_commit=expected_commit,
+            expected_correlation_id=expected_correlation,
+        )
+        assert inspection["is_fresh"] is False, inspection
+        assert expected_failure in inspection["freshness_failures"], inspection
+
+    mixed_jsonl = provenance_root / "mixed.jsonl"
+    mixed_jsonl.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "schema": "pi.perf.workload.v1",
+                    "timestamp": timestamp,
+                    "source_commit": expected_commit,
+                    "source_dirty": False,
+                    "run_id": expected_correlation,
+                    "correlation_id": expected_correlation,
+                }
+            )
+            for timestamp in (fresh_timestamp, "2000-01-01T00:00:00Z")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    mixed_inspection = inspect_direct_artifact(
+        mixed_jsonl,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert mixed_inspection["is_fresh"] is False, mixed_inspection
+    assert mixed_inspection["freshness_reason"] == "embedded_timestamp_stale", (
+        mixed_inspection
+    )
+
+    criterion_json = provenance_root / "estimates.json"
+    criterion_json.write_text('{"mean":{"point_estimate":1000.0}}\n', encoding="utf-8")
+    binary = provenance_root / "pi"
+    binary.write_bytes(b"binary")
+    for path in (criterion_json, binary):
+        inspection = inspect_direct_artifact(path, 24.0, provenance_now)
+        assert inspection["is_fresh"] is True, inspection
+        assert inspection["freshness_basis"] == "filesystem_mtime", inspection
+
     ok_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-ok-"))
     write_fixture(ok_root, include_policy=True)
     ok_code, ok_payload = build_report(build_args(ok_root))

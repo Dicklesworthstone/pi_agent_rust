@@ -326,10 +326,10 @@ impl Accumulator {
                 add_tokens(&mut self.tokens, &tokens);
                 self.cost += cost;
 
-                let key = (
-                    msg.provider.unwrap_or_else(|| "unknown".into()),
-                    msg.model.unwrap_or_else(|| "unknown".into()),
-                );
+                let provider = msg.provider.unwrap_or_else(|| "unknown".into());
+                let model = msg.model.unwrap_or_else(|| "unknown".into());
+                self.last_provider_model = Some((provider.clone(), model.clone()));
+                let key = (provider, model);
                 *self.pm_messages.entry(key.clone()).or_insert(0) += 1;
                 add_tokens(self.pm_tokens.entry(key.clone()).or_default(), &tokens);
                 *self.pm_cost.entry(key).or_default() += cost;
