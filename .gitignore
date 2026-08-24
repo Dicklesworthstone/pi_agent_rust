@@ -289,3 +289,13 @@ storage.sqlite3-wal.corrupt-*
 .env
 agy.mcp.json
 factory.mcp.json
+
+# Crash-recovery / merge debris (must-pass source snapshot gate hygiene)
+*.orig
+*.rej
+*.root_full_recovery
+*.empty_recovery
+
+# Large ad-hoc fixture drops under ext conformance artifacts
+tests/ext_conformance/artifacts/doom-overlay/doom1.wad
+tests/ext_conformance/artifacts/doom-overlay/doom-debug.log
