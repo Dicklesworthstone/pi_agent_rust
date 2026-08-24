@@ -59,6 +59,8 @@ const ROOT_SUBCOMMANDS: &[&str] = &[
     "import",
     "grievances",
     "self-update",
+    "web",
+    "gallery",
 ];
 
 fn known_long_option(name: &str) -> Option<LongOptionSpec> {
@@ -2441,6 +2443,13 @@ pub enum Commands {
         /// Maximum concurrent connected web viewers (default: 4)
         #[arg(long, default_value_t = 4)]
         max_viewers: usize,
+    },
+
+    /// Visual component gallery harness (bd-cv653.9.10)
+    Gallery {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
     },
 
     Migrate {
