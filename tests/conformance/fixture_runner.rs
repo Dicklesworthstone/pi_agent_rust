@@ -96,6 +96,18 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "jobs" => Box::new(pi::tools::JobsTool),
         "hub" => Box::new(pi::tools::HubTool::new(temp_dir.path())),
         "eval" => Box::new(pi::eval::EvalTool::new(temp_dir.path())),
+        "retain" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::RetainTool::new(std::sync::Arc::new(store)))
+        }
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
