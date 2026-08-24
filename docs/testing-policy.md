@@ -1018,6 +1018,28 @@ To ensure shipping releases satisfy performance claims without regression or mea
 - **Evaluator Tool**: `examples/startup_benchmark_runner.rs`
 - **Verification Gate**: `tests/startup_benchmark.rs`
 
+## Performance Benchmark Variance Gating & Host Topology Fingerprints (RI-VARGATE, DROPIN-R17)
+
+### Noise Score Rejection & NO_DATA Invariant
+
+To ensure benchmark integrity and prevent noisy host environments from producing invalid compliance:
+1. **Noise Score Calculation**:
+   - Measures governor mode, CPU turbo boost, transparent huge pages (THP), and address space layout randomization (ASLR).
+   - Scoring: governor != performance (+3), turbo enabled (+2), THP != never (+1), ASLR enabled (+1). Range: 0 (optimal) to 7 (worst).
+2. **Rejection Policy**:
+   - Inputs with `noise_score > max_admissible_noise_score` (default $\le 0$ for strict CI, $\le 3$ for developer runs) are **rejected as `NO_DATA`**.
+   - **Forbid Averaging into Compliance**: Noisy runs are strictly forbidden from being averaged with clean runs to satisfy budgets.
+3. **Host Topology Fingerprint**:
+   - Mandates embedding `pi.perf.host_topology_fingerprint.v1` alongside all performance measurement artifacts.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/variance-gating-contract.json` (`pi.perf.variance_gating.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/variance-gate-evaluations.json` (`pi.perf.variance_gate_report.v1`)
+- **Evaluator Tool**: `examples/variance_gate.rs`
+- **Verification Gate**: `tests/variance_gating.rs`
+
+
 
 
 

@@ -15,6 +15,9 @@
     "bootstrap_resamples": 1000,
     "require_distinct_correlation_ids": true,
     "max_allowed_noise_score": 15,
+    "require_host_topology_fingerprint": true,
+    "host_topology_schema": "pi.perf.host_topology_fingerprint.v1",
+    "variance_gating_contract": "docs/contracts/variance-gating-contract.json",
     "decision_rules": {
       "maximum_budget": "ci_95_upper <= threshold",
       "minimum_budget": "ci_95_lower >= threshold"

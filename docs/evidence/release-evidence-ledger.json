@@ -1,9 +1,9 @@
 {
   "schema": "pi.release_evidence.ledger.v1",
-  "generated_at": "2026-08-24T10:12:22.384915+00:00",
+  "generated_at": "2026-08-24T12:35:49.709446+00:00",
   "contract_path": "docs/contracts/release-evidence-ledger-contract.json",
-  "head_hash": "491754093d9c24601ac7148fee41291c8aae53c693cada1c34614a04b45ef83c",
-  "entry_count": 58,
+  "head_hash": "b54cb188d2f5a1e460dd559003ff079cd4a1d2fe53fd9626dd15313c0fc0ced3",
+  "entry_count": 59,
   "entries": [
     {
       "index": 0,
@@ -634,19 +634,30 @@
     },
     {
       "index": 57,
+      "path": "docs/evidence/variance-gate-evaluations.json",
+      "sha256": "16f19f075c36b25e998db1ea864290ec12c26a7e60a084342ec2322c967c0c0b",
+      "correlation_id": null,
+      "source_commit": null,
+      "owning_bead": "bd-sog97",
+      "schema": "pi.perf.variance_gate_report.v1",
+      "prev_hash": "f6d7d7496511864060ec3ec968e349ab3f0a215125ad2caf46071a723fbeeb97",
+      "entry_hash": "79378410361a048986a5ef00eee3d3f2edaa942eca75622199c92e1289f115d3"
+    },
+    {
+      "index": 58,
       "path": "docs/evidence/waivers.json",
       "sha256": "245a69851cc67b7948f68f5b75b9e69bd86ae528e320a22a5f252101b745050f",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.waiver.ledger.v1",
-      "prev_hash": "f6d7d7496511864060ec3ec968e349ab3f0a215125ad2caf46071a723fbeeb97",
-      "entry_hash": "491754093d9c24601ac7148fee41291c8aae53c693cada1c34614a04b45ef83c"
+      "prev_hash": "79378410361a048986a5ef00eee3d3f2edaa942eca75622199c92e1289f115d3",
+      "entry_hash": "b54cb188d2f5a1e460dd559003ff079cd4a1d2fe53fd9626dd15313c0fc0ced3"
     }
   ],
   "summary": {
-    "total_artifacts": 58,
-    "verified_intact": 58,
+    "total_artifacts": 59,
+    "verified_intact": 59,
     "missing_artifacts": 0,
     "sha_mismatches": 0
   }

@@ -4706,6 +4706,92 @@ else
     check_fail "startup_benchmark" "startup contract or evidence file missing"
 fi
 
+# Gate 13g: Performance Benchmark Variance Gating & Host Topology Fingerprint (RI-VARGATE)
+VARIANCE_CONTRACT="$PROJECT_ROOT/docs/contracts/variance-gating-contract.json"
+VARIANCE_EVIDENCE="$PROJECT_ROOT/docs/evidence/variance-gate-evaluations.json"
+
+if [ -f "$VARIANCE_CONTRACT" ] && [ -f "$VARIANCE_EVIDENCE" ]; then
+    if VARIANCE_CHECK=$(python3 - "$VARIANCE_CONTRACT" "$VARIANCE_EVIDENCE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+
+try:
+    with open(contract_path) as f:
+        contract = json.load(f)
+    with open(evidence_path) as f:
+        evidence = json.load(f)
+except Exception as e:
+    print(f"invalid:{e}")
+    sys.exit(0)
+
+if contract.get("schema") != "pi.perf.variance_gating.contract.v1":
+    print("invalid:contract schema mismatch")
+    sys.exit(0)
+
+if evidence.get("schema") != "pi.perf.variance_gate_report.v1":
+    print("invalid:evidence schema mismatch")
+    sys.exit(0)
+
+results = evidence.get("results", [])
+if not results:
+    print("invalid:empty results in variance gate evidence")
+    sys.exit(0)
+
+max_noise = evidence.get("max_admissible_noise_score", 0)
+
+for r in results:
+    env = r.get("environment", {})
+    if env.get("schema") != "pi.perf.host_topology_fingerprint.v1":
+        print(f"invalid:budget {r.get('budget_name')} missing valid host topology schema")
+        sys.exit(0)
+    
+    noise_score = env.get("noise_score", 0)
+    status = r.get("gate_status")
+    
+    if noise_score > max_noise:
+        if status != "REJECTED_NO_DATA":
+            print(f"invalid:noisy budget {r.get('budget_name')} was not REJECTED_NO_DATA")
+            sys.exit(0)
+        if r.get("empirical_value") is not None:
+            print(f"invalid:noisy budget {r.get('budget_name')} was averaged into compliance")
+            sys.exit(0)
+    else:
+        if status != "ACCEPTED":
+            print(f"invalid:clean budget {r.get('budget_name')} was rejected")
+            sys.exit(0)
+
+accepted = evidence.get("accepted_count", 0)
+rejected = evidence.get("rejected_noise_count", 0)
+print(f"ok:{len(results)}:{accepted}:{rejected}")
+PY
+); then
+        case "$VARIANCE_CHECK" in
+            ok:*)
+                VARIANCE_INFO="${VARIANCE_CHECK#ok:}"
+                TOTAL_EVAL="${VARIANCE_INFO%%:*}"
+                REMAINDER="${VARIANCE_INFO#*:}"
+                ACCEPTED="${REMAINDER%%:*}"
+                REJECTED="${REMAINDER##*:}"
+                check_pass "variance_gate" "evaluated $TOTAL_EVAL budgets with variance gating (accepted $ACCEPTED clean, rejected $REJECTED noisy runs as NO_DATA)"
+                ;;
+            invalid:*)
+                check_fail "variance_gate" "variance gate check failed (${VARIANCE_CHECK#invalid:})"
+                ;;
+            *)
+                check_fail "variance_gate" "unexpected variance gate check output: $VARIANCE_CHECK"
+                ;;
+        esac
+    else
+        check_fail "variance_gate" "variance gate evaluation failed: $VARIANCE_CHECK"
+    fi
+else
+    check_fail "variance_gate" "variance gate contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'
