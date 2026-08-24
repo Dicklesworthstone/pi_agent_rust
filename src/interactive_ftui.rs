@@ -776,6 +776,7 @@ impl PiFtuiModel {
             term: (80, 24),
             scroll_from_tail: 0,
             agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
+
             alt_screen: false,
             suspending: false,
             input: TextArea::new()
