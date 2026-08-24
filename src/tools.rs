@@ -8958,6 +8958,519 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
     (state.output, state.first_changed_line)
 }
 
+/// Outcome of the shared unique-replacement core.
+struct TextReplacementOutcome {
+    /// BOM-restored content ready to persist.
+    final_content: String,
+    /// LF-normalized pre-edit content (diff input).
+    before_normalized: String,
+    /// LF-normalized post-edit content (diff input).
+    after_normalized: String,
+}
+
+/// Shared text-replacement core for local and `ssh://` edits
+/// (bd-cv653.6.5): exactly one fuzzy-unique match of `old_text` replaced
+/// with `new_text`, preserving BOM, line endings, and unmatched bytes
+/// verbatim. Local edits feed the result through atomic-replace with a CAS
+/// expectation; remote edits stage the result atomically over ssh.
+fn apply_unique_text_replacement(
+    raw: &[u8],
+    old_text: &str,
+    new_text: &str,
+    display_path: &str,
+    tool: &'static str,
+) -> Result<TextReplacementOutcome> {
+    let raw_content = String::from_utf8(raw.to_vec()).map_err(|_| {
+        Error::tool(
+            tool,
+            "File contains invalid UTF-8 characters and cannot be safely edited as text."
+                .to_string(),
+        )
+    })?;
+
+    // Strip BOM before matching (LLM won't include invisible BOM in oldText).
+    let (content_no_bom, had_bom) = strip_bom(&raw_content);
+
+    let original_ending = detect_line_ending(content_no_bom);
+    let normalized_content = normalize_to_lf(content_no_bom);
+    let content_for_matching =
+        if content_no_bom.contains('\r') && !content_no_bom.contains('\n') {
+            std::borrow::Cow::Owned(content_no_bom.replace('\r', "\n"))
+        } else {
+            std::borrow::Cow::Borrowed(content_no_bom)
+        };
+    let normalized_old_text = normalize_to_lf(old_text);
+
+    if normalized_old_text.is_empty() {
+        return Err(Error::tool(
+            tool,
+            "The old text cannot be empty. To prepend text, include the first line's content in oldText and newText.".to_string(),
+        ));
+    }
+    if build_normalized_content(&normalized_old_text).is_empty() {
+        return Err(Error::tool(
+            tool,
+            "The old text must include at least one non-whitespace character.".to_string(),
+        ));
+    }
+
+    // Try variants of old_text to handle Unicode normalization differences
+    // (NFC vs NFD) and potential input normalization (clipboard, LLM output).
+    let mut variants = Vec::with_capacity(3);
+    variants.push(normalized_old_text.clone());
+
+    let nfc = normalized_old_text.nfc().collect::<String>();
+    if nfc != normalized_old_text {
+        variants.push(nfc);
+    }
+
+    let nfd = normalized_old_text.nfd().collect::<String>();
+    if nfd != normalized_old_text {
+        variants.push(nfd);
+    }
+
+    // Pre-compute normalized versions once and reuse for both matching and
+    // occurrence counting (avoids 2x redundant O(n) normalization).
+    let precomputed_content = build_normalized_content(content_for_matching.as_ref());
+
+    let mut best_match: Option<(FuzzyMatchResult, String, String)> = None;
+
+    for variant in variants {
+        let precomputed_variant = build_normalized_content(&variant);
+        let match_result = fuzzy_find_text_with_normalized(
+            content_for_matching.as_ref(),
+            &variant,
+            Some(precomputed_content.as_str()),
+            Some(precomputed_variant.as_str()),
+        );
+
+        if match_result.found {
+            best_match = Some((match_result, precomputed_variant, variant));
+            break;
+        }
+    }
+
+    let Some((match_result, _precomputed_variant, matched_variant)) = best_match else {
+        return Err(Error::tool(
+            tool,
+            format!(
+                "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
+                display_path
+            ),
+        ));
+    };
+
+    // Count occurrences in the same matching mode to avoid false ambiguity
+    // when normalized matching collapses distinct trailing whitespace.
+    let occurrences = if match_result.exact_match {
+        count_overlapping_occurrences(content_for_matching.as_ref(), &matched_variant)
+    } else {
+        count_overlapping_occurrences(&precomputed_content, &normalized_old_text)
+    };
+
+    if occurrences > 1 {
+        return Err(Error::tool(
+            tool,
+            format!(
+                "Found {occurrences} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique.",
+                display_path
+            ),
+        ));
+    }
+
+    // Perform replacement in the original coordinate space to preserve
+    // line endings and unmatched content exactly.
+    let idx = match_result.index;
+    let match_len = match_result.match_length;
+
+    // Adapt new_text to match the file's line endings.
+    let adapted_new_text = restore_line_endings(&normalize_to_lf(new_text), original_ending);
+
+    let new_len = content_no_bom.len() - match_len + adapted_new_text.len();
+    let mut new_content = String::with_capacity(new_len);
+    new_content.push_str(&content_no_bom[..idx]);
+    new_content.push_str(&adapted_new_text);
+    new_content.push_str(&content_no_bom[idx + match_len..]);
+
+    if content_no_bom.eq(&new_content) {
+        return Err(Error::tool(
+            tool,
+            format!(
+                "No changes made to {}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.",
+                display_path
+            ),
+        ));
+    }
+
+    let after_normalized = normalize_to_lf(&new_content);
+
+    // Re-add BOM if present.
+    let mut final_content = new_content;
+    if had_bom {
+        final_content = format!("\u{FEFF}{final_content}");
+    }
+
+    Ok(TextReplacementOutcome {
+        final_content,
+        before_normalized: normalized_content,
+        after_normalized,
+    })
+}
+
+/// Outcome of the shared hashline-op core.
+struct HashlineApplyOutcome {
+    /// BOM-restored content ready to persist.
+    final_content: String,
+    /// LF-normalized pre-edit content (diff input).
+    before_normalized: String,
+    /// LF-normalized post-edit content (diff input).
+    after_normalized: String,
+}
+
+/// Shared hashline-op core for local and `ssh://` hashline edits
+/// (bd-cv653.6.5): validates every LINE#HASH anchor against the current
+/// lines, dedupes, resolves ranges, rejects overlaps, splices bottom-up,
+/// then restores line endings and BOM.
+fn apply_hashline_edits_to_content(
+    raw_content: &str,
+    edits: &[HashlineOp],
+    display_path: &str,
+) -> Result<HashlineApplyOutcome> {
+    let (content_no_bom, had_bom) = strip_bom(raw_content);
+    let original_ending = detect_line_ending(content_no_bom);
+    let normalized = normalize_to_lf(content_no_bom);
+    let file_lines: Vec<&str> = normalized.split('\n').collect();
+
+    // Validate all hash references before making any changes
+    if let Err(e) = collect_mismatches(edits, &file_lines, had_bom) {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!("Hash validation failed — re-read the file to get current tags.\n\n{e}"),
+        ));
+    }
+
+    // Deduplicate edits
+    let mut seen = std::collections::HashSet::new();
+    let mut deduped_edits: Vec<&HashlineOp> = Vec::new();
+    for edit in edits {
+        let pos_line = edit
+            .pos
+            .as_ref()
+            .and_then(|p| parse_hashline_tag(p).ok())
+            .map(|(n, _)| n);
+        let end_line = edit
+            .end
+            .as_ref()
+            .and_then(|e| parse_hashline_tag(e).ok())
+            .map(|(n, _)| n);
+        let key = NormalizedEdit {
+            op: edit.op.clone(),
+            pos_line,
+            end_line,
+            lines: edit.get_lines(),
+        };
+        if seen.insert(key) {
+            deduped_edits.push(edit);
+        }
+    }
+
+    // Resolve line indices and sort bottom-up
+    let mut resolved: Vec<ResolvedEdit<'_>> = Vec::new();
+    for edit in &deduped_edits {
+        let replacement_lines: Vec<String> = edit
+            .get_lines()
+            .into_iter()
+            .map(|l| strip_hashline_prefix(&l).to_string())
+            .collect();
+
+        match edit.op.as_str() {
+            "replace" => {
+                let start_idx = match &edit.pos {
+                    Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => {
+                        return Err(Error::tool(
+                            "hashline_edit",
+                            "replace operation requires a pos anchor",
+                        ));
+                    }
+                };
+                let end_idx = match &edit.end {
+                    Some(end) => validate_line_ref(end, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => start_idx,
+                };
+                if end_idx < start_idx {
+                    return Err(Error::tool(
+                        "hashline_edit",
+                        format!(
+                            "End anchor (line {}) is before start anchor (line {})",
+                            end_idx + 1,
+                            start_idx + 1
+                        ),
+                    ));
+                }
+                resolved.push(ResolvedEdit {
+                    op: "replace",
+                    start: start_idx,
+                    end: end_idx,
+                    lines: replacement_lines,
+                });
+            }
+            "prepend" => {
+                let idx = match &edit.pos {
+                    Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => 0, // BOF
+                };
+                let end_idx = if file_lines == [""] && edit.pos.is_none() {
+                    0 // replace the empty line
+                } else {
+                    idx
+                };
+                resolved.push(ResolvedEdit {
+                    op: if file_lines == [""] && edit.pos.is_none() {
+                        "replace"
+                    } else {
+                        "prepend"
+                    },
+                    start: idx,
+                    end: end_idx,
+                    lines: replacement_lines,
+                });
+            }
+            "append" => {
+                let idx = match &edit.pos {
+                    Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
+                        .map_err(|e| Error::tool("hashline_edit", e))?,
+                    None => {
+                        if file_lines.len() > 1 && file_lines.last() == Some(&"") {
+                            file_lines.len() - 2
+                        } else {
+                            file_lines.len() - 1
+                        }
+                    }
+                };
+                resolved.push(ResolvedEdit {
+                    op: "append",
+                    start: idx,
+                    end: idx,
+                    lines: replacement_lines,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Sort bottom-up: highest line first, then by precedence (replace < append < prepend)
+    resolved.sort_by(|a, b| {
+        b.start
+            .cmp(&a.start)
+            .then_with(|| op_precedence(a.op).cmp(&op_precedence(b.op)))
+    });
+
+    // Detect overlapping edit ranges (undefined behavior if applied bottom-up)
+    for i in 0..resolved.len() {
+        for j in (i + 1)..resolved.len() {
+            let a = &resolved[i];
+            let b = &resolved[j];
+            if a.start <= b.end && b.start <= a.end {
+                return Err(Error::tool(
+                    "hashline_edit",
+                    format!(
+                        "Overlapping edits detected: {} at line {}-{} and {} at line {}-{}. \
+                         Please combine overlapping edits into a single operation.",
+                        a.op,
+                        a.start + 1,
+                        a.end + 1,
+                        b.op,
+                        b.start + 1,
+                        b.end + 1
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Apply splices bottom-up on a mutable Vec of lines
+    let mut lines: Vec<String> = file_lines.iter().map(|s| (*s).to_string()).collect();
+    let mut any_change = false;
+
+    for edit in &resolved {
+        match edit.op {
+            "replace" => {
+                // Check if it's a no-op
+                let existing: Vec<&str> = lines[edit.start..=edit.end]
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                if existing.eq(&edit.lines.iter().map(String::as_str).collect::<Vec<&str>>())
+                {
+                    continue; // no-op
+                }
+                // Splice: remove old range, insert new lines
+                lines.splice(edit.start..=edit.end, edit.lines.iter().cloned());
+                any_change = true;
+            }
+            "prepend" => {
+                // Insert before the target line
+                lines.splice(edit.start..edit.start, edit.lines.iter().cloned());
+                if !edit.lines.is_empty() {
+                    any_change = true;
+                }
+            }
+            "append" => {
+                // Insert after the target line
+                let insert_at = edit.start + 1;
+                lines.splice(insert_at..insert_at, edit.lines.iter().cloned());
+                if !edit.lines.is_empty() {
+                    any_change = true;
+                }
+            }
+            _ => {} // unreachable due to earlier validation
+        }
+    }
+
+    if !any_change {
+        return Err(Error::tool(
+            "hashline_edit",
+            format!(
+                "No changes made to {}. All edits were no-ops (replacement identical to existing content).",
+                display_path
+            ),
+        ));
+    }
+
+    // Reconstruct content
+    let after_normalized = lines.join("\n");
+    let new_content = restore_line_endings(&after_normalized, original_ending);
+    let mut final_content = new_content;
+    if had_bom {
+        final_content = format!("\u{FEFF}{final_content}");
+    }
+
+    Ok(HashlineApplyOutcome {
+        final_content,
+        before_normalized: normalized,
+        after_normalized,
+    })
+}
+
+impl EditTool {
+    /// `edit` over `ssh://host/path` (bd-cv653.6.5): fetch the FULL remote
+    /// content (never truncated — an editor on a truncated view would
+    /// overwrite real data), run the same replacement core as local edits,
+    /// then stage + rename atomically on the remote host.
+    async fn execute_ssh_edit(&self, input: &EditInput) -> Result<ToolOutput> {
+        let url = input.path.clone();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_fetch_document(&url, READ_TOOL_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("ssh read failed: {e}"))??);
+        let outcome = apply_unique_text_replacement(
+            &raw,
+            &input.old_text,
+            &input.new_text,
+            &input.path,
+            "edit",
+        )?;
+        let write_url = input.path.clone();
+        let payload = outcome.final_content.clone();
+        let write_details = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_write_document(&write_url, &payload)
+        })
+        .await
+        .map_err(|e| Error::tool("edit", format!("ssh write failed: {e}")))?;
+
+        let (diff, first_changed_line) =
+            generate_diff_string(&outcome.before_normalized, &outcome.after_normalized);
+        let mut details = serde_json::Map::new();
+        details.insert("diff".to_string(), serde_json::Value::String(diff));
+        if let Some(line) = first_changed_line {
+            details.insert(
+                "firstChangedLine".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(line)),
+            );
+        }
+        if let serde_json::Value::Object(remote) = write_details {
+            for (key, value) in remote {
+                details.entry(key).or_insert(value);
+            }
+        }
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Successfully replaced text in {}.",
+                input.path
+            )))],
+            details: Some(serde_json::Value::Object(details)),
+            is_error: false,
+        })
+    }
+}
+
+impl HashlineEditTool {
+    /// `hashline_edit` over `ssh://host/path` (bd-cv653.6.5): full remote
+    /// fetch, the same anchor-validation/splice core as local hashline
+    /// edits (stale anchors rejected), atomic remote staging.
+    async fn execute_ssh_hashline_edit(&self, input: &HashlineEditInput) -> Result<ToolOutput> {
+        let url = input.path.clone();
+        let raw = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_fetch_document(&url, READ_TOOL_MAX_BYTES)
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("ssh read failed: {e}")))??;
+        if raw.len() as u64 > READ_TOOL_MAX_BYTES {
+            return Err(Error::tool(
+                "hashline_edit",
+                format!("File too large (> {READ_TOOL_MAX_BYTES} bytes)"),
+            ));
+        }
+        let raw_content = String::from_utf8(raw).map_err(|_| {
+            Error::tool(
+                "hashline_edit",
+                "File contains invalid UTF-8 characters and cannot be safely edited as text."
+                    .to_string(),
+            )
+        })?;
+        let outcome =
+            apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
+
+        let write_url = input.path.clone();
+        let payload = outcome.final_content.clone();
+        let write_details = asupersync::runtime::spawn_blocking_io(move || {
+            crate::url_router::ssh_write_document(&write_url, &payload)
+        })
+        .await
+        .map_err(|e| Error::tool("hashline_edit", format!("ssh write failed: {e}")))?;
+
+        let (diff, first_changed_line) =
+            generate_diff_string(&outcome.before_normalized, &outcome.after_normalized);
+        let mut details = serde_json::Map::new();
+        details.insert("diff".to_string(), serde_json::Value::String(diff));
+        if let Some(line) = first_changed_line {
+            details.insert(
+                "firstChangedLine".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(line)),
+            );
+        }
+        if let serde_json::Value::Object(remote) = write_details {
+            for (key, value) in remote {
+                details.entry(key).or_insert(value);
+            }
+        }
+
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(format!(
+                "Successfully applied hashline edits to {}.",
+                input.path
+            )))],
+            details: Some(serde_json::Value::Object(details)),
+            is_error: false,
+        })
+    }
+}
 #[async_trait]
 #[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
@@ -9009,6 +9522,12 @@ impl Tool for EditTool {
                 input.new_text.len(),
                 WRITE_TOOL_MAX_BYTES
             )));
+        }
+
+        // Scheme URLs route through the router — never a silent filesystem
+        // fallback (bd-cv653.6.5).
+        if crate::url_router::has_scheme(&input.path) {
+            return self.execute_ssh_edit(&input).await;
         }
 
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
@@ -9103,142 +9622,16 @@ impl Tool for EditTool {
         }
 
         let source_expectation = AtomicContentExpectation::from_bytes(&raw);
-        let raw_content = String::from_utf8(raw).map_err(|_| {
-            Error::tool(
-                "edit",
-                "File contains invalid UTF-8 characters and cannot be safely edited as text."
-                    .to_string(),
-            )
-        })?;
-
-        // Strip BOM before matching (LLM won't include invisible BOM in oldText).
-        let (content_no_bom, had_bom) = strip_bom(&raw_content);
-
-        let original_ending = detect_line_ending(content_no_bom);
-        let normalized_content = normalize_to_lf(content_no_bom);
-        let content_for_matching =
-            if content_no_bom.contains('\r') && !content_no_bom.contains('\n') {
-                std::borrow::Cow::Owned(content_no_bom.replace('\r', "\n"))
-            } else {
-                std::borrow::Cow::Borrowed(content_no_bom)
-            };
-        let normalized_old_text = normalize_to_lf(&input.old_text);
-
-        if normalized_old_text.is_empty() {
-            return Err(Error::tool(
-                "edit",
-                "The old text cannot be empty. To prepend text, include the first line's content in oldText and newText.".to_string(),
-            ));
-        }
-        if build_normalized_content(&normalized_old_text).is_empty() {
-            return Err(Error::tool(
-                "edit",
-                "The old text must include at least one non-whitespace character.".to_string(),
-            ));
-        }
-
-        // Try variants of old_text to handle Unicode normalization differences (NFC vs NFD)
-        // and potential input normalization (clipboard, LLM output).
-        //
-        // Note: normalized_content is already LF-normalized but preserves Unicode form
-        // (from String::from_utf8).
-
-        let mut variants = Vec::with_capacity(3);
-        variants.push(normalized_old_text.clone());
-
-        let nfc = normalized_old_text.nfc().collect::<String>();
-        if nfc != normalized_old_text {
-            variants.push(nfc);
-        }
-
-        let nfd = normalized_old_text.nfd().collect::<String>();
-        if nfd != normalized_old_text {
-            variants.push(nfd);
-        }
-
-        // Pre-compute normalized versions once and reuse for both matching and
-        // occurrence counting (avoids 2x redundant O(n) normalization).
-        let precomputed_content = build_normalized_content(content_for_matching.as_ref());
-
-        let mut best_match: Option<(FuzzyMatchResult, String, String)> = None;
-
-        for variant in variants {
-            let precomputed_variant = build_normalized_content(&variant);
-            let match_result = fuzzy_find_text_with_normalized(
-                content_for_matching.as_ref(),
-                &variant,
-                Some(precomputed_content.as_str()),
-                Some(precomputed_variant.as_str()),
-            );
-
-            if match_result.found {
-                best_match = Some((match_result, precomputed_variant, variant));
-                break;
-            }
-        }
-
-        let Some((match_result, normalized_old_text, matched_variant)) = best_match else {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
-                    input.path
-                ),
-            ));
-        };
-
-        // Count occurrences in the same matching mode to avoid false ambiguity
-        // when normalized matching collapses distinct trailing whitespace.
-        let occurrences = if match_result.exact_match {
-            count_overlapping_occurrences(content_for_matching.as_ref(), &matched_variant)
-        } else {
-            count_overlapping_occurrences(&precomputed_content, &normalized_old_text)
-        };
-
-        if occurrences > 1 {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "Found {occurrences} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique.",
-                    input.path
-                ),
-            ));
-        }
-
-        // Perform replacement in the original coordinate space to preserve
-        // line endings and unmatched content exactly.
-        let idx = match_result.index;
-        let match_len = match_result.match_length;
-
-        // Adapt new_text to match the file's line endings.
-        // normalize_to_lf ensures we start from a known state (LF), then
-        // restore_line_endings converts LFs to the target ending (e.g. CRLF).
-        let adapted_new_text =
-            restore_line_endings(&normalize_to_lf(&input.new_text), original_ending);
-
-        let new_len = content_no_bom.len() - match_len + adapted_new_text.len();
-        let mut new_content = String::with_capacity(new_len);
-        new_content.push_str(&content_no_bom[..idx]);
-        new_content.push_str(&adapted_new_text);
-        new_content.push_str(&content_no_bom[idx + match_len..]);
-
-        if content_no_bom.eq(&new_content) {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "No changes made to {}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.",
-                    input.path
-                ),
-            ));
-        }
-
-        let new_content_for_diff = normalize_to_lf(&new_content);
-
-        // Re-add BOM if present.
-        let mut final_content = new_content;
-        if had_bom {
-            final_content = format!("\u{FEFF}{final_content}");
-        }
+        let outcome = apply_unique_text_replacement(
+            &raw,
+            &input.old_text,
+            &input.new_text,
+            &input.path,
+            "edit",
+        )?;
+        let final_content = outcome.final_content;
+        let normalized_content = outcome.before_normalized;
+        let new_content_for_diff = outcome.after_normalized;
 
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
         let absolute_path_clone = absolute_path.clone();
@@ -13377,6 +13770,12 @@ impl Tool for HashlineEditTool {
             return Err(Error::tool("hashline_edit", "No edits provided"));
         }
 
+        // Scheme URLs route through the router — never a silent filesystem
+        // fallback (bd-cv653.6.5).
+        if crate::url_router::has_scheme(&input.path) {
+            return self.execute_ssh_hashline_edit(&input).await;
+        }
+
         // Resolve file path and enforce scope before touching the filesystem.
         let resolved = resolve_read_path(&input.path, &self.cwd);
         let absolute_path =
@@ -13450,231 +13849,11 @@ impl Tool for HashlineEditTool {
             )
         })?;
 
-        let (content_no_bom, had_bom) = strip_bom(&raw_content);
-        let original_ending = detect_line_ending(content_no_bom);
-        let normalized = normalize_to_lf(content_no_bom);
-        let file_lines: Vec<&str> = normalized.split('\n').collect();
-
-        // Validate all hash references before making any changes
-        if let Err(e) = collect_mismatches(&input.edits, &file_lines, had_bom) {
-            return Err(Error::tool(
-                "hashline_edit",
-                format!("Hash validation failed — re-read the file to get current tags.\n\n{e}"),
-            ));
-        }
-
-        // Deduplicate edits
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped_edits: Vec<&HashlineOp> = Vec::new();
-        for edit in &input.edits {
-            let pos_line = edit
-                .pos
-                .as_ref()
-                .and_then(|p| parse_hashline_tag(p).ok())
-                .map(|(n, _)| n);
-            let end_line = edit
-                .end
-                .as_ref()
-                .and_then(|e| parse_hashline_tag(e).ok())
-                .map(|(n, _)| n);
-            let key = NormalizedEdit {
-                op: edit.op.clone(),
-                pos_line,
-                end_line,
-                lines: edit.get_lines(),
-            };
-            if seen.insert(key) {
-                deduped_edits.push(edit);
-            }
-        }
-
-        // Resolve line indices and sort bottom-up
-        let mut resolved: Vec<ResolvedEdit<'_>> = Vec::new();
-        for edit in &deduped_edits {
-            let replacement_lines: Vec<String> = edit
-                .get_lines()
-                .into_iter()
-                .map(|l| strip_hashline_prefix(&l).to_string())
-                .collect();
-
-            match edit.op.as_str() {
-                "replace" => {
-                    let start_idx = match &edit.pos {
-                        Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => {
-                            return Err(Error::tool(
-                                "hashline_edit",
-                                "replace operation requires a pos anchor",
-                            ));
-                        }
-                    };
-                    let end_idx = match &edit.end {
-                        Some(end) => validate_line_ref(end, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => start_idx,
-                    };
-                    if end_idx < start_idx {
-                        return Err(Error::tool(
-                            "hashline_edit",
-                            format!(
-                                "End anchor (line {}) is before start anchor (line {})",
-                                end_idx + 1,
-                                start_idx + 1
-                            ),
-                        ));
-                    }
-                    resolved.push(ResolvedEdit {
-                        op: "replace",
-                        start: start_idx,
-                        end: end_idx,
-                        lines: replacement_lines,
-                    });
-                }
-                "prepend" => {
-                    let idx = match &edit.pos {
-                        Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => 0, // BOF
-                    };
-                    let end_idx = if file_lines == [""] && edit.pos.is_none() {
-                        0 // replace the empty line
-                    } else {
-                        idx
-                    };
-                    resolved.push(ResolvedEdit {
-                        op: if file_lines == [""] && edit.pos.is_none() {
-                            "replace"
-                        } else {
-                            "prepend"
-                        },
-                        start: idx,
-                        end: end_idx,
-                        lines: replacement_lines,
-                    });
-                }
-                "append" => {
-                    let idx = match &edit.pos {
-                        Some(pos) => validate_line_ref(pos, &file_lines, had_bom)
-                            .map_err(|e| Error::tool("hashline_edit", e))?,
-                        None => {
-                            if file_lines.len() > 1 && file_lines.last() == Some(&"") {
-                                file_lines.len() - 2
-                            } else {
-                                file_lines.len().saturating_sub(1)
-                            }
-                        }
-                    };
-                    let end_idx = if file_lines == [""] && edit.pos.is_none() {
-                        0 // replace the empty line
-                    } else {
-                        idx
-                    };
-                    resolved.push(ResolvedEdit {
-                        op: if file_lines == [""] && edit.pos.is_none() {
-                            "replace"
-                        } else {
-                            "append"
-                        },
-                        start: idx,
-                        end: end_idx,
-                        lines: replacement_lines,
-                    });
-                }
-                other => {
-                    return Err(Error::tool(
-                        "hashline_edit",
-                        format!("Unknown op: {other:?}. Must be replace, prepend, or append."),
-                    ));
-                }
-            }
-        }
-
-        // Sort bottom-up: highest line first, then by precedence (replace < append < prepend)
-        resolved.sort_by(|a, b| {
-            b.start
-                .cmp(&a.start)
-                .then_with(|| op_precedence(a.op).cmp(&op_precedence(b.op)))
-        });
-
-        // Detect overlapping edit ranges (undefined behavior if applied bottom-up)
-        for i in 0..resolved.len() {
-            for j in (i + 1)..resolved.len() {
-                let a = &resolved[i];
-                let b = &resolved[j];
-                if a.start <= b.end && b.start <= a.end {
-                    return Err(Error::tool(
-                        "hashline_edit",
-                        format!(
-                            "Overlapping edits detected: {} at line {}-{} and {} at line {}-{}. \
-                             Please combine overlapping edits into a single operation.",
-                            a.op,
-                            a.start + 1,
-                            a.end + 1,
-                            b.op,
-                            b.start + 1,
-                            b.end + 1
-                        ),
-                    ));
-                }
-            }
-        }
-
-        // Apply splices bottom-up on a mutable Vec of lines
-        let mut lines: Vec<String> = file_lines.iter().map(|s| (*s).to_string()).collect();
-        let mut any_change = false;
-
-        for edit in &resolved {
-            match edit.op {
-                "replace" => {
-                    // Check if it's a no-op
-                    let existing: Vec<&str> = lines[edit.start..=edit.end]
-                        .iter()
-                        .map(String::as_str)
-                        .collect();
-                    if existing.eq(&edit.lines.iter().map(String::as_str).collect::<Vec<&str>>()) {
-                        continue; // no-op
-                    }
-                    // Splice: remove old range, insert new lines
-                    lines.splice(edit.start..=edit.end, edit.lines.iter().cloned());
-                    any_change = true;
-                }
-                "prepend" => {
-                    // Insert before the target line
-                    lines.splice(edit.start..edit.start, edit.lines.iter().cloned());
-                    if !edit.lines.is_empty() {
-                        any_change = true;
-                    }
-                }
-                "append" => {
-                    // Insert after the target line
-                    let insert_at = edit.start + 1;
-                    lines.splice(insert_at..insert_at, edit.lines.iter().cloned());
-                    if !edit.lines.is_empty() {
-                        any_change = true;
-                    }
-                }
-                _ => {} // unreachable due to earlier validation
-            }
-        }
-
-        if !any_change {
-            return Err(Error::tool(
-                "hashline_edit",
-                format!(
-                    "No changes made to {}. All edits were no-ops (replacement identical to existing content).",
-                    input.path
-                ),
-            ));
-        }
-
-        // Reconstruct content
-        let new_normalized = lines.join("\n");
-        let new_content = restore_line_endings(&new_normalized, original_ending);
-        let mut final_content = new_content;
-        if had_bom {
-            final_content = format!("\u{FEFF}{final_content}");
-        }
+        let outcome =
+            apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
+        let final_content = outcome.final_content;
+        let normalized = outcome.before_normalized;
+        let new_normalized = outcome.after_normalized;
 
         // Atomic write (same pattern as EditTool)
         let absolute_path_clone = absolute_path.clone();

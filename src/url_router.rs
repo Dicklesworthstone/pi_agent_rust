@@ -914,6 +914,66 @@ pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value>
     }))
 }
 
+/// Fetch the FULL remote file content for edit flows (bd-cv653.6.5).
+///
+/// Unlike [`resolve_ssh`], there is no `head -c` truncation: an editor
+/// operating on a truncated view would overwrite real data on write-back.
+/// `max_bytes` is enforced after transfer with a named error instead.
+///
+/// # Errors
+/// `PI_SSH_TARGET`/`PI_SSH_TRAVERSAL` (parse), `PI_SSH_HOSTKEY_CHANGED`,
+/// `PI_SSH_AUTH_FAILED`, `PI_SSH_TIMEOUT`, `PI_SSH_READ_FAILED`,
+/// `PI_SSH_TOO_LARGE`.
+pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let target = parse_ssh_target(url)?;
+    let output = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(format!("cat -- {}", sh_quote(&target.path)))
+        .output()
+        .map_err(|e| Error::tool("edit", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(match classify_ssh_failure(&stderr) {
+            SshFailureKind::HostKeyChanged => Error::tool(
+                "edit",
+                format!("PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION} (ssh stderr: {})", stderr.trim()),
+            ),
+            SshFailureKind::AuthFailed => Error::tool(
+                "edit",
+                format!(
+                    "PI_SSH_AUTH_FAILED: batch-mode authentication rejected for '{}'. ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::ConnectTimeout => Error::tool(
+                "edit",
+                format!("PI_SSH_TIMEOUT: connection to '{}' timed out. ssh stderr: {}", target.host, stderr.trim()),
+            ),
+            SshFailureKind::Other => Error::tool(
+                "edit",
+                format!(
+                    "PI_SSH_READ_FAILED: ssh {host} cat '{path}' failed: {stderr}",
+                    host = target.host,
+                    path = target.path,
+                    stderr = stderr.trim()
+                ),
+            ),
+        });
+    }
+    if output.stdout.len() as u64 > max_bytes {
+        return Err(Error::tool(
+            "edit",
+            format!(
+                "PI_SSH_TOO_LARGE: remote file exceeds the {}-byte edit limit.",
+                max_bytes
+            ),
+        ));
+    }
+    Ok(output.stdout)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,5 +1139,13 @@ mod tests {
             classify_ssh_failure("bash: x: command not found"),
             SshFailureKind::Other
         );
+    }
+
+    #[test]
+    fn ssh_fetch_rejects_bad_targets_before_spawning() {
+        // Parse/validation happens before any process spawn, so these are
+        // offline-safe assertions of the guard rails.
+        assert!(ssh_fetch_document("file:///etc/hosts", 1024).is_err());
+        assert!(ssh_fetch_document("ssh://h/a/../b", 1024).is_err());
     }
 }
