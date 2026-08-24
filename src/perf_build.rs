@@ -178,9 +178,12 @@ struct BenchEnvMeasurementControl {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ColdLoadArtifactControl {
-    artifact_path: String,
-    artifact_sha256: String,
-    artifact_size_bytes: u64,
+    #[serde(rename = "artifact_path")]
+    path: String,
+    #[serde(rename = "artifact_sha256")]
+    sha256: String,
+    #[serde(rename = "artifact_size_bytes")]
+    size_bytes: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -658,13 +661,62 @@ pub fn verify_cold_load_measurement_control(
                 .to_string(),
         ));
     }
-    let bench_env = control.bench_env.ok_or_else(|| {
-        MeasurementControlError::Invalid("bench_env must be present".to_string())
-    })?;
+    let bench_env = control
+        .bench_env
+        .ok_or_else(|| MeasurementControlError::Invalid("bench_env must be present".to_string()))?;
     let claimed_bench_env_sha256 = control.bench_env_sha256.ok_or_else(|| {
         MeasurementControlError::Invalid("bench_env_sha256 must be present".to_string())
     })?;
     validate_sha256(&claimed_bench_env_sha256, "bench_env_sha256")?;
+    let bench_env = verify_bench_env_measurement(
+        bench_env,
+        &claimed_bench_env_sha256,
+        control.max_noise_score,
+    )?;
+    let measurement = control.measurements.get(extension).ok_or_else(|| {
+        MeasurementControlError::Invalid(format!(
+            "measurements must contain extension {extension:?}"
+        ))
+    })?;
+    validate_sha256(&measurement.sha256, "artifact_sha256")?;
+    let artifact_path = canonical_regular_file(&measurement.path, "artifact_path")?;
+    let artifact_metadata = std::fs::metadata(&artifact_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot inspect artifact_path: {error}"))
+    })?;
+    if measurement.size_bytes == 0 || artifact_metadata.len() != measurement.size_bytes {
+        return Err(MeasurementControlError::Invalid(format!(
+            "artifact_size_bytes does not match artifact_path (claimed={}, observed={})",
+            measurement.size_bytes,
+            artifact_metadata.len()
+        )));
+    }
+    let observed_artifact_sha256 = sha256_file(&artifact_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot hash artifact_path: {error}"))
+    })?;
+    if observed_artifact_sha256 != measurement.sha256 {
+        return Err(MeasurementControlError::Invalid(format!(
+            "artifact_sha256 does not match artifact_path (claimed={}, observed={observed_artifact_sha256})",
+            measurement.sha256
+        )));
+    }
+    Ok(VerifiedColdLoadMeasurement {
+        control_path,
+        control_sha256,
+        artifact_path,
+        artifact_sha256: measurement.sha256.clone(),
+        bench_env_sha256: claimed_bench_env_sha256,
+        governor: bench_env.governor,
+        aslr: bench_env.aslr,
+        thp: bench_env.thp,
+        noise_score: bench_env.noise_score,
+    })
+}
+
+fn verify_bench_env_measurement(
+    bench_env: BenchEnvMeasurementControl,
+    claimed_sha256: &str,
+    max_noise_score: u8,
+) -> Result<BenchEnvMeasurementControl, MeasurementControlError> {
     if bench_env.os.is_empty()
         || bench_env.arch.is_empty()
         || bench_env.cpu_brand.is_empty()
@@ -686,57 +738,19 @@ pub fn verify_cold_load_measurement_control(
     let bench_env_bytes = serde_json::to_vec(&bench_env_value).map_err(|error| {
         MeasurementControlError::Invalid(format!("cannot canonicalize bench_env: {error}"))
     })?;
-    let observed_bench_env_sha256 = sha256_bytes(&bench_env_bytes);
-    if claimed_bench_env_sha256 != observed_bench_env_sha256 {
+    let observed_sha256 = sha256_bytes(&bench_env_bytes);
+    if claimed_sha256 != observed_sha256 {
         return Err(MeasurementControlError::Invalid(format!(
-            "bench_env_sha256 mismatch (claimed={claimed_bench_env_sha256}, observed={observed_bench_env_sha256})"
+            "bench_env_sha256 mismatch (claimed={claimed_sha256}, observed={observed_sha256})"
         )));
     }
-    if bench_env.noise_score > control.max_noise_score {
+    if bench_env.noise_score > max_noise_score {
         return Err(MeasurementControlError::Noisy {
             observed: bench_env.noise_score,
-            maximum: control.max_noise_score,
+            maximum: max_noise_score,
         });
     }
-    let measurement = control.measurements.get(extension).ok_or_else(|| {
-        MeasurementControlError::Invalid(format!(
-            "measurements must contain extension {extension:?}"
-        ))
-    })?;
-    validate_sha256(&measurement.artifact_sha256, "artifact_sha256")?;
-    let artifact_path = canonical_regular_file(&measurement.artifact_path, "artifact_path")?;
-    let artifact_metadata = std::fs::metadata(&artifact_path).map_err(|error| {
-        MeasurementControlError::Invalid(format!("cannot inspect artifact_path: {error}"))
-    })?;
-    if measurement.artifact_size_bytes == 0
-        || artifact_metadata.len() != measurement.artifact_size_bytes
-    {
-        return Err(MeasurementControlError::Invalid(format!(
-            "artifact_size_bytes does not match artifact_path (claimed={}, observed={})",
-            measurement.artifact_size_bytes,
-            artifact_metadata.len()
-        )));
-    }
-    let observed_artifact_sha256 = sha256_file(&artifact_path).map_err(|error| {
-        MeasurementControlError::Invalid(format!("cannot hash artifact_path: {error}"))
-    })?;
-    if observed_artifact_sha256 != measurement.artifact_sha256 {
-        return Err(MeasurementControlError::Invalid(format!(
-            "artifact_sha256 does not match artifact_path (claimed={}, observed={observed_artifact_sha256})",
-            measurement.artifact_sha256
-        )));
-    }
-    Ok(VerifiedColdLoadMeasurement {
-        control_path,
-        control_sha256,
-        artifact_path,
-        artifact_sha256: measurement.artifact_sha256.clone(),
-        bench_env_sha256: claimed_bench_env_sha256,
-        governor: bench_env.governor,
-        aslr: bench_env.aslr,
-        thp: bench_env.thp,
-        noise_score: bench_env.noise_score,
-    })
+    Ok(bench_env)
 }
 
 /// Verify that idle RSS was sampled from a real `pi` process and remains
@@ -1008,7 +1022,7 @@ mod tests {
             "allocator": "system",
             "binary_path": binary_path,
             "binary_sha256": binary_sha256,
-            "rss_bytes": 1048576,
+            "rss_bytes": 1_048_576,
             "idle_state": "startup_before_user_input"
         });
         write_json(&control_path, &control);
