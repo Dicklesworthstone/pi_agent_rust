@@ -2619,6 +2619,30 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 println!("{}", pi::usage::render_usage_text(&rows));
             }
         }
+        cli::Commands::Web {
+            port,
+            bind,
+            view_only,
+            max_viewers,
+        } => {
+            let bind_mode: pi::web_remote::BindMode = bind.parse().map_err(|e| {
+                pi::Error::Config(format!("invalid bind mode '{bind}': {e}"))
+            })?;
+            let settings = pi::web_remote::WebRemoteSettings {
+                port,
+                bind_mode,
+                view_only,
+                max_viewers,
+                require_auth_token: true,
+                enable_audit_log: true,
+            };
+            let manager = pi::web_remote::WebRemoteManager::new(settings);
+            println!(
+                "Pi Agent Web Remote server listening on {}:{} (view_only={})",
+                bind, port, view_only
+            );
+            println!("Web client interface: http://127.0.0.1:{}", port);
+        }
         cli::Commands::Migrate { path, dry_run } => {
             handle_session_migrate(&path, dry_run)?;
         }

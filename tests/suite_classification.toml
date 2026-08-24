@@ -130,6 +130,7 @@ files = [
     "computer",
     "browser",
     "clean_release_commit",
+    "web_remote",
     "checkpoint",
     "eval",
     "url_router",

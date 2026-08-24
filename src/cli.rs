@@ -2427,6 +2427,22 @@ pub enum Commands {
         refresh: bool,
     },
 
+    /// Serve the agent session over a Web interface via WebSocket frame diffs (bd-cv653.10.1)
+    Web {
+        /// Port to bind web server (default: 8080)
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+        /// Network interface binding mode: loopback (default), tailscale, lan
+        #[arg(long, default_value = "loopback", value_parser = ["loopback", "tailscale", "lan"])]
+        bind: String,
+        /// Connect in view-only mode (disallows input from web clients)
+        #[arg(long)]
+        view_only: bool,
+        /// Maximum concurrent connected web viewers (default: 4)
+        #[arg(long, default_value_t = 4)]
+        max_viewers: usize,
+    },
+
     Migrate {
         /// Path to specific session JSONL file (or directory to migrate all)
         path: String,
