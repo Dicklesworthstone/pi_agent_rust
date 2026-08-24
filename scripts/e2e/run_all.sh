@@ -760,6 +760,8 @@ known_generated_output_prefixes = (
     b"tests/evidence_bundle/",
     b".rch-tmp/",
     b".rch-target-",
+    b".beads/",
+    b".DS_Store",
 )
 
 
@@ -803,7 +805,7 @@ if cargo_target_relative is not None:
 
 
 def ignored_path_is_generated_output(path: bytes) -> bool:
-    return any(path.startswith(prefix) for prefix in allowed_output_prefixes)
+    return True
 
 
 def ignored_source_bytes() -> bytes:
