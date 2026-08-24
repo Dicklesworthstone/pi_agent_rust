@@ -465,6 +465,10 @@ fn command_value(command: Option<&Commands>) -> Value {
             "view_only": view_only,
             "max_viewers": max_viewers,
         }),
+        Some(Commands::Gallery { format }) => json!({
+            "name": "gallery",
+            "format": format,
+        }),
         Some(Commands::Migrate { path, dry_run }) => json!({
             "name": "migrate",
             "path": path,
