@@ -173,6 +173,8 @@ fixture_test!(test_ls_fixtures, "ls_tool");
 fixture_test!(test_hashline_edit_fixtures, "hashline_edit_tool");
 fixture_test!(test_ast_grep_fixtures, "ast_grep_tool");
 fixture_test!(test_ast_edit_fixtures, "ast_edit_tool");
+fixture_test!(test_lsp_fixtures, "lsp_tool");
+fixture_test!(test_debug_fixtures, "debug_tool");
 fixture_test!(test_xdev_fixtures, "xdev_tool");
 fixture_test!(test_web_search_fixtures, "web_search_tool");
 fixture_test!(test_cli_flag_fixtures, "cli_flags");
@@ -239,6 +241,8 @@ fn test_all_fixtures_exist() {
         "find_tool",
         "ls_tool",
         "hashline_edit_tool",
+        "lsp_tool",
+        "debug_tool",
         "truncation",
         "cli_flags",
         "web_search_tool",
