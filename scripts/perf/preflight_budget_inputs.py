@@ -1956,6 +1956,57 @@ def run_self_test() -> int:
     assert fresh_inspection["freshness_basis"] == "embedded_timestamp", fresh_inspection
     assert fresh_inspection["mtime_age_hours"] > 24.0, fresh_inspection
 
+    scenario_jsonl = provenance_root / "scenario-runner.jsonl"
+    scenario_records = [
+        {
+            "schema": "pi.ext.rust_bench.v1",
+            "timestamp": fresh_timestamp,
+            "source_commit": expected_commit,
+            "source_dirty": False,
+            "run_id": expected_correlation,
+            "correlation_id": scenario_correlation,
+            "orchestration_correlation_id": expected_correlation,
+        }
+        for scenario_correlation in ("scenario-a", "scenario-b")
+    ]
+    scenario_jsonl.write_text(
+        "\n".join(json.dumps(record) for record in scenario_records) + "\n",
+        encoding="utf-8",
+    )
+    scenario_inspection = inspect_direct_artifact(
+        scenario_jsonl,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert scenario_inspection["is_fresh"] is True, scenario_inspection
+    assert scenario_inspection["correlation_id"] == expected_correlation, (
+        scenario_inspection
+    )
+    assert (
+        scenario_inspection["orchestration_correlation_id"] == expected_correlation
+    ), scenario_inspection
+
+    mixed_scenario_records = [dict(record) for record in scenario_records]
+    mixed_scenario_records[-1]["orchestration_correlation_id"] = "foreign-correlation"
+    scenario_jsonl.write_text(
+        "\n".join(json.dumps(record) for record in mixed_scenario_records) + "\n",
+        encoding="utf-8",
+    )
+    mixed_scenario_inspection = inspect_direct_artifact(
+        scenario_jsonl,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert mixed_scenario_inspection["is_fresh"] is False, mixed_scenario_inspection
+    assert (
+        "conflicting_orchestration_correlation_id"
+        in mixed_scenario_inspection["freshness_failures"]
+    ), mixed_scenario_inspection
+
     mutation_cases = (
         ("wrong-commit", {"source_commit": "b" * 40}, "source_commit_mismatch"),
         ("dirty", {"source_dirty": True}, "source_dirty_not_false"),
