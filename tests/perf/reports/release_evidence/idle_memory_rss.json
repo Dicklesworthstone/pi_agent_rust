@@ -1,0 +1,62 @@
+{
+  "allocator": "system",
+  "bench_env": {
+    "arch": "x86_64",
+    "aslr": "full",
+    "config_hash": "18c05cadbf170ed7d441bfa41e889584dc00a89f559e789c8661a4160fe6057d",
+    "cpu_brand": "AMD EPYC Processor (with IBPB)",
+    "cpu_cores": 10,
+    "governor": "unavailable",
+    "mem_total_mb": 60269,
+    "noise_score": 2,
+    "os": "Linux (Ubuntu 25.10)",
+    "thp": "madvise",
+    "turbo_boost": "unavailable"
+  },
+  "bench_env_sha256": "0aaabd9727fba2537f65b108e077b1eedc484c8338c499aca853cf5e8fc542f4",
+  "bench_env_source": "benches/bench_env.rs",
+  "binary_path": "/Users/jemanuel/projects/pi_agent_rust_ri_bronzetern/target/release/pi",
+  "binary_sha256": "67b0b22b7e6e13df99998768e01e45830743994917dd83cdd9f100bf2d5ab133",
+  "build_command": "cargo build --bin pi --release",
+  "cargo_profile": "release",
+  "correlation_id": "bd-sog97.3-20260824T100500Z-cacea566",
+  "generated_at": "2026-08-24T10:05:18.908Z",
+  "idle_state": "startup_before_user_input",
+  "pid": 2724207,
+  "process_name": "pi",
+  "rss_bytes": 36360192,
+  "rss_spread_bytes": 237568,
+  "run_id": "bd-sog97.3-20260824T100500Z-cacea566",
+  "sample_count": 5,
+  "samples": [
+    {
+      "pid": 2724207,
+      "process_name": "pi",
+      "rss_bytes": 36360192
+    },
+    {
+      "pid": 2724266,
+      "process_name": "pi",
+      "rss_bytes": 36126720
+    },
+    {
+      "pid": 2724302,
+      "process_name": "pi",
+      "rss_bytes": 36130816
+    },
+    {
+      "pid": 2724338,
+      "process_name": "pi",
+      "rss_bytes": 36122624
+    },
+    {
+      "pid": 2724374,
+      "process_name": "pi",
+      "rss_bytes": 36200448
+    }
+  ],
+  "schema": "pi.perf.idle_rss_measurement.v1",
+  "settle_ms": 1000,
+  "source_commit": "cacea56690a23ccb936254d5fca17544dafa34d9",
+  "source_dirty": false
+}
