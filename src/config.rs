@@ -74,6 +74,8 @@ pub struct Config {
     pub media: Option<crate::media_tools::MediaSettings>,
     /// Opt-in computer tool settings (bd-cv653.2.5).
     pub computer: Option<crate::computer::ComputerSettings>,
+    /// Opt-in browser tool settings (bd-cv653.2.4).
+    pub browser: Option<crate::browser::BrowserSettings>,
     /// Secrets vault settings (bd-cv653.7.9).
     pub secrets: Option<crate::secrets::SecretsSettings>,
     /// Magic-keyword settings (bd-cv653.3.6).
@@ -850,6 +852,7 @@ impl Config {
             memory: merge_memory(base.memory, other.memory),
             media: merge_media(base.media, other.media),
             computer: merge_computer(base.computer, other.computer),
+            browser: merge_browser(base.browser, other.browser),
             secrets: other.secrets.or(base.secrets),
             keywords: other.keywords.or(base.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
@@ -1746,6 +1749,26 @@ fn merge_computer(
             enable_computer: other.enable_computer.or(base.enable_computer),
             require_approval: other.require_approval.or(base.require_approval),
             screenshot_dir: other.screenshot_dir.or(base.screenshot_dir),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge browser settings field-wise (bd-cv653.2.4).
+fn merge_browser(
+    base: Option<crate::browser::BrowserSettings>,
+    other: Option<crate::browser::BrowserSettings>,
+) -> Option<crate::browser::BrowserSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::browser::BrowserSettings {
+            enable_browser: other.enable_browser.or(base.enable_browser),
+            executable_path: other.executable_path.or(base.executable_path),
+            remote_debugging_port: other.remote_debugging_port.or(base.remote_debugging_port),
+            headless: other.headless.or(base.headless),
+            user_agent: other.user_agent.or(base.user_agent),
+            domain_allowlist: other.domain_allowlist.or(base.domain_allowlist),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

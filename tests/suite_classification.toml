@@ -128,6 +128,7 @@ files = [
     "variance_gating",
     "media_tools",
     "computer",
+    "browser",
     "checkpoint",
     "eval",
     "url_router",

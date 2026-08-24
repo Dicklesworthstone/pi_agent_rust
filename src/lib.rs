@@ -96,6 +96,8 @@ pub mod bash_mediation;
 #[doc(hidden)]
 pub mod btw;
 #[doc(hidden)]
+pub mod browser;
+#[doc(hidden)]
 pub mod buffer_shim;
 pub mod checkpoint;
 #[doc(hidden)]

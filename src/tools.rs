@@ -5366,6 +5366,15 @@ impl ToolRegistry {
                             .with_require_approval(require_approval),
                     ));
                 }
+                "browser" => {
+                    let domain_allowlist = config
+                        .and_then(|c| c.browser.as_ref())
+                        .and_then(|b| b.domain_allowlist.clone());
+                    tools.push(Box::new(
+                        crate::browser::BrowserTool::new(cwd)
+                            .with_domain_allowlist(domain_allowlist),
+                    ));
+                }
                 "subagent" => {
                     let structured_results = config
                         .and_then(|c| c.subagent_structured_results)
@@ -5442,6 +5451,18 @@ impl ToolRegistry {
                 tools.push(Box::new(
                     crate::computer::ComputerTool::new(cwd)
                         .with_require_approval(require_approval),
+                ));
+            }
+        }
+
+        // Browser tool (bd-cv653.2.4): opt-in via config.browser
+        if let Some(browser_cfg) = config.and_then(|c| c.browser.as_ref()) {
+            if browser_cfg.enable_browser.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "browser")
+            {
+                tools.push(Box::new(
+                    crate::browser::BrowserTool::new(cwd)
+                        .with_domain_allowlist(browser_cfg.domain_allowlist.clone()),
                 ));
             }
         }
