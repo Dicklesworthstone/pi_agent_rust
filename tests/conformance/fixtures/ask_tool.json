@@ -1,33 +1,60 @@
 {
   "version": "1.0",
   "tool": "ask",
-  "description": "Ask tool contract (bd-cv653.3.8): question prompt and choices schema validation.",
+  "description": "Ask contract for bd-cv653.3.8 and bd-cv653.8.1: recommended-policy success, option-count boundary, and named validation behavior.",
   "cases": [
     {
-      "name": "ask_requires_question",
-      "description": "missing question string produces validation error",
+      "name": "ask_auto_selects_recommended_option",
+      "description": "a non-interactive session deterministically chooses the recommended option",
       "requirement_ids": ["ASK-1"],
-      "expect_error": true,
-      "error_contains": "question",
-      "input": {},
-      "expected": {}
+      "input": {
+        "questions": [{
+          "id": "target",
+          "question": "Which target?",
+          "options": [{"label": "Safe"}, {"label": "Fast"}],
+          "recommended": 1
+        }]
+      },
+      "expected": {
+        "content_contains": ["non-interactive session", "Q: Which target?", "A: Fast"],
+        "details_exact": {
+          "schema": "ask_response.v1",
+          "autoAnswered": true,
+          "answers": [{"questionId": "target", "selected": ["Fast"]}]
+        }
+      }
     },
     {
-      "name": "ask_empty_question_error",
-      "description": "empty question string produces error",
+      "name": "ask_accepts_five_option_boundary",
+      "description": "the documented maximum of five options remains accepted",
       "requirement_ids": ["ASK-2"],
-      "expect_error": true,
-      "error_contains": "question",
-      "input": {"question": ""},
-      "expected": {}
+      "input": {
+        "questions": [{
+          "question": "Pick one?",
+          "options": [
+            {"label": "One"}, {"label": "Two"}, {"label": "Three"},
+            {"label": "Four"}, {"label": "Five"}
+          ]
+        }]
+      },
+      "expected": {
+        "content_contains": ["A: One"],
+        "details_exact": {"schema": "ask_response.v1", "autoAnswered": true}
+      }
     },
     {
-      "name": "ask_requires_choices_or_text",
-      "description": "ask tool validates options list structure",
+      "name": "ask_rejects_out_of_bounds_recommendation",
+      "description": "a recommendation cannot address an absent option",
       "requirement_ids": ["ASK-3"],
       "expect_error": true,
-      "error_contains": "options",
-      "input": {"question": "Select target?", "options": []},
+      "error_contains": "out of bounds",
+      "input": {
+        "questions": [{
+          "question": "Select target?",
+          "options": [{"label": "A"}, {"label": "B"}],
+          "recommended": 2
+        }]
+      },
       "expected": {}
     }
   ]

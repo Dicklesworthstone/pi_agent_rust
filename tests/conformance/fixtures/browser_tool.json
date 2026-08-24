@@ -1,25 +1,27 @@
 {
   "version": "1.0",
   "tool": "browser",
-  "description": "Browser automation tool contract (bd-cv653.2.4): multi-tab lifecycle and CDP validation.",
+  "description": "Browser automation contract for bd-cv653.2.4 and bd-cv653.8.1: hermetic navigation, empty-tab boundary, and named error behavior.",
   "cases": [
     {
-      "name": "browser_requires_action",
-      "description": "missing action produces a validation error",
+      "name": "browser_mock_navigates_example",
+      "description": "the mock backend navigates without a live browser or network",
       "requirement_ids": ["BROWSER-1"],
-      "expect_error": true,
-      "error_contains": "action",
-      "input": {},
-      "expected": {}
+      "input": {"action": "goto", "url": "https://example.com", "tab": "fixture"},
+      "expected": {
+        "content_contains": ["Navigated tab fixture", "Example Domain"],
+        "details_exact": {"tab": "fixture", "url": "https://example.com", "title": "Example Domain", "status": 200}
+      }
     },
     {
-      "name": "browser_unknown_action_error",
-      "description": "unsupported browser action produces named error",
+      "name": "browser_initial_tab_list_boundary",
+      "description": "a fresh browser reports its single deterministic about:blank tab",
       "requirement_ids": ["BROWSER-2"],
-      "expect_error": true,
-      "error_contains": "unknown",
-      "input": {"action": "destroy_all_browsers"},
-      "expected": {}
+      "input": {"action": "list_tabs"},
+      "expected": {
+        "content_contains": ["Active browser tabs (1)", "Blank Tab", "about:blank"],
+        "details_contains": ["\"name\": \"default\"", "\"url\": \"about:blank\""]
+      }
     },
     {
       "name": "browser_goto_requires_url",

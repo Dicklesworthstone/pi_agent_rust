@@ -80,13 +80,19 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             ];
             Box::new(pi::xdev::XdevTool::new(temp_dir.path(), snapshot))
         }
-        "inspect_image" => Box::new(pi::media_tools::InspectImageTool::new().with_mock(true)),
-        "generate_image" => Box::new(pi::media_tools::GenerateImageTool::new().with_mock(true)),
-        "tts" => Box::new(pi::media_tools::TtsTool::new().with_mock(true)),
-        "computer" => Box::new(pi::computer::ComputerTool::new().with_mock(true)),
-        "browser" => Box::new(pi::browser::BrowserTool::new().with_mock(true)),
-        "ask" => Box::new(pi::ask::AskTool::new()),
-        "todo" => Box::new(pi::todo::TodoTool::new()),
+        "inspect_image" => {
+            Box::new(pi::media_tools::InspectImageTool::new(temp_dir.path()).with_mock(true))
+        }
+        "generate_image" => {
+            Box::new(pi::media_tools::GenerateImageTool::new(temp_dir.path()).with_mock(true))
+        }
+        "tts" => Box::new(pi::media_tools::TtsTool::new(temp_dir.path()).with_mock(true)),
+        "computer" => Box::new(pi::computer::ComputerTool::new(temp_dir.path()).with_mock(true)),
+        "browser" => Box::new(pi::browser::BrowserTool::new(temp_dir.path()).with_mock(true)),
+        "ask" => Box::new(pi::ask::AskTool::new(pi::ask::AskPolicy::Recommended)),
+        "todo" => Box::new(pi::todo::TodoTool::new(std::sync::Arc::new(
+            asupersync::sync::Mutex::new(pi::session::Session::in_memory()),
+        ))),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
         }
@@ -105,7 +111,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
                         .to_lowercase()
                         .contains(&expected_substr.to_lowercase())
                     {
-                        return TestResult::pass(&case_name);
+                        let mut result = TestResult::pass(&case_name);
+                        result.actual_error = Some(error_msg);
+                        return result;
                     }
                     return TestResult::fail(
                         &case_name,
@@ -114,7 +122,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
                         ),
                     );
                 }
-                return TestResult::pass(&case_name);
+                let mut result = TestResult::pass(&case_name);
+                result.actual_error = Some(error_msg);
+                return result;
             }
             Ok(_) => {
                 return TestResult::fail(&case_name, "Expected error but tool succeeded");
@@ -197,7 +207,9 @@ fn run_cli_test_case(case: &TestCase, case_name: &str) -> TestResult {
                         .to_lowercase()
                         .contains(&expected_substr.to_lowercase())
                     {
-                        return TestResult::pass(case_name);
+                        let mut result = TestResult::pass(case_name);
+                        result.actual_error = Some(error_msg);
+                        return result;
                     }
                     return TestResult::fail(
                         case_name,
@@ -206,7 +218,9 @@ fn run_cli_test_case(case: &TestCase, case_name: &str) -> TestResult {
                         ),
                     );
                 }
-                return TestResult::pass(case_name);
+                let mut result = TestResult::pass(case_name);
+                result.actual_error = Some(error_msg);
+                return result;
             }
             None => {
                 return TestResult::fail(case_name, "Expected error but CLI parsed successfully");
@@ -437,6 +451,18 @@ fn command_value(command: Option<&Commands>) -> Value {
             "name": "usage",
             "format": format,
             "refresh": refresh,
+        }),
+        Some(Commands::Web {
+            port,
+            bind,
+            view_only,
+            max_viewers,
+        }) => json!({
+            "name": "web",
+            "port": port,
+            "bind": bind,
+            "view_only": view_only,
+            "max_viewers": max_viewers,
         }),
         Some(Commands::Migrate { path, dry_run }) => json!({
             "name": "migrate",

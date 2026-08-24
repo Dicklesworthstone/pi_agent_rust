@@ -11,7 +11,112 @@ mod conformance;
 #[path = "conformance/fixture_runner.rs"]
 mod fixture_runner;
 
+#[path = "common/logging.rs"]
+mod test_logging;
+
 use conformance::load_fixture;
+use std::io::Write as _;
+
+static JSONL_APPEND_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn log_fixture_case(
+    logger: &test_logging::TestLogger,
+    fixture_name: &str,
+    tool_name: &str,
+    case: &conformance::TestCase,
+    result: &conformance::TestResult,
+) -> Result<(), String> {
+    let mut redacted_input = case.input.clone();
+    test_logging::redact_json_value(&mut redacted_input);
+    let input = serde_json::to_string(&redacted_input)
+        .map_err(|error| format!("serialize redacted fixture input: {error}"))?;
+    let taxonomy = result
+        .actual_error
+        .as_deref()
+        .or(result.message.as_deref())
+        .unwrap_or("none");
+    let artifact_path = result
+        .actual_details
+        .as_ref()
+        .and_then(|details| details.get("saved_path").or_else(|| details.get("path")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("none");
+    let level = if result.passed {
+        test_logging::LogLevel::Info
+    } else {
+        test_logging::LogLevel::Error
+    };
+    logger.with_context(
+        level,
+        "conformance.fixture_case",
+        format!("Fixture case {}", result.name),
+        |ctx| {
+            ctx.push(("fixture".to_string(), fixture_name.to_string()));
+            ctx.push(("tool".to_string(), tool_name.to_string()));
+            ctx.push(("case".to_string(), case.name.clone()));
+            ctx.push((
+                "requirement_ids".to_string(),
+                case.requirement_ids.join(","),
+            ));
+            ctx.push(("input".to_string(), input));
+            ctx.push((
+                "status".to_string(),
+                if result.passed { "pass" } else { "fail" }.to_string(),
+            ));
+            ctx.push(("error_taxonomy".to_string(), taxonomy.to_string()));
+            ctx.push(("artifact_path".to_string(), artifact_path.to_string()));
+        },
+    );
+    Ok(())
+}
+
+fn append_fixture_logs(
+    fixture_name: &str,
+    fixture: &conformance::FixtureFile,
+    results: &[conformance::TestResult],
+) -> Result<(), String> {
+    let logger = test_logging::TestLogger::new();
+    logger.set_test_name(format!("conformance-fixture-{fixture_name}"));
+    logger.info_ctx("harness", "Fixture suite started", |ctx| {
+        ctx.push(("fixture".to_string(), fixture_name.to_string()));
+        ctx.push(("tool".to_string(), fixture.tool.clone()));
+        ctx.push(("case_count".to_string(), results.len().to_string()));
+        ctx.push(("bead_id".to_string(), "bd-cv653.8.1".to_string()));
+    });
+
+    for (case, result) in fixture.cases.iter().zip(results) {
+        log_fixture_case(&logger, fixture_name, &fixture.tool, case, result)?;
+    }
+
+    let jsonl = logger.dump_jsonl();
+    let schema_errors = test_logging::validate_jsonl(&jsonl);
+    if !schema_errors.is_empty() {
+        return Err(format!(
+            "structured fixture log schema validation failed: {schema_errors:?}"
+        ));
+    }
+
+    let Ok(path) = std::env::var("TEST_LOG_JSONL_PATH") else {
+        return Ok(());
+    };
+    let _guard = JSONL_APPEND_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let path = std::path::Path::new(&path);
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("create fixture log directory: {error}"))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("open fixture JSONL log {}: {error}", path.display()))?;
+    file.write_all(jsonl.as_bytes())
+        .map_err(|error| format!("append fixture JSONL log {}: {error}", path.display()))
+}
 
 /// Helper macro to generate fixture tests for each tool.
 macro_rules! fixture_test {
@@ -35,6 +140,9 @@ macro_rules! fixture_test {
                         ));
                     }
                 }
+
+                append_fixture_logs($fixture, &fixture, &results)
+                    .unwrap_or_else(|error| panic!("Fixture logging failed: {error}"));
 
                 if !failures.is_empty() {
                     panic!(
@@ -69,6 +177,8 @@ fixture_test!(test_xdev_fixtures, "xdev_tool");
 fixture_test!(test_web_search_fixtures, "web_search_tool");
 fixture_test!(test_cli_flag_fixtures, "cli_flags");
 fixture_test!(test_media_fixtures, "media_tools");
+fixture_test!(test_generate_image_fixtures, "generate_image_tool");
+fixture_test!(test_tts_fixtures, "tts_tool");
 fixture_test!(test_computer_fixtures, "computer_tool");
 fixture_test!(test_browser_fixtures, "browser_tool");
 fixture_test!(test_ask_fixtures, "ask_tool");
@@ -120,6 +230,8 @@ fn test_all_fixtures_exist() {
         "cli_flags",
         "web_search_tool",
         "media_tools",
+        "generate_image_tool",
+        "tts_tool",
         "computer_tool",
         "browser_tool",
         "ask_tool",

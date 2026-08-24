@@ -142,6 +142,9 @@ pub struct TestResult {
     pub message: Option<String>,
     pub actual_content: Option<String>,
     pub actual_details: Option<serde_json::Value>,
+    /// Tool error observed for an expected-error case. Retained so the
+    /// structured conformance log records the actual error taxonomy.
+    pub actual_error: Option<String>,
 }
 
 impl TestResult {
@@ -152,6 +155,7 @@ impl TestResult {
             message: None,
             actual_content: None,
             actual_details: None,
+            actual_error: None,
         }
     }
 
@@ -162,6 +166,7 @@ impl TestResult {
             message: Some(message.into()),
             actual_content: None,
             actual_details: None,
+            actual_error: None,
         }
     }
 }

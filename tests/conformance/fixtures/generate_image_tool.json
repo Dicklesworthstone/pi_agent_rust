@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "tool": "generate_image",
+  "description": "generate_image contract for bd-cv653.2.7 and bd-cv653.8.1: hermetic generation, size boundary, and named validation behavior.",
+  "cases": [
+    {
+      "name": "generate_image_mock_success",
+      "description": "the mock backend writes a deterministic PNG without network access",
+      "requirement_ids": ["MEDIA-GEN-1"],
+      "input": {"prompt": "a conformance fixture", "output_path": "out/generated.png"},
+      "expected": {
+        "content_contains": ["Successfully generated image", "a conformance fixture", "out/generated.png"],
+        "details_exact": {"provider": "openai", "size": "1024x1024", "size_bytes": 67}
+      }
+    },
+    {
+      "name": "generate_image_size_boundary",
+      "description": "the smallest documented size is preserved in the result contract",
+      "requirement_ids": ["MEDIA-GEN-2"],
+      "input": {"prompt": "small fixture", "size": "512x512", "output_path": "small.png"},
+      "expected": {
+        "content_contains": ["Size: 512x512"],
+        "details_exact": {"size": "512x512", "size_bytes": 67}
+      }
+    },
+    {
+      "name": "generate_image_requires_prompt",
+      "description": "missing prompt produces the named validation error",
+      "requirement_ids": ["MEDIA-GEN-3"],
+      "expect_error": true,
+      "error_contains": "prompt",
+      "input": {},
+      "expected": {}
+    }
+  ]
+}

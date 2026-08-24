@@ -1,24 +1,31 @@
 {
   "version": "1.0",
   "tool": "inspect_image",
-  "description": "Media trio tool contract (bd-cv653.2.7): schema validation, boundary checks, and named errors without external networks.",
+  "description": "inspect_image contract for bd-cv653.2.7 and bd-cv653.8.1: hermetic success, format boundary, and named error behavior.",
   "cases": [
     {
-      "name": "inspect_image_requires_path",
-      "description": "missing path is a named validation error",
+      "name": "inspect_image_mock_png_success",
+      "description": "a local PNG is inspected through the hermetic mock backend",
       "requirement_ids": ["MEDIA-1"],
-      "expect_error": true,
-      "error_contains": "path",
-      "input": {},
-      "expected": {}
+      "setup": [
+        {"type": "create_file", "path": "fixture.png", "content": "fixture-bytes"}
+      ],
+      "input": {"path": "fixture.png", "prompt": "Describe the fixture"},
+      "expected": {
+        "content_contains": ["Image Analysis for fixture.png", "Canned test fixture inspection completed successfully", "Describe the fixture"],
+        "details_exact": {"mime_type": "image/png", "size_bytes": 13}
+      }
     },
     {
-      "name": "inspect_image_empty_path_error",
-      "description": "empty path string produces an error",
+      "name": "inspect_image_rejects_unsupported_extension",
+      "description": "an existing file at the format boundary is rejected by extension taxonomy",
       "requirement_ids": ["MEDIA-2"],
+      "setup": [
+        {"type": "create_file", "path": "fixture.txt", "content": "not-an-image"}
+      ],
       "expect_error": true,
-      "error_contains": "path",
-      "input": {"path": ""},
+      "error_contains": "unsupported image extension",
+      "input": {"path": "fixture.txt"},
       "expected": {}
     },
     {

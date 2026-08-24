@@ -26,7 +26,7 @@ pub fn compute_shimmer_intensity(char_idx: usize, tick: u64, mode: ShimmerMode) 
         ShimmerMode::Cosine => {
             let dist = ((char_idx as f32) - (phase % 40.0)).abs();
             if dist < width {
-                (1.0 + (dist / width * std::f32::consts::PI).cos()) * 0.5
+                0.15 + 0.85 * (1.0 + (dist / width * std::f32::consts::PI).cos()) * 0.5
             } else {
                 0.15
             }
@@ -53,15 +53,21 @@ pub fn render_sparkline(values: &[f64]) -> String {
 
     const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
-    let first = values.first().copied().unwrap_or(0.0);
+    let first = values
+        .iter()
+        .copied()
+        .find(f64::is_finite)
+        .unwrap_or(0.0);
     let mut min = first;
     let mut max = first;
     for &v in values {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
+        if v.is_finite() {
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
     }
 
@@ -69,8 +75,8 @@ pub fn render_sparkline(values: &[f64]) -> String {
     let mut out = String::with_capacity(values.len());
 
     for &v in values {
-        let normalized = if range > 0.0 {
-            ((v - min) / range * 7.0).round() as usize
+        let normalized = if range > 0.0 && v.is_finite() {
+            (((v - min) / range * 7.0).round() as usize).min(7)
         } else {
             0
         };

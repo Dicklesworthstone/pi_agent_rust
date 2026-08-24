@@ -1,0 +1,35 @@
+{
+  "version": "1.0",
+  "tool": "tts",
+  "description": "tts contract for bd-cv653.2.7 and bd-cv653.8.1: hermetic synthesis, empty-text boundary, and named validation behavior.",
+  "cases": [
+    {
+      "name": "tts_mock_success",
+      "description": "the mock backend writes deterministic WAV bytes without network access",
+      "requirement_ids": ["MEDIA-TTS-1"],
+      "input": {"text": "hello fixture", "output_path": "audio/fixture.wav"},
+      "expected": {
+        "content_contains": ["Successfully synthesized speech audio", "Voice: eve", "Characters: 13"],
+        "details_exact": {"voice": "eve", "format": "wav", "size_bytes": 44, "char_count": 13}
+      }
+    },
+    {
+      "name": "tts_empty_text_boundary",
+      "description": "blank text is rejected before any artifact is written",
+      "requirement_ids": ["MEDIA-TTS-2"],
+      "expect_error": true,
+      "error_contains": "text cannot be empty",
+      "input": {"text": "   "},
+      "expected": {}
+    },
+    {
+      "name": "tts_requires_text",
+      "description": "missing text produces the named validation error",
+      "requirement_ids": ["MEDIA-TTS-3"],
+      "expect_error": true,
+      "error_contains": "text",
+      "input": {},
+      "expected": {}
+    }
+  ]
+}

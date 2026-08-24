@@ -1,33 +1,35 @@
 {
   "version": "1.0",
   "tool": "todo",
-  "description": "Todo task tracking tool contract (bd-cv653.3.9): tasks array and phase validation.",
+  "description": "Todo contract for bd-cv653.3.9 and bd-cv653.8.1: initialization success, empty-list boundary, and named validation behavior.",
   "cases": [
     {
-      "name": "todo_requires_action_or_items",
-      "description": "empty input to todo produces validation error",
+      "name": "todo_initializes_and_promotes_first_task",
+      "description": "initialization persists the list and auto-promotes its first task",
       "requirement_ids": ["TODO-1"],
-      "expect_error": true,
-      "error_contains": "action",
-      "input": {},
-      "expected": {}
+      "input": {"op": "init", "tasks": ["inspect", "repair"]},
+      "expected": {
+        "content_contains": ["[>] inspect", "[ ] repair", "0/2 settled"],
+        "details_exact": {"schema": "todo_list.v1", "summary": "0/2 · inspect"}
+      }
     },
     {
-      "name": "todo_unknown_action_error",
-      "description": "unsupported todo action produces named error",
+      "name": "todo_view_empty_list_boundary",
+      "description": "viewing a fresh session returns the explicit empty-list state",
       "requirement_ids": ["TODO-2"],
-      "expect_error": true,
-      "error_contains": "unknown",
-      "input": {"action": "wipe_all"},
-      "expected": {}
+      "input": {"op": "view"},
+      "expected": {
+        "content_exact": "(todo list is empty)",
+        "details_exact": {"schema": "todo_list.v1", "summary": null}
+      }
     },
     {
-      "name": "todo_add_requires_title",
-      "description": "add action requires task title",
+      "name": "todo_rejects_unknown_operation",
+      "description": "unsupported operations fail through the deserialization taxonomy",
       "requirement_ids": ["TODO-3"],
       "expect_error": true,
-      "error_contains": "title",
-      "input": {"action": "add"},
+      "error_contains": "unknown variant",
+      "input": {"op": "wipe_all"},
       "expected": {}
     }
   ]

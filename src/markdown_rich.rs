@@ -97,17 +97,33 @@ pub fn render_hex_swatches(text: &str) -> String {
 
     while i < chars.len() {
         if chars.get(i) == Some(&'#') && i + 6 < chars.len() {
-            let chunk: Vec<char> = chars.iter().skip(i + 1).take(6).copied().collect();
-            let is_hex = chunk.len() == 6 && chunk.iter().all(char::is_ascii_hexdigit);
-            if is_hex {
-                out.push('■');
-                out.push(' ');
-                out.push('#');
-                for c in chunk {
-                    out.push(c);
+            // Ensure not preceded by an alphanumeric character (e.g. not url#anchor or var#name)
+            let prev_ok = if i == 0 {
+                true
+            } else {
+                chars
+                    .get(i.saturating_sub(1))
+                    .is_none_or(|&prev| !prev.is_ascii_alphanumeric())
+            };
+
+            if prev_ok {
+                let chunk: Vec<char> = chars.iter().skip(i + 1).take(6).copied().collect();
+                let is_hex = chunk.len() == 6 && chunk.iter().all(char::is_ascii_hexdigit);
+                // Ensure not immediately followed by another hex digit (e.g. not a 7+ char hash)
+                let next_ok = chars
+                    .get(i + 7)
+                    .is_none_or(|&next| !next.is_ascii_hexdigit());
+
+                if is_hex && next_ok {
+                    out.push('■');
+                    out.push(' ');
+                    out.push('#');
+                    for c in chunk {
+                        out.push(c);
+                    }
+                    i += 7;
+                    continue;
                 }
-                i += 7;
-                continue;
             }
         }
         if let Some(&c) = chars.get(i) {

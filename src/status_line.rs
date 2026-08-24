@@ -260,11 +260,15 @@ impl PowerlineStatusLine {
         }
 
         // Sort by priority descending to identify segments to drop first
+        let sep_width = self.separator.glyph().chars().count() + 2;
         let sep_str = format!(" {} ", self.separator.glyph());
         while !rendered_segments.is_empty() {
-            let total_len: usize = rendered_segments.iter().map(|(_, t)| t.len()).sum::<usize>()
+            let total_len: usize = rendered_segments
+                .iter()
+                .map(|(_, t)| t.chars().count())
+                .sum::<usize>()
                 + if rendered_segments.len() > 1 {
-                    (rendered_segments.len() - 1) * sep_str.len()
+                    (rendered_segments.len() - 1) * sep_width
                 } else {
                     0
                 };

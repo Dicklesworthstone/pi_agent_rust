@@ -1,33 +1,35 @@
 {
   "version": "1.0",
   "tool": "computer",
-  "description": "Computer desktop automation tool contract (bd-cv653.2.5): action dispatch and schema validation.",
+  "description": "Computer desktop automation contract for bd-cv653.2.5 and bd-cv653.8.1: hermetic success, coordinate boundary, and named error behavior.",
   "cases": [
     {
-      "name": "computer_requires_action",
-      "description": "missing action produces a validation error",
+      "name": "computer_mock_lists_displays",
+      "description": "the mock backend returns its deterministic two-display inventory",
       "requirement_ids": ["COMP-1"],
-      "expect_error": true,
-      "error_contains": "action",
-      "input": {},
-      "expected": {}
+      "input": {"action": "list_displays"},
+      "expected": {
+        "content_contains": ["Found 2 display(s)", "Built-in Retina Display", "External 4K Monitor"],
+        "details_contains": ["\"width\": 2560", "\"width\": 3840"]
+      }
+    },
+    {
+      "name": "computer_mouse_move_zero_boundary",
+      "description": "omitted coordinates resolve deterministically to the origin",
+      "requirement_ids": ["COMP-2"],
+      "input": {"action": "mouse_move"},
+      "expected": {
+        "content_contains": ["Moved cursor to (0, 0)"],
+        "details_exact": {"action": "mouse_move", "x": 0, "y": 0}
+      }
     },
     {
       "name": "computer_unknown_action_error",
-      "description": "unsupported action produces named error",
-      "requirement_ids": ["COMP-2"],
+      "description": "unsupported action produces a named dispatch error",
+      "requirement_ids": ["COMP-3"],
       "expect_error": true,
       "error_contains": "unknown",
       "input": {"action": "invalid_action_xyz"},
-      "expected": {}
-    },
-    {
-      "name": "computer_mouse_move_requires_coords",
-      "description": "mouse_move without x/y coordinates fails",
-      "requirement_ids": ["COMP-3"],
-      "expect_error": true,
-      "error_contains": "coordinate",
-      "input": {"action": "mouse_move"},
       "expected": {}
     }
   ]
