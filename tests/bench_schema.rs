@@ -7692,7 +7692,10 @@ fn orchestrate_rejects_malformed_source_row_before_finalization() {
 fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_INDEX_STAGE_SAMPLE", "1")]);
-    assert_orchestrate_success(&output);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when a required stage sample is missing"
+    );
 
     let matrix_path = temp_root
         .join("run")
@@ -7833,7 +7836,10 @@ fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
 fn orchestrate_phase1_matrix_treats_missing_swarm_metrics_as_incomplete() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_SWARM_METRICS", "1")]);
-    assert_orchestrate_success(&output);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when required swarm metrics are missing"
+    );
 
     let matrix_path = temp_root
         .join("run")
@@ -7886,7 +7892,10 @@ fn orchestrate_phase1_matrix_treats_missing_swarm_metrics_as_incomplete() {
 fn orchestrate_phase1_weighted_attribution_missing_when_no_stage_cells_are_valid() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_ALL_STAGE_SAMPLES", "1")]);
-    assert_orchestrate_success(&output);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when every stage attribution is missing"
+    );
 
     let matrix_path = temp_root
         .join("run")
