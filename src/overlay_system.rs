@@ -7,7 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 
 /// Overlay surface types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

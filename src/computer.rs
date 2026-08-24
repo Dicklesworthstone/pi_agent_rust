@@ -239,7 +239,7 @@ impl Tool for ComputerTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::tool("computer", "missing required action parameter"))?;
 
-        let is_mutating = matches!(
+        let _is_mutating = matches!(
             action,
             "mouse_click" | "mouse_drag" | "key_type" | "key_press" | "clipboard_write"
         );
