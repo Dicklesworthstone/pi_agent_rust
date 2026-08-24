@@ -766,6 +766,22 @@ def validate_evidence_cache_entry(
             "observed_artifact_schema": recorded_schema,
         }
 
+    embedded_inspection = inspect_direct_artifact(
+        evidence_path,
+        effective_ttl_hours,
+        now,
+        expected_git_commit=context.git_commit,
+        expected_correlation_id=context.expected_correlation_id,
+    )
+    if not embedded_inspection["is_fresh"]:
+        return None, {
+            **rejection_base,
+            "reason": "cache_artifact_provenance_invalid",
+            "cache_artifact_path": str(evidence_path),
+            "freshness_failures": embedded_inspection["freshness_failures"],
+            "freshness_reason": embedded_inspection["freshness_reason"],
+        }
+
     accepted = {
         "source_kind": "cache",
         "path": str(evidence_path),
@@ -936,11 +952,24 @@ def inspect_direct_artifact(
     source_commit = _consistent_embedded_value(records, "source_commit", failures)
     source_dirty = _consistent_embedded_value(records, "source_dirty", failures)
     run_id = _consistent_embedded_value(records, "run_id", failures)
-    correlation_id = _consistent_embedded_value(records, "correlation_id", failures)
+    orchestration_correlation_id = _consistent_embedded_value(
+        records, "orchestration_correlation_id", failures
+    )
+    correlation_id = (
+        orchestration_correlation_id
+        if orchestration_correlation_id is not None
+        else _consistent_embedded_value(records, "correlation_id", failures)
+    )
     schema = _consistent_embedded_value(records, "schema", failures)
     field_presence = {
         key: sum(1 for record in records if key in record)
-        for key in ("source_commit", "source_dirty", "run_id", "correlation_id")
+        for key in (
+            "source_commit",
+            "source_dirty",
+            "run_id",
+            "correlation_id",
+            "orchestration_correlation_id",
+        )
     }
 
     requirements = EMBEDDED_PROVENANCE_REQUIREMENTS.get(schema, ())
@@ -990,6 +1019,7 @@ def inspect_direct_artifact(
         "source_dirty": source_dirty,
         "run_id": run_id,
         "correlation_id": correlation_id,
+        "orchestration_correlation_id": orchestration_correlation_id,
         "reused_evidence": False,
     }
 
@@ -1669,11 +1699,22 @@ def run_self_test() -> int:
         ttl_hours: float = 24.0,
         run_id: str | None = "run-123",
         correlation_id: str | None = "corr-123",
+        embedded_correlation_id: str | None = None,
     ) -> Path:
         cache_dir = root / "target/perf/evidence_cache"
         artifact_path = cache_dir / "artifacts" / contract_id / "estimates.json"
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_text('{"mean":{"point_estimate":1000.0}}\n', encoding="utf-8")
+        artifact_payload: dict[str, Any] = {"mean": {"point_estimate": 1000.0}}
+        if embedded_correlation_id is not None:
+            artifact_payload.update(
+                {
+                    "generated_at": iso_now(),
+                    "source_commit": cache_git_commit,
+                    "source_dirty": False,
+                    "correlation_id": embedded_correlation_id,
+                }
+            )
+        artifact_path.write_text(json.dumps(artifact_payload) + "\n", encoding="utf-8")
         entry = {
             "schema": EVIDENCE_CACHE_ENTRY_SCHEMA,
             "contract_id": contract_id,
@@ -2093,6 +2134,27 @@ def run_self_test() -> int:
         entry["reason"] == "correlation_id_mismatch"
         for entry in wrong_correlation_payload["rejected_evidence_cache_entries"]
     ), wrong_correlation_payload
+
+    relabeled_cache_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-relabeled-"))
+    write_fixture(relabeled_cache_root, include_policy=False)
+    relabeled_cache_dir = write_cache_index(
+        relabeled_cache_root,
+        embedded_correlation_id="foreign-correlation",
+    )
+    relabeled_code, relabeled_payload = build_report(
+        build_args(
+            relabeled_cache_root,
+            cache_dir=relabeled_cache_dir,
+            expected_correlation_id="corr-123",
+        )
+    )
+    assert relabeled_code == 1, relabeled_payload
+    assert any(
+        entry["reason"] == "cache_artifact_provenance_invalid"
+        and "correlation_id_mismatch"
+        in entry.get("freshness_failures", [])
+        for entry in relabeled_payload["rejected_evidence_cache_entries"]
+    ), relabeled_payload
 
     stale_cache_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-stale-"))
     write_fixture(stale_cache_root, include_policy=False)

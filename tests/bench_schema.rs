@@ -775,11 +775,13 @@ if [[ -n "${CI_CORRELATION_ID:-}" ]]; then
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 target_dir = Path(sys.argv[1])
 correlation_id = sys.argv[2]
 source_commit = sys.argv[3]
+generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 artifacts = (
     ("scenario_runner.jsonl", "orchestration_correlation_id"),
     ("pijs_workload.jsonl", "correlation_id"),
@@ -796,6 +798,8 @@ for relative_path, correlation_field in artifacts:
         if line.strip()
     ]
     for record in records:
+        record["timestamp"] = generated_at
+        record["run_id"] = correlation_id
         record[correlation_field] = correlation_id
         record["source_commit"] = source_commit
         record["source_dirty"] = False
