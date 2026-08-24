@@ -242,6 +242,34 @@ Accessor defaults:
 - `extensions`, `skills`, `prompts`, `themes` (arrays): resource filters.
 - `enable_skill_commands` (bool): default `true`.
 
+### Media (multimodal perception & speech)
+
+- `media.enable_media` (bool): Default `false`. When `true`, activates `inspect_image`, `generate_image`, and `tts`.
+- `media.tts_provider` (string): Default `"elevenlabs"`. Supported: `"openai"`, `"elevenlabs"`, `"system"`.
+- `media.tts_voice` (string): Voice identifier (e.g. `"alloy"`, `"rachel"`).
+- `media.image_gen_provider` (string): Default `"gemini"`. Supported: `"gemini"`, `"dall-e-3"`.
+- `media.output_dir` (string): Destination folder for generated media artifacts.
+
+### Computer (desktop automation)
+
+- `computer.enable_computer` (bool): Default `false`. When `true`, activates `computer` tool.
+- `computer.require_approval` (bool): Default `true`. Requires operator approval for mouse/keyboard inputs.
+- `computer.screenshot_dir` (string): Destination directory for captured screen artifacts.
+
+### Browser (headless Chromium automation)
+
+- `browser.enable_browser` (bool): Default `false`. When `true`, activates `browser` tool.
+- `browser.headless` (bool): Default `true`. Runs browser in headless mode.
+- `browser.remote_debugging_port` (integer): CDP debugging port (default `9222`).
+- `browser.domain_allowlist` (array of strings): Restricts browser navigation to approved hosts.
+
+### Web Remote & Collab
+
+- `web.port` (integer): Port for `pi web` WebSocket server (default `8080`).
+- `web.bind_mode` (string): `"loopback"`, `"tailscale"`, `"lan"`.
+- `web.view_only` (bool): Restricts all remote clients to view-only mode.
+- `web.max_viewers` (integer): Max concurrent viewer connections (default `4`).
+
 ## Full reference
 
 `src/config.rs` is the authoritative list of supported fields and defaulting behavior.
