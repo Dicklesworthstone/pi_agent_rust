@@ -542,17 +542,43 @@ def write_fixture(root: Path, include_policy: bool) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"mean":{"point_estimate":1000.0}}\n', encoding="utf-8")
 
+    generated_at = iso_now()
     (root / "target/perf/perf/pijs_workload_perf.jsonl").write_text(
-        '{"schema":"pi.perf.workload.v1","tool_calls_per_iteration":1}\n',
+        json.dumps(
+            {
+                "schema": "pi.perf.workload.v1",
+                "timestamp": generated_at,
+                "source_commit": "test-commit",
+                "source_dirty": False,
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+                "tool_calls_per_iteration": 1,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     (root / "target/release/pi").write_bytes(b"binary")
     (root / "tests/perf/reports/extension_benchmark_stratification.json").write_text(
-        '{"schema":"pi.perf.extension_benchmark_stratification.v1"}',
+        json.dumps(
+            {
+                "schema": "pi.perf.extension_benchmark_stratification.v1",
+                "generated_at": generated_at,
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
         encoding="utf-8",
     )
     (root / "target/perf/results/phase1_matrix_validation.json").write_text(
-        '{"schema":"pi.perf.phase1_matrix_validation.v1"}',
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": generated_at,
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
         encoding="utf-8",
     )
     context_budget_path = root / "target/perf/context_intelligence/perf_budget.json"

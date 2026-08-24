@@ -1731,17 +1731,46 @@ def run_self_test() -> int:
         for path in estimate_paths:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(fresh_payload), encoding="utf-8")
+        generated_at = iso_now()
         (root / "target/perf/perf/pijs_workload_perf.jsonl").write_text(
-            '{"schema":"pi.perf.workload.v1","iterations":2000,"tool_calls_per_iteration":1,"total_calls":2000,"build_profile_verified":true}\n',
+            json.dumps(
+                {
+                    "schema": "pi.perf.workload.v1",
+                    "timestamp": generated_at,
+                    "source_commit": "test-commit",
+                    "source_dirty": False,
+                    "run_id": "fixture-run",
+                    "correlation_id": "fixture-run",
+                    "iterations": 2000,
+                    "tool_calls_per_iteration": 1,
+                    "total_calls": 2000,
+                    "build_profile_verified": True,
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         (root / "target/release/pi").write_bytes(b"binary")
         (root / "tests/perf/reports/extension_benchmark_stratification.json").write_text(
-            '{"schema":"pi.perf.extension_benchmark_stratification.v1"}',
+            json.dumps(
+                {
+                    "schema": "pi.perf.extension_benchmark_stratification.v1",
+                    "generated_at": generated_at,
+                    "run_id": "fixture-run",
+                    "correlation_id": "fixture-run",
+                }
+            ),
             encoding="utf-8",
         )
         (root / "target/perf/results/phase1_matrix_validation.json").write_text(
-            '{"schema":"pi.perf.phase1_matrix_validation.v1"}',
+            json.dumps(
+                {
+                    "schema": "pi.perf.phase1_matrix_validation.v1",
+                    "generated_at": generated_at,
+                    "run_id": "fixture-run",
+                    "correlation_id": "fixture-run",
+                }
+            ),
             encoding="utf-8",
         )
         context_budget_path = root / "target/perf/context_intelligence/perf_budget.json"
@@ -1893,6 +1922,22 @@ def run_self_test() -> int:
         )
         assert inspection["is_fresh"] is False, inspection
         assert expected_failure in inspection["freshness_failures"], inspection
+
+    missing_lineage = provenance_root / "missing-lineage.json"
+    missing_lineage_payload = dict(base_payload)
+    missing_lineage_payload.pop("correlation_id")
+    missing_lineage.write_text(json.dumps(missing_lineage_payload), encoding="utf-8")
+    missing_lineage_inspection = inspect_direct_artifact(
+        missing_lineage,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert missing_lineage_inspection["is_fresh"] is False, missing_lineage_inspection
+    assert "missing_correlation_id" in missing_lineage_inspection["freshness_failures"], (
+        missing_lineage_inspection
+    )
 
     mixed_jsonl = provenance_root / "mixed.jsonl"
     mixed_jsonl.write_text(

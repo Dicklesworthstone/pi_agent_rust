@@ -192,6 +192,7 @@ fixture_test!(test_jobs_fixtures, "jobs_tool");
 fixture_test!(test_hub_fixtures, "hub_tool");
 fixture_test!(test_eval_fixtures, "eval_tool");
 fixture_test!(test_stats_fixtures, "stats_tool");
+fixture_test!(test_stream_rules_fixtures, "stream_rules_tool");
 #[cfg(unix)]
 fixture_test!(test_github_fixtures, "github_tool");
 fixture_test!(test_retain_fixtures, "retain_tool");
@@ -263,6 +264,7 @@ fn test_all_fixtures_exist() {
         "hub_tool",
         "eval_tool",
         "stats_tool",
+        "stream_rules_tool",
         "github_tool",
         "retain_tool",
         "recall_tool",

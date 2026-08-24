@@ -865,6 +865,27 @@ impl EGraphDecision {
         self.fallback_reason.is_none()
     }
 
+    /// Re-express the searched cost on a caller's own cost scale.
+    ///
+    /// Callers price plans in their own units — `src/extensions/protocol.rs`
+    /// uses a 100-point index, this module uses per-stage costs — so the raw
+    /// [`Self::selected_cost`] is meaningless to them. What transfers between
+    /// scales is the *ratio* the search established, which is what this
+    /// projects: `selected/baseline` applied to `caller_baseline`.
+    ///
+    /// Returns `None` when there is nothing to project — the search fell back,
+    /// or its own baseline was free, so no ratio exists. A caller that gets
+    /// `None` should keep whatever estimate it already had.
+    #[must_use]
+    pub fn project_cost_onto(&self, caller_baseline: u32) -> Option<u32> {
+        if !self.rewrote() || self.baseline_cost == 0 {
+            return None;
+        }
+        let scaled = u64::from(self.selected_cost).saturating_mul(u64::from(caller_baseline))
+            / u64::from(self.baseline_cost);
+        Some(u32::try_from(scaled).unwrap_or(caller_baseline))
+    }
+
     /// Hand the result to [`crate::hostcall_rewrite::HostcallRewriteEngine`],
     /// which owns the final authorization.
     ///
@@ -1674,6 +1695,54 @@ mod tests {
         assert_eq!(json["rewrote"], false);
         assert_eq!(json["fallback_reason"], "egraph_disabled");
         assert_eq!(json["expected_cost_delta"], 0);
+    }
+
+    #[test]
+    fn projecting_onto_another_scale_carries_the_ratio() {
+        // src/extensions/protocol.rs prices plans on a 100-point index while
+        // this module prices stages in its own units. Only the ratio is
+        // meaningful across that boundary.
+        let engine = HostcallEGraphEngine::new(true);
+        let decision = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
+        assert!(decision.rewrote());
+
+        let projected = decision.project_cost_onto(100).expect("a rewrite projects");
+        let expected = u32::try_from(
+            u64::from(decision.selected_cost) * 100 / u64::from(decision.baseline_cost),
+        )
+        .expect("in range");
+        assert_eq!(projected, expected);
+        // A projected saving must stay a saving on the new scale too.
+        assert!(
+            projected < 100,
+            "projected {projected} should beat the baseline"
+        );
+    }
+
+    #[test]
+    fn projection_declines_when_there_is_no_ratio_to_carry() {
+        // A fallback has no established ratio, so it must not hand a caller a
+        // number that looks like a measured saving.
+        let disabled = HostcallEGraphEngine::new(false);
+        let decision = disabled.optimize(&typed_plan_with_roundtrip("tool.read"));
+        assert!(!decision.rewrote());
+        assert_eq!(decision.project_cost_onto(100), None);
+    }
+
+    #[test]
+    fn projection_is_monotone_in_the_caller_scale() {
+        // Doubling the caller's baseline doubles the projection: the mapping
+        // between scales must be linear, or a caller could not reason about it.
+        let engine = HostcallEGraphEngine::new(true);
+        let decision = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
+        let at_100 = decision.project_cost_onto(100).expect("projects");
+        let at_200 = decision.project_cost_onto(200).expect("projects");
+        // Integer division makes this approximate; allow one unit of rounding.
+        assert!(
+            at_200.abs_diff(at_100.saturating_mul(2)) <= 1,
+            "projection not linear: {at_100} at 100 vs {at_200} at 200"
+        );
+        assert!(decision.project_cost_onto(0) == Some(0));
     }
 
     #[test]

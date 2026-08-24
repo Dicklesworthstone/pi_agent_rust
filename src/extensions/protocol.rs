@@ -289,23 +289,11 @@ fn egraph_fast_opcode_cost(opcode: CommonHostcallOpcode) -> Option<(u32, &'stati
         ),
     );
     let decision = engine.optimize(&baseline);
-    if !decision.rewrote() {
-        return None;
-    }
     // The two cost models are on different scales -- the search prices stages
     // in its own units, these constants are a 100-point index -- so the raw
-    // number cannot be compared against HOSTCALL_REWRITE_COST_BASELINE. Carry
-    // over the *ratio* the search established instead, which is the part that
-    // is scale-free.
-    let ratio_num = u64::from(decision.selected_cost);
-    let ratio_den = u64::from(decision.baseline_cost);
-    if ratio_den == 0 {
-        return None;
-    }
-    let projected = u32::try_from(
-        ratio_num.saturating_mul(u64::from(HOSTCALL_REWRITE_COST_BASELINE)) / ratio_den,
-    )
-    .unwrap_or(HOSTCALL_REWRITE_COST_BASELINE);
+    // number cannot be compared against HOSTCALL_REWRITE_COST_BASELINE.
+    // project_cost_onto carries over the ratio, which is the scale-free part.
+    let projected = decision.project_cost_onto(HOSTCALL_REWRITE_COST_BASELINE)?;
 
     // Neither model is calibrated, so take the more conservative of the two
     // rather than the more flattering one. Today the search is the pessimist,

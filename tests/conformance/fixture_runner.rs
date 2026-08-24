@@ -224,6 +224,129 @@ impl Tool for FixtureReadUrlTool {
     }
 }
 
+/// Test-only adapter around the production rolling matcher and pattern-test
+/// APIs. Stream rules are a CLI/session surface rather than an agent Tool.
+struct FixtureStreamRulesTool;
+
+#[async_trait::async_trait]
+impl Tool for FixtureStreamRulesTool {
+    fn name(&self) -> &str {
+        "stream_rules"
+    }
+
+    fn label(&self) -> &str {
+        "stream rules"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic adapter for the stream-rules matcher"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::read()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let op = input.get("op").and_then(Value::as_str).unwrap_or("match");
+        let (text, details) = match op {
+            "match" => {
+                let rules: Vec<pi::stream_rules::StreamRule> = serde_json::from_value(
+                    input.get("rules").cloned().unwrap_or_else(|| json!([])),
+                )
+                .map_err(|error| pi::error::Error::validation(error.to_string()))?;
+                let channel = match input
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                {
+                    "assistant" => pi::stream_rules::StreamChannel::AssistantText,
+                    "thinking" => pi::stream_rules::StreamChannel::Thinking,
+                    "tool_call_argument" => pi::stream_rules::StreamChannel::ToolCallArgument,
+                    other => {
+                        return Err(pi::error::Error::validation(format!(
+                            "unknown stream-rules channel {other:?}"
+                        )));
+                    }
+                };
+                let lookback = input
+                    .get("lookbackBytes")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(pi::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES);
+                let chunks = input
+                    .get("chunks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut matcher = pi::stream_rules::RollingStreamMatcher::new(&rules, lookback);
+                let matched = chunks
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find_map(|chunk| matcher.feed(chunk, channel));
+                matched.map_or_else(
+                    || {
+                        (
+                            "No stream rule matched.".to_string(),
+                            json!({"action": "continue", "matched": false}),
+                        )
+                    },
+                    |matched| {
+                        (
+                            format!("{}: {}", matched.rule_id, matched.matched_excerpt),
+                            json!({
+                                "action": "abort_and_inject",
+                                "matched": true,
+                                "ruleId": matched.rule_id,
+                                "ruleName": matched.rule_name,
+                                "ruleBody": matched.rule_body,
+                                "matchedExcerpt": matched.matched_excerpt,
+                            }),
+                        )
+                    },
+                )
+            }
+            "test_pattern" => {
+                let pattern = input
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pi::error::Error::validation("test_pattern requires pattern"))?;
+                let sample = input
+                    .get("sample")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let matched =
+                    pi::stream_rules::StreamRuleStore::default().test_pattern(pattern, sample)?;
+                (
+                    matched.as_deref().map_or_else(
+                        || "No match.".to_string(),
+                        |value| format!("Match: {value}"),
+                    ),
+                    json!({"action": "test_pattern", "match": matched}),
+                )
+            }
+            other => {
+                return Err(pi::error::Error::validation(format!(
+                    "unknown stream-rules operation {other:?}"
+                )));
+            }
+        };
+        Ok(pi::tools::ToolOutput {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -320,6 +443,7 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "stats" => Box::new(FixtureStatsTool {
             cwd: temp_dir.path().to_path_buf(),
         }),
+        "stream_rules" => Box::new(FixtureStreamRulesTool),
         "github" => {
             #[cfg(unix)]
             let gh_path = "/bin/sh";

@@ -1,0 +1,89 @@
+{
+  "version": "1.0",
+  "tool": "stream_rules",
+  "description": "Time-Traveling Stream Rules contract for bd-cv653.3.4 and bd-cv653.8.1: cross-chunk matching, strict tool-argument exclusion, and invalid-regex taxonomy through hermetic production APIs.",
+  "cases": [
+    {
+      "name": "stream_rules_match_across_chunk_boundaries",
+      "description": "the rolling matcher detects a rule whose regex is split across consecutive assistant deltas",
+      "requirement_ids": [
+        "STREAM-RULES-MATCH-1"
+      ],
+      "input": {
+        "op": "match",
+        "channel": "assistant",
+        "rules": [
+          {
+            "id": "no-box-leak",
+            "name": "No Box leak",
+            "pattern": "Box::leak",
+            "body": "Use scoped ownership.",
+            "enabled": true
+          }
+        ],
+        "chunks": [
+          "let value = Box::",
+          "leak(value);"
+        ]
+      },
+      "expected": {
+        "content_contains": [
+          "no-box-leak: Box::leak"
+        ],
+        "details_exact": {
+          "action": "abort_and_inject",
+          "matched": true,
+          "ruleId": "no-box-leak",
+          "ruleName": "No Box leak",
+          "ruleBody": "Use scoped ownership.",
+          "matchedExcerpt": "Box::leak"
+        }
+      }
+    },
+    {
+      "name": "stream_rules_exclude_tool_call_arguments",
+      "description": "matching text inside streamed tool JSON is ignored so the rule engine cannot corrupt a tool payload",
+      "requirement_ids": [
+        "STREAM-RULES-CHANNEL-BOUNDARY-1"
+      ],
+      "input": {
+        "op": "match",
+        "channel": "tool_call_argument",
+        "rules": [
+          {
+            "id": "no-unwrap",
+            "name": "No unwrap",
+            "pattern": "\\.unwrap\\(\\)",
+            "body": "Handle the error.",
+            "enabled": true
+          }
+        ],
+        "chunks": [
+          "{\"content\":\"value.unwrap()\"}"
+        ]
+      },
+      "expected": {
+        "content_exact": "No stream rule matched.",
+        "details_exact": {
+          "action": "continue",
+          "matched": false
+        }
+      }
+    },
+    {
+      "name": "stream_rules_reject_invalid_regex_patterns",
+      "description": "the production pattern-test path returns the named regex validation error",
+      "requirement_ids": [
+        "STREAM-RULES-REGEX-ERR-1"
+      ],
+      "input": {
+        "op": "test_pattern",
+        "pattern": "[unterminated",
+        "sample": "anything"
+      },
+      "expect_error": true,
+      "error_contains": "Invalid regex pattern",
+      "expected": {}
+    }
+  ]
+}
