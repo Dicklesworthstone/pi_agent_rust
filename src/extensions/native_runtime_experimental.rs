@@ -1,4 +1,11 @@
-//! Retained disabled prototype of the native extension runtime.
+//! Retained disabled prototype of the native extension runtime (dormant twin).
+//!
+//! # Disposition Note (bd-sog97.25)
+//! This file contains an early prototype of the native extension runtime and is
+//! compiled out via `#[cfg(any())]` in `src/extensions.rs`. The active, functional
+//! native descriptor runtime lives in `src/extensions/native_runtime.rs`.
+//! This file is retained for reference and historical parity until explicit operator
+//! approval is granted for deletion or archival per AGENTS.md Rule 1.
 
 // This source snapshot is compiled out with `cfg(any())`. Preserve its broad
 // import until reactivation work can validate a real, explicit dependency set.

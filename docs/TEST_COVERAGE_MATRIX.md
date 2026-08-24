@@ -91,7 +91,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extensions/exec_mediation.rs` | Extension exec mediation | `tests/bash_mediation.rs`; in-source exec-security tests. |
 | `src/extensions/extension_manager_impl.rs` | Extension manager | Extension lifecycle suites (`tests/extensions_runtime_matrix.rs`). |
 | `src/extensions/fs_connector.rs` | Extension fs connector | `tests/extensions_fs_shim.rs`. |
-| `src/extensions/native_runtime_duplicate_scaffold.rs` | Native runtime scaffold | Waived glue; duplicate scaffold retained for migration parity. |
+| `src/extensions/native_runtime.rs` | Active native descriptor runtime | Active native descriptor runtime interpreter. |
 | `src/extensions/native_runtime_experimental.rs` | Native runtime (experimental) | In-source runtime-parity tests. |
 | `src/extensions/permission_drift.rs` | Permission drift detection | In-source tests; policy suites. |
 | `src/extensions/policy_snapshot_tests.rs` | Policy snapshot tests | In-source test module (waived glue). |

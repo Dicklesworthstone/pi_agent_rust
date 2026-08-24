@@ -12697,13 +12697,13 @@ impl JsExtensionRuntimeHandle {
     }
 }
 
-mod native_runtime_duplicate_scaffold;
+mod native_runtime;
 
 pub type ExtensionRuntimeEngineSelection =
-    native_runtime_duplicate_scaffold::ExtensionRuntimeEngineSelection;
-pub type ExtensionRuntimeHandle = native_runtime_duplicate_scaffold::ExtensionRuntimeHandle;
+    native_runtime::ExtensionRuntimeEngineSelection;
+pub type ExtensionRuntimeHandle = native_runtime::ExtensionRuntimeHandle;
 pub type NativeRustExtensionRuntimeHandle =
-    native_runtime_duplicate_scaffold::NativeRustExtensionRuntimeHandle;
+    native_runtime::NativeRustExtensionRuntimeHandle;
 
 const JS_EXTENSION_ENTRY_EXTS: &[&str] = &["ts", "tsx", "jsx", "js", "mjs", "cjs", "mts", "cts"];
 

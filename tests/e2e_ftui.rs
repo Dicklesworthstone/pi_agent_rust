@@ -19,7 +19,7 @@ mod common;
 use common::tmux::TuiSession;
 use std::fs::OpenOptions;
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -446,26 +446,64 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
         "startup banner never appeared; pane:\n{pane}"
     );
 
-    // 2) Ctrl+z: the kernel stops pi's process group. The outer (non-m)
-    // shell observes the stop, then execs into the job-control interactive
-    // shell, which inherits the stopped job — but shells do not announce
-    // stopped jobs unprompted, so ask explicitly.
-    session.tmux.send_key("C-z");
-    std::thread::sleep(Duration::from_millis(500));
-    session.tmux.send_literal("jobs");
-    session.tmux.send_key("Enter");
-    let pane = session
-        .tmux
-        .wait_for_pane_contains("Stopped", COMMAND_TIMEOUT);
-    assert!(
-        pane.contains("Stopped"),
-        "shell never reported the stopped job after ctrl+z; pane:\n{pane}"
-    );
+    // 2) Ctrl+z: pi raises SIGTSTP against itself after restoring cooked
+    // mode, so the kernel stops its process group. Detect the stop through
+    // the recorded pid's process state ('T') rather than pane text: the
+    // stopped foreground process cannot echo anything, and shell job notices
+    // race our keystrokes into the stopped process's input buffer.
+    let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
+        let pane = session.tmux.capture_pane();
+        panic!("read pi pid failed: {err}\npane:\n{pane}");
+    });
+    let pid: u32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
+
+    fn process_state(pid: u32) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .map(|out| out.stdout)
+                .unwrap_or_default(),
+        )
+        .trim()
+        .to_string()
+    }
+
+    let start = Instant::now();
+    loop {
+        let state = process_state(pid);
+        if state.starts_with('T') {
+            break;
+        }
+        assert!(
+            !state.is_empty(),
+            "pi pid {pid} vanished instead of stopping"
+        );
+        assert!(
+            start.elapsed() < COMMAND_TIMEOUT,
+            "pi pid {pid} never entered stopped state (state={state})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 
     // 3) `fg` resumes pi: SIGCONT wakes the suspend task, which re-enters
-    // raw mode + alt screen and forces the full repaint.
+    // raw mode + alt screen and forces the full repaint. Confirm both the
+    // banner repaint AND the process actually leaving the stopped state.
     session.tmux.send_literal("fg");
     session.tmux.send_key("Enter");
+
+    let start = Instant::now();
+    loop {
+        let state = process_state(pid);
+        if !state.is_empty() && !state.starts_with('T') {
+            break;
+        }
+        assert!(
+            start.elapsed() < COMMAND_TIMEOUT,
+            "pi pid {pid} never left stopped state after fg"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let pane = session
         .tmux
         .wait_for_pane_contains("ftui preview stack", COMMAND_TIMEOUT);

@@ -3016,7 +3016,7 @@ src/
 │   ├── permission_drift.rs # Permission snapshot drift evidence
 │   ├── event_coalescer_impl.rs # Coalesced event dispatch
 │   ├── extension_manager_impl.rs # Manager lifecycle + event orchestration
-│   ├── native_runtime_duplicate_scaffold.rs # Active native descriptor runtime
+│   ├── native_runtime.rs   # Active native descriptor runtime
 │   ├── wasm_host.rs        # Feature-gated Wasmtime component host
 │   └── tests/              # Behavior-domain characterization suites
 ├── extensions_js.rs        # QuickJS runtime bridge + hostcalls

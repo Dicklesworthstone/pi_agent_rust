@@ -756,9 +756,13 @@ pub fn ssh_host_allowed(host: &str) -> bool {
 /// Shared ssh invocation flags: no interactive auth possible (BatchMode),
 /// bounded connect, and accept-new-then-strict host keys — a *changed* key
 /// still hard-fails and is classified by [`classify_ssh_failure`].
+///
+/// `PI_SSH_CLIENT_CONFIG_FILE` (optional) appends `-F <path>` so fixture
+/// and live lanes can pin port/user/identity/known_hosts without touching
+/// production behavior (unset by default).
 #[must_use]
-pub fn ssh_command_flags() -> [&'static str; 6] {
-    [
+pub fn ssh_command_flags() -> Vec<String> {
+    let mut flags: Vec<String> = [
         "-o",
         "BatchMode=yes",
         "-o",
@@ -766,6 +770,16 @@ pub fn ssh_command_flags() -> [&'static str; 6] {
         "-o",
         "StrictHostKeyChecking=accept-new",
     ]
+    .iter()
+    .map(ToString::to_string)
+    .collect();
+    if let Ok(config) = std::env::var("PI_SSH_CLIENT_CONFIG_FILE")
+        && !config.is_empty()
+    {
+        flags.push("-F".to_string());
+        flags.push(config);
+    }
+    flags
 }
 
 /// Remediation surfaced when a cached host key no longer matches.
@@ -1112,8 +1126,8 @@ mod tests {
     #[test]
     fn ssh_flags_force_batch_and_accept_new() {
         let flags = ssh_command_flags();
-        assert!(flags.contains(&"BatchMode=yes"));
-        assert!(flags.contains(&"StrictHostKeyChecking=accept-new"));
+        assert!(flags.iter().any(|flag| flag == "BatchMode=yes"));
+        assert!(flags.iter().any(|flag| flag == "StrictHostKeyChecking=accept-new"));
     }
 
     #[test]
