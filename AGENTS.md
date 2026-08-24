@@ -627,6 +627,36 @@ This check runs automatically in CI as the "Beads ledger reconciliation check" s
 
 ---
 
+## Module Reachability — Invariant
+
+**CRITICAL INVARIANT:** Every `pub mod` in `src/lib.rs` must have at least one non-test call site, or an allowlist entry stating why not.
+
+```bash
+python3 scripts/check_module_reachability.py          # exit 0 = safe to commit
+python3 scripts/check_module_reachability.py --json   # machine-readable report
+```
+
+### Why This Exists (bd-4rzpj)
+
+This is the second half of the completion-illusion defense. Ledger reconciliation above catches *untracked* gaps; it cannot catch a bead **closed against code nobody calls**, because that code compiles and its tests pass.
+
+That failure happened at epic scale on 2026-08-24 (bd-33df9): five modules landed with green unit tests, their beads were closed, the parent epics were closed — and nothing in the product ever called them. `reconcile_beads_ledger.sh` exited 0 the entire time. **A module only its own tests reference is not a shipped feature.**
+
+### What Counts as Reachable
+
+- `src/`, `examples/`, and `benches/` are real consumers. In this repo `cargo run --example` is a genuine operational path (the perf and conformance tooling runs that way).
+- `tests/` deliberately does **not** count. "A test pokes it" is exactly the state this gate exists to distinguish from "a user can reach it".
+- References inside a `#[cfg(test)] mod ... { }` block don't count either — the gate brace-tracks those blocks rather than guessing by proximity.
+
+### If It Fails
+
+1. **Land the call site** that makes the module reachable. This is almost always the right answer.
+2. **Or add it to `ALLOWLIST`** in the script *with a real reason*. Test-harness modules (`conformance_shapes`, `flake_classifier`, `swarm_flight_recorder`) are legitimate entries. The reason string is the point: it converts "nobody noticed" into "someone decided".
+
+**Never** silence this gate by deleting a module — Rule 1 forbids file deletion without express written permission, and a failing gate is evidence of missing integration work, not of a surplus file.
+
+---
+
 ## RCH — Remote Compilation Helper
 
 RCH offloads `cargo build`, `cargo test`, `cargo clippy`, and other compilation commands to a fleet of 8 remote Contabo VPS workers instead of building locally. This prevents compilation storms from overwhelming csd when many agents run simultaneously.

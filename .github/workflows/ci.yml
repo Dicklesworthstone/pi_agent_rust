@@ -714,6 +714,20 @@ jobs:
           fi
           echo "Beads ↔ ledger reconciliation passed: no orphan gaps or stale active gap beads found"
 
+      - name: Module reachability check [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Companion to the ledger check above, closing the other half of the
+          # completion-illusion class (bd-4rzpj). Ledger reconciliation cannot
+          # see a bead closed against code that compiles, tests green, and is
+          # unreachable; this catches that directly.
+          if ! python3 ./scripts/check_module_reachability.py; then
+            echo "REACHABILITY FAILED: a pub mod in src/lib.rs has no non-test call site" >&2
+            echo "Run 'python3 ./scripts/check_module_reachability.py' locally to see details" >&2
+            exit 1
+          fi
+
       - name: cargo fmt
         run: cargo fmt --check
 
