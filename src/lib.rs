@@ -177,6 +177,8 @@ pub mod file_lock;
 pub mod flake_classifier;
 pub mod gc;
 #[doc(hidden)]
+pub mod gallery;
+#[doc(hidden)]
 pub mod github;
 pub mod handoff;
 #[doc(hidden)]
