@@ -72,7 +72,11 @@ pub enum MeasurementControlError {
 impl fmt::Display for MeasurementControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Missing(path) => write!(formatter, "measurement control is missing: {}", path.display()),
+            Self::Missing(path) => write!(
+                formatter,
+                "measurement control is missing: {}",
+                path.display()
+            ),
             Self::Invalid(detail) => write!(formatter, "invalid measurement control: {detail}"),
             Self::Noisy { observed, maximum } => write!(
                 formatter,
@@ -498,10 +502,7 @@ fn read_measurement_control<T: serde::de::DeserializeOwned>(
         )));
     }
     let canonical_path = std::fs::canonicalize(path).map_err(|error| {
-        MeasurementControlError::Invalid(format!(
-            "cannot canonicalize {}: {error}",
-            path.display()
-        ))
+        MeasurementControlError::Invalid(format!("cannot canonicalize {}: {error}", path.display()))
     })?;
     let bytes = std::fs::read(&canonical_path).map_err(|error| {
         MeasurementControlError::Invalid(format!(
@@ -963,8 +964,11 @@ mod tests {
     const TEST_SOURCE_COMMIT: &str = "1234567890abcdef1234567890abcdef12345678";
 
     fn write_json(path: &Path, value: &serde_json::Value) {
-        std::fs::write(path, serde_json::to_vec(value).expect("serialize test control"))
-            .expect("write test control");
+        std::fs::write(
+            path,
+            serde_json::to_vec(value).expect("serialize test control"),
+        )
+        .expect("write test control");
     }
 
     #[test]
@@ -998,8 +1002,7 @@ mod tests {
             .expect("valid release-binary control");
         assert_eq!(verified.size_bytes, 23);
 
-        std::fs::write(&binary_path, b"tampered release binary")
-            .expect("tamper release binary");
+        std::fs::write(&binary_path, b"tampered release binary").expect("tamper release binary");
         assert!(matches!(
             verify_binary_size_measurement_control(&control_path),
             Err(MeasurementControlError::Invalid(_))
@@ -1012,8 +1015,7 @@ mod tests {
         let artifact_path = temp.path().join("estimates.json");
         std::fs::write(&artifact_path, br#"{"mean":{"point_estimate":1000000}}"#)
             .expect("write Criterion estimate");
-        let artifact_path =
-            std::fs::canonicalize(artifact_path).expect("canonical Criterion path");
+        let artifact_path = std::fs::canonicalize(artifact_path).expect("canonical Criterion path");
         let artifact_sha256 = super::sha256_file(&artifact_path).expect("hash Criterion estimate");
         let bench_env = serde_json::json!({
             "os": "linux",

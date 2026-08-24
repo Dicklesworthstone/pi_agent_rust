@@ -167,11 +167,26 @@ mod tests {
 
     #[test]
     fn test_highlight_language_detection() {
-        assert_eq!(HighlightLanguage::from_fence_tag("rust"), HighlightLanguage::Rust);
-        assert_eq!(HighlightLanguage::from_fence_tag("rs"), HighlightLanguage::Rust);
-        assert_eq!(HighlightLanguage::from_fence_tag("python"), HighlightLanguage::Python);
-        assert_eq!(HighlightLanguage::from_fence_tag("tsx"), HighlightLanguage::TypeScript);
-        assert_eq!(HighlightLanguage::from_fence_tag("unknown_xyz"), HighlightLanguage::Plain);
+        assert_eq!(
+            HighlightLanguage::from_fence_tag("rust"),
+            HighlightLanguage::Rust
+        );
+        assert_eq!(
+            HighlightLanguage::from_fence_tag("rs"),
+            HighlightLanguage::Rust
+        );
+        assert_eq!(
+            HighlightLanguage::from_fence_tag("python"),
+            HighlightLanguage::Python
+        );
+        assert_eq!(
+            HighlightLanguage::from_fence_tag("tsx"),
+            HighlightLanguage::TypeScript
+        );
+        assert_eq!(
+            HighlightLanguage::from_fence_tag("unknown_xyz"),
+            HighlightLanguage::Plain
+        );
     }
 
     #[test]

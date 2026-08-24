@@ -8,6 +8,8 @@ use pi::session_store_v2::SessionStoreV2;
 use serde_json::json;
 use std::time::Instant;
 
+const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 fn finish_case(harness: &TestHarness, case: &str) {
     harness
         .log()
@@ -29,7 +31,7 @@ fn test_resume_latency_and_tail_read() {
     let store_dir = harness.temp_path("session_v2_resume");
     let _ = std::fs::create_dir_all(&store_dir);
 
-    let store_res = SessionStoreV2::open(&store_dir);
+    let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "open store");
     let mut store = match store_res {
         Ok(s) => s,
@@ -77,7 +79,7 @@ fn test_fork_and_export_snapshot_consistency() {
     let store_dir = harness.temp_path("session_v2_origin");
     let _ = std::fs::create_dir_all(&store_dir);
 
-    let store_res = SessionStoreV2::open(&store_dir);
+    let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "open origin store");
     let mut store = match store_res {
         Ok(s) => s,
@@ -98,7 +100,7 @@ fn test_fork_and_export_snapshot_consistency() {
     }
 
     // Create checkpoint at turn 20
-    let cp_res = store.checkpoint("checkpoint at turn 20");
+    let cp_res = store.create_checkpoint(1, "checkpoint at turn 20");
     assert!(cp_res.is_ok(), "checkpoint");
     if let Ok(cp) = cp_res {
         assert_eq!(cp.checkpoint_seq, 1);
@@ -121,7 +123,8 @@ fn test_fork_and_export_snapshot_consistency() {
     assert!(fork_res.is_ok(), "fork at checkpoint");
 
     // Verify forked store has exactly 20 entries
-    let forked_store_res = SessionStoreV2::open(&fork_dir);
+    let forked_store_res =
+        SessionStoreV2::open_for_inspection(&fork_dir, MAX_SEGMENT_BYTES);
     assert!(forked_store_res.is_ok(), "open forked store");
     if let Ok(forked_store) = forked_store_res {
         let forked_all_res = forked_store.read_all_entries();

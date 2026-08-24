@@ -2625,9 +2625,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
             view_only,
             max_viewers,
         } => {
-            let bind_mode: pi::web_remote::BindMode = bind.parse().map_err(|e| {
-                pi::Error::Config(format!("invalid bind mode '{bind}': {e}"))
-            })?;
+            let bind_mode: pi::web_remote::BindMode = bind
+                .parse()
+                .map_err(|e| pi::Error::Config(format!("invalid bind mode '{bind}': {e}")))?;
             let settings = pi::web_remote::WebRemoteSettings {
                 port,
                 bind_mode,
@@ -9439,7 +9439,6 @@ mod tests {
         assert_eq!(parsed.1[1].name, "dry-run");
         assert!(parsed.1[1].value.is_none());
     }
-
 
     /// bd-cv653.3.12 / bd-cv653.7.12 / bd-cv653.7.12.1 regression: the
     /// pre-parser's `known_long_option` allowlist must include every

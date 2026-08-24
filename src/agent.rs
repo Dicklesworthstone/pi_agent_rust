@@ -6931,8 +6931,7 @@ mod extensions_integration_tests {
             json!("openai-responses-native")
         );
         assert_eq!(
-            shaped["details"]["compactedWindow"],
-            response["output"],
+            shaped["details"]["compactedWindow"], response["output"],
             "window must be echoed verbatim"
         );
         assert_eq!(shaped["details"]["compactResponseId"], json!("resp_9"));

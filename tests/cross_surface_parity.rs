@@ -827,9 +827,21 @@ mod omp_tool_cross_surface_parity {
 
         let tools = [
             ("web_search", json!({"query": "rust async"}), "WS-PARITY-1"),
-            ("inspect_image", json!({"path": "sample.png"}), "MEDIA-PARITY-1"),
-            ("computer", json!({"action": "list_displays"}), "COMP-PARITY-1"),
-            ("browser", json!({"action": "list_tabs"}), "BROWSER-PARITY-1"),
+            (
+                "inspect_image",
+                json!({"path": "sample.png"}),
+                "MEDIA-PARITY-1",
+            ),
+            (
+                "computer",
+                json!({"action": "list_displays"}),
+                "COMP-PARITY-1",
+            ),
+            (
+                "browser",
+                json!({"action": "list_tabs"}),
+                "BROWSER-PARITY-1",
+            ),
             ("ask", json!({"question": "Choose target?"}), "ASK-PARITY-1"),
             ("todo", json!({"action": "list"}), "TODO-PARITY-1"),
         ];
@@ -881,8 +893,10 @@ mod omp_tool_cross_surface_parity {
     #[test]
     fn test_omp_cross_surface_divergence_detection() {
         // Negative control test: deliberate divergence in payload is caught
-        let call_json = json!({"id": "call-1", "name": "browser", "arguments": {"action": "list_tabs"}});
-        let diverged_rpc = json!({"id": "call-2", "tool": "browser", "params": {"action": "list_tabs"}});
+        let call_json =
+            json!({"id": "call-1", "name": "browser", "arguments": {"action": "list_tabs"}});
+        let diverged_rpc =
+            json!({"id": "call-2", "tool": "browser", "params": {"action": "list_tabs"}});
 
         assert_ne!(
             call_json.get("name"),
