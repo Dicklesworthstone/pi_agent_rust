@@ -1758,8 +1758,31 @@ def _resolve_dotted_field(payload: Any, dotted: str) -> Any:
 def check_claim_bindings(
     obligations: list[ClaimObligation],
     bindings: list[dict[str, Any]],
+    readme_text: str,
+    *,
+    base_dir: Path | None = None,
 ) -> list[str]:
-    """Verify each bound artifact field's value appears on a citing README line."""
+    """Verify each bound artifact field's value appears in the citing README block.
+
+    The search context is the full Markdown block (list item / paragraph)
+    containing the citation, so multi-line bullets bind their leading numbers
+    to a trailing citation.
+    """
+    readme_lines = readme_text.splitlines()
+
+    def block_text(line_number: int) -> str:
+        start = line_number - 1  # 0-indexed cite line
+        while start > 0 and readme_lines[start - 1].strip() and not readme_lines[
+            start - 1
+        ].lstrip().startswith("#"):
+            start -= 1
+        end = line_number  # exclusive
+        while end < len(readme_lines) and readme_lines[end].strip() and not readme_lines[
+            end
+        ].lstrip().startswith("#"):
+            end += 1
+        return "\n".join(readme_lines[start:end])
+
     errors: list[str] = []
     for binding in bindings:
         artifact = binding["artifact"]
@@ -1775,26 +1798,30 @@ def check_claim_bindings(
                 "README citation references it"
             )
             continue
-        value_found = False
-        for obligation in cited:
-            try:
-                payload = json.loads(
-                    (Path.cwd() / artifact).read_text(encoding="utf-8")
-                )
-            except (OSError, json.JSONDecodeError):
-                break
-            resolved = _resolve_dotted_field(payload, field)
-            if isinstance(resolved, bool) or not isinstance(resolved, (int, str)):
-                continue
-            expected = str(resolved)
-            if expected and expected in obligation.claim_text:
-                value_found = True
-                break
-        if not value_found:
-            errors.append(
-                f"BINDING MISMATCH: no README line citing {artifact} contains the "
-                f"current value of '{field}'"
+        try:
+            payload = json.loads(
+                ((base_dir or Path.cwd()) / artifact).read_text(encoding="utf-8")
             )
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(
+                f"BINDING UNREADABLE: {artifact} could not be loaded for field "
+                f"'{field}': {exc}"
+            )
+            continue
+        resolved = _resolve_dotted_field(payload, field)
+        if isinstance(resolved, bool) or resolved is None:
+            errors.append(
+                f"BINDING INVALID: {artifact}.{field} is missing or has an "
+                "unbindable type"
+            )
+            continue
+        expected = str(resolved)
+        if any(expected in block_text(o.line_number) for o in cited):
+            continue
+        errors.append(
+            f"BINDING MISMATCH: no README block citing {artifact} contains the "
+            f"current value {expected!r} of '{field}'"
+        )
     return errors
 
 
@@ -2009,7 +2036,7 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
                     print(f"INVALID: line {obligation.line_number}: {artifact_path}: {error}")
                     print(
                         "  Remediation: cite an artifact whose schema/run provenance matches "
-                        f"the README claim on line {obligation.line_number}, or remove the claim."
+                        "the current strict evidence contract."
                     )
 
             results.append(CitationCheck(
@@ -2029,11 +2056,11 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
             return 2
 
     # Claim bindings: bound artifact fields must appear on their citing lines.
-    bindings, bindings_error = load_claim_bindings(Path.cwd())
+    bindings, bindings_error = load_claim_bindings(repo_root)
     if bindings_error is not None:
         print(f"INVALID: {bindings_error}")
         return 2
-    binding_errors = check_claim_bindings(obligations, bindings)
+    binding_errors = check_claim_bindings(obligations, bindings, readme_text)
     for error in binding_errors:
         print(error)
 
@@ -2465,6 +2492,48 @@ def run_self_test() -> int:
         ):
             print("SELF-TEST FAIL: bare/historical claim surfaces misclassified")
             return 2
+        bindings_target = reports / "bindings_target.json"
+        bindings_target.write_text(
+            json.dumps({"summary": {"passed": 17, "total_gates": 20}}),
+            encoding="utf-8",
+        )
+        binding_fixture_text = (
+            "- Gate: 17/20 passed "
+            "*(from tests/perf/reports/bindings_target.json)*\n"
+        )
+        binding_obligations = parse_citation_obligations(binding_fixture_text)
+        happy_bindings = [
+            {
+                "artifact": "tests/perf/reports/bindings_target.json",
+                "field": "summary.passed",
+            },
+            {
+                "artifact": "tests/perf/reports/bindings_target.json",
+                "field": "summary.total_gates",
+            },
+        ]
+        if check_claim_bindings(
+            binding_obligations, happy_bindings, binding_fixture_text,
+            base_dir=generic_root,
+        ):
+            print("SELF-TEST FAIL: matching claim bindings must pass")
+            return 2
+        drifted_bindings = [
+            {
+                "artifact": "tests/perf/reports/bindings_target.json",
+                "field": "summary.passed",
+            }
+        ]
+        drifted_errors = check_claim_bindings(
+            binding_obligations,
+            drifted_bindings,
+            binding_fixture_text.replace("Gate: 17/20", "Gate: 16/20"),
+            base_dir=generic_root,
+        )
+        if len(drifted_errors) != 1 or "BINDING MISMATCH" not in drifted_errors[0]:
+            print(f"SELF-TEST FAIL: diverged binding must fail: {drifted_errors}")
+            return 2
+
 
 
         result, output = run_check(
