@@ -183,17 +183,9 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
         out.write_all(b"\x1b[?25h")?; // show cursor
         out.flush()?;
     }
-
-    let _ = std::fs::write(
-        "/tmp/ftui-suspend-markers",
-        format!("entered-raise pid={}\n", std::process::id()),
-    );
+;
     // Stops the process here; resumes after `fg`.
-    signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
-    let _ = std::fs::write(
-        "/tmp/ftui-suspend-markers",
-        format!("resumed pid={}\n", std::process::id()),
-    );
+    signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;;
 
     // --- continued ---
     enable_raw_mode()?;
@@ -1679,11 +1671,7 @@ impl PiFtuiModel {
                         // terminal after SIGCONT, and reports back.
                         self.suspending = true;
                         #[cfg(unix)]
-                        {
-                            let _ = std::fs::write(
-                                "/tmp/ftui-suspend-markers",
-                                format!("dispatched pid={}\n", std::process::id()),
-                            );
+                        {;
                             #[cfg(test)]
                             let task = self
                                 .suspend_task_override
