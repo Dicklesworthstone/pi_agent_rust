@@ -955,14 +955,25 @@ impl HostcallEGraphEngine {
     /// disables both halves of the rewrite path.
     #[must_use]
     pub fn from_env() -> Self {
-        let enabled = std::env::var("PI_HOSTCALL_EGRAPH_REWRITE")
-            .ok()
-            .is_none_or(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "disabled"
-                )
-            });
+        Self::from_opt(std::env::var("PI_HOSTCALL_EGRAPH_REWRITE").ok().as_deref())
+    }
+
+    /// Parse the kill switch from an explicit value.
+    ///
+    /// Split out of [`Self::from_env`] for the same reason
+    /// [`crate::hostcall_rewrite::HostcallRewriteEngine::from_opt`] is: the
+    /// crate is `#![forbid(unsafe_code)]` and `std::env::set_var` is unsafe in
+    /// Rust 2024, so the parsing has to be testable without touching the
+    /// process environment. Absent means enabled, matching that engine exactly
+    /// — one variable, one meaning, both halves of the rewrite path.
+    #[must_use]
+    pub fn from_opt(value: Option<&str>) -> Self {
+        let enabled = value.is_none_or(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "disabled"
+            )
+        });
         Self::new(enabled)
     }
 
@@ -1712,23 +1723,52 @@ mod tests {
     }
 
     #[test]
-    fn env_kill_switch_parses_the_disabling_values() {
-        // Same vocabulary as hostcall_rewrite, so one variable governs both.
-        for value in ["0", "false", "off", "disabled", "OFF", " false "] {
-            unsafe { std::env::set_var("PI_HOSTCALL_EGRAPH_REWRITE", value) };
+    fn kill_switch_parses_the_disabling_values() {
+        // Tested through from_opt, not by mutating the environment: the crate
+        // is forbid(unsafe_code) and std::env::set_var is unsafe in Rust 2024.
+        for value in [
+            "0", "false", "off", "disabled", "OFF", " false ", "DISABLED",
+        ] {
             assert!(
-                !HostcallEGraphEngine::from_env().enabled(),
+                !HostcallEGraphEngine::from_opt(Some(value)).enabled(),
                 "{value:?} should disable the search"
             );
         }
-        for value in ["1", "true", "on"] {
-            unsafe { std::env::set_var("PI_HOSTCALL_EGRAPH_REWRITE", value) };
-            assert!(HostcallEGraphEngine::from_env().enabled());
+        for value in ["1", "true", "on", "yes", ""] {
+            assert!(
+                HostcallEGraphEngine::from_opt(Some(value)).enabled(),
+                "{value:?} should leave the search enabled"
+            );
         }
-        unsafe { std::env::remove_var("PI_HOSTCALL_EGRAPH_REWRITE") };
         assert!(
-            HostcallEGraphEngine::from_env().enabled(),
+            HostcallEGraphEngine::from_opt(None).enabled(),
             "absent means enabled, matching hostcall_rewrite"
         );
+    }
+
+    #[test]
+    fn the_kill_switch_agrees_with_the_existing_planner() {
+        // One variable governs both halves of the rewrite path, so the two
+        // parsers must never disagree about what a value means.
+        use crate::hostcall_rewrite::HostcallRewriteEngine;
+
+        for value in [
+            Some("0"),
+            Some("false"),
+            Some("off"),
+            Some("disabled"),
+            Some("OFF"),
+            Some(" false "),
+            Some("1"),
+            Some("true"),
+            Some("anything-else"),
+            None,
+        ] {
+            assert_eq!(
+                HostcallEGraphEngine::from_opt(value).enabled(),
+                HostcallRewriteEngine::from_opt(value).enabled(),
+                "kill-switch parsers disagree on {value:?}"
+            );
+        }
     }
 }
