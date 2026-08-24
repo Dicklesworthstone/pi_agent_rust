@@ -119,6 +119,7 @@ files = [
     "magic_keywords",
     "worktree_iso",
     "waiver_ledger",
+    "release_evidence_ledger",
     "checkpoint",
     "eval",
     "url_router",

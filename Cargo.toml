@@ -159,6 +159,10 @@ name = "pijs_workload"
 path = "examples/pijs_workload.rs"
 
 [[example]]
+name = "release_evidence_ledger"
+path = "examples/release_evidence_ledger.rs"
+
+[[example]]
 name = "session_workload_bench"
 path = "examples/session_workload_bench.rs"
 

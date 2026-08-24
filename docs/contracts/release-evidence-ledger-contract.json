@@ -1,0 +1,22 @@
+{
+  "schema": "pi.release_evidence.ledger.contract.v1",
+  "bead_id": "bd-sog97.13",
+  "version": "1.0.0",
+  "effective_date_utc": "2026-08-24T00:00:00Z",
+  "status": "active_blocking_policy",
+  "policy_owner_issue": "bd-sog97.13",
+  "normative_statement": "Release evidence artifacts MUST be recorded in a tamper-evident, cryptographic hash-chain ledger (docs/evidence/release-evidence-ledger.json). Verification MUST assert chain continuity, matching sha256 checksums, and resolve owning beads.",
+  "ledger_path": "docs/evidence/release-evidence-ledger.json",
+  "required_entry_fields": [
+    "index",
+    "path",
+    "sha256",
+    "correlation_id",
+    "source_commit",
+    "owning_bead",
+    "schema",
+    "prev_hash",
+    "entry_hash"
+  ],
+  "genesis_prev_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+}
