@@ -5356,6 +5356,16 @@ impl ToolRegistry {
                         voice,
                     )));
                 }
+                "computer" => {
+                    let require_approval = config
+                        .and_then(|c| c.computer.as_ref())
+                        .and_then(|comp| comp.require_approval)
+                        .unwrap_or(true);
+                    tools.push(Box::new(
+                        crate::computer::ComputerTool::new(cwd)
+                            .with_require_approval(require_approval),
+                    ));
+                }
                 "subagent" => {
                     let structured_results = config
                         .and_then(|c| c.subagent_structured_results)
@@ -5420,6 +5430,19 @@ impl ToolRegistry {
                     cwd,
                     media_cfg.tts_voice.clone(),
                 )));
+            }
+        }
+
+        // Computer tool (bd-cv653.2.5): opt-in via config.computer
+        if let Some(comp_cfg) = config.and_then(|c| c.computer.as_ref()) {
+            if comp_cfg.enable_computer.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "computer")
+            {
+                let require_approval = comp_cfg.require_approval.unwrap_or(true);
+                tools.push(Box::new(
+                    crate::computer::ComputerTool::new(cwd)
+                        .with_require_approval(require_approval),
+                ));
             }
         }
 

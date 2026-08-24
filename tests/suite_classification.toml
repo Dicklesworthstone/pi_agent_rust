@@ -127,6 +127,7 @@ files = [
     "startup_benchmark",
     "variance_gating",
     "media_tools",
+    "computer",
     "checkpoint",
     "eval",
     "url_router",

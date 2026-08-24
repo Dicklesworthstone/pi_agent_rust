@@ -72,6 +72,8 @@ pub struct Config {
     pub memory: Option<MemorySettings>,
     /// Opt-in media trio settings (bd-cv653.2.7).
     pub media: Option<crate::media_tools::MediaSettings>,
+    /// Opt-in computer tool settings (bd-cv653.2.5).
+    pub computer: Option<crate::computer::ComputerSettings>,
     /// Secrets vault settings (bd-cv653.7.9).
     pub secrets: Option<crate::secrets::SecretsSettings>,
     /// Magic-keyword settings (bd-cv653.3.6).
@@ -847,6 +849,7 @@ impl Config {
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
             media: merge_media(base.media, other.media),
+            computer: merge_computer(base.computer, other.computer),
             secrets: other.secrets.or(base.secrets),
             keywords: other.keywords.or(base.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
@@ -1726,6 +1729,23 @@ fn merge_media(
             image_gen_model: other.image_gen_model.or(base.image_gen_model),
             tts_voice: other.tts_voice.or(base.tts_voice),
             tts_provider: other.tts_provider.or(base.tts_provider),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge computer settings field-wise (bd-cv653.2.5).
+fn merge_computer(
+    base: Option<crate::computer::ComputerSettings>,
+    other: Option<crate::computer::ComputerSettings>,
+) -> Option<crate::computer::ComputerSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::computer::ComputerSettings {
+            enable_computer: other.enable_computer.or(base.enable_computer),
+            require_approval: other.require_approval.or(base.require_approval),
+            screenshot_dir: other.screenshot_dir.or(base.screenshot_dir),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

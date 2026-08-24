@@ -111,6 +111,8 @@ pub mod completions;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
+pub mod computer;
+#[doc(hidden)]
 pub mod conformance;
 #[doc(hidden)]
 pub mod conformance_shapes;
