@@ -8993,12 +8993,11 @@ fn apply_unique_text_replacement(
 
     let original_ending = detect_line_ending(content_no_bom);
     let normalized_content = normalize_to_lf(content_no_bom);
-    let content_for_matching =
-        if content_no_bom.contains('\r') && !content_no_bom.contains('\n') {
-            std::borrow::Cow::Owned(content_no_bom.replace('\r', "\n"))
-        } else {
-            std::borrow::Cow::Borrowed(content_no_bom)
-        };
+    let content_for_matching = if content_no_bom.contains('\r') && !content_no_bom.contains('\n') {
+        std::borrow::Cow::Owned(content_no_bom.replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(content_no_bom)
+    };
     let normalized_old_text = normalize_to_lf(old_text);
 
     if normalized_old_text.is_empty() {
@@ -9304,8 +9303,7 @@ fn apply_hashline_edits_to_content(
                     .iter()
                     .map(String::as_str)
                     .collect();
-                if existing.eq(&edit.lines.iter().map(String::as_str).collect::<Vec<&str>>())
-                {
+                if existing.eq(&edit.lines.iter().map(String::as_str).collect::<Vec<&str>>()) {
                     continue; // no-op
                 }
                 // Splice: remove old range, insert new lines
@@ -9365,9 +9363,10 @@ impl EditTool {
         let url = input.path.clone();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
             crate::url_router::ssh_fetch_document(&url, READ_TOOL_MAX_BYTES)
+                .map_err(std::io::Error::other)
         })
         .await
-        .map_err(|e| Error::tool("edit", format!("ssh read failed: {e}"))??);
+        .map_err(|e| Error::tool("edit", format!("ssh read failed: {e}")))?;
         let outcome = apply_unique_text_replacement(
             &raw,
             &input.old_text,
@@ -9379,6 +9378,7 @@ impl EditTool {
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
             crate::url_router::ssh_write_document(&write_url, &payload)
+                .map_err(std::io::Error::other)
         })
         .await
         .map_err(|e| Error::tool("edit", format!("ssh write failed: {e}")))?;
@@ -9418,9 +9418,10 @@ impl HashlineEditTool {
         let url = input.path.clone();
         let raw = asupersync::runtime::spawn_blocking_io(move || {
             crate::url_router::ssh_fetch_document(&url, READ_TOOL_MAX_BYTES)
+                .map_err(std::io::Error::other)
         })
         .await
-        .map_err(|e| Error::tool("hashline_edit", format!("ssh read failed: {e}")))??;
+        .map_err(|e| Error::tool("hashline_edit", format!("ssh read failed: {e}")))?;
         if raw.len() as u64 > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
                 "hashline_edit",
@@ -9434,17 +9435,16 @@ impl HashlineEditTool {
                     .to_string(),
             )
         })?;
-        let outcome =
-            apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
+        let outcome = apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
 
         let write_url = input.path.clone();
         let payload = outcome.final_content.clone();
         let write_details = asupersync::runtime::spawn_blocking_io(move || {
             crate::url_router::ssh_write_document(&write_url, &payload)
+                .map_err(std::io::Error::other)
         })
         .await
         .map_err(|e| Error::tool("hashline_edit", format!("ssh write failed: {e}")))?;
-
         let (diff, first_changed_line) =
             generate_diff_string(&outcome.before_normalized, &outcome.after_normalized);
         let mut details = serde_json::Map::new();
@@ -13849,8 +13849,7 @@ impl Tool for HashlineEditTool {
             )
         })?;
 
-        let outcome =
-            apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
+        let outcome = apply_hashline_edits_to_content(&raw_content, &input.edits, &input.path)?;
         let final_content = outcome.final_content;
         let normalized = outcome.before_normalized;
         let new_normalized = outcome.after_normalized;

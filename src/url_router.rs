@@ -937,7 +937,10 @@ pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
         return Err(match classify_ssh_failure(&stderr) {
             SshFailureKind::HostKeyChanged => Error::tool(
                 "edit",
-                format!("PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION} (ssh stderr: {})", stderr.trim()),
+                format!(
+                    "PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION} (ssh stderr: {})",
+                    stderr.trim()
+                ),
             ),
             SshFailureKind::AuthFailed => Error::tool(
                 "edit",
@@ -949,7 +952,11 @@ pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
             ),
             SshFailureKind::ConnectTimeout => Error::tool(
                 "edit",
-                format!("PI_SSH_TIMEOUT: connection to '{}' timed out. ssh stderr: {}", target.host, stderr.trim()),
+                format!(
+                    "PI_SSH_TIMEOUT: connection to '{}' timed out. ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
             ),
             SshFailureKind::Other => Error::tool(
                 "edit",
