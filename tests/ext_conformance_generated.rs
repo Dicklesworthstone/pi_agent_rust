@@ -151,7 +151,11 @@ fn ensure_must_pass_worktree_matches_commit(
     untracked_command
         .arg("-C")
         .arg(root)
-        .args(["ls-files", "--others", "-z", "--"])
+        // Standard git semantics: honor .gitignore / .git/info/exclude so
+        // ignored debris (crash-recovery snapshots, *.rej, ad-hoc fixture
+        // drops) does not fail-close the snapshot, while genuinely untracked
+        // non-ignored source files still do.
+        .args(["ls-files", "--others", "--exclude-standard", "-z", "--"])
         .args(source_paths);
     let untracked_output = untracked_command
         .output()
