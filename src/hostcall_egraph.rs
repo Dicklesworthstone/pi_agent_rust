@@ -257,6 +257,49 @@ pub struct MeasuredStages {
     pub policy_us: f64,
     pub execute_us: f64,
     pub io_us: f64,
+    /// Typed-decode latency, when marshalling telemetry is available.
+    ///
+    /// The six-stage matrix reports one `marshal` figure and cannot separate
+    /// typed decode from JSON decode — but the marshalling path already times
+    /// both lanes per call and reports the difference as
+    /// `rewrite_observed_cost_delta` (see `src/extensions/protocol.rs`). Supply
+    /// the fast-lane figure here to calibrate the parameter the whole fast path
+    /// rests on, instead of leaving it modelled.
+    pub marshal_typed_us: Option<f64>,
+}
+
+impl MeasuredStages {
+    /// The six-stage matrix alone, with no marshalling telemetry.
+    #[must_use]
+    pub const fn from_stage_matrix(
+        marshal_us: f64,
+        queue_us: f64,
+        schedule_us: f64,
+        policy_us: f64,
+        execute_us: f64,
+        io_us: f64,
+    ) -> Self {
+        Self {
+            marshal_us,
+            queue_us,
+            schedule_us,
+            policy_us,
+            execute_us,
+            io_us,
+            marshal_typed_us: None,
+        }
+    }
+
+    /// Add the typed-decode latency from marshalling telemetry.
+    ///
+    /// `fast_candidate_latency_us` in `HostcallMarshallingArtifacts` is the
+    /// measurement; `baseline_latency_us` is already the `marshal_us` above, so
+    /// the pair gives both sides of the comparison the fast lane exists to win.
+    #[must_use]
+    pub const fn with_typed_marshal(mut self, fast_candidate_latency_us: f64) -> Self {
+        self.marshal_typed_us = Some(fast_candidate_latency_us);
+        self
+    }
 }
 
 /// What a calibration run could and could not measure.
@@ -297,15 +340,20 @@ impl CostModel {
     /// - [`StageOp::Dispatch`] <- `queue_us + schedule_us`, the routing work
     ///   between authorization and execution.
     ///
-    /// The rest **cannot be derived from this harness**, and calibration says so
-    /// instead of inventing them:
-    /// - `marshal_typed`, `validate`, `convert`: the harness reports one
-    ///   `marshal` figure covering decode and shape checking together, and does
-    ///   not separate typed decode from JSON decode. The premise of the fast
-    ///   lane is that typed decode is cheaper — by how much is exactly what is
-    ///   not measured here.
-    /// - `fused`: no measured stage corresponds to an intrinsic that has not
-    ///   been built yet.
+    /// `marshal_typed` is measured **when the caller supplies it** via
+    /// [`MeasuredStages::with_typed_marshal`]. The six-stage matrix cannot
+    /// distinguish typed decode from JSON decode, but the marshalling path
+    /// already times both lanes per call (`baseline_latency_us` and
+    /// `fast_candidate_latency_us` in `src/extensions/protocol.rs`, reported as
+    /// `rewrite_observed_cost_delta`). That is the parameter the entire fast
+    /// path rests on, so it is worth wiring through rather than modelling.
+    ///
+    /// The rest **cannot be derived from either source**, and calibration says
+    /// so instead of inventing them:
+    /// - `validate`, `convert`: the marshal figure covers decode and shape
+    ///   checking together; neither source splits them.
+    /// - `fused`: no measurement corresponds to an intrinsic that has not been
+    ///   built yet.
     ///
     /// Unmeasured fields keep [`Self::measured_default`]'s conservative values,
     /// so a fusion whose benefit was never measured still has to beat the
@@ -336,11 +384,24 @@ impl CostModel {
         model.policy = cost_of(stages.policy_us);
         model.dispatch = cost_of(stages.queue_us + stages.schedule_us);
 
-        let report = CalibrationReport {
-            measured: vec!["marshal_json", "policy", "dispatch"],
-            unmeasured: vec!["marshal_typed", "validate", "convert", "fused"],
-        };
-        (model, report)
+        let mut measured = vec!["marshal_json", "policy", "dispatch"];
+        let mut unmeasured = vec!["validate", "convert", "fused"];
+
+        if let Some(typed_us) = stages.marshal_typed_us {
+            model.marshal_typed = cost_of(typed_us);
+            measured.push("marshal_typed");
+        } else {
+            unmeasured.push("marshal_typed");
+        }
+        unmeasured.sort_unstable();
+
+        (
+            Self { ..model },
+            CalibrationReport {
+                measured,
+                unmeasured,
+            },
+        )
     }
 
     /// Cost shape matching the harness's stage attribution.
@@ -1805,14 +1866,7 @@ mod tests {
     // ── Calibration ─────────────────────────────────────────────────────
 
     fn sample_stages() -> MeasuredStages {
-        MeasuredStages {
-            marshal_us: 41.2,
-            queue_us: 6.4,
-            schedule_us: 5.1,
-            policy_us: 9.7,
-            execute_us: 820.0,
-            io_us: 130.0,
-        }
+        MeasuredStages::from_stage_matrix(41.2, 6.4, 5.1, 9.7, 820.0, 130.0)
     }
 
     #[test]
@@ -1862,18 +1916,32 @@ mod tests {
     fn a_measured_stage_never_prices_as_free() {
         // A zero or nonsensical measurement must not make a stage cost nothing;
         // that would let any plan containing it win by arithmetic accident.
-        let degenerate = MeasuredStages {
-            marshal_us: 0.0,
-            queue_us: -3.0,
-            schedule_us: f64::NAN,
-            policy_us: 0.000_1,
-            execute_us: 0.0,
-            io_us: 0.0,
-        };
+        let degenerate = MeasuredStages::from_stage_matrix(0.0, -3.0, f64::NAN, 0.000_1, 0.0, 0.0)
+            .with_typed_marshal(-1.0);
         let (model, _) = CostModel::from_measured_stages(degenerate);
         assert!(model.marshal_json >= 1);
         assert!(model.policy >= 1);
         assert!(model.dispatch >= 1);
+    }
+
+    #[test]
+    fn marshalling_telemetry_measures_the_parameter_the_fast_path_rests_on() {
+        // The six-stage matrix alone leaves marshal_typed modelled. The
+        // marshalling path already times the typed lane per call, so supplying
+        // it moves the single most decisive parameter onto the measured side.
+        let (_, matrix_only) = CostModel::from_measured_stages(sample_stages());
+        assert!(matrix_only.unmeasured.contains(&"marshal_typed"));
+        assert!(!matrix_only.measured.contains(&"marshal_typed"));
+
+        let (model, report) =
+            CostModel::from_measured_stages(sample_stages().with_typed_marshal(13.6));
+        assert_eq!(model.marshal_typed, 14, "typed marshal rounds from 13.6");
+        assert!(report.measured.contains(&"marshal_typed"));
+        assert!(!report.unmeasured.contains(&"marshal_typed"));
+
+        // Still not fully measured: validate/convert/fused remain modelled.
+        assert!(!report.is_fully_measured());
+        assert_eq!(report.unmeasured, ["convert", "fused", "validate"]);
     }
 
     #[test]

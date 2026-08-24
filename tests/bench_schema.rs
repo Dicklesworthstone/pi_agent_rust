@@ -750,6 +750,13 @@ JSON
     ;;
   perf_budgets)
     if [[ "${PI_PERF_POST_GENERATION:-0}" == "1" ]]; then
+      case " $* " in
+        *" ci_enforced_budgets_fail_on_regression_or_missing_data "*" --exact "*) ;;
+        *)
+          echo "post-generation perf_budgets invocation omitted the exact data-contract test" >&2
+          exit 64
+          ;;
+      esac
       python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
 import json
 import sys
@@ -765,6 +772,19 @@ for name in (
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("correlation_id") != expected_correlation_id:
         raise SystemExit(f"{name}: correlation_id mismatch")
+(evidence_dir / "perf_budgets_post_generation_invocation.json").write_text(
+    json.dumps(
+        {
+            "schema": "pi.perf.fake_post_generation_invocation.v1",
+            "correlation_id": expected_correlation_id,
+            "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
+            "exact": True,
+        },
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
 PY
     fi
     ;;
@@ -805,23 +825,33 @@ for relative_path, correlation_field in artifacts:
         record["source_dirty"] = False
     if (
         relative_path == "scenario_runner.jsonl"
-        and os.environ.get("PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW") == "1"
         and records
-        and not any(
-            record.get("orchestration_correlation_id") == "foreign-correlation"
-            for record in records
-        )
     ):
-        foreign = dict(records[-1])
-        foreign["orchestration_correlation_id"] = "foreign-correlation"
-        foreign["total_ms"] = 0.001
-        records.append(foreign)
+        if (
+            os.environ.get("PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW") == "1"
+            and not any(
+                record.get("orchestration_correlation_id") == "foreign-correlation"
+                for record in records
+            )
+        ):
+            foreign = dict(records[-1])
+            foreign["orchestration_correlation_id"] = "foreign-correlation"
+            foreign["total_ms"] = 0.001
+            records.append(foreign)
+        if os.environ.get("PI_FAKE_INJECT_STALE_SCENARIO_ROW") == "1":
+            stale = dict(records[-1])
+            stale["timestamp"] = "2000-01-01T00:00:00Z"
+            stale["total_ms"] = 0.002
+            records.append(stale)
     path.write_text(
         "\n".join(json.dumps(record, separators=(",", ":")) for record in records)
         + "\n",
         encoding="utf-8",
     )
 PY
+  if [[ "${PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW:-0}" == "1" ]]; then
+    printf '{not-json\n' >>"$target_dir/perf/scenario_runner.jsonl"
+  fi
 fi
 exit 0
 "#;
@@ -6863,6 +6893,20 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
         .find("# ─── Phase 6: Generate checksums")
         .expect("checksum generation phase");
 
+    for token in [
+        "--message-format=json-render-diagnostics",
+        "pi.perf.test_binary_attestation.v1",
+        "perf_budgets binary attestation commit mismatch",
+        "perf_budgets test binary checksum mismatch",
+        "source_dataset_checksum_mismatch",
+        "timestamp_before_run_start",
+    ] {
+        assert!(
+            content.contains(token),
+            "post-generation evidence gate must include token: {token}"
+        );
+    }
+
     assert!(
         phase1_generation < post_generation_budget
             && post_generation_budget < final_preflight
@@ -7503,20 +7547,38 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         }),
         "manifest must record a passing post-generation perf budget consumer"
     );
+    let post_generation_invocation: Value = serde_json::from_str(
+        &fs::read_to_string(
+            output_dir.join("results/perf_budgets_post_generation_invocation.json"),
+        )
+        .expect("read post-generation budget invocation marker"),
+    )
+    .expect("parse post-generation budget invocation marker");
+    assert_eq!(
+        post_generation_invocation["correlation_id"].as_str(),
+        Some(expected_correlation_id),
+        "post-generation budget invocation must consume the current run"
+    );
+    assert_eq!(
+        post_generation_invocation["test_filter"].as_str(),
+        Some("ci_enforced_budgets_fail_on_regression_or_missing_data"),
+        "post-generation budget invocation must select the data-contract test"
+    );
+    assert_eq!(
+        post_generation_invocation["exact"].as_bool(),
+        Some(true),
+        "post-generation budget invocation must use an exact test filter"
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
 
 #[cfg(unix)]
-#[test]
-fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW",
-        "1",
-    )]);
+fn assert_orchestrate_rejects_scenario_mutation(env_name: &str, expected_reason: &str) {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(env_name, "1")]);
     assert!(
         !output.status.success(),
-        "strict orchestration must fail when a foreign-correlation source row is present"
+        "strict orchestration must fail when a mutated source row is present"
     );
 
     let results_dir = temp_root.join("run/results");
@@ -7542,7 +7604,21 @@ fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
     assert_eq!(
         scenario_dataset["rejected_record_count"].as_u64(),
         Some(1),
-        "the single foreign-correlation mutation must be rejected"
+        "the single source mutation must be rejected"
+    );
+    assert!(
+        scenario_dataset["rejections"]
+            .as_array()
+            .is_some_and(|rejections| {
+                rejections.iter().any(|rejection| {
+                    rejection["reasons"].as_array().is_some_and(|reasons| {
+                        reasons
+                            .iter()
+                            .any(|reason| reason.as_str() == Some(expected_reason))
+                    })
+                })
+            }),
+        "scenario mutation must report its causal rejection reason: {expected_reason}"
     );
     assert_eq!(
         matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
@@ -7566,6 +7642,33 @@ fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
             })
         }),
         "post-generation validation must identify the mixed scenario lineage"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
+    assert_orchestrate_rejects_scenario_mutation(
+        "PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW",
+        "correlation_id_mismatch",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_stale_same_lineage_before_finalization() {
+    assert_orchestrate_rejects_scenario_mutation(
+        "PI_FAKE_INJECT_STALE_SCENARIO_ROW",
+        "timestamp_before_run_start",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_malformed_source_row_before_finalization() {
+    assert_orchestrate_rejects_scenario_mutation(
+        "PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW",
+        "invalid_json",
     );
 }
 

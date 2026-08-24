@@ -16,8 +16,8 @@
     clippy::doc_markdown
 )]
 
-use futures::executor::block_on;
 use chrono::{SecondsFormat, Utc};
+use futures::executor::block_on;
 use pi::error::Result;
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,

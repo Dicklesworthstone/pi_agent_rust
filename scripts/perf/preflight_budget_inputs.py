@@ -44,6 +44,20 @@ EMBEDDED_PROVENANCE_REQUIREMENTS = {
         "run_id",
         "correlation_id",
     ),
+    "pi.ext.rust_bench.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.ext.legacy_bench.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
     "pi.perf.phase1_matrix_validation.v1": (
         "embedded_timestamp",
         "source_commit",
