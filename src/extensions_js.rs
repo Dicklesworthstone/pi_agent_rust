@@ -5083,6 +5083,62 @@ fn path_is_in_allowed_extension_root(
     path_is_in_owned_extension_root(path, extension_id, module_state)
 }
 
+/// Emit one structured host-filesystem policy decision record (bd-xhl7u).
+///
+/// Denials log at WARN so default subscribers capture them; allows at DEBUG.
+/// Every record carries runtime identity, active extension id, requested vs
+/// normalized path, workspace root, and the full registered-root lists so
+/// full-suite interference can be reconstructed from tracing captures alone.
+fn log_host_fs_decision(
+    op: &'static str,
+    allowed: bool,
+    runtime_id: &str,
+    extension_id: Option<&str>,
+    requested: &str,
+    checked_path: &Path,
+    workspace_root: &Path,
+    allowed_read_roots: &std::sync::Mutex<Vec<PathBuf>>,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) {
+    let read_roots = allowed_read_roots
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = module_state.borrow();
+    let decision = if allowed { "allow" } else { "deny" };
+    let roots_to_string = |roots: &[PathBuf]| {
+        roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    macro_rules! emit {
+        ($level:path) => {
+            tracing::event!(
+                $level,
+                event = "pijs.hostfs.decision",
+                op = op,
+                decision = decision,
+                runtime_id = %runtime_id,
+                extension_id = %extension_id.unwrap_or("<none>"),
+                requested = %requested,
+                normalized = %checked_path.display(),
+                workspace_root = %workspace_root.display(),
+                read_roots_count = read_roots.len(),
+                extension_roots_count = state.canonical_extension_roots.len(),
+                read_roots = %roots_to_string(&read_roots),
+                extension_roots = %roots_to_string(&state.canonical_extension_roots),
+                "host fs policy decision"
+            );
+        };
+    }
+    if allowed {
+        emit!(tracing::Level::DEBUG);
+    } else {
+        emit!(tracing::Level::WARN);
+    }
+}
+
 /// Resolve the deepest declared extension boundary for a path and allow only
 /// the active owner's roots (or legacy idless roots). This is shared by
 /// filesystem checks and module resolution so a peer root nested under a
@@ -16916,6 +16972,9 @@ pub struct PiJsRuntime<C: SchedulerClock = WallClock> {
     policy: Option<ExtensionPolicy>,
     /// Per-runtime capability used to authenticate Rust-only bridge entrypoints.
     bridge_secret: String,
+    /// Stable per-runtime identity for host-fs decision diagnostics
+    /// (bd-xhl7u); deliberately NOT the authentication secret.
+    runtime_id: String,
     /// Immutable principal for production extension isolates. Harness runtimes
     /// leave this unset so low-level bridge tests can model multiple identities.
     owner_extension_id: Option<Arc<str>>,
@@ -17136,6 +17195,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let tick_counter = Arc::new(AtomicU64::new(0));
         let trace_seq = Arc::new(AtomicU64::new(1));
         let bridge_secret = uuid::Uuid::new_v4().simple().to_string();
+        let runtime_id = uuid::Uuid::new_v4().simple().to_string();
 
         let instance = Self {
             runtime,
@@ -17156,6 +17216,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             module_state,
             policy,
             bridge_secret,
+            runtime_id,
             owner_extension_id,
         };
 
@@ -18143,6 +18204,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     #[allow(clippy::too_many_lines)]
     async fn install_pi_bridge(&self) -> Result<()> {
+        let runtime_id = self.runtime_id.clone();
         let hostcall_queue = self.hostcall_queue.clone();
         let scheduler = Rc::clone(&self.scheduler);
         let hostcall_tracker = Rc::clone(&self.hostcall_tracker);
@@ -18873,6 +18935,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let module_state = Rc::clone(&module_state);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
                             let extension_id = current_extension_id(&ctx);
 
@@ -18900,6 +18963,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 &module_state,
                                 &allowed_read_roots,
                             );
+                            log_host_fs_decision(
+                                "read",
+                                allowed,
+                                &runtime_id,
+                                extension_id.as_deref(),
+                                &path,
+                                &checked_path,
+                                &workspace_root,
+                                &allowed_read_roots,
+                                &module_state,
+                            );
 
                             if allowed {
                                 Ok(())
@@ -18922,6 +18996,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let module_state = Rc::clone(&module_state);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
                             let extension_id = current_extension_id(&ctx);
 
@@ -18948,6 +19023,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 extension_id.as_deref(),
                                 &module_state,
                                 &allowed_read_roots,
+                            );
+                            log_host_fs_decision(
+                                "write",
+                                allowed,
+                                &runtime_id,
+                                extension_id.as_deref(),
+                                &path,
+                                &checked_path,
+                                &workspace_root,
+                                &allowed_read_roots,
+                                &module_state,
                             );
 
                             if allowed {
@@ -18972,6 +19058,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let process_cwd = process_cwd.clone();
                         let allowed_read_roots = Arc::clone(&allowed_read_roots);
                         let module_state = Rc::clone(&module_state);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>,
                               path: String,
                               follow_symlinks: bool|
@@ -18995,6 +19082,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 extension_id.as_deref(),
                                 &module_state,
                                 &allowed_read_roots,
+                            );
+                            log_host_fs_decision(
+                                "stat",
+                                allowed,
+                                &runtime_id,
+                                extension_id.as_deref(),
+                                &path,
+                                &checked_path,
+                                &workspace_root,
+                                &allowed_read_roots,
+                                &module_state,
                             );
 
                             if !allowed {
@@ -19148,6 +19246,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let module_state = Rc::clone(&module_state);
                         let configured_repair_mode = repair_mode;
                         let repair_events = Arc::clone(&repair_events);
+                        let runtime_id = runtime_id.clone();
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<String> {
                             const MAX_SYNC_READ_SIZE: u64 = 64 * 1024 * 1024; // 64MB hard limit
                             let extension_id = current_extension_id(&ctx);
@@ -19229,6 +19328,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                     &module_state,
                                     &allowed_read_roots,
                                 ) {
+                                    log_host_fs_decision(
+                                        "read",
+                                        false,
+                                        &runtime_id,
+                                        extension_id.as_deref(),
+                                        &path,
+                                        &prechecked_path,
+                                        &workspace_root,
+                                        &allowed_read_roots,
+                                        &module_state,
+                                    );
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
                                         "host read denied: path outside extension root".to_string(),
@@ -19293,6 +19403,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 );
 
                                 if !allowed {
+                                    log_host_fs_decision(
+                                        "read",
+                                        false,
+                                        &runtime_id,
+                                        extension_id.as_deref(),
+                                        &path,
+                                        &secure_path,
+                                        &workspace_root,
+                                        &allowed_read_roots,
+                                        &module_state,
+                                    );
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
                                         "host read denied: path outside extension root".to_string(),
@@ -19343,6 +19464,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 );
 
                                 if !allowed {
+                                    log_host_fs_decision(
+                                        "read",
+                                        false,
+                                        &runtime_id,
+                                        extension_id.as_deref(),
+                                        &path,
+                                        &checked_path,
+                                        &workspace_root,
+                                        &allowed_read_roots,
+                                        &module_state,
+                                    );
                                     return Err(rquickjs::Error::new_loading_message(
                                         &path,
                                         "host read denied: path outside extension root".to_string(),
@@ -19536,6 +19668,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::tools::isolate_command_process_group(&mut command);
 
                                 let mut child = command.spawn().map_err(|e| e.to_string())?;
+                                crate::tools::attach_child_job_discipline(&child);
                                 let pid = child.id();
 
                                 let stdout_pipe =
@@ -24806,6 +24939,7 @@ mod tests {
     use super::*;
     use crate::scheduler::DeterministicClock;
     use serde_json::json;
+    use tracing_subscriber::layer::SubscriberExt as _;
 
     fn sha256_hex(bytes: &[u8]) -> String {
         hex_lower(&Sha256::digest(bytes))
@@ -29864,6 +29998,147 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 serde_json::json!("from-B")
             );
         });
+    }
+
+    #[test]
+    fn host_fs_decision_helper_emits_structured_event() {
+        // bd-xhl7u: every host-filesystem allow/deny must carry runtime
+        // identity, active extension, and normalized path so full-suite
+        // interference is reconstructible from tracing captures. The guards
+        // call this helper from scheduler threads where thread-local
+        // subscribers do not apply, so the contract is pinned on the helper
+        // itself (call sites are compile-enforced at each guard exit).
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Debug, Clone)]
+        struct CapturedDecision {
+            level: tracing::Level,
+            fields: std::collections::BTreeMap<String, String>,
+        }
+
+        #[derive(Clone, Default)]
+        struct DecisionCapture {
+            events: std::sync::Arc<StdMutex<Vec<CapturedDecision>>>,
+        }
+
+        impl DecisionCapture {
+            fn snapshot(&self) -> Vec<CapturedDecision> {
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for DecisionCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = std::collections::BTreeMap::new();
+                let mut recorder = FieldRecorder(&mut fields);
+                event.record(&mut recorder);
+                self.events
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(CapturedDecision {
+                        level: *event.metadata().level(),
+                        fields,
+                    });
+            }
+        }
+
+        struct FieldRecorder<'a>(&'a mut std::collections::BTreeMap<String, String>);
+
+        impl tracing::field::Visit for FieldRecorder<'_> {
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0.insert(field.name().to_string(), value.to_string());
+            }
+
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0
+                    .insert(field.name().to_string(), format!("{value:?}"));
+            }
+        }
+
+        let read_roots = StdMutex::new(vec![PathBuf::from("/tmp/registered-root")]);
+        let runtime = futures::executor::block_on(PiJsRuntime::with_clock_and_config_with_policy(
+            DeterministicClock::new(0),
+            PiJsRuntimeConfig::default(),
+            None,
+        ))
+        .expect("create diagnostic runtime");
+        let module_state = std::rc::Rc::clone(&runtime.module_state);
+        module_state
+            .borrow_mut()
+            .canonical_extension_roots
+            .push(PathBuf::from("/tmp/ext-a"));
+
+        let capture = DecisionCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let () = tracing::subscriber::with_default(subscriber, || {
+            log_host_fs_decision(
+                "read",
+                false,
+                "runtime-diag-1234",
+                Some("ext.b"),
+                "/tmp/ext-a/secret.txt",
+                &PathBuf::from("/private/tmp/ext-a/secret.txt"),
+                &PathBuf::from("/workspace"),
+                &read_roots,
+                &module_state,
+            );
+        });
+
+        let decisions = capture.snapshot();
+        assert_eq!(
+            decisions.len(),
+            1,
+            "exactly one decision event; got {decisions:#?}"
+        );
+        let event = &decisions[0];
+        assert_eq!(event.level, tracing::Level::WARN);
+        assert_eq!(
+            event.fields.get("decision").map(String::as_str),
+            Some("deny")
+        );
+        assert_eq!(event.fields.get("op").map(String::as_str), Some("read"));
+        assert_eq!(
+            event.fields.get("runtime_id").map(String::as_str),
+            Some("runtime-diag-1234")
+        );
+        assert_eq!(
+            event.fields.get("extension_id").map(String::as_str),
+            Some("ext.b")
+        );
+        assert!(
+            event
+                .fields
+                .get("normalized")
+                .is_some_and(|path| path.contains("secret.txt")),
+            "normalized path missing: {:#?}",
+            event.fields
+        );
+        assert!(
+            event
+                .fields
+                .get("read_roots")
+                .is_some_and(|roots| roots.contains("/tmp/registered-root")),
+            "registered read roots missing: {:#?}",
+            event.fields
+        );
+        assert!(
+            event
+                .fields
+                .get("extension_roots")
+                .is_some_and(|roots| roots.contains("/tmp/ext-a")),
+            "extension roots missing: {:#?}",
+            event.fields
+        );
     }
 
     #[test]
