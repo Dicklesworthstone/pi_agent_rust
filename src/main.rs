@@ -2643,6 +2643,20 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
             );
             println!("Web client interface: http://127.0.0.1:{}", port);
         }
+        cli::Commands::Gallery { format } => {
+            let matrix = pi::gallery::GalleryMatrix::new();
+            if format.eq_ignore_ascii_case("json") {
+                println!("{}", matrix.render_report_json());
+            } else {
+                println!("Pi Component Gallery Matrix ({})", matrix.schema);
+                println!("Total components: {}", matrix.items.len());
+                for item in &matrix.items {
+                    println!("\n[{:?}] {} ({:?})", item.category, item.name, item.state);
+                    println!("  Description: {}", item.description);
+                    println!("  Sample:\n{}", item.sample_output);
+                }
+            }
+        }
         cli::Commands::Migrate { path, dry_run } => {
             handle_session_migrate(&path, dry_run)?;
         }
