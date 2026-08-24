@@ -190,6 +190,7 @@ fixture_test!(test_retain_fixtures, "retain_tool");
 fixture_test!(test_recall_fixtures, "recall_tool");
 fixture_test!(test_memory_edit_fixtures, "memory_edit_tool");
 fixture_test!(test_reflect_fixtures, "reflect_tool");
+fixture_test!(test_learn_fixtures, "learn_tool");
 fixture_test!(test_security_scan_fixtures, "security_scan_tool");
 
 /// Run truncation tests from fixtures.
@@ -251,6 +252,7 @@ fn test_all_fixtures_exist() {
         "recall_tool",
         "memory_edit_tool",
         "reflect_tool",
+        "learn_tool",
         "security_scan_tool",
     ];
 

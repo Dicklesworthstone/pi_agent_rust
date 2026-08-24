@@ -183,6 +183,18 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
                 std::sync::Arc::new(FixtureReflectProvider),
             ))
         }
+        "learn" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::tools::LearnTool::new(std::sync::Arc::new(store)))
+        }
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
