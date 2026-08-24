@@ -1,0 +1,96 @@
+{
+  "version": "1.0",
+  "tool": "security_scan",
+  "description": "security_scan contract for bd-cv653.2.6 and bd-cv653.8.1: deterministic offline scan, scoped-plan boundary, and named scope error.",
+  "cases": [
+    {
+      "name": "security_scan_finds_seeded_aws_key",
+      "description": "run writes SARIF and reports the seeded credential through the embedded rule pack",
+      "requirement_ids": [
+        "SEC-SCAN-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "app.py",
+          "content": "AWS_KEY = \"AKIAIOSFODNN7EXAMPLE\"\n"
+        }
+      ],
+      "input": {
+        "op": "run",
+        "paths": [
+          "app.py"
+        ],
+        "sarifOut": "artifacts/scan.sarif"
+      },
+      "expected": {
+        "content_contains": [
+          "Security scan: 1 active finding(s) (1 error, 0 warning, 0 note)",
+          "secret.aws-access-key app.py:1"
+        ],
+        "details_exact": {
+          "schema": "pi.security-scan/v1",
+          "active": 1,
+          "suppressed": 0,
+          "errors": 1,
+          "warnings": 0,
+          "notes": 0
+        },
+        "details_contains": [
+          "secret.aws-access-key",
+          "artifacts/scan.sarif"
+        ]
+      }
+    },
+    {
+      "name": "security_scan_plan_scopes_single_file",
+      "description": "plan accepts the one-file scope boundary without walking unrelated files",
+      "requirement_ids": [
+        "SEC-SCAN-2"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "clean.rs",
+          "content": "fn main() {}\n"
+        }
+      ],
+      "input": {
+        "op": "plan",
+        "paths": [
+          "clean.rs"
+        ]
+      },
+      "expected": {
+        "content_contains": [
+          "Security review plan: 1 file(s) in scope, 7 rule(s) across 1 pack(s)",
+          "pi-default v1 (7 rules)"
+        ],
+        "details_exact": {
+          "schema": "pi.security-scan/v1",
+          "scopedFiles": 1
+        },
+        "details_contains": [
+          "secret.generic-api-key",
+          "traversal.join-unsanitized"
+        ]
+      }
+    },
+    {
+      "name": "security_scan_rejects_missing_scope",
+      "description": "a mistyped scope fails loudly instead of returning a false-clean scan",
+      "requirement_ids": [
+        "SEC-SCAN-3"
+      ],
+      "input": {
+        "op": "run",
+        "paths": [
+          "missing-scope"
+        ]
+      },
+      "expect_error": true,
+      "error_contains": "scope path does not exist",
+      "expected": {}
+    }
+  ]
+}

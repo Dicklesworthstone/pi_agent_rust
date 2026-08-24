@@ -93,6 +93,7 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "todo" => Box::new(pi::todo::TodoTool::new(std::sync::Arc::new(
             asupersync::sync::Mutex::new(pi::session::Session::in_memory()),
         ))),
+        "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
         }
