@@ -1703,6 +1703,101 @@ def check_artifact_content(
     return tuple(errors)
 
 
+CLAIM_BINDINGS_SCHEMA = "pi.readme.claim_bindings.v1"
+DEFAULT_CLAIM_BINDINGS_PATH = "docs/evidence/readme-claim-bindings.json"
+
+
+def load_claim_bindings(repo_root: Path) -> tuple[list[dict[str, Any]], str | None]:
+    """Load the optional README claim-binding manifest (artifact field -> line)."""
+    raw = os.environ.get("README_CLAIM_BINDINGS_JSON", "").strip()
+    path = (
+        resolve_env_path(repo_root, Path(raw))
+        if raw
+        else repo_root / DEFAULT_CLAIM_BINDINGS_PATH
+    )
+    if not path.exists():
+        return [], None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], f"claim-bindings manifest {path} is unreadable: {exc}"
+    if not isinstance(payload, dict) or payload.get("schema") != CLAIM_BINDINGS_SCHEMA:
+        return [], (
+            f"claim-bindings manifest {path} must be a JSON object with "
+            f"schema={CLAIM_BINDINGS_SCHEMA!r}"
+        )
+    bindings = payload.get("bindings")
+    if not isinstance(bindings, list):
+        return [], f"claim-bindings manifest {path} must contain a bindings array"
+    cleaned: list[dict[str, Any]] = []
+    for index, binding in enumerate(bindings):
+        if (
+            not isinstance(binding, dict)
+            or not isinstance(binding.get("artifact"), str)
+            or not isinstance(binding.get("field"), str)
+            or not binding["artifact"]
+            or not binding["field"]
+        ):
+            return [], (
+                f"claim-bindings manifest {path} entry #{index + 1} must provide "
+                "non-empty 'artifact' and 'field' strings"
+            )
+        cleaned.append({"artifact": binding["artifact"], "field": binding["field"]})
+    return cleaned, None
+
+
+def _resolve_dotted_field(payload: Any, dotted: str) -> Any:
+    current: Any = payload
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def check_claim_bindings(
+    obligations: list[ClaimObligation],
+    bindings: list[dict[str, Any]],
+) -> list[str]:
+    """Verify each bound artifact field's value appears on a citing README line."""
+    errors: list[str] = []
+    for binding in bindings:
+        artifact = binding["artifact"]
+        field = binding["field"]
+        cited = [
+            obligation
+            for obligation in obligations
+            if obligation.artifact_path == artifact
+        ]
+        if not cited:
+            errors.append(
+                f"BINDING UNCITED: {artifact} is bound for field '{field}' but no "
+                "README citation references it"
+            )
+            continue
+        value_found = False
+        for obligation in cited:
+            try:
+                payload = json.loads(
+                    (Path.cwd() / artifact).read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                break
+            resolved = _resolve_dotted_field(payload, field)
+            if isinstance(resolved, bool) or not isinstance(resolved, (int, str)):
+                continue
+            expected = str(resolved)
+            if expected and expected in obligation.claim_text:
+                value_found = True
+                break
+        if not value_found:
+            errors.append(
+                f"BINDING MISMATCH: no README line citing {artifact} contains the "
+                f"current value of '{field}'"
+            )
+    return errors
+
+
 def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     """Check the README under repo_root for missing or stale artifact citations."""
     readme_path = repo_root / "README.md"
@@ -1933,6 +2028,15 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
             print(f"ERROR: Failed to check {artifact_path}: {e}")
             return 2
 
+    # Claim bindings: bound artifact fields must appear on their citing lines.
+    bindings, bindings_error = load_claim_bindings(Path.cwd())
+    if bindings_error is not None:
+        print(f"INVALID: {bindings_error}")
+        return 2
+    binding_errors = check_claim_bindings(obligations, bindings)
+    for error in binding_errors:
+        print(error)
+
     # Summary
     print(f"\nSUMMARY:")
     print(f"  Total proof obligations: {len(obligations)}")
@@ -1943,6 +2047,7 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     print(f"  Stale artifacts: {stale_count}")
     print(f"  Missing artifacts: {missing_count}")
     print(f"  Invalid artifact content checks: {content_error_count}")
+    print(f"  Claim bindings enforced: {len(bindings)} ({len(binding_errors)} mismatched)")
 
     if stale_count > 0:
         print(f"\nFAIL: {stale_count} cited artifact(s) are >14 days stale.")
@@ -1960,8 +2065,17 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
         print("Evidence claims must cite artifacts with matching run provenance and clean data.")
         return 1
 
-    print("\nPASS: All cited artifacts are fresh and content-valid.")
+    if binding_errors:
+        print(
+            f"\nFAIL: {len(binding_errors)} README claim binding(s) diverged from "
+            "current artifact values."
+        )
+        print("Update the README numbers or regenerate the cited artifact; never hand-patch artifacts.")
+        return 1
+
+    print("\nPASS: All cited artifacts are fresh, content-valid, and value-bound.")
     return 0
+
 
 
 def run_self_test() -> int:
