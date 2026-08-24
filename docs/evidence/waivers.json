@@ -1,0 +1,13 @@
+{
+  "schema": "pi.waiver.ledger.v1",
+  "generated_at": "2026-08-24T08:43:18.255422+00:00",
+  "contract_path": "docs/contracts/waiver-ledger-contract.json",
+  "waivers": [],
+  "summary": {
+    "total_waivers": 0,
+    "active": 0,
+    "expired": 0,
+    "invalid": 0,
+    "suppressed_claims_count": 0
+  }
+}

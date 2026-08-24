@@ -1,0 +1,25 @@
+{
+  "schema": "pi.waiver.ledger.contract.v1",
+  "bead_id": "bd-sog97.12",
+  "version": "1.0.0",
+  "effective_date_utc": "2026-08-24T00:00:00Z",
+  "status": "active_blocking_policy",
+  "policy_owner_issue": "bd-sog97.12",
+  "normative_statement": "A budget or gate waiver MUST specify budget_id, reason, evidence_links, operator, created_at, and expires_at. Expired waivers automatically re-block the release gate. A waived budget CANNOT authorize its user-facing claim copy.",
+  "ledger_path": "docs/evidence/waivers.json",
+  "max_waiver_duration_days": 30,
+  "required_entry_fields": [
+    "budget_id",
+    "reason",
+    "evidence_links",
+    "operator",
+    "created_at",
+    "expires_at",
+    "suppressed_claim_keys"
+  ],
+  "rules": {
+    "no_expired_waivers": "Any waiver with expires_at in the past is status=expired and re-blocks its target budget/gate.",
+    "claim_copy_suppression": "Any budget with an active waiver must suppress corresponding claim copy in docs/README.",
+    "max_duration_enforced": "No waiver can be created with duration exceeding max_waiver_duration_days (30 days)."
+  }
+}

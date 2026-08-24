@@ -4247,6 +4247,112 @@ else
     check_fail "dropin_contract" "docs/contracts/dropin-certification-contract.json not found"
 fi
 
+# Gate: Formal Waiver Ledger (bd-sog97.12)
+WAIVER_CONTRACT="$PROJECT_ROOT/docs/contracts/waiver-ledger-contract.json"
+WAIVER_LEDGER="$PROJECT_ROOT/docs/evidence/waivers.json"
+if [[ -f "$WAIVER_CONTRACT" ]] && [[ -f "$WAIVER_LEDGER" ]]; then
+    if WAIVER_LEDGER_CHECK=$(python3 - "$PROJECT_ROOT" "$WAIVER_CONTRACT" "$WAIVER_LEDGER" 2>&1 <<'PY'
+import json, sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+project_root = Path(sys.argv[1])
+contract_path = Path(sys.argv[2])
+ledger_path = Path(sys.argv[3])
+
+try:
+    with open(contract_path, "r", encoding="utf-8") as f:
+        contract = json.load(f)
+    if contract.get("schema") != "pi.waiver.ledger.contract.v1":
+        print(f"invalid:unexpected contract schema {contract.get('schema')!r}")
+        sys.exit(1)
+    if contract.get("bead_id") != "bd-sog97.12":
+        print(f"invalid:unexpected contract bead_id {contract.get('bead_id')!r}")
+        sys.exit(1)
+        
+    with open(ledger_path, "r", encoding="utf-8") as f:
+        ledger = json.load(f)
+    if ledger.get("schema") != "pi.waiver.ledger.v1":
+        print(f"invalid:unexpected ledger schema {ledger.get('schema')!r}")
+        sys.exit(1)
+    if ledger.get("contract_path") != "docs/contracts/waiver-ledger-contract.json":
+        print(f"invalid:unexpected ledger contract_path {ledger.get('contract_path')!r}")
+        sys.exit(1)
+        
+    now = datetime.now(timezone.utc)
+    max_duration_days = int(contract.get("max_waiver_duration_days", 30))
+    required_fields = set(contract.get("required_entry_fields", []))
+    
+    waivers = ledger.get("waivers", [])
+    if not isinstance(waivers, list):
+        print("invalid:waivers must be an array")
+        sys.exit(1)
+        
+    active_count = 0
+    expired_count = 0
+    suppressed_claims_count = 0
+    
+    for idx, w in enumerate(waivers):
+        if not isinstance(w, dict):
+            print(f"invalid:waivers[{idx}] must be a JSON object")
+            sys.exit(1)
+        missing = required_fields - set(w.keys())
+        if missing:
+            print(f"invalid:waivers[{idx}] missing required fields: {sorted(missing)}")
+            sys.exit(1)
+            
+        created_at = datetime.fromisoformat(w["created_at"].replace("Z", "+00:00"))
+        expires_at = datetime.fromisoformat(w["expires_at"].replace("Z", "+00:00"))
+        
+        if expires_at <= created_at:
+            print(f"invalid:waivers[{idx}] expires_at must be after created_at")
+            sys.exit(1)
+            
+        duration = expires_at - created_at
+        if duration > timedelta(days=max_duration_days):
+            print(f"invalid:waivers[{idx}] duration ({duration.days}d) exceeds max allowed ({max_duration_days}d)")
+            sys.exit(1)
+            
+        if expires_at < now:
+            expired_count += 1
+            print(f"expired:waiver for budget '{w['budget_id']}' expired at {w['expires_at']} and has re-blocked")
+            sys.exit(1)
+        else:
+            active_count += 1
+            suppressed_claims_count += len(w.get("suppressed_claim_keys", []))
+            
+    summary = ledger.get("summary", {})
+    if summary.get("total_waivers") != len(waivers) or summary.get("active") != active_count or summary.get("expired") != expired_count:
+        print("invalid:summary counts do not match evaluated waivers")
+        sys.exit(1)
+        
+    print(f"ok:total={len(waivers)} active={active_count} expired={expired_count} suppressed_claims={suppressed_claims_count}")
+except Exception as e:
+    print(f"error:{e}")
+    sys.exit(1)
+PY
+    ); then
+        case "$WAIVER_LEDGER_CHECK" in
+            ok:*)
+                check_pass "waiver_ledger" "waiver ledger is valid (${WAIVER_LEDGER_CHECK#ok:})"
+                ;;
+            expired:*)
+                check_fail "waiver_ledger" "expired waiver detected (${WAIVER_LEDGER_CHECK#expired:})"
+                ;;
+            invalid:*|error:*)
+                check_fail "waiver_ledger" "waiver ledger validation failed (${WAIVER_LEDGER_CHECK#*:})"
+                ;;
+            *)
+                check_fail "waiver_ledger" "unexpected waiver check output: $WAIVER_LEDGER_CHECK"
+                ;;
+        esac
+    else
+        check_fail "waiver_ledger" "waiver ledger evaluation failed: $WAIVER_LEDGER_CHECK"
+    fi
+else
+    check_fail "waiver_ledger" "waiver ledger contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'

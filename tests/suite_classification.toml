@@ -118,6 +118,7 @@ files = [
     "skills_managed",
     "magic_keywords",
     "worktree_iso",
+    "waiver_ledger",
     "checkpoint",
     "eval",
     "url_router",
