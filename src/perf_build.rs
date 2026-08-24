@@ -3,9 +3,12 @@
 //! These helpers keep profile and allocator reporting consistent across
 //! benchmark binaries, regression tests, and shell harnesses.
 
+use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
+use std::fmt;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Environment variable that overrides benchmark build-profile metadata.
 pub const BENCH_BUILD_PROFILE_ENV: &str = "PI_BENCH_BUILD_PROFILE";
@@ -48,6 +51,155 @@ pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] = &[
 
 /// Versioned name for the authoritative Cargo build fingerprint contract.
 pub const BUILD_FINGERPRINT_CONTRACT: &str = "cargo_build_fingerprint.v1";
+
+/// Release-binary size measurement control emitted by the perf orchestrator.
+pub const BINARY_SIZE_MEASUREMENT_SCHEMA: &str = "pi.perf.binary_size_measurement.v1";
+
+/// Idle-process RSS measurement control consumed by the release budget gate.
+pub const IDLE_RSS_MEASUREMENT_SCHEMA: &str = "pi.perf.idle_rss_measurement.v1";
+
+/// Criterion cold-load measurement control emitted by the perf orchestrator.
+pub const COLD_LOAD_MEASUREMENT_SCHEMA: &str = "pi.perf.cold_load_measurement.v1";
+
+/// A measurement control can be absent, malformed, or valid-but-too-noisy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MeasurementControlError {
+    Missing(PathBuf),
+    Invalid(String),
+    Noisy { observed: u8, maximum: u8 },
+}
+
+impl fmt::Display for MeasurementControlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(path) => write!(formatter, "measurement control is missing: {}", path.display()),
+            Self::Invalid(detail) => write!(formatter, "invalid measurement control: {detail}"),
+            Self::Noisy { observed, maximum } => write!(
+                formatter,
+                "measurement control noise_score={observed} exceeds maximum={maximum}"
+            ),
+        }
+    }
+}
+
+/// Verified release-binary size input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBinarySizeMeasurement {
+    pub control_path: PathBuf,
+    pub control_sha256: String,
+    pub binary_path: PathBuf,
+    pub binary_sha256: String,
+    pub size_bytes: u64,
+}
+
+/// Verified Criterion cold-load input and its environment fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedColdLoadMeasurement {
+    pub control_path: PathBuf,
+    pub control_sha256: String,
+    pub artifact_path: PathBuf,
+    pub artifact_sha256: String,
+    pub bench_env_sha256: String,
+    pub governor: String,
+    pub aslr: String,
+    pub thp: String,
+    pub noise_score: u8,
+}
+
+/// Verified idle-process RSS input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedIdleRssMeasurement {
+    pub control_path: PathBuf,
+    pub control_sha256: String,
+    pub pid: u32,
+    pub process_name: String,
+    pub allocator: String,
+    pub binary_path: PathBuf,
+    pub binary_sha256: String,
+    pub rss_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BinarySizeMeasurementControl {
+    schema: String,
+    generated_at: String,
+    run_id: String,
+    correlation_id: String,
+    source_commit: String,
+    source_dirty: bool,
+    binary_path: String,
+    binary_sha256: String,
+    size_bytes: u64,
+    cargo_profile: String,
+    compiled_profile_family: String,
+    compiled_opt_level: String,
+    strip: bool,
+    profile_source: String,
+    build_command: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdLoadMeasurementControl {
+    schema: String,
+    generated_at: String,
+    run_id: String,
+    correlation_id: String,
+    source_commit: String,
+    source_dirty: bool,
+    benchmark_exit_code: i32,
+    max_noise_score: u8,
+    bench_env_source: String,
+    status: String,
+    reason: Option<String>,
+    bench_env: Option<BenchEnvMeasurementControl>,
+    #[serde(default)]
+    bench_env_sha256: Option<String>,
+    measurements: BTreeMap<String, ColdLoadArtifactControl>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct BenchEnvMeasurementControl {
+    os: String,
+    arch: String,
+    cpu_brand: String,
+    cpu_cores: usize,
+    mem_total_mb: u64,
+    governor: String,
+    turbo_boost: String,
+    aslr: String,
+    thp: String,
+    noise_score: u8,
+    config_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ColdLoadArtifactControl {
+    artifact_path: String,
+    artifact_sha256: String,
+    artifact_size_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdleRssMeasurementControl {
+    schema: String,
+    generated_at: String,
+    run_id: String,
+    correlation_id: String,
+    source_commit: String,
+    source_dirty: bool,
+    pid: u32,
+    process_name: String,
+    allocator: String,
+    binary_path: String,
+    binary_sha256: String,
+    rss_bytes: u64,
+    idle_state: String,
+}
 
 /// Independent build assertions carried by benchmark provenance.
 #[derive(Debug, Clone, Copy)]
@@ -292,6 +444,359 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(crate::package_manager::hex_encode(&hasher.finalize()))
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    crate::package_manager::hex_encode(&hasher.finalize())
+}
+
+fn read_measurement_control<T: serde::de::DeserializeOwned>(
+    path: &Path,
+) -> Result<(PathBuf, String, T), MeasurementControlError> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MeasurementControlError::Missing(path.to_path_buf()));
+        }
+        Err(error) => {
+            return Err(MeasurementControlError::Invalid(format!(
+                "cannot inspect {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(MeasurementControlError::Invalid(format!(
+            "{} must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    let canonical_path = std::fs::canonicalize(path).map_err(|error| {
+        MeasurementControlError::Invalid(format!(
+            "cannot canonicalize {}: {error}",
+            path.display()
+        ))
+    })?;
+    let bytes = std::fs::read(&canonical_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!(
+            "cannot read {}: {error}",
+            canonical_path.display()
+        ))
+    })?;
+    let control = serde_json::from_slice(&bytes).map_err(|error| {
+        MeasurementControlError::Invalid(format!(
+            "{} is not the exact expected JSON document: {error}",
+            canonical_path.display()
+        ))
+    })?;
+    Ok((canonical_path, sha256_bytes(&bytes), control))
+}
+
+fn validate_control_lineage(
+    generated_at: &str,
+    run_id: &str,
+    correlation_id: &str,
+    source_commit: &str,
+    source_dirty: bool,
+) -> Result<(), MeasurementControlError> {
+    if chrono::DateTime::parse_from_rfc3339(generated_at).is_err() {
+        return Err(MeasurementControlError::Invalid(
+            "generated_at must be an RFC3339 timestamp".to_string(),
+        ));
+    }
+    if run_id.is_empty() || run_id != correlation_id {
+        return Err(MeasurementControlError::Invalid(
+            "run_id and correlation_id must be the same non-empty value".to_string(),
+        ));
+    }
+    if source_commit.len() != 40
+        || !source_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || source_commit.bytes().all(|byte| byte == b'0')
+    {
+        return Err(MeasurementControlError::Invalid(
+            "source_commit must be a full lowercase nonzero Git SHA-1".to_string(),
+        ));
+    }
+    if source_dirty {
+        return Err(MeasurementControlError::Invalid(
+            "source_dirty must be false for release-budget evidence".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_regular_file(path: &str, field: &str) -> Result<PathBuf, MeasurementControlError> {
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(MeasurementControlError::Invalid(format!(
+            "{field} must be absolute"
+        )));
+    }
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot inspect {field}: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(MeasurementControlError::Invalid(format!(
+            "{field} must identify a regular non-symlink file"
+        )));
+    }
+    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot canonicalize {field}: {error}"))
+    })?;
+    if canonical != path {
+        return Err(MeasurementControlError::Invalid(format!(
+            "{field} must already be canonical"
+        )));
+    }
+    Ok(canonical)
+}
+
+fn validate_sha256(value: &str, field: &str) -> Result<(), MeasurementControlError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Ok(());
+    }
+    Err(MeasurementControlError::Invalid(format!(
+        "{field} must be 64 lowercase hexadecimal characters"
+    )))
+}
+
+/// Verify that the size input names and hashes the exact release binary and
+/// proves the shipping profile's size-oriented Cargo settings.
+pub fn verify_binary_size_measurement_control(
+    control_path: &Path,
+) -> Result<VerifiedBinarySizeMeasurement, MeasurementControlError> {
+    let (control_path, control_sha256, control): (_, _, BinarySizeMeasurementControl) =
+        read_measurement_control(control_path)?;
+    if control.schema != BINARY_SIZE_MEASUREMENT_SCHEMA {
+        return Err(MeasurementControlError::Invalid(format!(
+            "schema must equal {BINARY_SIZE_MEASUREMENT_SCHEMA}"
+        )));
+    }
+    validate_control_lineage(
+        &control.generated_at,
+        &control.run_id,
+        &control.correlation_id,
+        &control.source_commit,
+        control.source_dirty,
+    )?;
+    if control.cargo_profile != "release"
+        || control.compiled_profile_family != "release"
+        || control.compiled_opt_level != "z"
+        || !control.strip
+        || control.profile_source != "Cargo.toml#profile.release"
+        || control.build_command != "cargo build --bin pi --release"
+    {
+        return Err(MeasurementControlError::Invalid(
+            "release binary must prove profile=release, opt-level=z, strip=true, and the canonical build command"
+                .to_string(),
+        ));
+    }
+    validate_sha256(&control.binary_sha256, "binary_sha256")?;
+    let binary_path = canonical_regular_file(&control.binary_path, "binary_path")?;
+    let metadata = std::fs::metadata(&binary_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot inspect binary_path: {error}"))
+    })?;
+    if control.size_bytes == 0 || metadata.len() != control.size_bytes {
+        return Err(MeasurementControlError::Invalid(format!(
+            "size_bytes does not match binary_path (claimed={}, observed={})",
+            control.size_bytes,
+            metadata.len()
+        )));
+    }
+    let observed_sha256 = sha256_file(&binary_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot hash binary_path: {error}"))
+    })?;
+    if observed_sha256 != control.binary_sha256 {
+        return Err(MeasurementControlError::Invalid(format!(
+            "binary_sha256 does not match binary_path (claimed={}, observed={observed_sha256})",
+            control.binary_sha256
+        )));
+    }
+    Ok(VerifiedBinarySizeMeasurement {
+        control_path,
+        control_sha256,
+        binary_path,
+        binary_sha256: control.binary_sha256,
+        size_bytes: control.size_bytes,
+    })
+}
+
+/// Verify one extension's Criterion cold-load estimate against the exact
+/// `benches/bench_env.rs` fingerprint captured by the same orchestrator run.
+pub fn verify_cold_load_measurement_control(
+    control_path: &Path,
+    extension: &str,
+) -> Result<VerifiedColdLoadMeasurement, MeasurementControlError> {
+    let (control_path, control_sha256, control): (_, _, ColdLoadMeasurementControl) =
+        read_measurement_control(control_path)?;
+    if control.schema != COLD_LOAD_MEASUREMENT_SCHEMA {
+        return Err(MeasurementControlError::Invalid(format!(
+            "schema must equal {COLD_LOAD_MEASUREMENT_SCHEMA}"
+        )));
+    }
+    validate_control_lineage(
+        &control.generated_at,
+        &control.run_id,
+        &control.correlation_id,
+        &control.source_commit,
+        control.source_dirty,
+    )?;
+    if control.benchmark_exit_code != 0
+        || control.status != "verified"
+        || control.reason.is_some()
+        || control.bench_env_source != "benches/bench_env.rs"
+        || control.max_noise_score != 0
+    {
+        return Err(MeasurementControlError::Invalid(
+            "cold-load control must be a successful verified benches/bench_env.rs run with max_noise_score=0"
+                .to_string(),
+        ));
+    }
+    let bench_env = control.bench_env.ok_or_else(|| {
+        MeasurementControlError::Invalid("bench_env must be present".to_string())
+    })?;
+    let claimed_bench_env_sha256 = control.bench_env_sha256.ok_or_else(|| {
+        MeasurementControlError::Invalid("bench_env_sha256 must be present".to_string())
+    })?;
+    validate_sha256(&claimed_bench_env_sha256, "bench_env_sha256")?;
+    if bench_env.os.is_empty()
+        || bench_env.arch.is_empty()
+        || bench_env.cpu_brand.is_empty()
+        || bench_env.cpu_cores == 0
+        || bench_env.mem_total_mb == 0
+        || bench_env.governor.is_empty()
+        || bench_env.turbo_boost.is_empty()
+        || bench_env.aslr.is_empty()
+        || bench_env.thp.is_empty()
+    {
+        return Err(MeasurementControlError::Invalid(
+            "bench_env fields must be complete and non-empty".to_string(),
+        ));
+    }
+    validate_sha256(&bench_env.config_hash, "bench_env.config_hash")?;
+    let bench_env_value = serde_json::to_value(&bench_env).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot serialize bench_env: {error}"))
+    })?;
+    let bench_env_bytes = serde_json::to_vec(&bench_env_value).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot canonicalize bench_env: {error}"))
+    })?;
+    let observed_bench_env_sha256 = sha256_bytes(&bench_env_bytes);
+    if claimed_bench_env_sha256 != observed_bench_env_sha256 {
+        return Err(MeasurementControlError::Invalid(format!(
+            "bench_env_sha256 mismatch (claimed={claimed_bench_env_sha256}, observed={observed_bench_env_sha256})"
+        )));
+    }
+    if bench_env.noise_score > control.max_noise_score {
+        return Err(MeasurementControlError::Noisy {
+            observed: bench_env.noise_score,
+            maximum: control.max_noise_score,
+        });
+    }
+    let measurement = control.measurements.get(extension).ok_or_else(|| {
+        MeasurementControlError::Invalid(format!(
+            "measurements must contain extension {extension:?}"
+        ))
+    })?;
+    validate_sha256(&measurement.artifact_sha256, "artifact_sha256")?;
+    let artifact_path = canonical_regular_file(&measurement.artifact_path, "artifact_path")?;
+    let artifact_metadata = std::fs::metadata(&artifact_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot inspect artifact_path: {error}"))
+    })?;
+    if measurement.artifact_size_bytes == 0
+        || artifact_metadata.len() != measurement.artifact_size_bytes
+    {
+        return Err(MeasurementControlError::Invalid(format!(
+            "artifact_size_bytes does not match artifact_path (claimed={}, observed={})",
+            measurement.artifact_size_bytes,
+            artifact_metadata.len()
+        )));
+    }
+    let observed_artifact_sha256 = sha256_file(&artifact_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot hash artifact_path: {error}"))
+    })?;
+    if observed_artifact_sha256 != measurement.artifact_sha256 {
+        return Err(MeasurementControlError::Invalid(format!(
+            "artifact_sha256 does not match artifact_path (claimed={}, observed={observed_artifact_sha256})",
+            measurement.artifact_sha256
+        )));
+    }
+    Ok(VerifiedColdLoadMeasurement {
+        control_path,
+        control_sha256,
+        artifact_path,
+        artifact_sha256: measurement.artifact_sha256.clone(),
+        bench_env_sha256: claimed_bench_env_sha256,
+        governor: bench_env.governor,
+        aslr: bench_env.aslr,
+        thp: bench_env.thp,
+        noise_score: bench_env.noise_score,
+    })
+}
+
+/// Verify that idle RSS was sampled from a real `pi` process and remains
+/// bound to the exact measured executable and allocator.
+pub fn verify_idle_rss_measurement_control(
+    control_path: &Path,
+) -> Result<VerifiedIdleRssMeasurement, MeasurementControlError> {
+    let (control_path, control_sha256, control): (_, _, IdleRssMeasurementControl) =
+        read_measurement_control(control_path)?;
+    if control.schema != IDLE_RSS_MEASUREMENT_SCHEMA {
+        return Err(MeasurementControlError::Invalid(format!(
+            "schema must equal {IDLE_RSS_MEASUREMENT_SCHEMA}"
+        )));
+    }
+    validate_control_lineage(
+        &control.generated_at,
+        &control.run_id,
+        &control.correlation_id,
+        &control.source_commit,
+        control.source_dirty,
+    )?;
+    if control.pid == 0
+        || control.process_name != "pi"
+        || !matches!(control.allocator.as_str(), "system" | "jemalloc")
+        || control.rss_bytes == 0
+        || control.idle_state != "startup_before_user_input"
+    {
+        return Err(MeasurementControlError::Invalid(
+            "idle RSS control requires pid>0, process_name=pi, a known allocator, rss_bytes>0, and the startup_before_user_input boundary"
+                .to_string(),
+        ));
+    }
+    validate_sha256(&control.binary_sha256, "binary_sha256")?;
+    let binary_path = canonical_regular_file(&control.binary_path, "binary_path")?;
+    if binary_path.file_name().and_then(|name| name.to_str()) != Some("pi") {
+        return Err(MeasurementControlError::Invalid(
+            "idle RSS binary_path must identify the pi executable".to_string(),
+        ));
+    }
+    let observed_binary_sha256 = sha256_file(&binary_path).map_err(|error| {
+        MeasurementControlError::Invalid(format!("cannot hash binary_path: {error}"))
+    })?;
+    if observed_binary_sha256 != control.binary_sha256 {
+        return Err(MeasurementControlError::Invalid(format!(
+            "binary_sha256 does not match binary_path (claimed={}, observed={observed_binary_sha256})",
+            control.binary_sha256
+        )));
+    }
+    Ok(VerifiedIdleRssMeasurement {
+        control_path,
+        control_sha256,
+        pid: control.pid,
+        process_name: control.process_name,
+        allocator: control.allocator,
+        binary_path,
+        binary_sha256: control.binary_sha256,
+        rss_bytes: control.rss_bytes,
+    })
+}
+
 /// Hashes asserted build/source/binary provenance as compact canonical JSON.
 ///
 /// Evidence producers and consumers share this helper so field omissions or
@@ -348,11 +853,177 @@ pub fn profile_from_target_path(path: &Path) -> Option<String> {
 mod tests {
     use super::{
         AllocatorKind, BENCH_ALLOCATOR_ENV, BenchmarkBuildVerification, BenchmarkProvenance,
-        benchmark_provenance_config_hash, detect_build_profile_from,
+        MeasurementControlError, benchmark_provenance_config_hash, detect_build_profile_from,
         matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
         profile_from_target_path, resolve_bench_allocator_from,
+        verify_binary_size_measurement_control, verify_cold_load_measurement_control,
+        verify_idle_rss_measurement_control,
     };
     use std::path::Path;
+
+    const TEST_SOURCE_COMMIT: &str = "1234567890abcdef1234567890abcdef12345678";
+
+    fn write_json(path: &Path, value: &serde_json::Value) {
+        std::fs::write(path, serde_json::to_vec(value).expect("serialize test control"))
+            .expect("write test control");
+    }
+
+    #[test]
+    fn binary_size_control_binds_exact_release_binary_and_profile() {
+        let temp = tempfile::tempdir().expect("create test directory");
+        let binary_path = temp.path().join("pi");
+        std::fs::write(&binary_path, b"shipping release binary").expect("write release binary");
+        let binary_path = std::fs::canonicalize(binary_path).expect("canonical binary path");
+        let binary_sha256 = super::sha256_file(&binary_path).expect("hash release binary");
+        let control_path = temp.path().join("binary-size.json");
+        let control = serde_json::json!({
+            "schema": super::BINARY_SIZE_MEASUREMENT_SCHEMA,
+            "generated_at": "2026-08-24T00:00:00Z",
+            "run_id": "test-run",
+            "correlation_id": "test-run",
+            "source_commit": TEST_SOURCE_COMMIT,
+            "source_dirty": false,
+            "binary_path": binary_path,
+            "binary_sha256": binary_sha256,
+            "size_bytes": 23,
+            "cargo_profile": "release",
+            "compiled_profile_family": "release",
+            "compiled_opt_level": "z",
+            "strip": true,
+            "profile_source": "Cargo.toml#profile.release",
+            "build_command": "cargo build --bin pi --release"
+        });
+        write_json(&control_path, &control);
+
+        let verified = verify_binary_size_measurement_control(&control_path)
+            .expect("valid release-binary control");
+        assert_eq!(verified.size_bytes, 23);
+
+        std::fs::write(&binary_path, b"tampered release binary")
+            .expect("tamper release binary");
+        assert!(matches!(
+            verify_binary_size_measurement_control(&control_path),
+            Err(MeasurementControlError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn cold_load_control_rejects_noisy_or_tampered_criterion_input() {
+        let temp = tempfile::tempdir().expect("create test directory");
+        let artifact_path = temp.path().join("estimates.json");
+        std::fs::write(&artifact_path, br#"{"mean":{"point_estimate":1000000}}"#)
+            .expect("write Criterion estimate");
+        let artifact_path =
+            std::fs::canonicalize(artifact_path).expect("canonical Criterion path");
+        let artifact_sha256 = super::sha256_file(&artifact_path).expect("hash Criterion estimate");
+        let bench_env = serde_json::json!({
+            "os": "linux",
+            "arch": "x86_64",
+            "cpu_brand": "fixture cpu",
+            "cpu_cores": 8,
+            "mem_total_mb": 16384,
+            "governor": "performance",
+            "turbo_boost": "disabled",
+            "aslr": "enabled",
+            "thp": "never",
+            "noise_score": 0,
+            "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let bench_env_sha256 = super::sha256_bytes(
+            &serde_json::to_vec(&bench_env).expect("serialize benchmark environment"),
+        );
+        let control_path = temp.path().join("cold-load.json");
+        let mut control = serde_json::json!({
+            "schema": super::COLD_LOAD_MEASUREMENT_SCHEMA,
+            "generated_at": "2026-08-24T00:00:00Z",
+            "run_id": "test-run",
+            "correlation_id": "test-run",
+            "source_commit": TEST_SOURCE_COMMIT,
+            "source_dirty": false,
+            "benchmark_exit_code": 0,
+            "max_noise_score": 0,
+            "bench_env_source": "benches/bench_env.rs",
+            "status": "verified",
+            "reason": null,
+            "bench_env": bench_env,
+            "bench_env_sha256": bench_env_sha256,
+            "measurements": {
+                "hello": {
+                    "artifact_path": artifact_path,
+                    "artifact_sha256": artifact_sha256,
+                    "artifact_size_bytes": 35
+                }
+            }
+        });
+        write_json(&control_path, &control);
+
+        verify_cold_load_measurement_control(&control_path, "hello")
+            .expect("quiet, bound Criterion control");
+
+        control["bench_env"]["noise_score"] = serde_json::json!(1);
+        let noisy_env_sha256 = super::sha256_bytes(
+            &serde_json::to_vec(&control["bench_env"]).expect("serialize noisy environment"),
+        );
+        control["bench_env_sha256"] = serde_json::json!(noisy_env_sha256);
+        write_json(&control_path, &control);
+        assert_eq!(
+            verify_cold_load_measurement_control(&control_path, "hello"),
+            Err(MeasurementControlError::Noisy {
+                observed: 1,
+                maximum: 0
+            })
+        );
+
+        control["bench_env"]["noise_score"] = serde_json::json!(0);
+        let quiet_env_sha256 = super::sha256_bytes(
+            &serde_json::to_vec(&control["bench_env"]).expect("serialize quiet environment"),
+        );
+        control["bench_env_sha256"] = serde_json::json!(quiet_env_sha256);
+        write_json(&control_path, &control);
+        std::fs::write(&artifact_path, br#"{"mean":{"point_estimate":2000000}}"#)
+            .expect("tamper Criterion estimate");
+        assert!(matches!(
+            verify_cold_load_measurement_control(&control_path, "hello"),
+            Err(MeasurementControlError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn idle_rss_control_binds_pi_process_allocator_and_executable() {
+        let temp = tempfile::tempdir().expect("create test directory");
+        let binary_path = temp.path().join("pi");
+        std::fs::write(&binary_path, b"measured pi executable").expect("write Pi executable");
+        let binary_path = std::fs::canonicalize(binary_path).expect("canonical Pi path");
+        let binary_sha256 = super::sha256_file(&binary_path).expect("hash Pi executable");
+        let control_path = temp.path().join("idle-rss.json");
+        let mut control = serde_json::json!({
+            "schema": super::IDLE_RSS_MEASUREMENT_SCHEMA,
+            "generated_at": "2026-08-24T00:00:00Z",
+            "run_id": "test-run",
+            "correlation_id": "test-run",
+            "source_commit": TEST_SOURCE_COMMIT,
+            "source_dirty": false,
+            "pid": 4242,
+            "process_name": "pi",
+            "allocator": "system",
+            "binary_path": binary_path,
+            "binary_sha256": binary_sha256,
+            "rss_bytes": 1048576,
+            "idle_state": "startup_before_user_input"
+        });
+        write_json(&control_path, &control);
+
+        let verified = verify_idle_rss_measurement_control(&control_path)
+            .expect("valid idle RSS control");
+        assert_eq!(verified.pid, 4242);
+
+        control["process_name"] = serde_json::json!("cargo-test");
+        write_json(&control_path, &control);
+        assert!(matches!(
+            verify_idle_rss_measurement_control(&control_path),
+            Err(MeasurementControlError::Invalid(_))
+        ));
+    }
 
     #[test]
     fn detect_build_profile_prefers_env_override() {

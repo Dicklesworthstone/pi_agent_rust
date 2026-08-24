@@ -14,9 +14,12 @@
 
 use pi::perf_build::{
     BINARY_SIZE_RELEASE_BUDGET_MB, BUILD_FINGERPRINT_CONTRACT, BenchmarkBuildVerification,
-    BenchmarkProvenance, CANONICAL_PIJS_PERF_FEATURES, benchmark_provenance_config_hash,
-    matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
-    profile_from_target_path, sha256_file,
+    BenchmarkProvenance, CANONICAL_PIJS_PERF_FEATURES, MeasurementControlError,
+    VerifiedBinarySizeMeasurement, VerifiedColdLoadMeasurement, VerifiedIdleRssMeasurement,
+    benchmark_provenance_config_hash, matches_canonical_perf_build_fingerprint,
+    matches_canonical_pijs_perf_features, profile_from_target_path, sha256_file,
+    verify_binary_size_measurement_control, verify_cold_load_measurement_control,
+    verify_idle_rss_measurement_control,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -347,6 +350,9 @@ const CONTEXT_INTELLIGENCE_BUDGET_METRICS: &[(&str, &str)] = &[
 const CONTEXT_INTELLIGENCE_CACHE_FIELDS: &[&str] =
     &["cold_graph_build", "warm_graph_build", "incremental_update"];
 const PIJS_REGRESSION_GATE_ITERATIONS: u64 = 2_000;
+const BINARY_SIZE_CONTROL_FILE: &str = "binary_size_measurement.json";
+const COLD_LOAD_CONTROL_FILE: &str = "cold_load_measurement.json";
+const IDLE_RSS_CONTROL_FILE: &str = "idle_memory_rss.json";
 
 // ─── Data Readers ────────────────────────────────────────────────────────────
 
@@ -922,10 +928,7 @@ fn budget_artifact_candidates(root: &Path, budget_name: &str) -> Vec<PathBuf> {
         "tool_call_latency_mean" | "tool_call_throughput_min" => {
             pijs_workload_candidate_paths(root)
         }
-        "ext_cold_load_simple_p95" => criterion_estimate_candidate_paths(
-            root,
-            "criterion/ext_load_init/load_init_cold/hello/new/estimates.json",
-        ),
+        "ext_cold_load_simple_p95" => cold_load_control_candidates(root),
         "startup_version_p95" => criterion_estimate_candidate_paths(
             root,
             "criterion/startup/version/warm/new/estimates.json",
@@ -948,7 +951,8 @@ fn budget_artifact_candidates(root: &Path, budget_name: &str) -> Vec<PathBuf> {
             root,
             "criterion/ext_policy/evaluate",
         )),
-        "binary_size_release" => binary_size_candidate_paths(root),
+        "idle_memory_rss" => idle_rss_control_candidates(root),
+        "binary_size_release" => binary_size_control_candidates(root),
         "protocol_parse_p99" => collect_estimate_json_files_from_bases(&criterion_base_candidates(
             root,
             "criterion/ext_protocol/parse_and_validate",
@@ -1008,6 +1012,118 @@ fn binary_size_candidate_paths(root: &Path) -> Vec<PathBuf> {
         ));
     }
     dedup_paths(paths)
+}
+
+fn measurement_control_candidate_paths(
+    root: &Path,
+    env_override: &str,
+    file_name: &str,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if root == project_root().as_path() {
+        if let Some(raw) = std::env::var_os(env_override)
+            && let Some(path) = resolve_env_path(root, PathBuf::from(raw))
+        {
+            paths.push(path);
+        }
+        paths.extend(
+            perf_evidence_dirs(root)
+                .into_iter()
+                .map(|dir| dir.join("release_evidence").join(file_name)),
+        );
+    }
+    paths.extend(
+        target_dir_candidates(root)
+            .into_iter()
+            .map(|dir| dir.join("perf/release_evidence").join(file_name)),
+    );
+    dedup_paths(paths)
+}
+
+fn first_existing_control_path(
+    candidates: &[PathBuf],
+) -> Result<&Path, MeasurementControlError> {
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .map(PathBuf::as_path)
+        .ok_or_else(|| {
+            MeasurementControlError::Missing(
+                candidates
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("measurement-control.json")),
+            )
+        })
+}
+
+fn binary_size_control_candidates(root: &Path) -> Vec<PathBuf> {
+    measurement_control_candidate_paths(
+        root,
+        "PERF_BINARY_SIZE_CONTROL_PATH",
+        BINARY_SIZE_CONTROL_FILE,
+    )
+}
+
+fn cold_load_control_candidates(root: &Path) -> Vec<PathBuf> {
+    measurement_control_candidate_paths(
+        root,
+        "PERF_COLD_LOAD_CONTROL_PATH",
+        COLD_LOAD_CONTROL_FILE,
+    )
+}
+
+fn idle_rss_control_candidates(root: &Path) -> Vec<PathBuf> {
+    measurement_control_candidate_paths(
+        root,
+        "PERF_IDLE_RSS_CONTROL_PATH",
+        IDLE_RSS_CONTROL_FILE,
+    )
+}
+
+fn verify_binary_size_control_for_root(
+    root: &Path,
+) -> Result<VerifiedBinarySizeMeasurement, MeasurementControlError> {
+    let candidates = binary_size_control_candidates(root);
+    let verified = verify_binary_size_measurement_control(first_existing_control_path(&candidates)?)?;
+    let admissible_binary = binary_size_candidate_paths(root)
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|path| path == verified.binary_path);
+    if !admissible_binary {
+        return Err(MeasurementControlError::Invalid(
+            "binary_path is not the configured release/pi artifact".to_string(),
+        ));
+    }
+    Ok(verified)
+}
+
+fn verify_cold_load_control_for_root(
+    root: &Path,
+    extension: &str,
+) -> Result<VerifiedColdLoadMeasurement, MeasurementControlError> {
+    let candidates = cold_load_control_candidates(root);
+    let verified =
+        verify_cold_load_measurement_control(first_existing_control_path(&candidates)?, extension)?;
+    let relative =
+        format!("criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json");
+    let admissible_artifact = criterion_estimate_candidate_paths(root, &relative)
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .any(|path| path == verified.artifact_path);
+    if !admissible_artifact {
+        return Err(MeasurementControlError::Invalid(format!(
+            "artifact_path is not the configured Criterion estimate for {extension}"
+        )));
+    }
+    Ok(verified)
+}
+
+fn verify_idle_rss_control_for_root(
+    root: &Path,
+) -> Result<VerifiedIdleRssMeasurement, MeasurementControlError> {
+    let candidates = idle_rss_control_candidates(root);
+    verify_idle_rss_measurement_control(first_existing_control_path(&candidates)?)
 }
 
 fn collect_estimate_json_files(base: &Path) -> Vec<PathBuf> {
@@ -1836,6 +1952,73 @@ fn evaluate_context_intelligence_budget_contract(
     failures
 }
 
+fn uses_release_measurement_control(budget_name: &str) -> bool {
+    matches!(
+        budget_name,
+        "binary_size_release"
+            | "idle_memory_rss"
+            | "ext_cold_load_simple_p95"
+            | "ext_cold_load_complex_p95"
+    )
+}
+
+fn measurement_control_failure(
+    contract_id: &str,
+    budget_name: &str,
+    error: &MeasurementControlError,
+) -> DataContractFailure {
+    DataContractFailure {
+        contract_id: contract_id.to_string(),
+        budget_name: Some(budget_name.to_string()),
+        detail: error.to_string(),
+        remediation: "Regenerate the measurement control and measured artifact in the same clean orchestrator run."
+            .to_string(),
+    }
+}
+
+fn evaluate_release_measurement_controls(root: &Path) -> Vec<DataContractFailure> {
+    let mut failures = Vec::new();
+    if let Err(error) = verify_binary_size_control_for_root(root) {
+        let contract_id = match &error {
+            MeasurementControlError::Missing(_) => "missing_binary_size_measurement_control",
+            MeasurementControlError::Invalid(_) | MeasurementControlError::Noisy { .. } => {
+                "invalid_binary_size_measurement_control"
+            }
+        };
+        failures.push(measurement_control_failure(
+            contract_id,
+            "binary_size_release",
+            &error,
+        ));
+    }
+    if let Err(error) = verify_idle_rss_control_for_root(root) {
+        let contract_id = match &error {
+            MeasurementControlError::Missing(_) => "missing_idle_rss_measurement_control",
+            MeasurementControlError::Invalid(_) | MeasurementControlError::Noisy { .. } => {
+                "invalid_idle_rss_measurement_control"
+            }
+        };
+        failures.push(measurement_control_failure(
+            contract_id,
+            "idle_memory_rss",
+            &error,
+        ));
+    }
+    if let Err(error) = verify_cold_load_control_for_root(root, "hello") {
+        let contract_id = match &error {
+            MeasurementControlError::Missing(_) => "missing_cold_load_measurement_control",
+            MeasurementControlError::Invalid(_) => "invalid_cold_load_measurement_control",
+            MeasurementControlError::Noisy { .. } => "noisy_cold_load_measurement_control",
+        };
+        failures.push(measurement_control_failure(
+            contract_id,
+            "ext_cold_load_simple_p95",
+            &error,
+        ));
+    }
+    failures
+}
+
 fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
     let max_age_hours = max_artifact_age_hours();
     let mut failures = Vec::new();
@@ -1844,7 +2027,8 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
         if matches!(
             budget.name,
             "tool_call_latency_mean" | "tool_call_throughput_min"
-        ) {
+        ) || uses_release_measurement_control(budget.name)
+        {
             // PiJS selects one canonical artifact by precedence. Its dedicated
             // contract below binds freshness and parsing to that exact source.
             continue;
@@ -1864,6 +2048,7 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
         }
     }
 
+    failures.extend(evaluate_release_measurement_controls(root));
     failures.extend(evaluate_required_e2e_ratio_contract(root, max_age_hours));
     failures.extend(evaluate_phase1_weighted_attribution_contract(
         root,
@@ -1930,13 +2115,17 @@ fn check_budget_with_strict_at_root(budget: &Budget, strict: bool, root: &Path) 
             None,
         ),
         "policy_eval_p99" => read_criterion_policy_eval(root),
-        "idle_memory_rss" => read_idle_memory_rss(),
+        "idle_memory_rss" => read_idle_memory_rss(root),
         "binary_size_release" => read_binary_size(root),
         "protocol_parse_p99" => read_criterion_protocol_parse(root),
         _ => (None, "no data source configured".to_string()),
     };
 
-    let status = classify_budget_status(budget, actual, strict);
+    let status = if actual.is_none() && uses_release_measurement_control(budget.name) {
+        "NO_DATA"
+    } else {
+        classify_budget_status(budget, actual, strict)
+    };
     let failure_reason = if status == "FAIL" && actual.is_none() && budget.ci_enforced && strict {
         Some("missing_measurement_data".to_string())
     } else {
@@ -2623,20 +2812,40 @@ fn pijs_workload_candidate_paths_in_evidence_dir(evidence_dir: &Path) -> Vec<Pat
 }
 
 fn read_criterion_load_time(root: &Path, ext: &str) -> (Option<f64>, String) {
-    // Criterion stores results in target/criterion/<group>/<bench>/new/estimates.json
-    let relative = format!("criterion/ext_load_init/load_init_cold/{ext}/new/estimates.json");
-    for path in criterion_estimate_candidate_paths(root, &relative) {
-        if let Some(estimates) = read_json_file(&path)
-            && let Some(mean_ns) = estimates
-                .get("mean")
-                .and_then(|m| m.get("point_estimate"))
-                .and_then(Value::as_f64)
-        {
-            let ms = mean_ns / 1_000_000.0;
-            return (Some(ms), display_source_path(root, &path));
-        }
-    }
-    (None, format!("no criterion data for {ext}"))
+    let verified = match verify_cold_load_control_for_root(root, ext) {
+        Ok(verified) => verified,
+        Err(error) => return (None, error.to_string()),
+    };
+    let Some(estimates) = read_json_file(&verified.artifact_path) else {
+        return (
+            None,
+            "verified Criterion estimate became unreadable".to_string(),
+        );
+    };
+    let Some(mean_ns) = estimates
+        .get("mean")
+        .and_then(|mean| mean.get("point_estimate"))
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    else {
+        return (
+            None,
+            "verified Criterion estimate has no finite non-negative mean.point_estimate"
+                .to_string(),
+        );
+    };
+    let source = format!(
+        "{}#control=bench_env_v1;control_sha256={};artifact_sha256={};bench_env_sha256={};noise_score={};governor={};aslr={};thp={}",
+        display_source_path(root, &verified.artifact_path),
+        verified.control_sha256,
+        verified.artifact_sha256,
+        verified.bench_env_sha256,
+        verified.noise_score,
+        verified.governor,
+        verified.aslr,
+        verified.thp,
+    );
+    (Some(mean_ns / 1_000_000.0), source)
 }
 
 fn read_total_load_time(root: &Path) -> (Option<f64>, String) {
@@ -2828,25 +3037,42 @@ fn read_criterion_policy_eval(root: &Path) -> (Option<f64>, String) {
     )
 }
 
-fn read_idle_memory_rss() -> (Option<f64>, String) {
+fn read_idle_memory_rss(root: &Path) -> (Option<f64>, String) {
+    let verified = match verify_idle_rss_control_for_root(root) {
+        Ok(verified) => verified,
+        Err(error) => return (None, error.to_string()),
+    };
+    let source = format!(
+        "{}#control=idle_rss_v1;control_sha256={};pid={};process={};allocator={};binary_sha256={};rss_bytes={}",
+        display_source_path(root, &verified.control_path),
+        verified.control_sha256,
+        verified.pid,
+        verified.process_name,
+        verified.allocator,
+        verified.binary_sha256,
+        verified.rss_bytes,
+    );
     (
-        None,
-        "no canonical idle Pi RSS artifact; test-harness process RSS is inadmissible".to_string(),
+        Some(verified.rss_bytes as f64 / 1024.0 / 1024.0),
+        source,
     )
 }
 
 fn read_binary_size(root: &Path) -> (Option<f64>, String) {
-    for path in binary_size_candidate_paths(root) {
-        if let Ok(meta) = std::fs::metadata(&path) {
-            let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
-            let source = display_source_path(root, &path);
-            return (Some(size_mb), source);
-        }
-    }
+    let verified = match verify_binary_size_control_for_root(root) {
+        Ok(verified) => verified,
+        Err(error) => return (None, error.to_string()),
+    };
+    let source = format!(
+        "{}#control=release_binary_v1;control_sha256={};binary_sha256={};size_bytes={};profile=release;opt_level=z;strip=true",
+        display_source_path(root, &verified.control_path),
+        verified.control_sha256,
+        verified.binary_sha256,
+        verified.size_bytes,
+    );
     (
-        None,
-        "no release binary found (requires target/release/pi or PERF_RELEASE_BINARY_PATH)"
-            .to_string(),
+        Some(verified.size_bytes as f64 / 1024.0 / 1024.0),
+        source,
     )
 }
 

@@ -39,6 +39,7 @@
 #   PERF_REMOTE_TARGET_DIR    Optional remote CARGO_TARGET_DIR prefix recorded in artifact staging manifests
 #   PERF_EVIDENCE_DIR         Optional repo-visible staged evidence root consumed by perf_budgets report generation
 #   PERF_EVIDENCE_DIRS        Optional path-list of additional staged evidence roots
+#   PERF_MAX_BENCH_ENV_NOISE_SCORE  Maximum admissible benches/bench_env.rs score (default: 0)
 #   PERF_EVIDENCE_CACHE_DIR   Optional perf evidence cache directory (default: $CARGO_TARGET_DIR/perf/evidence_cache)
 #   PI_PERF_EVIDENCE_CACHE_TTL_HOURS
 #                             Maximum reusable perf evidence cache TTL in hours (default: 168)
@@ -85,7 +86,10 @@ CREATE_BUNDLE=0
 VALIDATE_ONLY=""
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 GIT_COMMIT_FULL="$(git rev-parse HEAD 2>/dev/null || echo "unknown")"
-GIT_DIRTY="$(git diff --quiet 2>/dev/null && echo "false" || echo "true")"
+GIT_DIRTY=false
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)" ]]; then
+  GIT_DIRTY=true
+fi
 CARGO_RUNNER_REQUEST="${PERF_CARGO_RUNNER:-rch}" # rch | auto | local
 CARGO_RUNNER_MODE="local"
 declare -a CARGO_RUNNER_ARGS=("cargo")
@@ -402,6 +406,195 @@ suite_selected() {
   return 1
 }
 
+write_binary_size_measurement_control() {
+  local binary_path="$1"
+  local control_path="$TARGET_DIR/perf/release_evidence/binary_size_measurement.json"
+  mkdir -p "$(dirname "$control_path")"
+
+  python3 - \
+    "$PROJECT_ROOT/Cargo.toml" \
+    "$binary_path" \
+    "$control_path" \
+    "$GIT_COMMIT_FULL" \
+    "$GIT_DIRTY" \
+    "$CORRELATION_ID" <<'PY'
+import hashlib
+import json
+import os
+import sys
+import tomllib
+from datetime import datetime, timezone
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+binary_path = Path(sys.argv[2]).resolve(strict=True)
+control_path = Path(sys.argv[3])
+source_commit = sys.argv[4]
+source_dirty = sys.argv[5] == "true"
+correlation_id = sys.argv[6]
+
+with manifest_path.open("rb") as handle:
+    manifest = tomllib.load(handle)
+release = manifest.get("profile", {}).get("release", {})
+opt_level = release.get("opt-level")
+strip = release.get("strip")
+if opt_level != "z" or strip is not True:
+    raise SystemExit(
+        "release binary measurement control requires Cargo.toml "
+        "[profile.release] opt-level='z' and strip=true"
+    )
+
+digest = hashlib.sha256()
+with binary_path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+payload = {
+    "schema": "pi.perf.binary_size_measurement.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    "run_id": correlation_id,
+    "correlation_id": correlation_id,
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
+    "binary_path": str(binary_path),
+    "binary_sha256": digest.hexdigest(),
+    "size_bytes": binary_path.stat().st_size,
+    "cargo_profile": "release",
+    "compiled_profile_family": "release",
+    "compiled_opt_level": "z",
+    "strip": True,
+    "profile_source": "Cargo.toml#profile.release",
+    "build_command": "cargo build --bin pi --release",
+}
+encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+temporary_path = control_path.with_name(control_path.name + ".tmp")
+temporary_path.write_text(encoded, encoding="utf-8")
+os.replace(temporary_path, control_path)
+PY
+  log_ok "Binary-size measurement control: $control_path"
+}
+
+write_cold_load_measurement_control() {
+  local result_dir="$1"
+  local benchmark_exit_code="$2"
+  local control_path="$TARGET_DIR/perf/release_evidence/cold_load_measurement.json"
+  mkdir -p "$(dirname "$control_path")"
+
+  python3 - \
+    "$result_dir/stderr.log" \
+    "$TARGET_DIR/criterion" \
+    "$control_path" \
+    "$benchmark_exit_code" \
+    "$GIT_COMMIT_FULL" \
+    "$GIT_DIRTY" \
+    "$CORRELATION_ID" \
+    "${PERF_MAX_BENCH_ENV_NOISE_SCORE:-0}" <<'PY'
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+stderr_path = Path(sys.argv[1])
+criterion_root = Path(sys.argv[2])
+control_path = Path(sys.argv[3])
+benchmark_exit_code = int(sys.argv[4])
+source_commit = sys.argv[5]
+source_dirty = sys.argv[6] == "true"
+correlation_id = sys.argv[7]
+max_noise_score = int(sys.argv[8])
+if not 0 <= max_noise_score <= 7:
+    raise SystemExit("PERF_MAX_BENCH_ENV_NOISE_SCORE must be an integer in 0..7")
+
+banner_pattern = re.compile(
+    r'^\[bench-env\] os=(?P<os>.*?) arch=(?P<arch>\S+) cpu="(?P<cpu>.*?)" '
+    r'cores=(?P<cores>\d+) mem_mb=(?P<mem_mb>\d+) governor=(?P<governor>\S+) '
+    r'turbo=(?P<turbo>\S+) aslr=(?P<aslr>\S+) thp=(?P<thp>\S+) '
+    r'noise_score=(?P<noise_score>\d+) config_hash=(?P<config_hash>[0-9a-f]{64})$'
+)
+banner_match = None
+if stderr_path.is_file():
+    for line in stderr_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        candidate = banner_pattern.fullmatch(line.strip())
+        if candidate is not None:
+            banner_match = candidate
+
+payload = {
+    "schema": "pi.perf.cold_load_measurement.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    "run_id": correlation_id,
+    "correlation_id": correlation_id,
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
+    "benchmark_exit_code": benchmark_exit_code,
+    "max_noise_score": max_noise_score,
+    "bench_env_source": "benches/bench_env.rs",
+    "status": "no_data",
+    "reason": "criterion_extensions did not emit a parseable benches/bench_env.rs fingerprint",
+    "bench_env": None,
+    "measurements": {},
+}
+
+if banner_match is not None:
+    values = banner_match.groupdict()
+    bench_env = {
+        "os": values["os"],
+        "arch": values["arch"],
+        "cpu_brand": values["cpu"],
+        "cpu_cores": int(values["cores"]),
+        "mem_total_mb": int(values["mem_mb"]),
+        "governor": values["governor"],
+        "turbo_boost": values["turbo"],
+        "aslr": values["aslr"],
+        "thp": values["thp"],
+        "noise_score": int(values["noise_score"]),
+        "config_hash": values["config_hash"],
+    }
+    bench_env_bytes = json.dumps(
+        bench_env, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    measurements = {}
+    for extension in ("hello", "pirate"):
+        estimate_path = (
+            criterion_root
+            / "ext_load_init"
+            / "load_init_cold"
+            / extension
+            / "new"
+            / "estimates.json"
+        )
+        if not estimate_path.is_file():
+            continue
+        estimate_bytes = estimate_path.read_bytes()
+        measurements[extension] = {
+            "artifact_path": str(estimate_path.resolve(strict=True)),
+            "artifact_sha256": hashlib.sha256(estimate_bytes).hexdigest(),
+            "artifact_size_bytes": len(estimate_bytes),
+        }
+    payload.update(
+        {
+            "status": "verified"
+            if benchmark_exit_code == 0 and len(measurements) == 2
+            else "no_data",
+            "reason": None
+            if benchmark_exit_code == 0 and len(measurements) == 2
+            else "criterion_extensions failed or did not produce both cold-load estimates",
+            "bench_env": bench_env,
+            "bench_env_sha256": hashlib.sha256(bench_env_bytes).hexdigest(),
+            "measurements": measurements,
+        }
+    )
+
+encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+temporary_path = control_path.with_name(control_path.name + ".tmp")
+temporary_path.write_text(encoded, encoding="utf-8")
+os.replace(temporary_path, control_path)
+PY
+  log_ok "Cold-load measurement control: $control_path"
+}
+
 # ─── Generate correlation ID ────────────────────────────────────────────────
 
 if [[ -z "$CORRELATION_ID" ]]; then
@@ -556,6 +749,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log_step "Building release pi binary for release-size gates..."
     if "${CARGO_RUNNER_ARGS[@]}" build --bin pi --release >"$OUTPUT_DIR/logs/build_release_pi.log" 2>&1; then
       log_ok "Release pi binary built: $TARGET_DIR/release/pi"
+      write_binary_size_measurement_control "$TARGET_DIR/release/pi"
     elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
       die "Failed to build release pi binary required for binary-size gates (see logs/build_release_pi.log)"
     else
@@ -686,6 +880,10 @@ run_criterion_bench() {
     cp -r "$criterion_dir" "$result_dir/criterion/" 2>/dev/null || true
   fi
 
+  if [[ "$suite_name" == "criterion_extensions" ]]; then
+    write_cold_load_measurement_control "$result_dir" "$exit_code"
+  fi
+
   cat > "$result_dir/result.json" <<EOF
 {
   "schema": "pi.perf.suite_result.v1",
@@ -704,8 +902,15 @@ EOF
   SUITE_RESULTS+=("{\"suite\":\"$suite_name\",\"status\":\"$status\",\"exit_code\":$exit_code,\"elapsed_ms\":$suite_elapsed}")
 }
 
-# Execute each selected suite
+# Execute each selected suite. The budget consumer runs last so a full profile
+# cannot inspect ambient Criterion files before this run has emitted their
+# hash-bound environment controls.
+deferred_perf_budgets=false
 for suite in "${SELECTED_SUITES[@]}"; do
+  if [[ "$suite" == "perf_budgets" ]]; then
+    deferred_perf_budgets=true
+    continue
+  fi
   if [[ -n "${SUITE_TARGETS[$suite]+x}" ]]; then
     run_test_suite "$suite" "${SUITE_TARGETS[$suite]}"
   elif [[ -n "${CRITERION_BENCHES[$suite]+x}" ]]; then
@@ -715,6 +920,10 @@ for suite in "${SELECTED_SUITES[@]}"; do
     suite_skip=$((suite_skip + 1))
   fi
 done
+
+if [[ "$deferred_perf_budgets" == "true" ]]; then
+  run_test_suite "perf_budgets" "${SUITE_TARGETS[perf_budgets]}"
+fi
 
 run_end=$(epoch_ms)
 run_elapsed=$((run_end - run_start))
