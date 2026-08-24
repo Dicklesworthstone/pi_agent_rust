@@ -573,19 +573,30 @@ if banner_match is not None:
             "artifact_sha256": hashlib.sha256(estimate_bytes).hexdigest(),
             "artifact_size_bytes": len(estimate_bytes),
         }
-    payload.update(
-        {
-            "status": "verified"
-            if benchmark_exit_code == 0 and len(measurements) == 2
-            else "no_data",
-            "reason": None
-            if benchmark_exit_code == 0 and len(measurements) == 2
-            else "criterion_extensions failed or did not produce both cold-load estimates",
-            "bench_env": bench_env,
-            "bench_env_sha256": hashlib.sha256(bench_env_bytes).hexdigest(),
-            "measurements": measurements,
-        }
-    )
+    if bench_env["noise_score"] > max_noise_score:
+        payload.update(
+            {
+                "status": "no_data",
+                "reason": f"bench_env noise score {bench_env['noise_score']} exceeds max_noise_score {max_noise_score}",
+                "bench_env": bench_env,
+                "bench_env_sha256": hashlib.sha256(bench_env_bytes).hexdigest(),
+                "measurements": measurements,
+            }
+        )
+    else:
+        payload.update(
+            {
+                "status": "verified"
+                if benchmark_exit_code == 0 and len(measurements) == 2
+                else "no_data",
+                "reason": None
+                if benchmark_exit_code == 0 and len(measurements) == 2
+                else "criterion_extensions failed or did not produce both cold-load estimates",
+                "bench_env": bench_env,
+                "bench_env_sha256": hashlib.sha256(bench_env_bytes).hexdigest(),
+                "measurements": measurements,
+            }
+        )
 
 encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
 temporary_path = control_path.with_name(control_path.name + ".tmp")

@@ -183,6 +183,10 @@ name = "startup_benchmark_runner"
 path = "examples/startup_benchmark_runner.rs"
 
 [[example]]
+name = "variance_gate"
+path = "examples/variance_gate.rs"
+
+[[example]]
 name = "session_workload_bench"
 path = "examples/session_workload_bench.rs"
 

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "pi.perf.variance_gating.contract.v1",
+  "contract_id": "pi.contract.variance_gating.v1",
+  "title": "Performance Benchmark Variance Gating & Host Topology Fingerprint Contract",
+  "version": "1.0.0",
+  "bead_id": "bd-sog97.21",
+  "policy_owner_role": "Release Engineering / Runtime Autonomy",
+  "created_at": "2026-08-24T00:12:37Z",
+  "status": "enforced",
+  "description": "Governs rejection of benchmark artifacts whose environment noise score exceeds threshold, mandating NO_DATA status over averaging-into-compliance and embedding host topology fingerprints.",
+  "gating_rules": {
+    "max_admissible_noise_score_strict": 0,
+    "max_admissible_noise_score_relaxed": 3,
+    "rejection_status": "NO_DATA",
+    "forbid_averaging_noisy_runs": true,
+    "require_host_topology_fingerprint": true,
+    "host_topology_schema": "pi.perf.host_topology_fingerprint.v1"
+  },
+  "noise_scoring_weights": {
+    "governor_not_performance": 3,
+    "turbo_enabled": 2,
+    "thp_not_never": 1,
+    "aslr_enabled": 1
+  }
+}

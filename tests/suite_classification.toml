@@ -125,6 +125,7 @@ files = [
     "perf_drift_watch",
     "conformal_budget_calibration",
     "startup_benchmark",
+    "variance_gating",
     "checkpoint",
     "eval",
     "url_router",
