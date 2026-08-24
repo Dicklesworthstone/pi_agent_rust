@@ -35,7 +35,27 @@ from pathlib import Path
 #
 # Do NOT add a module here to make the gate quiet. If a feature is supposed to
 # be reachable and is not, the fix is a call site or a bead -- not an entry.
-ALLOWLIST: dict[str, str] = {}
+ALLOWLIST: dict[str, str] = {
+    "conformance_shapes": (
+        "Shape-aware conformance harness for extension types. A test-suite "
+        "fixture engine by construction; its consumer is "
+        "tests/ext_conformance_shapes.rs and there is no product path that "
+        "should call it."
+    ),
+    "flake_classifier": (
+        "Classifies test failures as deterministic vs transient for CI retry "
+        "and triage (bd-k5q5.5.4). Consumed by tests/provider_native_contract.rs "
+        "and CI tooling; the shipped agent has no reason to classify its own "
+        "test flakes."
+    ),
+    "swarm_flight_recorder": (
+        "Deterministic E2E evidence harness for multi-agent runs, documented in "
+        "docs/swarm-flight-recorder.md as driven via "
+        "`cargo test --test e2e_swarm_flight_recorder`. Test-lane by design -- "
+        "it consumes already-emitted runtime events rather than being called "
+        "from them."
+    ),
+}
 
 # `pub mod foo;` -- declarations only. `pub mod foo { ... }` inline modules are
 # not separate files and are not what this gate is about.

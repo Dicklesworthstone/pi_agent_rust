@@ -104,7 +104,7 @@ fn test_fork_and_export_snapshot_consistency() {
 
     // Create checkpoint at turn 20
     let cp_res = store.create_checkpoint(1, "checkpoint at turn 20");
-    assert!(cp_res.is_ok(), "checkpoint");
+    assert!(cp_res.is_ok(), "checkpoint failed: {cp_res:?}");
     if let Ok(cp) = cp_res {
         assert_eq!(cp.checkpoint_seq, 1);
     }
