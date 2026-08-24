@@ -7415,7 +7415,7 @@
       "entry_path": "third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": true,
+        "registers_tools": false,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -7443,8 +7443,7 @@
         "tools": [],
         "commands": [
           "sub-bar:import",
-          "sub-bar:settings",
-          "sub-core:settings"
+          "sub-bar:settings"
         ],
         "flags": [],
         "event_handlers": [
