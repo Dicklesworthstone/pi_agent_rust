@@ -669,10 +669,10 @@ From:
 - Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
 - Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.3.0`)*
-- Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json; historical snapshot)*
-- Historical extension gate: `123/123` then-observed must-pass extensions passed; informational stretch set `100/101` passed with one non-blocking stretch failure *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
-- Extension health delta: `223/223` tested extensions passed (`100.0%`), `0` regressions, `13` fixes vs the 2026-02-07 baseline, with `1` intentionally excluded test fixture disclosed in the report *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
-- Extension journey coverage: `123/123` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-08-04`: `29` total sections, `27` present, `0` missing, `2` invalid (bundle verdict: `insufficient`) *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed — the May 2026 `123/123` snapshot predates the expanded corpus *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
+- Extension health delta, as regenerated `2026-08-17`: `226` extensions tested at `95.6%` pass rate with `0` regressions vs the 2026-02-07 baseline *(from tests/ext_conformance/reports/health_delta/health_delta_report.json; historical snapshot)*
+- Extension journey coverage, as regenerated `2026-08-17`: `125/125` journey scenarios passed (`100.0%`); command, event-subscriber, multi-capability, passive, and tool-provider categories are green *(from tests/ext_conformance/reports/journeys/journey_report.json; historical snapshot)*
 - Historical stress-triage evidence is retained under `tests/perf/reports/`; it is not current enough to support a `v0.3.0` performance claim.
 
 ---
@@ -2056,10 +2056,15 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- The current budget summary is a blocker artifact, not claim support: without
-  strict, source-bound, same-run lineage it records every declared budget as
-  `NO_DATA` and does not run the artifact data-contract evaluation. Its empty
-  failure list therefore means "not evaluated," not "contracts passed."
+- Current strict budget summary (run `beige-evidence-refresh-20260823`, source
+  `2697f21d`): `19` declared budgets — `12` PASS, `5` FAIL, `2` NO_DATA;
+  claim readiness is `blocked` and performance claims are NOT authorized.
+  The FAIL set: extension cold-load p95 over budget, tool-call latency and
+  throughput inputs missing (fail-closed), idle-memory RSS artifact absent,
+  and binary size measured against the wrong (unstripped perf-profile)
+  artifact — harness fix landed, re-measurement pending.
+  Current counts are value-bound to the artifact:
+  *(from tests/perf/reports/budget_summary.json)*
 - Before spending time on a definitive refresh, run
   `python3 scripts/perf/preflight_budget_inputs.py` to list missing budget
   inputs, expected artifact paths, and RCH-only refresh commands.
@@ -2087,10 +2092,10 @@ Current checked-in performance evidence state:
   throughput, memory, or startup numbers to this README.
 
 Historical certification/evidence refresh (`2026-05-15` progress SLO closeout; `2026-05-15` extension gate; `2026-05-14` full-suite reports; `2026-05-18` drop-in certification verdict). These results do not certify the current source revision or `v0.3.0`:
-- Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json; historical snapshot)*
+- Unified evidence bundle, as regenerated `2026-08-04`: `29` total sections, `27` present, `0` missing, `2` invalid (bundle verdict: `insufficient`) *(from tests/evidence_bundle/index.json; historical snapshot)*
 - Full-suite gate at its latest regeneration (`2026-08-04`): `17/20` gates passed with `12/14` blocking gates; blockers are the stale extension must-pass verdict and the practical-finish checkpoint — see [Current checked-in performance evidence state](#benchmark-evidence-vs-shipping-artifacts) above for the live posture *(from tests/full_suite_gate/full_suite_verdict.json; historical snapshot)*
 - Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
-- Historical extension gate: `123/123` then-observed must-pass extensions passed; stretch set `100/101` passed with only non-blocking stretch failures *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
+- Extension must-pass gate, as regenerated `2026-08-17`: `206/208` must-pass extensions passed (`2` failures); informational stretch set `10/19` passed *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json; historical snapshot)*
 - Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json; historical snapshot)*
 - Progress SLO closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, source-boundary checks, stress-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/swarm-progress-slo-closeout-gate.json; historical snapshot)*
 - Runtime-intelligence closeout gate: `pass`, with child Beads mapped to compaction admission, tool-output artifacts, provider routing, scheduler fairness, frame-budget telemetry, cancellation cleanup, extension safety provenance, docs/evidence, source-boundary checks, pushed commits, staged UBS, and Beads ledger reconciliation *(from docs/evidence/runtime-intelligence-closeout-gate.json; historical snapshot)*
