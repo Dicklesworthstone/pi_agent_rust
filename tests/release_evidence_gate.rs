@@ -4367,6 +4367,38 @@ fn retained_performance_binding_fixture(packaged_evidence: bool) -> (PathBuf, St
     (root, source_commit)
 }
 
+fn run_embedded_performance_summary_fixture(
+    mut summary: Value,
+    require_claim_ready: bool,
+) -> String {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    if !summary["source_commit"].is_null() {
+        summary["source_commit"] = json!(source_commit);
+    }
+    let summary_path = root.join(PERFORMANCE_BUDGET_SUMMARY_PATH);
+    std::fs::write(
+        &summary_path,
+        serde_json::to_vec_pretty(&summary).expect("serialize performance summary fixture"),
+    )
+    .expect("write performance summary fixture");
+    commit_performance_binding_fixture(&root, "record performance summary evidence");
+
+    let root_arg = root.to_str().expect("UTF-8 fixture root");
+    let summary_arg = summary_path.to_str().expect("UTF-8 fixture summary path");
+    let claim_ready_arg = if require_claim_ready { "1" } else { "0" };
+    let (command, program) = release_gate_python_command(
+        "if [[ -f \"$PERFORMANCE_SUMMARY\" ]]; then",
+        &[root_arg, summary_arg, claim_ready_arg, "168"],
+    );
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "performance validator reports contract status through stdout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("performance validator stdout must be UTF-8")
+}
+
 fn e2e_source_snapshot_from_clean_checkout(root: &Path, source_commit: &str) -> String {
     fn update_framed(digest: &mut Sha256, value: &[u8]) {
         digest.update(value.len().to_string().as_bytes());
@@ -7976,13 +8008,60 @@ fn performance_contract_rejects_forged_tampered_and_unproven_measurements() {
         .as_array_mut()
         .expect("fixture failures");
     failures.retain(|failure| failure["budget_name"] != "binary_size_release");
-    unnamed_missing["data_contract_failures_count"] = json!(failures.len());
+    let failure_count = failures.len();
+    unnamed_missing["data_contract_failures_count"] = json!(failure_count);
     let error =
         validate_performance_budget_summary(&unnamed_missing, now, Duration::hours(168), false)
             .expect_err("NO_DATA must identify the failed binary measurement control");
     assert!(
         error.contains("named measurement-control failure"),
         "{error}"
+    );
+}
+
+#[test]
+fn release_gate_script_enforces_measurement_controls_with_named_reasons() {
+    let now = Utc::now();
+    let ready = run_embedded_performance_summary_fixture(
+        claim_ready_performance_summary_fixture(now),
+        true,
+    );
+    assert!(ready.starts_with("pass|"), "{ready}");
+
+    let mut forged = claim_ready_performance_summary_fixture(now);
+    let binary_index = forged["budget_results"]
+        .as_array()
+        .expect("fixture budget results")
+        .iter()
+        .position(|result| result["budget_name"] == "binary_size_release")
+        .expect("binary-size result");
+    forged["budget_results"][binary_index]["source"] = json!("fixture://release/pi");
+    let forged = run_embedded_performance_summary_fixture(forged, true);
+    assert!(forged.starts_with("fail|"), "{forged}");
+    assert!(forged.contains("negative-control proof"), "{forged}");
+
+    let mut tampered = claim_ready_performance_summary_fixture(now);
+    let source = tampered["budget_results"][binary_index]["source"]
+        .as_str()
+        .expect("binary proof source")
+        .replace("size_bytes=50331648", "size_bytes=1");
+    tampered["budget_results"][binary_index]["source"] = json!(source);
+    let tampered = run_embedded_performance_summary_fixture(tampered, true);
+    assert!(tampered.starts_with("fail|"), "{tampered}");
+    assert!(tampered.contains("size_bytes"), "{tampered}");
+
+    let mut unnamed_missing = blocked_performance_summary_fixture(now);
+    let failures = unnamed_missing["failing_data_contracts"]
+        .as_array_mut()
+        .expect("fixture failures");
+    failures.retain(|failure| failure["budget_name"] != "binary_size_release");
+    let failure_count = failures.len();
+    unnamed_missing["data_contract_failures_count"] = json!(failure_count);
+    let unnamed = run_embedded_performance_summary_fixture(unnamed_missing, false);
+    assert!(unnamed.starts_with("fail|"), "{unnamed}");
+    assert!(
+        unnamed.contains("named measurement-control failure"),
+        "{unnamed}"
     );
 }
 
