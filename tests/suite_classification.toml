@@ -131,6 +131,7 @@ files = [
     "browser",
     "clean_release_commit",
     "web_remote",
+    "web_security",
     "checkpoint",
     "eval",
     "url_router",
