@@ -95,26 +95,29 @@ def module_files(src: Path, name: str) -> set[Path]:
     return owned
 
 
-def referencing_lines(src: Path, name: str) -> list[tuple[Path, int, str]]:
-    """Every `<name>::` occurrence under src/, as (path, line number, text).
+def referencing_lines(roots: list[Path], name: str) -> list[tuple[Path, int, str]]:
+    """Every `<name>::` occurrence under the given roots, as (path, line, text).
 
     Deliberately textual rather than syntactic: the question is "does any other
     part of the crate reach for this module", and a grep answers it without a
     parse. Over-matching is safe here -- a false *pass* needs a real mention of
-    the module somewhere in src/, which is already the signal we want.
+    the module somewhere in shipped code, which is the signal we want.
     """
     hits: list[tuple[Path, int, str]] = []
     pattern = re.compile(rf"\b{re.escape(name)}::")
-    for path in src.rglob("*.rs"):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+    for root in roots:
+        if not root.is_dir():
             continue
-        if not pattern.search(text):
-            continue
-        for lineno, line in enumerate(text.splitlines(), start=1):
-            if pattern.search(line):
-                hits.append((path.resolve(), lineno, line.strip()))
+        for path in root.rglob("*.rs"):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if not pattern.search(text):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if pattern.search(line):
+                    hits.append((path.resolve(), lineno, line.strip()))
     return hits
 
 
@@ -167,20 +170,31 @@ def test_module_lines(path: Path) -> set[int]:
     return inside
 
 
-def classify(src: Path, name: str) -> tuple[str, list[str]]:
+def classify(root: Path, name: str) -> tuple[str, list[str]]:
     """Return (verdict, evidence) for one module.
 
     Verdict is `reachable`, `test_only`, or `unreferenced`.
+
+    `examples/` and `benches/` count alongside `src/`: in this repo they are
+    real entry points, not scaffolding -- the perf and conformance tooling
+    genuinely runs via `cargo run --example`. `tests/` deliberately does not
+    count, because "a test pokes it" is precisely the state this gate exists to
+    distinguish from "a user can reach it".
     """
+    src = root / "src"
+    roots = [src, root / "examples", root / "benches"]
     owned = module_files(src, name)
     evidence: list[str] = []
     saw_test_only = False
     test_lines: dict[Path, set[int]] = {}
 
-    for path, lineno, text in referencing_lines(src, name):
+    for path, lineno, text in referencing_lines(roots, name):
         if path in owned:
             continue
-        rel = path.relative_to(src.parent)
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            rel = path
         if path not in test_lines:
             test_lines[path] = test_module_lines(path)
         if lineno in test_lines[path]:
@@ -221,7 +235,7 @@ def main() -> int:
     failures: list[tuple[str, str]] = []
 
     for name in sorted(modules):
-        verdict, _evidence = classify(src, name)
+        verdict, _evidence = classify(root, name)
         if verdict == "reachable":
             reachable.append(name)
         elif name in ALLOWLIST:
