@@ -111,6 +111,119 @@ impl Tool for FixtureStatsTool {
     }
 }
 
+/// Test-only loopback adapter for the real ReadTool URL path. Each execution
+/// serves exactly one canned HTTP response, then joins the fixture server.
+struct FixtureReadUrlTool {
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Tool for FixtureReadUrlTool {
+    fn name(&self) -> &str {
+        "read_url"
+    }
+
+    fn label(&self) -> &str {
+        "read URL"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic loopback adapter for the ReadTool URL surface"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::network()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        mut input: Value,
+        on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let object = input.as_object_mut().ok_or_else(|| {
+            pi::error::Error::validation("read_url fixture input must be an object")
+        })?;
+        let body = object
+            .remove("fixtureBody")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let content_type = object
+            .remove("fixtureContentType")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+        let status = object
+            .remove("fixtureStatus")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(200);
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error.to_string()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error.to_string()))?;
+        let raw = object
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.ends_with(":raw"));
+        object.insert(
+            "path".to_string(),
+            Value::String(format!(
+                "http://{address}/fixture{}",
+                if raw { ":raw" } else { "" }
+            )),
+        );
+
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            use std::io::Write as _;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err("fixture HTTP server timed out waiting for request".into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(format!("fixture HTTP accept failed: {error}")),
+                }
+            };
+            let reason = match status {
+                200 => "OK",
+                404 => "Not Found",
+                503 => "Service Unavailable",
+                _ => "Fixture Status",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|error| format!("fixture HTTP write failed: {error}"))
+        });
+
+        let result = pi::tools::ReadTool::new(&self.cwd)
+            .with_url_policy(true)
+            .execute(tool_call_id, input, on_update)
+            .await;
+        server
+            .join()
+            .map_err(|_| pi::error::Error::tool("read_url_fixture", "server thread panicked"))?
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error))?;
+        result
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -147,6 +260,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
     // Create the tool
     let tool: Box<dyn Tool> = match tool_name {
         "read" => Box::new(pi::tools::ReadTool::new(temp_dir.path())),
+        "read_url" => Box::new(FixtureReadUrlTool {
+            cwd: temp_dir.path().to_path_buf(),
+        }),
         "bash" => Box::new(pi::tools::BashTool::new(temp_dir.path())),
         "edit" => Box::new(pi::tools::EditTool::new(temp_dir.path())),
         "write" => Box::new(pi::tools::WriteTool::new(temp_dir.path())),

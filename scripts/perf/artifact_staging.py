@@ -590,7 +590,13 @@ def write_fixture(root: Path, include_policy: bool) -> None:
 
 
 def run_self_test() -> int:
-    def staging_args(root: Path, *, cache_dir: Path | None = None, update_cache: bool = False) -> dict[str, Any]:
+    def staging_args(
+        root: Path,
+        *,
+        cache_dir: Path | None = None,
+        update_cache: bool = False,
+        expected_correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "repo_root": root,
             "target_dir": root / "target",
@@ -604,7 +610,7 @@ def run_self_test() -> int:
             "cache_profile": "perf",
             "cache_ttl_hours": 24.0,
             "run_id": "self-test-run",
-            "expected_correlation_id": None,
+            "expected_correlation_id": expected_correlation_id,
             "update_evidence_cache": update_cache,
         }
 
@@ -653,6 +659,96 @@ def run_self_test() -> int:
         == "/remote/pi-agent-target/criterion/ext_policy/evaluate/safe/new/estimates.json"
     ), policy_entries[0]
     assert policy_entries[0]["retrieval_status"] == "retrieved", policy_entries[0]
+
+    stale_provenance_root = Path(tempfile.mkdtemp(prefix="pi-perf-staging-stale-lineage-"))
+    write_fixture(stale_provenance_root, include_policy=True)
+    stale_phase1 = stale_provenance_root / "target/perf/results/phase1_matrix_validation.json"
+    stale_phase1.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": "2000-01-01T00:00:00Z",
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_manifest = build_staging_manifest(
+        **staging_args(
+            stale_provenance_root,
+            update_cache=True,
+            expected_correlation_id="self-test-run",
+        )
+    )
+    assert stale_manifest["summary"]["status"] == "blocked", stale_manifest
+    assert any(
+        entry["contract_id"] == "phase1_matrix_validation"
+        and entry["status"] == "stale"
+        and entry["freshness_reason"] == "embedded_timestamp_stale"
+        and entry["mtime_age_hours"] < 1.0
+        for entry in stale_manifest["entries"]
+    ), stale_manifest
+    stale_cache_entries, _ = load_evidence_cache_entries(
+        stale_provenance_root / "target/perf/evidence_cache"
+    )
+    assert not any(
+        entry.get("contract_id") == "phase1_matrix_validation"
+        for entry in stale_cache_entries
+    ), stale_cache_entries
+
+    fresh_provenance_root = Path(tempfile.mkdtemp(prefix="pi-perf-staging-fresh-lineage-"))
+    write_fixture(fresh_provenance_root, include_policy=True)
+    fresh_phase1 = fresh_provenance_root / "target/perf/results/phase1_matrix_validation.json"
+    fresh_phase1.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": iso_now(),
+                "source_commit": "test-commit",
+                "source_dirty": False,
+                "run_id": "timestamp-derived-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_mtime = utc_now().timestamp() - (48.0 * 3600.0)
+    os.utime(fresh_phase1, (old_mtime, old_mtime))
+    fresh_manifest = build_staging_manifest(
+        **staging_args(
+            fresh_provenance_root,
+            update_cache=True,
+            expected_correlation_id="self-test-run",
+        )
+    )
+    assert fresh_manifest["summary"]["status"] == "ready", fresh_manifest
+    assert any(
+        entry["contract_id"] == "phase1_matrix_validation"
+        and entry["status"] == "present"
+        and entry["freshness_basis"] == "embedded_timestamp"
+        and entry["mtime_age_hours"] > 24.0
+        for entry in fresh_manifest["entries"]
+    ), fresh_manifest
+    fresh_cache_entries, _ = load_evidence_cache_entries(
+        fresh_provenance_root / "target/perf/evidence_cache"
+    )
+    fresh_phase1_entry = next(
+        entry
+        for entry in fresh_manifest["entries"]
+        if entry["contract_id"] == "phase1_matrix_validation"
+        and entry["status"] == "present"
+    )
+    fresh_phase1_cache = next(
+        entry
+        for entry in fresh_cache_entries
+        if entry.get("contract_id") == "phase1_matrix_validation"
+    )
+    assert fresh_phase1_cache["created_at"] == fresh_phase1_entry["embedded_timestamp"], (
+        fresh_phase1_cache
+    )
+    assert fresh_phase1_cache["run_id"] == "timestamp-derived-run", fresh_phase1_cache
+    assert fresh_phase1_cache["correlation_id"] == "self-test-run", fresh_phase1_cache
 
     blocked_root = Path(tempfile.mkdtemp(prefix="pi-perf-staging-blocked-"))
     write_fixture(blocked_root, include_policy=False)

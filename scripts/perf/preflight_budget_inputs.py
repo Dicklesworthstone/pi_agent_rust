@@ -36,6 +36,25 @@ DEFAULT_MAX_ARTIFACT_AGE_HOURS = 24.0
 DEFAULT_EVIDENCE_CACHE_TTL_HOURS = 168.0
 EXTENSION_BLOCKER_BEAD = "bd-2zcs5.51"
 FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 300.0
+EMBEDDED_PROVENANCE_REQUIREMENTS = {
+    "pi.perf.workload.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.perf.phase1_matrix_validation.v1": (
+        "embedded_timestamp",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.perf.extension_benchmark_stratification.v1": (
+        "embedded_timestamp",
+        "run_id",
+        "correlation_id",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -903,8 +922,22 @@ def inspect_direct_artifact(
     source_dirty = _consistent_embedded_value(records, "source_dirty", failures)
     run_id = _consistent_embedded_value(records, "run_id", failures)
     correlation_id = _consistent_embedded_value(records, "correlation_id", failures)
+    schema = _consistent_embedded_value(records, "schema", failures)
+    field_presence = {
+        key: sum(1 for record in records if key in record)
+        for key in ("source_commit", "source_dirty", "run_id", "correlation_id")
+    }
 
-    if source_commit is not None:
+    requirements = EMBEDDED_PROVENANCE_REQUIREMENTS.get(schema, ())
+    for requirement in requirements:
+        if requirement == "embedded_timestamp":
+            if timestamp_presence == 0:
+                failures.append("missing_embedded_timestamp")
+            continue
+        if field_presence[requirement] == 0:
+            failures.append(f"missing_{requirement}")
+
+    if field_presence["source_commit"]:
         if not isinstance(source_commit, str) or not source_commit.strip():
             failures.append("invalid_source_commit")
         elif (
@@ -913,10 +946,10 @@ def inspect_direct_artifact(
             and source_commit != expected_git_commit
         ):
             failures.append("source_commit_mismatch")
-    if source_dirty is not None and source_dirty is not False:
+    if field_presence["source_dirty"] and source_dirty is not False:
         failures.append("source_dirty_not_false")
     for key, value in (("run_id", run_id), ("correlation_id", correlation_id)):
-        if value is not None and (not isinstance(value, str) or not value.strip()):
+        if field_presence[key] and (not isinstance(value, str) or not value.strip()):
             failures.append(f"invalid_{key}")
     if expected_correlation_id:
         observed_id = correlation_id if correlation_id is not None else run_id
@@ -937,6 +970,7 @@ def inspect_direct_artifact(
         "max_age_hours": max_age_hours,
         "size_bytes": path.stat().st_size,
         "sha256": sha256_file(path),
+        "artifact_schema": schema,
         "source_commit": source_commit,
         "source_dirty": source_dirty,
         "run_id": run_id,

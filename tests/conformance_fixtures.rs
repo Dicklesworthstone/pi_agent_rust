@@ -164,6 +164,7 @@ macro_rules! fixture_test {
 
 // Tool fixture tests
 fixture_test!(test_read_fixtures, "read_tool");
+fixture_test!(test_read_url_fixtures, "read_url_tool");
 fixture_test!(test_edit_fixtures, "edit_tool");
 fixture_test!(test_bash_fixtures, "bash_tool");
 fixture_test!(test_grep_fixtures, "grep_tool");
@@ -237,6 +238,7 @@ fn test_truncation_fixtures() {
 fn test_all_fixtures_exist() {
     let expected_fixtures = [
         "read_tool",
+        "read_url_tool",
         "edit_tool",
         "bash_tool",
         "grep_tool",
