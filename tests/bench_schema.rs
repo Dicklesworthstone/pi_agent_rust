@@ -590,6 +590,10 @@ const FAKE_ORCHESTRATE_SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01
 fn install_fake_orchestrate_toolchain(bin_dir: &Path) {
     let cargo_stub = r#"#!/usr/bin/env bash
 set -euo pipefail
+if [[ "${PI_FAKE_RCH_EXECUTED:-0}" != "1" ]]; then
+  echo "cargo bypassed the required rch exec path" >&2
+  exit 66
+fi
 target_dir="${CARGO_TARGET_DIR:-target}"
 test_name=""
 for ((i=1; i<=$#; i++)); do
@@ -876,7 +880,7 @@ case "${1:-}" in
     if [[ "${1:-}" == "--" ]]; then
       shift
     fi
-    exec "$@"
+    PI_FAKE_RCH_EXECUTED=1 exec "$@"
     ;;
   *)
     exit 64
@@ -953,6 +957,73 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         &target_dir.join("perf/results/phase1_matrix_validation.json"),
         r#"{"schema":"pi.perf.phase1_matrix_validation.v1"}"#,
     );
+}
+
+#[cfg(unix)]
+fn install_fake_orchestrate_rch_attestation(target_dir: &Path, output_dir: &Path) {
+    let binary_path = target_dir.join("perf/deps/perf_budgets-fake");
+    fs::create_dir_all(binary_path.parent().expect("fake binary parent"))
+        .expect("create fake perf_budgets binary directory");
+    let binary = r#"#!/usr/bin/env bash
+set -euo pipefail
+case " $* " in
+  *" ci_enforced_budgets_fail_on_regression_or_missing_data "*" --exact "*) ;;
+  *)
+    echo "post-generation perf_budgets invocation omitted the exact data-contract test" >&2
+    exit 64
+    ;;
+esac
+python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+evidence_dir = Path(sys.argv[1])
+expected_correlation_id = sys.argv[2]
+for name in (
+    "extension_benchmark_stratification.json",
+    "phase1_matrix_validation.json",
+):
+    path = evidence_dir / name
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("correlation_id") != expected_correlation_id:
+        raise SystemExit(f"{name}: correlation_id mismatch")
+(evidence_dir / "perf_budgets_post_generation_invocation.json").write_text(
+    json.dumps(
+        {
+            "schema": "pi.perf.fake_post_generation_invocation.v1",
+            "correlation_id": expected_correlation_id,
+            "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
+            "exact": True,
+        },
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+"#;
+    write_executable(&binary_path, binary);
+
+    let attestation_path = output_dir.join("results/perf_budgets_test_binary.json");
+    fs::create_dir_all(attestation_path.parent().expect("fake attestation parent"))
+        .expect("create fake perf_budgets attestation directory");
+    let binary_sha256 = sha256_file(&binary_path).expect("hash fake perf_budgets binary");
+    fs::write(
+        attestation_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.perf.test_binary_attestation.v1",
+            "generated_at": "2026-08-24T00:00:00Z",
+            "source_commit": FAKE_ORCHESTRATE_SOURCE_COMMIT,
+            "source_dirty": false,
+            "cargo_profile": "perf",
+            "target_name": "perf_budgets",
+            "binary_path": binary_path,
+            "sha256": binary_sha256,
+        }))
+        .expect("serialize fake perf_budgets attestation"),
+    )
+    .expect("write fake perf_budgets attestation");
 }
 
 fn canonical_protocol_contract() -> Value {
@@ -7038,6 +7109,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     fs::create_dir_all(&output_dir).expect("create output dir");
     install_fake_orchestrate_toolchain(&bin_dir);
     install_fake_orchestrate_staging_artifacts(&target_dir);
+    install_fake_orchestrate_rch_attestation(&target_dir, &output_dir);
 
     let path = format!(
         "{}:{}",
