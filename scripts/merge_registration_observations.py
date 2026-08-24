@@ -40,7 +40,13 @@ def main() -> int:
         type=Path,
         default=Path("tests/ext_conformance/VALIDATED_MANIFEST.json"),
     )
-    parser.add_argument("--apply", action="store_true", help="write changes")
+    parser.add_argument(
+        "--ids-from",
+        type=Path,
+        help="optional file of extension ids to include (one per line); "
+        "apply only triaged true-drift entries while deferring "
+        "environment-gap failures",
+    )
     args = parser.parse_args()
 
     manifest_path = args.manifest
@@ -62,7 +68,18 @@ def main() -> int:
         if entry is None:
             print(f"SKIP (not in manifest): {ext_id}")
             continue
-        registrations = entry.setdefault("registrations", {})
+    if args.ids_from:
+        allowed = {
+            line.strip()
+            for line in args.ids_from.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        observations = {
+            ext_id: record
+            for ext_id, record in observations.items()
+            if ext_id in allowed
+        }
+    changed = 0
         capabilities = entry.setdefault("capabilities", {})
         diffs: list[str] = []
         for field in SET_FIELDS:

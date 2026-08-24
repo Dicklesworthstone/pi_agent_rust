@@ -19,6 +19,7 @@ mod common;
 use asupersync::test_utils;
 use pi::model::ContentBlock;
 use pi::tools::{EditTool, HashlineEditTool, ReadTool, Tool, WriteTool};
+use pi::url_router;
 
 use common::logging::TestLogger;
 
@@ -200,6 +201,45 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
         );
         logger.info(BEAD, "case=refusal ok");
 
+        // 7) push with resume proof: an interrupted upload is simulated by
+        // pre-writing exactly half the payload to the remote side; the
+        // transfer must report that offset and complete byte-identically.
+        logger.info(BEAD, "case=transfer-push begin");
+        let payload: Vec<u8> = (0..(256 * 1024u32)).map(|i| (i % 251) as u8).collect();
+        let local_src = work.join("big.bin");
+        std::fs::write(&local_src, &payload).expect("seed big");
+        let remote_big = work.join("big.remote.bin");
+        std::fs::write(&remote_big, &payload[..payload.len() / 2]).expect("partial seed");
+        let pushed = url_router::ssh_transfer(
+            local_src.to_string_lossy().as_ref(),
+            &url_for(&work, "big.remote.bin"),
+        )
+        .expect("push transfer");
+        assert_eq!(
+            pushed["resumedFrom"].as_u64(),
+            Some((payload.len() / 2) as u64),
+            "{pushed:?}"
+        );
+        assert_eq!(std::fs::read(&remote_big).expect("remote bytes"), payload);
+        logger.info(BEAD, "case=transfer-push ok");
+
+        // 8) pull direction: interrupted download simulated with one
+        // quarter of the payload already present locally.
+        logger.info(BEAD, "case=transfer-pull begin");
+        let pulled_local = work.join("pulled.bin");
+        std::fs::write(&pulled_local, &payload[..payload.len() / 4]).expect("partial local");
+        let pulled = url_router::ssh_transfer(
+            &url_for(&work, "big.remote.bin"),
+            pulled_local.to_string_lossy().as_ref(),
+        )
+        .expect("pull transfer");
+        assert_eq!(
+            pulled["resumedFrom"].as_u64(),
+            Some((payload.len() / 4) as u64),
+            "{pulled:?}"
+        );
+        assert_eq!(std::fs::read(&pulled_local).expect("local bytes"), payload);
+        logger.info(BEAD, "case=transfer-pull ok");
         let artifact_dir = std::path::PathBuf::from(
             std::env::var("E2E_ARTIFACT_DIR")
                 .unwrap_or_else(|_| format!("tests/e2e_results/ssh/local")),

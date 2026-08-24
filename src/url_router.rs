@@ -997,6 +997,251 @@ pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+// ---------------------------------------------------------------------------
+// ssh:// transfers with resume (bd-cv653.6.5 acceptance #2)
+// ---------------------------------------------------------------------------
+
+/// One side of a `ssh_transfer` operation.
+#[derive(Debug, Clone)]
+pub enum TransferEndpoint {
+    Local(PathBuf),
+    Remote(SshTarget),
+}
+
+/// Parse a transfer spec: a filesystem path or an `ssh://host/path` URL.
+///
+/// # Errors
+/// Non-ssh schemes are named errors — never a silent fallback.
+pub fn parse_transfer_endpoint(spec: &str) -> Result<TransferEndpoint> {
+    match split_scheme(spec) {
+        Some(("ssh", _)) => Ok(TransferEndpoint::Remote(parse_ssh_target(spec)?)),
+        Some((scheme, _)) => Err(Error::validation(format!(
+            "PI_SSH_TRANSFER_SCHEME: unsupported scheme '{scheme}://' for transfer (use a local path or ssh://host/path)"
+        ))),
+        None => Ok(TransferEndpoint::Local(PathBuf::from(spec))),
+    }
+}
+
+/// Resume offset for a partially transferred target: 0 when absent/empty,
+/// the partial size when it is a strict prefix of the source, and a named
+/// conflict when the partial is LARGER than the source (nothing to resume).
+///
+/// # Errors
+/// `PI_SSH_TRANSFER_SIZE_CONFLICT`.
+pub fn resume_offset(partial: u64, total: u64) -> Result<u64> {
+    match partial.cmp(&total) {
+        std::cmp::Ordering::Greater => Err(Error::validation(format!(
+            "PI_SSH_TRANSFER_SIZE_CONFLICT: partial target ({partial} bytes) is larger than source ({total} bytes); refusing to truncate silently"
+        ))),
+        std::cmp::Ordering::Equal => Err(Error::validation(
+            "PI_SSH_TRANSFER_SIZE_CONFLICT: target already matches source size; nothing to transfer",
+        )),
+        std::cmp::Ordering::Less => Ok(partial),
+    }
+}
+
+fn local_file_size(path: &Path) -> Result<u64> {
+    std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| Error::tool("transfer", format!("local stat {}: {e}", path.display())))
+}
+
+/// Remote size probe: GNU first (`stat -c %s`), BSD/macOS fallback
+/// (`stat -f %z`). A missing file reads as size 0 so fresh targets resume
+/// from zero instead of erroring.
+fn remote_size(target: &SshTarget) -> Result<u64> {
+    let quoted = sh_quote(&target.path);
+    let output = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(format!(
+            "stat -c %s -- {quoted} 2>/dev/null || stat -f %z -- {quoted} 2>/dev/null || echo 0"
+        ))
+        .output()
+        .map_err(|e| {
+            Error::tool(
+                "transfer",
+                format!("PI_SSH_BACKEND: failed to run ssh: {e}"),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(Error::tool(
+            "transfer",
+            format!(
+                "PI_SSH_READ_FAILED: size probe for {host}:{path} failed: {stderr}",
+                host = target.host,
+                path = target.path,
+                stderr = String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim().parse::<u64>().map_err(|_| {
+        Error::tool(
+            "transfer",
+            format!("PI_SSH_READ_FAILED: unparsable size probe output '{text}'"),
+        )
+    })
+}
+
+/// Transfer a file between a local path and `ssh://host/path`, either
+/// direction, resuming from whatever prefix already exists at the target
+/// (partial-upload/upload-interruption semantics). Completion is verified
+/// by comparing final sizes on both sides.
+///
+/// # Errors
+/// `PI_SSH_TRANSFER_*` taxonomy plus the shared ssh failure kinds.
+pub fn ssh_transfer(source: &str, dest: &str) -> Result<serde_json::Value> {
+    let src = parse_transfer_endpoint(source)?;
+    let dst = parse_transfer_endpoint(dest)?;
+    match (src, dst) {
+        (TransferEndpoint::Local(local), TransferEndpoint::Remote(remote)) => {
+            transfer_push(local, remote)
+        }
+        (TransferEndpoint::Remote(remote), TransferEndpoint::Local(local)) => {
+            transfer_pull(remote, local)
+        }
+        (TransferEndpoint::Local(_), TransferEndpoint::Local(_)) => Err(Error::validation(
+            "PI_SSH_TRANSFER_SCHEME: both endpoints are local; copy locally",
+        )),
+        (TransferEndpoint::Remote(_), TransferEndpoint::Remote(_)) => Err(Error::validation(
+            "PI_SSH_TRANSFER_SCHEME: remote-to-remote relay is not supported in v1",
+        )),
+    }
+}
+
+fn transfer_push(local: PathBuf, remote: SshTarget) -> Result<serde_json::Value> {
+    let total = local_file_size(&local)?;
+    let resumed_from = resume_offset(remote_size(&remote)?, total)?;
+    if total > resumed_from {
+        let mut src = std::fs::File::open(&local)
+            .map_err(|e| Error::tool("transfer", format!("open {}: {e}", local.display())))?;
+        use std::io::Seek as _;
+        src.seek(std::io::SeekFrom::Start(resumed_from))
+            .map_err(|e| Error::tool("transfer", format!("seek {resumed_from}: {e}")))?;
+        let script = format!("cat >> {}", sh_quote(&remote.path));
+        let mut child = std::process::Command::new("ssh")
+            .args(ssh_command_flags())
+            .arg(&remote.host)
+            .arg(&script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: spawn: {e}")))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::tool("transfer", "missing ssh stdin"))?;
+            std::io::copy(&mut src, &mut stdin)
+                .map_err(|e| Error::tool("transfer", format!("stream payload: {e}")))?;
+        }
+        wait_transfer_child(
+            child,
+            &format!("{host}:{path}", host = remote.host, path = remote.path),
+        )?;
+    }
+    let final_size = remote_size(&remote)?;
+    if final_size != total {
+        return Err(Error::tool(
+            "transfer",
+            format!(
+                "PI_SSH_VERIFY_FAILED: post-transfer size mismatch (remote {final_size}, source {total})"
+            ),
+        ));
+    }
+    Ok(serde_json::json!({
+        "schema": URL_ROUTER_SCHEMA,
+        "scheme": "ssh",
+        "direction": "push",
+        "bytesTotal": total,
+        "resumedFrom": resumed_from,
+        "verified": true,
+    }))
+}
+
+fn transfer_pull(remote: SshTarget, local: PathBuf) -> Result<serde_json::Value> {
+    let total = remote_size(&remote)?;
+    let existing = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+    let resumed_from = resume_offset(existing, total)?;
+    if total > resumed_from {
+        // POSIX `tail -c +N file` emits from byte N (1-based) onward — the
+        // portable way to stream a remote suffix without GNU dd flags.
+        let script = format!(
+            "tail -c +{} -- {}",
+            resumed_from + 1,
+            sh_quote(&remote.path)
+        );
+        let mut child = std::process::Command::new("ssh")
+            .args(ssh_command_flags())
+            .arg(&remote.host)
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: spawn: {e}")))?;
+        {
+            let mut stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| Error::tool("transfer", "missing ssh stdout"))?;
+            let mut dst = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&local)
+                .map_err(|e| Error::tool("transfer", format!("open {}: {e}", local.display())))?;
+            std::io::copy(&mut stdout, &mut dst)
+                .map_err(|e| Error::tool("transfer", format!("stream payload: {e}")))?;
+        }
+        wait_transfer_child(
+            child,
+            &format!("{host}:{path}", host = remote.host, path = remote.path),
+        )?;
+    }
+    let final_size = local_file_size(&local)?;
+    if final_size != total {
+        return Err(Error::tool(
+            "transfer",
+            format!(
+                "PI_SSH_VERIFY_FAILED: post-transfer size mismatch (local {final_size}, source {total})"
+            ),
+        ));
+    }
+    Ok(serde_json::json!({
+        "schema": URL_ROUTER_SCHEMA,
+        "scheme": "ssh",
+        "direction": "pull",
+        "bytesTotal": total,
+        "resumedFrom": resumed_from,
+        "verified": true,
+    }))
+}
+
+fn wait_transfer_child(child: std::process::Child, what: &str) -> Result<()> {
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::tool("transfer", format!("PI_SSH_BACKEND: wait: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(match classify_ssh_failure(&stderr) {
+            SshFailureKind::HostKeyChanged => Error::tool(
+                "transfer",
+                format!("PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION}"),
+            ),
+            SshFailureKind::AuthFailed => {
+                Error::tool("transfer", format!("PI_SSH_AUTH_FAILED: {stderr}"))
+            }
+            _ => Error::tool(
+                "transfer",
+                format!("PI_SSH_WRITE_FAILED: transfer to {what} failed: {stderr}"),
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1174,5 +1419,28 @@ mod tests {
         // offline-safe assertions of the guard rails.
         assert!(ssh_fetch_document("file:///etc/hosts", 1024).is_err());
         assert!(ssh_fetch_document("ssh://h/a/../b", 1024).is_err());
+    }
+
+    #[test]
+    fn transfer_endpoints_parse() {
+        assert!(matches!(
+            parse_transfer_endpoint("/tmp/a.bin"),
+            Ok(TransferEndpoint::Local(_))
+        ));
+        assert!(matches!(
+            parse_transfer_endpoint("ssh://yto/var/x"),
+            Ok(TransferEndpoint::Remote(_))
+        ));
+        assert!(parse_transfer_endpoint("file:///x").is_err());
+    }
+
+    #[test]
+    fn resume_offset_semantics() {
+        assert_eq!(resume_offset(0, 100).expect("fresh"), 0);
+        assert_eq!(resume_offset(40, 100).expect("partial"), 40);
+        let oversize = resume_offset(120, 100).unwrap_err();
+        assert!(oversize.to_string().contains("SIZE_CONFLICT"));
+        let done = resume_offset(100, 100).unwrap_err();
+        assert!(done.to_string().contains("nothing to transfer"));
     }
 }
