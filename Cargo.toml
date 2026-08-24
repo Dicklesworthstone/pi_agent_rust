@@ -406,6 +406,12 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 [target.'cfg(target_os = "android")'.dependencies]
 rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 
+# Windows child-tree kill discipline (bd-9jgrt item 1): Job objects close the
+# snapshot-vs-kill race that the parent-chain walk cannot. win32job keeps our
+# crate unsafe-free while encapsulating the Win32 FFI.
+[target.'cfg(windows)'.dependencies]
+win32job = "2.0.3"
+
 [features]
 default = ["sqlite-sessions", "tui", "bpe-tokens"]
 full = [

@@ -158,6 +158,7 @@ impl DapTransport {
                 format!("failed to spawn debug adapter {command:?}: {err}"),
             )
         })?;
+        crate::tools::attach_child_job_discipline(&child);
         let stdin = child
             .stdin
             .take()

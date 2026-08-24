@@ -6438,6 +6438,7 @@ pub(crate) async fn run_bash_command(
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+    attach_child_job_discipline(&child);
 
     let stdout = child
         .stdout
@@ -12451,6 +12452,102 @@ impl Drop for ProcessGuard {
     }
 }
 
+/// Attach a freshly-spawned child to platform tree-discipline bookkeeping.
+///
+/// Windows assigns the child to a kill-on-close Job object so later
+/// `kill_process_group_tree` / `terminate_process_group_tree` calls reap the
+/// whole descendant tree, including processes spawned between the kill-time
+/// snapshot and the kill (bd-9jgrt item 1). Unix needs nothing here: the
+/// child already leads its own process group. Hub PTY services are out of
+/// scope (portable-pty children keep the walk-based discipline).
+// Const only on unix where the body degenerates to `let _`; the windows
+// branch calls non-const job registration, so the lint cannot hold for both
+// targets at once.
+#[allow(clippy::missing_const_for_fn)]
+pub(crate) fn attach_child_job_discipline(child: &std::process::Child) {
+    #[cfg(windows)]
+    win_job::attach(child);
+    #[cfg(not(windows))]
+    {
+        let _ = child;
+    }
+}
+
+#[cfg(windows)]
+mod win_job {
+    //! Kill-on-close Job objects keyed by root pid (bd-9jgrt item 1).
+    //!
+    //! Windows has no process groups, so the parent-chain walk in
+    //! [`kill_process_tree_with`] races grandchildren spawned after its
+    //! process snapshot. A job closes that race: descendants cannot break
+    //! away (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` is never set), and dropping the
+    //! job's handle terminates every current member in one shot.
+
+    use std::collections::HashMap;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::{LazyLock, Mutex};
+
+    use win32job::{ExtendedLimitInfo, Job};
+
+    static REGISTRY: LazyLock<Mutex<HashMap<u32, Job>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// Assign `child` to a fresh kill-on-close job and remember it by pid.
+    ///
+    /// Best-effort: any failure leaves the walk-based discipline below in
+    /// charge (e.g. systems that reject nested-job assignment fall back).
+    pub(crate) fn attach(child: &Child) {
+        let Ok(mut map) = REGISTRY.lock() else {
+            return;
+        };
+        prune_dead_entries(&mut map);
+        let mut info = ExtendedLimitInfo::new();
+        info.limit_kill_on_job_close();
+        let Ok(job) = Job::create_with_limit_info(&info) else {
+            return;
+        };
+        // RawHandle is *mut c_void; win32job takes the isize numeric handle.
+        if job.assign_process(child.as_raw_handle() as isize).is_err() {
+            // Never assigned, so closing harms nothing.
+            drop(job);
+            return;
+        }
+        map.insert(child.id(), job);
+    }
+
+    /// Kill the tree rooted at `pid` via its job, returning whether one
+    /// existed. Dropping the stored `Job` closes the handle, and
+    /// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does the actual termination.
+    pub(crate) fn terminate(pid: u32) -> bool {
+        REGISTRY
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&pid))
+            .is_some()
+    }
+
+    /// Drop entries whose root process no longer exists so the map (and its
+    /// kernel handles) stays proportional to live spawned children. Skipped
+    /// while small to avoid a process-table refresh per trivial spawn.
+    fn prune_dead_entries(map: &mut HashMap<u32, Job>) {
+        if map.len() < 8 {
+            return;
+        }
+        let pids: Vec<sysinfo::Pid> = map.keys().map(|&pid| sysinfo::Pid::from_u32(pid)).collect();
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pids), true);
+        let dead: Vec<u32> = pids
+            .iter()
+            .filter(|pid| sys.process(**pid).is_none())
+            .map(|pid| pid.as_u32())
+            .collect();
+        for pid in dead {
+            // Jobs whose root died are empty; dropping just reclaims the handle.
+            map.remove(&pid);
+        }
+    }
+}
 fn cleanup_child(pid: Option<u32>, cleanup_mode: ProcessCleanupMode) {
     if cleanup_mode == ProcessCleanupMode::ProcessGroupTree {
         kill_process_group_tree(pid);
@@ -12473,6 +12570,17 @@ fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal, include_pro
     let Some(pid) = pid else {
         return;
     };
+
+    // Windows fast path: children spawned through
+    // `attach_child_job_discipline` carry a Job object containing their whole
+    // descendant tree, so dropping the job kills everyone in one shot —
+    // including grandchildren that appeared after this function would
+    // otherwise have taken its snapshot (bd-9jgrt item 1). Pids without a
+    // job (hub PTY services, external pids) fall through to the walk below.
+    #[cfg(windows)]
+    if win_job::terminate(pid) {
+        return;
+    }
 
     let root = sysinfo::Pid::from_u32(pid);
 
