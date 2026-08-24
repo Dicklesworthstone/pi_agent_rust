@@ -835,6 +835,7 @@ const fn make_settings(keep_recent_tokens: u32) -> pi::compaction::ResolvedCompa
         reserve_tokens: 0,
         keep_recent_tokens,
         mode: pi::compaction::AutoCompactionMode::Summary,
+        render_mode: pi::compaction::CompactionRenderMode::Text,
     }
 }
 

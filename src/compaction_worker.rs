@@ -866,6 +866,7 @@ mod tests {
                     modified_files: vec![],
                     mode: None,
                 },
+                snap_payload: None,
             };
             let pending = ready_pending_with_handle(runtime_handle, Ok(result)).await;
             inject_pending(&mut w, pending);
@@ -895,6 +896,7 @@ mod tests {
                 modified_files: vec![],
                 mode: None,
             },
+            snap_payload: None,
         })
     }
 

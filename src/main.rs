@@ -1768,6 +1768,11 @@ async fn run(
         max_tool_iterations,
         stream_options,
         block_images: config.image_block_images(),
+        model_accepts_images: selection
+            .model_entry
+            .model
+            .input
+            .contains(&pi::provider::InputType::Image),
         fail_closed_hooks: config.fail_closed_hooks(),
         tool_approval: None,
         keyword_settings: config.keywords.clone(),
@@ -1794,6 +1799,7 @@ async fn run(
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
         context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
         mode: config.compaction_mode(),
+        render_mode: config.compaction_render_mode(),
     };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
