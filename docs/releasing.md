@@ -3952,8 +3952,64 @@ For branches opened before this gate was introduced:
   [benchmark guide](planning/BENCHMARKS.md)).
 - Distribution compatibility matrix (above) passes for all required paths.
 
+## Canonical Binary Adoption and `rpi` Interim Migration Policy (RI-ADOPT, DROPIN-R13)
+
+### Background & Existing Host State
+
+In developer and owner environments:
+- The TypeScript Pi CLI (`~/.bun/bin/pi` or `/opt/homebrew/bin/pi`) may historically occupy the canonical `pi` command name.
+- The Rust Pi port is installed and managed via `install.sh` with the compatibility alias `rpi` (`~/.local/bin/rpi`) or legacy `pi-rust` (`~/.local/bin/pi-rust`).
+
+### Interim Adoption Policy (Pre-RI-AUTH)
+
+During active development and before final strict drop-in authorization (`RI-AUTH`):
+1. **Non-Destructive Coexistence**:
+   - The installer creates and manages the `rpi -> pi` symlink/launcher to allow instant side-by-side evaluation without displacing the TypeScript CLI.
+   - When `install.sh` detects an existing `pi` binary from another toolchain, it preserves the existing binary and informs the operator:
+     ```text
+     Existing pi command detected; managed rpi alias installed for side-by-side execution.
+     ```
+2. **Subagent & Child Process Delegation**:
+   - Pi Rust subagent delegation inspects `PI_SUBAGENT_PI_BINARY` or defaults to the current executable path, ensuring child processes invoke the matching Rust binary regardless of canonical PATH priority.
+
+### Canonical Migration Procedure (Post-RI-AUTH)
+
+Once `RI-AUTH` authorizes strict drop-in replacement (`docs/evidence/dropin-certification-verdict.json` reports `overall_verdict = CERTIFIED`):
+1. **Preserve Legacy Binary**:
+   ```bash
+   # Move legacy TypeScript binary to an explicit compatibility name
+   if [ -f "$HOME/.bun/bin/pi" ]; then
+       mv "$HOME/.bun/bin/pi" "$HOME/.bun/bin/pi-legacy-ts"
+   fi
+   ```
+2. **Promote Rust Pi to Canonical**:
+   ```bash
+   # Re-run installer targeting the primary user bin directory
+   ./install.sh --force --install-dir "$HOME/.local/bin"
+   ```
+3. **Verify Resolution**:
+   ```bash
+   which pi        # Resolves to $HOME/.local/bin/pi
+   pi --version    # Reports pi 0.3.x (Rust)
+   pi-legacy-ts --version # Confirms legacy fallback remains operational
+   ```
+
+### Upgrade Path for Installed v0.1.x Binaries
+
+For environments with older `v0.1.x` binaries installed:
+- Upgrade via source build:
+  ```bash
+  cargo build --release --bin pi
+  cp target/release/pi "$HOME/.local/bin/pi"
+  ```
+- Or upgrade via cargo install:
+  ```bash
+  cargo install --path . --locked --force
+  ```
+
 ## Post-release checklist
 - GitHub Release exists and includes expected artifacts for each platform.
 - `SHA256SUMS` matches downloaded artifacts.
 - Crates.io publish succeeded (if configured) and the version matches the tag.
 - Smoke test install paths (download binary + run `pi --version`).
+
