@@ -334,15 +334,18 @@ impl PiApp {
         let mut output = String::new();
         let plain_width = self.term_width.saturating_sub(4).max(1);
 
-        if !self.startup_welcome.trim().is_empty() {
-            for line in self.startup_welcome.lines() {
-                if line.trim().is_empty() {
-                    output.push('\n');
-                    continue;
-                }
-                for segment in wrapped_line_segments(line, plain_width) {
-                    let _ = writeln!(output, "{}", self.styles.muted_italic.render(segment));
-                }
+        if self.startup_welcome.trim().is_empty() {
+            let welcome = crate::overlay_system::WelcomeScreen::new();
+            return welcome.render(self.term_width);
+        }
+
+        for line in self.startup_welcome.lines() {
+            if line.trim().is_empty() {
+                output.push('\n');
+                continue;
+            }
+            for segment in wrapped_line_segments(line, plain_width) {
+                let _ = writeln!(output, "{}", self.styles.muted_italic.render(segment));
             }
         }
 
@@ -676,6 +679,8 @@ impl PiApp {
             max_width,
         );
 
+        let _term_title = crate::delight::format_terminal_title(&self.session_id, &self.model, self.streaming);
+
         let _ = write!(
             output,
             "  {} {}{}\n  {}\n  {}\n",
@@ -859,6 +864,25 @@ impl PiApp {
         if footer.chars().count() > max_width {
             footer = truncate(&footer, max_width);
         }
+        let status_ctx = crate::status_line::StatusContext {
+            model: Some(self.model.as_str()),
+            thinking_level: None,
+            mode: if self.plan_mode { "plan" } else { "act" },
+            cwd: self.cwd.to_string_lossy().to_string(),
+            git_branch: self.vcs_info.as_deref(),
+            git_dirty: false,
+            context_pct: 0,
+            cost_usd: total_cost,
+            tokens_used: (input + output_tokens) as u64,
+            subagent_count: 0,
+            session_name: self.session_id.clone(),
+            timestamp_str: String::new(),
+        };
+        let _powerline = crate::status_line::PowerlineStatusLine::new(
+            crate::status_line::StatusLinePreset::Compact,
+        )
+        .render(&status_ctx, self.term_width);
+
         let _ = write!(output, "\n  {}\n", self.styles.muted.render(&footer));
     }
 
@@ -913,11 +937,14 @@ impl PiApp {
                     );
                 }
 
-                // Render markdown content
+                // Render markdown content with rich enhancements
+                let enriched_content = crate::markdown_rich::render_hex_swatches(
+                    &crate::markdown_rich::latex_to_unicode(&msg.content),
+                );
                 let rendered = glamour::Renderer::new()
                     .with_style_config(self.markdown_style.clone())
                     .with_word_wrap(self.term_width.saturating_sub(6).max(40))
-                    .render(&msg.content);
+                    .render(&enriched_content);
                 for line in rendered.lines() {
                     let _ = writeln!(output, "  {line}");
                 }

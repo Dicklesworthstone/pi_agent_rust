@@ -137,6 +137,7 @@ files = [
     "overlay_system",
     "delight",
     "gallery",
+    "chrome_tui_integration",
     "session_store_v2_ux",
     "checkpoint",
     "eval",

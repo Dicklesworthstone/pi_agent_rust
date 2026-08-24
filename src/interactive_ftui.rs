@@ -26,11 +26,14 @@
 //!   ([`agent_event_to_pi_msgs`] pins the translation), asks pair through
 //!   `respond_ui`, sessions persist per the usual CLI flags.
 //!
-//! Still on the bubbletea stack: the interactive tree/fork selector overlays
-//! (bd-cv653.9.8) and the command-palette composer (bd-cv653.9.3). Core
-//! session slash commands (/new, /clear, /session, /tree summary,
-//! /thinking, /name), bash context-inclusion, extension UIs, and the
-//! PTY/e2e acceptance lanes are ported here.
+//! Fully ported surfaces:
+//! - Interactive tree/fork selector overlays and toast queue ([`crate::overlay_system`])
+//! - Command-palette autocomplete and composer ([`crate::autocomplete`])
+//! - Rich Powerline status line with responsive dropping ([`crate::status_line`])
+//! - Rich markdown with LaTeX symbols, mermaid diagrams, and hex swatches ([`crate::markdown_rich`])
+//! - Delight animations, sparklines, and terminal titles ([`crate::delight`])
+//! - Visual regression test matrix ([`crate::gallery`])
+//! - Core session slash commands (/new, /clear, /session, /tree summary, /thinking, /name), bash context-inclusion, extension UIs, and the PTY/e2e acceptance lanes.
 
 use std::cell::Cell;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
