@@ -985,6 +985,11 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             "{run_correlation_id}|{extension}|{scenario}|{scenario_id_for_hash}"
         ));
         let scenario_correlation: String = scenario_correlation.chars().take(32).collect();
+        let orchestration_correlation_id = std::env::var("CI_CORRELATION_ID")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| run_correlation_id.to_owned());
 
         let replay_input = scenario_replay_input(map);
         let build_profile = env
@@ -1088,6 +1093,10 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
         scenario_metadata
             .entry("replay_input".to_string())
             .or_insert(replay_input);
+        scenario_metadata.insert(
+            "orchestration_correlation_id".to_string(),
+            Value::String(orchestration_correlation_id.clone()),
+        );
 
         for field in BUILD_PROVENANCE_FIELDS {
             let value = env.get(*field).cloned().unwrap_or(Value::Null);
@@ -1119,6 +1128,10 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
         map.insert(
             "correlation_id".to_string(),
             Value::String(scenario_correlation),
+        );
+        map.insert(
+            "orchestration_correlation_id".to_string(),
+            Value::String(orchestration_correlation_id),
         );
         map.insert(
             "scenario_metadata".to_string(),
@@ -1501,6 +1514,10 @@ fn assert_record_required_fields(obj: &Map<String, Value>) {
     );
     assert!(obj.contains_key("correlation_id"), "missing correlation_id");
     assert!(
+        obj.contains_key("orchestration_correlation_id"),
+        "missing orchestration_correlation_id"
+    );
+    assert!(
         obj.contains_key("scenario_metadata"),
         "missing scenario_metadata"
     );
@@ -1627,6 +1644,14 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
     assert!(
         !correlation_id.is_empty(),
         "correlation_id must be non-empty"
+    );
+    let orchestration_correlation_id = obj
+        .get("orchestration_correlation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    assert!(
+        !orchestration_correlation_id.is_empty(),
+        "orchestration_correlation_id must be non-empty"
     );
 }
 
@@ -1868,6 +1893,7 @@ fn assert_scenario_metadata_fields(obj: &Map<String, Value>) -> &Map<String, Val
         "host",
         "scenario_id",
         "replay_input",
+        "orchestration_correlation_id",
     ] {
         assert!(
             metadata.contains_key(*field),

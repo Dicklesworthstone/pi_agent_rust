@@ -101,7 +101,7 @@ pub struct WelcomeScreen {
 impl Default for WelcomeScreen {
     fn default() -> Self {
         Self {
-            greeting: "Welcome to Pi Agent".to_string(),
+            greeting: "Welcome to Pi!".to_string(),
             recent_sessions: Vec::new(),
             tips: vec![
                 "Tip: Type /help to see all available slash commands and shortcuts.".to_string(),

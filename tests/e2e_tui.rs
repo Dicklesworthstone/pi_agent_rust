@@ -1510,6 +1510,10 @@ fn e2e_tui_quiet_startup_hides_welcome_message() {
         !pane.contains("Welcome to Pi!"),
         "Expected quiet startup to suppress welcome text; got:\n{pane}"
     );
+    assert!(
+        !pane.contains("Tip: Type /help"),
+        "Expected quiet startup to suppress welcome tips; got:\n{pane}"
+    );
 
     session.exit_gracefully();
     session.write_artifacts();

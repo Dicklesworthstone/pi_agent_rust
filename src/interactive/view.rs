@@ -335,6 +335,9 @@ impl PiApp {
         let plain_width = self.term_width.saturating_sub(4).max(1);
 
         if self.startup_welcome.trim().is_empty() {
+            if self.config.quiet_startup.unwrap_or(false) {
+                return output;
+            }
             let welcome = crate::overlay_system::WelcomeScreen::default();
             let _ = writeln!(output, "  {}", self.styles.title.render(&welcome.greeting));
             let _ = writeln!(

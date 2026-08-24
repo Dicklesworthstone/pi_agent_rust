@@ -1667,6 +1667,7 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   TIMESTAMP="$TIMESTAMP" \
   STRATIFICATION_PATH="$STRATIFICATION_PATH" \
   python3 - <<'PY'
+import hashlib
 import json
 import os
 import re
@@ -1756,10 +1757,61 @@ suite_result_by_name = {
     if isinstance(row, dict) and str(row.get("suite", "")).strip()
 }
 
-scenario_runner_records = load_jsonl(scenario_runner_path)
-workload_records = load_jsonl(workload_path)
-ext_bench_records = load_jsonl(ext_bench_path)
-legacy_records = load_jsonl(legacy_path)
+def admit_dataset(path: Path, records: list[dict], correlation_field: str, required: bool):
+    accepted = []
+    rejected = []
+    for index, record in enumerate(records):
+        observed_correlation = record.get(correlation_field)
+        observed_commit = record.get("source_commit")
+        observed_dirty = record.get("source_dirty")
+        reasons = []
+        if observed_correlation != correlation_id:
+            reasons.append("correlation_id_mismatch")
+        if observed_commit != source_commit:
+            reasons.append("source_commit_mismatch")
+        if observed_dirty is not False:
+            reasons.append("source_dirty_not_false")
+        if reasons:
+            rejected.append({"record_index": index, "reasons": reasons})
+        else:
+            accepted.append(record)
+    digest = None
+    if path.is_file():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return accepted, {
+        "path": str(path),
+        "sha256": digest,
+        "required": required,
+        "correlation_field": correlation_field,
+        "expected_correlation_id": correlation_id,
+        "expected_source_commit": source_commit,
+        "accepted_record_count": len(accepted),
+        "rejected_record_count": len(rejected),
+        "rejections": rejected,
+    }
+
+
+scenario_runner_records, scenario_dataset = admit_dataset(
+    scenario_runner_path,
+    load_jsonl(scenario_runner_path),
+    "orchestration_correlation_id",
+    True,
+)
+workload_records, workload_dataset = admit_dataset(
+    workload_path, load_jsonl(workload_path), "correlation_id", True
+)
+ext_bench_records, ext_bench_dataset = admit_dataset(
+    ext_bench_path, load_jsonl(ext_bench_path), "correlation_id", False
+)
+legacy_records, legacy_dataset = admit_dataset(
+    legacy_path, load_jsonl(legacy_path), "correlation_id", True
+)
+source_datasets = [
+    scenario_dataset,
+    workload_dataset,
+    ext_bench_dataset,
+    legacy_dataset,
+]
 
 comparison_rows = []
 if perf_comparison_path.exists():
@@ -2084,6 +2136,11 @@ layer_coverage = {
 }
 
 invalidity_reasons = []
+for dataset in source_datasets:
+    if dataset["required"] and dataset["accepted_record_count"] == 0:
+        invalidity_reasons.append(f"missing_current_run_source:{dataset['path']}")
+    if dataset["rejected_record_count"] > 0:
+        invalidity_reasons.append(f"mixed_source_lineage:{dataset['path']}")
 if not layer_coverage.get("full_e2e_long_session", False) and (
     layer_coverage.get("cold_load_init", False)
     or layer_coverage.get("per_call_dispatch_micro", False)
@@ -2120,6 +2177,7 @@ payload = {
         "lineage_contract": "all layers must share run_id + correlation_id lineage",
     },
     "layers": layers,
+    "source_datasets": source_datasets,
     "claim_integrity": {
         "anti_conflation": {
             "cold_load_wins_do_not_imply_per_call_or_e2e": True,
@@ -3691,6 +3749,284 @@ then
 else
   die "Failed to generate phase-1 matrix validation artifact"
 fi
+
+# ─── Phase 5g: Authoritative post-generation evidence gate ─────────────────
+
+log_phase "Phase 5g: Post-Generation Evidence Gate"
+
+POST_GENERATION_CONTRACT_PATH="$OUTPUT_DIR/results/post_generation_evidence_contract.json"
+post_generation_exit=0
+if OUTPUT_DIR="$OUTPUT_DIR" \
+  CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
+  POST_GENERATION_CONTRACT_PATH="$POST_GENERATION_CONTRACT_PATH" \
+  python3 - <<'PY'
+import json
+import math
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+output_dir = Path(os.environ["OUTPUT_DIR"])
+expected_correlation_id = os.environ["CORRELATION_ID"]
+expected_source_commit = os.environ["GIT_COMMIT_FULL"]
+expected_source_dirty = os.environ["GIT_DIRTY"] == "true"
+report_path = Path(os.environ["POST_GENERATION_CONTRACT_PATH"])
+phase1_path = output_dir / "results" / "phase1_matrix_validation.json"
+stratification_path = output_dir / "results" / "extension_benchmark_stratification.json"
+failures = []
+
+
+def load_artifact(path: Path, expected_schema: str):
+    if not path.is_file():
+        failures.append({"path": str(path), "reason": "missing_artifact"})
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        failures.append(
+            {"path": str(path), "reason": "invalid_json", "detail": str(error)}
+        )
+        return {}
+    if payload.get("schema") != expected_schema:
+        failures.append(
+            {
+                "path": str(path),
+                "reason": "schema_mismatch",
+                "expected": expected_schema,
+                "observed": payload.get("schema"),
+            }
+        )
+    for field, expected in (
+        ("source_commit", expected_source_commit),
+        ("source_dirty", expected_source_dirty),
+        ("correlation_id", expected_correlation_id),
+    ):
+        if payload.get(field) != expected:
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": f"{field}_mismatch",
+                    "expected": expected,
+                    "observed": payload.get(field),
+                }
+            )
+    return payload
+
+
+phase1 = load_artifact(phase1_path, "pi.perf.phase1_matrix_validation.v1")
+matrix_cells = phase1.get("matrix_cells", [])
+required_cell_count = phase1.get("matrix_requirements", {}).get("required_cell_count")
+if not isinstance(required_cell_count, int) or required_cell_count <= 0:
+    failures.append({"path": str(phase1_path), "reason": "invalid_required_cell_count"})
+elif not isinstance(matrix_cells, list) or len(matrix_cells) != required_cell_count:
+    failures.append(
+        {
+            "path": str(phase1_path),
+            "reason": "matrix_cell_count_mismatch",
+            "expected": required_cell_count,
+            "observed": len(matrix_cells) if isinstance(matrix_cells, list) else None,
+        }
+    )
+if isinstance(matrix_cells, list):
+    required_stages = ("open_ms", "append_ms", "save_ms", "index_ms")
+    for index, cell in enumerate(matrix_cells):
+        attribution = cell.get("stage_attribution", {}) if isinstance(cell, dict) else {}
+        invalid_stages = [
+            key
+            for key in required_stages
+            if not isinstance(attribution.get(key), (int, float))
+            or not math.isfinite(float(attribution[key]))
+            or float(attribution[key]) < 0.0
+        ]
+        if (
+            not isinstance(cell, dict)
+            or cell.get("status") != "pass"
+            or cell.get("missing_reasons") not in ([], None)
+            or invalid_stages
+        ):
+            failures.append(
+                {
+                    "path": str(phase1_path),
+                    "reason": "invalid_matrix_cell",
+                    "cell_index": index,
+                    "invalid_stages": invalid_stages,
+                }
+            )
+
+stratification = load_artifact(
+    stratification_path, "pi.perf.extension_benchmark_stratification.v1"
+)
+required_layers = {"cold_load_init", "per_call_dispatch_micro", "full_e2e_long_session"}
+layers = stratification.get("layers", [])
+observed_layers = {
+    layer.get("layer_id")
+    for layer in layers
+    if isinstance(layer, dict) and layer.get("evidence_state") == "measured"
+}
+if observed_layers != required_layers:
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "required_layers_not_measured",
+            "expected": sorted(required_layers),
+            "observed": sorted(layer for layer in observed_layers if isinstance(layer, str)),
+        }
+    )
+claim_guard = stratification.get("claim_integrity", {}).get("cherry_pick_guard", {})
+if claim_guard.get("global_claim_valid") is not True:
+    failures.append(
+        {"path": str(stratification_path), "reason": "global_claim_not_valid"}
+    )
+
+report = {
+    "schema": "pi.perf.post_generation_evidence_contract.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "source_commit": expected_source_commit,
+    "source_dirty": expected_source_dirty,
+    "correlation_id": expected_correlation_id,
+    "status": "ready" if not failures else "blocked",
+    "failure_count": len(failures),
+    "failures": failures,
+    "artifacts": [str(phase1_path), str(stratification_path)],
+}
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+raise SystemExit(0 if not failures else 1)
+PY
+then
+  log_ok "Post-generation evidence contract passed"
+else
+  post_generation_exit=$?
+  log_warn "Post-generation evidence contract blocked: results/$(basename "$POST_GENERATION_CONTRACT_PATH")"
+fi
+artifact_count=$((artifact_count + 1))
+
+staging_exit=0
+if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH"; then
+  log_ok "Final budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
+else
+  staging_exit=$?
+  log_warn "Final budget preflight found blockers:"
+  log_warn "  results/$(basename "$PREFLIGHT_AFTER_RUN_PATH") (exit=$staging_exit)"
+fi
+
+if [[ -f "$PREFLIGHT_AFTER_RUN_PATH" ]]; then
+  artifact_count=$((artifact_count + 1))
+  log_ok "Collected: $(basename "$PREFLIGHT_AFTER_RUN_PATH")"
+fi
+
+if run_artifact_staging_manifest "$STAGING_MANIFEST_PATH"; then
+  log_ok "Final artifact staging passed: results/$(basename "$STAGING_MANIFEST_PATH")"
+else
+  staging_exit=$?
+  log_warn "Final artifact staging found blockers: results/$(basename "$STAGING_MANIFEST_PATH") (exit=$staging_exit)"
+fi
+
+if [[ -f "$STAGING_MANIFEST_PATH" ]]; then
+  artifact_count=$((artifact_count + 1))
+  staging_summary="$(
+    python3 - "$STAGING_MANIFEST_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+summary = payload.get("summary", {})
+print(
+    "|".join(
+        str(summary.get(key, 0))
+        for key in (
+            "status",
+            "missing_required_count",
+            "stale_required_count",
+            "present_required_count",
+        )
+    )
+    + "|"
+    + str(len(payload.get("blockers", [])))
+)
+PY
+  )"
+  IFS='|' read -r \
+    ARTIFACT_STAGING_STATUS \
+    ARTIFACT_STAGING_MISSING_REQUIRED \
+    ARTIFACT_STAGING_STALE_REQUIRED \
+    ARTIFACT_STAGING_PRESENT_REQUIRED \
+    ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
+  log_ok "Final artifact staging: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
+  log_ok "Final artifact blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
+else
+  log_warn "Final artifact staging manifest was not generated"
+fi
+
+post_generation_status="pass"
+post_generation_result_exit=0
+if [[ "$post_generation_exit" -ne 0 || "$staging_exit" -ne 0 || "$ARTIFACT_STAGING_STATUS" == "blocked" ]]; then
+  post_generation_result_exit=$((post_generation_exit != 0 ? post_generation_exit : staging_exit))
+  if [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+    post_generation_status="fail"
+    suite_fail=$((suite_fail + 1))
+  else
+    post_generation_status="skip"
+    suite_skip=$((suite_skip + 1))
+  fi
+else
+  suite_pass=$((suite_pass + 1))
+fi
+
+OUTPUT_DIR="$OUTPUT_DIR" \
+  ARTIFACT_COUNT="$artifact_count" \
+  SUITE_PASS="$suite_pass" \
+  SUITE_FAIL="$suite_fail" \
+  SUITE_SKIP="$suite_skip" \
+  POST_GENERATION_STATUS="$post_generation_status" \
+  POST_GENERATION_EXIT="$post_generation_result_exit" \
+  ARTIFACT_STAGING_STATUS="$ARTIFACT_STAGING_STATUS" \
+  ARTIFACT_STAGING_MISSING_REQUIRED="$ARTIFACT_STAGING_MISSING_REQUIRED" \
+  ARTIFACT_STAGING_STALE_REQUIRED="$ARTIFACT_STAGING_STALE_REQUIRED" \
+  ARTIFACT_STAGING_BLOCKERS="$ARTIFACT_STAGING_BLOCKERS" \
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["OUTPUT_DIR"]) / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+run_summary = manifest.setdefault("run_summary", {})
+passed = int(os.environ["SUITE_PASS"])
+failed = int(os.environ["SUITE_FAIL"])
+skipped = int(os.environ["SUITE_SKIP"])
+run_summary.update(
+    {
+        "total_suites": passed + failed + skipped,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "artifact_count": int(os.environ["ARTIFACT_COUNT"]),
+    }
+)
+manifest.setdefault("artifact_staging", {}).update(
+    {
+        "status": os.environ["ARTIFACT_STAGING_STATUS"],
+        "missing_required_count": int(os.environ["ARTIFACT_STAGING_MISSING_REQUIRED"]),
+        "stale_required_count": int(os.environ["ARTIFACT_STAGING_STALE_REQUIRED"]),
+        "blocker_count": int(os.environ["ARTIFACT_STAGING_BLOCKERS"]),
+    }
+)
+suite_results = manifest.setdefault("suite_results", [])
+suite_results.append(
+    {
+        "suite": "post_generation_evidence",
+        "status": os.environ["POST_GENERATION_STATUS"],
+        "exit_code": int(os.environ["POST_GENERATION_EXIT"]),
+        "elapsed_ms": 0,
+    }
+)
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+
+log_ok "Total artifacts collected and finalized: $artifact_count"
 
 # ─── Phase 6: Generate checksums ────────────────────────────────────────────
 
