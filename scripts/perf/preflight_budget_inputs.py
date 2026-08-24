@@ -35,6 +35,7 @@ HOST_TOPOLOGY_SCHEMA = "pi.perf.host_topology_fingerprint.v1"
 DEFAULT_MAX_ARTIFACT_AGE_HOURS = 24.0
 DEFAULT_EVIDENCE_CACHE_TTL_HOURS = 168.0
 EXTENSION_BLOCKER_BEAD = "bd-2zcs5.51"
+FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -806,25 +807,165 @@ def file_age_hours(path: Path, now: datetime) -> float | None:
     return (now - modified).total_seconds() / 3600.0
 
 
+def _direct_artifact_records(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    if path.suffix not in {".json", ".jsonl"}:
+        return [], []
+
+    failures: list[str] = []
+    records: list[dict[str, Any]] = []
+    try:
+        if path.suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                records.append(payload)
+            else:
+                failures.append("invalid_json_object")
+            return records, failures
+
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    failures.append("invalid_jsonl_record")
+                    continue
+                records.append(payload)
+    except (OSError, json.JSONDecodeError):
+        failures.append("invalid_json" if path.suffix == ".json" else "invalid_jsonl_record")
+    if path.suffix == ".jsonl" and not records and not failures:
+        failures.append("empty_jsonl")
+    return records, failures
+
+
+def _consistent_embedded_value(
+    records: list[dict[str, Any]], key: str, failures: list[str]
+) -> Any:
+    present = [record[key] for record in records if key in record]
+    if not present:
+        return None
+    if len(present) != len(records):
+        failures.append(f"partial_{key}")
+        return None
+    canonical = {json.dumps(value, sort_keys=True) for value in present}
+    if len(canonical) != 1:
+        failures.append(f"conflicting_{key}")
+        return None
+    return present[0]
+
+
+def inspect_direct_artifact(
+    path: Path,
+    max_age_hours: float,
+    now: datetime,
+    *,
+    expected_git_commit: str | None = None,
+    expected_correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """Inspect direct evidence without allowing checkout mtime to mask provenance."""
+    mtime_age = file_age_hours(path, now)
+    failures: list[str] = []
+    records, parse_failures = _direct_artifact_records(path)
+    failures.extend(parse_failures)
+
+    embedded_times: list[tuple[str, datetime]] = []
+    timestamp_presence = 0
+    for record in records:
+        timestamp_key = "generated_at" if "generated_at" in record else "timestamp"
+        if timestamp_key not in record:
+            continue
+        timestamp_presence += 1
+        parsed = parse_utc_timestamp(record.get(timestamp_key))
+        if parsed is None:
+            failures.append("malformed_embedded_timestamp")
+            continue
+        embedded_times.append((str(record[timestamp_key]), parsed))
+
+    if timestamp_presence and timestamp_presence != len(records):
+        failures.append("partial_embedded_timestamp")
+
+    freshness_basis = "embedded_timestamp" if timestamp_presence else "filesystem_mtime"
+    embedded_timestamp: str | None = None
+    if embedded_times:
+        embedded_timestamp, oldest_timestamp = min(embedded_times, key=lambda item: item[1])
+        age_hours = (now - oldest_timestamp).total_seconds() / 3600.0
+        if age_hours < -(FUTURE_TIMESTAMP_TOLERANCE_SECONDS / 3600.0):
+            failures.append("embedded_timestamp_in_future")
+        elif age_hours > max_age_hours:
+            failures.append("embedded_timestamp_stale")
+    else:
+        age_hours = mtime_age
+        if timestamp_presence == 0 and (age_hours is None or age_hours > max_age_hours):
+            failures.append("filesystem_mtime_stale")
+
+    source_commit = _consistent_embedded_value(records, "source_commit", failures)
+    source_dirty = _consistent_embedded_value(records, "source_dirty", failures)
+    run_id = _consistent_embedded_value(records, "run_id", failures)
+    correlation_id = _consistent_embedded_value(records, "correlation_id", failures)
+
+    if source_commit is not None:
+        if not isinstance(source_commit, str) or not source_commit.strip():
+            failures.append("invalid_source_commit")
+        elif (
+            expected_git_commit
+            and expected_git_commit != "unknown"
+            and source_commit != expected_git_commit
+        ):
+            failures.append("source_commit_mismatch")
+    if source_dirty is not None and source_dirty is not False:
+        failures.append("source_dirty_not_false")
+    for key, value in (("run_id", run_id), ("correlation_id", correlation_id)):
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            failures.append(f"invalid_{key}")
+    if expected_correlation_id:
+        observed_id = correlation_id if correlation_id is not None else run_id
+        if observed_id is not None and observed_id != expected_correlation_id:
+            failures.append("correlation_id_mismatch")
+
+    failures = list(dict.fromkeys(failures))
+    return {
+        "source_kind": "direct",
+        "path": str(path),
+        "is_fresh": not failures,
+        "freshness_basis": freshness_basis,
+        "freshness_reason": failures[0] if failures else "fresh",
+        "freshness_failures": failures,
+        "age_hours": age_hours,
+        "mtime_age_hours": mtime_age,
+        "embedded_timestamp": embedded_timestamp,
+        "max_age_hours": max_age_hours,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "reused_evidence": False,
+    }
+
+
 def existing_fresh_candidates(
-    candidates: tuple[Path, ...], max_age_hours: float, now: datetime
+    candidates: tuple[Path, ...],
+    max_age_hours: float,
+    now: datetime,
+    *,
+    expected_git_commit: str | None = None,
+    expected_correlation_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     fresh: list[dict[str, Any]] = []
     stale: list[dict[str, Any]] = []
     for path in candidates:
         if not path.is_file():
             continue
-        age = file_age_hours(path, now)
-        artifact = {
-            "source_kind": "direct",
-            "path": str(path),
-            "age_hours": age,
-            "max_age_hours": max_age_hours,
-            "size_bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-            "reused_evidence": False,
-        }
-        if age is not None and age <= max_age_hours:
+        artifact = inspect_direct_artifact(
+            path,
+            max_age_hours,
+            now,
+            expected_git_commit=expected_git_commit,
+            expected_correlation_id=expected_correlation_id,
+        )
+        if artifact["is_fresh"]:
             fresh.append(artifact)
         else:
             stale.append(artifact)
@@ -1281,8 +1422,17 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     recognized_blockers: list[dict[str, Any]] = []
 
     groups = artifact_groups(repo_root, target_dir)
+    expected_correlation_id = args.expected_correlation_id or os.environ.get(
+        "PI_PERF_EXPECTED_CORRELATION_ID"
+    )
     for group in groups:
-        group_fresh, group_stale = existing_fresh_candidates(group.candidates, max_age_hours, now)
+        group_fresh, group_stale = existing_fresh_candidates(
+            group.candidates,
+            max_age_hours,
+            now,
+            expected_git_commit=cache_context.git_commit,
+            expected_correlation_id=expected_correlation_id,
+        )
         cache_fresh, cache_rejected = evidence_cache_for_group(
             cache_entries,
             group,
@@ -1454,6 +1604,7 @@ def run_self_test() -> int:
             cache_ttl_hours=cache_ttl_hours,
             cache_profile=cache_profile,
             cache_git_commit=cache_git_commit,
+            expected_correlation_id=None,
             skip_rch_check=True,
         )
 
@@ -1868,6 +2019,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--cache-git-commit",
         help="Expected cached evidence git commit. Defaults to PI_PERF_GIT_COMMIT or current HEAD.",
+    )
+    parser.add_argument(
+        "--expected-correlation-id",
+        help="When set, embedded correlation_id (or run_id fallback) must match this value.",
     )
     parser.add_argument(
         "--skip-rch-check",

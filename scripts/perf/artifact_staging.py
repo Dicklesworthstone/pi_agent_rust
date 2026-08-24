@@ -28,7 +28,7 @@ from preflight_budget_inputs import (
     current_toolchain,
     context_criterion_relative,
     evidence_cache_for_group,
-    file_age_hours,
+    inspect_direct_artifact,
     iso_now,
     load_evidence_cache_entries,
     read_json,
@@ -114,10 +114,22 @@ def artifact_entry(
     max_age_hours: float,
     now: datetime,
     runner_mode: str,
+    expected_git_commit: str,
+    expected_correlation_id: str | None,
 ) -> dict[str, Any]:
-    age = file_age_hours(candidate, now)
     exists = candidate.is_file()
-    is_fresh = exists and age is not None and age <= max_age_hours
+    inspection = (
+        inspect_direct_artifact(
+            candidate,
+            max_age_hours,
+            now,
+            expected_git_commit=expected_git_commit,
+            expected_correlation_id=expected_correlation_id,
+        )
+        if exists
+        else None
+    )
+    is_fresh = bool(inspection and inspection["is_fresh"])
     status = "present" if is_fresh else "stale" if exists else "missing"
     retrieval_status = {
         "present": "retrieved",
@@ -150,10 +162,19 @@ def artifact_entry(
         "local_staged_path": staged_path_str,
         "size_bytes": size_bytes,
         "mtime_utc": mtime_utc(candidate) if exists else None,
-        "age_hours": age,
+        "age_hours": inspection.get("age_hours") if inspection else None,
+        "mtime_age_hours": inspection.get("mtime_age_hours") if inspection else None,
         "max_age_hours": max_age_hours,
         "sha256": sha256_file(candidate) if exists else None,
         "artifact_schema": artifact_schema(candidate) if exists else None,
+        "freshness_basis": inspection.get("freshness_basis") if inspection else None,
+        "freshness_reason": inspection.get("freshness_reason") if inspection else "missing",
+        "freshness_failures": inspection.get("freshness_failures", []) if inspection else [],
+        "embedded_timestamp": inspection.get("embedded_timestamp") if inspection else None,
+        "source_commit": inspection.get("source_commit") if inspection else None,
+        "source_dirty": inspection.get("source_dirty") if inspection else None,
+        "run_id": inspection.get("run_id") if inspection else None,
+        "correlation_id": inspection.get("correlation_id") if inspection else None,
         "runner_mode": runner_mode,
         "suggested_commands": list(group.suggested_commands),
         "blocker": group.blocker,
@@ -258,8 +279,6 @@ def update_evidence_cache_index(
         if isinstance(entry, dict)
     }
 
-    expires_at = (now + timedelta(hours=context.max_ttl_hours)).isoformat().replace("+00:00", "Z")
-    created_at = now.isoformat().replace("+00:00", "Z")
     toolchain = current_toolchain()
     host_fingerprint = current_host_fingerprint()
 
@@ -279,6 +298,15 @@ def update_evidence_cache_index(
             status["skipped_entry_count"] += 1
             continue
 
+        created_at = staging_entry.get("embedded_timestamp")
+        parsed_created_at = parse_utc_timestamp(created_at)
+        if parsed_created_at is None:
+            parsed_created_at = now
+            created_at = now.isoformat().replace("+00:00", "Z")
+        expires_at = (parsed_created_at + timedelta(hours=context.max_ttl_hours)).isoformat().replace(
+            "+00:00", "Z"
+        )
+
         cache_path = cache_artifact_destination(context.cache_dir, contract_id, source_path, sha)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         if not cache_path.exists():
@@ -295,8 +323,10 @@ def update_evidence_cache_index(
             "toolchain": toolchain,
             "host_fingerprint": host_fingerprint,
             "build_profile": context.build_profile,
-            "run_id": run_id,
-            "correlation_id": run_id,
+            "run_id": staging_entry.get("run_id") or run_id,
+            "correlation_id": staging_entry.get("correlation_id") or run_id,
+            "source_commit": staging_entry.get("source_commit"),
+            "source_dirty": staging_entry.get("source_dirty"),
             "sha256": sha,
             "artifact_schema": staging_entry.get("artifact_schema"),
             "created_at": created_at,
@@ -339,6 +369,7 @@ def build_staging_manifest(
     cache_profile: str,
     cache_ttl_hours: float,
     run_id: str | None,
+    expected_correlation_id: str | None,
     update_evidence_cache: bool,
 ) -> dict[str, Any]:
     groups = artifact_groups(repo_root, target_dir)
@@ -371,6 +402,8 @@ def build_staging_manifest(
                 max_age_hours=max_age_hours,
                 now=now,
                 runner_mode=runner_mode,
+                expected_git_commit=cache_git_commit,
+                expected_correlation_id=expected_correlation_id,
             )
             for candidate in group.candidates
         ]
