@@ -131,13 +131,13 @@ impl StageOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanExpr {
     pub op: StageOp,
-    pub children: Vec<PlanExpr>,
+    pub children: Vec<Self>,
 }
 
 impl PlanExpr {
     /// A terminal stage.
     #[must_use]
-    pub fn leaf(op: StageOp) -> Self {
+    pub const fn leaf(op: StageOp) -> Self {
         Self {
             op,
             children: Vec::new(),
@@ -582,8 +582,8 @@ impl EGraph {
 
     /// Insert a node, returning its class. Identical nodes share a class, so
     /// structurally equal subterms are automatically shared.
-    fn add_node(&mut self, node: ENode) -> EClassId {
-        let canonical = self.canonicalize(&node);
+    fn add_node(&mut self, node: &ENode) -> EClassId {
+        let canonical = self.canonicalize(node);
         if let Some(existing) = self.memo.get(&canonical) {
             return self.find(*existing);
         }
@@ -604,7 +604,7 @@ impl EGraph {
             .iter()
             .map(|child| self.add_expr(child))
             .collect();
-        self.add_node(ENode {
+        self.add_node(&ENode {
             op: expr.op.clone(),
             children,
         })
@@ -765,14 +765,11 @@ impl EGraph {
                     let mut resolvable = true;
                     for child in &node.children {
                         let root = self.find_const(*child);
-                        match best.get(&root.0) {
-                            Some((child_cost, _)) => {
-                                total = total.saturating_add(*child_cost);
-                            }
-                            None => {
-                                resolvable = false;
-                                break;
-                            }
+                        if let Some((child_cost, _)) = best.get(&root.0) {
+                            total = total.saturating_add(*child_cost);
+                        } else {
+                            resolvable = false;
+                            break;
                         }
                     }
                     if !resolvable {
@@ -876,7 +873,7 @@ impl EGraphDecision {
     /// one place. A search that fell back reports a baseline-cost candidate,
     /// which that engine's `no_better_candidate` path then rejects.
     #[must_use]
-    pub fn to_rewrite_plan(
+    pub const fn to_rewrite_plan(
         &self,
         kind: HostcallRewritePlanKind,
         rule_id: &'static str,
@@ -978,7 +975,7 @@ impl HostcallEGraphEngine {
     }
 
     #[must_use]
-    pub fn with_limits(mut self, limits: SaturationLimits) -> Self {
+    pub const fn with_limits(mut self, limits: SaturationLimits) -> Self {
         self.limits = limits;
         self
     }
@@ -997,6 +994,63 @@ impl HostcallEGraphEngine {
     #[must_use]
     pub const fn cost_model(&self) -> &CostModel {
         &self.model
+    }
+
+    /// Run rewrite rules to a fixpoint or a budget, whichever comes first.
+    ///
+    /// Returns the stopping reason and the iteration count. Split out of
+    /// [`Self::optimize`] so the search loop and the decision logic can be read
+    /// independently — the loop only grows the graph, and every judgement about
+    /// what that growth means lives in the caller.
+    fn saturate(
+        &self,
+        graph: &mut EGraph,
+        applied: &mut BTreeSet<&'static str>,
+    ) -> (SaturationOutcome, usize) {
+        let rules = rewrite_rules();
+        let mut iterations = 0;
+
+        for iteration in 0..self.limits.max_iterations {
+            iterations = iteration + 1;
+            if graph.node_count() >= self.limits.max_nodes {
+                return (SaturationOutcome::NodeBudget, iterations);
+            }
+
+            // Snapshot every class's concrete forms, then apply rules to each.
+            // Rewriting *adds* an equivalent form rather than replacing one,
+            // which is the property that makes phase ordering irrelevant.
+            let class_ids: Vec<usize> = graph.classes.keys().copied().collect();
+            let mut merges: Vec<(EClassId, PlanExpr, &'static str)> = Vec::new();
+            for class_id in class_ids {
+                let class = EClassId(class_id);
+                for expr in graph.enumerate(class, self.limits.max_expr_depth) {
+                    for rule in &rules {
+                        if let Some(rewritten) = rule.apply(&expr) {
+                            merges.push((class, rewritten, rule.id));
+                        }
+                    }
+                }
+            }
+
+            let mut changed = false;
+            for (class, rewritten, rule_id) in merges {
+                if graph.node_count() >= self.limits.max_nodes {
+                    return (SaturationOutcome::NodeBudget, iterations);
+                }
+                let new_class = graph.add_expr(&rewritten);
+                if graph.union(class, new_class) {
+                    applied.insert(rule_id);
+                    changed = true;
+                }
+            }
+
+            // Nothing new: every reachable equivalent form is already present.
+            if !changed {
+                return (SaturationOutcome::Fixpoint, iterations);
+            }
+        }
+
+        (SaturationOutcome::IterationBudget, iterations)
     }
 
     /// Search for a cheaper form of `baseline`.
@@ -1028,57 +1082,8 @@ impl HostcallEGraphEngine {
 
         let mut graph = EGraph::new();
         let root = graph.add_expr(baseline);
-        let rules = rewrite_rules();
         let mut applied: BTreeSet<&'static str> = BTreeSet::new();
-        let mut outcome = SaturationOutcome::IterationBudget;
-        let mut iterations = 0;
-
-        for iteration in 0..self.limits.max_iterations {
-            iterations = iteration + 1;
-            if graph.node_count() >= self.limits.max_nodes {
-                outcome = SaturationOutcome::NodeBudget;
-                break;
-            }
-
-            // Snapshot every class's concrete forms, then apply rules to each.
-            // Rewriting *adds* an equivalent form rather than replacing one,
-            // which is the property that makes phase ordering irrelevant.
-            let class_ids: Vec<usize> = graph.classes.keys().copied().collect();
-            let mut merges: Vec<(EClassId, PlanExpr, &'static str)> = Vec::new();
-
-            for class_id in class_ids {
-                let class = EClassId(class_id);
-                for expr in graph.enumerate(class, self.limits.max_expr_depth) {
-                    for rule in &rules {
-                        if let Some(rewritten) = rule.apply(&expr) {
-                            merges.push((class, rewritten, rule.id));
-                        }
-                    }
-                }
-            }
-
-            let mut changed = false;
-            for (class, rewritten, rule_id) in merges {
-                if graph.node_count() >= self.limits.max_nodes {
-                    outcome = SaturationOutcome::NodeBudget;
-                    changed = false;
-                    break;
-                }
-                let new_class = graph.add_expr(&rewritten);
-                if graph.union(class, new_class) {
-                    applied.insert(rule_id);
-                    changed = true;
-                }
-            }
-
-            if matches!(outcome, SaturationOutcome::NodeBudget) {
-                break;
-            }
-            if !changed {
-                outcome = SaturationOutcome::Fixpoint;
-                break;
-            }
-        }
+        let (outcome, iterations) = self.saturate(&mut graph, &mut applied);
 
         decision.outcome = outcome;
         decision.iterations = iterations;
