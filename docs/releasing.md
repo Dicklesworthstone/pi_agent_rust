@@ -151,6 +151,27 @@ Policy constraints:
 3. Any release note claiming performance gains should include correlation-linked evidence references from benchmark artifact bundles.
 4. If profile labels/provenance are missing or contradictory, treat the performance claim as invalid until regenerated.
 
+### Release-budget measurement controls
+
+Before `tests/perf/reports/budget_summary.json` can authorize claims, each
+release-facing size, idle-RSS, and Criterion cold-load value must prove what was
+measured:
+
+- The size record hashes the exact `pi` file and records its byte length plus
+  Cargo `release` provenance (`opt-level = "z"`, `strip = true`).
+- The idle-RSS record names the measured PID, `pi` process, allocator, idle
+  boundary, executable hash, and RSS byte count. The test runner's own RSS is
+  never an admissible substitute.
+- The cold-load record hashes the exact Criterion estimate and embeds the
+  fingerprint emitted by `benches/bench_env.rs`, including governor, ASLR, THP,
+  and noise score. A nonzero noise score is not release evidence.
+
+`scripts/perf/orchestrate.sh` emits the binary and cold-load controls.
+`scripts/release_gate.sh` independently rejects a numeric result whose source
+does not carry the corresponding proof. Missing or invalid controls are
+`NO_DATA` inputs with named data-contract failures; never raise a threshold or
+reuse an ambient artifact to make the gate green.
+
 ## Swarm-scale claim readiness report (bd-2zcs5.27)
 
 Before using swarm-scale, drop-in, extension, full-suite, or performance evidence in release-facing copy, generate the read-only readiness report:

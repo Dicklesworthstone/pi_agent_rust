@@ -301,6 +301,7 @@
         "realistic_replay_inputs",
         "required_metadata_fields",
         "evidence_labels",
+        "budget_input_negative_controls",
         "partition_weighting",
         "partition_interpretation",
         "user_perceived_sli_catalog",
@@ -427,6 +428,126 @@
             }
           },
           "description": "Evidence class and confidence label vocabulary for benchmark claims."
+        },
+        "budget_input_negative_controls": {
+          "type": "object",
+          "required": [
+            "scope",
+            "control_schema_version",
+            "unproven_input_status",
+            "release_binary",
+            "idle_rss",
+            "criterion_cold_load"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "release_budget_inputs"
+            },
+            "control_schema_version": {
+              "type": "string",
+              "const": "v1"
+            },
+            "unproven_input_status": {
+              "type": "string",
+              "const": "NO_DATA"
+            },
+            "release_binary": {
+              "type": "object",
+              "required": ["schema", "required_fields"],
+              "additionalProperties": false,
+              "properties": {
+                "schema": {
+                  "type": "string",
+                  "const": "pi.perf.binary_size_measurement.v1"
+                },
+                "required_fields": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 8,
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "binary_path",
+                      "binary_sha256",
+                      "size_bytes",
+                      "cargo_profile",
+                      "compiled_profile_family",
+                      "compiled_opt_level",
+                      "strip",
+                      "profile_source"
+                    ]
+                  }
+                }
+              }
+            },
+            "idle_rss": {
+              "type": "object",
+              "required": ["schema", "required_fields"],
+              "additionalProperties": false,
+              "properties": {
+                "schema": {
+                  "type": "string",
+                  "const": "pi.perf.idle_rss_measurement.v1"
+                },
+                "required_fields": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 8,
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "generated_at",
+                      "pid",
+                      "process_name",
+                      "allocator",
+                      "binary_path",
+                      "binary_sha256",
+                      "rss_bytes",
+                      "idle_state"
+                    ]
+                  }
+                }
+              }
+            },
+            "criterion_cold_load": {
+              "type": "object",
+              "required": ["schema", "required_fields", "max_noise_score"],
+              "additionalProperties": false,
+              "properties": {
+                "schema": {
+                  "type": "string",
+                  "const": "pi.perf.cold_load_measurement.v1"
+                },
+                "required_fields": {
+                  "type": "array",
+                  "uniqueItems": true,
+                  "minItems": 7,
+                  "maxItems": 7,
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "bench_env_source",
+                      "bench_env_sha256",
+                      "governor",
+                      "aslr",
+                      "thp",
+                      "noise_score",
+                      "artifact_sha256"
+                    ]
+                  }
+                },
+                "max_noise_score": {
+                  "type": "integer",
+                  "const": 0
+                }
+              }
+            }
+          },
+          "description": "Release-budget negative controls. Numeric inputs without the required hash-bound proof are NO_DATA, never measurements."
         },
         "regression_gate_admission": {
           "type": "object",

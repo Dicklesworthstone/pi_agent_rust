@@ -954,6 +954,50 @@ fn canonical_protocol_contract() -> Value {
             "evidence_class": [EVIDENCE_CLASS_MEASURED, EVIDENCE_CLASS_INFERRED],
             "confidence": [CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW],
         },
+        "budget_input_negative_controls": {
+            "scope": "release_budget_inputs",
+            "control_schema_version": "v1",
+            "unproven_input_status": "NO_DATA",
+            "release_binary": {
+                "schema": "pi.perf.binary_size_measurement.v1",
+                "required_fields": [
+                    "binary_path",
+                    "binary_sha256",
+                    "size_bytes",
+                    "cargo_profile",
+                    "compiled_profile_family",
+                    "compiled_opt_level",
+                    "strip",
+                    "profile_source"
+                ]
+            },
+            "idle_rss": {
+                "schema": "pi.perf.idle_rss_measurement.v1",
+                "required_fields": [
+                    "generated_at",
+                    "pid",
+                    "process_name",
+                    "allocator",
+                    "binary_path",
+                    "binary_sha256",
+                    "rss_bytes",
+                    "idle_state"
+                ]
+            },
+            "criterion_cold_load": {
+                "schema": "pi.perf.cold_load_measurement.v1",
+                "required_fields": [
+                    "bench_env_source",
+                    "bench_env_sha256",
+                    "governor",
+                    "aslr",
+                    "thp",
+                    "noise_score",
+                    "artifact_sha256"
+                ],
+                "max_noise_score": 0
+            }
+        },
         "regression_gate_admission": {
             "scope": REGRESSION_GATE_GENERIC_SCOPE,
             "required_record_fields": REGRESSION_GATE_REQUIRED_RECORD_FIELDS,
@@ -6370,6 +6414,10 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
         "benchmark protocol schema must require partition_weighting"
     );
     assert!(
+        required_fields.contains(&"budget_input_negative_controls"),
+        "benchmark protocol schema must require release-budget negative controls"
+    );
+    assert!(
         required_fields.contains(&"partition_interpretation"),
         "benchmark protocol schema must require partition_interpretation"
     );
@@ -6380,6 +6428,28 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
     assert!(
         !required_fields.contains(&"pijs_regression_gate_admission"),
         "PiJS-specific admission must remain an optional v1 overlay"
+    );
+
+    let budget_controls = &benchmark_protocol["properties"]["budget_input_negative_controls"];
+    assert_eq!(
+        budget_controls["properties"]["unproven_input_status"]["const"],
+        "NO_DATA"
+    );
+    assert_eq!(
+        budget_controls["properties"]["release_binary"]["properties"]["schema"]["const"],
+        "pi.perf.binary_size_measurement.v1"
+    );
+    assert_eq!(
+        budget_controls["properties"]["idle_rss"]["properties"]["schema"]["const"],
+        "pi.perf.idle_rss_measurement.v1"
+    );
+    assert_eq!(
+        budget_controls["properties"]["criterion_cold_load"]["properties"]["schema"]["const"],
+        "pi.perf.cold_load_measurement.v1"
+    );
+    assert_eq!(
+        budget_controls["properties"]["criterion_cold_load"]["properties"]["max_noise_score"]["const"],
+        0
     );
 
     let admission = benchmark_protocol["properties"]["regression_gate_admission"]
@@ -6619,6 +6689,40 @@ fn orchestrate_script_emits_extension_stratification_contract() {
             "orchestrate stratification phase must include token: {token}"
         );
     }
+}
+
+#[test]
+fn orchestrate_script_emits_budget_input_negative_controls_before_consumption() {
+    let script_path = project_root().join("scripts/perf/orchestrate.sh");
+    let content = fs::read_to_string(&script_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", script_path.display()));
+
+    for token in [
+        "pi.perf.binary_size_measurement.v1",
+        "binary_size_measurement.json",
+        "Cargo.toml#profile.release",
+        "cargo build --bin pi --release",
+        "pi.perf.cold_load_measurement.v1",
+        "cold_load_measurement.json",
+        "benches/bench_env.rs",
+        "PERF_MAX_BENCH_ENV_NOISE_SCORE",
+        "deferred_perf_budgets=true",
+    ] {
+        assert!(
+            content.contains(token),
+            "orchestrate budget-control phase must include token: {token}"
+        );
+    }
+    let cold_control = content
+        .find("write_cold_load_measurement_control \"$result_dir\" \"$exit_code\"")
+        .expect("cold-load control producer call");
+    let budget_consumer = content
+        .rfind("run_test_suite \"perf_budgets\"")
+        .expect("deferred budget consumer call");
+    assert!(
+        cold_control < budget_consumer,
+        "cold-load proof must be emitted before the budget consumer runs"
+    );
 }
 
 #[test]

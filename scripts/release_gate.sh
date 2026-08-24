@@ -3393,6 +3393,50 @@ OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
+MEASUREMENT_CONTROL_SOURCE_PATTERNS = {
+    "binary_size_release": re.compile(
+        r".+#control=release_binary_v1;control_sha256=(?P<control_sha256>[0-9a-f]{64});"
+        r"binary_sha256=(?P<binary_sha256>[0-9a-f]{64});"
+        r"size_bytes=(?P<size_bytes>[1-9][0-9]*);profile=release;opt_level=z;strip=true"
+    ),
+    "idle_memory_rss": re.compile(
+        r".+#control=idle_rss_v1;control_sha256=(?P<control_sha256>[0-9a-f]{64});"
+        r"pid=(?P<pid>[1-9][0-9]*);process=pi;allocator=(?P<allocator>system|jemalloc);"
+        r"binary_sha256=(?P<binary_sha256>[0-9a-f]{64});rss_bytes=(?P<rss_bytes>[1-9][0-9]*)"
+    ),
+    "ext_cold_load_simple_p95": re.compile(
+        r".+#control=bench_env_v1;control_sha256=(?P<control_sha256>[0-9a-f]{64});"
+        r"artifact_sha256=(?P<artifact_sha256>[0-9a-f]{64});"
+        r"bench_env_sha256=(?P<bench_env_sha256>[0-9a-f]{64});noise_score=(?P<noise_score>[0-7]);"
+        r"governor=(?P<governor>[^;]+);aslr=(?P<aslr>[^;]+);thp=(?P<thp>[^;]+)"
+    ),
+    "ext_cold_load_complex_p95": re.compile(
+        r".+#control=bench_env_v1;control_sha256=(?P<control_sha256>[0-9a-f]{64});"
+        r"artifact_sha256=(?P<artifact_sha256>[0-9a-f]{64});"
+        r"bench_env_sha256=(?P<bench_env_sha256>[0-9a-f]{64});noise_score=(?P<noise_score>[0-7]);"
+        r"governor=(?P<governor>[^;]+);aslr=(?P<aslr>[^;]+);thp=(?P<thp>[^;]+)"
+    ),
+}
+MEASUREMENT_CONTROL_FAILURE_IDS = {
+    "binary_size_release": {
+        "missing_binary_size_measurement_control",
+        "invalid_binary_size_measurement_control",
+    },
+    "idle_memory_rss": {
+        "missing_idle_rss_measurement_control",
+        "invalid_idle_rss_measurement_control",
+    },
+    "ext_cold_load_simple_p95": {
+        "missing_cold_load_measurement_control",
+        "invalid_cold_load_measurement_control",
+        "noisy_cold_load_measurement_control",
+    },
+    "ext_cold_load_complex_p95": {
+        "missing_cold_load_measurement_control",
+        "invalid_cold_load_measurement_control",
+        "noisy_cold_load_measurement_control",
+    },
+}
 CANONICAL_BUDGET_INVENTORY_SHA256 = "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663"
 
 
@@ -3779,6 +3823,7 @@ try:
         )
 
     results_by_name = {}
+    missing_measurement_controls = set()
     status_counts = {"PASS": 0, "FAIL": 0, "NO_DATA": 0}
     ci_with_data = 0
     ci_fail = 0
@@ -3809,7 +3854,7 @@ try:
             fail(f"budget_results[{index}].ci_enforced must be a boolean")
         if result["ci_enforced"] is not budget["ci_enforced"]:
             fail(f"budget result {name} has mismatched ci_enforced")
-        nonempty_string(result["source"], f"budget_results[{index}].source")
+        source = nonempty_string(result["source"], f"budget_results[{index}].source")
         status = result["status"]
         if status not in status_counts:
             fail(f"budget result {name} has unsupported status: {status!r}")
@@ -3819,7 +3864,14 @@ try:
             nonempty_string(failure_reason, f"budget_results[{index}].failure_reason")
         actual = result["actual"]
         if actual is None:
-            if strict_mode and budget["ci_enforced"]:
+            if name in MEASUREMENT_CONTROL_SOURCE_PATTERNS:
+                missing_measurement_controls.add(name)
+                if status != "NO_DATA" or failure_reason_present:
+                    fail(
+                        f"budget {name} without a verified measurement control must be "
+                        "NO_DATA without a failure reason"
+                    )
+            elif strict_mode and budget["ci_enforced"]:
                 if status != "FAIL" or failure_reason != "missing_measurement_data":
                     fail(
                         f"strict CI budget {name} without data must be FAIL with "
@@ -3844,6 +3896,31 @@ try:
                 )
             if failure_reason_present:
                 fail(f"budget result {name} with data must not contain failure_reason")
+            control_pattern = MEASUREMENT_CONTROL_SOURCE_PATTERNS.get(name)
+            if control_pattern is not None:
+                control_match = control_pattern.fullmatch(source)
+                if control_match is None:
+                    fail(
+                        f"budget result {name} with data lacks its required measurement "
+                        "negative-control proof"
+                    )
+                control_fields = control_match.groupdict()
+                if name == "binary_size_release":
+                    measured_mb = int(control_fields["size_bytes"]) / 1024.0 / 1024.0
+                    if not math.isclose(actual_value, measured_mb, rel_tol=0.0, abs_tol=1e-12):
+                        fail(
+                            "budget result binary_size_release actual does not match "
+                            "its negative-control size_bytes"
+                        )
+                elif name == "idle_memory_rss":
+                    measured_mb = int(control_fields["rss_bytes"]) / 1024.0 / 1024.0
+                    if not math.isclose(actual_value, measured_mb, rel_tol=0.0, abs_tol=1e-12):
+                        fail(
+                            "budget result idle_memory_rss actual does not match "
+                            "its negative-control rss_bytes"
+                        )
+                elif int(control_fields["noise_score"]) != 0:
+                    fail(f"budget result {name} admits a noisy bench-env fingerprint")
         status_counts[status] += 1
         if budget["ci_enforced"]:
             ci_with_data += int(actual is not None)
@@ -3860,6 +3937,7 @@ try:
         )
 
     failure_fingerprints = set()
+    failure_ids_by_budget = {}
     for index, failure in enumerate(failures):
         exact_fields(
             failure,
@@ -3877,10 +3955,20 @@ try:
             )
             if budget_name not in budgets_by_name:
                 fail(f"data-contract failure references unknown budget: {budget_name}")
+            failure_ids_by_budget.setdefault(budget_name, set()).add(values[0])
         fingerprint = (*values, budget_name)
         if fingerprint in failure_fingerprints:
             fail(f"duplicate data-contract failure at index {index}")
         failure_fingerprints.add(fingerprint)
+
+    for budget_name in sorted(missing_measurement_controls):
+        allowed_ids = MEASUREMENT_CONTROL_FAILURE_IDS[budget_name]
+        observed_ids = failure_ids_by_budget.get(budget_name, set())
+        if observed_ids.isdisjoint(allowed_ids):
+            fail(
+                f"budget result {budget_name} without data lacks a named measurement-control "
+                f"failure (expected one of {sorted(allowed_ids)})"
+            )
 
     derived_counts = {
         "total_budgets": len(budgets),
