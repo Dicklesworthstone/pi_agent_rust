@@ -10,7 +10,7 @@ use tempfile::tempdir;
 fn rebuild_index_skips_subsequent_segments_on_corruption() -> PiResult<()> {
     let dir = tempdir()?;
     // Small threshold to force multiple segments
-    let mut store = SessionStoreV2::create(dir.path(), 200)?;
+    let mut store = SessionStoreV2::create(dir.path(), 500)?;
 
     // Write enough data to span 2 segments.
     // Each entry is roughly ~50-60 bytes.

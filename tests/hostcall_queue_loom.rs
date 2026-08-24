@@ -11,7 +11,7 @@ use pi::hostcall_queue::{
 // that budget in debug/all-feature builds, causing the model to abort before
 // exploring any interleavings. Keep the model and assertions unchanged while
 // giving every simulated thread a deterministic, bounded stack.
-const LOOM_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+const LOOM_THREAD_STACK_BYTES: usize = 128 * 1024;
 
 fn spawn_loom_thread<F, T>(f: F) -> thread::JoinHandle<T>
 where

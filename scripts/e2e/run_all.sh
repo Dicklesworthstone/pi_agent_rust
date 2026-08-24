@@ -168,9 +168,15 @@ run_cargo() {
         fi
 
         if [[ ${#env_overrides[@]} -gt 0 ]]; then
-            env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" "${CARGO_RUNNER_ARGS[@]}" env "${env_overrides[@]}" cargo "$@"
+            if ! env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" "${CARGO_RUNNER_ARGS[@]}" env "${env_overrides[@]}" cargo "$@"; then
+                echo "[runner] rch execution failed or timed out, falling back to local cargo..." >&2
+                cargo "$@"
+            fi
         else
-            env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" "${CARGO_RUNNER_ARGS[@]}" cargo "$@"
+            if ! env "RCH_FORCE_REMOTE=${RCH_FORCE_REMOTE:-true}" "${CARGO_RUNNER_ARGS[@]}" cargo "$@"; then
+                echo "[runner] rch execution failed or timed out, falling back to local cargo..." >&2
+                cargo "$@"
+            fi
         fi
     else
         cargo "$@"
@@ -1436,8 +1442,11 @@ build_tests() {
     fi
     if [[ ${#loom_args[@]} -gt 0 ]]; then
         if ! run_cargo test --locked --features loom-tests "${loom_args[@]}" --no-run 2>>"$build_log"; then
-            echo "[build] Loom targets failed — see $build_log" >&2
-            return 1
+            echo "[build] Retrying loom compilation locally..."
+            if ! cargo test --locked --features loom-tests "${loom_args[@]}" --no-run 2>>"$build_log"; then
+                echo "[build] Loom targets failed — see $build_log" >&2
+                return 1
+            fi
         fi
     fi
 
@@ -12254,7 +12263,7 @@ if isinstance(franken_node_mission_contract, dict):
     franken_node_kernel_boundary_drift_report_payload = {
         "schema": "pi.franken_node.kernel_boundary_drift_report.v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "run_id": run_id,
+        "run_id": expected_claim_correlation_id,
         "correlation_id": expected_claim_correlation_id,
         "manifest": {
             "path": str(kernel_boundary_manifest_path),
