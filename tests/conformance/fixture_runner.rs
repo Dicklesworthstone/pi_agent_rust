@@ -108,6 +108,30 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             };
             Box::new(pi::memory::RetainTool::new(std::sync::Arc::new(store)))
         }
+        "recall" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::RecallTool::new(std::sync::Arc::new(store)))
+        }
+        "memory_edit" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::MemoryEditTool::new(std::sync::Arc::new(store)))
+        }
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
@@ -718,6 +742,29 @@ fn run_setup_steps(steps: &[SetupStep], dir: &Path) -> Result<(), String> {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     return Err(format!("Setup command failed: {stderr}"));
                 }
+            }
+            SetupStep::RetainMemory {
+                content,
+                kind,
+                tags,
+            } => {
+                let kind = match kind.trim().to_ascii_lowercase().as_str() {
+                    "fact" => pi::memory::MemoryKind::Fact,
+                    "lesson" => pi::memory::MemoryKind::Lesson,
+                    "preference" => pi::memory::MemoryKind::Preference,
+                    "decision" => pi::memory::MemoryKind::Decision,
+                    other => {
+                        return Err(format!(
+                            "Unknown setup memory kind '{other}'; expected fact, lesson, \
+                             preference, or decision"
+                        ));
+                    }
+                };
+                let store = pi::memory::MemoryStore::open(dir)
+                    .map_err(|error| format!("Failed to open setup memory store: {error}"))?;
+                store
+                    .retain(kind, content, tags, None)
+                    .map_err(|error| format!("Failed to retain setup memory: {error}"))?;
             }
         }
     }
