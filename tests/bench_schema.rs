@@ -966,13 +966,11 @@ fn install_fake_orchestrate_rch_attestation(target_dir: &Path, output_dir: &Path
         .expect("create fake perf_budgets binary directory");
     let binary = r#"#!/usr/bin/env bash
 set -euo pipefail
-case " $* " in
-  *" ci_enforced_budgets_fail_on_regression_or_missing_data "*" --exact "*) ;;
-  *)
-    echo "post-generation perf_budgets invocation omitted the exact data-contract test" >&2
-    exit 64
-    ;;
-esac
+if [[ "${1:-}" != "ci_enforced_budgets_fail_on_regression_or_missing_data" \
+  || "${2:-}" != "--exact" ]]; then
+  echo "post-generation perf_budgets invocation omitted the exact data-contract test" >&2
+  exit 64
+fi
 python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
 import json
 import sys
@@ -7103,6 +7101,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     let bin_dir = temp_root.join("bin");
     let target_dir = temp_root.join("target");
     let output_dir = temp_root.join("run");
+    let fault_injection_root = temp_root.join("fault-injection");
 
     fs::create_dir_all(&bin_dir).expect("create bin dir");
     fs::create_dir_all(&target_dir).expect("create target dir");
@@ -7110,6 +7109,18 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     install_fake_orchestrate_toolchain(&bin_dir);
     install_fake_orchestrate_staging_artifacts(&target_dir);
     install_fake_orchestrate_rch_attestation(&target_dir, &output_dir);
+    let fault_injection_summary = fault_injection_root.join("stub/summary.json");
+    fs::create_dir_all(
+        fault_injection_summary
+            .parent()
+            .expect("fault-injection summary parent"),
+    )
+    .expect("create fake fault-injection evidence directory");
+    fs::write(
+        &fault_injection_summary,
+        r#"{"overall_status":"pass"}"#,
+    )
+    .expect("write fake fault-injection evidence");
 
     let path = format!(
         "{}:{}",
@@ -7129,6 +7140,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("PERF_OUTPUT_DIR", &output_dir)
+        .env("PERF_FAULT_INJECTION_ROOT", &fault_injection_root)
         .env("PERF_SKIP_CRITERION", "1");
     for (key, value) in extra_env {
         command.env(key, value);

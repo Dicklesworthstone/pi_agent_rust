@@ -16,7 +16,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{self, Write as _};
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -351,18 +351,26 @@ impl GarbageCollector {
             return true;
         }
 
-        // Inspect session header (first line) for explicit name / pinned marker
-        if let Ok(content) = fs::read_to_string(path)
-            && let Some(first_line) = content.lines().next()
-        {
-            if first_line.contains("\"name\":")
-                && !first_line.contains("\"name\":null")
-                && !first_line.contains("\"name\":\"\"")
-            {
-                return true;
-            }
-            if first_line.contains("\"pinned\":true") {
-                return true;
+        // Inspect the session header (first line) for an explicit name or
+        // pinned marker. Read only that line, bounded: this runs once per
+        // session file during a sweep, and a session JSONL can be enormous --
+        // slurping a multi-gigabyte history to look at its first line would
+        // make `pi gc` cost time proportional to the data it is deciding
+        // whether to keep.
+        const MAX_HEADER_BYTES: u64 = 64 * 1024;
+        if let Ok(file) = fs::File::open(path) {
+            let mut first_line = String::new();
+            let mut reader = std::io::BufReader::new(file.take(MAX_HEADER_BYTES));
+            if reader.read_line(&mut first_line).is_ok() {
+                if first_line.contains("\"name\":")
+                    && !first_line.contains("\"name\":null")
+                    && !first_line.contains("\"name\":\"\"")
+                {
+                    return true;
+                }
+                if first_line.contains("\"pinned\":true") {
+                    return true;
+                }
             }
         }
 

@@ -39,6 +39,7 @@
 #   PERF_REMOTE_TARGET_DIR    Optional remote CARGO_TARGET_DIR prefix recorded in artifact staging manifests
 #   PERF_EVIDENCE_DIR         Optional repo-visible staged evidence root consumed by perf_budgets report generation
 #   PERF_EVIDENCE_DIRS        Optional path-list of additional staged evidence roots
+#   PERF_FAULT_INJECTION_ROOT Optional persistence-fault evidence root for hermetic runs
 #   PERF_MAX_BENCH_ENV_NOISE_SCORE  Maximum admissible benches/bench_env.rs score (default: 0)
 #   PERF_EVIDENCE_CACHE_DIR   Optional perf evidence cache directory (default: $CARGO_TARGET_DIR/perf/evidence_cache)
 #   PI_PERF_EVIDENCE_CACHE_TTL_HOURS
@@ -2489,6 +2490,7 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   PHASE1_MATRIX_PATH="$PHASE1_MATRIX_PATH" \
   PARAMETER_SWEEPS_PATH="$PARAMETER_SWEEPS_PATH" \
   OPPORTUNITY_MATRIX_PATH="$OPPORTUNITY_MATRIX_PATH" \
+  PERF_FAULT_INJECTION_ROOT="${PERF_FAULT_INJECTION_ROOT:-$PROJECT_ROOT/tests/e2e_results/persistence-fault-injection}" \
   python3 - <<'PY'
 import hashlib
 import json
@@ -2522,9 +2524,7 @@ stratification_path = output_dir / "results" / "extension_benchmark_stratificati
 baseline_path = output_dir / "results" / "baseline_variance_confidence.json"
 perf_sli_path = project_root / "docs" / "perf_sli_matrix.json"
 fault_injection_script = project_root / "scripts" / "e2e" / "run_persistence_fault_injection.sh"
-fault_injection_root = (
-    project_root / "tests" / "e2e_results" / "persistence-fault-injection"
-)
+fault_injection_root = Path(os.environ["PERF_FAULT_INJECTION_ROOT"])
 
 
 def load_json(path: Path):

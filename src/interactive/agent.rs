@@ -659,9 +659,9 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
     let summary = match tool_invocation_renderer(tool_name)? {
         ToolInvocationRenderer::Field(field) => clip(nonblank_str_arg(args, field)?, MAX),
         ToolInvocationRenderer::Search { pattern, scope } => {
-            let pattern = nonblank_str_arg(args, pattern)?;
+            let pattern = nonblank_str_arg(args, pattern)?.trim();
             match nonblank_str_arg(args, scope) {
-                Some(scope) => clip(&format!("{pattern} in {scope}"), MAX),
+                Some(scope) => clip(&format!("{pattern} in {}", scope.trim()), MAX),
                 _ => clip(pattern, MAX),
             }
         }
@@ -682,9 +682,9 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
         }
         ToolInvocationRenderer::Subagent => {
             if args.get("agent").is_some() || args.get("task").is_some() {
-                let task = nonblank_str_arg(args, "task")?;
+                let task = nonblank_str_arg(args, "task")?.trim();
                 match nonblank_str_arg(args, "agent") {
-                    Some(agent) => clip(&format!("{agent}: {task}"), MAX),
+                    Some(agent) => clip(&format!("{}: {task}", agent.trim()), MAX),
                     None => clip(task, MAX),
                 }
             } else if let Some(tasks) = args.get("tasks").and_then(serde_json::Value::as_array) {
@@ -4101,7 +4101,7 @@ mod tool_invocation_summary_coverage {
         assert_eq!(
             tool_invocation_summary(
                 "lsp",
-                &serde_json::json!({"action": "definition", "file": "src/main.rs"})
+                &serde_json::json!({"action": " definition ", "file": " src/main.rs "})
             )
             .as_deref(),
             Some("definition · src/main.rs")
@@ -4109,7 +4109,7 @@ mod tool_invocation_summary_coverage {
         assert_eq!(
             tool_invocation_summary(
                 "subagent",
-                &serde_json::json!({"agent": "reviewer", "task": "audit the patch"})
+                &serde_json::json!({"agent": " reviewer ", "task": " audit the patch "})
             )
             .as_deref(),
             Some("reviewer: audit the patch")
