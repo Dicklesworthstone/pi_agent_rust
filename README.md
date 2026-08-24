@@ -370,7 +370,9 @@ remains reachable:
   `debug`, `manage_skill` — plus the memory-bank tools (`retain`,
   `recall`, `reflect`, `memory_edit`, `learn`) when `memory.backend` is
   `local`
-- **`--tools` opt-in extras**: `jobs`, `hub`, `eval`, `github`
+- **Default-enabled**: `jobs` (background bash job control) and `hub` (PTY
+  service supervision), alongside the essential tier
+- **`--tools` opt-in extras**: `eval`, `github`, `security_scan`
 - **Opt-in only**: `subagent` (it can start additional coding-agent
   processes)
 
@@ -385,10 +387,11 @@ remains reachable:
 | `submit_plan` | Submit a completed plan for approval when plan mode is active |
 | `xdev` | Dispatcher exposing the discoverable tier (`list/describe/run/promote`) |
 | `ast_grep` / `ast_edit` | Structural code search and rewrite |
-| `lsp` / `debug` | Language-server (14 ops) and DAP debugging (28 ops) bridges |
+| `lsp` / `debug` | Language-server (14 ops) and DAP debugging (29 ops) bridges |
 | `eval` | Persistent Python and JS kernels with cell semantics |
 | `jobs` / `hub` | Background bash job control; PTY service supervision |
 | `github` | `gh`-backed PR/issue/run operations |
+| `security_scan` | Rule-pack security scanning to SARIF (`plan`/`run`/`disposition`/`compare`) |
 | `manage_skill` + memory tools | Managed skills CRUD; opt-in project memory bank |
 | `subagent` | Delegate isolated work to named Rust Pi child agents |
 
@@ -1462,7 +1465,7 @@ The algorithm runs automatically after each agent turn when estimated token usag
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Token estimation** uses a conservative `chars ÷ 4` heuristic for text and a flat 1,200 tokens per image. When an assistant message includes a `usage` field from the API, that measured value takes precedence over the heuristic.
+**Token estimation** counts tokens with real BPE tables (O200k/Cl100k, enabled by the default `bpe-tokens` feature); when BPE is unavailable it falls back to a conservative `chars ÷ 3` heuristic for text, plus a flat 1,200 tokens per image. When an assistant message includes a `usage` field from the API, that measured value takes precedence over the estimate.
 
 **Cut point selection** prefers boundaries between complete user-assistant turns. If the budget forces a mid-turn cut, the algorithm includes prefix messages from the split turn so the model retains context about what was being discussed at the boundary.
 
@@ -1630,7 +1633,7 @@ Mode changes are gated by sample coverage and risk checks, so Pi does not switch
 
 **Compatibility scanner**: Before loading, Pi statically analyzes extension source code for imports, `require()` calls, and forbidden patterns (`eval`, `Function()`, `process.binding`, `dlopen`). The scan produces a capability evidence ledger that informs policy decisions.
 
-**Environment variable filtering**: Extensions calling `pi.env()` hit a blocklist that denies access to API keys, credentials, tokens, and private keys. The filter blocks exact matches (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`), suffix patterns (`*_API_KEY`, `*_SECRET`, `*_TOKEN`), and prefix patterns (`AWS_SECRET_*`, `AWS_SESSION_*`). Only `PI_*` variables are unconditionally allowed.
+**Environment variable filtering**: Extensions calling `pi.env()` hit a blocklist that denies access to API keys, credentials, tokens, and private keys. The filter blocks exact matches (`ANTHROPIC_API_KEY`, `AWS_SECRET_ACCESS_KEY`), suffix patterns (`*_API_KEY`, `*_SECRET`, `*_TOKEN`), and prefix patterns (`AWS_SECRET_*`, `AWS_SESSION_*`). Variables whose names do not match any secret pattern — including most `PI_*` variables — are served normally; there is no unconditional `PI_*` exemption, so a name like `PI_EXAMPLE_API_KEY` is blocked by the suffix rule.
 
 **Trust lifecycle and kill switch**: Extension trust state is tracked explicitly (`pending`, `acknowledged`, `trusted`, `killed`). A kill switch demotes an extension to `killed`, quarantines it in the runtime risk controller, emits a critical alert, and writes an audit record. Lifting the switch requires an explicit operator action and moves the extension back to `acknowledged`.
 
