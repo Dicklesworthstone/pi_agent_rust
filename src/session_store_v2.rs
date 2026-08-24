@@ -3171,7 +3171,7 @@ impl SessionStoreV2 {
                 payload_value,
             )?;
         }
-        target_store.create_checkpoint(1, &format!("forked from checkpoint {checkpoint_seq}"))?;
+        target_store.create_checkpoint(1, "manual")?;
         Ok(target_dir.to_path_buf())
     }
 
