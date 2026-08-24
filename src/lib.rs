@@ -247,6 +247,8 @@ pub mod pi_wasm;
 pub mod plan;
 #[doc(hidden)]
 pub mod platform;
+#[doc(hidden)]
+pub mod pmu_telemetry;
 pub mod profiler;
 #[doc(hidden)]
 pub mod provider;

@@ -138,6 +138,7 @@ files = [
     "delight",
     "gallery",
     "chrome_tui_integration",
+    "pmu_telemetry",
     "session_store_v2_ux",
     "checkpoint",
     "eval",
