@@ -183,6 +183,8 @@ fixture_test!(test_generate_image_fixtures, "generate_image_tool");
 fixture_test!(test_tts_fixtures, "tts_tool");
 fixture_test!(test_computer_fixtures, "computer_tool");
 fixture_test!(test_browser_fixtures, "browser_tool");
+#[cfg(unix)]
+fixture_test!(test_subagent_fixtures, "subagent_tool");
 fixture_test!(test_ask_fixtures, "ask_tool");
 fixture_test!(test_todo_fixtures, "todo_tool");
 fixture_test!(test_jobs_fixtures, "jobs_tool");
@@ -251,6 +253,7 @@ fn test_all_fixtures_exist() {
         "tts_tool",
         "computer_tool",
         "browser_tool",
+        "subagent_tool",
         "ask_tool",
         "todo_tool",
         "jobs_tool",

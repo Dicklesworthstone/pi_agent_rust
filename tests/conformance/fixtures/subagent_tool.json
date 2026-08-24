@@ -1,0 +1,127 @@
+{
+  "version": "1.0",
+  "tool": "subagent",
+  "description": "SubagentTool v2 contract for bd-cv653.5.1, bd-cv653.5.2, and bd-cv653.8.1: a real hermetic child-protocol success, bounded parallel ordering, and mutually-exclusive request validation.",
+  "cases": [
+    {
+      "name": "subagent_single_runs_the_fixture_child_protocol",
+      "description": "a discovered project agent executes the stub child and returns the real v2 result envelope",
+      "requirement_ids": [
+        "SUBAGENT-V2-SINGLE-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": ".pi/agents/scout.md",
+          "content": "---\nname: scout\ndescription: Hermetic conformance scout\n---\nReturn the fixture result.\n"
+        },
+        {
+          "type": "create_file",
+          "path": "child-fixture.sh",
+          "content": "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"fixture child result\"}]}]}'\n"
+        },
+        {
+          "type": "run_command",
+          "command": "chmod 700 child-fixture.sh"
+        }
+      ],
+      "input": {
+        "agent": "scout",
+        "task": "inspect the fixture"
+      },
+      "expected": {
+        "content_contains": [
+          "## scout",
+          "fixture child result"
+        ],
+        "details": {
+          "schema": "pi.subagent.result.v2",
+          "mode": "single",
+          "sessionIsolation": "ephemeral_no_session",
+          "results": [
+            {
+              "agent": "scout",
+              "task": "inspect the fixture",
+              "status": "completed",
+              "output": "fixture child result"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "subagent_parallel_preserves_task_result_order",
+      "description": "two bounded parallel tasks settle through the same hermetic child while the returned array preserves request order",
+      "requirement_ids": [
+        "SUBAGENT-V2-PARALLEL-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": ".pi/agents/scout.md",
+          "content": "---\nname: scout\ndescription: Hermetic conformance scout\n---\nReturn the fixture result.\n"
+        },
+        {
+          "type": "create_file",
+          "path": "child-fixture.sh",
+          "content": "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"agent_end\",\"messages\":[{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"fixture child result\"}]}]}'\n"
+        },
+        {
+          "type": "run_command",
+          "command": "chmod 700 child-fixture.sh"
+        }
+      ],
+      "input": {
+        "tasks": [
+          {
+            "agent": "scout",
+            "task": "first fixture task"
+          },
+          {
+            "agent": "scout",
+            "task": "second fixture task"
+          }
+        ],
+        "concurrency": 2
+      },
+      "expected": {
+        "content_contains": [
+          "fixture child result"
+        ],
+        "details": {
+          "mode": "parallel",
+          "results": [
+            {
+              "task": "first fixture task",
+              "status": "completed"
+            },
+            {
+              "task": "second fixture task",
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "subagent_rejects_multiple_request_modes",
+      "description": "single and parallel forms are mutually exclusive and fail before discovery or child execution",
+      "requirement_ids": [
+        "SUBAGENT-V2-ERR-1"
+      ],
+      "input": {
+        "agent": "scout",
+        "task": "single",
+        "tasks": [
+          {
+            "agent": "scout",
+            "task": "parallel"
+          }
+        ]
+      },
+      "expect_error": true,
+      "error_contains": "Provide exactly one of agent+task, tasks, or chain",
+      "expected": {}
+    }
+  ]
+}
