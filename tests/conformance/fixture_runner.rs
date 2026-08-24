@@ -347,6 +347,80 @@ impl Tool for FixtureStreamRulesTool {
     }
 }
 
+/// Test-only adapter for the production MCP discovery and trust-gated call
+/// paths. The full stdio/HTTP fixture server remains covered by tests/mcp.rs.
+struct FixtureMcpClientTool {
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Tool for FixtureMcpClientTool {
+    fn name(&self) -> &str {
+        "mcp_client"
+    }
+
+    fn label(&self) -> &str {
+        "MCP client"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic adapter for MCP discovery and trust gates"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::network().union(pi::tools::ToolEffects::process())
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let manager = pi::mcp::McpManager::bootstrap(&self.cwd, &self.cwd.join("global"), &[])?;
+        let op = input.get("op").and_then(Value::as_str).unwrap_or("list");
+        let (text, details) = match op {
+            "list" => {
+                let servers = manager.list();
+                let details = json!({"op": "list", "servers": servers});
+                (serde_json::to_string_pretty(&details)?, details)
+            }
+            "call" => {
+                let server = input
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pi::error::Error::validation("MCP call requires server"))?;
+                let tool = input
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pi::error::Error::validation("MCP call requires tool"))?;
+                let result = manager
+                    .call_tool(
+                        server,
+                        tool,
+                        input.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                    )
+                    .await?;
+                (serde_json::to_string_pretty(&result)?, result)
+            }
+            other => {
+                return Err(pi::error::Error::validation(format!(
+                    "unknown MCP fixture operation {other:?}"
+                )));
+            }
+        };
+        Ok(pi::tools::ToolOutput {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -444,6 +518,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             cwd: temp_dir.path().to_path_buf(),
         }),
         "stream_rules" => Box::new(FixtureStreamRulesTool),
+        "mcp_client" => Box::new(FixtureMcpClientTool {
+            cwd: temp_dir.path().to_path_buf(),
+        }),
         "github" => {
             #[cfg(unix)]
             let gh_path = "/bin/sh";
