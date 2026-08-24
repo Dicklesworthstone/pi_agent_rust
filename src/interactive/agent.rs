@@ -492,7 +492,10 @@ enum ToolInvocationRenderer {
 fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
     use ToolInvocationRenderer::{Action, Field, Mcp, Questions, Search, Subagent};
 
-    if tool_name.starts_with("mcp__") {
+    if tool_name
+        .strip_prefix("mcp__")
+        .is_some_and(|mounted| !mounted.is_empty())
+    {
         return Some(Mcp);
     }
 
@@ -594,6 +597,10 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
+
+    fn nonblank_str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+        str_arg(args, key).filter(|value| !value.trim().is_empty())
+    }
     /// First non-blank line only, collapsed to at most `max` characters.
     /// Control characters (incl. ESC) are dropped so a hostile or binary
     /// command string can never inject escape sequences into the transcript
@@ -629,8 +636,16 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
         default_action: Option<&str>,
         max: usize,
     ) -> Option<String> {
-        let action = str_arg(args, action).or(default_action)?;
-        let detail = context.iter().find_map(|key| scalar_arg(args, key));
+        let action = match str_arg(args, action) {
+            Some(value) if !value.trim().is_empty() => value.trim(),
+            Some(_) => return None,
+            None => default_action?,
+        };
+        let detail = context
+            .iter()
+            .find_map(|key| scalar_arg(args, key))
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         Some(clip(
             &detail.map_or_else(
                 || action.to_string(),
@@ -642,11 +657,11 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
 
     const MAX: usize = 96;
     let summary = match tool_invocation_renderer(tool_name)? {
-        ToolInvocationRenderer::Field(field) => clip(str_arg(args, field)?, MAX),
+        ToolInvocationRenderer::Field(field) => clip(nonblank_str_arg(args, field)?, MAX),
         ToolInvocationRenderer::Search { pattern, scope } => {
-            let pattern = str_arg(args, pattern)?;
-            match str_arg(args, scope) {
-                Some(scope) if !scope.is_empty() => clip(&format!("{pattern} in {scope}"), MAX),
+            let pattern = nonblank_str_arg(args, pattern)?;
+            match nonblank_str_arg(args, scope) {
+                Some(scope) => clip(&format!("{pattern} in {scope}"), MAX),
                 _ => clip(pattern, MAX),
             }
         }
@@ -661,18 +676,26 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
                 .as_array()?
                 .first()?
                 .get("question")?
-                .as_str()?;
+                .as_str()
+                .filter(|question| !question.trim().is_empty())?;
             clip(question, MAX)
         }
         ToolInvocationRenderer::Subagent => {
-            if let Some(task) = str_arg(args, "task") {
-                match str_arg(args, "agent") {
+            if args.get("agent").is_some() || args.get("task").is_some() {
+                let task = nonblank_str_arg(args, "task")?;
+                match nonblank_str_arg(args, "agent") {
                     Some(agent) => clip(&format!("{agent}: {task}"), MAX),
                     None => clip(task, MAX),
                 }
             } else if let Some(tasks) = args.get("tasks").and_then(serde_json::Value::as_array) {
+                if tasks.is_empty() {
+                    return None;
+                }
                 format!("{} parallel tasks", tasks.len())
             } else if let Some(chain) = args.get("chain").and_then(serde_json::Value::as_array) {
+                if chain.is_empty() {
+                    return None;
+                }
                 format!("{} chained tasks", chain.len())
             } else {
                 return None;
@@ -2865,8 +2888,12 @@ mod tool_invocation_summary_tests {
     }
 
     #[test]
-    fn unknown_tools_and_missing_or_blank_args_yield_none() {
-        assert!(tool_invocation_summary("todo", &json!({"op": "view"})).is_none());
+    fn unknown_tools_and_missing_or_blank_args_are_handled_consistently() {
+        assert_eq!(
+            tool_invocation_summary("todo", &json!({"op": "view"})).as_deref(),
+            Some("view")
+        );
+        assert!(tool_invocation_summary("extension_owned", &json!({})).is_none());
         assert!(tool_invocation_summary("bash", &json!({})).is_none());
         assert!(tool_invocation_summary("bash", &json!({"command": "   \n  "})).is_none());
         assert!(tool_invocation_summary("bash", &json!({"command": 42})).is_none());
@@ -4004,6 +4031,10 @@ mod tool_invocation_summary_coverage {
             tool_invocation_renderer("extension_owned_tool").is_none(),
             "extension tools retain their custom/generic renderer bridge"
         );
+        assert!(
+            tool_invocation_renderer("mcp__").is_none(),
+            "the MCP namespace prefix alone is not a mounted tool"
+        );
     }
 
     #[test]
@@ -4094,5 +4125,20 @@ mod tool_invocation_summary_coverage {
         for name in ["ask", "todo", "web_search", "submit_plan", "xdev"] {
             assert!(tool_invocation_summary(name, &serde_json::json!({})).is_none());
         }
+        assert!(
+            tool_invocation_summary(
+                "lsp",
+                &serde_json::json!({"action": "   ", "file": "src/main.rs"})
+            )
+            .is_none()
+        );
+        assert!(
+            tool_invocation_summary(
+                "subagent",
+                &serde_json::json!({"agent": "reviewer", "task": "   "})
+            )
+            .is_none()
+        );
+        assert!(tool_invocation_summary("subagent", &serde_json::json!({"tasks": []})).is_none());
     }
 }

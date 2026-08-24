@@ -28,12 +28,16 @@
 //! performs both (fusion). Two hard constraints hold throughout:
 //!
 //! - **Policy is never moved, duplicated, or elided.** Authorization ordering
-//!   is a security property, not an optimization surface. A rule that would
-//!   reorder [`StageOp::Policy`] relative to [`StageOp::Dispatch`] is rejected
-//!   at construction by [`RewriteRule::is_policy_preserving`].
+//!   is a security property, not an optimization surface. Every rewrite is
+//!   checked by [`RewriteRule::is_policy_preserving`] *as it is applied*, which
+//!   compares the policy stage count, the opcodes, and the subtree beneath each
+//!   policy stage. That last comparison is what makes ordering — not merely
+//!   presence — preserved: a rewrite turning `dispatch(policy(x))` into
+//!   `policy(dispatch(x))` keeps the count and the opcodes, and is rejected
+//!   anyway.
 //! - **Saturation is bounded.** Rewrites run to a fixpoint or to an explicit
-//!   node/iteration budget, whichever comes first, so a pathological trace
-//!   cannot stall a hostcall.
+//!   iteration, node, or enumeration budget, whichever comes first, so a
+//!   pathological trace cannot stall a hostcall.
 //!
 //! # Failing closed
 //!
@@ -195,9 +199,31 @@ impl PlanExpr {
         out
     }
 
-    /// Whether the tree contains a policy stage.
-    fn has_policy(&self) -> bool {
-        self.op.is_policy() || self.children.iter().any(Self::has_policy)
+    /// Signature of the subtree under each policy stage, in encounter order.
+    ///
+    /// Children run before their parent, so whatever sits below a policy node
+    /// is exactly the work already done at the moment authorization happens.
+    /// Comparing these across a rewrite is what pins authorization *ordering*,
+    /// which a count alone cannot see.
+    fn policy_subtrees(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        self.collect_policy_subtrees(&mut out);
+        out
+    }
+
+    fn collect_policy_subtrees(&self, out: &mut Vec<String>) {
+        if self.op.is_policy() {
+            out.push(
+                self.children
+                    .iter()
+                    .map(Self::signature)
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        for child in &self.children {
+            child.collect_policy_subtrees(out);
+        }
     }
 
     /// Count of policy stages, so a rewrite cannot quietly duplicate one.
@@ -522,14 +548,29 @@ impl RewriteRule {
 
     /// Whether a rewrite leaves authorization behavior untouched.
     ///
-    /// Requires the policy stage count to be identical, not merely nonzero:
-    /// dropping one authorization and adding another elsewhere would keep a
-    /// boolean "has policy" check happy while changing what gets authorized.
+    /// Three things must hold, and each rules out a distinct way to break
+    /// authorization while looking harmless:
+    ///
+    /// 1. **The same opcodes execute.** Otherwise the plan authorizes one call
+    ///    and performs another.
+    /// 2. **The policy stage count is identical** — not merely still nonzero.
+    ///    Dropping one authorization and adding another elsewhere would satisfy
+    ///    a boolean "has policy?" test while changing what gets authorized.
+    /// 3. **Nothing below any policy stage changes.** Children execute before
+    ///    their parent, so the subtree under a policy node is exactly the work
+    ///    that already happened when authorization runs. Holding it fixed is
+    ///    what makes *ordering* preserved rather than merely presence: a
+    ///    rewrite turning `dispatch(policy(x))` into `policy(dispatch(x))`
+    ///    keeps the count and the opcodes but authorizes after dispatching, and
+    ///    check 3 is the one that catches it.
+    ///
+    /// Fusion above a policy stage is unaffected, which is where every rule in
+    /// [`rewrite_rules`] operates.
     #[must_use]
     pub fn is_policy_preserving(before: &PlanExpr, after: &PlanExpr) -> bool {
         before.policy_count() == after.policy_count()
-            && before.has_policy() == after.has_policy()
             && before.opcodes() == after.opcodes()
+            && before.policy_subtrees() == after.policy_subtrees()
     }
 }
 
@@ -1690,6 +1731,82 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_that_reorders_policy_past_dispatch_is_refused() {
+        // The attack a count check cannot see: same opcode, same number of
+        // policy stages, but authorization now happens AFTER dispatch instead
+        // of before it. Only comparing what sits below policy catches this.
+        let bad = RewriteRule {
+            id: "test_only_reorders_policy",
+            invariant: "deliberately unsound, for the guard test",
+            matcher: |expr| {
+                // dispatch(policy(x)) -> policy(dispatch(x))
+                if !matches!(expr.op, StageOp::Dispatch) {
+                    return None;
+                }
+                let inner = expr.children.first()?;
+                if !matches!(inner.op, StageOp::Policy) {
+                    return None;
+                }
+                let x = inner.children.first().cloned()?;
+                Some(PlanExpr::unary(
+                    StageOp::Policy,
+                    PlanExpr::unary(StageOp::Dispatch, x),
+                ))
+            },
+        };
+        let expr = PlanExpr::unary(
+            StageOp::Dispatch,
+            PlanExpr::unary(StageOp::Policy, opcode_leaf()),
+        );
+
+        // The matcher itself fires -- the shape does match ...
+        assert!(
+            (bad.matcher)(&expr).is_some(),
+            "matcher should match the shape"
+        );
+        // ... and the guard is what refuses it.
+        assert!(
+            bad.apply(&expr).is_none(),
+            "authorizing after dispatch is not an optimization"
+        );
+
+        // And the count check alone would have let it through, which is why
+        // the subtree check exists.
+        let reordered = (bad.matcher)(&expr).expect("matched");
+        assert_eq!(expr.policy_count(), reordered.policy_count());
+        assert_eq!(expr.opcodes(), reordered.opcodes());
+        assert_ne!(expr.policy_subtrees(), reordered.policy_subtrees());
+    }
+
+    #[test]
+    fn fusion_above_policy_is_still_allowed() {
+        // The ordering check must not be so strict that it blocks the rewrites
+        // this engine exists to find -- all of which operate above policy.
+        for rule in rewrite_rules() {
+            for plan in [
+                canonical_plan("tool.read"),
+                typed_plan_with_roundtrip("tool.read"),
+            ] {
+                for sub in subtrees(&plan) {
+                    if let Some(rewritten) = (rule.matcher)(&sub) {
+                        assert_eq!(
+                            sub.policy_subtrees(),
+                            rewritten.policy_subtrees(),
+                            "rule {} disturbed what sits below policy",
+                            rule.id
+                        );
+                        assert!(
+                            rule.apply(&sub).is_some(),
+                            "rule {} was wrongly refused by the guard",
+                            rule.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_rule_that_swaps_the_opcode_is_refused() {
         let bad = RewriteRule {
             id: "test_only_swaps_opcode",
@@ -1806,7 +1923,7 @@ mod tests {
             let decision = engine.optimize(&baseline);
             assert_eq!(decision.plan.policy_count(), baseline.policy_count());
             assert_eq!(decision.plan.opcodes(), baseline.opcodes());
-            assert!(decision.plan.has_policy(), "authorization survives");
+            assert!(decision.plan.policy_count() > 0, "authorization survives");
         }
     }
 
