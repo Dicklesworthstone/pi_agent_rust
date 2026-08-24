@@ -59,6 +59,7 @@ pub enum SlashCommand {
     RemoveDir,
     Crash,
     Btw,
+    Tan,
 }
 
 impl SlashCommand {
@@ -114,6 +115,7 @@ impl SlashCommand {
             "/add-dir" => Self::AddDir,
             "/remove-dir" => Self::RemoveDir,
             "/btw" => Self::Btw,
+            "/tan" => Self::Tan,
             "/crash" => Self::Crash,
             "/omfg" => Self::Omfg,
             "/commit" => Self::Commit,
@@ -159,6 +161,7 @@ impl SlashCommand {
   /remove-dir <dir>  - Revoke an additional workspace root immediately
   /crash [show|delete] - Inspect or clear redacted crash bundles
   /btw <question>    - Ephemeral side question on the smol role (never persisted)
+  /tan <work>        - Run tangential work in a background task-role child
   /omfg <complaint>  - Record user grievance and draft a candidate stream rule
   /commit [dry-run|all|bead] - Create dependency-ordered atomic commits from changes
   /review [target]   - Run prioritized code review on changes with ship verdict card
@@ -2356,6 +2359,7 @@ impl PiApp {
             SlashCommand::RemoveDir => self.handle_slash_remove_dir(args),
             SlashCommand::Crash => self.handle_slash_crash(args),
             SlashCommand::Btw => self.handle_slash_btw(args),
+            SlashCommand::Tan => self.handle_slash_tan(args),
             SlashCommand::Omfg => self.handle_slash_omfg(args),
             SlashCommand::Commit => self.handle_slash_commit(args),
             SlashCommand::Review => self.handle_slash_review(args),
@@ -3306,6 +3310,79 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             };
             let _ = crate::interactive::enqueue_pi_event(&event_tx, &Cx::for_request(), msg).await;
         });
+        self.scroll_to_bottom();
+        None
+    }
+
+    /// `/tan <work>` — run tangential work in a background task-role child
+    /// (bd-cv653.3.16). The command returns immediately; the child joins the
+    /// hub roster as `kind=tan`, renders a display-only completion card, and
+    /// queues its summary through the background-jobs follow-up seam for the
+    /// parent agent's next idle turn boundary.
+    pub(super) fn handle_slash_tan(&mut self, args: &str) -> Option<Cmd> {
+        enum TanGate {
+            Enabled,
+            Disabled,
+            Busy,
+        }
+
+        let work = args.trim().to_string();
+        if work.is_empty() {
+            self.status_message = Some("Usage: /tan <work>".to_string());
+            self.scroll_to_bottom();
+            return None;
+        }
+
+        let gate = self.agent.try_lock().map_or(TanGate::Busy, |agent| {
+            if agent.has_tool("subagent") {
+                TanGate::Enabled
+            } else {
+                TanGate::Disabled
+            }
+        });
+        match gate {
+            TanGate::Busy => {
+                self.status_message = Some("/tan unavailable: agent session is busy".to_string());
+                self.scroll_to_bottom();
+                return None;
+            }
+            TanGate::Disabled => {
+                self.status_message = Some(
+                    "/tan unavailable: enable the opt-in subagent tool with --tools ...subagent"
+                        .to_string(),
+                );
+                self.scroll_to_bottom();
+                return None;
+            }
+            TanGate::Enabled => {}
+        }
+
+        let tool = pi::subagents::SubagentTool::new(&self.cwd)
+            .with_role_model_spec(pi::app::subagent_role_spec(&self.config));
+        let runtime = self.runtime_handle.clone();
+        let event_tx = self.event_tx.clone();
+        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
+        let display_work = work.clone();
+        runtime.spawn(async move {
+            let card = match tool.run_background_tan(&work).await {
+                Ok(completion) => {
+                    pi::jobs::push_completion_notice(completion.follow_up_text());
+                    completion.card_text()
+                }
+                Err(err) => format!("(/tan failed)\n{err}"),
+            };
+            let _ =
+                crate::interactive::enqueue_pi_event(&event_tx, &task_cx, PiMsg::SystemNote(card))
+                    .await;
+        });
+
+        self.messages.push(ConversationMessage {
+            role: MessageRole::System,
+            content: format!("(/tan started) {display_work}"),
+            thinking: None,
+            collapsed: false,
+        });
+        self.status_message = Some("(/tan) running in background".to_string());
         self.scroll_to_bottom();
         None
     }
@@ -4410,6 +4487,11 @@ mod tests {
             super::SlashCommand::parse("/redo"),
             Some((super::SlashCommand::Redo, ""))
         ));
+        assert!(matches!(
+            super::SlashCommand::parse("/tan update the changelog"),
+            Some((super::SlashCommand::Tan, "update the changelog"))
+        ));
+        assert!(parse_extension_command("/tan inspect this").is_none());
     }
 
     #[test]

@@ -401,10 +401,10 @@ if [[ ${#SELECTED_SUITES[@]} -eq 0 ]]; then
             SELECTED_SUITES=("${ALL_SUITES[@]}")
             ;;
         focused)
-            SELECTED_SUITES=(e2e_extension_registration e2e_tools e2e_ast_tools)
+            SELECTED_SUITES=(btw_tan e2e_extension_registration e2e_tools e2e_ast_tools)
             ;;
         ci)
-            SELECTED_SUITES=(e2e_extension_registration e2e_ast_tools)
+            SELECTED_SUITES=(btw_tan e2e_extension_registration e2e_ast_tools)
             ;;
         quick)
             SELECTED_SUITES=()

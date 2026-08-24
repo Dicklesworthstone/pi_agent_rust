@@ -2155,6 +2155,10 @@
           "justification": "Subagent fan-out routing to task-role models over real processes (bd-cv653.3.1)."
         },
         {
+          "path": "tests/btw_tan.rs",
+          "justification": "Background /tan task-role child execution, automatic parent follow-up, TUI completion card, and session persistence (bd-cv653.3.16)."
+        },
+        {
           "path": "tests/e2e_url_read.rs",
           "justification": "URL reads: reader-mode conversion, SSRF denial, pagination (bd-cv653.2.2)."
         },

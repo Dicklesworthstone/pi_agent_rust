@@ -1552,6 +1552,15 @@ impl Agent {
         self.cached_tool_defs = None; // Invalidate cache when tools change
     }
 
+    /// Whether a tool implementation is enabled for this agent session.
+    ///
+    /// Interactive host commands use this to inherit opt-in tool gates
+    /// without exposing the registry itself.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.get(name).is_some()
+    }
+
     /// Queue a steering message (delivered after tool completion).
     pub fn queue_steering(&mut self, message: Message) -> u64 {
         self.message_queue.push_steering(message)

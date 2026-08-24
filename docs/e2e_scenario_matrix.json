@@ -971,6 +971,38 @@
       "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_subagent_roles"
     },
     {
+      "workflow_id": "wf-background-tan-side-channel",
+      "workflow_class": "success_path",
+      "workflow_title": "Background /tan task-role child completes and feeds the parent turn",
+      "status": "covered",
+      "vcr_mode": "vcr-only",
+      "vcr_mode_rationale": "Deterministic loopback mock providers and a local tmux TUI only; no live credentials or non-loopback network.",
+      "owner": "bd-cv653.3.16",
+      "provider_families": [
+        "provider-routing",
+        "core-runtime"
+      ],
+      "suite_ids": [
+        "btw_tan"
+      ],
+      "test_paths": [
+        "tests/btw_tan.rs"
+      ],
+      "sli_ids": [
+        "sli_e2e_turn_latency_p95_ms"
+      ],
+      "expected_artifacts": [
+        "output.log",
+        "result.json",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "summary.json",
+        "environment.json",
+        "evidence_contract.json"
+      ],
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite btw_tan"
+    },
+    {
       "workflow_id": "wf-url-read-reader-mode",
       "workflow_class": "success_path",
       "workflow_title": "URL reads with reader mode, SSRF denial, and pagination",

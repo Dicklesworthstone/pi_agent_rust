@@ -452,6 +452,13 @@ stderr details, and are killed/reaped if the parent is cancelled. Child agents
 receive the declared tool allowlist; the default child allowlist deliberately
 excludes `subagent` to prevent accidental recursive delegation.
 
+In interactive mode, `/tan <work>` starts the same task-role child machinery
+without interrupting the main conversation. The child runs in the current
+directory, appears in `hub agent roster` with `kind=tan`, and sends its bounded
+completion summary through the follow-up queue at the next idle turn boundary.
+Because `/tan` inherits the delegation safety gate, it is available only when
+the opt-in `subagent` tool is enabled.
+
 ### Session Management
 
 Sessions persist as JSONL files with full conversation history:
@@ -1724,6 +1731,7 @@ The interactive mode uses the **Elm Architecture** (Model-Update-View) via the `
 | `/resume` (`/r`), `/session` (`/info`), `/name`, `/history` | Session picker, info, naming, input history |
 | `/settings`, `/theme`, `/hotkeys` (`/keys`), `/changelog` | Settings UI, themes (incl. `auto`), keybindings, changelog |
 | `/plan`, `/approval`, `/advisor` | Plan mode, approval modes, second-model turn review |
+| `/btw <question>`, `/tan <work>` | Ephemeral smol-role side question; background task-role tangential work |
 | `/mcp`, `/usage`, `/rules`, `/omfg` | MCP server status, provider credit/quota, stream rules, grievances |
 | `/export`, `/share`, `/copy` (`/cp`) | HTML export, GitHub Gist share, copy last reply |
 | `/handoff`, `/commit`, `/review` | Handoff document, dependency-ordered commit splitting, review |

@@ -42,8 +42,66 @@ const STRUCTURED_BLOCK_OPEN: &str = "<subagent-structured-result>";
 const STRUCTURED_BLOCK_CLOSE: &str = "</subagent-structured-result>";
 const STRUCTURED_TRUNCATION_MARKER: &str = "…[truncated]";
 const DEFAULT_CHILD_TOOLS: &str = "read,bash,edit,write,grep,find,ls,hashline_edit";
+const TAN_RESULT_SCHEMA: &str = "pi.background-tan.result.v1";
+const TAN_AGENT_NAME: &str = "tan";
+const TAN_SYSTEM_PROMPT: &str = "You are a background tangential coding agent. Complete the assigned work autonomously in the current working directory. Keep your final response concise and lead with the concrete outcome, changed files, and verification performed. Do not ask follow-up questions.";
 
 type UpdateCallback = Arc<dyn Fn(ToolUpdate) + Send + Sync>;
+
+/// Settled result from an interactive `/tan` background child.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TanCompletion {
+    pub schema: &'static str,
+    pub hub_id: Option<String>,
+    pub task: String,
+    pub status: String,
+    pub output: String,
+    pub error: Option<String>,
+    pub is_error: bool,
+}
+
+impl TanCompletion {
+    fn from_result(result: SubagentResult) -> Self {
+        Self {
+            schema: TAN_RESULT_SCHEMA,
+            hub_id: result.hub_id,
+            task: result.task,
+            status: result.status.as_str().to_string(),
+            output: result.output,
+            error: result.error,
+            is_error: result.is_error,
+        }
+    }
+
+    /// Follow-up content delivered to the parent agent at its next idle turn
+    /// boundary. The bounded excerpt prevents a verbose child from consuming
+    /// the entire next-turn context.
+    #[must_use]
+    pub fn follow_up_text(&self) -> String {
+        let summary_source = if self.output.trim().is_empty() {
+            self.error.as_deref().unwrap_or("(no output)")
+        } else {
+            self.output.trim()
+        };
+        let summary = truncated_field(summary_source, 16 * 1024);
+        format!(
+            "[background tan {} settled: {}]\nwork: {}\nsummary:\n{}",
+            self.hub_id.as_deref().unwrap_or("unregistered"),
+            self.status,
+            self.task,
+            summary
+        )
+    }
+
+    /// Display-only completion card for the interactive transcript. The
+    /// authoritative model delivery is [`Self::follow_up_text`].
+    #[must_use]
+    pub fn card_text(&self) -> String {
+        let marker = if self.is_error { "failed" } else { "completed" };
+        format!("(/tan {marker})\n{}", self.follow_up_text())
+    }
+}
 
 /// A native tool that delegates bounded work to isolated Pi child processes.
 pub struct SubagentTool {
@@ -92,6 +150,48 @@ impl SubagentTool {
         self
     }
 
+    /// Run one built-in tangential child in the current working directory.
+    ///
+    /// This uses the same process, task-role, cancellation, transcript, and
+    /// hub machinery as the opt-in `subagent` tool while avoiding a required
+    /// user-authored agent definition for the `/tan` host command.
+    pub async fn run_background_tan(&self, task: &str) -> Result<TanCompletion> {
+        if current_subagent_depth() >= MAX_SUBAGENT_DEPTH {
+            return Err(Error::tool(
+                "subagent",
+                format!(
+                    "Refusing nested subagent depth above {MAX_SUBAGENT_DEPTH}; child agents are isolated by default and do not receive the subagent tool."
+                ),
+            ));
+        }
+        let task = task.trim();
+        if task.is_empty() {
+            return Err(Error::validation("/tan requires non-empty work"));
+        }
+
+        let definition = tan_agent_definition();
+        let agents = BTreeMap::from([(TAN_AGENT_NAME.to_string(), definition)]);
+        let request = SubagentTask {
+            agent: TAN_AGENT_NAME.to_string(),
+            task: task.to_string(),
+            cwd: Some(self.cwd.clone()),
+            isolation: None,
+            iso_apply: None,
+            output_schema: None,
+            schema_mode: SchemaMode::Permissive,
+        };
+        let result = ChildRunner::new(
+            self.cwd.clone(),
+            self.global_dir.clone(),
+            self.child_binary.clone(),
+            self.role_model_spec.clone(),
+            crate::agent_hub::ChildKind::Tan,
+        )
+        .run_one(&agents, request, None, None)
+        .await;
+        Ok(TanCompletion::from_result(result))
+    }
+
     #[cfg(test)]
     fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
         Self {
@@ -137,7 +237,13 @@ impl SubagentTool {
                         let role_spec = role_spec.clone();
                         let update = update.clone();
                         async move {
-                            let runner = ChildRunner::new(cwd, global_dir, binary, role_spec);
+                            let runner = ChildRunner::new(
+                                cwd,
+                                global_dir,
+                                binary,
+                                role_spec,
+                                crate::agent_hub::ChildKind::Subagent,
+                            );
                             (index, runner.run_one(&agents, task, None, update).await)
                         }
                     })
@@ -180,6 +286,7 @@ impl SubagentTool {
             self.global_dir.clone(),
             self.child_binary.clone(),
             self.role_model_spec.clone(),
+            crate::agent_hub::ChildKind::Subagent,
         )
         .run_one(agents, task, step, on_update)
         .await
@@ -464,6 +571,7 @@ enum AgentScope {
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AgentSource {
+    BuiltIn,
     User,
     Project,
 }
@@ -483,6 +591,21 @@ struct AgentDefinition {
     output_schema: Option<Value>,
     source: AgentSource,
     file_path: PathBuf,
+}
+
+fn tan_agent_definition() -> AgentDefinition {
+    AgentDefinition {
+        name: TAN_AGENT_NAME.to_string(),
+        description: "Background tangential coding agent".to_string(),
+        model: None,
+        reasoning: None,
+        tools: None,
+        skills: Vec::new(),
+        system_prompt: TAN_SYSTEM_PROMPT.to_string(),
+        output_schema: None,
+        source: AgentSource::BuiltIn,
+        file_path: PathBuf::from("<built-in:tan>"),
+    }
 }
 
 fn discover_agents_with_roots(
@@ -679,6 +802,7 @@ struct ChildRunner {
     global_dir: PathBuf,
     child_binary: PathBuf,
     role_model_spec: Option<String>,
+    hub_kind: crate::agent_hub::ChildKind,
 }
 
 impl ChildRunner {
@@ -687,12 +811,14 @@ impl ChildRunner {
         global_dir: PathBuf,
         child_binary: PathBuf,
         role_model_spec: Option<String>,
+        hub_kind: crate::agent_hub::ChildKind,
     ) -> Self {
         Self {
             cwd,
             global_dir,
             child_binary,
             role_model_spec,
+            hub_kind,
         }
     }
 
@@ -846,7 +972,10 @@ impl ChildRunner {
         let hub_entry = crate::agent_hub::registry()
             .lock()
             .ok()
-            .and_then(|mut reg| reg.register(&agent.name, &result.task).ok());
+            .and_then(|mut reg| {
+                reg.register_kind(&agent.name, &result.task, self.hub_kind)
+                    .ok()
+            });
         result.hub_id = hub_entry.as_ref().map(|entry| entry.id.clone());
         let update = on_update.as_ref();
         emit_progress(update, &result);
@@ -1254,6 +1383,18 @@ enum SubagentStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl SubagentStatus {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1770,6 +1911,63 @@ mod tests {
     }
 
     #[test]
+    fn tan_definition_uses_task_role_and_default_non_recursive_tools() {
+        let args = child_args(
+            &tan_agent_definition(),
+            "update the changelog",
+            Some("ai-router/gpt-5.6-terra"),
+            None,
+        )
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--model", "ai-router/gpt-5.6-terra"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--tools", DEFAULT_CHILD_TOOLS])
+        );
+        assert!(!args.iter().any(|arg| arg == "subagent"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--append-system-prompt", TAN_SYSTEM_PROMPT])
+        );
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("Task: update the changelog")
+        );
+    }
+
+    #[test]
+    fn tan_completion_has_bounded_follow_up_and_distinct_card_shape() {
+        let task = SubagentTask {
+            agent: TAN_AGENT_NAME.to_string(),
+            task: "update the changelog".to_string(),
+            cwd: None,
+            isolation: None,
+            iso_apply: None,
+            output_schema: None,
+            schema_mode: SchemaMode::default(),
+        };
+        let mut result = SubagentResult::unknown(task, None);
+        result.hub_id = Some("tan-7".to_string());
+        result.status = SubagentStatus::Completed;
+        result.output = "changelog updated".to_string();
+        result.error = None;
+        result.is_error = false;
+        let completion = TanCompletion::from_result(result);
+        assert_eq!(completion.schema, TAN_RESULT_SCHEMA);
+        assert_eq!(completion.hub_id.as_deref(), Some("tan-7"));
+        assert_eq!(
+            completion.follow_up_text(),
+            "[background tan tan-7 settled: completed]\nwork: update the changelog\nsummary:\nchangelog updated"
+        );
+        assert!(completion.card_text().starts_with("(/tan completed)\n"));
+    }
+
+    #[test]
     fn request_requires_exactly_one_mode_and_renders_chain_context() {
         let invalid: SubagentRequest = serde_json::from_value(json!({
             "agent": "scout", "task": "x", "tasks": [{"agent": "review", "task": "y"}]
@@ -2105,6 +2303,76 @@ printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"
             }),
             "missing child-process evidence: {output:?}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn background_tan_runs_child_and_registers_tan_hub_kind() {
+        let temp = TempDir::new().expect("tempdir");
+        let global_dir = temp.path().join("global");
+        let child = temp.path().join("tan-child-fixture.sh");
+        std::fs::write(
+            &child,
+            r#"#!/bin/sh
+sleep 1
+printf '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"tan fixture completed"}]}]}\n'
+"#,
+        )
+        .expect("write tan child fixture");
+        let mut permissions = std::fs::metadata(&child)
+            .expect("tan child metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&child, permissions).expect("make tan child executable");
+
+        let tool = SubagentTool::with_paths(temp.path().to_path_buf(), global_dir, child)
+            .with_role_model_spec(Some("test-provider/task-model".to_string()));
+        let task = format!("tan-fixture-{}", std::process::id());
+        let child_task = task.clone();
+        let handle = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("runtime build");
+            runtime
+                .block_on(tool.run_background_tan(&child_task))
+                .expect("tan child execution succeeds")
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let running_entry = loop {
+            let candidate = crate::agent_hub::registry()
+                .lock()
+                .expect("hub registry lock")
+                .roster()
+                .into_iter()
+                .find(|entry| {
+                    entry.task == task && entry.status == crate::agent_hub::ChildStatus::Running
+                });
+            if let Some(entry) = candidate {
+                break entry;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tan child never appeared in the running hub roster"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(running_entry.kind, crate::agent_hub::ChildKind::Tan);
+
+        let completion = handle.join().expect("join tan child thread");
+
+        assert!(!completion.is_error, "{completion:?}");
+        assert_eq!(completion.status, "completed");
+        assert!(completion.output.contains("tan fixture completed"));
+        let hub_id = completion.hub_id.expect("tan completion has hub id");
+        let entry = crate::agent_hub::registry()
+            .lock()
+            .expect("hub registry lock")
+            .get(&hub_id)
+            .expect("tan child remains in roster");
+        assert_eq!(entry.kind, crate::agent_hub::ChildKind::Tan);
+        assert_eq!(entry.status, crate::agent_hub::ChildStatus::Done);
+        assert_eq!(entry.task, task);
     }
 
     /// Write an executable stub child that emits `first` on its first run and

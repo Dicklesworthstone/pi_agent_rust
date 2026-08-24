@@ -969,6 +969,14 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
             description: "Show or manage stream rules",
         },
         BuiltinSlashCommand {
+            name: "btw",
+            description: "Ask an ephemeral side question on the smol role",
+        },
+        BuiltinSlashCommand {
+            name: "tan",
+            description: "Run tangential work in a background task-role child",
+        },
+        BuiltinSlashCommand {
             name: "omfg",
             description: "File a grievance and inject a stream rule",
         },
@@ -1368,6 +1376,13 @@ mod tests {
     fn builtin_slash_commands_contains_template() {
         let cmds = builtin_slash_commands();
         assert!(cmds.iter().any(|c| c.name == "template"));
+    }
+
+    #[test]
+    fn builtin_slash_commands_contains_side_channel_commands() {
+        let cmds = builtin_slash_commands();
+        assert!(cmds.iter().any(|c| c.name == "btw"));
+        assert!(cmds.iter().any(|c| c.name == "tan"));
     }
 
     #[test]

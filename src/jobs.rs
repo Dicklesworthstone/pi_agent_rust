@@ -43,6 +43,11 @@ const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 /// Bounded in-memory output tail kept per job for notices and `wait`.
 const OUTPUT_TAIL_BYTES: usize = 64 * 1024;
 
+/// Maximum undelivered completion notices across background job and `/tan`
+/// producers. The oldest notice is discarded first if a session never
+/// reaches another delivery boundary.
+const MAX_COMPLETION_NOTICES: usize = 64;
+
 /// How a background job settled (or is settling).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -438,10 +443,8 @@ fn monitor_job(id: &str, mut child: std::process::Child, timeout_secs: Option<u6
             )
         })
     };
-    if let Some(notice) = notice
-        && let Ok(mut reg) = registry().lock()
-    {
-        reg.notices.push(notice);
+    if let Some(notice) = notice {
+        push_completion_notice(notice);
     }
 }
 
@@ -560,13 +563,31 @@ pub fn take_completion_notices() -> Vec<Message> {
     };
     reg.notices
         .drain(..)
-        .map(|text| {
-            Message::User(UserMessage {
-                content: UserContent::Text(text),
-                timestamp: now_ms(),
-            })
-        })
+        .map(completion_notice_message)
         .collect()
+}
+
+fn completion_notice_message(text: String) -> Message {
+    Message::User(UserMessage {
+        content: UserContent::Text(text),
+        timestamp: now_ms(),
+    })
+}
+
+/// Enqueue a host-produced background completion for the existing follow-up delivery path.
+///
+/// `/tan` shares this seam with background bash jobs so queue
+/// modes, persistence, RPC behavior, and turn-boundary semantics stay
+/// identical.
+pub fn push_completion_notice(text: impl Into<String>) {
+    let Ok(mut reg) = registry().lock() else {
+        tracing::error!("jobs registry poisoned; dropping completion notice");
+        return;
+    };
+    if reg.notices.len() >= MAX_COMPLETION_NOTICES {
+        reg.notices.remove(0);
+    }
+    reg.notices.push(text.into());
 }
 
 /// Build the follow-up fetcher that delivers job completion notices into
@@ -619,6 +640,19 @@ mod tests {
         tail.push(b"world!");
         // "hello world!" is 12 bytes; the tail retains the last 8.
         assert_eq!(tail.text(), "o world!");
+    }
+
+    #[test]
+    fn host_completion_notice_uses_follow_up_message_shape() {
+        let marker = "[background tan tan-1 settled: completed]".to_string();
+        let message = completion_notice_message(marker.clone());
+        assert!(matches!(
+            message,
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == marker
+        ));
     }
 
     #[test]

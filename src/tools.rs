@@ -8313,9 +8313,10 @@ impl HubTool {
                         .iter()
                         .map(|e| {
                             format!(
-                                "{} [{}] {} (pid {}, {} bytes out)",
+                                "{} [{} kind={}] {} (pid {}, {} bytes out)",
                                 e.id,
                                 e.status.as_str(),
+                                e.kind.as_str(),
                                 e.task,
                                 e.pid
                                     .map_or_else(|| "n/a".to_string(), |pid| pid.to_string()),

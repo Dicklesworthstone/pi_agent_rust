@@ -42,6 +42,28 @@ pub enum ChildStatus {
     Killed,
 }
 
+/// Origin of a child run in the parent session.
+///
+/// Regular tool delegations remain `subagent`; `/tan` uses a distinct kind so
+/// roster consumers can identify background tangential work without parsing
+/// the child name or task text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChildKind {
+    Subagent,
+    Tan,
+}
+
+impl ChildKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Subagent => "subagent",
+            Self::Tan => "tan",
+        }
+    }
+}
+
 impl ChildStatus {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -73,6 +95,8 @@ pub struct ChildEntry {
     pub id: String,
     /// Agent definition name (e.g. `scout`).
     pub name: String,
+    /// Spawn surface (`subagent` tool or `/tan`).
+    pub kind: ChildKind,
     /// The task text (truncated for roster display).
     pub task: String,
     pub pid: Option<u32>,
@@ -157,12 +181,18 @@ impl AgentHubRegistry {
 
     /// Register a child at spawn time. Returns the assigned run id.
     pub fn register(&mut self, name: &str, task: &str) -> Result<ChildEntry> {
+        self.register_kind(name, task, ChildKind::Subagent)
+    }
+
+    /// Register a child with an explicit spawn kind.
+    pub fn register_kind(&mut self, name: &str, task: &str, kind: ChildKind) -> Result<ChildEntry> {
         self.seq = self.seq.saturating_add(1);
         let id = format!("{}-{}", sanitize_id(name), self.seq);
         let dir = self.dir()?;
         let entry = ChildEntry {
             id: id.clone(),
             name: name.to_string(),
+            kind,
             task: truncate_chars(task, 500),
             pid: None,
             status: ChildStatus::Starting,
@@ -324,7 +354,7 @@ impl AgentHubRegistry {
             prior.status.as_str(),
             tail
         );
-        let mut entry = self.register(&prior.name, &task)?;
+        let mut entry = self.register_kind(&prior.name, &task, prior.kind)?;
         entry.revived_from = Some(from_id.to_string());
         self.entries.insert(entry.id.clone(), entry.clone());
         Ok((entry, task))
@@ -444,6 +474,7 @@ mod tests {
         reg.dir = Some(temp.clone());
         let entry = reg.register("scout", "inspect the code").expect("register");
         assert_eq!(entry.status, ChildStatus::Starting);
+        assert_eq!(entry.kind, ChildKind::Subagent);
         reg.mark_running(&entry.id, 4242);
         assert_eq!(
             reg.get(&entry.id).expect("get").status,
@@ -453,6 +484,18 @@ mod tests {
         let settled = reg.get(&entry.id).expect("get");
         assert_eq!(settled.status, ChildStatus::Done);
         assert!(settled.finished_ms.is_some());
+        let tan = reg
+            .register_kind("tan", "update the changelog", ChildKind::Tan)
+            .expect("register tan");
+        let roster = reg.roster();
+        let tan_roster = roster
+            .iter()
+            .find(|candidate| candidate.id == tan.id)
+            .expect("tan appears in roster");
+        assert_eq!(tan_roster.kind, ChildKind::Tan);
+        assert_eq!(tan_roster.kind.as_str(), "tan");
+        let serialized = serde_json::to_value(tan_roster).expect("serialize roster entry");
+        assert_eq!(serialized["kind"], "tan");
         let _ = fs::remove_dir_all(&temp);
     }
 

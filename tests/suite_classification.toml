@@ -132,7 +132,6 @@ files = [
     "clean_release_commit",
     "web_remote",
     "web_security",
-    "btw_tan",
     "status_line",
     "markdown_rich",
     "overlay_system",
@@ -330,6 +329,7 @@ files = [
 [suite.e2e]
 files = [
     "agent_hub",
+    "btw_tan",
     "security_scan",
     "e2e_agent_loop",
     "e2e_ast_tools",
