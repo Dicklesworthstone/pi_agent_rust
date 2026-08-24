@@ -253,7 +253,11 @@ impl BocpdDetector {
         self.posterior = post.clamp(0.0, 1.0);
 
         // Adapt running estimate
-        let alpha = if self.posterior >= self.threshold { 0.8 } else { 0.15 };
+        let alpha = if self.posterior >= self.threshold {
+            0.8
+        } else {
+            0.15
+        };
         self.mean = (1.0 - alpha) * self.mean + alpha * value;
         self.var = (1.0 - alpha) * self.var + alpha * (diff * diff).max(1e-4);
 
@@ -271,7 +275,10 @@ pub fn analyze_series_drift(
     }
 
     let mut cusum = CusumDetector::new(config.cusum_k, config.cusum_h);
-    let mut bocpd = BocpdDetector::new(config.bocpd_hazard_lambda, config.bocpd_changepoint_threshold);
+    let mut bocpd = BocpdDetector::new(
+        config.bocpd_hazard_lambda,
+        config.bocpd_changepoint_threshold,
+    );
 
     let mut latest_val = 0.0;
     let mut final_upper = 0.0;
@@ -306,12 +313,18 @@ pub fn analyze_series_drift(
     } else if bocpd_alarm {
         (
             "REGIME_SHIFT".to_string(),
-            format!("Regime Shift: sudden change-point detected by BOCPD (posterior p={bocpd_prob:.2} >= {})", config.bocpd_changepoint_threshold),
+            format!(
+                "Regime Shift: sudden change-point detected by BOCPD (posterior p={bocpd_prob:.2} >= {})",
+                config.bocpd_changepoint_threshold
+            ),
         )
     } else if cusum_alarm {
         (
             "DRIFT_WARNING".to_string(),
-            format!("Drift Warning: persistent CUSUM trend accumulating (upper={final_upper:.2}, lower={final_lower:.2} >= {})", config.cusum_h),
+            format!(
+                "Drift Warning: persistent CUSUM trend accumulating (upper={final_upper:.2}, lower={final_lower:.2} >= {})",
+                config.cusum_h
+            ),
         )
     } else {
         (
@@ -350,8 +363,12 @@ impl std::fmt::Display for DriftIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidCount(name, cnt) => write!(f, "zero samples in budget {name}: {cnt}"),
-            Self::InvalidProb(name, p) => write!(f, "invalid BOCPD probability {p} in budget {name}"),
-            Self::UnknownStatus(name, st) => write!(f, "unknown drift status {st} in budget {name}"),
+            Self::InvalidProb(name, p) => {
+                write!(f, "invalid BOCPD probability {p} in budget {name}")
+            }
+            Self::UnknownStatus(name, st) => {
+                write!(f, "unknown drift status {st} in budget {name}")
+            }
         }
     }
 }
@@ -391,11 +408,17 @@ pub fn verify_drift_artifact(
 
     for analysis in &artifact.analyses {
         if analysis.sample_count == 0 {
-            issues.push(DriftIssue::InvalidCount(&analysis.budget_name, analysis.sample_count));
+            issues.push(DriftIssue::InvalidCount(
+                &analysis.budget_name,
+                analysis.sample_count,
+            ));
         }
 
         if analysis.bocpd_changepoint_prob < 0.0 || analysis.bocpd_changepoint_prob > 1.0 {
-            issues.push(DriftIssue::InvalidProb(&analysis.budget_name, analysis.bocpd_changepoint_prob));
+            issues.push(DriftIssue::InvalidProb(
+                &analysis.budget_name,
+                analysis.bocpd_changepoint_prob,
+            ));
         }
 
         match analysis.drift_status.as_str() {
@@ -466,10 +489,26 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
     let text = fs::read_to_string(contract_path)?;
     let val: serde_json::Value = serde_json::from_str(&text)?;
 
-    assert_eq!(val.get("schema").and_then(|v| v.as_str()), Some(DRIFT_WATCH_CONTRACT_SCHEMA));
-    assert_eq!(val.get("bead_id").and_then(|v| v.as_str()), Some("bd-sog97.14"));
-    assert_eq!(val.get("detector_parameters").and_then(|dp| dp.get("cusum_k")).and_then(|k| k.as_f64()), Some(0.5));
-    assert_eq!(val.get("detector_parameters").and_then(|dp| dp.get("cusum_h")).and_then(|h| h.as_f64()), Some(4.0));
+    assert_eq!(
+        val.get("schema").and_then(|v| v.as_str()),
+        Some(DRIFT_WATCH_CONTRACT_SCHEMA)
+    );
+    assert_eq!(
+        val.get("bead_id").and_then(|v| v.as_str()),
+        Some("bd-sog97.14")
+    );
+    assert_eq!(
+        val.get("detector_parameters")
+            .and_then(|dp| dp.get("cusum_k"))
+            .and_then(|k| k.as_f64()),
+        Some(0.5)
+    );
+    assert_eq!(
+        val.get("detector_parameters")
+            .and_then(|dp| dp.get("cusum_h"))
+            .and_then(|h| h.as_f64()),
+        Some(4.0)
+    );
 
     Ok(())
 }
@@ -481,7 +520,10 @@ fn cusum_detector_healthy_on_stationary_noise() {
     for i in 0..50 {
         let val = 100.0 + ((i % 5) as f64 - 2.0) * 0.5;
         let (_u, _l, alarmed) = detector.observe(val);
-        assert!(!alarmed, "stationary oscillations should not trigger CUSUM alarm at step {i}");
+        assert!(
+            !alarmed,
+            "stationary oscillations should not trigger CUSUM alarm at step {i}"
+        );
     }
 }
 
@@ -501,7 +543,10 @@ fn cusum_detector_alarms_on_persistent_drift() {
             break;
         }
     }
-    assert!(alarmed, "persistent upward drift should trigger CUSUM alarm");
+    assert!(
+        alarmed,
+        "persistent upward drift should trigger CUSUM alarm"
+    );
 }
 
 #[test]
@@ -520,7 +565,10 @@ fn two_sided_cusum_detects_downward_drift() {
             break;
         }
     }
-    assert!(alarmed, "persistent downward drift should trigger lower CUSUM alarm");
+    assert!(
+        alarmed,
+        "persistent downward drift should trigger lower CUSUM alarm"
+    );
 }
 
 #[test]
@@ -536,7 +584,10 @@ fn bocpd_detector_alarms_on_sudden_regime_shift() {
     let (prob3, a3) = detector.observe(125.0);
 
     let max_prob = prob1.max(prob2).max(prob3);
-    assert!(a1 || a2 || a3 || max_prob >= 0.5, "sudden shift should trigger BOCPD change-point alert (max prob = {max_prob})");
+    assert!(
+        a1 || a2 || a3 || max_prob >= 0.5,
+        "sudden shift should trigger BOCPD change-point alert (max prob = {max_prob})"
+    );
 }
 
 #[test]
@@ -588,7 +639,11 @@ fn live_drift_watch_artifact_passes_verification() -> Result<()> {
 
     let report = verify_drift_artifact(&artifact, contract_path);
     assert_eq!(report.status, "pass");
-    assert!(report.errors.is_empty(), "expected 0 errors, got {:?}", report.errors);
+    assert!(
+        report.errors.is_empty(),
+        "expected 0 errors, got {:?}",
+        report.errors
+    );
     assert_eq!(report.evaluated_budgets, 6);
 
     Ok(())
@@ -628,4 +683,3 @@ fn tamper_detection_in_drift_artifact() -> Result<()> {
 
     Ok(())
 }
-

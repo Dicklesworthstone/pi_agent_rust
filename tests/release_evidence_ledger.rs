@@ -237,7 +237,10 @@ pub fn verify_ledger(
 #[test]
 fn contract_file_matches_schema_and_policy() -> Result<(), Box<dyn Error>> {
     let contract_path = repo_root().join("docs/contracts/release-evidence-ledger-contract.json");
-    assert!(contract_path.exists(), "release evidence contract file must exist");
+    assert!(
+        contract_path.exists(),
+        "release evidence contract file must exist"
+    );
 
     let text = std::fs::read_to_string(&contract_path)?;
     let contract: Value = serde_json::from_str(&text)?;
@@ -272,13 +275,20 @@ fn contract_file_matches_schema_and_policy() -> Result<(), Box<dyn Error>> {
 fn live_ledger_file_passes_verification() -> Result<(), Box<dyn Error>> {
     let root = repo_root();
     let ledger_path = root.join("docs/evidence/release-evidence-ledger.json");
-    assert!(ledger_path.exists(), "release evidence ledger file must exist");
+    assert!(
+        ledger_path.exists(),
+        "release evidence ledger file must exist"
+    );
 
     let text = std::fs::read_to_string(&ledger_path)?;
     let ledger: ReleaseEvidenceLedgerArtifact = serde_json::from_str(&text)?;
 
     let report = verify_ledger(&ledger, &root);
-    assert_eq!(report.status, "pass", "ledger verification must pass: {:?}", report.errors);
+    assert_eq!(
+        report.status, "pass",
+        "ledger verification must pass: {:?}",
+        report.errors
+    );
     assert!(report.errors.is_empty());
     assert!(report.entry_count > 0, "ledger must contain entries");
     Ok(())
@@ -292,13 +302,19 @@ fn tamper_detection_checksum_mutation() -> Result<(), Box<dyn Error>> {
     let mut ledger: ReleaseEvidenceLedgerArtifact = serde_json::from_str(&text)?;
 
     if let Some(first) = ledger.entries.get_mut(0) {
-        first.sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
+        first.sha256 =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string();
     }
 
     let report = verify_ledger(&ledger, &root);
     assert_eq!(report.status, "fail");
     assert!(!report.errors.is_empty());
-    assert!(report.errors.iter().any(|e| e.contains("entry_hash mismatch") || e.contains("checksum mismatch")));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("entry_hash mismatch") || e.contains("checksum mismatch"))
+    );
     Ok(())
 }
 
@@ -310,11 +326,17 @@ fn tamper_detection_prev_hash_disruption() -> Result<(), Box<dyn Error>> {
     let mut ledger: ReleaseEvidenceLedgerArtifact = serde_json::from_str(&text)?;
 
     if let Some(third) = ledger.entries.get_mut(2) {
-        third.prev_hash = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
+        third.prev_hash =
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string();
     }
     let report = verify_ledger(&ledger, &root);
     assert_eq!(report.status, "fail");
-    assert!(report.errors.iter().any(|e| e.contains("hash chain broken")));
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("hash chain broken"))
+    );
     Ok(())
 }
 
@@ -329,7 +351,12 @@ fn tamper_detection_swapped_entries() -> Result<(), Box<dyn Error>> {
         ledger.entries.swap(1, 2);
         let report = verify_ledger(&ledger, &root);
         assert_eq!(report.status, "fail");
-        assert!(report.errors.iter().any(|e| e.contains("entry index mismatch") || e.contains("hash chain broken")));
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("entry index mismatch") || e.contains("hash chain broken"))
+        );
     }
     Ok(())
 }

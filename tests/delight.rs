@@ -5,7 +5,7 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::delight::{
-    compute_shimmer_intensity, format_terminal_title, render_sparkline, FireworksState, ShimmerMode,
+    FireworksState, ShimmerMode, compute_shimmer_intensity, format_terminal_title, render_sparkline,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {

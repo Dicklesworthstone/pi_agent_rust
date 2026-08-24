@@ -13,6 +13,42 @@ use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
+/// Hermetic provider for reflect fixtures: no auth, network, or model registry.
+struct FixtureReflectProvider;
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl pi::provider::Provider for FixtureReflectProvider {
+    fn name(&self) -> &str {
+        "fixture-reflect"
+    }
+
+    fn api(&self) -> &str {
+        "fixture"
+    }
+
+    fn model_id(&self) -> &str {
+        "fixture-reflect-v1"
+    }
+
+    async fn stream(
+        &self,
+        _context: &pi::provider::Context<'_>,
+        _options: &pi::provider::StreamOptions,
+    ) -> pi::error::Result<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+        >,
+    > {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(
+            pi::model::StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "Fixture synthesis cites memory [1].".to_string(),
+            },
+        )])))
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -93,6 +129,94 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "todo" => Box::new(pi::todo::TodoTool::new(std::sync::Arc::new(
             asupersync::sync::Mutex::new(pi::session::Session::in_memory()),
         ))),
+        "jobs" => Box::new(pi::tools::JobsTool),
+        "hub" => Box::new(pi::tools::HubTool::new(temp_dir.path())),
+        "eval" => Box::new(pi::eval::EvalTool::new(temp_dir.path())),
+        "github" => {
+            #[cfg(unix)]
+            let gh_path = "/bin/sh";
+            #[cfg(not(unix))]
+            let gh_path = "cmd";
+            Box::new(pi::github::GithubTool::new(temp_dir.path(), Some(gh_path)))
+        }
+        "retain" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::RetainTool::new(std::sync::Arc::new(store)))
+        }
+        "recall" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::RecallTool::new(std::sync::Arc::new(store)))
+        }
+        "memory_edit" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::MemoryEditTool::new(std::sync::Arc::new(store)))
+        }
+        "reflect" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::ReflectTool::with_provider(
+                std::sync::Arc::new(store),
+                std::sync::Arc::new(FixtureReflectProvider),
+            ))
+        }
+        "learn" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::tools::LearnTool::new(std::sync::Arc::new(store)))
+        }
+        "submit_plan" => {
+            let state = pi::plan::PlanState::new();
+            let initial_mode = case
+                .setup
+                .iter()
+                .find_map(|step| match step {
+                    SetupStep::SetPlanMode { mode } => Some(mode.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("planning");
+            if initial_mode == "planning" {
+                state.enter_planning();
+            }
+            Box::new(pi::plan::SubmitPlanTool::new(state, false))
+        }
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
@@ -465,6 +589,10 @@ fn command_value(command: Option<&Commands>) -> Value {
             "view_only": view_only,
             "max_viewers": max_viewers,
         }),
+        Some(Commands::Gallery { format }) => json!({
+            "name": "gallery",
+            "format": format,
+        }),
         Some(Commands::Migrate { path, dry_run }) => json!({
             "name": "migrate",
             "path": path,
@@ -700,6 +828,37 @@ fn run_setup_steps(steps: &[SetupStep], dir: &Path) -> Result<(), String> {
                     return Err(format!("Setup command failed: {stderr}"));
                 }
             }
+            SetupStep::RetainMemory {
+                content,
+                kind,
+                tags,
+            } => {
+                let kind = match kind.trim().to_ascii_lowercase().as_str() {
+                    "fact" => pi::memory::MemoryKind::Fact,
+                    "lesson" => pi::memory::MemoryKind::Lesson,
+                    "preference" => pi::memory::MemoryKind::Preference,
+                    "decision" => pi::memory::MemoryKind::Decision,
+                    other => {
+                        return Err(format!(
+                            "Unknown setup memory kind '{other}'; expected fact, lesson, \
+                             preference, or decision"
+                        ));
+                    }
+                };
+                let store = pi::memory::MemoryStore::open(dir)
+                    .map_err(|error| format!("Failed to open setup memory store: {error}"))?;
+                store
+                    .retain(kind, content, tags, None)
+                    .map_err(|error| format!("Failed to retain setup memory: {error}"))?;
+            }
+            SetupStep::SetPlanMode { mode } => match mode.as_str() {
+                "off" | "planning" => {}
+                other => {
+                    return Err(format!(
+                        "Unknown setup plan mode '{other}'; expected off or planning"
+                    ));
+                }
+            },
         }
     }
     Ok(())

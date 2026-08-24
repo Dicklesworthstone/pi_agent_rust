@@ -202,9 +202,17 @@ pub fn evaluate_gated_series(
         };
 
         let budget_verdict = if comparison == "minimum" {
-            if p95 >= threshold { "PASS".to_string() } else { "FAIL".to_string() }
+            if p95 >= threshold {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            }
         } else {
-            if p95 <= threshold { "PASS".to_string() } else { "FAIL".to_string() }
+            if p95 <= threshold {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            }
         };
 
         GatedBudgetResult {
@@ -233,9 +241,18 @@ impl std::fmt::Display for VarianceIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidSchema(b, s) => write!(f, "invalid topology schema for {b}: {s}"),
-            Self::NotRejected(b, score, max) => write!(f, "budget {b} with noise_score {score} > {max} was not REJECTED_NO_DATA"),
-            Self::HasEmpiricalValue(b, score) => write!(f, "budget {b} with noise_score {score} has empirical_value, violating no-averaging invariant"),
-            Self::CleanRejected(b, score, max) => write!(f, "clean budget {b} with noise_score {score} <= {max} was rejected"),
+            Self::NotRejected(b, score, max) => write!(
+                f,
+                "budget {b} with noise_score {score} > {max} was not REJECTED_NO_DATA"
+            ),
+            Self::HasEmpiricalValue(b, score) => write!(
+                f,
+                "budget {b} with noise_score {score} has empirical_value, violating no-averaging invariant"
+            ),
+            Self::CleanRejected(b, score, max) => write!(
+                f,
+                "clean budget {b} with noise_score {score} <= {max} was rejected"
+            ),
         }
     }
 }
@@ -266,7 +283,10 @@ pub fn verify_variance_artifact(
 
     for r in &artifact.results {
         if r.environment.schema != HOST_TOPOLOGY_SCHEMA {
-            issues.push(VarianceIssue::InvalidSchema(&r.budget_name, &r.environment.schema));
+            issues.push(VarianceIssue::InvalidSchema(
+                &r.budget_name,
+                &r.environment.schema,
+            ));
         }
 
         if r.environment.noise_score > artifact.max_admissible_noise_score {
@@ -380,7 +400,11 @@ fn main() -> Result<()> {
                 accepted_count,
                 rejected_noise_count: rejected_count,
                 results,
-                overall_status: if rejected_count == 0 { "PASS".to_string() } else { "REJECTED_NO_DATA".to_string() },
+                overall_status: if rejected_count == 0 {
+                    "PASS".to_string()
+                } else {
+                    "REJECTED_NO_DATA".to_string()
+                },
             };
 
             let json_out = serde_json::to_string_pretty(&artifact)?;
@@ -397,8 +421,9 @@ fn main() -> Result<()> {
             );
         }
         CommandMode::Verify(args) => {
-            let artifact_text = fs::read_to_string(&args.input)
-                .with_context(|| format!("failed to read artifact from {}", args.input.display()))?;
+            let artifact_text = fs::read_to_string(&args.input).with_context(|| {
+                format!("failed to read artifact from {}", args.input.display())
+            })?;
             let artifact: VarianceGateArtifact = serde_json::from_str(&artifact_text)?;
             let report = verify_variance_artifact(&artifact, &args.contract);
             println!("{}", serde_json::to_string_pretty(&report)?);

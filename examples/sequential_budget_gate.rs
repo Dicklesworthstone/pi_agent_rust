@@ -35,7 +35,10 @@ struct EvaluateArgs {
     #[arg(long, default_value = "docs/evidence/nrun-measurement-series.json")]
     input: PathBuf,
     /// Output path for the sequential evaluation artifact.
-    #[arg(long, default_value = "docs/evidence/sequential-budget-gate-evaluations.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/sequential-budget-gate-evaluations.json"
+    )]
     output: PathBuf,
     /// Type I error budget (alpha).
     #[arg(long, default_value_t = DEFAULT_ALPHA)]
@@ -48,10 +51,16 @@ struct EvaluateArgs {
 #[derive(Debug, Args)]
 struct VerifyArgs {
     /// Path to the sequential budget evaluation artifact.
-    #[arg(long, default_value = "docs/evidence/sequential-budget-gate-evaluations.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/sequential-budget-gate-evaluations.json"
+    )]
     input: PathBuf,
     /// Contract path for protocol rules.
-    #[arg(long, default_value = "docs/contracts/sequential-budget-gate-contract.json")]
+    #[arg(
+        long,
+        default_value = "docs/contracts/sequential-budget-gate-contract.json"
+    )]
     contract: PathBuf,
 }
 
@@ -173,7 +182,10 @@ pub fn run_sequential_test(
     max_steps: usize,
 ) -> Result<SequentialBudgetResult> {
     if series.samples.is_empty() {
-        bail!("cannot run sequential test on empty series {}", series.budget_name);
+        bail!(
+            "cannot run sequential test on empty series {}",
+            series.budget_name
+        );
     }
 
     let e_pass_threshold = 1.0 / alpha.clamp(0.0001, 0.5);
@@ -187,8 +199,12 @@ pub fn run_sequential_test(
 
     for (step_idx, sample) in series.samples.iter().enumerate() {
         let step = step_idx + 1;
-        let step_log_lr =
-            compute_step_log_lr(sample.raw_value, sample.weight, series.threshold, &series.comparison);
+        let step_log_lr = compute_step_log_lr(
+            sample.raw_value,
+            sample.weight,
+            series.threshold,
+            &series.comparison,
+        );
 
         log_e = (log_e + step_log_lr).clamp(-100.0, 100.0);
         let e_val = log_e.exp();
@@ -232,7 +248,15 @@ pub fn run_sequential_test(
     let trajectory = intermediate_traces
         .into_iter()
         .map(
-            |(step, sample_value, weight, log_likelihood_ratio, accumulated_log_e, e_value, decision)| {
+            |(
+                step,
+                sample_value,
+                weight,
+                log_likelihood_ratio,
+                accumulated_log_e,
+                e_value,
+                decision,
+            )| {
                 SequentialStepTrace {
                     step,
                     sample_value,
@@ -271,7 +295,10 @@ impl std::fmt::Display for SeqIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEValue(name, val) => write!(f, "invalid e-value {val} in budget {name}"),
-            Self::VerdictMismatch(name, expected, recorded) => write!(f, "verdict mismatch for {name}: expected {expected}, recorded {recorded}"),
+            Self::VerdictMismatch(name, expected, recorded) => write!(
+                f,
+                "verdict mismatch for {name}: expected {expected}, recorded {recorded}"
+            ),
             Self::TrajectoryEmpty(name) => write!(f, "empty trajectory for budget {name}"),
         }
     }
@@ -319,7 +346,10 @@ pub fn verify_sequential_artifact(
         }
 
         if eval.final_e_value.is_nan() || eval.final_e_value < 0.0 {
-            issues.push(SeqIssue::InvalidEValue(&eval.budget_name, eval.final_e_value));
+            issues.push(SeqIssue::InvalidEValue(
+                &eval.budget_name,
+                eval.final_e_value,
+            ));
         }
 
         let expected_verdict = match eval.decision.as_str() {
@@ -329,7 +359,11 @@ pub fn verify_sequential_artifact(
         };
 
         if eval.final_verdict != expected_verdict {
-            issues.push(SeqIssue::VerdictMismatch(&eval.budget_name, expected_verdict, &eval.final_verdict));
+            issues.push(SeqIssue::VerdictMismatch(
+                &eval.budget_name,
+                expected_verdict,
+                &eval.final_verdict,
+            ));
         }
 
         if eval.final_verdict == "PASS" {
@@ -435,9 +469,11 @@ fn main() -> Result<()> {
             );
         }
         CommandMode::Verify(args) => {
-            let artifact_text = fs::read_to_string(&args.input)
-                .with_context(|| format!("failed to read artifact from {}", args.input.display()))?;
-            let artifact: SequentialBudgetEvaluationArtifact = serde_json::from_str(&artifact_text)?;
+            let artifact_text = fs::read_to_string(&args.input).with_context(|| {
+                format!("failed to read artifact from {}", args.input.display())
+            })?;
+            let artifact: SequentialBudgetEvaluationArtifact =
+                serde_json::from_str(&artifact_text)?;
             let report = verify_sequential_artifact(&artifact, &args.contract);
             println!("{}", serde_json::to_string_pretty(&report)?);
             if report.status != "pass" {

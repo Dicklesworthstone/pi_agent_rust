@@ -1,0 +1,79 @@
+{
+  "version": "1.0",
+  "tool": "memory_edit",
+  "description": "MemoryEditTool contract for bd-cv653.4.1 and bd-cv653.8.1: audited update, required replacement content, and named unknown-id refusal.",
+  "cases": [
+    {
+      "name": "memory_edit_updates_seeded_memory",
+      "description": "update replaces the seeded row and returns the versioned edit envelope",
+      "requirement_ids": [
+        "MEM-EDIT-1"
+      ],
+      "setup": [
+        {
+          "type": "retain_memory",
+          "content": "Original memory content.",
+          "kind": "fact"
+        }
+      ],
+      "input": {
+        "id": 1,
+        "op": "update",
+        "content": "Corrected memory content."
+      },
+      "expected": {
+        "content_exact": "Memory 1 updated.",
+        "details_exact": {
+          "schema": "pi.memory.v1",
+          "id": 1,
+          "op": "update"
+        }
+      }
+    },
+    {
+      "name": "memory_edit_update_requires_content",
+      "description": "update refuses a missing replacement while preserving the seeded row",
+      "requirement_ids": [
+        "MEM-EDIT-2"
+      ],
+      "setup": [
+        {
+          "type": "retain_memory",
+          "content": "Preserve this memory.",
+          "kind": "fact"
+        }
+      ],
+      "input": {
+        "id": 1,
+        "op": "update"
+      },
+      "expected": {
+        "content_contains": [
+          "memory_edit update requires content"
+        ],
+        "details_contains": [
+          "memory_edit update requires content"
+        ]
+      }
+    },
+    {
+      "name": "memory_edit_names_unknown_id",
+      "description": "an absent id returns the stable PI_MEMORY_UNKNOWN_ID taxonomy",
+      "requirement_ids": [
+        "MEM-EDIT-ERR-1"
+      ],
+      "input": {
+        "id": 999,
+        "op": "invalidate"
+      },
+      "expected": {
+        "content_contains": [
+          "PI_MEMORY_UNKNOWN_ID: no memory with id 999"
+        ],
+        "details_contains": [
+          "PI_MEMORY_UNKNOWN_ID: no memory with id 999"
+        ]
+      }
+    }
+  ]
+}

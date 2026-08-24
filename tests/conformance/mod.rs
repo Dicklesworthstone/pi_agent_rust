@@ -97,6 +97,17 @@ pub enum SetupStep {
     /// Run a command
     #[serde(rename = "run_command")]
     RunCommand { command: String },
+    /// Seed the isolated project memory bank before constructing a memory tool.
+    #[serde(rename = "retain_memory")]
+    RetainMemory {
+        content: String,
+        kind: String,
+        #[serde(default)]
+        tags: Vec<String>,
+    },
+    /// Configure the initial state for a session-coupled submit_plan fixture.
+    #[serde(rename = "set_plan_mode")]
+    SetPlanMode { mode: String },
 }
 
 /// Expected results for a test case.

@@ -1,0 +1,79 @@
+{
+  "version": "1.0",
+  "tool": "recall",
+  "description": "RecallTool contract for bd-cv653.4.1 and bd-cv653.8.1: project-scoped full-text lookup, zero-result limit boundary, and required query validation.",
+  "cases": [
+    {
+      "name": "recall_finds_seeded_project_memory",
+      "description": "full-text lookup returns a seeded active memory with its typed envelope",
+      "requirement_ids": [
+        "MEM-RECALL-1"
+      ],
+      "setup": [
+        {
+          "type": "retain_memory",
+          "content": "Remote verification must remain fail-closed.",
+          "kind": "lesson",
+          "tags": [
+            "verification"
+          ]
+        }
+      ],
+      "input": {
+        "query": "Remote verification"
+      },
+      "expected": {
+        "content_contains": [
+          "[1] (lesson): Remote verification must remain fail-closed."
+        ],
+        "details_exact": {
+          "schema": "pi.memory.v1",
+          "query": "Remote verification"
+        },
+        "details_contains": [
+          "Remote verification must remain fail-closed."
+        ]
+      }
+    },
+    {
+      "name": "recall_zero_limit_returns_no_rows",
+      "description": "an explicit zero limit is honored without leaking a matching row",
+      "requirement_ids": [
+        "MEM-RECALL-2"
+      ],
+      "setup": [
+        {
+          "type": "retain_memory",
+          "content": "Boundary sentinel memory.",
+          "kind": "fact"
+        }
+      ],
+      "input": {
+        "query": "Boundary sentinel",
+        "limit": 0
+      },
+      "expected": {
+        "content_exact": "No memories match 'Boundary sentinel'.",
+        "content_not_contains": [
+          "Boundary sentinel memory."
+        ],
+        "details_exact": {
+          "schema": "pi.memory.v1",
+          "query": "Boundary sentinel",
+          "memories": []
+        }
+      }
+    },
+    {
+      "name": "recall_requires_query",
+      "description": "a query-less request fails before touching the memory index",
+      "requirement_ids": [
+        "MEM-RECALL-ERR-1"
+      ],
+      "input": {},
+      "expect_error": true,
+      "error_contains": "missing field `query`",
+      "expected": {}
+    }
+  ]
+}

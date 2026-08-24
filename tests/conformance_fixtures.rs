@@ -183,6 +183,17 @@ fixture_test!(test_computer_fixtures, "computer_tool");
 fixture_test!(test_browser_fixtures, "browser_tool");
 fixture_test!(test_ask_fixtures, "ask_tool");
 fixture_test!(test_todo_fixtures, "todo_tool");
+fixture_test!(test_jobs_fixtures, "jobs_tool");
+fixture_test!(test_hub_fixtures, "hub_tool");
+fixture_test!(test_eval_fixtures, "eval_tool");
+#[cfg(unix)]
+fixture_test!(test_github_fixtures, "github_tool");
+fixture_test!(test_retain_fixtures, "retain_tool");
+fixture_test!(test_recall_fixtures, "recall_tool");
+fixture_test!(test_memory_edit_fixtures, "memory_edit_tool");
+fixture_test!(test_reflect_fixtures, "reflect_tool");
+fixture_test!(test_learn_fixtures, "learn_tool");
+fixture_test!(test_submit_plan_fixtures, "submit_plan_tool");
 fixture_test!(test_security_scan_fixtures, "security_scan_tool");
 
 /// Run truncation tests from fixtures.
@@ -237,6 +248,16 @@ fn test_all_fixtures_exist() {
         "browser_tool",
         "ask_tool",
         "todo_tool",
+        "jobs_tool",
+        "hub_tool",
+        "eval_tool",
+        "github_tool",
+        "retain_tool",
+        "recall_tool",
+        "memory_edit_tool",
+        "reflect_tool",
+        "learn_tool",
+        "submit_plan_tool",
         "security_scan_tool",
     ];
 

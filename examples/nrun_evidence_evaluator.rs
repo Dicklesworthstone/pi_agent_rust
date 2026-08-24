@@ -50,7 +50,10 @@ struct VerifyArgs {
     #[arg(long, default_value = "docs/evidence/nrun-budget-evaluation.json")]
     input: PathBuf,
     /// Contract path for protocol rules.
-    #[arg(long, default_value = "docs/contracts/nrun-evidence-protocol-contract.json")]
+    #[arg(
+        long,
+        default_value = "docs/contracts/nrun-evidence-protocol-contract.json"
+    )]
     contract: PathBuf,
 }
 
@@ -126,7 +129,11 @@ pub struct DeterministicPrng {
 
 impl DeterministicPrng {
     pub fn new(seed: u64) -> Self {
-        let state = if seed == 0 { 0x5EED_1234_5678_ABCD } else { seed };
+        let state = if seed == 0 {
+            0x5EED_1234_5678_ABCD
+        } else {
+            seed
+        };
         Self { state }
     }
 
@@ -260,10 +267,16 @@ pub fn evaluate_budget_series(
     }
 
     if let Some(dup) = duplicate_correlation {
-        bail!("duplicate correlation_id found in series {}: {dup}", series.budget_name);
+        bail!(
+            "duplicate correlation_id found in series {}: {dup}",
+            series.budget_name
+        );
     }
     if let Some(score) = noisy_score {
-        bail!("sample noise_score {score} exceeds max {MAX_ALLOWED_NOISE_SCORE} in series {}", series.budget_name);
+        bail!(
+            "sample noise_score {score} exceeds max {MAX_ALLOWED_NOISE_SCORE} in series {}",
+            series.budget_name
+        );
     }
 
     let repetition_count = series.samples.len();
@@ -315,10 +328,20 @@ enum NRunIssue<'a> {
 impl std::fmt::Display for NRunIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InsufficientRepetitions(name, cnt) => write!(f, "budget {name} evaluated with {cnt} repetitions (< 10)"),
-            Self::InvalidCi(name, lower, upper) => write!(f, "invalid CI bounds for {name}: lower {lower} > upper {upper}"),
-            Self::StatusMismatch(name, expected, recorded) => write!(f, "status mismatch for {name}: expected {expected}, recorded {recorded}"),
-            Self::UnknownRule(name, rule) => write!(f, "unknown comparison rule {rule} in budget {name}"),
+            Self::InsufficientRepetitions(name, cnt) => {
+                write!(f, "budget {name} evaluated with {cnt} repetitions (< 10)")
+            }
+            Self::InvalidCi(name, lower, upper) => write!(
+                f,
+                "invalid CI bounds for {name}: lower {lower} > upper {upper}"
+            ),
+            Self::StatusMismatch(name, expected, recorded) => write!(
+                f,
+                "status mismatch for {name}: expected {expected}, recorded {recorded}"
+            ),
+            Self::UnknownRule(name, rule) => {
+                write!(f, "unknown comparison rule {rule} in budget {name}")
+            }
         }
     }
 }
@@ -364,11 +387,18 @@ pub fn verify_nrun_artifact(
 
     for eval in &artifact.evaluations {
         if eval.repetition_count < MIN_REPETITIONS {
-            issues.push(NRunIssue::InsufficientRepetitions(&eval.budget_name, eval.repetition_count));
+            issues.push(NRunIssue::InsufficientRepetitions(
+                &eval.budget_name,
+                eval.repetition_count,
+            ));
         }
 
         if eval.ci_95_lower > eval.ci_95_upper {
-            issues.push(NRunIssue::InvalidCi(&eval.budget_name, eval.ci_95_lower, eval.ci_95_upper));
+            issues.push(NRunIssue::InvalidCi(
+                &eval.budget_name,
+                eval.ci_95_lower,
+                eval.ci_95_upper,
+            ));
         }
 
         match eval.comparison.as_str() {
@@ -379,7 +409,11 @@ pub fn verify_nrun_artifact(
                     "FAIL"
                 };
                 if eval.status != expected_status {
-                    issues.push(NRunIssue::StatusMismatch(&eval.budget_name, expected_status, &eval.status));
+                    issues.push(NRunIssue::StatusMismatch(
+                        &eval.budget_name,
+                        expected_status,
+                        &eval.status,
+                    ));
                 }
             }
             "minimum" => {
@@ -389,7 +423,11 @@ pub fn verify_nrun_artifact(
                     "FAIL"
                 };
                 if eval.status != expected_status {
-                    issues.push(NRunIssue::StatusMismatch(&eval.budget_name, expected_status, &eval.status));
+                    issues.push(NRunIssue::StatusMismatch(
+                        &eval.budget_name,
+                        expected_status,
+                        &eval.status,
+                    ));
                 }
             }
             other => {
@@ -456,7 +494,9 @@ fn main() -> Result<()> {
             let mut failing = 0;
 
             for (idx, series) in series_input.series.iter().enumerate() {
-                let series_seed = args.seed.wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                let series_seed = args
+                    .seed
+                    .wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 let result = evaluate_budget_series(series, MIN_REPETITIONS, series_seed)?;
                 if result.status == "PASS" {
                     passing += 1;
@@ -498,8 +538,9 @@ fn main() -> Result<()> {
             );
         }
         CommandMode::Verify(args) => {
-            let artifact_text = fs::read_to_string(&args.input)
-                .with_context(|| format!("failed to read artifact from {}", args.input.display()))?;
+            let artifact_text = fs::read_to_string(&args.input).with_context(|| {
+                format!("failed to read artifact from {}", args.input.display())
+            })?;
             let artifact: NRunBudgetEvaluationArtifact = serde_json::from_str(&artifact_text)?;
             let report = verify_nrun_artifact(&artifact, &args.contract);
             println!("{}", serde_json::to_string_pretty(&report)?);

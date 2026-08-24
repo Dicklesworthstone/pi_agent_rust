@@ -5,8 +5,8 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, WebAuditEvent, WebFrameType, WebRemoteManager,
-    WebRemoteSettings, EMBEDDED_WEB_CLIENT_HTML,
+    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, WebAuditEvent, WebFrameType, WebRemoteManager,
+    WebRemoteSettings,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -90,7 +90,9 @@ fn test_remote_mutating_action_requires_local_approval() {
 
     // Audit logs record takeover grant with provenance
     let logs = manager.audit_log();
-    assert!(logs.iter().any(|e| e.event_type == "takeover_granted" && e.client_id.as_deref() == Some("remote-user")));
+    assert!(logs.iter().any(
+        |e| e.event_type == "takeover_granted" && e.client_id.as_deref() == Some("remote-user")
+    ));
 
     finish_case(&harness, "remote_approval_gate");
 }

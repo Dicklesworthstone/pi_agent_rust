@@ -817,7 +817,7 @@ mod structured_traceability_logs {
 mod omp_tool_cross_surface_parity {
     use super::*;
     use common::logging::{TestLogger, validate_jsonl};
-    use pi::model::{ToolCall, ToolResult};
+    use pi::model::{ToolCall, ToolResultMessage};
     use serde_json::json;
 
     #[test]
@@ -827,9 +827,21 @@ mod omp_tool_cross_surface_parity {
 
         let tools = [
             ("web_search", json!({"query": "rust async"}), "WS-PARITY-1"),
-            ("inspect_image", json!({"path": "sample.png"}), "MEDIA-PARITY-1"),
-            ("computer", json!({"action": "list_displays"}), "COMP-PARITY-1"),
-            ("browser", json!({"action": "list_tabs"}), "BROWSER-PARITY-1"),
+            (
+                "inspect_image",
+                json!({"path": "sample.png"}),
+                "MEDIA-PARITY-1",
+            ),
+            (
+                "computer",
+                json!({"action": "list_displays"}),
+                "COMP-PARITY-1",
+            ),
+            (
+                "browser",
+                json!({"action": "list_tabs"}),
+                "BROWSER-PARITY-1",
+            ),
             ("ask", json!({"question": "Choose target?"}), "ASK-PARITY-1"),
             ("todo", json!({"action": "list"}), "TODO-PARITY-1"),
         ];
@@ -840,6 +852,7 @@ mod omp_tool_cross_surface_parity {
                 id: format!("call-{tool_name}"),
                 name: tool_name.to_string(),
                 arguments: payload,
+                thought_signature: None,
             };
 
             // Surface 2: JSON serialization round-trip
@@ -847,17 +860,19 @@ mod omp_tool_cross_surface_parity {
             assert!(json_str.contains(tool_name));
 
             // Surface 3: ToolResult envelope
-            let res = ToolResult {
-                id: call.id,
-                content: vec![ContentBlock::Text(TextContent {
-                    text: format!("Executed {tool_name}"),
-                })],
+            let res = ToolResultMessage {
+                tool_call_id: call.id,
+                tool_name: tool_name.to_string(),
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Executed {tool_name}"
+                )))],
                 is_error: false,
                 details: None,
+                timestamp: 0,
             };
 
             let res_json = serde_json::to_string(&res).unwrap_or_default();
-            assert!(res_json.contains(&res.id));
+            assert!(res_json.contains(&res.tool_call_id));
 
             logger.info_ctx(
                 "omp.cross_surface.tool_verified",
@@ -881,8 +896,10 @@ mod omp_tool_cross_surface_parity {
     #[test]
     fn test_omp_cross_surface_divergence_detection() {
         // Negative control test: deliberate divergence in payload is caught
-        let call_json = json!({"id": "call-1", "name": "browser", "arguments": {"action": "list_tabs"}});
-        let diverged_rpc = json!({"id": "call-2", "tool": "browser", "params": {"action": "list_tabs"}});
+        let call_json =
+            json!({"id": "call-1", "name": "browser", "arguments": {"action": "list_tabs"}});
+        let diverged_rpc =
+            json!({"id": "call-2", "tool": "browser", "params": {"action": "list_tabs"}});
 
         assert_ne!(
             call_json.get("name"),

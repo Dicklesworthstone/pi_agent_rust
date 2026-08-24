@@ -80,7 +80,11 @@ pub struct DeterministicPrng {
 
 impl DeterministicPrng {
     pub fn new(seed: u64) -> Self {
-        let state = if seed == 0 { 0x5EED_1234_5678_ABCD } else { seed };
+        let state = if seed == 0 {
+            0x5EED_1234_5678_ABCD
+        } else {
+            seed
+        };
         Self { state }
     }
 
@@ -195,7 +199,8 @@ pub fn evaluate_budget_series(
             series.budget_name,
             min_repetitions,
             series.samples.len()
-        ).into());
+        )
+        .into());
     }
 
     let mut duplicate_correlation = None;
@@ -214,10 +219,18 @@ pub fn evaluate_budget_series(
     }
 
     if let Some(dup) = duplicate_correlation {
-        return Err(format!("duplicate correlation_id found in series {}: {dup}", series.budget_name).into());
+        return Err(format!(
+            "duplicate correlation_id found in series {}: {dup}",
+            series.budget_name
+        )
+        .into());
     }
     if let Some(score) = noisy_score {
-        return Err(format!("sample noise_score {score} exceeds max {MAX_ALLOWED_NOISE_SCORE} in series {}", series.budget_name).into());
+        return Err(format!(
+            "sample noise_score {score} exceeds max {MAX_ALLOWED_NOISE_SCORE} in series {}",
+            series.budget_name
+        )
+        .into());
     }
 
     let repetition_count = series.samples.len();
@@ -269,10 +282,20 @@ enum NRunIssue<'a> {
 impl std::fmt::Display for NRunIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InsufficientRepetitions(name, cnt) => write!(f, "budget {name} evaluated with {cnt} repetitions (< 10)"),
-            Self::InvalidCi(name, lower, upper) => write!(f, "invalid CI bounds for {name}: lower {lower} > upper {upper}"),
-            Self::StatusMismatch(name, expected, recorded) => write!(f, "status mismatch for {name}: expected {expected}, recorded {recorded}"),
-            Self::UnknownRule(name, rule) => write!(f, "unknown comparison rule {rule} in budget {name}"),
+            Self::InsufficientRepetitions(name, cnt) => {
+                write!(f, "budget {name} evaluated with {cnt} repetitions (< 10)")
+            }
+            Self::InvalidCi(name, lower, upper) => write!(
+                f,
+                "invalid CI bounds for {name}: lower {lower} > upper {upper}"
+            ),
+            Self::StatusMismatch(name, expected, recorded) => write!(
+                f,
+                "status mismatch for {name}: expected {expected}, recorded {recorded}"
+            ),
+            Self::UnknownRule(name, rule) => {
+                write!(f, "unknown comparison rule {rule} in budget {name}")
+            }
         }
     }
 }
@@ -318,11 +341,18 @@ pub fn verify_nrun_artifact(
 
     for eval in &artifact.evaluations {
         if eval.repetition_count < MIN_REPETITIONS {
-            issues.push(NRunIssue::InsufficientRepetitions(&eval.budget_name, eval.repetition_count));
+            issues.push(NRunIssue::InsufficientRepetitions(
+                &eval.budget_name,
+                eval.repetition_count,
+            ));
         }
 
         if eval.ci_95_lower > eval.ci_95_upper {
-            issues.push(NRunIssue::InvalidCi(&eval.budget_name, eval.ci_95_lower, eval.ci_95_upper));
+            issues.push(NRunIssue::InvalidCi(
+                &eval.budget_name,
+                eval.ci_95_lower,
+                eval.ci_95_upper,
+            ));
         }
 
         match eval.comparison.as_str() {
@@ -333,7 +363,11 @@ pub fn verify_nrun_artifact(
                     "FAIL"
                 };
                 if eval.status != expected_status {
-                    issues.push(NRunIssue::StatusMismatch(&eval.budget_name, expected_status, &eval.status));
+                    issues.push(NRunIssue::StatusMismatch(
+                        &eval.budget_name,
+                        expected_status,
+                        &eval.status,
+                    ));
                 }
             }
             "minimum" => {
@@ -343,7 +377,11 @@ pub fn verify_nrun_artifact(
                     "FAIL"
                 };
                 if eval.status != expected_status {
-                    issues.push(NRunIssue::StatusMismatch(&eval.budget_name, expected_status, &eval.status));
+                    issues.push(NRunIssue::StatusMismatch(
+                        &eval.budget_name,
+                        expected_status,
+                        &eval.status,
+                    ));
                 }
             }
             other => {
@@ -414,12 +452,27 @@ fn contract_file_matches_schema_and_policy() -> Result<(), Box<dyn Error>> {
         Some("bd-sog97.10")
     );
 
-    let reqs = contract.get("protocol_requirements").ok_or("missing protocol_requirements")?;
-    assert_eq!(reqs.get("min_repetitions").and_then(Value::as_u64), Some(10));
-    assert_eq!(reqs.get("confidence_level").and_then(Value::as_f64), Some(0.95));
-    assert_eq!(reqs.get("require_distinct_correlation_ids").and_then(Value::as_bool), Some(true));
+    let reqs = contract
+        .get("protocol_requirements")
+        .ok_or("missing protocol_requirements")?;
+    assert_eq!(
+        reqs.get("min_repetitions").and_then(Value::as_u64),
+        Some(10)
+    );
+    assert_eq!(
+        reqs.get("confidence_level").and_then(Value::as_f64),
+        Some(0.95)
+    );
+    assert_eq!(
+        reqs.get("require_distinct_correlation_ids")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
 
-    let enforced = contract.get("enforced_budgets").and_then(Value::as_array).ok_or("missing enforced_budgets")?;
+    let enforced = contract
+        .get("enforced_budgets")
+        .and_then(Value::as_array)
+        .ok_or("missing enforced_budgets")?;
     assert!(enforced.len() >= 5);
     Ok(())
 }
@@ -435,7 +488,11 @@ fn live_nrun_artifact_passes_verification() -> Result<(), Box<dyn Error>> {
     let artifact: NRunBudgetEvaluationArtifact = serde_json::from_str(&text)?;
 
     let report = verify_nrun_artifact(&artifact, &contract_path);
-    assert_eq!(report.status, "pass", "verification report errors: {:?}", report.errors);
+    assert_eq!(
+        report.status, "pass",
+        "verification report errors: {:?}",
+        report.errors
+    );
     assert!(report.errors.is_empty());
     assert!(report.evaluated_budgets >= 5);
     Ok(())
@@ -523,7 +580,12 @@ fn rejection_of_insufficient_repetitions() {
 
     let result = evaluate_budget_series(&series, MIN_REPETITIONS, 12345);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("insufficient repetitions"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("insufficient repetitions")
+    );
 }
 
 #[test]
@@ -540,7 +602,9 @@ fn rejection_of_duplicate_correlation_ids() {
         })
         .collect();
 
-    if let Some(s) = samples.get_mut(5) { s.correlation_id = "corr-0".to_string(); }
+    if let Some(s) = samples.get_mut(5) {
+        s.correlation_id = "corr-0".to_string();
+    }
 
     let series = BudgetMeasurementSeries {
         budget_name: "test_duplicate".to_string(),
@@ -553,7 +617,12 @@ fn rejection_of_duplicate_correlation_ids() {
 
     let result = evaluate_budget_series(&series, MIN_REPETITIONS, 12345);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("duplicate correlation_id"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate correlation_id")
+    );
 }
 
 #[test]
@@ -570,7 +639,9 @@ fn rejection_of_noisy_samples() {
         })
         .collect();
 
-    if let Some(s) = samples.get_mut(3) { s.noise_score = 25; } // exceeds max 15
+    if let Some(s) = samples.get_mut(3) {
+        s.noise_score = 25;
+    } // exceeds max 15
 
     let series = BudgetMeasurementSeries {
         budget_name: "test_noisy".to_string(),
@@ -583,7 +654,12 @@ fn rejection_of_noisy_samples() {
 
     let result = evaluate_budget_series(&series, MIN_REPETITIONS, 12345);
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("noise_score 25 exceeds max 15"));
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("noise_score 25 exceeds max 15")
+    );
 }
 
 #[test]

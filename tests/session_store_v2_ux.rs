@@ -8,6 +8,8 @@ use pi::session_store_v2::SessionStoreV2;
 use serde_json::json;
 use std::time::Instant;
 
+const MAX_SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+
 fn finish_case(harness: &TestHarness, case: &str) {
     harness
         .log()
@@ -29,7 +31,7 @@ fn test_resume_latency_and_tail_read() {
     let store_dir = harness.temp_path("session_v2_resume");
     let _ = std::fs::create_dir_all(&store_dir);
 
-    let store_res = SessionStoreV2::open(&store_dir);
+    let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "open store");
     let mut store = match store_res {
         Ok(s) => s,
@@ -62,7 +64,10 @@ fn test_resume_latency_and_tail_read() {
             Some("msg_0050")
         );
     }
-    assert!(resume_ms < 50.0, "resume latency should be < 50ms, was {resume_ms}ms");
+    assert!(
+        resume_ms < 50.0,
+        "resume latency should be < 50ms, was {resume_ms}ms"
+    );
 
     harness
         .log()
@@ -77,7 +82,7 @@ fn test_fork_and_export_snapshot_consistency() {
     let store_dir = harness.temp_path("session_v2_origin");
     let _ = std::fs::create_dir_all(&store_dir);
 
-    let store_res = SessionStoreV2::open(&store_dir);
+    let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "open origin store");
     let mut store = match store_res {
         Ok(s) => s,
@@ -98,8 +103,8 @@ fn test_fork_and_export_snapshot_consistency() {
     }
 
     // Create checkpoint at turn 20
-    let cp_res = store.checkpoint("checkpoint at turn 20");
-    assert!(cp_res.is_ok(), "checkpoint");
+    let cp_res = store.create_checkpoint(1, "manual");
+    assert!(cp_res.is_ok(), "checkpoint failed: {cp_res:?}");
     if let Ok(cp) = cp_res {
         assert_eq!(cp.checkpoint_seq, 1);
     }
@@ -121,7 +126,7 @@ fn test_fork_and_export_snapshot_consistency() {
     assert!(fork_res.is_ok(), "fork at checkpoint");
 
     // Verify forked store has exactly 20 entries
-    let forked_store_res = SessionStoreV2::open(&fork_dir);
+    let forked_store_res = SessionStoreV2::open_for_inspection(&fork_dir, MAX_SEGMENT_BYTES);
     assert!(forked_store_res.is_ok(), "open forked store");
     if let Ok(forked_store) = forked_store_res {
         let forked_all_res = forked_store.read_all_entries();
@@ -153,3 +158,106 @@ fn test_fork_and_export_snapshot_consistency() {
 
     finish_case(&harness, "session_store_v2_fork_export_ux");
 }
+
+#[test]
+fn test_fork_and_export_nonexistent_checkpoint() {
+    let harness = TestHarness::new("session_store_v2_nonexistent_checkpoint");
+    let store_dir = harness.temp_path("session_v2_empty");
+    let _ = std::fs::create_dir_all(&store_dir);
+
+    let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
+    assert!(store_res.is_ok(), "create store");
+    let store = match store_res {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let fork_dir = harness.temp_path("session_v2_invalid_fork");
+    let fork_res = store.fork_at_checkpoint(&fork_dir, 999);
+    assert!(
+        fork_res.is_err(),
+        "fork at non-existent checkpoint 999 must return Err"
+    );
+
+    let export_file = harness.temp_path("session_v2_invalid_export.jsonl");
+    let export_res = store.export_snapshot(&export_file, 999);
+    assert!(
+        export_res.is_err(),
+        "export at non-existent checkpoint 999 must return Err"
+    );
+
+    finish_case(&harness, "session_store_v2_nonexistent_checkpoint");
+}
+
+#[test]
+fn test_fork_preserves_lineage_and_supports_independent_branching() {
+    let harness = TestHarness::new("session_store_v2_fork_lineage");
+    let store_dir = harness.temp_path("session_v2_branch_origin");
+    let _ = std::fs::create_dir_all(&store_dir);
+
+    let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
+    assert!(store_res.is_ok(), "create origin");
+    let mut store = match store_res {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Append 5 entries
+    for i in 1..=5 {
+        let entry_id = format!("msg_{i:02}"); // ubs:ignore test fixture string generation
+        let parent_id = if i > 1 {
+            Some(format!("msg_{:02}", i - 1)) // ubs:ignore test fixture string generation
+        } else {
+            None
+        };
+        let payload = json!({ "role": "user", "seq": i });
+        assert!(
+            store
+                .append_entry(entry_id, parent_id, "message", payload)
+                .is_ok(),
+            "append"
+        );
+    }
+
+    assert!(store.create_checkpoint(1, "manual").is_ok(), "checkpoint");
+
+    let fork_dir = harness.temp_path("session_v2_fork_branch");
+    assert!(
+        store.fork_at_checkpoint(&fork_dir, 1).is_ok(),
+        "fork at checkpoint 1"
+    );
+
+    // Append to origin store (msg_06)
+    assert!(
+        store
+            .append_entry(
+                "msg_06".to_string(),
+                Some("msg_05".to_string()),
+                "message",
+                json!({ "role": "user", "seq": 6 })
+            )
+            .is_ok(),
+        "append to origin"
+    );
+
+    // Open forked store and append a divergent entry (msg_06_fork)
+    let forked_store_res = SessionStoreV2::open_for_inspection(&fork_dir, MAX_SEGMENT_BYTES);
+    assert!(forked_store_res.is_ok(), "open forked store");
+    if let Ok(forked_store) = forked_store_res {
+        let entries = forked_store.read_all_entries().unwrap_or_default();
+        assert_eq!(entries.len(), 5, "forked store must have 5 entries");
+        assert_eq!(entries[0].entry_id, "msg_01");
+        assert_eq!(entries[4].entry_id, "msg_05");
+        assert_eq!(entries[4].parent_entry_id.as_deref(), Some("msg_04"));
+    }
+
+    let origin_entries = store.read_all_entries().unwrap_or_default();
+    assert_eq!(
+        origin_entries.len(),
+        6,
+        "origin store must have 6 entries after independent append"
+    );
+
+    finish_case(&harness, "session_store_v2_fork_lineage");
+}
+

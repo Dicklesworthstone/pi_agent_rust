@@ -115,7 +115,11 @@ fn test_browser_tab_lifecycle_and_switching() {
 
         // Close tab1
         let out_close = tool
-            .execute("call_close", json!({ "action": "close", "tab": "tab1" }), None)
+            .execute(
+                "call_close",
+                json!({ "action": "close", "tab": "tab1" }),
+                None,
+            )
             .await
             .expect("close tab1");
 
@@ -133,7 +137,11 @@ fn test_browser_close_nonexistent_tab_error() {
     asupersync::test_utils::run_test(|| async {
         let tool = BrowserTool::new(harness.temp_dir()).with_mock(true);
         let res = tool
-            .execute("call_err", json!({ "action": "close", "tab": "ghost_tab" }), None)
+            .execute(
+                "call_err",
+                json!({ "action": "close", "tab": "ghost_tab" }),
+                None,
+            )
             .await;
 
         match res {
@@ -207,38 +215,65 @@ fn test_browser_input_actions() {
 
         // click
         let out_click = tool
-            .execute("call_c", json!({ "action": "click", "selector": "@e3" }), None)
+            .execute(
+                "call_c",
+                json!({ "action": "click", "selector": "@e3" }),
+                None,
+            )
             .await
             .expect("click");
-        assert_eq!(out_click.details.as_ref().map(|d| d["action"].as_str()), Some(Some("click")));
+        assert_eq!(
+            out_click.details.as_ref().map(|d| d["action"].as_str()),
+            Some(Some("click"))
+        );
 
         // fill
         let out_fill = tool
-            .execute("call_f", json!({ "action": "fill", "selector": "@e2", "text": "rust search" }), None)
+            .execute(
+                "call_f",
+                json!({ "action": "fill", "selector": "@e2", "text": "rust search" }),
+                None,
+            )
             .await
             .expect("fill");
-        assert_eq!(out_fill.details.as_ref().map(|d| d["char_count"].as_u64()), Some(Some(11)));
+        assert_eq!(
+            out_fill.details.as_ref().map(|d| d["char_count"].as_u64()),
+            Some(Some(11))
+        );
 
         // press
         let out_press = tool
             .execute("call_p", json!({ "action": "press", "key": "Enter" }), None)
             .await
             .expect("press");
-        assert_eq!(out_press.details.as_ref().map(|d| d["key"].as_str()), Some(Some("Enter")));
+        assert_eq!(
+            out_press.details.as_ref().map(|d| d["key"].as_str()),
+            Some(Some("Enter"))
+        );
 
         // scroll
         let out_scroll = tool
             .execute("call_s", json!({ "action": "scroll" }), None)
             .await
             .expect("scroll");
-        assert_eq!(out_scroll.details.as_ref().map(|d| d["action"].as_str()), Some(Some("scroll")));
+        assert_eq!(
+            out_scroll.details.as_ref().map(|d| d["action"].as_str()),
+            Some(Some("scroll"))
+        );
 
         // wait_for
         let out_wait = tool
-            .execute("call_w", json!({ "action": "wait_for", "selector": "div.results", "timeout_ms": 2000 }), None)
+            .execute(
+                "call_w",
+                json!({ "action": "wait_for", "selector": "div.results", "timeout_ms": 2000 }),
+                None,
+            )
             .await
             .expect("wait_for");
-        assert_eq!(out_wait.details.as_ref().map(|d| d["found"].as_bool()), Some(Some(true)));
+        assert_eq!(
+            out_wait.details.as_ref().map(|d| d["found"].as_bool()),
+            Some(Some(true))
+        );
     });
 
     finish_case(&harness, "browser_inputs");
@@ -267,7 +302,10 @@ fn test_browser_screenshot_writes_valid_png() {
         assert!(full_path.is_file(), "screenshot PNG must exist");
 
         let bytes = fs::read(&full_path).expect("read screenshot");
-        assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "must be valid PNG");
+        assert!(
+            bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+            "must be valid PNG"
+        );
 
         let details = output.details.as_ref().expect("details present");
         assert_eq!(details["tab"], "default");
@@ -283,17 +321,28 @@ fn test_browser_domain_allowlist_enforcement() {
     asupersync::test_utils::run_test(|| async {
         let tool = BrowserTool::new(harness.temp_dir())
             .with_mock(true)
-            .with_domain_allowlist(Some(vec!["example.com".to_string(), "rust-lang.org".to_string()]));
+            .with_domain_allowlist(Some(vec![
+                "example.com".to_string(),
+                "rust-lang.org".to_string(),
+            ]));
 
         // Allowed navigation
         let allowed = tool
-            .execute("call_ok", json!({ "action": "open", "url": "https://example.com/docs" }), None)
+            .execute(
+                "call_ok",
+                json!({ "action": "open", "url": "https://example.com/docs" }),
+                None,
+            )
             .await;
         assert!(allowed.is_ok(), "allowed domain must succeed");
 
         // Blocked navigation
         let blocked = tool
-            .execute("call_block", json!({ "action": "open", "url": "https://malicious-domain.net" }), None)
+            .execute(
+                "call_block",
+                json!({ "action": "open", "url": "https://malicious-domain.net" }),
+                None,
+            )
             .await;
         match blocked {
             Err(e) => assert!(e.to_string().contains("blocked by domain allowlist")),
@@ -327,11 +376,8 @@ fn test_browser_opt_in_activation() {
         domain_allowlist: Some(vec!["*".to_string()]),
     });
 
-    let enabled_registry = ToolRegistry::new(
-        &["read", "browser"],
-        harness.temp_dir(),
-        Some(&config),
-    );
+    let enabled_registry =
+        ToolRegistry::new(&["read", "browser"], harness.temp_dir(), Some(&config));
 
     assert!(enabled_registry.get("browser").is_some());
 

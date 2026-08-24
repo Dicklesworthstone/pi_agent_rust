@@ -1,0 +1,61 @@
+{
+  "version": "1.0",
+  "tool": "hub",
+  "description": "HubTool contract for bd-cv653.5.4 and bd-cv653.8.1: supervisor roster envelope, required launch application, and explicit operation taxonomy.",
+  "cases": [
+    {
+      "name": "hub_ps_returns_supervisor_registry",
+      "description": "ps returns the versioned service registry whether it is empty or populated by another case in the process",
+      "requirement_ids": [
+        "HUB-PS-1"
+      ],
+      "input": {
+        "op": "ps"
+      },
+      "expected": {
+        "content_regex": "^(No supervised services this session\\.|[0-9]+ service\\(s\\):)",
+        "details_exact": {
+          "schema": "pi.hub.service.v1"
+        }
+      }
+    },
+    {
+      "name": "hub_start_requires_application",
+      "description": "start refuses a named service without an executable before mutating supervisor state",
+      "requirement_ids": [
+        "HUB-START-1"
+      ],
+      "input": {
+        "op": "start",
+        "name": "fixture-service"
+      },
+      "expected": {
+        "content_contains": [
+          "hub start requires application"
+        ],
+        "details_contains": [
+          "hub start requires application"
+        ]
+      }
+    },
+    {
+      "name": "hub_rejects_unknown_operation",
+      "description": "unknown operations return the complete accepted operation set as a readable tool error",
+      "requirement_ids": [
+        "HUB-ERR-1"
+      ],
+      "input": {
+        "op": "attach"
+      },
+      "expected": {
+        "content_contains": [
+          "Unknown hub op 'attach'",
+          "start, ps, logs, stop, restart, describe, send, jobs, or agent"
+        ],
+        "details_contains": [
+          "Unknown hub op 'attach'"
+        ]
+      }
+    }
+  ]
+}

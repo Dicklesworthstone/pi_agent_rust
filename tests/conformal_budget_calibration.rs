@@ -31,7 +31,10 @@ struct CalibrateArgs {
     #[arg(long, default_value = "docs/evidence/nrun-measurement-series.json")]
     input: PathBuf,
     /// Output path for the calibration artifact.
-    #[arg(long, default_value = "docs/evidence/conformal-budget-calibration.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/conformal-budget-calibration.json"
+    )]
     output: PathBuf,
     /// Target empirical coverage level (e.g. 0.95 for 95% coverage).
     #[arg(long, default_value_t = 0.95)]
@@ -47,10 +50,16 @@ struct CalibrateArgs {
 #[derive(Debug, Args)]
 struct VerifyArgs {
     /// Path to the conformal calibration artifact.
-    #[arg(long, default_value = "docs/evidence/conformal-budget-calibration.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/conformal-budget-calibration.json"
+    )]
     input: PathBuf,
     /// Contract path for conformal calibration rules.
-    #[arg(long, default_value = "docs/contracts/conformal-budget-calibration-contract.json")]
+    #[arg(
+        long,
+        default_value = "docs/contracts/conformal-budget-calibration-contract.json"
+    )]
     contract: PathBuf,
 }
 
@@ -176,7 +185,9 @@ pub fn compute_conformal_threshold(
         Ok((threshold, q_idx, base_val))
     } else {
         // Upper quantile bound for latency/maximums: index = ceil((n + 1) * (1 - alpha))
-        let q_idx = (((n + 1) as f64) * (1.0 - alpha)).ceil().clamp(1.0, n as f64) as usize;
+        let q_idx = (((n + 1) as f64) * (1.0 - alpha))
+            .ceil()
+            .clamp(1.0, n as f64) as usize;
         let base_val = sorted.get(q_idx.saturating_sub(1)).copied().unwrap_or(0.0);
         let threshold = base_val * padding_multiplier.max(1.0);
         Ok((threshold, q_idx, base_val))
@@ -356,10 +367,26 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
     let text = fs::read_to_string(contract_path)?;
     let val: serde_json::Value = serde_json::from_str(&text)?;
 
-    assert_eq!(val.get("schema").and_then(|v| v.as_str()), Some(CONFORMAL_CONTRACT_SCHEMA));
-    assert_eq!(val.get("bead_id").and_then(|v| v.as_str()), Some("bd-sog97.15"));
-    assert_eq!(val.get("calibration_parameters").and_then(|cp| cp.get("target_coverage")).and_then(|c| c.as_f64()), Some(0.95));
-    assert_eq!(val.get("calibration_parameters").and_then(|cp| cp.get("min_calibration_samples")).and_then(|m| m.as_u64()), Some(10));
+    assert_eq!(
+        val.get("schema").and_then(|v| v.as_str()),
+        Some(CONFORMAL_CONTRACT_SCHEMA)
+    );
+    assert_eq!(
+        val.get("bead_id").and_then(|v| v.as_str()),
+        Some("bd-sog97.15")
+    );
+    assert_eq!(
+        val.get("calibration_parameters")
+            .and_then(|cp| cp.get("target_coverage"))
+            .and_then(|c| c.as_f64()),
+        Some(0.95)
+    );
+    assert_eq!(
+        val.get("calibration_parameters")
+            .and_then(|cp| cp.get("min_calibration_samples"))
+            .and_then(|m| m.as_u64()),
+        Some(10)
+    );
 
     Ok(())
 }
@@ -386,7 +413,8 @@ fn conformal_coverage_finite_sample_guarantee() -> Result<()> {
     }
 
     let target_coverage = 0.95;
-    let (calibrated_threshold, _, _) = compute_conformal_threshold(&calib_samples, "maximum", target_coverage, 1.0)?;
+    let (calibrated_threshold, _, _) =
+        compute_conformal_threshold(&calib_samples, "maximum", target_coverage, 1.0)?;
 
     // Test on 1000 independent test points
     let n_test = 1000;
@@ -412,12 +440,14 @@ fn conformal_coverage_finite_sample_guarantee() -> Result<()> {
 fn conformal_quantile_index_formula() -> Result<()> {
     // Test exact finite sample formula ceil((n + 1) * (1 - alpha))
     let samples: Vec<f64> = (1..=20).map(|x| x as f64).collect();
-    let (thresh_max, q_idx_max, base_max) = compute_conformal_threshold(&samples, "maximum", 0.95, 1.0)?;
+    let (thresh_max, q_idx_max, base_max) =
+        compute_conformal_threshold(&samples, "maximum", 0.95, 1.0)?;
     assert_eq!(q_idx_max, 20); // ceil(21 * 0.95) = ceil(19.95) = 20
     assert_eq!(base_max, 20.0);
     assert_eq!(thresh_max, 20.0);
 
-    let (thresh_min, q_idx_min, base_min) = compute_conformal_threshold(&samples, "minimum", 0.95, 1.0)?;
+    let (thresh_min, q_idx_min, base_min) =
+        compute_conformal_threshold(&samples, "minimum", 0.95, 1.0)?;
     assert_eq!(q_idx_min, 1); // floor(21 * 0.05) = floor(1.05) = 1
     assert_eq!(base_min, 1.0);
     assert_eq!(thresh_min, 1.0);
@@ -450,7 +480,10 @@ fn live_conformal_artifact_passes_verification() -> Result<()> {
         calibrated_budgets.push(cal);
     }
 
-    assert!(data_derived >= 3, "must calibrate >= 3 budgets via data-derived quantiles");
+    assert!(
+        data_derived >= 3,
+        "must calibrate >= 3 budgets via data-derived quantiles"
+    );
 
     let amendment_dry_runs = vec![BudgetAmendmentRecord {
         budget_name: "ext_cold_load_simple_p95".to_string(),
@@ -477,7 +510,11 @@ fn live_conformal_artifact_passes_verification() -> Result<()> {
 
     let report = verify_conformal_artifact(&artifact, contract_path);
     assert_eq!(report.status, "pass");
-    assert!(report.errors.is_empty(), "expected 0 errors, got {:?}", report.errors);
+    assert!(
+        report.errors.is_empty(),
+        "expected 0 errors, got {:?}",
+        report.errors
+    );
     assert_eq!(report.evaluated_budgets, 6);
     assert_eq!(report.amendment_records, 1);
 

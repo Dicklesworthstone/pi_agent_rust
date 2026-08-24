@@ -1,0 +1,68 @@
+{
+  "version": "1.0",
+  "tool": "reflect",
+  "description": "ReflectTool contract for bd-cv653.4.1 and bd-cv653.8.1: hermetic cited synthesis, empty-bank boundary, and required question validation.",
+  "cases": [
+    {
+      "name": "reflect_synthesizes_from_seeded_memory",
+      "description": "a canned provider synthesizes a cited answer over the matching project memory without network access",
+      "requirement_ids": [
+        "MEM-REFLECT-1"
+      ],
+      "setup": [
+        {
+          "type": "retain_memory",
+          "content": "Cargo checks must run through the remote compilation helper.",
+          "kind": "lesson",
+          "tags": [
+            "cargo"
+          ]
+        }
+      ],
+      "input": {
+        "question": "How should Cargo checks run?"
+      },
+      "expected": {
+        "content_exact": "Fixture synthesis cites memory [1].",
+        "details_exact": {
+          "schema": "pi.memory.v1",
+          "question": "How should Cargo checks run?",
+          "citations": [
+            1
+          ]
+        },
+        "details_contains": [
+          "Cargo checks must run through the remote compilation helper."
+        ]
+      }
+    },
+    {
+      "name": "reflect_empty_bank_skips_provider",
+      "description": "an empty memory bank returns an explicit no-evidence response without resolving auth or a provider",
+      "requirement_ids": [
+        "MEM-REFLECT-2"
+      ],
+      "input": {
+        "question": "What should I remember?"
+      },
+      "expected": {
+        "content_exact": "No memories to reflect on yet — retain some facts first.",
+        "details_exact": {
+          "schema": "pi.memory.v1",
+          "citations": []
+        }
+      }
+    },
+    {
+      "name": "reflect_requires_question",
+      "description": "a question-less request fails before provider resolution",
+      "requirement_ids": [
+        "MEM-REFLECT-ERR-1"
+      ],
+      "input": {},
+      "expect_error": true,
+      "error_contains": "missing field `question`",
+      "expected": {}
+    }
+  ]
+}

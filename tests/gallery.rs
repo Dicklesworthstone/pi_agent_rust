@@ -29,10 +29,22 @@ fn test_gallery_matrix_schema_and_categories() {
     assert_eq!(matrix.schema, "pi.gallery.matrix.v1");
     assert!(matrix.items.len() >= 6);
 
-    let has_tool_card = matrix.items.iter().any(|i| i.category == GalleryCategory::ToolCard);
-    let has_status_line = matrix.items.iter().any(|i| i.category == GalleryCategory::StatusLine);
-    let has_overlay = matrix.items.iter().any(|i| i.category == GalleryCategory::Overlay);
-    let has_delight = matrix.items.iter().any(|i| i.category == GalleryCategory::Delight);
+    let has_tool_card = matrix
+        .items
+        .iter()
+        .any(|i| i.category == GalleryCategory::ToolCard);
+    let has_status_line = matrix
+        .items
+        .iter()
+        .any(|i| i.category == GalleryCategory::StatusLine);
+    let has_overlay = matrix
+        .items
+        .iter()
+        .any(|i| i.category == GalleryCategory::Overlay);
+    let has_delight = matrix
+        .items
+        .iter()
+        .any(|i| i.category == GalleryCategory::Delight);
 
     assert!(has_tool_card);
     assert!(has_status_line);

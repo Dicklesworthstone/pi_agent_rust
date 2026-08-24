@@ -52,11 +52,10 @@ fn test_inspect_image_fixture_analysis() {
 
     // Minimal valid 1x1 PNG
     const PNG_BYTES: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-        0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
     fs::write(&img_path, PNG_BYTES).expect("write png fixture");
@@ -117,7 +116,9 @@ fn test_inspect_image_unsupported_format_error() {
 
     asupersync::test_utils::run_test(|| async {
         let tool = InspectImageTool::new(harness.temp_dir()).with_mock(true);
-        let res = tool.execute("call_3", json!({ "path": "bad.txt" }), None).await;
+        let res = tool
+            .execute("call_3", json!({ "path": "bad.txt" }), None)
+            .await;
 
         match res {
             Err(e) => assert!(e.to_string().contains("unsupported image extension")),
@@ -137,24 +138,20 @@ fn test_inspect_image_auth_error_when_unconfigured() {
 
     asupersync::test_utils::run_test(|| async {
         // mock disabled (mock_mode = false) and explicit empty api key -> named auth error
-        let tool = InspectImageTool::with_defaults(
-            harness.temp_dir(),
-            Some("gemini".to_string()),
-            None,
-        )
-        .with_mock(false)
-        .with_api_key(Some(String::new()));
+        let tool =
+            InspectImageTool::with_defaults(harness.temp_dir(), Some("gemini".to_string()), None)
+                .with_mock(false)
+                .with_api_key(Some(String::new()));
 
         let res = tool
-            .execute(
-                "call_auth",
-                json!({ "path": "fixture.png" }),
-                None,
-            )
+            .execute("call_auth", json!({ "path": "fixture.png" }), None)
             .await;
 
         match res {
-            Err(e) => assert!(e.to_string().contains("missing API key for vision provider")),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("missing API key for vision provider")
+            ),
             Ok(_) => panic!("expected auth error when unconfigured"),
         }
     });
@@ -202,7 +199,10 @@ fn test_generate_image_writes_valid_png_artifact() {
         assert!(full_path.is_file(), "output image file must be written");
 
         let bytes = fs::read(&full_path).expect("read generated png");
-        assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "must have valid PNG signature");
+        assert!(
+            bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+            "must have valid PNG signature"
+        );
 
         let details = output.details.as_ref().expect("expected details metadata");
         assert_eq!(details["size"], "1024x1024");
@@ -220,7 +220,9 @@ fn test_generate_image_missing_prompt_error() {
         let tool = GenerateImageTool::new(harness.temp_dir()).with_mock(true);
         let res = tool.execute("call_5", json!({}), None).await;
         match res {
-            Err(e) => assert!(e.to_string().contains("missing required") && e.to_string().contains("prompt")),
+            Err(e) => assert!(
+                e.to_string().contains("missing required") && e.to_string().contains("prompt")
+            ),
             Ok(_) => panic!("expected error for missing prompt"),
         }
     });
@@ -246,7 +248,10 @@ fn test_generate_image_auth_error_when_unconfigured() {
             .await;
 
         match res {
-            Err(e) => assert!(e.to_string().contains("missing API key for image generation provider")),
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("missing API key for image generation provider")
+            ),
             Ok(_) => panic!("expected auth error when unconfigured"),
         }
     });
@@ -295,7 +300,10 @@ fn test_tts_writes_valid_wav_artifact() {
         assert!(full_path.is_file(), "output audio file must be written");
 
         let bytes = fs::read(&full_path).expect("read generated audio");
-        assert!(bytes.starts_with(b"RIFF"), "must have valid WAV RIFF header");
+        assert!(
+            bytes.starts_with(b"RIFF"),
+            "must have valid WAV RIFF header"
+        );
         if bytes.len() >= 12 {
             assert_eq!(&bytes[8..12], b"WAVE");
         }
@@ -315,9 +323,7 @@ fn test_tts_empty_text_error() {
 
     asupersync::test_utils::run_test(|| async {
         let tool = TtsTool::new(harness.temp_dir()).with_mock(true);
-        let res = tool
-            .execute("call_7", json!({ "text": "   " }), None)
-            .await;
+        let res = tool.execute("call_7", json!({ "text": "   " }), None).await;
 
         match res {
             Err(e) => assert!(e.to_string().contains("text cannot be empty")),
@@ -338,11 +344,7 @@ fn test_tts_auth_error_when_unconfigured() {
             .with_api_key(Some(String::new()));
 
         let res = tool
-            .execute(
-                "call_auth_tts",
-                json!({ "text": "hello world" }),
-                None,
-            )
+            .execute("call_auth_tts", json!({ "text": "hello world" }), None)
             .await;
 
         match res {

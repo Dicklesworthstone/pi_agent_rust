@@ -1,0 +1,65 @@
+{
+  "version": "1.0",
+  "tool": "eval",
+  "description": "EvalTool contract for bd-cv653.1.4 and bd-cv653.8.1: hermetic QuickJS evaluation, structured exception boundary, and explicit kernel-selection error.",
+  "cases": [
+    {
+      "name": "eval_js_returns_final_expression",
+      "description": "the hermetic JavaScript kernel reports startup and returns the final expression",
+      "requirement_ids": [
+        "EVAL-JS-1"
+      ],
+      "input": {
+        "code": "40 + 2",
+        "kernel": "js"
+      },
+      "expected": {
+        "content_contains": [
+          "(js kernel started)",
+          "42"
+        ],
+        "details_exact": {
+          "kernel": "js",
+          "cell": 1,
+          "restarted": true
+        }
+      }
+    },
+    {
+      "name": "eval_js_exception_is_structured_output",
+      "description": "a JavaScript exception returns stable exception details and payload instead of crashing the host",
+      "requirement_ids": [
+        "EVAL-JS-2"
+      ],
+      "input": {
+        "code": "throw new Error('eval-boundary-boom')",
+        "kernel": "js"
+      },
+      "expected": {
+        "content_contains": [
+          "eval-boundary-boom"
+        ],
+        "details_exact": {
+          "kernel": "js",
+          "cell": 1,
+          "restarted": true,
+          "errorKind": "exception"
+        }
+      }
+    },
+    {
+      "name": "eval_rejects_unknown_kernel",
+      "description": "an unsupported kernel selector fails loudly with the documented allowed values",
+      "requirement_ids": [
+        "EVAL-ERR-1"
+      ],
+      "input": {
+        "code": "1 + 1",
+        "kernel": "ruby"
+      },
+      "expect_error": true,
+      "error_contains": "unknown kernel: ruby (python|js)",
+      "expected": {}
+    }
+  ]
+}

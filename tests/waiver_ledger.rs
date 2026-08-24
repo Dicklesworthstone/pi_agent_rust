@@ -79,7 +79,10 @@ pub fn evaluate_waiver_entry(
         return WaiverEvaluation {
             budget_id: entry.budget_id.clone(),
             status: WaiverStatus::Invalid,
-            error_message: Some(format!("invalid created_at timestamp: {}", entry.created_at)),
+            error_message: Some(format!(
+                "invalid created_at timestamp: {}",
+                entry.created_at
+            )),
             days_remaining: None,
         };
     };
@@ -87,7 +90,10 @@ pub fn evaluate_waiver_entry(
         return WaiverEvaluation {
             budget_id: entry.budget_id.clone(),
             status: WaiverStatus::Invalid,
-            error_message: Some(format!("invalid expires_at timestamp: {}", entry.expires_at)),
+            error_message: Some(format!(
+                "invalid expires_at timestamp: {}",
+                entry.expires_at
+            )),
             days_remaining: None,
         };
     };
@@ -158,7 +164,9 @@ fn contract_file_matches_schema_and_policy() -> Result<(), Box<dyn Error>> {
         "bead_id must be bd-sog97.12"
     );
     assert_eq!(
-        contract.get("max_waiver_duration_days").and_then(Value::as_i64),
+        contract
+            .get("max_waiver_duration_days")
+            .and_then(Value::as_i64),
         Some(30),
         "max_waiver_duration_days must be 30"
     );
@@ -198,7 +206,10 @@ fn evidence_file_matches_schema_and_references_contract() -> Result<(), Box<dyn 
     );
 
     let summary = evidence.get("summary").ok_or("summary must exist")?;
-    let waivers = evidence.get("waivers").and_then(Value::as_array).ok_or("waivers array")?;
+    let waivers = evidence
+        .get("waivers")
+        .and_then(Value::as_array)
+        .ok_or("waivers array")?;
 
     assert_eq!(
         summary.get("total_waivers").and_then(Value::as_u64),
@@ -264,7 +275,11 @@ fn waiver_lifecycle_max_duration_exceeded_rejected() -> Result<(), Box<dyn Error
 
     let eval = evaluate_waiver_entry(&entry, now, 30);
     assert_eq!(eval.status, WaiverStatus::Invalid);
-    assert!(eval.error_message.ok_or("missing error message")?.contains("exceeds maximum allowed duration"));
+    assert!(
+        eval.error_message
+            .ok_or("missing error message")?
+            .contains("exceeds maximum allowed duration")
+    );
     Ok(())
 }
 
@@ -283,13 +298,22 @@ fn waiver_lifecycle_missing_required_fields_rejected() -> Result<(), Box<dyn Err
 
     let eval = evaluate_waiver_entry(&entry, now, 30);
     assert_eq!(eval.status, WaiverStatus::Invalid);
-    assert!(eval.error_message.ok_or("missing error message")?.contains("budget_id"));
+    assert!(
+        eval.error_message
+            .ok_or("missing error message")?
+            .contains("budget_id")
+    );
 
     entry.budget_id = "valid_budget".into();
     entry.suppressed_claim_keys = vec![];
     let eval2 = evaluate_waiver_entry(&entry, now, 30);
     assert_eq!(eval2.status, WaiverStatus::Invalid);
-    assert!(eval2.error_message.ok_or("missing error message")?.contains("suppressed_claim_keys"));
+    assert!(
+        eval2
+            .error_message
+            .ok_or("missing error message")?
+            .contains("suppressed_claim_keys")
+    );
     Ok(())
 }
 

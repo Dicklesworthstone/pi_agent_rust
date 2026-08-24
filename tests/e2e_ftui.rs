@@ -243,7 +243,8 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
     let wrapper_env = std::fs::read_to_string(session.harness.temp_path("wrapper-env.txt"))
         .unwrap_or_else(|_| String::from("<no dump>"));
-    let wrapper_trace = std::fs::read_to_string(&trace_log).unwrap_or_else(|_| String::from("<no trace>"));
+    let wrapper_trace =
+        std::fs::read_to_string(&trace_log).unwrap_or_else(|_| String::from("<no trace>"));
     let script_present = script_path.exists();
     assert!(
         startup_pane.contains("ftui preview stack"),
