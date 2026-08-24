@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "pi.perf.startup_benchmark.contract.v1",
+  "contract_id": "pi.contract.startup_benchmark.v1",
+  "title": "Release Startup Performance & Binary Size Benchmark Contract",
+  "version": "1.0.0",
+  "bead_id": "bd-sog97.17",
+  "policy_owner_role": "Release Engineering",
+  "created_at": "2026-08-24T00:11:51Z",
+  "status": "enforced",
+  "description": "Governs fresh release-build startup time benchmarks (--version, --help, --list-models) and binary size measurements under the N-Run protocol with host environment fingerprinting.",
+  "protocol_requirements": {
+    "min_repetitions_per_command": 10,
+    "min_warmup_runs": 3,
+    "max_allowed_noise_score": 15,
+    "require_environment_fingerprint": true,
+    "require_git_provenance": true
+  },
+  "command_budgets": [
+    {
+      "command": "--version",
+      "metric_name": "startup_version_p95",
+      "p95_threshold_ms": 100.0,
+      "comparison": "maximum"
+    },
+    {
+      "command": "--help",
+      "metric_name": "startup_help_p95",
+      "p95_threshold_ms": 150.0,
+      "comparison": "maximum"
+    },
+    {
+      "command": "--list-models",
+      "metric_name": "startup_list_models_p95",
+      "p95_threshold_ms": 200.0,
+      "comparison": "maximum"
+    },
+    {
+      "command": "binary_size",
+      "metric_name": "binary_size_mb",
+      "max_threshold_mb": 48.0,
+      "comparison": "maximum"
+    }
+  ]
+}

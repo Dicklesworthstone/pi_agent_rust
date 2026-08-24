@@ -1,0 +1,289 @@
+{
+  "schema": "pi.perf.startup_benchmark.v1",
+  "generated_at": "2026-08-24T10:11:17.553854+00:00",
+  "contract_path": "docs/contracts/startup-benchmark-contract.json",
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "cpu_brand": "Apple M4 Pro",
+    "cpu_cores": 14,
+    "mem_total_mb": 65536,
+    "noise_score": 0,
+    "git_commit": "380af591"
+  },
+  "binary_size": {
+    "metric_name": "binary_size_mb",
+    "binary_path": "release_artifacts/v0.1.0/stage_darwin/pi",
+    "size_bytes": 24170784,
+    "size_mb": 23.05,
+    "threshold_mb": 48.0,
+    "status": "PASS"
+  },
+  "commands": [
+    {
+      "command": "--version",
+      "metric_name": "startup_version_p95",
+      "threshold_ms": 100.0,
+      "repetitions": 15,
+      "mean_ms": 5.27,
+      "p95_ms": 7.14,
+      "ci95_lower_ms": 4.99,
+      "ci95_upper_ms": 5.63,
+      "status": "PASS",
+      "samples": [
+        {
+          "run_index": 1,
+          "correlation_id": "startup---version-1",
+          "latency_ms": 4.17
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "startup---version-2",
+          "latency_ms": 5.17
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "startup---version-3",
+          "latency_ms": 5.65
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "startup---version-4",
+          "latency_ms": 7.14
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "startup---version-5",
+          "latency_ms": 5.29
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "startup---version-6",
+          "latency_ms": 5.09
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "startup---version-7",
+          "latency_ms": 4.65
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "startup---version-8",
+          "latency_ms": 4.81
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "startup---version-9",
+          "latency_ms": 5.06
+        },
+        {
+          "run_index": 10,
+          "correlation_id": "startup---version-10",
+          "latency_ms": 5.53
+        },
+        {
+          "run_index": 11,
+          "correlation_id": "startup---version-11",
+          "latency_ms": 4.91
+        },
+        {
+          "run_index": 12,
+          "correlation_id": "startup---version-12",
+          "latency_ms": 5.89
+        },
+        {
+          "run_index": 13,
+          "correlation_id": "startup---version-13",
+          "latency_ms": 5.51
+        },
+        {
+          "run_index": 14,
+          "correlation_id": "startup---version-14",
+          "latency_ms": 5.02
+        },
+        {
+          "run_index": 15,
+          "correlation_id": "startup---version-15",
+          "latency_ms": 5.23
+        }
+      ]
+    },
+    {
+      "command": "--help",
+      "metric_name": "startup_help_p95",
+      "threshold_ms": 150.0,
+      "repetitions": 15,
+      "mean_ms": 4.79,
+      "p95_ms": 5.67,
+      "ci95_lower_ms": 4.54,
+      "ci95_upper_ms": 5.05,
+      "status": "PASS",
+      "samples": [
+        {
+          "run_index": 1,
+          "correlation_id": "startup---help-1",
+          "latency_ms": 4.11
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "startup---help-2",
+          "latency_ms": 4.38
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "startup---help-3",
+          "latency_ms": 5.4
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "startup---help-4",
+          "latency_ms": 4.62
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "startup---help-5",
+          "latency_ms": 4.6
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "startup---help-6",
+          "latency_ms": 4.56
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "startup---help-7",
+          "latency_ms": 3.98
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "startup---help-8",
+          "latency_ms": 4.1
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "startup---help-9",
+          "latency_ms": 5.08
+        },
+        {
+          "run_index": 10,
+          "correlation_id": "startup---help-10",
+          "latency_ms": 5.09
+        },
+        {
+          "run_index": 11,
+          "correlation_id": "startup---help-11",
+          "latency_ms": 5.44
+        },
+        {
+          "run_index": 12,
+          "correlation_id": "startup---help-12",
+          "latency_ms": 5.01
+        },
+        {
+          "run_index": 13,
+          "correlation_id": "startup---help-13",
+          "latency_ms": 4.58
+        },
+        {
+          "run_index": 14,
+          "correlation_id": "startup---help-14",
+          "latency_ms": 5.16
+        },
+        {
+          "run_index": 15,
+          "correlation_id": "startup---help-15",
+          "latency_ms": 5.67
+        }
+      ]
+    },
+    {
+      "command": "--list-models",
+      "metric_name": "startup_list_models_p95",
+      "threshold_ms": 200.0,
+      "repetitions": 15,
+      "mean_ms": 4.78,
+      "p95_ms": 6.03,
+      "ci95_lower_ms": 4.49,
+      "ci95_upper_ms": 5.09,
+      "status": "PASS",
+      "samples": [
+        {
+          "run_index": 1,
+          "correlation_id": "startup---list-models-1",
+          "latency_ms": 4.84
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "startup---list-models-2",
+          "latency_ms": 4.81
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "startup---list-models-3",
+          "latency_ms": 4.19
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "startup---list-models-4",
+          "latency_ms": 5.07
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "startup---list-models-5",
+          "latency_ms": 3.82
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "startup---list-models-6",
+          "latency_ms": 4.45
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "startup---list-models-7",
+          "latency_ms": 4.3
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "startup---list-models-8",
+          "latency_ms": 4.28
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "startup---list-models-9",
+          "latency_ms": 4.63
+        },
+        {
+          "run_index": 10,
+          "correlation_id": "startup---list-models-10",
+          "latency_ms": 5.57
+        },
+        {
+          "run_index": 11,
+          "correlation_id": "startup---list-models-11",
+          "latency_ms": 6.03
+        },
+        {
+          "run_index": 12,
+          "correlation_id": "startup---list-models-12",
+          "latency_ms": 4.97
+        },
+        {
+          "run_index": 13,
+          "correlation_id": "startup---list-models-13",
+          "latency_ms": 4.53
+        },
+        {
+          "run_index": 14,
+          "correlation_id": "startup---list-models-14",
+          "latency_ms": 4.81
+        },
+        {
+          "run_index": 15,
+          "correlation_id": "startup---list-models-15",
+          "latency_ms": 5.46
+        }
+      ]
+    }
+  ],
+  "overall_status": "PASS"
+}

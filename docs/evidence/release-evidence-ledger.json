@@ -1,9 +1,9 @@
 {
   "schema": "pi.release_evidence.ledger.v1",
-  "generated_at": "2026-08-24T09:48:06.346051+00:00",
+  "generated_at": "2026-08-24T10:12:22.384915+00:00",
   "contract_path": "docs/contracts/release-evidence-ledger-contract.json",
-  "head_hash": "0f406425d8b9589e5b80fd05684761949f431e9a6fdd9540a13f7ac9d2f1ac05",
-  "entry_count": 57,
+  "head_hash": "491754093d9c24601ac7148fee41291c8aae53c693cada1c34614a04b45ef83c",
+  "entry_count": 58,
   "entries": [
     {
       "index": 0,
@@ -502,140 +502,151 @@
     },
     {
       "index": 45,
+      "path": "docs/evidence/startup-benchmark-report.json",
+      "sha256": "83a6bea14baca51cd5999ca6f3337da4ffae5b0482f5b0146b415ea74a5282ad",
+      "correlation_id": null,
+      "source_commit": null,
+      "owning_bead": "bd-sog97",
+      "schema": "pi.perf.startup_benchmark.v1",
+      "prev_hash": "a895f13f39a02531773e7f22b0cb57c660f1750d2e573dd5ef662edff111543f",
+      "entry_hash": "387ce38cdfaf018cb5c01ab62c7622ce80037c1a07f72ce47c9953df92b92da5"
+    },
+    {
+      "index": 46,
       "path": "docs/evidence/swarm-autopilot-decision-gate.json",
       "sha256": "36a9eae6965c44619864b125d3b368942e4476944aaf1813d6c3031dd6d22da0",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.autopilot_decision_gate.v1",
-      "prev_hash": "a895f13f39a02531773e7f22b0cb57c660f1750d2e573dd5ef662edff111543f",
-      "entry_hash": "229919640e548ba6d321ec50865d6469e1a891264f919bf0c287c94934a0a63b"
+      "prev_hash": "387ce38cdfaf018cb5c01ab62c7622ce80037c1a07f72ce47c9953df92b92da5",
+      "entry_hash": "47a26be84830dcc4016cadcb9d5983c9ea06f835aeb0ec25ff0fe511d7aee918"
     },
     {
-      "index": 46,
+      "index": 47,
       "path": "docs/evidence/swarm-incident-corpus.json",
       "sha256": "32a7203ff32bed58b01a5d4075bacebbb1b39cbc980c7d35ef89796b8395ee09",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-9yq7i.1",
       "schema": "pi.swarm.incident_corpus.v1",
-      "prev_hash": "229919640e548ba6d321ec50865d6469e1a891264f919bf0c287c94934a0a63b",
-      "entry_hash": "bb40432a4393c4e0577f0db6f1fabb13ad99452e404b2953be114cb0a8061795"
+      "prev_hash": "47a26be84830dcc4016cadcb9d5983c9ea06f835aeb0ec25ff0fe511d7aee918",
+      "entry_hash": "77c75591561106dc6075fbcc34fc5f02b10bf17144fa595a20a943af2bc2e1be"
     },
     {
-      "index": 47,
+      "index": 48,
       "path": "docs/evidence/swarm-incident-replay-e2e.json",
       "sha256": "81ed005177000cb771b35e9f8fa2c80aec75816969417ee8756405c0c7284028",
       "correlation_id": "incident-replay-e2e-2026-05-18T000000Z0000",
       "source_commit": null,
       "owning_bead": "bd-9yq7i.7",
       "schema": "pi.swarm.incident_replay_e2e.v1",
-      "prev_hash": "bb40432a4393c4e0577f0db6f1fabb13ad99452e404b2953be114cb0a8061795",
-      "entry_hash": "6ed9633212472638dd8c122d86c5a6763aa4c984ed0ae1822f7fd311bcd9a013"
+      "prev_hash": "77c75591561106dc6075fbcc34fc5f02b10bf17144fa595a20a943af2bc2e1be",
+      "entry_hash": "e6ec33a50cddaea683aa6dcd66e494ec939d17bb96d31af0d653370f8b3dc529"
     },
     {
-      "index": 48,
+      "index": 49,
       "path": "docs/evidence/swarm-incident-replay.json",
       "sha256": "7e8396795694c4e9bfd35b6e5373bf9f1037b338fcc51fcd7d6853315d7b9b71",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-9yq7i.2",
       "schema": "pi.swarm.incident_replay.v1",
-      "prev_hash": "6ed9633212472638dd8c122d86c5a6763aa4c984ed0ae1822f7fd311bcd9a013",
-      "entry_hash": "2c3277f2ff13f34bfac35ff4315677eff46d2f1962559350948169ce84599603"
+      "prev_hash": "e6ec33a50cddaea683aa6dcd66e494ec939d17bb96d31af0d653370f8b3dc529",
+      "entry_hash": "210874d689876994d6ee586cb8335b7743d0f1e6956ef31822c63b5865810736"
     },
     {
-      "index": 49,
+      "index": 50,
       "path": "docs/evidence/swarm-progress-slo-closeout-gate.json",
       "sha256": "43f78cb11d88d7c7730f5799fe2bc758d509e32650ea2e49b784edbed5d1f802",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.progress_slo.closeout_gate.v1",
-      "prev_hash": "2c3277f2ff13f34bfac35ff4315677eff46d2f1962559350948169ce84599603",
-      "entry_hash": "2ec73af4f691fc71e88a04ca7a2cc93f5c5f3425737d8a2c6af2a9a9a8262d61"
+      "prev_hash": "210874d689876994d6ee586cb8335b7743d0f1e6956ef31822c63b5865810736",
+      "entry_hash": "9b23f33d66532c3153eca1a852e70fbec77bebc660d200ab47f5ab1c59c8fabe"
     },
     {
-      "index": 50,
+      "index": 51,
       "path": "docs/evidence/swarm-replay-closeout-gate.json",
       "sha256": "61e9f821ebf633b2d545805daa04f45c6f80ba1fe150b343ee0a15e0f13ae7d6",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.replay_closeout_gate.v1",
-      "prev_hash": "2ec73af4f691fc71e88a04ca7a2cc93f5c5f3425737d8a2c6af2a9a9a8262d61",
-      "entry_hash": "18aa802ccbe21ce06528e5439fe7606130d00306a90d02c7551f01b8443372a1"
+      "prev_hash": "9b23f33d66532c3153eca1a852e70fbec77bebc660d200ab47f5ab1c59c8fabe",
+      "entry_hash": "0a500e174f1eb583f714cfc43f869e5951fbdd165929074c73c52843c8c640fc"
     },
     {
-      "index": 51,
+      "index": 52,
       "path": "docs/evidence/ubs-extension-runtime-noise-baseline.json",
       "sha256": "5eb152bd4261d8814e6a8470f333fdb7d04aacecccad468ed77a56e88e772584",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-wv10l",
       "schema": "pi.ubs.extension_runtime_noise_baseline.v1",
-      "prev_hash": "18aa802ccbe21ce06528e5439fe7606130d00306a90d02c7551f01b8443372a1",
-      "entry_hash": "91baec73b36ddee1fb7ef7e883e09d9a528f4b181a2083e23965ac68221871ac"
+      "prev_hash": "0a500e174f1eb583f714cfc43f869e5951fbdd165929074c73c52843c8c640fc",
+      "entry_hash": "01b0f6b1c1cbc334c999fbf794436832c882875cdc692a9736adf5d1bd043e95"
     },
     {
-      "index": 52,
+      "index": 53,
       "path": "docs/evidence/validation-broker-closeout-gate.json",
       "sha256": "a1530a79ee96545c1a871183cfa3210d0c7d12dcb41d4de9e45e168f0cf56de9",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.validation_broker.closeout_gate.v1",
-      "prev_hash": "91baec73b36ddee1fb7ef7e883e09d9a528f4b181a2083e23965ac68221871ac",
-      "entry_hash": "7618ce8c0290ad4c85200ce4300338b015e6b9d512248ab42d6d4815d7078b37"
+      "prev_hash": "01b0f6b1c1cbc334c999fbf794436832c882875cdc692a9736adf5d1bd043e95",
+      "entry_hash": "58a6345ffc030df12a7d4fbdf0a4a4b2672410775b3599079ba1dafdae24eb10"
     },
     {
-      "index": 53,
+      "index": 54,
       "path": "docs/evidence/validation-broker-stress-budgets.json",
       "sha256": "6ce58d96658eb6a42e25aa3c174f367a37da189be532eddf0099aa70eb07e69e",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-gusp4.9",
       "schema": "pi.validation_broker.stress_budget_report.v1",
-      "prev_hash": "7618ce8c0290ad4c85200ce4300338b015e6b9d512248ab42d6d4815d7078b37",
-      "entry_hash": "36663a966512f3ea50a6bf38503e7eb0b8cc6d5eef804feac1a52cfe0014cf42"
+      "prev_hash": "58a6345ffc030df12a7d4fbdf0a4a4b2672410775b3599079ba1dafdae24eb10",
+      "entry_hash": "196b14af814ae5a5f66af4a59656c994d911f6e148c97009c80b533cc574c172"
     },
     {
-      "index": 54,
+      "index": 55,
       "path": "docs/evidence/validation-proof-memory-index.json",
       "sha256": "5235cf2e80a995be3386866ab3b9dc8072005aa02057f1485fbc43232e2605d3",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-9yq7i.3",
       "schema": "pi.validation.proof_memory_index.v1",
-      "prev_hash": "36663a966512f3ea50a6bf38503e7eb0b8cc6d5eef804feac1a52cfe0014cf42",
-      "entry_hash": "a790388831ca65ec3d47e1cb34c4649e3adac0b35b72d395800e409522e665d3"
+      "prev_hash": "196b14af814ae5a5f66af4a59656c994d911f6e148c97009c80b533cc574c172",
+      "entry_hash": "d966356f7f1ff3b70a491ba24478cc6be7f33abbb59003919096fc59f87863b3"
     },
     {
-      "index": 55,
+      "index": 56,
       "path": "docs/evidence/validation-scheduler-plan.json",
       "sha256": "f407c70ba3b7d5aa264d2869db6f8c117729b55b7555af1d8a9f3d69550d649e",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.swarm.validation_scheduler_plan.v1",
-      "prev_hash": "a790388831ca65ec3d47e1cb34c4649e3adac0b35b72d395800e409522e665d3",
-      "entry_hash": "0b5332d93b508b708e942bf9151efc638f6a0f91a5f5f1c8085287c9d5b1d20c"
+      "prev_hash": "d966356f7f1ff3b70a491ba24478cc6be7f33abbb59003919096fc59f87863b3",
+      "entry_hash": "f6d7d7496511864060ec3ec968e349ab3f0a215125ad2caf46071a723fbeeb97"
     },
     {
-      "index": 56,
+      "index": 57,
       "path": "docs/evidence/waivers.json",
       "sha256": "245a69851cc67b7948f68f5b75b9e69bd86ae528e320a22a5f252101b745050f",
       "correlation_id": null,
       "source_commit": null,
       "owning_bead": "bd-sog97",
       "schema": "pi.waiver.ledger.v1",
-      "prev_hash": "0b5332d93b508b708e942bf9151efc638f6a0f91a5f5f1c8085287c9d5b1d20c",
-      "entry_hash": "0f406425d8b9589e5b80fd05684761949f431e9a6fdd9540a13f7ac9d2f1ac05"
+      "prev_hash": "f6d7d7496511864060ec3ec968e349ab3f0a215125ad2caf46071a723fbeeb97",
+      "entry_hash": "491754093d9c24601ac7148fee41291c8aae53c693cada1c34614a04b45ef83c"
     }
   ],
   "summary": {
-    "total_artifacts": 57,
-    "verified_intact": 57,
+    "total_artifacts": 58,
+    "verified_intact": 58,
     "missing_artifacts": 0,
     "sha_mismatches": 0
   }

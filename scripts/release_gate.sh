@@ -4629,6 +4629,83 @@ else
     check_fail "conformal_budget_calibration" "conformal contract or evidence file missing"
 fi
 
+# Gate 13f: Fresh Release Startup Performance & Binary Size (RI-STARTUP)
+STARTUP_CONTRACT="$PROJECT_ROOT/docs/contracts/startup-benchmark-contract.json"
+STARTUP_EVIDENCE="$PROJECT_ROOT/docs/evidence/startup-benchmark-report.json"
+
+if [ -f "$STARTUP_CONTRACT" ] && [ -f "$STARTUP_EVIDENCE" ]; then
+    if STARTUP_CHECK=$(python3 - "$STARTUP_CONTRACT" "$STARTUP_EVIDENCE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+
+try:
+    with open(contract_path) as f:
+        contract = json.load(f)
+    with open(evidence_path) as f:
+        evidence = json.load(f)
+except Exception as e:
+    print(f"invalid:{e}")
+    sys.exit(0)
+
+if contract.get("schema") != "pi.perf.startup_benchmark.contract.v1":
+    print("invalid:contract schema mismatch")
+    sys.exit(0)
+
+if evidence.get("schema") != "pi.perf.startup_benchmark.v1":
+    print("invalid:evidence schema mismatch")
+    sys.exit(0)
+
+commands = evidence.get("commands", [])
+if not commands:
+    print("invalid:empty commands in startup evidence")
+    sys.exit(0)
+
+for cmd in commands:
+    reps = cmd.get("repetitions", 0)
+    if reps < 10:
+        print(f"invalid:command {cmd.get('command')} reps {reps} < 10")
+        sys.exit(0)
+    p95 = cmd.get("p95_ms", 0.0)
+    thresh = cmd.get("threshold_ms", 0.0)
+    if p95 > thresh:
+        print(f"invalid:command {cmd.get('command')} p95 {p95}ms > threshold {thresh}ms")
+        sys.exit(0)
+
+bsize = evidence.get("binary_size", {})
+size_mb = bsize.get("size_mb", 0.0)
+thresh_mb = bsize.get("threshold_mb", 48.0)
+if size_mb > thresh_mb:
+    print(f"invalid:binary size {size_mb}MB > threshold {thresh_mb}MB")
+    sys.exit(0)
+
+print(f"ok:{len(commands)}:{size_mb}")
+PY
+); then
+        case "$STARTUP_CHECK" in
+            ok:*)
+                STARTUP_INFO="${STARTUP_CHECK#ok:}"
+                CMD_COUNT="${STARTUP_INFO%%:*}"
+                SIZE_MB="${STARTUP_INFO##*:}"
+                check_pass "startup_benchmark" "verified $CMD_COUNT startup commands (all p95 within budgets) and binary size ${SIZE_MB}MB <= 48MB"
+                ;;
+            invalid:*)
+                check_fail "startup_benchmark" "startup benchmark check failed (${STARTUP_CHECK#invalid:})"
+                ;;
+            *)
+                check_fail "startup_benchmark" "unexpected startup check output: $STARTUP_CHECK"
+                ;;
+        esac
+    else
+        check_fail "startup_benchmark" "startup benchmark evaluation failed: $STARTUP_CHECK"
+    fi
+else
+    check_fail "startup_benchmark" "startup contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'

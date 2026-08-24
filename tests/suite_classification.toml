@@ -124,6 +124,7 @@ files = [
     "sequential_budget_gate",
     "perf_drift_watch",
     "conformal_budget_calibration",
+    "startup_benchmark",
     "checkpoint",
     "eval",
     "url_router",

@@ -997,6 +997,28 @@ When an amended threshold is needed (e.g. for `ext_cold_load_simple_p95` in the 
 - **Evaluator Tool**: `examples/conformal_budget_calibration.rs`
 - **Verification Gate**: `tests/conformal_budget_calibration.rs`
 
+## Fresh Release Startup & Binary Size Benchmark (RI-STARTUP, DROPIN-R10)
+
+### Purpose & Measurement Methodology
+
+To ensure shipping releases satisfy performance claims without regression or measurement gap:
+1. **Startup Latency ($N \ge 10$)**:
+   - `pi --version`: Minimal fast-path startup (<100ms p95, typically ~5-7ms).
+   - `pi --help`: Full argument parser and help formatting path (<150ms p95, typically ~12-15ms).
+   - `pi --list-models`: Provider catalog and model registry resolution path (<200ms p95, typically ~20-25ms).
+2. **Release Binary Size**:
+   - Release profile artifacts are budgeted at $\le 48\text{ MiB}$ (enforced across Darwin and Linux release binaries).
+3. **Environment & Provenance Fingerprinting**:
+   - Every startup benchmark run captures OS, CPU topology, memory size, noise score, and source git commit hash.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/startup-benchmark-contract.json` (`pi.perf.startup_benchmark.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/startup-benchmark-report.json` (`pi.perf.startup_benchmark.v1`)
+- **Evaluator Tool**: `examples/startup_benchmark_runner.rs`
+- **Verification Gate**: `tests/startup_benchmark.rs`
+
+
 
 
 

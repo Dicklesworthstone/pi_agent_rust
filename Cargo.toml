@@ -179,6 +179,10 @@ name = "conformal_budget_calibration"
 path = "examples/conformal_budget_calibration.rs"
 
 [[example]]
+name = "startup_benchmark_runner"
+path = "examples/startup_benchmark_runner.rs"
+
+[[example]]
 name = "session_workload_bench"
 path = "examples/session_workload_bench.rs"
 
