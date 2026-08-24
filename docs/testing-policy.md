@@ -478,6 +478,28 @@ Normative rules:
    - `bd-3ar8v.6.3` extension conformance + perf stress certification
    - `bd-3ar8v.6.6` unified certification dossier lane
 
+#### Release-budget measurement negative controls
+
+`pi.perf.budget_summary.v2` admits a numeric release-budget input only when its
+measurement-specific negative control verifies. A present number without the
+control is `NO_DATA`; strict CI may additionally fail because required data is
+missing, but it must never compare the unproven number with a threshold.
+
+- `binary_size_release` requires a `pi.perf.binary_size_measurement.v1` record
+  that binds the exact binary path, SHA-256, and byte length to Cargo profile
+  `release`, profile family `release`, `opt-level = "z"`, and `strip = true`.
+- `idle_memory_rss` requires a `pi.perf.idle_rss_measurement.v1` record with the
+  measured PID, process name `pi`, allocator (`system` or `jemalloc`), idle-state
+  boundary, RSS bytes, and the measured executable's path and SHA-256.
+- `ext_cold_load_simple_p95` and `ext_cold_load_complex_p95` require a
+  `pi.perf.cold_load_measurement.v1` record that hashes each Criterion estimate
+  and embeds the `benches/bench_env.rs` governor, ASLR, THP, and noise-score
+  fingerprint. The release gate admits only `noise_score = 0`.
+
+The producer and consumer must both validate these controls. Missing, malformed,
+hash-mismatched, wrong-profile, wrong-process, or noisy evidence produces a named
+data-contract failure and cannot authorize a performance claim.
+
 #### Practical-finish checkpoint policy (bd-3ar8v.6.9)
 
 Release/certification decisions must apply a docs-last contract before final report wrap-up:
