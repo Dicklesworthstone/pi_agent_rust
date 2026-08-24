@@ -258,47 +258,65 @@ fn hostcall_egraph_engine() -> &'static HostcallEGraphEngine {
     ENGINE.get_or_init(HostcallEGraphEngine::from_env)
 }
 
-/// Derive the fast-opcode candidate's cost from an equality-saturation search
-/// instead of the hardcoded constant (bd-3ar8v.4.22).
+/// Price the fast-opcode candidate by searching both marshalling plans instead
+/// of trusting the hardcoded constant (bd-3ar8v.4.22).
 ///
 /// **This can only ever refine a candidate the caller already proved safe.** It
 /// is called from inside the branch where the fast path's params hash and args
 /// shape hash both matched the baseline; that hash equivalence remains the sole
-/// authorization for taking the fast lane. The search contributes a measured
-/// cost and the rule that produced it — it cannot enable a fast path the hash
-/// check would have rejected, because it never runs when that check fails.
+/// authorization for taking the fast lane. The search contributes a cost and
+/// nothing else — it cannot enable a fast path the hash check would have
+/// rejected, because it never runs when that check fails. Only the cost is
+/// consumed; the plan structure the search produces is advisory, so a fused
+/// intrinsic it "finds" is never executed as such.
 ///
-/// Returns `None` when the search declines (disabled, no cheaper plan, budget
-/// exhausted, ambiguous tie), leaving the caller on the static constant. A
-/// search that cannot justify a number does not get to supply one.
+/// # What is compared
+///
+/// `HOSTCALL_REWRITE_COST_BASELINE` denotes the canonical JSON path and
+/// `HOSTCALL_REWRITE_COST_FAST_OPCODE` the typed fast-opcode path, so the ratio
+/// that belongs on this scale is typed-versus-canonical. Both plans are
+/// therefore searched and their best forms compared. Measuring the typed plan
+/// against its own pre-fusion self would answer a different question — how much
+/// fusion helped — and reporting that on this scale would be a category error.
+///
+/// Returns `None` whenever the search declines (disabled, no cheaper plan,
+/// budget exhausted, ambiguous tie) or the result would not beat the baseline,
+/// leaving the caller on the static constant. A search that cannot justify a
+/// number does not get to supply one.
 fn egraph_fast_opcode_cost(opcode: CommonHostcallOpcode) -> Option<(u32, &'static str)> {
-    let engine = hostcall_egraph_engine();
-    // The fast lane decodes straight into typed form, so that is the plan whose
-    // cost we are asking about.
-    let baseline = PlanExpr::unary(
-        StageOp::Dispatch,
+    /// Wrap a marshalling stage chain around the shared policy + opcode tail.
+    /// Policy sits below the decode stages in every plan, so the search cannot
+    /// mistake a reordering for an optimization.
+    fn plan_for(opcode: CommonHostcallOpcode, marshal: Repr) -> PlanExpr {
         PlanExpr::unary(
-            StageOp::Validate,
+            StageOp::Dispatch,
             PlanExpr::unary(
-                StageOp::Marshal(Repr::Typed),
+                StageOp::Validate,
                 PlanExpr::unary(
-                    StageOp::Policy,
-                    PlanExpr::leaf(StageOp::Opcode(opcode.code().to_string())),
+                    StageOp::Marshal(marshal),
+                    PlanExpr::unary(
+                        StageOp::Policy,
+                        PlanExpr::leaf(StageOp::Opcode(opcode.code().to_string())),
+                    ),
                 ),
             ),
-        ),
-    );
-    let decision = engine.optimize(&baseline);
-    // The two cost models are on different scales -- the search prices stages
-    // in its own units, these constants are a 100-point index -- so the raw
-    // number cannot be compared against HOSTCALL_REWRITE_COST_BASELINE.
-    // project_cost_onto carries over the ratio, which is the scale-free part.
-    let projected = decision.project_cost_onto(HOSTCALL_REWRITE_COST_BASELINE)?;
+        )
+    }
+
+    let engine = hostcall_egraph_engine();
+    if !engine.enabled() {
+        return None;
+    }
+
+    // The canonical JSON path is what the 100-point baseline denotes; the typed
+    // path is the candidate. Search both so the comparison is like-for-like.
+    let canonical = engine.optimize(&plan_for(opcode, Repr::Json));
+    let typed = engine.optimize(&plan_for(opcode, Repr::Typed));
+    let projected = typed.relative_to(&canonical, HOSTCALL_REWRITE_COST_BASELINE)?;
 
     // Neither model is calibrated, so take the more conservative of the two
-    // rather than the more flattering one. Today the search is the pessimist,
-    // which is the direction an uncalibrated estimate should err in: it can
-    // shrink the claimed saving, never inflate it.
+    // rather than the more flattering one: the search may shrink the claimed
+    // saving, never inflate it past what the static constant already asserts.
     let estimated = projected.max(HOSTCALL_REWRITE_COST_FAST_OPCODE);
     if estimated >= HOSTCALL_REWRITE_COST_BASELINE {
         return None;
