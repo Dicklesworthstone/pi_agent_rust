@@ -186,6 +186,8 @@ fixture_test!(test_todo_fixtures, "todo_tool");
 fixture_test!(test_jobs_fixtures, "jobs_tool");
 fixture_test!(test_hub_fixtures, "hub_tool");
 fixture_test!(test_eval_fixtures, "eval_tool");
+#[cfg(unix)]
+fixture_test!(test_github_fixtures, "github_tool");
 fixture_test!(test_retain_fixtures, "retain_tool");
 fixture_test!(test_recall_fixtures, "recall_tool");
 fixture_test!(test_memory_edit_fixtures, "memory_edit_tool");
@@ -249,6 +251,7 @@ fn test_all_fixtures_exist() {
         "jobs_tool",
         "hub_tool",
         "eval_tool",
+        "github_tool",
         "retain_tool",
         "recall_tool",
         "memory_edit_tool",

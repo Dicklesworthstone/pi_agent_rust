@@ -132,6 +132,13 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "jobs" => Box::new(pi::tools::JobsTool),
         "hub" => Box::new(pi::tools::HubTool::new(temp_dir.path())),
         "eval" => Box::new(pi::eval::EvalTool::new(temp_dir.path())),
+        "github" => {
+            #[cfg(unix)]
+            let gh_path = "/bin/sh";
+            #[cfg(not(unix))]
+            let gh_path = "cmd";
+            Box::new(pi::github::GithubTool::new(temp_dir.path(), Some(gh_path)))
+        }
         "retain" => {
             let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
                 Ok(store) => store,

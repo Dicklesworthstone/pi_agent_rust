@@ -1,0 +1,75 @@
+{
+  "version": "1.0",
+  "tool": "github",
+  "description": "GithubTool contract for bd-cv653.2.3 and bd-cv653.8.1: canned gh JSON formatting, repository-shape boundary, and named parse taxonomy without live network.",
+  "cases": [
+    {
+      "name": "github_pr_view_formats_canned_gh_json",
+      "description": "the real gh argument path parses canned structured output into the agent-facing pull-request card",
+      "requirement_ids": [
+        "GITHUB-PR-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "pr",
+          "content": "echo '{\"number\":5,\"title\":\"Stubbed change\",\"state\":\"MERGED\",\"author\":{\"login\":\"fixture-bot\"},\"labels\":[{\"name\":\"verified\"}],\"body\":\"Hermetic body.\",\"comments\":[]}'\n"
+        }
+      ],
+      "input": {
+        "op": "pr_view",
+        "number": 5,
+        "repo": "owner/repo"
+      },
+      "expected": {
+        "content_contains": [
+          "## PR #5: Stubbed change",
+          "state: MERGED · author: fixture-bot · labels: verified",
+          "Hermetic body."
+        ],
+        "details_exact": {
+          "number": 5,
+          "title": "Stubbed change",
+          "state": "MERGED"
+        }
+      }
+    },
+    {
+      "name": "github_rejects_invalid_repository_shape",
+      "description": "an explicit repository must be owner/name before any gh process starts",
+      "requirement_ids": [
+        "GITHUB-REPO-1"
+      ],
+      "input": {
+        "op": "pr_view",
+        "number": 5,
+        "repo": "owner-only"
+      },
+      "expect_error": true,
+      "error_contains": "GH_REPO: expected owner/repo",
+      "expected": {}
+    },
+    {
+      "name": "github_names_malformed_gh_json",
+      "description": "successful gh execution with malformed JSON fails with the stable GH_PARSE taxonomy",
+      "requirement_ids": [
+        "GITHUB-ERR-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "pr",
+          "content": "echo 'not-json'\n"
+        }
+      ],
+      "input": {
+        "op": "pr_view",
+        "number": 8,
+        "repo": "owner/repo"
+      },
+      "expect_error": true,
+      "error_contains": "GH_PARSE",
+      "expected": {}
+    }
+  ]
+}
