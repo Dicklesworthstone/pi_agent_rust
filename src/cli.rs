@@ -2262,7 +2262,7 @@ pub enum Commands {
         /// Retention window (e.g. 30d, 7d, 24h, or integer days; default: 30d)
         #[arg(long, default_value = "30d")]
         older_than: String,
-        /// Number of most recent sessions to unconditionally preserve per project (default: 5)
+        /// Number of most recent prunable sessions to preserve per project; named/pinned sessions are always kept and do not consume a slot (default: 5)
         #[arg(long, default_value_t = 5)]
         keep_last: usize,
         /// Include extension transpile caches and temporary runtime caches

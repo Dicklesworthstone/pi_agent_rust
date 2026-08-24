@@ -129,6 +129,7 @@ files = [
     "media_tools",
     "computer",
     "browser",
+    "clean_release_commit",
     "checkpoint",
     "eval",
     "url_router",

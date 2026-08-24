@@ -205,6 +205,9 @@ impl GcResult {
 #[derive(Debug, Clone)]
 pub struct GcOptions {
     pub older_than_days: u64,
+    /// Newest N sessions per project to retain regardless of age. Ranked over
+    /// the prunable population only: named/pinned sessions are already kept
+    /// unconditionally and never consume a slot.
     pub keep_last: usize,
     pub prune_caches: bool,
     pub dry_run: bool,
@@ -388,16 +391,31 @@ impl GarbageCollector {
             Self::scan_session_files(&sessions_dir, &mut project_sessions, &mut all_session_stems)?;
 
             for (_proj_dir, mut session_files) in project_sessions {
-                // Sort descending by modified time (newest first)
-                session_files.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+                // Sort descending by modified time (newest first). Filesystems
+                // with coarse timestamp granularity hand back ties, so break
+                // them on path to keep a plan reproducible across runs.
+                session_files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
-                for (idx, (file_path, mtime, size)) in session_files.into_iter().enumerate() {
+                // Rank for the keep-last quota. Named/pinned sessions survive
+                // unconditionally, so they must not consume a quota slot —
+                // otherwise `--keep-last N` silently retains fewer than N
+                // prunable sessions (module docs: "retaining `keep_last` per
+                // project" applies to the not-named/pinned population).
+                let mut prunable_rank = 0usize;
+
+                for (file_path, mtime, size) in session_files {
                     let age = now.duration_since(mtime).unwrap_or_default();
                     let age_secs = age.as_secs();
 
                     // Check protection: keep_last, named, or pinned
-                    let is_keep_last = idx < options.keep_last;
                     let is_named_or_pinned = Self::is_session_protected(&file_path);
+                    let rank = prunable_rank;
+                    let is_keep_last = if is_named_or_pinned {
+                        false
+                    } else {
+                        prunable_rank += 1;
+                        rank < options.keep_last
+                    };
 
                     if is_keep_last || is_named_or_pinned {
                         let reason = if is_named_or_pinned {
@@ -406,7 +424,7 @@ impl GarbageCollector {
                             format!(
                                 "Preserved under keep-last {} quota (rank {})",
                                 options.keep_last,
-                                idx + 1
+                                rank + 1
                             )
                         };
                         items_protected.push(make_session_gc_item(
@@ -966,6 +984,16 @@ mod tests {
         let _ = fs::write(&s2, "{\"version\":3}\n");
         let _ = fs::write(&s3, "{\"version\":3}\n");
 
+        // Pin mtimes explicitly: three writes in a row can land on the same
+        // filesystem timestamp, which used to leave the newest-first ordering
+        // (and therefore the assertions below) up to directory iteration order.
+        // Newest is the *named* session, which must not consume the keep-last
+        // slot that belongs to s2.
+        for (path, unix_secs) in [(&s1, 1_700_000_300), (&s2, 1_700_000_200), (&s3, 1_700_000_100)]
+        {
+            let _ = filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0));
+        }
+
         let options = GcOptions {
             older_than_days: 0, // Age immediately for test
             keep_last: 1,       // Keep 1 newest unpinned
@@ -979,7 +1007,18 @@ mod tests {
         };
 
         let plan = GarbageCollector::plan(&options).expect("plan");
-        assert!(plan.items_protected.iter().any(|i| i.path == s1));
-        assert_eq!(plan.items_to_prune.len(), 1);
+        assert!(
+            plan.items_protected.iter().any(|i| i.path == s1),
+            "named session preserved"
+        );
+        assert!(
+            plan.items_protected.iter().any(|i| i.path == s2),
+            "newest prunable session holds the keep-last slot the named session must not take"
+        );
+        assert_eq!(
+            plan.items_to_prune.iter().map(|i| &i.path).collect::<Vec<_>>(),
+            vec![&s3],
+            "only the oldest prunable session is reclaimed"
+        );
     }
 }
