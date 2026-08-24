@@ -299,3 +299,8 @@ factory.mcp.json
 # Large ad-hoc fixture drops under ext conformance artifacts
 tests/ext_conformance/artifacts/doom-overlay/doom1.wad
 tests/ext_conformance/artifacts/doom-overlay/doom-debug.log
+
+# macOS metadata & host scratch debris
+.DS_Store
+README.md:*
+root@*
