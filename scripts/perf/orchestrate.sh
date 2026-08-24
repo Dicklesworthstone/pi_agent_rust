@@ -3990,6 +3990,56 @@ else
 fi
 artifact_count=$((artifact_count + 1))
 
+POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
+mkdir -p "$POST_GENERATION_BUDGET_DIR"
+post_generation_budget_exit=0
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+  post_generation_budget_binary=""
+  for candidate in "$TARGET_DIR/$CARGO_PROFILE/deps/perf_budgets-"*; do
+    if [[ -f "$candidate" && -x "$candidate" ]] \
+      && [[ -z "$post_generation_budget_binary" || "$candidate" -nt "$post_generation_budget_binary" ]]; then
+      post_generation_budget_binary="$candidate"
+    fi
+  done
+  if [[ -z "$post_generation_budget_binary" ]]; then
+    post_generation_budget_exit=127
+    echo "No downloaded perf_budgets test binary found under $TARGET_DIR/$CARGO_PROFILE/deps" \
+      > "$POST_GENERATION_BUDGET_DIR/stderr.log"
+  else
+    PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+    PI_PERF_POST_GENERATION=1 \
+    CI_CORRELATION_ID="$CORRELATION_ID" \
+    "$post_generation_budget_binary" \
+      ci_enforced_budgets_fail_on_regression_or_missing_data --exact --nocapture \
+      > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+      2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
+      || post_generation_budget_exit=$?
+  fi
+else
+  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+  PI_PERF_POST_GENERATION=1 \
+  CI_CORRELATION_ID="$CORRELATION_ID" \
+  "${CARGO_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \
+    ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact --nocapture \
+    > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+    2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
+    || post_generation_budget_exit=$?
+fi
+
+post_generation_budget_status="pass"
+if [[ "$post_generation_budget_exit" -eq 0 ]]; then
+  suite_pass=$((suite_pass + 1))
+  log_ok "Post-generation perf budget data-contract evaluation passed"
+elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+  post_generation_budget_status="fail"
+  suite_fail=$((suite_fail + 1))
+  log_warn "Post-generation perf budget data-contract evaluation failed (exit=$post_generation_budget_exit)"
+else
+  post_generation_budget_status="skip"
+  suite_skip=$((suite_skip + 1))
+  log_warn "Post-generation perf budget data-contract evaluation skipped after failure (exit=$post_generation_budget_exit)"
+fi
+
 staging_exit=0
 if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH"; then
   log_ok "Final budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
@@ -4070,6 +4120,8 @@ OUTPUT_DIR="$OUTPUT_DIR" \
   SUITE_SKIP="$suite_skip" \
   POST_GENERATION_STATUS="$post_generation_status" \
   POST_GENERATION_EXIT="$post_generation_result_exit" \
+  POST_GENERATION_BUDGET_STATUS="$post_generation_budget_status" \
+  POST_GENERATION_BUDGET_EXIT="$post_generation_budget_exit" \
   ARTIFACT_STAGING_STATUS="$ARTIFACT_STAGING_STATUS" \
   ARTIFACT_STAGING_MISSING_REQUIRED="$ARTIFACT_STAGING_MISSING_REQUIRED" \
   ARTIFACT_STAGING_STALE_REQUIRED="$ARTIFACT_STAGING_STALE_REQUIRED" \
@@ -4103,6 +4155,14 @@ manifest.setdefault("artifact_staging", {}).update(
     }
 )
 suite_results = manifest.setdefault("suite_results", [])
+suite_results.append(
+    {
+        "suite": "perf_budgets_post_generation",
+        "status": os.environ["POST_GENERATION_BUDGET_STATUS"],
+        "exit_code": int(os.environ["POST_GENERATION_BUDGET_EXIT"]),
+        "elapsed_ms": 0,
+    }
+)
 suite_results.append(
     {
         "suite": "post_generation_evidence",

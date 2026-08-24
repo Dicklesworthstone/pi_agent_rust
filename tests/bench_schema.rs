@@ -748,7 +748,77 @@ JSON
 {"schema":"pi.perf.workload.v1","scenario":"200x10","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":1200,"per_call_us":45,"calls_per_sec":1666}
 JSON
     ;;
+  perf_budgets)
+    if [[ "${PI_PERF_POST_GENERATION:-0}" == "1" ]]; then
+      python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+evidence_dir = Path(sys.argv[1])
+expected_correlation_id = sys.argv[2]
+for name in (
+    "extension_benchmark_stratification.json",
+    "phase1_matrix_validation.json",
+):
+    path = evidence_dir / name
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("correlation_id") != expected_correlation_id:
+        raise SystemExit(f"{name}: correlation_id mismatch")
+PY
+    fi
+    ;;
 esac
+
+if [[ -n "${CI_CORRELATION_ID:-}" ]]; then
+  python3 - "$target_dir" "$CI_CORRELATION_ID" "$(git rev-parse HEAD)" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+target_dir = Path(sys.argv[1])
+correlation_id = sys.argv[2]
+source_commit = sys.argv[3]
+artifacts = (
+    ("scenario_runner.jsonl", "orchestration_correlation_id"),
+    ("pijs_workload.jsonl", "correlation_id"),
+    ("ext_bench_harness.jsonl", "correlation_id"),
+    ("legacy_extension_workloads.jsonl", "correlation_id"),
+)
+for relative_path, correlation_field in artifacts:
+    path = target_dir / "perf" / relative_path
+    if not path.is_file():
+        continue
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for record in records:
+        record[correlation_field] = correlation_id
+        record["source_commit"] = source_commit
+        record["source_dirty"] = False
+    if (
+        relative_path == "scenario_runner.jsonl"
+        and os.environ.get("PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW") == "1"
+        and records
+        and not any(
+            record.get("orchestration_correlation_id") == "foreign-correlation"
+            for record in records
+        )
+    ):
+        foreign = dict(records[-1])
+        foreign["orchestration_correlation_id"] = "foreign-correlation"
+        foreign["total_ms"] = 0.001
+        records.append(foreign)
+    path.write_text(
+        "\n".join(json.dumps(record, separators=(",", ":")) for record in records)
+        + "\n",
+        encoding="utf-8",
+    )
+PY
+fi
 exit 0
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
