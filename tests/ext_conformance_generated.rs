@@ -781,16 +781,22 @@ fn run_conformance_test(ext_id: &str) {
     let cwd = harness.temp_dir().to_path_buf();
     prepare_extension_fixture(ext_id, &cwd);
 
-    // Resolve the extension entry file.
-    // Some artifacts live under dist/ which rch excludes from sync.
-    // Gracefully skip when the artifact is absent (matches try_conformance behaviour).
+    // Resolve the extension entry file. The corpus is vendored and
+    // hash-pinned (VENDORED_SHA256SUMS.txt, bd-sog97.29), so an absent file
+    // means a corrupted/partial checkout — that must fail LOUDLY: silent
+    // skips here are exactly what produced the 143/208 empty-observation
+    // run this bead exists to prevent.
     let entry_file = artifacts_dir().join(&entry.entry_path);
     if !entry_file.exists() {
-        eprintln!(
-            "SKIP: artifact not found (likely rch dist/ exclusion): {}",
+        // Intentional loud failure: silent skips produced the 143/208
+        // empty-observation run this bead prevents (bd-sog97.29).
+        let missing = format!(
+            "EXT_CONFORMANCE_ARTIFACT_MISSING: {} is absent. The corpus is \
+             vendored; verify your checkout with \
+             `python3 scripts/vendor_ext_conformance_artifacts.py --verify`.",
             entry_file.display()
         );
-        return;
+        panic!("{missing}"); // ubs:ignore intentional hermetic-corpus tripwire
     }
 
     harness
@@ -1545,7 +1551,11 @@ fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
 /// (see docs/EXTENSION_REFRESH_CHECKLIST.md §3.2) and for diagnosing manifest
 /// drift like bd-sog97.29.
 fn maybe_dump_registration_observation(ext_id: &str, observation: &RegistrationObservation) {
-    if std::env::var("PI_DUMP_REGISTRATION_OBSERVATIONS").ok().as_deref() != Some("1") {
+    if std::env::var("PI_DUMP_REGISTRATION_OBSERVATIONS")
+        .ok()
+        .as_deref()
+        != Some("1")
+    {
         return;
     }
     #[derive(serde::Serialize)]
@@ -1582,7 +1592,11 @@ fn maybe_dump_registration_observation(ext_id: &str, observation: &RegistrationO
         return;
     };
     use std::io::Write as _;
-    let _ = writeln!(file, "{}", serde_json::to_string(&record).unwrap_or_default());
+    let _ = writeln!(
+        file,
+        "{}",
+        serde_json::to_string(&record).unwrap_or_default()
+    );
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
@@ -3632,6 +3646,19 @@ fn conformance_must_pass_gate() {
     use chrono::{SecondsFormat, Utc};
     use std::fmt::Write as _;
 
+    // Fail fast on a corrupted/partial artifact corpus before running 200+
+    // extension loads (bd-sog97.29): empty-observation signatures are what
+    // this gate exists to prevent.
+    let verify = std::process::Command::new("python3")
+        .arg("scripts/vendor_ext_conformance_artifacts.py")
+        .arg("--verify")
+        .output()
+        .expect("spawn vendor verifier");
+    assert!(
+        verify.status.success(),
+        "vendored conformance corpus failed verification:\n{}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_snapshot = capture_must_pass_source_snapshot(repo_root)
         .expect("capture coherent must-pass release source snapshot");
