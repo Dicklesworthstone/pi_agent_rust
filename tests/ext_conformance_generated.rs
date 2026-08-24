@@ -1539,6 +1539,52 @@ fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
     try_conformance_with_manifest(load_manifest(), ext_id)
 }
 
+/// When PI_DUMP_REGISTRATION_OBSERVATIONS=1, append every extension's
+/// runtime-observed registration identities to a JSONL oracle artifact. This
+/// is the ground-truth feed for regenerating VALIDATED_MANIFEST.json entries
+/// (see docs/EXTENSION_REFRESH_CHECKLIST.md §3.2) and for diagnosing manifest
+/// drift like bd-sog97.29.
+fn maybe_dump_registration_observation(ext_id: &str, observation: &RegistrationObservation) {
+    if std::env::var("PI_DUMP_REGISTRATION_OBSERVATIONS").ok().as_deref() != Some("1") {
+        return;
+    }
+    #[derive(serde::Serialize)]
+    struct Record<'a> {
+        id: &'a str,
+        commands: &'a std::collections::BTreeSet<String>,
+        flags: &'a std::collections::BTreeSet<String>,
+        tools: &'a std::collections::BTreeSet<String>,
+        providers: &'a std::collections::BTreeSet<String>,
+        event_handlers: &'a std::collections::BTreeSet<String>,
+    }
+    let record = Record {
+        id: ext_id,
+        commands: &observation.commands,
+        flags: &observation.flags,
+        tools: &observation.tools,
+        providers: &observation.providers,
+        event_handlers: &observation.event_handlers,
+    };
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("ext_conformance")
+        .join("reports")
+        .join("registration_observations.jsonl");
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        eprintln!(
+            "WARN: could not open registration observation artifact {}",
+            path.display()
+        );
+        return;
+    };
+    use std::io::Write as _;
+    let _ = writeln!(file, "{}", serde_json::to_string(&record).unwrap_or_default());
+}
+
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> ExtensionConformanceResult {
     let Some(entry) = manifest.find(ext_id) else {
@@ -1689,6 +1735,8 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
             };
         }
     };
+    maybe_dump_registration_observation(ext_id, &observation);
+
     if let Err(err) = validate_registration_observation(entry, &observation) {
         return ExtensionConformanceResult {
             id: ext_id.to_string(),
