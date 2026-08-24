@@ -70,6 +70,8 @@ pub struct Config {
     pub bash: Option<BashSettings>,
     /// Memory-bank settings (bd-cv653.4.1).
     pub memory: Option<MemorySettings>,
+    /// Opt-in media trio settings (bd-cv653.2.7).
+    pub media: Option<crate::media_tools::MediaSettings>,
     /// Secrets vault settings (bd-cv653.7.9).
     pub secrets: Option<crate::secrets::SecretsSettings>,
     /// Magic-keyword settings (bd-cv653.3.6).
@@ -844,6 +846,7 @@ impl Config {
             read: merge_read(base.read, other.read),
             bash: merge_bash(base.bash, other.bash),
             memory: merge_memory(base.memory, other.memory),
+            media: merge_media(base.media, other.media),
             secrets: other.secrets.or(base.secrets),
             keywords: other.keywords.or(base.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
@@ -1700,6 +1703,29 @@ fn merge_memory(
     match (base, other) {
         (Some(base), Some(other)) => Some(MemorySettings {
             backend: other.backend.or(base.backend),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+/// Merge media trio settings field-wise (bd-cv653.2.7).
+fn merge_media(
+    base: Option<crate::media_tools::MediaSettings>,
+    other: Option<crate::media_tools::MediaSettings>,
+) -> Option<crate::media_tools::MediaSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::media_tools::MediaSettings {
+            enable_inspect_image: other.enable_inspect_image.or(base.enable_inspect_image),
+            enable_generate_image: other.enable_generate_image.or(base.enable_generate_image),
+            enable_tts: other.enable_tts.or(base.enable_tts),
+            vision_model: other.vision_model.or(base.vision_model),
+            vision_provider: other.vision_provider.or(base.vision_provider),
+            image_gen_provider: other.image_gen_provider.or(base.image_gen_provider),
+            image_gen_model: other.image_gen_model.or(base.image_gen_model),
+            tts_voice: other.tts_voice.or(base.tts_voice),
+            tts_provider: other.tts_provider.or(base.tts_provider),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

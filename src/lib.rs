@@ -210,6 +210,8 @@ pub mod magic_keywords;
 #[doc(hidden)]
 pub mod mcp;
 #[doc(hidden)]
+pub mod media_tools;
+#[doc(hidden)]
 pub mod memory;
 #[doc(hidden)]
 pub mod migrations;

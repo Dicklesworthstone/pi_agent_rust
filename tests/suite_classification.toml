@@ -126,6 +126,7 @@ files = [
     "conformal_budget_calibration",
     "startup_benchmark",
     "variance_gating",
+    "media_tools",
     "checkpoint",
     "eval",
     "url_router",

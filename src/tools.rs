@@ -5325,6 +5325,37 @@ impl ToolRegistry {
                 "ast_edit" => tools.push(Box::new(crate::ast_tools::AstEditTool::new(cwd))),
                 "lsp" => tools.push(Box::new(crate::lsp::LspTool::new(cwd, config))),
                 "debug" => tools.push(Box::new(crate::debug::DebugTool::new(cwd, config))),
+                "inspect_image" => {
+                    let vision_model = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.vision_model.clone());
+                    let vision_provider = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.vision_provider.clone());
+                    tools.push(Box::new(crate::media_tools::InspectImageTool::with_defaults(
+                        cwd,
+                        vision_provider,
+                        vision_model,
+                    )));
+                }
+                "generate_image" => {
+                    let provider = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.image_gen_provider.clone());
+                    tools.push(Box::new(crate::media_tools::GenerateImageTool::with_provider(
+                        cwd,
+                        provider,
+                    )));
+                }
+                "tts" => {
+                    let voice = config
+                        .and_then(|c| c.media.as_ref())
+                        .and_then(|m| m.tts_voice.clone());
+                    tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
+                        cwd,
+                        voice,
+                    )));
+                }
                 "subagent" => {
                     let structured_results = config
                         .and_then(|c| c.subagent_structured_results)
@@ -5361,6 +5392,35 @@ impl ToolRegistry {
             )));
             // learn captures lessons into the same bank (bd-cv653.4.2).
             tools.push(Box::new(LearnTool::new(store)));
+        }
+
+        // Media tools (bd-cv653.2.7): opt-in via config.media
+        if let Some(media_cfg) = config.and_then(|c| c.media.as_ref()) {
+            if media_cfg.enable_inspect_image.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "inspect_image")
+            {
+                tools.push(Box::new(crate::media_tools::InspectImageTool::with_defaults(
+                    cwd,
+                    media_cfg.vision_provider.clone(),
+                    media_cfg.vision_model.clone(),
+                )));
+            }
+            if media_cfg.enable_generate_image.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "generate_image")
+            {
+                tools.push(Box::new(crate::media_tools::GenerateImageTool::with_provider(
+                    cwd,
+                    media_cfg.image_gen_provider.clone(),
+                )));
+            }
+            if media_cfg.enable_tts.unwrap_or(false)
+                && !tools.iter().any(|t| t.name() == "tts")
+            {
+                tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
+                    cwd,
+                    media_cfg.tts_voice.clone(),
+                )));
+            }
         }
 
         // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
