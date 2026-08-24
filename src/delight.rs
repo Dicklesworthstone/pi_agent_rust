@@ -164,7 +164,13 @@ impl FireworksState {
 /// Format OSC 0 / OSC 2 terminal window title escape sequence.
 #[must_use]
 pub fn format_terminal_title(title: &str) -> String {
-    format!("\x1b]0;{title}\x07")
+    const MAX_TITLE_CHARS: usize = 256;
+    let safe_title: String = title
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_TITLE_CHARS)
+        .collect();
+    format!("\x1b]0;{safe_title}\x07")
 }
 
 #[cfg(test)]
@@ -212,5 +218,19 @@ mod tests {
     fn test_terminal_title_formatting() {
         let seq = format_terminal_title("Pi Agent - Session Alpha");
         assert!(seq.starts_with("\x1b]0;Pi Agent - Session Alpha\x07"));
+    }
+
+    #[test]
+    fn test_terminal_title_strips_control_sequences() {
+        let seq = format_terminal_title("safe\x07\x1b]2;injected\nname");
+        assert_eq!(seq, "\x1b]0;safe]2;injectedname\x07");
+        assert_eq!(seq.matches('\x07').count(), 1);
+        assert_eq!(seq.matches('\x1b').count(), 1);
+    }
+
+    #[test]
+    fn test_terminal_title_has_a_bounded_payload() {
+        let seq = format_terminal_title(&"x".repeat(300));
+        assert_eq!(seq, format!("\x1b]0;{}\x07", "x".repeat(256)));
     }
 }

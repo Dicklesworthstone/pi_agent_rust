@@ -260,4 +260,3 @@ fn test_fork_preserves_lineage_and_supports_independent_branching() {
 
     finish_case(&harness, "session_store_v2_fork_lineage");
 }
-

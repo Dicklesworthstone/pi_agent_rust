@@ -184,11 +184,11 @@ pub mod handoff;
 #[doc(hidden)]
 pub mod hostcall_amac;
 #[doc(hidden)]
+pub mod hostcall_egraph;
+#[doc(hidden)]
 pub mod hostcall_io_uring_lane;
 #[doc(hidden)]
 pub mod hostcall_queue;
-#[doc(hidden)]
-pub mod hostcall_egraph;
 pub mod hostcall_rewrite;
 #[doc(hidden)]
 pub mod hostcall_s3_fifo;

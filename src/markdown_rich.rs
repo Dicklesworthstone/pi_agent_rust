@@ -52,7 +52,6 @@ impl HighlightLanguage {
 /// Convert LaTeX math expressions to legible Unicode representations.
 #[must_use]
 pub fn latex_to_unicode(latex: &str) -> String {
-    let mut out = latex.to_string();
     let replacements = [
         (r"\alpha", "α"),
         (r"\beta", "β"),
@@ -82,8 +81,28 @@ pub fn latex_to_unicode(latex: &str) -> String {
         (r"\sqrt", "√"),
     ];
 
-    for (from, to) in replacements {
-        out = out.replace(from, to);
+    let mut out = String::with_capacity(latex.len());
+    let mut cursor = 0;
+    while cursor < latex.len() {
+        let remaining = &latex[cursor..];
+        if let Some(&(from, to)) = replacements.iter().find(|&&(from, _)| {
+            remaining.strip_prefix(from).is_some_and(|suffix| {
+                suffix
+                    .chars()
+                    .next()
+                    .is_none_or(|next| !next.is_ascii_alphabetic())
+            })
+        }) {
+            out.push_str(to);
+            cursor += from.len();
+            continue;
+        }
+
+        let Some(next) = remaining.chars().next() else {
+            break;
+        };
+        out.push(next);
+        cursor += next.len_utf8();
     }
     out
 }
@@ -96,7 +115,7 @@ pub fn render_hex_swatches(text: &str) -> String {
     let mut i = 0;
 
     while i < chars.len() {
-        if chars.get(i) == Some(&'#') && i + 6 < chars.len() {
+        if chars.get(i) == Some(&'#') {
             // Ensure not preceded by an alphanumeric character (e.g. not url#anchor or var#name)
             let prev_ok = if i == 0 {
                 true
@@ -107,21 +126,21 @@ pub fn render_hex_swatches(text: &str) -> String {
             };
 
             if prev_ok {
-                let chunk: Vec<char> = chars.iter().skip(i + 1).take(6).copied().collect();
-                let is_hex = chunk.len() == 6 && chunk.iter().all(char::is_ascii_hexdigit);
-                // Ensure not immediately followed by another hex digit (e.g. not a 7+ char hash)
-                let next_ok = chars
-                    .get(i + 7)
-                    .is_none_or(|&next| !next.is_ascii_hexdigit());
+                let digit_count = [6, 3].into_iter().find(|digit_count| {
+                    let end = i + 1 + digit_count;
+                    end <= chars.len()
+                        && chars[i + 1..end].iter().all(char::is_ascii_hexdigit)
+                        && chars
+                            .get(end)
+                            .is_none_or(|next| !next.is_ascii_alphanumeric())
+                });
 
-                if is_hex && next_ok {
+                if let Some(digit_count) = digit_count {
+                    let end = i + 1 + digit_count;
                     out.push('■');
                     out.push(' ');
-                    out.push('#');
-                    for c in chunk {
-                        out.push(c);
-                    }
-                    i += 7;
+                    out.extend(chars[i..end].iter().copied());
+                    i = end;
                     continue;
                 }
             }
@@ -138,7 +157,15 @@ pub fn render_hex_swatches(text: &str) -> String {
 /// Emit an OSC-8 terminal hyperlink.
 #[must_use]
 pub fn format_osc8_link(url: &str, label: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\")
+    let safe_url: String = url
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let safe_label: String = label
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    format!("\x1b]8;;{safe_url}\x1b\\{safe_label}\x1b]8;;\x1b\\")
 }
 
 /// Format a mermaid diagram code block for clean terminal display.
@@ -197,11 +224,25 @@ mod tests {
     }
 
     #[test]
+    fn test_latex_to_unicode_preserves_longer_commands() {
+        let math = r"\left(x\right) + \top + \alpha_1";
+        let unicode = latex_to_unicode(math);
+        assert_eq!(unicode, r"\left(x\right) + \top + α_1");
+    }
+
+    #[test]
     fn test_hex_swatch_injection() {
-        let input = "The primary accent is #3b82f6 and dark is #1e293b.";
+        let input = "The primary accent is #3b82f6, dark is #1e293b, and short is #abc.";
         let swatched = render_hex_swatches(input);
         assert!(swatched.contains("■ #3b82f6"));
         assert!(swatched.contains("■ #1e293b"));
+        assert!(swatched.contains("■ #abc"));
+    }
+
+    #[test]
+    fn test_hex_swatch_rejects_longer_alphanumeric_tokens() {
+        let input = "Not colors: #1234567, #abcdefg, or #fffz.";
+        assert_eq!(render_hex_swatches(input), input);
     }
 
     #[test]
@@ -210,6 +251,19 @@ mod tests {
         assert!(link.starts_with("\x1b]8;;https://github.com\x1b\\"));
         assert!(link.ends_with("\x1b]8;;\x1b\\"));
         assert!(link.contains("GitHub"));
+    }
+
+    #[test]
+    fn test_osc8_link_strips_hostile_control_sequences() {
+        let link = format_osc8_link("https://example.test/\x1b]2;bad", "safe\x07\nlabel");
+        assert!(link.contains("https://example.test/]2;bad"));
+        assert!(link.contains("safelabel"));
+        assert_eq!(
+            link.matches('\x1b').count(),
+            4,
+            "only OSC-8 framing remains"
+        );
+        assert!(!link.contains('\x07'));
     }
 
     #[test]

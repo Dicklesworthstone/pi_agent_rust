@@ -8,7 +8,7 @@
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};
 use pi::pmu_telemetry::{
-    PmuOpportunityRanker, PmuRegressionBudget, PmuSample, PMU_TELEMETRY_SCHEMA,
+    PMU_TELEMETRY_SCHEMA, PmuOpportunityRanker, PmuRegressionBudget, PmuSample,
 };
 
 #[derive(Debug, Parser)]
@@ -86,8 +86,14 @@ fn main() -> Result<()> {
             println!("Schema: {PMU_TELEMETRY_SCHEMA}");
             println!("IPC: {:.2}", sample.ipc());
             println!("LLC Miss Rate: {:.2}%", sample.llc_miss_rate() * 100.0);
-            println!("Branch Miss Rate: {:.2}%", sample.branch_miss_rate() * 100.0);
-            println!("Total Stall Ratio: {:.2}%", sample.total_stall_ratio() * 100.0);
+            println!(
+                "Branch Miss Rate: {:.2}%",
+                sample.branch_miss_rate() * 100.0
+            );
+            println!(
+                "Total Stall Ratio: {:.2}%",
+                sample.total_stall_ratio() * 100.0
+            );
             println!("Verdict: {}", verdict.summary);
 
             if !verdict.passed {

@@ -880,7 +880,9 @@ fn artifact_age_hours(path: &Path) -> Option<f64> {
                     if let Some(ts_str) = ts_raw {
                         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
                             let now = chrono::Utc::now();
-                            let elapsed = (now - dt.with_timezone(&chrono::Utc)).num_milliseconds() as f64 / 1000.0;
+                            let elapsed = (now - dt.with_timezone(&chrono::Utc)).num_milliseconds()
+                                as f64
+                                / 1000.0;
                             if elapsed < -300.0 {
                                 return Some(f64::INFINITY);
                             }
@@ -911,7 +913,10 @@ fn artifact_age_hours(path: &Path) -> Option<f64> {
                         if let Some(ts_str) = ts_raw {
                             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
                                 let now = chrono::Utc::now();
-                                let elapsed = (now - dt.with_timezone(&chrono::Utc)).num_milliseconds() as f64 / 1000.0;
+                                let elapsed = (now - dt.with_timezone(&chrono::Utc))
+                                    .num_milliseconds()
+                                    as f64
+                                    / 1000.0;
                                 if elapsed < -300.0 {
                                     return Some(f64::INFINITY);
                                 }
@@ -5748,8 +5753,11 @@ fn artifact_age_hours_uses_embedded_generated_at_and_ignores_fresh_mtime() {
         "generated_at": stale_time.to_rfc3339(),
         "source_commit": "1234567890abcdef1234567890abcdef12345678",
     });
-    std::fs::write(&artifact_path, serde_json::to_string_pretty(&payload).unwrap())
-        .expect("write stale json artifact");
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).unwrap(),
+    )
+    .expect("write stale json artifact");
 
     // File was just written, so filesystem mtime is fresh (0s old),
     // but embedded generated_at is 48 hours old.
@@ -5781,8 +5789,11 @@ fn artifact_age_hours_uses_embedded_jsonl_timestamp_and_ignores_fresh_mtime() {
         "source_commit": "1234567890abcdef1234567890abcdef12345678",
         "iterations": 2000,
     });
-    std::fs::write(&artifact_path, format!("{}\n", serde_json::to_string(&record).unwrap()))
-        .expect("write stale jsonl artifact");
+    std::fs::write(
+        &artifact_path,
+        format!("{}\n", serde_json::to_string(&record).unwrap()),
+    )
+    .expect("write stale jsonl artifact");
 
     // Fresh filesystem mtime, stale embedded timestamp
     let age = artifact_age_hours(&artifact_path).expect("computed age");
@@ -5808,14 +5819,14 @@ fn artifact_age_hours_accepts_fresh_embedded_timestamp_with_old_mtime() {
         "generated_at": fresh_time.to_rfc3339(),
         "source_commit": "1234567890abcdef1234567890abcdef12345678",
     });
-    std::fs::write(&artifact_path, serde_json::to_string_pretty(&payload).unwrap())
-        .expect("write fresh json artifact");
+    std::fs::write(
+        &artifact_path,
+        serde_json::to_string_pretty(&payload).unwrap(),
+    )
+    .expect("write fresh json artifact");
 
     let age = artifact_age_hours(&artifact_path).expect("computed age");
-    assert!(
-        age < 0.1,
-        "expected fresh embedded age < 0.1h, got {age}"
-    );
+    assert!(age < 0.1, "expected fresh embedded age < 0.1h, got {age}");
 
     let rejection = evaluate_artifact_contract(tmp.path(), &[artifact_path], 24.0);
     assert!(
@@ -5823,4 +5834,3 @@ fn artifact_age_hours_accepts_fresh_embedded_timestamp_with_old_mtime() {
         "expected fresh artifact to pass contract evaluation"
     );
 }
-

@@ -5,7 +5,7 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::pmu_telemetry::{
-    PmuOpportunityRanker, PmuRegressionBudget, PmuSample, PMU_TELEMETRY_SCHEMA,
+    PMU_TELEMETRY_SCHEMA, PmuOpportunityRanker, PmuRegressionBudget, PmuSample,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -45,9 +45,10 @@ fn test_pmu_sample_derived_metrics() {
     assert!((sample.backend_stall_ratio() - 0.15).abs() < 1e-6);
     assert!((sample.total_stall_ratio() - 0.25).abs() < 1e-6);
 
-    harness
-        .log()
-        .info("metrics", format!("schema={PMU_TELEMETRY_SCHEMA} ipc={:.2}", sample.ipc()));
+    harness.log().info(
+        "metrics",
+        format!("schema={PMU_TELEMETRY_SCHEMA} ipc={:.2}", sample.ipc()),
+    );
 
     finish_case(&harness, "pmu_sample_derived_metrics");
 }
@@ -116,7 +117,8 @@ fn test_pmu_opportunity_ranker() {
         backend_stall_cycles: 70_000,
     };
 
-    let opportunity = PmuOpportunityRanker::score_candidate("hot_hostcall_dispatch", &memory_heavy_sample);
+    let opportunity =
+        PmuOpportunityRanker::score_candidate("hot_hostcall_dispatch", &memory_heavy_sample);
     assert_eq!(opportunity.name, "hot_hostcall_dispatch");
     assert_eq!(opportunity.bottleneck_category, "memory_bound_llc");
     assert!(opportunity.estimated_speedup > 1.20);
@@ -178,7 +180,10 @@ fn test_pmu_edge_cases_and_categories() {
         backend_stall_cycles: 2_000,
     };
     let frontend_opp = PmuOpportunityRanker::score_candidate("frontend_heavy", &frontend_sample);
-    assert_eq!(frontend_opp.bottleneck_category, "frontend_instruction_starvation");
+    assert_eq!(
+        frontend_opp.bottleneck_category,
+        "frontend_instruction_starvation"
+    );
 
     finish_case(&harness, "pmu_edge_cases_and_categories");
 }
