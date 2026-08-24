@@ -132,6 +132,7 @@ files = [
     "clean_release_commit",
     "web_remote",
     "web_security",
+    "btw_tan",
     "checkpoint",
     "eval",
     "url_router",

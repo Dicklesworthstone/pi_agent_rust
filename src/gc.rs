@@ -989,9 +989,13 @@ mod tests {
         // (and therefore the assertions below) up to directory iteration order.
         // Newest is the *named* session, which must not consume the keep-last
         // slot that belongs to s2.
-        for (path, unix_secs) in [(&s1, 1_700_000_300), (&s2, 1_700_000_200), (&s3, 1_700_000_100)]
-        {
-            let _ = filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0));
+        for (path, unix_secs) in [
+            (&s1, 1_700_000_300),
+            (&s2, 1_700_000_200),
+            (&s3, 1_700_000_100),
+        ] {
+            let _ =
+                filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(unix_secs, 0));
         }
 
         let options = GcOptions {
@@ -1016,7 +1020,10 @@ mod tests {
             "newest prunable session holds the keep-last slot the named session must not take"
         );
         assert_eq!(
-            plan.items_to_prune.iter().map(|i| &i.path).collect::<Vec<_>>(),
+            plan.items_to_prune
+                .iter()
+                .map(|i| &i.path)
+                .collect::<Vec<_>>(),
             vec![&s3],
             "only the oldest prunable session is reclaimed"
         );
