@@ -335,8 +335,14 @@ impl PiApp {
         let plain_width = self.term_width.saturating_sub(4).max(1);
 
         if self.startup_welcome.trim().is_empty() {
-            let welcome = crate::overlay_system::WelcomeScreen::new();
-            return welcome.render(self.term_width);
+            let welcome = crate::overlay_system::WelcomeScreen::default();
+            let _ = writeln!(output, "  {}", self.styles.title.render(&welcome.greeting));
+            let _ = writeln!(
+                output,
+                "\n  {}",
+                self.styles.muted_italic.render(welcome.current_tip())
+            );
+            return output;
         }
 
         for line in self.startup_welcome.lines() {
@@ -679,7 +685,13 @@ impl PiApp {
             max_width,
         );
 
-        let _term_title = crate::delight::format_terminal_title(&self.session_id, &self.model, self.streaming);
+        let activity = match self.agent_state {
+            AgentState::Idle => "ready",
+            AgentState::Processing => "processing",
+            AgentState::ToolRunning => "tool",
+        };
+        let terminal_title = format!("Pi · {} · {activity}", self.model);
+        output.push_str(&crate::delight::format_terminal_title(&terminal_title));
 
         let _ = write!(
             output,
@@ -864,26 +876,50 @@ impl PiApp {
         if footer.chars().count() > max_width {
             footer = truncate(&footer, max_width);
         }
+        let (thinking_level, session_name) = self.session.try_lock().ok().map_or_else(
+            || (None, String::new()),
+            |session| {
+                (
+                    session.header.thinking_level.clone(),
+                    session
+                        .get_name()
+                        .unwrap_or_else(|| session.header.id.clone()),
+                )
+            },
+        );
+        let mode = self.agent.try_lock().ok().map_or("act", |agent| {
+            let plan_mode = agent.plan_state().mode();
+            if plan_mode == crate::plan::PlanMode::Off {
+                "act"
+            } else {
+                plan_mode.as_str()
+            }
+        });
+        let cwd = self.cwd.to_string_lossy();
         let status_ctx = crate::status_line::StatusContext {
-            model: Some(self.model.as_str()),
-            thinking_level: None,
-            mode: if self.plan_mode { "plan" } else { "act" },
-            cwd: self.cwd.to_string_lossy().to_string(),
+            model: self.model.as_str(),
+            thinking_level: thinking_level.as_deref(),
+            mode,
+            cwd: cwd.as_ref(),
             git_branch: self.vcs_info.as_deref(),
             git_dirty: false,
             context_pct: 0,
             cost_usd: total_cost,
             tokens_used: input.saturating_add(output_tokens),
             subagent_count: 0,
-            session_name: self.session_id.clone(),
-            timestamp_str: String::new(),
+            session_name: &session_name,
+            timestamp_str: "",
         };
-        let _powerline = crate::status_line::PowerlineStatusLine::new(
+        let powerline = crate::status_line::PowerlineStatusLine::with_preset(
             crate::status_line::StatusLinePreset::Compact,
         )
-        .render(&status_ctx, self.term_width);
+        .render(&status_ctx, max_width);
 
-        let _ = write!(output, "\n  {}\n", self.styles.muted.render(&footer));
+        output.push('\n');
+        if !powerline.is_empty() {
+            let _ = writeln!(output, "  {}", self.styles.muted.render(&powerline));
+        }
+        let _ = writeln!(output, "  {}", self.styles.muted.render(&footer));
     }
 
     /// Render a single conversation message to a string (uncached path).

@@ -56,7 +56,7 @@ pub fn render_sparkline(values: &[f64]) -> String {
     let first = values
         .iter()
         .copied()
-        .find(f64::is_finite)
+        .find(|value| value.is_finite())
         .unwrap_or(0.0);
     let mut min = first;
     let mut max = first;
