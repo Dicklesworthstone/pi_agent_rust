@@ -22,16 +22,312 @@
 mod bench_env;
 
 use std::env;
+use std::fs;
 use std::hint::black_box;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 
 fn criterion_config() -> Criterion {
+    match idle_rss_raw_artifact_path() {
+        Ok(Some(raw_path)) => {
+            if let Err(error) = generate_idle_rss_raw_artifact(&raw_path) {
+                eprintln!("failed to generate canonical idle-RSS raw artifact: {error}");
+                std::process::exit(2);
+            }
+            // This opt-in mode is an evidence producer, not a Criterion timing run.
+            // Exit only after every sampled child is reaped and the artifact is
+            // atomically published, so unrelated benchmark setup cannot contaminate
+            // the declared idle boundary.
+            std::process::exit(0);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("invalid idle-RSS evidence configuration: {error}");
+            std::process::exit(2);
+        }
+    }
     bench_env::criterion_config_system()
+}
+
+const IDLE_RSS_RAW_PATH_ENV: &str = "PI_IDLE_RSS_RAW_RELATIVE_PATH";
+const IDLE_RSS_SOURCE_COMMIT_ENV: &str = "PI_IDLE_RSS_SOURCE_COMMIT";
+const IDLE_RSS_SOURCE_DIRTY_ENV: &str = "PI_IDLE_RSS_SOURCE_DIRTY";
+const IDLE_RSS_CORRELATION_ID_ENV: &str = "PI_IDLE_RSS_CORRELATION_ID";
+const IDLE_RSS_SAMPLE_COUNT: usize = 5;
+const IDLE_RSS_SETTLE_MS: u64 = 1_000;
+
+#[derive(Debug, Clone, Serialize)]
+struct IdleRssSample {
+    pid: u32,
+    process_name: String,
+    rss_bytes: u64,
+}
+
+// Fields mirror `BenchEnvMeasurementControl` in `src/perf_build.rs`; both
+// producer and verifier hash the normalized JSON object.
+#[derive(Debug, Serialize)]
+struct IdleRssBenchEnv {
+    os: String,
+    arch: &'static str,
+    cpu_brand: String,
+    cpu_cores: usize,
+    mem_total_mb: u64,
+    governor: String,
+    turbo_boost: String,
+    aslr: String,
+    thp: String,
+    noise_score: u8,
+    config_hash: String,
+}
+
+fn invalid_idle_rss_input(detail: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, detail.into())
+}
+
+fn idle_rss_raw_artifact_path() -> io::Result<Option<PathBuf>> {
+    let Some(raw) = env::var_os(IDLE_RSS_RAW_PATH_ENV) else {
+        return Ok(None);
+    };
+    let relative = PathBuf::from(raw);
+    if relative.as_os_str().is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(invalid_idle_rss_input(format!(
+            "{IDLE_RSS_RAW_PATH_ENV} must be a non-empty normalized relative path"
+        )));
+    }
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| {
+            invalid_idle_rss_input(format!("{IDLE_RSS_RAW_PATH_ENV} requires CARGO_TARGET_DIR"))
+        })?;
+    Ok(Some(target_dir.join(relative)))
+}
+
+fn sample_interactive_idle_rss(
+    binary_path: &Path,
+    workspace: &Path,
+    agent_dir: &Path,
+    settle_ms: u64,
+) -> io::Result<IdleRssSample> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|error| io::Error::other(format!("allocate idle-RSS PTY: {error}")))?;
+    let mut command = CommandBuilder::new(binary_path);
+    command.cwd(workspace);
+    command.env("TERM", "xterm-256color");
+    command.env("PI_NO_MOUSE_CAPTURE", "1");
+    command.env("PI_WORKSPACE_TRUST", "trusted");
+    command.env("PI_CODING_AGENT_DIR", agent_dir);
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| io::Error::other(format!("spawn interactive pi: {error}")))?;
+    drop(pair.slave);
+    let Some(pid) = child.process_id() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::other(
+            "interactive pi did not expose a process id",
+        ));
+    };
+    let mut reader = match pair.master.try_clone_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!(
+                "clone idle-RSS PTY reader: {error}"
+            )));
+        }
+    };
+    let drain = thread::spawn(move || {
+        let _ = io::copy(&mut reader, &mut io::sink());
+    });
+
+    thread::sleep(Duration::from_millis(settle_ms));
+    let sample_result = (|| {
+        if let Some(status) = child.try_wait()? {
+            return Err(io::Error::other(format!(
+                "interactive pi exited before idle sample: {status:?}"
+            )));
+        }
+        let pid = sysinfo::Pid::from_u32(pid);
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_memory()),
+        );
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let process = system
+            .process(pid)
+            .ok_or_else(|| io::Error::other("interactive pi vanished before RSS refresh"))?;
+        let process_name = process.name().to_string_lossy().into_owned();
+        if process_name != "pi" {
+            return Err(io::Error::other(format!(
+                "idle-RSS sample resolved process name {process_name:?}, expected pi"
+            )));
+        }
+        let rss_bytes = process.memory();
+        if rss_bytes == 0 {
+            return Err(io::Error::other("interactive pi reported zero RSS"));
+        }
+        Ok(IdleRssSample {
+            pid: pid.as_u32(),
+            process_name,
+            rss_bytes,
+        })
+    })();
+
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(pair.master);
+    let _ = drain.join();
+    sample_result
+}
+
+fn generate_idle_rss_raw_artifact(output_path: &Path) -> io::Result<()> {
+    let binary = resolve_pi_binary();
+    if binary.kind != BinaryKind::Release {
+        return Err(invalid_idle_rss_input(format!(
+            "idle RSS requires target/release/pi, resolved {}",
+            binary.path.display()
+        )));
+    }
+    let binary_path = fs::canonicalize(&binary.path)?;
+    if binary_path.file_name().and_then(|name| name.to_str()) != Some("pi") {
+        return Err(invalid_idle_rss_input(
+            "idle RSS release binary must be named pi",
+        ));
+    }
+    let source_commit = env::var(IDLE_RSS_SOURCE_COMMIT_ENV)
+        .map_err(|_| invalid_idle_rss_input(format!("missing {IDLE_RSS_SOURCE_COMMIT_ENV}")))?;
+    let source_dirty = env::var(IDLE_RSS_SOURCE_DIRTY_ENV)
+        .map_err(|_| invalid_idle_rss_input(format!("missing {IDLE_RSS_SOURCE_DIRTY_ENV}")))?;
+    if source_dirty != "false" {
+        return Err(invalid_idle_rss_input(
+            "idle RSS release evidence requires source_dirty=false",
+        ));
+    }
+    let correlation_id = env::var(IDLE_RSS_CORRELATION_ID_ENV)
+        .map_err(|_| invalid_idle_rss_input(format!("missing {IDLE_RSS_CORRELATION_ID_ENV}")))?;
+    if correlation_id.trim().is_empty() {
+        return Err(invalid_idle_rss_input(
+            "idle RSS correlation id must be non-empty",
+        ));
+    }
+
+    let workspace = output_path
+        .parent()
+        .ok_or_else(|| invalid_idle_rss_input("idle RSS output path has no parent"))?;
+    fs::create_dir_all(workspace)?;
+    let mut samples = Vec::with_capacity(IDLE_RSS_SAMPLE_COUNT);
+    for sample_index in 0..IDLE_RSS_SAMPLE_COUNT {
+        // Isolate global settings, extensions, skills, and session state so a
+        // worker's personal Pi installation cannot contaminate idle RSS.
+        let agent_dir = workspace.join(format!("agent-sample-{}", sample_index + 1));
+        fs::create_dir_all(&agent_dir)?;
+        samples.push(sample_interactive_idle_rss(
+            &binary_path,
+            workspace,
+            &agent_dir,
+            IDLE_RSS_SETTLE_MS,
+        )?);
+    }
+    let representative = samples
+        .iter()
+        .max_by_key(|sample| sample.rss_bytes)
+        .cloned()
+        .ok_or_else(|| io::Error::other("idle RSS produced no samples"))?;
+    let min_rss_bytes = samples
+        .iter()
+        .map(|sample| sample.rss_bytes)
+        .min()
+        .ok_or_else(|| io::Error::other("idle RSS produced no minimum"))?;
+
+    let fingerprint = bench_env::collect_fingerprint();
+    let bench_env = IdleRssBenchEnv {
+        os: fingerprint.os,
+        arch: fingerprint.arch,
+        cpu_brand: fingerprint.cpu_brand,
+        cpu_cores: fingerprint.cpu_cores,
+        mem_total_mb: fingerprint.mem_total_mb,
+        governor: fingerprint.governor,
+        turbo_boost: fingerprint.turbo_boost,
+        aslr: fingerprint.aslr,
+        thp: fingerprint.thp,
+        noise_score: fingerprint.noise_score,
+        config_hash: fingerprint.config_hash,
+    };
+    let bench_env_value = serde_json::to_value(&bench_env)
+        .map_err(|error| io::Error::other(format!("normalize benchmark environment: {error}")))?;
+    let bench_env_bytes = serde_json::to_vec(&bench_env_value)
+        .map_err(|error| io::Error::other(format!("serialize benchmark environment: {error}")))?;
+    let bench_env_sha256 = pi::package_manager::hex_encode(&Sha256::digest(&bench_env_bytes));
+    let binary_sha256 = pi::perf_build::sha256_file(&binary_path)?;
+    let payload = serde_json::json!({
+        "schema": pi::perf_build::IDLE_RSS_MEASUREMENT_SCHEMA,
+        "generated_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "run_id": correlation_id,
+        "correlation_id": correlation_id,
+        "source_commit": source_commit,
+        "source_dirty": false,
+        "pid": representative.pid,
+        "process_name": representative.process_name,
+        "allocator": pi::perf_build::compiled_allocator().as_str(),
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "rss_bytes": representative.rss_bytes,
+        "idle_state": "startup_before_user_input",
+        "cargo_profile": "release",
+        "build_command": "cargo build --bin pi --release",
+        "sample_count": samples.len(),
+        "samples": samples,
+        "rss_spread_bytes": representative.rss_bytes.saturating_sub(min_rss_bytes),
+        "settle_ms": IDLE_RSS_SETTLE_MS,
+        "bench_env_source": "benches/bench_env.rs",
+        "bench_env": bench_env,
+        "bench_env_sha256": bench_env_sha256,
+    });
+    let mut encoded = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| io::Error::other(format!("serialize idle-RSS artifact: {error}")))?;
+    encoded.push(b'\n');
+    let temporary_path = output_path.with_extension("json.tmp");
+    fs::write(&temporary_path, &encoded)?;
+    fs::rename(&temporary_path, output_path)?;
+    let transport_record = serde_json::to_string(&payload)
+        .map_err(|error| io::Error::other(format!("serialize idle-RSS transport: {error}")))?;
+    eprintln!("[idle-rss-control] {transport_record}");
+    eprintln!(
+        "[idle-rss] artifact={} samples={} max_bytes={} spread_bytes={} binary_sha256={} bench_env_sha256={}",
+        output_path.display(),
+        IDLE_RSS_SAMPLE_COUNT,
+        representative.rss_bytes,
+        representative.rss_bytes.saturating_sub(min_rss_bytes),
+        payload["binary_sha256"].as_str().unwrap_or("invalid"),
+        payload["bench_env_sha256"].as_str().unwrap_or("invalid"),
+    );
+    Ok(())
 }
 
 // ============================================================================

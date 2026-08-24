@@ -5,7 +5,7 @@
 
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -117,6 +117,12 @@ pub struct VerifiedIdleRssMeasurement {
     pub binary_path: PathBuf,
     pub binary_sha256: String,
     pub rss_bytes: u64,
+    pub sample_count: usize,
+    pub rss_spread_bytes: u64,
+    pub settle_ms: u64,
+    pub bench_env_sha256: String,
+    pub governor: String,
+    pub noise_score: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,6 +208,23 @@ struct IdleRssMeasurementControl {
     binary_sha256: String,
     rss_bytes: u64,
     idle_state: String,
+    cargo_profile: String,
+    build_command: String,
+    sample_count: usize,
+    samples: Vec<IdleRssSampleControl>,
+    rss_spread_bytes: u64,
+    settle_ms: u64,
+    bench_env_source: String,
+    bench_env: BenchEnvMeasurementControl,
+    bench_env_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdleRssSampleControl {
+    pid: u32,
+    process_name: String,
+    rss_bytes: u64,
 }
 
 /// Independent build assertions carried by benchmark provenance.
@@ -753,6 +776,52 @@ fn verify_bench_env_measurement(
     Ok(bench_env)
 }
 
+fn verify_idle_rss_samples(
+    control: &IdleRssMeasurementControl,
+) -> Result<(), MeasurementControlError> {
+    if control.sample_count < 5 || control.sample_count != control.samples.len() {
+        return Err(MeasurementControlError::Invalid(
+            "idle RSS control requires sample_count >= 5 matching samples length".to_string(),
+        ));
+    }
+    if !(100..=10_000).contains(&control.settle_ms) {
+        return Err(MeasurementControlError::Invalid(
+            "idle RSS settle_ms must be in 100..=10000".to_string(),
+        ));
+    }
+    let mut unique_pids = HashSet::with_capacity(control.samples.len());
+    let mut min_rss_bytes = u64::MAX;
+    let mut max_rss_bytes = 0u64;
+    for sample in &control.samples {
+        if sample.pid == 0
+            || sample.process_name != "pi"
+            || sample.rss_bytes == 0
+            || !unique_pids.insert(sample.pid)
+        {
+            return Err(MeasurementControlError::Invalid(
+                "idle RSS samples require unique pid>0, process_name=pi, and rss_bytes>0"
+                    .to_string(),
+            ));
+        }
+        min_rss_bytes = min_rss_bytes.min(sample.rss_bytes);
+        max_rss_bytes = max_rss_bytes.max(sample.rss_bytes);
+    }
+    if control.rss_bytes != max_rss_bytes
+        || control.rss_spread_bytes != max_rss_bytes.saturating_sub(min_rss_bytes)
+        || !control.samples.iter().any(|sample| {
+            sample.pid == control.pid
+                && sample.process_name == control.process_name
+                && sample.rss_bytes == control.rss_bytes
+        })
+    {
+        return Err(MeasurementControlError::Invalid(
+            "idle RSS aggregate must identify the maximum sample and exact max-minus-min spread"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verify that idle RSS was sampled from a real `pi` process and remains
 /// bound to the exact measured executable and allocator.
 pub fn verify_idle_rss_measurement_control(
@@ -777,12 +846,22 @@ pub fn verify_idle_rss_measurement_control(
         || !matches!(control.allocator.as_str(), "system" | "jemalloc")
         || control.rss_bytes == 0
         || control.idle_state != "startup_before_user_input"
+        || control.cargo_profile != "release"
+        || control.build_command != "cargo build --bin pi --release"
     {
         return Err(MeasurementControlError::Invalid(
-            "idle RSS control requires pid>0, process_name=pi, a known allocator, rss_bytes>0, and the startup_before_user_input boundary"
+            "idle RSS control requires a release-built pi process, a known allocator, rss_bytes>0, and the startup_before_user_input boundary"
                 .to_string(),
         ));
     }
+    verify_idle_rss_samples(&control)?;
+    if control.bench_env_source != "benches/bench_env.rs" {
+        return Err(MeasurementControlError::Invalid(
+            "idle RSS bench_env_source must equal benches/bench_env.rs".to_string(),
+        ));
+    }
+    validate_sha256(&control.bench_env_sha256, "bench_env_sha256")?;
+    let bench_env = verify_bench_env_measurement(control.bench_env, &control.bench_env_sha256, 7)?;
     validate_sha256(&control.binary_sha256, "binary_sha256")?;
     let binary_path = canonical_regular_file(&control.binary_path, "binary_path")?;
     if binary_path.file_name().and_then(|name| name.to_str()) != Some("pi") {
@@ -808,6 +887,12 @@ pub fn verify_idle_rss_measurement_control(
         binary_path,
         binary_sha256: control.binary_sha256,
         rss_bytes: control.rss_bytes,
+        sample_count: control.sample_count,
+        rss_spread_bytes: control.rss_spread_bytes,
+        settle_ms: control.settle_ms,
+        bench_env_sha256: control.bench_env_sha256,
+        governor: bench_env.governor,
+        noise_score: bench_env.noise_score,
     })
 }
 
@@ -1010,6 +1095,27 @@ mod tests {
         let binary_path = std::fs::canonicalize(binary_path).expect("canonical Pi path");
         let binary_sha256 = super::sha256_file(&binary_path).expect("hash Pi executable");
         let control_path = temp.path().join("idle-rss.json");
+        let bench_env = serde_json::json!({
+            "os": "Linux",
+            "arch": "x86_64",
+            "cpu_brand": "fixture cpu",
+            "cpu_cores": 8,
+            "mem_total_mb": 16_384,
+            "governor": "performance",
+            "turbo_boost": "disabled",
+            "aslr": "full",
+            "thp": "never",
+            "noise_score": 1,
+            "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        });
+        let typed_bench_env: super::BenchEnvMeasurementControl =
+            serde_json::from_value(bench_env.clone()).expect("parse benchmark environment");
+        let bench_env_sha256 = super::sha256_bytes(
+            &serde_json::to_vec(
+                &serde_json::to_value(&typed_bench_env).expect("normalize benchmark environment"),
+            )
+            .expect("serialize benchmark environment"),
+        );
         let mut control = serde_json::json!({
             "schema": super::IDLE_RSS_MEASUREMENT_SCHEMA,
             "generated_at": "2026-08-24T00:00:00Z",
@@ -1022,16 +1128,62 @@ mod tests {
             "allocator": "system",
             "binary_path": binary_path,
             "binary_sha256": binary_sha256,
-            "rss_bytes": 1_048_576,
-            "idle_state": "startup_before_user_input"
+            "rss_bytes": 1_572_864,
+            "idle_state": "startup_before_user_input",
+            "cargo_profile": "release",
+            "build_command": "cargo build --bin pi --release",
+            "sample_count": 5,
+            "samples": [
+                {"pid": 4240, "process_name": "pi", "rss_bytes": 1_048_576},
+                {"pid": 4241, "process_name": "pi", "rss_bytes": 1_179_648},
+                {"pid": 4242, "process_name": "pi", "rss_bytes": 1_572_864},
+                {"pid": 4243, "process_name": "pi", "rss_bytes": 1_310_720},
+                {"pid": 4244, "process_name": "pi", "rss_bytes": 1_441_792}
+            ],
+            "rss_spread_bytes": 524_288,
+            "settle_ms": 1_000,
+            "bench_env_source": "benches/bench_env.rs",
+            "bench_env": bench_env,
+            "bench_env_sha256": bench_env_sha256
         });
         write_json(&control_path, &control);
 
-        let verified = verify_idle_rss_measurement_control(&control_path)
-            .expect("valid idle RSS control");
+        let verified =
+            verify_idle_rss_measurement_control(&control_path).expect("valid idle RSS control");
         assert_eq!(verified.pid, 4242);
+        assert_eq!(verified.sample_count, 5);
+        assert_eq!(verified.rss_spread_bytes, 524_288);
 
         control["process_name"] = serde_json::json!("cargo-test");
+        write_json(&control_path, &control);
+        assert!(matches!(
+            verify_idle_rss_measurement_control(&control_path),
+            Err(MeasurementControlError::Invalid(_))
+        ));
+
+        control["process_name"] = serde_json::json!("pi");
+        control["sample_count"] = serde_json::json!(4);
+        control["samples"] = serde_json::json!([
+            {"pid": 4240, "process_name": "pi", "rss_bytes": 1_048_576},
+            {"pid": 4241, "process_name": "pi", "rss_bytes": 1_179_648},
+            {"pid": 4242, "process_name": "pi", "rss_bytes": 1_572_864},
+            {"pid": 4243, "process_name": "pi", "rss_bytes": 1_310_720}
+        ]);
+        write_json(&control_path, &control);
+        assert!(matches!(
+            verify_idle_rss_measurement_control(&control_path),
+            Err(MeasurementControlError::Invalid(_))
+        ));
+
+        control["sample_count"] = serde_json::json!(5);
+        control["samples"] = serde_json::json!([
+            {"pid": 4240, "process_name": "pi", "rss_bytes": 1_048_576},
+            {"pid": 4241, "process_name": "pi", "rss_bytes": 1_179_648},
+            {"pid": 4242, "process_name": "pi", "rss_bytes": 1_572_864},
+            {"pid": 4243, "process_name": "pi", "rss_bytes": 1_310_720},
+            {"pid": 4244, "process_name": "pi", "rss_bytes": 1_441_792}
+        ]);
+        control["bench_env_sha256"] = serde_json::json!("0".repeat(64));
         write_json(&control_path, &control);
         assert!(matches!(
             verify_idle_rss_measurement_control(&control_path),

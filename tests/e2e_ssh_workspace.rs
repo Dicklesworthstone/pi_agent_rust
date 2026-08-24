@@ -16,7 +16,6 @@
 use std::path::{Path, PathBuf};
 mod common;
 
-
 use asupersync::test_utils;
 use pi::model::ContentBlock;
 use pi::tools::{EditTool, HashlineEditTool, ReadTool, Tool, WriteTool};
@@ -212,4 +211,3 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
         println!("[ssh-e2e] PASS (artifacts: {})", artifact_dir.display());
     });
 }
-

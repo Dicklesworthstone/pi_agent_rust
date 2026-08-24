@@ -981,7 +981,16 @@ fn canonical_protocol_contract() -> Value {
                     "binary_path",
                     "binary_sha256",
                     "rss_bytes",
-                    "idle_state"
+                    "idle_state",
+                    "cargo_profile",
+                    "build_command",
+                    "sample_count",
+                    "samples",
+                    "rss_spread_bytes",
+                    "settle_ms",
+                    "bench_env_source",
+                    "bench_env",
+                    "bench_env_sha256"
                 ]
             },
             "criterion_cold_load": {
@@ -6443,6 +6452,27 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
         budget_controls["properties"]["idle_rss"]["properties"]["schema"]["const"],
         "pi.perf.idle_rss_measurement.v1"
     );
+    let idle_rss_fields =
+        budget_controls["properties"]["idle_rss"]["properties"]["required_fields"]["items"]["enum"]
+            .as_array()
+            .expect("idle RSS required-field enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+    for field in [
+        "sample_count",
+        "samples",
+        "rss_spread_bytes",
+        "settle_ms",
+        "bench_env_source",
+        "bench_env",
+        "bench_env_sha256",
+    ] {
+        assert!(
+            idle_rss_fields.contains(field),
+            "idle RSS negative control must require {field}"
+        );
+    }
     assert_eq!(
         budget_controls["properties"]["criterion_cold_load"]["properties"]["schema"]["const"],
         "pi.perf.cold_load_measurement.v1"
@@ -6704,6 +6734,11 @@ fn orchestrate_script_emits_budget_input_negative_controls_before_consumption() 
         "cargo build --bin pi --release",
         "pi.perf.cold_load_measurement.v1",
         "cold_load_measurement.json",
+        "pi.perf.idle_rss_measurement.v1",
+        "idle_memory_rss.raw.json",
+        "idle_memory_rss.json",
+        "PI_IDLE_RSS_RAW_RELATIVE_PATH",
+        "[idle-rss-control] ",
         "benches/bench_env.rs",
         "PERF_MAX_BENCH_ENV_NOISE_SCORE",
         "deferred_perf_budgets=true",
@@ -6716,12 +6751,19 @@ fn orchestrate_script_emits_budget_input_negative_controls_before_consumption() 
     let cold_control = content
         .find("write_cold_load_measurement_control \"$result_dir\" \"$exit_code\"")
         .expect("cold-load control producer call");
+    let idle_control = content
+        .find("write_idle_rss_measurement_control")
+        .expect("idle-RSS control producer call");
     let budget_consumer = content
         .rfind("run_test_suite \"perf_budgets\"")
         .expect("deferred budget consumer call");
     assert!(
         cold_control < budget_consumer,
         "cold-load proof must be emitted before the budget consumer runs"
+    );
+    assert!(
+        idle_control < budget_consumer,
+        "idle-RSS proof must be emitted before the budget consumer runs"
     );
 }
 

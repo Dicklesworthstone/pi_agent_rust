@@ -595,6 +595,158 @@ PY
   log_ok "Cold-load measurement control: $control_path"
 }
 
+write_idle_rss_measurement_control() {
+  local producer_log="$1"
+  local binary_path="$2"
+  local control_path="$TARGET_DIR/perf/release_evidence/idle_memory_rss.json"
+  mkdir -p "$(dirname "$control_path")"
+
+  python3 - \
+    "$PROJECT_ROOT/Cargo.toml" \
+    "$producer_log" \
+    "$binary_path" \
+    "$control_path" \
+    "$GIT_COMMIT_FULL" \
+    "$GIT_DIRTY" \
+    "$CORRELATION_ID" <<'PY'
+import hashlib
+import json
+import os
+import sys
+import tomllib
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+producer_log = Path(sys.argv[2])
+binary_path = Path(sys.argv[3]).resolve(strict=True)
+control_path = Path(sys.argv[4])
+source_commit = sys.argv[5]
+source_dirty = sys.argv[6] == "true"
+correlation_id = sys.argv[7]
+
+with manifest_path.open("rb") as handle:
+    release = tomllib.load(handle).get("profile", {}).get("release", {})
+if release.get("opt-level") != "z" or release.get("strip") is not True:
+    raise SystemExit(
+        "idle RSS measurement requires Cargo.toml [profile.release] "
+        "opt-level='z' and strip=true"
+    )
+if source_dirty:
+    raise SystemExit("idle RSS release evidence requires source_dirty=false")
+if not producer_log.is_file():
+    raise SystemExit(f"idle RSS producer log is missing: {producer_log}")
+record_prefix = "[idle-rss-control] "
+records = [
+    line.split(record_prefix, 1)[1]
+    for line in producer_log.read_text(encoding="utf-8", errors="replace").splitlines()
+    if record_prefix in line
+]
+if len(records) != 1:
+    raise SystemExit(
+        f"idle RSS producer log must contain exactly one transport record, found {len(records)}"
+    )
+raw = json.loads(records[0])
+if raw.get("schema") != "pi.perf.idle_rss_measurement.v1":
+    raise SystemExit("idle RSS raw artifact has the wrong schema")
+for field, expected in (
+    ("run_id", correlation_id),
+    ("correlation_id", correlation_id),
+    ("source_commit", source_commit),
+    ("source_dirty", False),
+    ("process_name", "pi"),
+    ("idle_state", "startup_before_user_input"),
+    ("cargo_profile", "release"),
+    ("build_command", "cargo build --bin pi --release"),
+    ("bench_env_source", "benches/bench_env.rs"),
+):
+    if raw.get(field) != expected:
+        raise SystemExit(
+            f"idle RSS raw artifact field {field!r} does not match {expected!r}"
+        )
+if raw.get("allocator") not in {"system", "jemalloc"}:
+    raise SystemExit("idle RSS raw artifact has an unknown allocator")
+
+samples = raw.get("samples")
+sample_count = raw.get("sample_count")
+if not isinstance(samples, list) or not isinstance(sample_count, int):
+    raise SystemExit("idle RSS raw artifact samples are malformed")
+if sample_count < 5 or sample_count != len(samples):
+    raise SystemExit("idle RSS raw artifact requires at least five declared samples")
+pids = set()
+rss_values = []
+for sample in samples:
+    if not isinstance(sample, dict):
+        raise SystemExit("idle RSS sample must be an object")
+    pid = sample.get("pid")
+    rss_bytes = sample.get("rss_bytes")
+    if (
+        not isinstance(pid, int)
+        or pid <= 0
+        or pid in pids
+        or sample.get("process_name") != "pi"
+        or not isinstance(rss_bytes, int)
+        or rss_bytes <= 0
+    ):
+        raise SystemExit("idle RSS samples require unique positive pi PIDs and RSS bytes")
+    pids.add(pid)
+    rss_values.append(rss_bytes)
+max_rss = max(rss_values)
+min_rss = min(rss_values)
+if raw.get("rss_bytes") != max_rss:
+    raise SystemExit("idle RSS aggregate must equal the maximum sample")
+if raw.get("rss_spread_bytes") != max_rss - min_rss:
+    raise SystemExit("idle RSS spread must equal maximum minus minimum")
+if not any(
+    sample["pid"] == raw.get("pid") and sample["rss_bytes"] == max_rss
+    for sample in samples
+):
+    raise SystemExit("idle RSS representative PID must identify a maximum sample")
+settle_ms = raw.get("settle_ms")
+if not isinstance(settle_ms, int) or not 100 <= settle_ms <= 10_000:
+    raise SystemExit("idle RSS settle_ms must be in 100..=10000")
+
+bench_env = raw.get("bench_env")
+bench_env_keys = [
+    "os",
+    "arch",
+    "cpu_brand",
+    "cpu_cores",
+    "mem_total_mb",
+    "governor",
+    "turbo_boost",
+    "aslr",
+    "thp",
+    "noise_score",
+    "config_hash",
+]
+if not isinstance(bench_env, dict) or set(bench_env) != set(bench_env_keys):
+    raise SystemExit("idle RSS benchmark environment fields are malformed")
+bench_env_bytes = json.dumps(
+    bench_env, separators=(",", ":"), ensure_ascii=False, sort_keys=True
+).encode("utf-8")
+observed_bench_env_sha256 = hashlib.sha256(bench_env_bytes).hexdigest()
+if raw.get("bench_env_sha256") != observed_bench_env_sha256:
+    raise SystemExit("idle RSS bench_env_sha256 does not match bench_env")
+
+binary_digest = hashlib.sha256()
+with binary_path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        binary_digest.update(chunk)
+binary_sha256 = binary_digest.hexdigest()
+if raw.get("binary_sha256") != binary_sha256:
+    raise SystemExit("idle RSS remote binary hash does not match the retrieved release pi")
+
+payload = dict(raw)
+payload["binary_path"] = str(binary_path)
+payload["binary_sha256"] = binary_sha256
+encoded = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+temporary_path = control_path.with_name(control_path.name + ".tmp")
+temporary_path.write_text(encoded, encoding="utf-8")
+os.replace(temporary_path, control_path)
+PY
+  log_ok "Idle-RSS measurement control: $control_path"
+}
+
 # ─── Generate correlation ID ────────────────────────────────────────────────
 
 if [[ -z "$CORRELATION_ID" ]]; then
@@ -746,14 +898,38 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   fi
 
   if suite_selected "perf_budgets" || suite_selected "perf_regression"; then
+    release_pi_built=0
     log_step "Building release pi binary for release-size gates..."
     if "${CARGO_RUNNER_ARGS[@]}" build --bin pi --release >"$OUTPUT_DIR/logs/build_release_pi.log" 2>&1; then
+      release_pi_built=1
       log_ok "Release pi binary built: $TARGET_DIR/release/pi"
       write_binary_size_measurement_control "$TARGET_DIR/release/pi"
     elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
       die "Failed to build release pi binary required for binary-size gates (see logs/build_release_pi.log)"
     else
       log_warn "Failed to build release pi binary (see logs/build_release_pi.log); binary-size checks may return NO_DATA"
+    fi
+
+    if [[ "$release_pi_built" -eq 1 ]]; then
+      idle_rss_raw_relative="perf/release_evidence/idle_memory_rss.raw.json"
+      log_step "Sampling release pi interactive-idle RSS (N=5)..."
+      if PI_IDLE_RSS_RAW_RELATIVE_PATH="$idle_rss_raw_relative" \
+        PI_IDLE_RSS_SOURCE_COMMIT="$GIT_COMMIT_FULL" \
+        PI_IDLE_RSS_SOURCE_DIRTY="$GIT_DIRTY" \
+        PI_IDLE_RSS_CORRELATION_ID="$CORRELATION_ID" \
+        PI_BENCH_BUILD_PROFILE=release \
+        "${CARGO_RUNNER_ARGS[@]}" bench --bench system --profile release -- __idle_rss_control__ \
+        >"$OUTPUT_DIR/logs/idle_memory_rss.log" 2>&1; then
+        write_idle_rss_measurement_control \
+          "$OUTPUT_DIR/logs/idle_memory_rss.log" \
+          "$TARGET_DIR/release/pi"
+      elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+        die "Failed to sample release pi idle RSS (see logs/idle_memory_rss.log)"
+      else
+        log_warn "Failed to sample release pi idle RSS (see logs/idle_memory_rss.log); idle-memory checks may return NO_DATA"
+      fi
+    else
+      log_warn "Skipping idle-RSS sampling because this run did not build its release pi binary"
     fi
   fi
 
