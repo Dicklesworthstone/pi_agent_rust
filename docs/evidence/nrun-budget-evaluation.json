@@ -1,0 +1,90 @@
+{
+  "schema": "pi.nrun.budget_evaluation.v1",
+  "generated_at": "2026-08-24T09:24:11.671553+00:00",
+  "contract_path": "docs/contracts/nrun-evidence-protocol-contract.json",
+  "min_repetitions_enforced": 10,
+  "total_budgets": 6,
+  "passing_budgets": 4,
+  "failing_budgets": 2,
+  "overall_status": "FAIL",
+  "evaluations": [
+    {
+      "budget_name": "startup_version_p95",
+      "category": "startup",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 100.0,
+      "repetition_count": 12,
+      "n_eff": 12.0,
+      "weighted_mean": 4.202500000000001,
+      "ci_95_lower": 4.1775,
+      "ci_95_upper": 4.2250000000000005,
+      "status": "PASS"
+    },
+    {
+      "budget_name": "binary_size_mb",
+      "category": "binary_size",
+      "comparison": "maximum",
+      "unit": "MB",
+      "threshold": 48.0,
+      "repetition_count": 10,
+      "n_eff": 10.0,
+      "weighted_mean": 43.620999999999995,
+      "ci_95_lower": 43.620999999999995,
+      "ci_95_upper": 43.620999999999995,
+      "status": "PASS"
+    },
+    {
+      "budget_name": "context_graph_build_cold_p95",
+      "category": "context_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 150.0,
+      "repetition_count": 14,
+      "n_eff": 14.0,
+      "weighted_mean": 55.95000000000001,
+      "ci_95_lower": 55.68214285714287,
+      "ci_95_upper": 56.2357142857143,
+      "status": "PASS"
+    },
+    {
+      "budget_name": "runtime_intelligence_eval_p95",
+      "category": "runtime_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 25.0,
+      "repetition_count": 10,
+      "n_eff": 10.0,
+      "weighted_mean": 1.206,
+      "ci_95_lower": 1.1939999999999995,
+      "ci_95_upper": 1.2200000000000002,
+      "status": "PASS"
+    },
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "category": "extension",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 5.0,
+      "repetition_count": 12,
+      "n_eff": 12.0,
+      "weighted_mean": 11.950000000000001,
+      "ci_95_lower": 11.910000000000002,
+      "ci_95_upper": 11.993333333333332,
+      "status": "FAIL"
+    },
+    {
+      "budget_name": "tool_call_latency_mean",
+      "category": "tool_call",
+      "comparison": "maximum",
+      "unit": "us",
+      "threshold": 200.0,
+      "repetition_count": 10,
+      "n_eff": 10.0,
+      "weighted_mean": 245.0,
+      "ci_95_lower": 243.65,
+      "ci_95_upper": 246.35,
+      "status": "FAIL"
+    }
+  ]
+}

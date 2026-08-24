@@ -4353,6 +4353,72 @@ else
     check_fail "waiver_ledger" "waiver ledger contract or evidence file missing"
 fi
 
+# Gate 13b: N-Run Multi-Repetition Evidence Protocol (RI-NRUN)
+NRUN_CONTRACT="$PROJECT_ROOT/docs/contracts/nrun-evidence-protocol-contract.json"
+NRUN_EVIDENCE="$PROJECT_ROOT/docs/evidence/nrun-budget-evaluation.json"
+
+if [ -f "$NRUN_CONTRACT" ] && [ -f "$NRUN_EVIDENCE" ]; then
+    if NRUN_CHECK=$(python3 - "$NRUN_CONTRACT" "$NRUN_EVIDENCE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+
+try:
+    with open(contract_path) as f:
+        contract = json.load(f)
+    with open(evidence_path) as f:
+        evidence = json.load(f)
+except Exception as e:
+    print(f"invalid:{e}")
+    sys.exit(0)
+
+if contract.get("schema") != "pi.nrun.evidence_protocol.contract.v1":
+    print("invalid:contract schema mismatch")
+    sys.exit(0)
+
+if evidence.get("schema") != "pi.nrun.budget_evaluation.v1":
+    print("invalid:evidence schema mismatch")
+    sys.exit(0)
+
+min_reps = contract.get("protocol_requirements", {}).get("min_repetitions", 10)
+evaluations = evidence.get("evaluations", [])
+if not evaluations:
+    print("invalid:empty evaluations in evidence")
+    sys.exit(0)
+
+for ev in evaluations:
+    reps = ev.get("repetition_count", 0)
+    if reps < min_reps:
+        print(f"invalid:insufficient repetitions for {ev.get('budget_name')} ({reps} < {min_reps})")
+        sys.exit(0)
+    if ev.get("ci_95_lower", 0.0) > ev.get("ci_95_upper", 0.0):
+        print(f"invalid:inverted CI bounds for {ev.get('budget_name')}")
+        sys.exit(0)
+
+print(f"ok:{len(evaluations)}")
+PY
+); then
+        case "$NRUN_CHECK" in
+            ok:*)
+                check_pass "nrun_evidence_protocol" "evaluated ${NRUN_CHECK#ok:} budgets with N>=10 bootstrap CIs"
+                ;;
+            invalid:*)
+                check_fail "nrun_evidence_protocol" "N-run evidence protocol check failed (${NRUN_CHECK#invalid:})"
+                ;;
+            *)
+                check_fail "nrun_evidence_protocol" "unexpected N-run check output: $NRUN_CHECK"
+                ;;
+        esac
+    else
+        check_fail "nrun_evidence_protocol" "N-run evidence protocol evaluation failed: $NRUN_CHECK"
+    fi
+else
+    check_fail "nrun_evidence_protocol" "N-run contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'

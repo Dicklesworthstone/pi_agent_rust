@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "pi.nrun.evidence_protocol.contract.v1",
+  "contract_id": "pi.contract.nrun_evidence_protocol.v1",
+  "title": "N-Run Evidence Protocol Contract",
+  "version": "1.0.0",
+  "bead_id": "bd-sog97.10",
+  "policy_owner_role": "Release Engineering",
+  "created_at": "2026-08-24T00:10:38Z",
+  "status": "enforced",
+  "description": "Defines multi-run evidence protocol requirements preventing peeking statistics and single-run evaluation. Mandates N>=10 repetitions across distinct correlation IDs with bootstrap 95% confidence intervals.",
+  "protocol_requirements": {
+    "min_repetitions": 10,
+    "confidence_level": 0.95,
+    "bootstrap_resamples": 1000,
+    "require_distinct_correlation_ids": true,
+    "max_allowed_noise_score": 15,
+    "decision_rules": {
+      "maximum_budget": "ci_95_upper <= threshold",
+      "minimum_budget": "ci_95_lower >= threshold"
+    }
+  },
+  "required_series_fields": [
+    "run_index",
+    "correlation_id",
+    "timestamp",
+    "git_commit",
+    "raw_value",
+    "weight",
+    "noise_score"
+  ],
+  "required_budget_evaluation_fields": [
+    "budget_name",
+    "category",
+    "comparison",
+    "unit",
+    "threshold",
+    "repetition_count",
+    "n_eff",
+    "weighted_mean",
+    "ci_95_lower",
+    "ci_95_upper",
+    "status"
+  ],
+  "enforced_budgets": [
+    "startup_version_p95",
+    "binary_size_mb",
+    "context_graph_build_cold_p95",
+    "runtime_intelligence_eval_p95",
+    "ext_cold_load_simple_p95",
+    "tool_call_latency_mean"
+  ]
+}

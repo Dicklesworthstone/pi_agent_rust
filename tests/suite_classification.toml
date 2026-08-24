@@ -120,6 +120,7 @@ files = [
     "worktree_iso",
     "waiver_ledger",
     "release_evidence_ledger",
+    "nrun_evidence_protocol",
     "checkpoint",
     "eval",
     "url_router",

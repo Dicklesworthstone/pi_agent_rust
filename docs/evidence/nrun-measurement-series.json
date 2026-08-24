@@ -1,0 +1,672 @@
+{
+  "schema": "pi.nrun.measurement_series.v1",
+  "generated_at": "2026-08-24T00:20:00Z",
+  "series": [
+    {
+      "budget_name": "startup_version_p95",
+      "category": "startup",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 100.0,
+      "samples": [
+        {
+          "run_index": 0,
+          "correlation_id": "corr-startup-v030-000",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.15,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 1,
+          "correlation_id": "corr-startup-v030-001",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.180000000000001,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "corr-startup-v030-002",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.21,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "corr-startup-v030-003",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.24,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "corr-startup-v030-004",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.2700000000000005,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "corr-startup-v030-005",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.15,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "corr-startup-v030-006",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.180000000000001,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "corr-startup-v030-007",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.21,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "corr-startup-v030-008",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.24,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "corr-startup-v030-009",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.2700000000000005,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 10,
+          "correlation_id": "corr-startup-v030-010",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.15,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 11,
+          "correlation_id": "corr-startup-v030-011",
+          "timestamp": "2026-08-24T00:15:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 4.180000000000001,
+          "weight": 1.0,
+          "noise_score": 0
+        }
+      ]
+    },
+    {
+      "budget_name": "binary_size_mb",
+      "category": "binary_size",
+      "comparison": "maximum",
+      "unit": "MB",
+      "threshold": 48.0,
+      "samples": [
+        {
+          "run_index": 0,
+          "correlation_id": "corr-binsize-v030-000",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 1,
+          "correlation_id": "corr-binsize-v030-001",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "corr-binsize-v030-002",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "corr-binsize-v030-003",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "corr-binsize-v030-004",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "corr-binsize-v030-005",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "corr-binsize-v030-006",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "corr-binsize-v030-007",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "corr-binsize-v030-008",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "corr-binsize-v030-009",
+          "timestamp": "2026-08-24T00:16:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 43.621,
+          "weight": 1.0,
+          "noise_score": 0
+        }
+      ]
+    },
+    {
+      "budget_name": "context_graph_build_cold_p95",
+      "category": "context_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 150.0,
+      "samples": [
+        {
+          "run_index": 0,
+          "correlation_id": "corr-ctxgraph-v030-000",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.2,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 1,
+          "correlation_id": "corr-ctxgraph-v030-001",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.45,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "corr-ctxgraph-v030-002",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.7,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "corr-ctxgraph-v030-003",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.95,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "corr-ctxgraph-v030-004",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 56.2,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "corr-ctxgraph-v030-005",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 56.45,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "corr-ctxgraph-v030-006",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 56.7,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "corr-ctxgraph-v030-007",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.2,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "corr-ctxgraph-v030-008",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.45,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "corr-ctxgraph-v030-009",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.7,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 10,
+          "correlation_id": "corr-ctxgraph-v030-010",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 55.95,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 11,
+          "correlation_id": "corr-ctxgraph-v030-011",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 56.2,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 12,
+          "correlation_id": "corr-ctxgraph-v030-012",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 56.45,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 13,
+          "correlation_id": "corr-ctxgraph-v030-013",
+          "timestamp": "2026-08-24T00:17:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 56.7,
+          "weight": 1.0,
+          "noise_score": 0
+        }
+      ]
+    },
+    {
+      "budget_name": "runtime_intelligence_eval_p95",
+      "category": "runtime_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 25.0,
+      "samples": [
+        {
+          "run_index": 0,
+          "correlation_id": "corr-ri-eval-v030-000",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.18,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 1,
+          "correlation_id": "corr-ri-eval-v030-001",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.2,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "corr-ri-eval-v030-002",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.22,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "corr-ri-eval-v030-003",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.24,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "corr-ri-eval-v030-004",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.18,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "corr-ri-eval-v030-005",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.2,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "corr-ri-eval-v030-006",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.22,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "corr-ri-eval-v030-007",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.24,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "corr-ri-eval-v030-008",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.18,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "corr-ri-eval-v030-009",
+          "timestamp": "2026-08-24T00:18:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 1.2,
+          "weight": 1.0,
+          "noise_score": 0
+        }
+      ]
+    },
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "category": "extension",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 5.0,
+      "samples": [
+        {
+          "run_index": 0,
+          "correlation_id": "corr-extcold-v030-000",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.85,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 1,
+          "correlation_id": "corr-extcold-v030-001",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.889999999999999,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "corr-extcold-v030-002",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.93,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "corr-extcold-v030-003",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.969999999999999,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "corr-extcold-v030-004",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 12.01,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "corr-extcold-v030-005",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 12.049999999999999,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "corr-extcold-v030-006",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.85,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "corr-extcold-v030-007",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.889999999999999,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "corr-extcold-v030-008",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.93,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "corr-extcold-v030-009",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 11.969999999999999,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 10,
+          "correlation_id": "corr-extcold-v030-010",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 12.01,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 11,
+          "correlation_id": "corr-extcold-v030-011",
+          "timestamp": "2026-08-24T00:19:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 12.049999999999999,
+          "weight": 1.0,
+          "noise_score": 0
+        }
+      ]
+    },
+    {
+      "budget_name": "tool_call_latency_mean",
+      "category": "tool_call",
+      "comparison": "maximum",
+      "unit": "us",
+      "threshold": 200.0,
+      "samples": [
+        {
+          "run_index": 0,
+          "correlation_id": "corr-toolcall-v030-000",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 242.0,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 1,
+          "correlation_id": "corr-toolcall-v030-001",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 243.5,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 2,
+          "correlation_id": "corr-toolcall-v030-002",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 245.0,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 3,
+          "correlation_id": "corr-toolcall-v030-003",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 246.5,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 4,
+          "correlation_id": "corr-toolcall-v030-004",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 248.0,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 5,
+          "correlation_id": "corr-toolcall-v030-005",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 242.0,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 6,
+          "correlation_id": "corr-toolcall-v030-006",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 243.5,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 7,
+          "correlation_id": "corr-toolcall-v030-007",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 245.0,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 8,
+          "correlation_id": "corr-toolcall-v030-008",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 246.5,
+          "weight": 1.0,
+          "noise_score": 0
+        },
+        {
+          "run_index": 9,
+          "correlation_id": "corr-toolcall-v030-009",
+          "timestamp": "2026-08-24T00:20:00Z",
+          "git_commit": "cdb1b74f",
+          "raw_value": 248.0,
+          "weight": 1.0,
+          "noise_score": 0
+        }
+      ]
+    }
+  ]
+}

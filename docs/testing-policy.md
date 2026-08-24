@@ -881,3 +881,30 @@ Proposed fix:
 Verification plan:
   <How will we confirm the fix works? (e.g., 3 clean CI runs)>
 ```
+
+## Multi-Run N-Run Evidence Protocol (RI-NRUN, DROPIN-R14)
+
+### Purpose & Anti-Peeking Principle
+
+Release-integrity performance budgets must not be evaluated on single test runs or selective single measurements (which introduces peeking statistics and false-pass risk). The N-Run Evidence Protocol mandates that release-deciding performance budgets be evaluated over multi-run series with rigorous statistical estimation.
+
+### Protocol Requirements
+
+1. **Repetitions**: Every evaluated budget must include at least $N \ge 10$ distinct measurement runs.
+2. **Correlation Isolation**: Every measurement run must record a distinct, unique `correlation_id` across separate executions.
+3. **Environment & Noise Gating**: Each sample records environment metadata and a `noise_score` ($\le 15$ required for valid samples).
+4. **Statistical Estimation**:
+   - **Weighted Mean**: $\bar{x}_w = \frac{\sum w_i x_i}{\sum w_i}$
+   - **Effective Sample Size**: $n_{\text{eff}} = \frac{(\sum w_i)^2}{\sum w_i^2}$
+   - **Bootstrap 95% Confidence Intervals**: $B = 1000$ resamples with replacement produce empirical percentile bounds $[\text{CI}_{95,\text{lower}}, \text{CI}_{95,\text{upper}}]$.
+5. **Decision Rule**:
+   - For `maximum` budgets (latency, size, memory): Budget passes only when $\text{CI}_{95,\text{upper}} \le \text{threshold}$.
+   - For `minimum` budgets (throughput, QPS): Budget passes only when $\text{CI}_{95,\text{lower}} \ge \text{threshold}$.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/nrun-evidence-protocol-contract.json` (`pi.nrun.evidence_protocol.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/nrun-budget-evaluation.json` (`pi.nrun.budget_evaluation.v1`)
+- **Evaluator Tool**: `examples/nrun_evidence_evaluator.rs`
+- **Verification Gate**: `tests/nrun_evidence_protocol.rs`
+

@@ -159,6 +159,10 @@ name = "pijs_workload"
 path = "examples/pijs_workload.rs"
 
 [[example]]
+name = "nrun_evidence_evaluator"
+path = "examples/nrun_evidence_evaluator.rs"
+
+[[example]]
 name = "release_evidence_ledger"
 path = "examples/release_evidence_ledger.rs"
 
