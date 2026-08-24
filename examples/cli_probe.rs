@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::CommandFactory;
 fn main() {
     let mut cmd = pi::cli::Cli::command();
     cmd.build();
