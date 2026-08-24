@@ -11,6 +11,18 @@
 //! bd-cv653.5.3 child registry), `vault://` (needs the bd-cv653.7.9
 //! placeholder vault). Unknown schemes error with the registered list —
 //! resolution NEVER silently falls back to the filesystem.
+//!
+//! `ssh://` workspace surface (bd-cv653.6.5): reads are open to any
+//! reachable host; writes/edits require the host in `~/.ssh/config` or
+//! `PI_SSH_ALLOWED_HOSTS`; auth is BatchMode-only (never interactive);
+//! host keys use accept-new-then-strict with hard failure + remediation on
+//! change; writes stage atomically (mktemp + rename, permissions preserved
+//! via `cp -p`); transfers resume from existing target prefixes and verify
+//! final sizes. Heavy remote trees are better served by an explicit SSHFS
+//! mount (`sshfs host:path mnt`) — documented degradation: pi then sees a
+//! local FS with network latency and no atomic-replace guarantees across
+//! the mount, so prefer the scheme tools for correctness-critical edits.
+//!
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
