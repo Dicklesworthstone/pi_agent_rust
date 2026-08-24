@@ -208,7 +208,8 @@ run_artifact_staging_manifest() {
   if [[ -n "${PERF_REMOTE_TARGET_DIR:-}" ]]; then
     args+=(--remote-target-dir "$PERF_REMOTE_TARGET_DIR")
   fi
-  python3 "$SCRIPT_DIR/artifact_staging.py" "${args[@]}" "$@"
+  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+    python3 "$SCRIPT_DIR/artifact_staging.py" "${args[@]}" "$@"
 }
 
 # ─── CLI Parsing ─────────────────────────────────────────────────────────────
@@ -363,6 +364,29 @@ elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; 
   else
     log_warn "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)."
   fi
+fi
+
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+  for required_env in \
+    BENCH_OUTPUT_DIR \
+    PERF_REGRESSION_OUTPUT \
+    PERF_RELEASE_BINARY_PATH \
+    CI_CORRELATION_ID \
+    VERGEN_GIT_SHA \
+    VERGEN_GIT_DIRTY \
+    RUST_TEST_THREADS \
+    PI_IDLE_RSS_RAW_RELATIVE_PATH \
+    PI_IDLE_RSS_SOURCE_COMMIT \
+    PI_IDLE_RSS_SOURCE_DIRTY \
+    PI_IDLE_RSS_CORRELATION_ID \
+    PI_BENCH_BUILD_PROFILE \
+    PI_PERF_STRICT; do
+    case ",${RCH_ENV_ALLOWLIST:-}," in
+      *",$required_env,"*) ;;
+      *) RCH_ENV_ALLOWLIST="${RCH_ENV_ALLOWLIST:+$RCH_ENV_ALLOWLIST,}$required_env" ;;
+    esac
+  done
+  export RCH_ENV_ALLOWLIST
 fi
 
 # ─── Profile-based suite selection ───────────────────────────────────────────
@@ -1564,16 +1588,32 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = line.strip()
         if not line:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "__lineage_parse_error": "invalid_json",
+                    "line_number": line_number,
+                    "detail": str(error),
+                }
+            )
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+        else:
+            rows.append(
+                {
+                    "__lineage_parse_error": "non_object_json",
+                    "line_number": line_number,
+                }
+            )
     return rows
 
 
@@ -1768,6 +1808,8 @@ def admit_dataset(path: Path, records: list[dict], correlation_field: str, requi
         observed_commit = record.get("source_commit")
         observed_dirty = record.get("source_dirty")
         reasons = []
+        if record.get("__lineage_parse_error"):
+            reasons.append(str(record["__lineage_parse_error"]))
         if observed_correlation != correlation_id:
             reasons.append("correlation_id_mismatch")
         if observed_commit != source_commit:
@@ -2360,16 +2402,32 @@ def load_jsonl(path: Path):
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = line.strip()
         if not line:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "__lineage_parse_error": "invalid_json",
+                    "line_number": line_number,
+                    "detail": str(error),
+                }
+            )
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+        else:
+            rows.append(
+                {
+                    "__lineage_parse_error": "non_object_json",
+                    "line_number": line_number,
+                }
+            )
     return rows
 
 
@@ -2488,6 +2546,8 @@ def admit_dataset(path, records, correlation_field):
     rejected = []
     for index, record in enumerate(records):
         reasons = []
+        if record.get("__lineage_parse_error"):
+            reasons.append(str(record["__lineage_parse_error"]))
         if record.get(correlation_field) != correlation_id:
             reasons.append("correlation_id_mismatch")
         if record.get("source_commit") != source_commit:

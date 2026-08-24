@@ -7432,6 +7432,74 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         "weighted global_ranking weighted_contribution_pct values should sum to ~100, got {contribution_sum}"
     );
 
+    let staging_path = output_dir.join("results/perf_artifact_staging_manifest.json");
+    let staging: Value = serde_json::from_str(
+        &fs::read_to_string(&staging_path).expect("read final artifact staging manifest"),
+    )
+    .expect("parse final artifact staging manifest");
+    let staging_entries = staging["entries"]
+        .as_array()
+        .expect("artifact staging entries array");
+    let source_commit = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(project_root())
+            .output()
+            .expect("resolve current Git commit")
+            .stdout,
+    )
+    .expect("Git commit must be UTF-8");
+    let source_commit = source_commit.trim();
+    let expected_correlation_id = manifest["correlation_id"]
+        .as_str()
+        .expect("manifest correlation_id");
+    for (contract_id, artifact_name) in [
+        (
+            "extension_benchmark_stratification",
+            "extension_benchmark_stratification.json",
+        ),
+        ("phase1_matrix_validation", "phase1_matrix_validation.json"),
+    ] {
+        let expected_source_path = output_dir.join("results").join(artifact_name);
+        let entry = staging_entries
+            .iter()
+            .find(|entry| {
+                entry["contract_id"].as_str() == Some(contract_id)
+                    && entry["evidence_source"].as_str() == Some("direct")
+                    && entry["status"].as_str() == Some("present")
+                    && entry["source_path"].as_str()
+                        == Some(expected_source_path.to_string_lossy().as_ref())
+            })
+            .unwrap_or_else(|| {
+                panic!("missing direct current-run staging entry for {contract_id}")
+            });
+        assert_eq!(
+            entry["correlation_id"].as_str(),
+            Some(expected_correlation_id),
+            "staged {contract_id} correlation must match the run manifest"
+        );
+        assert_eq!(
+            entry["source_commit"].as_str(),
+            Some(source_commit),
+            "staged {contract_id} commit must match the source checkout"
+        );
+        assert_eq!(
+            entry["source_dirty"].as_bool(),
+            Some(false),
+            "staged {contract_id} must be clean-source evidence"
+        );
+    }
+    assert!(
+        manifest["suite_results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                result["suite"].as_str() == Some("perf_budgets_post_generation")
+                    && result["status"].as_str() == Some("pass")
+                    && result["exit_code"].as_i64() == Some(0)
+            })
+        }),
+        "manifest must record a passing post-generation perf budget consumer"
+    );
+
     let _ = fs::remove_dir_all(temp_root);
 }
 
