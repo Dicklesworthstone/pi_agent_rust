@@ -7569,6 +7569,21 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         Some(true),
         "post-generation budget invocation must use an exact test filter"
     );
+    let post_generation_contract: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("results/post_generation_evidence_contract.json"))
+            .expect("read positive post-generation evidence contract"),
+    )
+    .expect("parse positive post-generation evidence contract");
+    assert_eq!(
+        post_generation_contract["status"].as_str(),
+        Some("ready"),
+        "current direct derived artifacts must pass the post-generation contract"
+    );
+    assert_eq!(
+        post_generation_contract["failure_count"].as_u64(),
+        Some(0),
+        "current direct phase1 and stratification artifacts must have zero contract failures"
+    );
 
     let _ = fs::remove_dir_all(temp_root);
 }
