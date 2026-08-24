@@ -52,6 +52,7 @@
 #   PERF_REGRESSION_FULL      Forwarded to perf_regression (1 = full mode)
 #   PI_PERF_STRICT            Set to 1 to fail CI-enforced budgets on NO_DATA (auto-set for ci/full profiles)
 #   PERF_CARGO_RUNNER         Cargo runner mode: rch | auto | local (default: rch)
+#   RCH_REQUIRE_REMOTE        RCH proof mode: fail closed instead of falling back locally
 
 set -euo pipefail
 
@@ -354,8 +355,15 @@ if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
   if ! command -v rch >/dev/null 2>&1; then
     die "PERF_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
   fi
+  if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+    export RCH_REQUIRE_REMOTE=1
+  fi
   if ! rch check --quiet >/dev/null 2>&1; then
-    die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+    if [[ "${RCH_REQUIRE_REMOTE:-0}" == "1" ]]; then
+      log_warn "'rch check' reports fleet degradation; proceeding with fail-closed remote execution."
+    else
+      die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+    fi
   fi
   CARGO_RUNNER_MODE="rch"
   CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")

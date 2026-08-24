@@ -861,6 +861,29 @@ fi
 exit 0
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
+    let rch_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  check)
+    exit 2
+    ;;
+  exec)
+    if [[ "${RCH_REQUIRE_REMOTE:-0}" != "1" ]]; then
+      echo "rch exec was not placed in fail-closed proof mode" >&2
+      exit 65
+    fi
+    shift
+    if [[ "${1:-}" == "--" ]]; then
+      shift
+    fi
+    exec "$@"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+    write_executable(&bin_dir.join("rch"), rch_stub);
     let git_stub = r#"#!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
@@ -7029,7 +7052,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .arg("full")
         .arg("--skip-build")
         .arg("--skip-env-check")
-        .arg("--no-rch")
+        .arg("--require-rch")
         .current_dir(project_root())
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", &target_dir)

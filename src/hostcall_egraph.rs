@@ -400,10 +400,13 @@ impl CostModel {
         } else {
             unmeasured.push("marshal_typed");
         }
+        // Both lists sorted so a report is comparable across runs regardless of
+        // which fields a given run happened to fill.
+        measured.sort_unstable();
         unmeasured.sort_unstable();
 
         (
-            Self { ..model },
+            model,
             CalibrationReport {
                 measured,
                 unmeasured,
@@ -1961,7 +1964,7 @@ mod tests {
         assert_eq!(model.marshal_json, 41, "marshal rounds from 41.2");
         assert_eq!(model.policy, 10, "policy rounds from 9.7");
         assert_eq!(model.dispatch, 12, "dispatch is queue + schedule = 11.5");
-        assert_eq!(report.measured, ["marshal_json", "policy", "dispatch"]);
+        assert_eq!(report.measured, ["dispatch", "marshal_json", "policy"]);
     }
 
     #[test]
