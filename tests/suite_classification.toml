@@ -135,6 +135,7 @@ files = [
     "btw_tan",
     "status_line",
     "markdown_rich",
+    "overlay_system",
     "checkpoint",
     "eval",
     "url_router",

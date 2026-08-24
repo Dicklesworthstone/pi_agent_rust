@@ -230,6 +230,8 @@ pub mod model_selector;
 #[doc(hidden)]
 pub mod models;
 #[doc(hidden)]
+pub mod overlay_system;
+#[doc(hidden)]
 pub mod package_manager;
 #[doc(hidden)]
 pub mod perf_build;
