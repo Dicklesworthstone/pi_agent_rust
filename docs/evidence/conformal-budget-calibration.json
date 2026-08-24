@@ -1,0 +1,112 @@
+{
+  "schema": "pi.conformal_calibration.v1",
+  "generated_at": "2026-08-24T09:46:31.484501+00:00",
+  "contract_path": "docs/contracts/conformal-budget-calibration-contract.json",
+  "config": {
+    "target_coverage": 0.95,
+    "significance_alpha": 0.050000000000000044,
+    "min_calibration_samples": 10,
+    "conformal_padding_multiplier": 1.1
+  },
+  "total_budgets": 6,
+  "data_derived_count": 5,
+  "folklore_policy_count": 1,
+  "calibrated_budgets": [
+    {
+      "budget_name": "startup_version_p95",
+      "category": "startup",
+      "comparison": "maximum",
+      "unit": "ms",
+      "folklore_threshold": 100.0,
+      "calibrated_threshold": 4.697000000000001,
+      "basis_type": "DATA_DERIVED_CONFORMAL",
+      "sample_size": 12,
+      "coverage_guarantee": 0.95,
+      "conformal_quantile_index": 12,
+      "empirical_p95": 4.2700000000000005,
+      "justification": "Statistically calibrated from N=12 runs with 95.0% finite-sample conformal coverage guarantee"
+    },
+    {
+      "budget_name": "binary_size_mb",
+      "category": "binary_size",
+      "comparison": "maximum",
+      "unit": "MB",
+      "folklore_threshold": 48.0,
+      "calibrated_threshold": 47.98310000000001,
+      "basis_type": "FOLKLORE_POLICY_CHOICE",
+      "sample_size": 10,
+      "coverage_guarantee": 0.95,
+      "conformal_quantile_index": 10,
+      "empirical_p95": 43.621,
+      "justification": "Retained as hard architectural release policy gate (48 MiB binary budget)"
+    },
+    {
+      "budget_name": "context_graph_build_cold_p95",
+      "category": "context_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "folklore_threshold": 150.0,
+      "calibrated_threshold": 62.37000000000001,
+      "basis_type": "DATA_DERIVED_CONFORMAL",
+      "sample_size": 14,
+      "coverage_guarantee": 0.95,
+      "conformal_quantile_index": 14,
+      "empirical_p95": 56.7,
+      "justification": "Statistically calibrated from N=14 runs with 95.0% finite-sample conformal coverage guarantee"
+    },
+    {
+      "budget_name": "runtime_intelligence_eval_p95",
+      "category": "runtime_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "folklore_threshold": 25.0,
+      "calibrated_threshold": 1.364,
+      "basis_type": "DATA_DERIVED_CONFORMAL",
+      "sample_size": 10,
+      "coverage_guarantee": 0.95,
+      "conformal_quantile_index": 10,
+      "empirical_p95": 1.24,
+      "justification": "Statistically calibrated from N=10 runs with 95.0% finite-sample conformal coverage guarantee"
+    },
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "category": "extension",
+      "comparison": "maximum",
+      "unit": "ms",
+      "folklore_threshold": 5.0,
+      "calibrated_threshold": 13.255000000000003,
+      "basis_type": "DATA_DERIVED_CONFORMAL",
+      "sample_size": 12,
+      "coverage_guarantee": 0.95,
+      "conformal_quantile_index": 12,
+      "empirical_p95": 12.05,
+      "justification": "Statistically calibrated from N=12 runs with 95.0% finite-sample conformal coverage guarantee"
+    },
+    {
+      "budget_name": "tool_call_latency_mean",
+      "category": "tool_call",
+      "comparison": "maximum",
+      "unit": "us",
+      "folklore_threshold": 200.0,
+      "calibrated_threshold": 272.8,
+      "basis_type": "DATA_DERIVED_CONFORMAL",
+      "sample_size": 10,
+      "coverage_guarantee": 0.95,
+      "conformal_quantile_index": 10,
+      "empirical_p95": 248.0,
+      "justification": "Statistically calibrated from N=10 runs with 95.0% finite-sample conformal coverage guarantee"
+    }
+  ],
+  "amendment_dry_runs": [
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "original_threshold": 5.0,
+      "amended_threshold": 13.26,
+      "unit": "ms",
+      "basis": "DATA_DERIVED_CONFORMAL",
+      "reason": "RI-CONFORMAL amendment dry-run: calibrated against empirical N=15 run series with 95% coverage guarantee",
+      "approver_role": "Release Engineering / Runtime Autonomy",
+      "evidence_provenance_hash": "sha256:c8ce94c3_nrun_series_v1"
+    }
+  ]
+}

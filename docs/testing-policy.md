@@ -962,5 +962,41 @@ Performance regressions rarely appear instantly without warning; they often exhi
 - **Evaluator Tool**: `examples/perf_drift_watch.rs`
 - **Verification Gate**: `tests/perf_drift_watch.rs`
 
+## Data-Derived Conformal Budget Calibration (RI-CONFORMAL, DROPIN-R20)
+
+### Purpose & Theoretical Coverage Guarantee
+
+Traditional performance engineering relies on round-number "folklore" budgets (e.g. 5ms cold-load, 100ms startup) set without empirical statistical foundations. When systems fail these arbitrary thresholds, teams are forced into subjective negotiation.
+
+Conformal budget calibration applies **split-conformal prediction** (Vovk et al. 2005) to compute rigorous, distribution-free performance thresholds with guaranteed finite-sample coverage $1 - \alpha \ge 95\%$:
+
+$$\mathbb{P}(X_{n+1} \le \hat{T}_{\text{conformal}}) \ge 1 - \alpha$$
+
+For $n$ sorted calibration samples $X_{(1)} \le \dots \le X_{(n)}$, the conformal quantile index is:
+$$k = \min\left(n, \left\lceil (n + 1)(1 - \alpha) \right\rceil\right)$$
+$$\hat{T}_{\text{conformal}} = X_{(k)} \times \text{padding\_multiplier}$$
+
+### Distinction: Data-Derived vs Folklore Policy Choice
+
+Every performance budget in the system must be explicitly classified:
+1. `DATA_DERIVED_CONFORMAL`: Statistically calibrated from $N \ge 10$ empirical measurement runs at guaranteed $\ge 95\%$ coverage.
+2. `FOLKLORE_POLICY_CHOICE`: Explicit policy decisions (e.g. 48 MiB binary size limit, hard CI timeout) where business or platform constraints supersede empirical distribution.
+
+### Formal Budget Amendment Workflow
+
+When an amended threshold is needed (e.g. for `ext_cold_load_simple_p95` in the risk register), the amendment procedure requires:
+- Cryptographic provenance series hash (`evidence_provenance_hash`).
+- Calibration over $N \ge 10$ clean runs with $\ge 95\%$ coverage guarantee.
+- Formal justification rationale recorded in the calibration artifact.
+- Named approver role (`Release Engineering / Runtime Autonomy`).
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/conformal-budget-calibration-contract.json` (`pi.conformal_calibration.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/conformal-budget-calibration.json` (`pi.conformal_calibration.v1`)
+- **Evaluator Tool**: `examples/conformal_budget_calibration.rs`
+- **Verification Gate**: `tests/conformal_budget_calibration.rs`
+
+
 
 

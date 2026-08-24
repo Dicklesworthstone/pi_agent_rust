@@ -123,6 +123,7 @@ files = [
     "nrun_evidence_protocol",
     "sequential_budget_gate",
     "perf_drift_watch",
+    "conformal_budget_calibration",
     "checkpoint",
     "eval",
     "url_router",

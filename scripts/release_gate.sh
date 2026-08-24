@@ -4551,6 +4551,84 @@ else
     check_fail "perf_drift_watch" "drift watch contract or evidence file missing"
 fi
 
+# Gate 13e: Conformal Budget Calibration & Amendment (RI-CONFORMAL)
+CONFORMAL_CONTRACT="$PROJECT_ROOT/docs/contracts/conformal-budget-calibration-contract.json"
+CONFORMAL_EVIDENCE="$PROJECT_ROOT/docs/evidence/conformal-budget-calibration.json"
+
+if [ -f "$CONFORMAL_CONTRACT" ] && [ -f "$CONFORMAL_EVIDENCE" ]; then
+    if CONFORMAL_CHECK=$(python3 - "$CONFORMAL_CONTRACT" "$CONFORMAL_EVIDENCE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+
+try:
+    with open(contract_path) as f:
+        contract = json.load(f)
+    with open(evidence_path) as f:
+        evidence = json.load(f)
+except Exception as e:
+    print(f"invalid:{e}")
+    sys.exit(0)
+
+if contract.get("schema") != "pi.conformal_calibration.contract.v1":
+    print("invalid:contract schema mismatch")
+    sys.exit(0)
+
+if evidence.get("schema") != "pi.conformal_calibration.v1":
+    print("invalid:evidence schema mismatch")
+    sys.exit(0)
+
+calibrated = evidence.get("calibrated_budgets", [])
+if not calibrated:
+    print("invalid:empty calibrated_budgets in evidence")
+    sys.exit(0)
+
+data_derived = 0
+for cb in calibrated:
+    bt = cb.get("basis_type")
+    if bt not in ["DATA_DERIVED_CONFORMAL", "FOLKLORE_POLICY_CHOICE"]:
+        print(f"invalid:unknown basis_type {bt} for {cb.get('budget_name')}")
+        sys.exit(0)
+    if bt == "DATA_DERIVED_CONFORMAL":
+        data_derived += 1
+
+if data_derived < 3:
+    print(f"invalid:insufficient data-derived calibrated budgets ({data_derived} < 3)")
+    sys.exit(0)
+
+amendments = evidence.get("amendment_dry_runs", [])
+if not amendments:
+    print("invalid:empty amendment_dry_runs in evidence")
+    sys.exit(0)
+
+print(f"ok:{len(calibrated)}:{data_derived}:{len(amendments)}")
+PY
+); then
+        case "$CONFORMAL_CHECK" in
+            ok:*)
+                CONF_INFO="${CONFORMAL_CHECK#ok:}"
+                TOTAL_B="$(echo "$CONF_INFO" | cut -d: -f1)"
+                DATA_D="$(echo "$CONF_INFO" | cut -d: -f2)"
+                AMENDS="$(echo "$CONF_INFO" | cut -d: -f3)"
+                check_pass "conformal_budget_calibration" "calibrated $TOTAL_B budgets ($DATA_D data-derived, $AMENDS amendment dry-runs at >=95% coverage)"
+                ;;
+            invalid:*)
+                check_fail "conformal_budget_calibration" "conformal calibration check failed (${CONFORMAL_CHECK#invalid:})"
+                ;;
+            *)
+                check_fail "conformal_budget_calibration" "unexpected conformal check output: $CONFORMAL_CHECK"
+                ;;
+        esac
+    else
+        check_fail "conformal_budget_calibration" "conformal budget calibration evaluation failed: $CONFORMAL_CHECK"
+    fi
+else
+    check_fail "conformal_budget_calibration" "conformal contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'
