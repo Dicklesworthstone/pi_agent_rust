@@ -2310,11 +2310,13 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   CORRELATION_ID="$CORRELATION_ID" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   GIT_DIRTY="$GIT_DIRTY" \
+  PI_PERF_STRICT="${PI_PERF_STRICT:-0}" \
   TIMESTAMP="$TIMESTAMP" \
   PHASE1_MATRIX_PATH="$PHASE1_MATRIX_PATH" \
   PARAMETER_SWEEPS_PATH="$PARAMETER_SWEEPS_PATH" \
   OPPORTUNITY_MATRIX_PATH="$OPPORTUNITY_MATRIX_PATH" \
   python3 - <<'PY'
+import hashlib
 import json
 import os
 import re
@@ -2327,6 +2329,7 @@ target_dir = Path(os.environ["TARGET_DIR"])
 correlation_id = os.environ["CORRELATION_ID"]
 source_commit = os.environ["GIT_COMMIT_FULL"]
 source_dirty = os.environ["GIT_DIRTY"] == "true"
+strict_mode = os.environ["PI_PERF_STRICT"] == "1"
 timestamp = os.environ["TIMESTAMP"]
 phase1_matrix_path = Path(os.environ["PHASE1_MATRIX_PATH"])
 parameter_sweeps_path = Path(os.environ["PARAMETER_SWEEPS_PATH"])
@@ -2466,15 +2469,60 @@ if not required_sizes:
 
 effective_scenario_runner_path = scenario_runner_path
 scenario_runner_records = load_jsonl(scenario_runner_path)
-if not scenario_runner_records and scenario_runner_fallback_path.exists():
+if not scenario_runner_records and not strict_mode and scenario_runner_fallback_path.exists():
     scenario_runner_records = load_jsonl(scenario_runner_fallback_path)
     effective_scenario_runner_path = scenario_runner_fallback_path
 
 effective_workload_path = workload_path
 workload_records = load_jsonl(workload_path)
-if not workload_records and workload_fallback_path.exists():
+if not workload_records and not strict_mode and workload_fallback_path.exists():
     workload_records = load_jsonl(workload_fallback_path)
     effective_workload_path = workload_fallback_path
+
+
+def admit_dataset(path, records, correlation_field):
+    accepted = []
+    rejected = []
+    for index, record in enumerate(records):
+        reasons = []
+        if record.get(correlation_field) != correlation_id:
+            reasons.append("correlation_id_mismatch")
+        if record.get("source_commit") != source_commit:
+            reasons.append("source_commit_mismatch")
+        if record.get("source_dirty") is not False:
+            reasons.append("source_dirty_not_false")
+        if reasons:
+            rejected.append({"record_index": index, "reasons": reasons})
+        else:
+            accepted.append(record)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return accepted, {
+        "path": str(path),
+        "sha256": digest,
+        "correlation_field": correlation_field,
+        "expected_correlation_id": correlation_id,
+        "expected_source_commit": source_commit,
+        "accepted_record_count": len(accepted),
+        "rejected_record_count": len(rejected),
+        "rejections": rejected,
+    }
+
+
+scenario_runner_records, scenario_dataset = admit_dataset(
+    effective_scenario_runner_path,
+    scenario_runner_records,
+    "orchestration_correlation_id",
+)
+workload_records, workload_dataset = admit_dataset(
+    effective_workload_path,
+    workload_records,
+    "correlation_id",
+)
+source_datasets = [scenario_dataset, workload_dataset]
+source_lineage_valid = all(
+    dataset["accepted_record_count"] > 0 and dataset["rejected_record_count"] == 0
+    for dataset in source_datasets
+)
 
 
 def parse_partition(record, metadata, scenario_id):
@@ -3563,6 +3611,8 @@ for guard_name, status in (
 
 required_cell_count = len(required_partitions) * len(required_sizes)
 phase5_ready = (
+    source_lineage_valid
+    and
     primary_status == "pass"
     and cells_with_complete_stage_breakdown == required_cell_count
     and len(missing_cells) == 0
@@ -3579,6 +3629,7 @@ payload = {
     "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
+    "source_datasets": source_datasets,
     "matrix_requirements": {
         "required_partition_tags": required_partitions,
         "required_session_message_sizes": required_sizes,
@@ -3663,6 +3714,8 @@ payload = {
         },
         "artifact_ready_for_phase5": phase5_ready,
         "fail_closed_conditions": [
+            "missing_current_run_source",
+            "mixed_source_lineage",
             "missing_matrix_source_record",
             "missing_stage_metrics",
             "missing_primary_wall_clock",
@@ -3815,7 +3868,41 @@ def load_artifact(path: Path, expected_schema: str):
     return payload
 
 
+def validate_source_datasets(path: Path, payload):
+    datasets = payload.get("source_datasets", [])
+    if not isinstance(datasets, list) or not datasets:
+        failures.append({"path": str(path), "reason": "missing_source_datasets"})
+        return
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            failures.append({"path": str(path), "reason": "invalid_source_dataset"})
+            continue
+        accepted = dataset.get("accepted_record_count")
+        rejected = dataset.get("rejected_record_count")
+        required = dataset.get("required", True)
+        if required and (not isinstance(accepted, int) or accepted <= 0):
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "missing_current_run_source_records",
+                    "source_path": dataset.get("path"),
+                }
+            )
+        if not isinstance(rejected, int) or rejected != 0:
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "mixed_source_lineage",
+                    "source_path": dataset.get("path"),
+                    "rejected_record_count": rejected,
+                }
+            )
+
+
 phase1 = load_artifact(phase1_path, "pi.perf.phase1_matrix_validation.v1")
+validate_source_datasets(phase1_path, phase1)
+if phase1.get("consumption_contract", {}).get("artifact_ready_for_phase5") is not True:
+    failures.append({"path": str(phase1_path), "reason": "phase1_not_ready"})
 matrix_cells = phase1.get("matrix_cells", [])
 required_cell_count = phase1.get("matrix_requirements", {}).get("required_cell_count")
 if not isinstance(required_cell_count, int) or required_cell_count <= 0:
@@ -3858,6 +3945,7 @@ if isinstance(matrix_cells, list):
 stratification = load_artifact(
     stratification_path, "pi.perf.extension_benchmark_stratification.v1"
 )
+validate_source_datasets(stratification_path, stratification)
 required_layers = {"cold_load_init", "per_call_dispatch_micro", "full_e2e_long_session"}
 layers = stratification.get("layers", [])
 observed_layers = {
