@@ -262,13 +262,12 @@ fn hostcall_egraph_engine() -> &'static HostcallEGraphEngine {
 /// of trusting the hardcoded constant (bd-3ar8v.4.22).
 ///
 /// **This can only ever refine a candidate the caller already proved safe.** It
-/// is called from inside the branch where the fast path's params hash and args
-/// shape hash both matched the baseline; that hash equivalence remains the sole
-/// authorization for taking the fast lane. The search contributes a cost and
-/// nothing else — it cannot enable a fast path the hash check would have
-/// rejected, because it never runs when that check fails. Only the cost is
-/// consumed; the plan structure the search produces is advisory, so a fused
-/// intrinsic it "finds" is never executed as such.
+/// is consulted from inside the branch where the fast path's params hash and
+/// args shape hash both matched the baseline; that hash equivalence remains the
+/// sole authorization for taking the fast lane. The search contributes a cost
+/// and nothing else — it cannot enable a fast path the hash check would have
+/// rejected. Only the cost is consumed; the plan structure the search produces
+/// is advisory, so a fused intrinsic it "finds" is never executed as such.
 ///
 /// # What is compared
 ///
@@ -279,30 +278,47 @@ fn hostcall_egraph_engine() -> &'static HostcallEGraphEngine {
 /// against its own pre-fusion self would answer a different question — how much
 /// fusion helped — and reporting that on this scale would be a category error.
 ///
-/// Returns `None` whenever the search declines (disabled, no cheaper plan,
-/// budget exhausted, ambiguous tie) or the result would not beat the baseline,
-/// leaving the caller on the static constant. A search that cannot justify a
-/// number does not get to supply one.
-fn egraph_fast_opcode_cost(opcode: CommonHostcallOpcode) -> Option<(u32, &'static str)> {
-    /// Wrap a marshalling stage chain around the shared policy + opcode tail.
-    /// Policy sits below the decode stages in every plan, so the search cannot
-    /// mistake a reordering for an optimization.
-    fn plan_for(opcode: CommonHostcallOpcode, marshal: Repr) -> PlanExpr {
+/// # Why this is computed once
+///
+/// `marshal()` runs on every hostcall, and an equality-saturation search is far
+/// too expensive to run there — twice — for a value that never changes. The
+/// answer depends only on the cost model, which is fixed for the process: no
+/// rewrite rule inspects the opcode, and `CostModel::stage_cost` prices every
+/// `StageOp::Opcode` identically, so every opcode yields the same ratio. It is
+/// computed once and reused.
+///
+/// That opcode-independence is an invariant, not a coincidence, so it is pinned
+/// by `egraph_fast_opcode_cost_is_opcode_independent` below. If a future rule
+/// does key on the opcode, that test fails and this cache must become a map
+/// rather than a single cell.
+fn egraph_fast_opcode_cost() -> Option<(u32, &'static str)> {
+    static COST: OnceLock<Option<(u32, &'static str)>> = OnceLock::new();
+    *COST.get_or_init(|| egraph_fast_opcode_cost_uncached(CommonHostcallOpcode::ToolRead))
+}
+
+/// Wrap a marshalling stage chain around the shared policy + opcode tail.
+///
+/// Policy sits below the decode stages in every plan, so the search cannot
+/// mistake a reordering for an optimization.
+fn egraph_marshal_plan(opcode: CommonHostcallOpcode, marshal: Repr) -> PlanExpr {
+    PlanExpr::unary(
+        StageOp::Dispatch,
         PlanExpr::unary(
-            StageOp::Dispatch,
+            StageOp::Validate,
             PlanExpr::unary(
-                StageOp::Validate,
+                StageOp::Marshal(marshal),
                 PlanExpr::unary(
-                    StageOp::Marshal(marshal),
-                    PlanExpr::unary(
-                        StageOp::Policy,
-                        PlanExpr::leaf(StageOp::Opcode(opcode.code().to_string())),
-                    ),
+                    StageOp::Policy,
+                    PlanExpr::leaf(StageOp::Opcode(opcode.code().to_string())),
                 ),
             ),
-        )
-    }
+        ),
+    )
+}
 
+/// The uncached search. Separated so the opcode-independence test can exercise
+/// it per opcode without defeating the cache.
+fn egraph_fast_opcode_cost_uncached(opcode: CommonHostcallOpcode) -> Option<(u32, &'static str)> {
     let engine = hostcall_egraph_engine();
     if !engine.enabled() {
         return None;
@@ -310,8 +326,8 @@ fn egraph_fast_opcode_cost(opcode: CommonHostcallOpcode) -> Option<(u32, &'stati
 
     // The canonical JSON path is what the 100-point baseline denotes; the typed
     // path is the candidate. Search both so the comparison is like-for-like.
-    let canonical = engine.optimize(&plan_for(opcode, Repr::Json));
-    let typed = engine.optimize(&plan_for(opcode, Repr::Typed));
+    let canonical = engine.optimize(&egraph_marshal_plan(opcode, Repr::Json));
+    let typed = engine.optimize(&egraph_marshal_plan(opcode, Repr::Typed));
     let projected = typed.relative_to(&canonical, HOSTCALL_REWRITE_COST_BASELINE)?;
 
     // Neither model is calibrated, so take the more conservative of the two
@@ -589,7 +605,7 @@ impl<'a> HostcallPayloadArena<'a> {
                     // Hash equivalence just authorized the fast lane. The
                     // e-graph search may refine what that lane is estimated to
                     // cost; when it declines, the static constant stands.
-                    let (estimated_cost, rule_id) = egraph_fast_opcode_cost(opcode).unwrap_or((
+                    let (estimated_cost, rule_id) = egraph_fast_opcode_cost().unwrap_or((
                         HOSTCALL_REWRITE_COST_FAST_OPCODE,
                         HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION,
                     ));
@@ -607,6 +623,12 @@ impl<'a> HostcallPayloadArena<'a> {
 
         let rewrite_decision =
             hostcall_rewrite_engine().select_plan(baseline_plan, &rewrite_candidates);
+        // Only FastOpcodeFusion takes the fast lane here, because only it is
+        // authorized by the hash equivalence checked above. A candidate of any
+        // other kind -- HostcallRewritePlanKind::FusedIntrinsic, say -- would
+        // fall through to the canonical path even if it priced cheaper, which
+        // is the safe direction: this gate wants matching evidence, not a
+        // smaller number.
         let use_fast_rewrite = rewrite_decision.selected.kind
             == HostcallRewritePlanKind::FastOpcodeFusion
             && fast_candidate_hashes.is_some();
@@ -2223,4 +2245,72 @@ fn validate_error(payload: &ErrorPayload) -> Result<()> {
         return Err(Error::validation("Error message is empty"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod egraph_cost_tests {
+    use super::*;
+
+    /// The cache in [`egraph_fast_opcode_cost`] stores ONE value for every
+    /// opcode. That is sound only while no rewrite rule keys on the opcode and
+    /// `CostModel::stage_cost` prices every `StageOp::Opcode` identically.
+    ///
+    /// If this fails, the cache is silently serving one opcode's answer for
+    /// another. The fix is to make it a map keyed by opcode, not to relax this
+    /// assertion.
+    #[test]
+    fn egraph_fast_opcode_cost_is_opcode_independent() {
+        // Deliberately spans all four hostcall families, since a rule keyed on
+        // a prefix like "tool." would otherwise slip through.
+        let opcodes = [
+            CommonHostcallOpcode::ToolRead,
+            CommonHostcallOpcode::ToolWrite,
+            CommonHostcallOpcode::ToolBash,
+            CommonHostcallOpcode::SessionGetState,
+            CommonHostcallOpcode::SessionSetName,
+            CommonHostcallOpcode::EventsEmit,
+            CommonHostcallOpcode::EventsListFlags,
+        ];
+        let first = egraph_fast_opcode_cost_uncached(opcodes[0]);
+        for opcode in opcodes {
+            assert_eq!(
+                egraph_fast_opcode_cost_uncached(opcode),
+                first,
+                "opcode {} priced differently; the OnceLock cache in \
+                 egraph_fast_opcode_cost must become per-opcode",
+                opcode.code()
+            );
+        }
+    }
+
+    /// The refined cost must stay a genuine improvement over the canonical
+    /// baseline, or the fast lane would be priced out of contention entirely.
+    #[test]
+    fn egraph_refined_cost_still_beats_the_canonical_baseline() {
+        let Some((cost, rule)) = egraph_fast_opcode_cost() else {
+            // Declining is a legitimate outcome (kill switch, ambiguity); there
+            // is simply nothing to assert about a value that was not produced.
+            return;
+        };
+        assert!(
+            cost < HOSTCALL_REWRITE_COST_BASELINE,
+            "refined cost {cost} must beat baseline {HOSTCALL_REWRITE_COST_BASELINE}"
+        );
+        assert!(
+            cost >= HOSTCALL_REWRITE_COST_FAST_OPCODE,
+            "refined cost {cost} must not claim a bigger saving than the static \
+             constant {HOSTCALL_REWRITE_COST_FAST_OPCODE} already asserts"
+        );
+        assert_eq!(rule, HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION);
+    }
+
+    /// Repeated calls must be identical — the cache is only sound if the
+    /// underlying search is deterministic.
+    #[test]
+    fn egraph_fast_opcode_cost_is_stable_across_calls() {
+        let first = egraph_fast_opcode_cost();
+        for _ in 0..4 {
+            assert_eq!(egraph_fast_opcode_cost(), first);
+        }
+    }
 }

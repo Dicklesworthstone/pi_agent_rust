@@ -790,9 +790,25 @@ impl EGraph {
         })
     }
 
+    /// Whether `id` was issued by this graph.
+    ///
+    /// Ids are opaque and only this module can mint them, but nothing stops a
+    /// caller handing one graph an id that another graph issued. Checking is
+    /// cheaper than the alternative, which is an index panic out of a public
+    /// method.
+    const fn owns(&self, id: EClassId) -> bool {
+        id.0 < self.parents.len()
+    }
+
     /// Assert that two classes denote the same plan. Returns whether this
     /// changed anything.
+    ///
+    /// Returns `false` for an id this graph did not issue, rather than
+    /// panicking on the out-of-range index.
     pub fn union(&mut self, a: EClassId, b: EClassId) -> bool {
+        if !self.owns(a) || !self.owns(b) {
+            return false;
+        }
         let (ra, rb) = (self.find(a), self.find(b));
         if ra == rb {
             return false;
@@ -1361,10 +1377,15 @@ impl HostcallEGraphEngine {
         // A budget stop means unexplored plans remain, so "minimum cost" would
         // be a claim the search did not earn.
         if !outcome.is_complete() {
+            // Exhaustive on purpose: a wildcard here would silently report a
+            // future stopping reason as an iteration-budget stop.
             decision.fallback_reason = Some(match outcome {
                 SaturationOutcome::NodeBudget => "node_budget_exhausted",
                 SaturationOutcome::EnumerationBudget => "enumeration_budget_exhausted",
-                _ => "iteration_budget_exhausted",
+                SaturationOutcome::IterationBudget => "iteration_budget_exhausted",
+                // Unreachable: is_complete() is true only for Fixpoint, and we
+                // are inside the !is_complete() branch.
+                SaturationOutcome::Fixpoint => "fixpoint_not_a_fallback",
             });
             return decision;
         }
@@ -1811,8 +1832,7 @@ mod tests {
         // engine must not present its partial result as minimal.
         let engine = HostcallEGraphEngine::new(true).with_limits(SaturationLimits {
             max_iterations: 1,
-            max_nodes: DEFAULT_MAX_NODES,
-            max_expr_depth: 12,
+            ..SaturationLimits::default()
         });
         let decision = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
         assert!(!decision.rewrote());
@@ -1823,9 +1843,8 @@ mod tests {
     #[test]
     fn a_node_budget_stop_also_falls_back() {
         let engine = HostcallEGraphEngine::new(true).with_limits(SaturationLimits {
-            max_iterations: DEFAULT_MAX_ITERATIONS,
             max_nodes: 3,
-            max_expr_depth: 12,
+            ..SaturationLimits::default()
         });
         let decision = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
         assert!(!decision.rewrote());
@@ -2132,10 +2151,8 @@ mod tests {
         // report a fixpoint -- that would turn "we ran out of room" into "we
         // proved this is optimal".
         let engine = HostcallEGraphEngine::new(true).with_limits(SaturationLimits {
-            max_iterations: DEFAULT_MAX_ITERATIONS,
-            max_nodes: DEFAULT_MAX_NODES,
-            max_expr_depth: 12,
             max_enumerated: 1,
+            ..SaturationLimits::default()
         });
         let decision = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
         assert!(!decision.rewrote(), "must not rewrite on a partial view");

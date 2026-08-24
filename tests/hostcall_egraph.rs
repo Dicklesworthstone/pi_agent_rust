@@ -5,10 +5,9 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::hostcall_egraph::{
-    CostModel, EGraph, HostcallEGraphEngine, PlanExpr, Repr, SaturationLimits,
+    CostModel, EGraph, HostcallEGraphEngine, PlanExpr, RULE_DROP_ROUNDTRIP_CONVERT,
+    RULE_FUSE_MARSHAL_VALIDATE, RULE_FUSE_TYPED_PIPELINE, Repr, SaturationLimits,
     SaturationOutcome, StageOp, canonical_plan, typed_plan_with_roundtrip,
-    RULE_DROP_ROUNDTRIP_CONVERT, RULE_FUSE_MARSHAL_VALIDATE,
-    RULE_FUSE_TYPED_PIPELINE,
 };
 use pi::hostcall_rewrite::HostcallRewritePlanKind;
 
@@ -35,9 +34,19 @@ fn test_egraph_roundtrip_elimination_and_fusion() {
     let baseline = typed_plan_with_roundtrip("tool.read");
     let decision = engine.optimize(&baseline);
 
-    assert!(decision.rewrote(), "expected rewrite optimization to succeed");
-    assert!(decision.expected_cost_delta > 0, "expected positive cost delta");
-    assert!(decision.applied_rules.contains(&RULE_DROP_ROUNDTRIP_CONVERT));
+    assert!(
+        decision.rewrote(),
+        "expected rewrite optimization to succeed"
+    );
+    assert!(
+        decision.expected_cost_delta > 0,
+        "expected positive cost delta"
+    );
+    assert!(
+        decision
+            .applied_rules
+            .contains(&RULE_DROP_ROUNDTRIP_CONVERT)
+    );
     assert!(decision.applied_rules.contains(&RULE_FUSE_MARSHAL_VALIDATE));
     assert!(decision.applied_rules.contains(&RULE_FUSE_TYPED_PIPELINE));
     assert_eq!(decision.outcome, SaturationOutcome::Fixpoint);
@@ -68,9 +77,8 @@ fn test_egraph_budget_exhaustion_fallback() {
 
     // Engine with tiny node budget forces fallback
     let engine = HostcallEGraphEngine::default().with_limits(SaturationLimits {
-        max_iterations: 8,
         max_nodes: 3,
-        max_expr_depth: 12,
+        ..SaturationLimits::default()
     });
 
     let baseline = canonical_plan("tool.write");
@@ -80,10 +88,9 @@ fn test_egraph_budget_exhaustion_fallback() {
     assert_eq!(decision.selected_cost, decision.baseline_cost);
     assert_eq!(decision.fallback_reason, Some("node_budget_exhausted"));
 
-    harness.log().info(
-        "fallback",
-        format!("reason={:?}", decision.fallback_reason),
-    );
+    harness
+        .log()
+        .info("fallback", format!("reason={:?}", decision.fallback_reason));
 
     finish_case(&harness, "egraph_budget_fallback");
 }
