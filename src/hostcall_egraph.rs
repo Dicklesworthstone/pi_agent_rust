@@ -243,8 +243,113 @@ pub struct CostModel {
     pub fused_default: u32,
 }
 
+/// Per-stage costs measured by the workload harness, in microseconds.
+///
+/// Mirrors the six-stage decomposition `examples/ext_workloads` emits as
+/// `pi.ext.hostcall_hotspot_matrix.v1`. Feed it to
+/// [`CostModel::from_measured_stages`] to replace the hand-written defaults
+/// with numbers from a real run (bd-oxu87).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeasuredStages {
+    pub marshal_us: f64,
+    pub queue_us: f64,
+    pub schedule_us: f64,
+    pub policy_us: f64,
+    pub execute_us: f64,
+    pub io_us: f64,
+}
+
+/// What a calibration run could and could not measure.
+///
+/// The harness's six stages are coarser than [`StageOp`], so a measured run
+/// does **not** determine every field of a [`CostModel`]. Rather than let the
+/// difference disappear into plausible-looking numbers, calibration reports it:
+/// anything listed in `unmeasured` kept a conservative default, and any saving
+/// that depends on it is modelled, not measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationReport {
+    /// `CostModel` fields the run determined.
+    pub measured: Vec<&'static str>,
+    /// Fields the harness cannot distinguish, left at conservative defaults.
+    pub unmeasured: Vec<&'static str>,
+}
+
+impl CalibrationReport {
+    /// Whether every field that affects fusion selection was measured.
+    ///
+    /// False means a reported saving is partly modelled — which is a legitimate
+    /// state to be in, but not one to make a performance claim from.
+    #[must_use]
+    pub fn is_fully_measured(&self) -> bool {
+        self.unmeasured.is_empty()
+    }
+}
+
 impl CostModel {
+    /// Build a cost model from a measured run, reporting what it could not fix.
+    ///
+    /// # The mapping, and its limits
+    ///
+    /// Three [`StageOp`]s map onto a measured stage directly:
+    /// - [`StageOp::Marshal`] with [`Repr::Json`] <- `marshal_us`, the canonical
+    ///   decode the fast lane exists to avoid.
+    /// - [`StageOp::Policy`] <- `policy_us`.
+    /// - [`StageOp::Dispatch`] <- `queue_us + schedule_us`, the routing work
+    ///   between authorization and execution.
+    ///
+    /// The rest **cannot be derived from this harness**, and calibration says so
+    /// instead of inventing them:
+    /// - `marshal_typed`, `validate`, `convert`: the harness reports one
+    ///   `marshal` figure covering decode and shape checking together, and does
+    ///   not separate typed decode from JSON decode. The premise of the fast
+    ///   lane is that typed decode is cheaper — by how much is exactly what is
+    ///   not measured here.
+    /// - `fused`: no measured stage corresponds to an intrinsic that has not
+    ///   been built yet.
+    ///
+    /// Unmeasured fields keep [`Self::measured_default`]'s conservative values,
+    /// so a fusion whose benefit was never measured still has to beat the
+    /// baseline on numbers that do not flatter it.
+    ///
+    /// `execute_us` and `io_us` are deliberately unused: they price the work the
+    /// hostcall performs, which every plan pays identically. Including them
+    /// would inflate both sides of every comparison and shrink the apparent
+    /// difference between plans.
+    #[must_use]
+    pub fn from_measured_stages(stages: MeasuredStages) -> (Self, CalibrationReport) {
+        /// Round a microsecond figure into the model's integer cost units,
+        /// clamping at 1 so a measured stage never prices as free.
+        fn cost_of(us: f64) -> u32 {
+            if !us.is_finite() || us <= 0.0 {
+                return 1;
+            }
+            let rounded = us.round();
+            if rounded >= f64::from(u32::MAX) {
+                u32::MAX
+            } else {
+                (rounded as u32).max(1)
+            }
+        }
+
+        let mut model = Self::measured_default();
+        model.marshal_json = cost_of(stages.marshal_us);
+        model.policy = cost_of(stages.policy_us);
+        model.dispatch = cost_of(stages.queue_us + stages.schedule_us);
+
+        let report = CalibrationReport {
+            measured: vec!["marshal_json", "policy", "dispatch"],
+            unmeasured: vec!["marshal_typed", "validate", "convert", "fused"],
+        };
+        (model, report)
+    }
+
     /// Cost shape matching the harness's stage attribution.
+    ///
+    /// Hand-written, and **not** a calibrated measurement: it carries the shape
+    /// real runs report — JSON marshalling dominates, conversions are not free,
+    /// fused intrinsics cost less than the sum of their parts — so the search
+    /// behaves sensibly out of the box. Use [`Self::from_measured_stages`] when
+    /// a real run is available.
     #[must_use]
     pub fn measured_default() -> Self {
         let mut fused = BTreeMap::new();
@@ -1695,6 +1800,91 @@ mod tests {
         assert_eq!(json["rewrote"], false);
         assert_eq!(json["fallback_reason"], "egraph_disabled");
         assert_eq!(json["expected_cost_delta"], 0);
+    }
+
+    // ── Calibration ─────────────────────────────────────────────────────
+
+    fn sample_stages() -> MeasuredStages {
+        MeasuredStages {
+            marshal_us: 41.2,
+            queue_us: 6.4,
+            schedule_us: 5.1,
+            policy_us: 9.7,
+            execute_us: 820.0,
+            io_us: 130.0,
+        }
+    }
+
+    #[test]
+    fn calibration_takes_the_three_stages_it_can_map() {
+        let (model, report) = CostModel::from_measured_stages(sample_stages());
+        assert_eq!(model.marshal_json, 41, "marshal rounds from 41.2");
+        assert_eq!(model.policy, 10, "policy rounds from 9.7");
+        assert_eq!(model.dispatch, 12, "dispatch is queue + schedule = 11.5");
+        assert_eq!(report.measured, ["marshal_json", "policy", "dispatch"]);
+    }
+
+    #[test]
+    fn calibration_admits_what_it_could_not_measure() {
+        // The honest half: the harness cannot separate typed decode from JSON
+        // decode, or price an intrinsic that does not exist yet. Those fields
+        // must be reported, not quietly filled in.
+        let (model, report) = CostModel::from_measured_stages(sample_stages());
+        assert!(!report.is_fully_measured());
+        for field in ["marshal_typed", "validate", "convert", "fused"] {
+            assert!(
+                report.unmeasured.contains(&field),
+                "{field} is not measurable from six-stage attribution"
+            );
+        }
+        let defaults = CostModel::measured_default();
+        assert_eq!(model.marshal_typed, defaults.marshal_typed);
+        assert_eq!(model.validate, defaults.validate);
+        assert_eq!(model.convert, defaults.convert);
+        assert_eq!(model.fused, defaults.fused);
+    }
+
+    #[test]
+    fn calibration_ignores_execute_and_io() {
+        // Every plan pays the same execute/io cost, so including it would
+        // inflate both sides and shrink the visible difference between plans.
+        let mut heavy = sample_stages();
+        heavy.execute_us = 50_000.0;
+        heavy.io_us = 90_000.0;
+        let (baseline_model, _) = CostModel::from_measured_stages(sample_stages());
+        let (heavy_model, _) = CostModel::from_measured_stages(heavy);
+        assert_eq!(baseline_model.marshal_json, heavy_model.marshal_json);
+        assert_eq!(baseline_model.policy, heavy_model.policy);
+        assert_eq!(baseline_model.dispatch, heavy_model.dispatch);
+    }
+
+    #[test]
+    fn a_measured_stage_never_prices_as_free() {
+        // A zero or nonsensical measurement must not make a stage cost nothing;
+        // that would let any plan containing it win by arithmetic accident.
+        let degenerate = MeasuredStages {
+            marshal_us: 0.0,
+            queue_us: -3.0,
+            schedule_us: f64::NAN,
+            policy_us: 0.000_1,
+            execute_us: 0.0,
+            io_us: 0.0,
+        };
+        let (model, _) = CostModel::from_measured_stages(degenerate);
+        assert!(model.marshal_json >= 1);
+        assert!(model.policy >= 1);
+        assert!(model.dispatch >= 1);
+    }
+
+    #[test]
+    fn a_calibrated_model_still_refuses_unpriced_fusions() {
+        // Calibration must not weaken the fail-closed posture: fused costs are
+        // among the unmeasured fields, so clearing them still loses.
+        let (mut model, _) = CostModel::from_measured_stages(sample_stages());
+        model.fused.clear();
+        let engine = HostcallEGraphEngine::new(true).with_cost_model(model);
+        let decision = engine.optimize(&canonical_plan("tool.read"));
+        assert!(!decision.rewrote());
     }
 
     #[test]

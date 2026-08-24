@@ -6838,6 +6838,37 @@ fn orchestrate_script_emits_budget_input_negative_controls_before_consumption() 
 }
 
 #[test]
+fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
+    let script_path = project_root().join("scripts/perf/orchestrate.sh");
+    let content = fs::read_to_string(&script_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", script_path.display()));
+
+    let phase1_generation = content
+        .find("Phase-1 matrix validation written")
+        .expect("phase1 derived-artifact generation");
+    let post_generation_budget = content
+        .find("POST_GENERATION_BUDGET_DIR=")
+        .expect("post-generation Rust budget gate");
+    let final_preflight = content
+        .find("run_budget_preflight \"$PREFLIGHT_AFTER_RUN_PATH\"")
+        .expect("final budget preflight");
+    let final_staging = content
+        .find("run_artifact_staging_manifest \"$STAGING_MANIFEST_PATH\"")
+        .expect("final artifact staging");
+    let checksums = content
+        .find("# ─── Phase 6: Generate checksums")
+        .expect("checksum generation phase");
+
+    assert!(
+        phase1_generation < post_generation_budget
+            && post_generation_budget < final_preflight
+            && final_preflight < final_staging
+            && final_staging < checksums,
+        "phase1 generation, Rust consumption, final preflight/staging, and checksums must remain causally ordered"
+    );
+}
+
+#[test]
 fn orchestrate_script_emits_phase1_matrix_validation_contract() {
     let script_path = project_root().join("scripts/perf/orchestrate.sh");
     let content = fs::read_to_string(&script_path)
