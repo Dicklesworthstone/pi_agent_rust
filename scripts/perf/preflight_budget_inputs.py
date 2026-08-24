@@ -46,11 +46,15 @@ EMBEDDED_PROVENANCE_REQUIREMENTS = {
     ),
     "pi.perf.phase1_matrix_validation.v1": (
         "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
         "run_id",
         "correlation_id",
     ),
     "pi.perf.extension_benchmark_stratification.v1": (
         "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
         "run_id",
         "correlation_id",
     ),
@@ -84,6 +88,7 @@ class EvidenceCacheContext:
     git_commit: str
     build_profile: str
     max_ttl_hours: float
+    expected_correlation_id: str | None
 
 
 def utc_now() -> datetime:
@@ -675,6 +680,16 @@ def validate_evidence_cache_entry(
             "reason": "missing_lineage",
             "run_id_present": run_id is not None,
             "correlation_id_present": correlation_id is not None,
+        }
+    if (
+        context.expected_correlation_id is not None
+        and correlation_id != context.expected_correlation_id
+    ):
+        return None, {
+            **rejection_base,
+            "reason": "correlation_id_mismatch",
+            "expected_correlation_id": context.expected_correlation_id,
+            "observed_correlation_id": correlation_id,
         }
 
     if entry_string(entry, "command") is None:
@@ -1430,6 +1445,9 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         target_dir,
         args.evidence_cache_dir or os.environ.get("PI_PERF_EVIDENCE_CACHE_DIR"),
     )
+    expected_correlation_id = args.expected_correlation_id or os.environ.get(
+        "PI_PERF_EXPECTED_CORRELATION_ID"
+    )
     cache_context = EvidenceCacheContext(
         repo_root=repo_root,
         target_dir=target_dir,
@@ -1442,6 +1460,7 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         or os.environ.get("CARGO_PROFILE")
         or "perf",
         max_ttl_hours=args.cache_ttl_hours,
+        expected_correlation_id=expected_correlation_id,
     )
     cache_entries, cache_status = load_evidence_cache_entries(cache_dir)
     contracts = parse_budget_contracts(repo_root / "tests/perf_budgets.rs")
@@ -1456,9 +1475,6 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     recognized_blockers: list[dict[str, Any]] = []
 
     groups = artifact_groups(repo_root, target_dir)
-    expected_correlation_id = args.expected_correlation_id or os.environ.get(
-        "PI_PERF_EXPECTED_CORRELATION_ID"
-    )
     for group in groups:
         group_fresh, group_stale = existing_fresh_candidates(
             group.candidates,
@@ -1756,6 +1772,8 @@ def run_self_test() -> int:
                 {
                     "schema": "pi.perf.extension_benchmark_stratification.v1",
                     "generated_at": generated_at,
+                    "source_commit": "test-commit",
+                    "source_dirty": False,
                     "run_id": "fixture-run",
                     "correlation_id": "fixture-run",
                 }
@@ -1767,6 +1785,8 @@ def run_self_test() -> int:
                 {
                     "schema": "pi.perf.phase1_matrix_validation.v1",
                     "generated_at": generated_at,
+                    "source_commit": "test-commit",
+                    "source_dirty": False,
                     "run_id": "fixture-run",
                     "correlation_id": "fixture-run",
                 }

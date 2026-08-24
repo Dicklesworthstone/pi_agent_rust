@@ -381,6 +381,7 @@ def build_staging_manifest(
         git_commit=cache_git_commit,
         build_profile=cache_profile,
         max_ttl_hours=cache_ttl_hours,
+        expected_correlation_id=expected_correlation_id,
     )
     cache_entries, cache_status = load_evidence_cache_entries(cache_dir)
     entries: list[dict[str, Any]] = []
@@ -564,6 +565,8 @@ def write_fixture(root: Path, include_policy: bool) -> None:
             {
                 "schema": "pi.perf.extension_benchmark_stratification.v1",
                 "generated_at": generated_at,
+                "source_commit": "test-commit",
+                "source_dirty": False,
                 "run_id": "self-test-run",
                 "correlation_id": "self-test-run",
             }
@@ -575,6 +578,8 @@ def write_fixture(root: Path, include_policy: bool) -> None:
             {
                 "schema": "pi.perf.phase1_matrix_validation.v1",
                 "generated_at": generated_at,
+                "source_commit": "test-commit",
+                "source_dirty": False,
                 "run_id": "self-test-run",
                 "correlation_id": "self-test-run",
             }

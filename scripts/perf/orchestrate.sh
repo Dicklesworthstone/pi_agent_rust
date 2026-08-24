@@ -181,6 +181,7 @@ run_budget_preflight() {
     --cache-ttl-hours "$EVIDENCE_CACHE_TTL_HOURS"
     --cache-profile "$CARGO_PROFILE"
     --cache-git-commit "$GIT_COMMIT_FULL"
+    --expected-correlation-id "$CORRELATION_ID"
     --skip-rch-check
   )
   python3 "$SCRIPT_DIR/preflight_budget_inputs.py" "${args[@]}" "$@" > "$output_path"
@@ -199,6 +200,7 @@ run_artifact_staging_manifest() {
     --cache-profile "$CARGO_PROFILE"
     --cache-git-commit "$GIT_COMMIT_FULL"
     --run-id "$CORRELATION_ID"
+    --expected-correlation-id "$CORRELATION_ID"
     --update-evidence-cache
     --output "$output_path"
   )
@@ -1324,6 +1326,8 @@ BASELINE_CONFIDENCE_PATH="$OUTPUT_DIR/results/baseline_variance_confidence.json"
 if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
   TIMESTAMP="$TIMESTAMP" \
   BASELINE_CONFIDENCE_PATH="$BASELINE_CONFIDENCE_PATH" \
   python3 - <<'PY'
@@ -1337,6 +1341,8 @@ from pathlib import Path
 output_dir = Path(os.environ["OUTPUT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
 correlation_id = os.environ["CORRELATION_ID"]
+source_commit = os.environ["GIT_COMMIT_FULL"]
+source_dirty = os.environ["GIT_DIRTY"] == "true"
 timestamp = os.environ["TIMESTAMP"]
 baseline_confidence_path = Path(os.environ["BASELINE_CONFIDENCE_PATH"])
 
@@ -1552,6 +1558,8 @@ payload = {
     "schema": "pi.perf.baseline_variance_confidence.v1",
     "bead_id": "bd-3ar8v.1.5",
     "generated_at": datetime.now(timezone.utc).isoformat(),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
     "source_manifest_path": str(manifest_path),
@@ -2307,6 +2315,8 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   TARGET_DIR="$TARGET_DIR" \
   CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
   TIMESTAMP="$TIMESTAMP" \
   PHASE1_MATRIX_PATH="$PHASE1_MATRIX_PATH" \
   PARAMETER_SWEEPS_PATH="$PARAMETER_SWEEPS_PATH" \
@@ -2322,6 +2332,8 @@ output_dir = Path(os.environ["OUTPUT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
 target_dir = Path(os.environ["TARGET_DIR"])
 correlation_id = os.environ["CORRELATION_ID"]
+source_commit = os.environ["GIT_COMMIT_FULL"]
+source_dirty = os.environ["GIT_DIRTY"] == "true"
 timestamp = os.environ["TIMESTAMP"]
 phase1_matrix_path = Path(os.environ["PHASE1_MATRIX_PATH"])
 parameter_sweeps_path = Path(os.environ["PARAMETER_SWEEPS_PATH"])
@@ -3570,6 +3582,8 @@ payload = {
     "schema": "pi.perf.phase1_matrix_validation.v1",
     "bead_id": "bd-3ar8v.2.8",
     "generated_at": datetime.now(timezone.utc).isoformat(),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
     "matrix_requirements": {
