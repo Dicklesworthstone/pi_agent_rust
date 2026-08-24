@@ -246,7 +246,7 @@ impl PmuOpportunityRanker {
         };
 
         // Estimated recoverable cycles is 60% of stalls for memory/branch bottlenecks
-        let recoverable_stall_cycles = (total_stalls as f64 * 0.60) as u64;
+        let recoverable_stall_cycles = total_stalls.saturating_mul(6) / 10;
         let speedup = if sample.cycles == 0 {
             1.0
         } else {
