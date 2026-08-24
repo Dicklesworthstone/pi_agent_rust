@@ -13,6 +13,42 @@ use serde_json::{Value, json};
 use std::path::{Component, Path, PathBuf};
 use tempfile::TempDir;
 
+/// Hermetic provider for reflect fixtures: no auth, network, or model registry.
+struct FixtureReflectProvider;
+
+#[async_trait::async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
+impl pi::provider::Provider for FixtureReflectProvider {
+    fn name(&self) -> &str {
+        "fixture-reflect"
+    }
+
+    fn api(&self) -> &str {
+        "fixture"
+    }
+
+    fn model_id(&self) -> &str {
+        "fixture-reflect-v1"
+    }
+
+    async fn stream(
+        &self,
+        _context: &pi::provider::Context<'_>,
+        _options: &pi::provider::StreamOptions,
+    ) -> pi::error::Result<
+        std::pin::Pin<
+            Box<dyn futures::Stream<Item = pi::error::Result<pi::model::StreamEvent>> + Send>,
+        >,
+    > {
+        Ok(Box::pin(futures::stream::iter(vec![Ok(
+            pi::model::StreamEvent::TextDelta {
+                content_index: 0,
+                delta: "Fixture synthesis cites memory [1].".to_string(),
+            },
+        )])))
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -131,6 +167,21 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
                 }
             };
             Box::new(pi::memory::MemoryEditTool::new(std::sync::Arc::new(store)))
+        }
+        "reflect" => {
+            let store = match pi::memory::MemoryStore::open(temp_dir.path()) {
+                Ok(store) => store,
+                Err(error) => {
+                    return TestResult::fail(
+                        &case_name,
+                        format!("Failed to open fixture memory store: {error}"),
+                    );
+                }
+            };
+            Box::new(pi::memory::ReflectTool::with_provider(
+                std::sync::Arc::new(store),
+                std::sync::Arc::new(FixtureReflectProvider),
+            ))
         }
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
