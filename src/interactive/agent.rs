@@ -681,18 +681,25 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
             clip(question, MAX)
         }
         ToolInvocationRenderer::Subagent => {
-            if args.get("agent").is_some() || args.get("task").is_some() {
+            let has_single = args.get("agent").is_some() || args.get("task").is_some();
+            let has_tasks = args.get("tasks").is_some();
+            let has_chain = args.get("chain").is_some();
+            if usize::from(has_single) + usize::from(has_tasks) + usize::from(has_chain) != 1 {
+                return None;
+            }
+
+            if has_single {
+                let agent = nonblank_str_arg(args, "agent")?.trim();
                 let task = nonblank_str_arg(args, "task")?.trim();
-                match nonblank_str_arg(args, "agent") {
-                    Some(agent) => clip(&format!("{}: {task}", agent.trim()), MAX),
-                    None => clip(task, MAX),
-                }
-            } else if let Some(tasks) = args.get("tasks").and_then(serde_json::Value::as_array) {
+                clip(&format!("{agent}: {task}"), MAX)
+            } else if has_tasks {
+                let tasks = args.get("tasks")?.as_array()?;
                 if tasks.is_empty() {
                     return None;
                 }
                 format!("{} parallel tasks", tasks.len())
-            } else if let Some(chain) = args.get("chain").and_then(serde_json::Value::as_array) {
+            } else if has_chain {
+                let chain = args.get("chain")?.as_array()?;
                 if chain.is_empty() {
                     return None;
                 }
@@ -4139,6 +4146,24 @@ mod tool_invocation_summary_coverage {
             )
             .is_none()
         );
+        assert!(
+            tool_invocation_summary("subagent", &serde_json::json!({"task": "audit"})).is_none()
+        );
+        assert!(
+            tool_invocation_summary("subagent", &serde_json::json!({"agent": "reviewer"}))
+                .is_none()
+        );
         assert!(tool_invocation_summary("subagent", &serde_json::json!({"tasks": []})).is_none());
+        assert!(
+            tool_invocation_summary(
+                "subagent",
+                &serde_json::json!({
+                    "agent": "reviewer",
+                    "task": "audit",
+                    "tasks": [{"agent": "reviewer", "task": "parallel audit"}]
+                })
+            )
+            .is_none()
+        );
     }
 }

@@ -7116,11 +7116,8 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             .expect("fault-injection summary parent"),
     )
     .expect("create fake fault-injection evidence directory");
-    fs::write(
-        &fault_injection_summary,
-        r#"{"overall_status":"pass"}"#,
-    )
-    .expect("write fake fault-injection evidence");
+    fs::write(&fault_injection_summary, r#"{"overall_status":"pass"}"#)
+        .expect("write fake fault-injection evidence");
 
     let path = format!(
         "{}:{}",
