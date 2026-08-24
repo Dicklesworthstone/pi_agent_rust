@@ -1,0 +1,19 @@
+{
+  "schema": "pi.readme.claim_bindings.v1",
+  "generated_at": "2026-08-24T01:35:00.000Z",
+  "description": "Binds README numeric claims to artifact fields: each bound field's current value must appear verbatim on a README line citing that artifact. Enforced by scripts/check_readme_evidence_freshness.py; when an artifact regenerates, update the README numbers (never hand-patch the artifact).",
+  "bindings": [
+    { "artifact": "tests/perf/reports/budget_summary.json", "field": "total_budgets" },
+    { "artifact": "tests/perf/reports/budget_summary.json", "field": "pass" },
+    { "artifact": "tests/perf/reports/budget_summary.json", "field": "fail" },
+    { "artifact": "tests/perf/reports/budget_summary.json", "field": "no_data" },
+    { "artifact": "tests/full_suite_gate/full_suite_verdict.json", "field": "summary.passed" },
+    { "artifact": "tests/full_suite_gate/full_suite_verdict.json", "field": "summary.total_gates" },
+    { "artifact": "tests/full_suite_gate/full_suite_verdict.json", "field": "summary.blocking_pass" },
+    { "artifact": "tests/full_suite_gate/full_suite_verdict.json", "field": "summary.blocking_total" },
+    { "artifact": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json", "field": "observed.must_pass_passed" },
+    { "artifact": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json", "field": "observed.must_pass_total" },
+    { "artifact": "tests/evidence_bundle/index.json", "field": "summary.total_sections" },
+    { "artifact": "tests/evidence_bundle/index.json", "field": "summary.present_sections" }
+  ]
+}

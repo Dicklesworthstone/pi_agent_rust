@@ -235,7 +235,11 @@ def is_placeholder_citation(artifact_path: str, correlation_id: str) -> bool:
     return artifact_path.startswith("[") or correlation_id.startswith("[")
 
 
-def classify_claim_surface(claim_text: str, artifact_path: str) -> str:
+def classify_claim_surface(
+    claim_text: str,
+    artifact_path: str,
+    citation_kind: str = "",
+) -> str:
     """Classify whether a claim is release-facing or explicitly historical."""
     # Do not let traversal text inside a citation manufacture a historical
     # classification. The caller supplies the canonical repository-relative
@@ -246,11 +250,17 @@ def classify_claim_surface(claim_text: str, artifact_path: str) -> str:
     # Historical evidence is an explicit semantic contract, not a keyword
     # heuristic.  Generic words such as "baseline", "snapshot", or "retained"
     # routinely appear in current comparative claims and must never disable
-    # freshness or strict performance-proof validation.  Historical-only
-    # citations live under docs/planning and carry the exact, whole-line label
-    # below.  Requiring equality (rather than accepting the label as a prefix)
-    # prevents a current claim appended to the disclaimer from inheriting the
-    # historical exemption.
+    # freshness or strict performance-proof validation.
+    #
+    # Two explicit contracts may classify a citation as historical:
+    # (1) the "; historical snapshot" citation form — the citation itself
+    #     declares retained-snapshot status at the exact cite site; and
+    # (2) docs/planning citations carrying the exact, whole-line label below.
+    # Requiring equality for (2) (rather than accepting the label as a
+    # prefix) prevents a current claim appended to the disclaimer from
+    # inheriting the historical exemption.
+    if citation_kind == "historical":
+        return "historical_snapshot"
     if (
         artifact_path.startswith("docs/planning/")
         and normalized_prose
@@ -328,6 +338,14 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
     citation_patterns = [
         ("run", re.compile(r'\*\(from ([^,]+), run ([^)]+)\)\*')),
         ("generated", re.compile(r'\*\(from ([^,]+), generated `?([^`)]+)`?\)\*')),
+        # Explicit historical contract: the citation itself declares the
+        # obligation a retained snapshot, not a current release claim.
+        ("historical", re.compile(r'\*\(from ([^,);]+); historical snapshot\)\*')),
+        # Bare path-only form: *(from path)*. The captured token must look
+        # like a repository-relative artifact path (contains "/" and no
+        # whitespace) so prose citations such as "the Git-pinned verdict
+        # blob above" stay unmatched.
+        ("bare", re.compile(r'\*\((?:from )([^),]+)\)\*')),
     ]
     obligations: list[ClaimObligation] = []
     seen: set[tuple[int, str, str, str]] = set()
@@ -336,7 +354,12 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
         for citation_kind, citation_pattern in citation_patterns:
             for match in citation_pattern.finditer(stripped_line):
                 artifact_path = match.group(1).strip()
-                citation_value = match.group(2).strip()
+                if citation_kind in {"bare", "historical"}:
+                    if " " in artifact_path or "/" not in artifact_path:
+                        continue
+                    citation_value = ""
+                else:
+                    citation_value = match.group(2).strip()
                 if is_placeholder_citation(artifact_path, citation_value):
                     continue
                 key = (line_number, artifact_path, citation_kind, citation_value)
@@ -350,7 +373,9 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
                         artifact_path=artifact_path,
                         citation_kind=citation_kind,
                         citation_value=citation_value,
-                        claim_surface=classify_claim_surface(original_line, artifact_path),
+                        claim_surface=classify_claim_surface(
+                            original_line, artifact_path, citation_kind
+                        ),
                     )
                 )
     return obligations
@@ -1603,6 +1628,13 @@ def check_artifact_content(
             )
         return tuple(errors)
 
+    if citation_kind in {"bare", "historical"}:
+        # Path-only and explicit-historical citations carry no inline
+        # provenance value to match. Existence, decodability, and JSON
+        # validity above are the contract; staleness is governed by
+        # claim_surface classification.
+        return tuple(errors)
+
     if citation_kind == "run":
         structured_ids = {
             field: payload[field]
@@ -1669,6 +1701,128 @@ def check_artifact_content(
         )
 
     return tuple(errors)
+
+
+CLAIM_BINDINGS_SCHEMA = "pi.readme.claim_bindings.v1"
+DEFAULT_CLAIM_BINDINGS_PATH = "docs/evidence/readme-claim-bindings.json"
+
+
+def load_claim_bindings(repo_root: Path) -> tuple[list[dict[str, Any]], str | None]:
+    """Load the optional README claim-binding manifest (artifact field -> line)."""
+    raw = os.environ.get("README_CLAIM_BINDINGS_JSON", "").strip()
+    path = (
+        resolve_env_path(repo_root, Path(raw))
+        if raw
+        else repo_root / DEFAULT_CLAIM_BINDINGS_PATH
+    )
+    if not path.exists():
+        return [], None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], f"claim-bindings manifest {path} is unreadable: {exc}"
+    if not isinstance(payload, dict) or payload.get("schema") != CLAIM_BINDINGS_SCHEMA:
+        return [], (
+            f"claim-bindings manifest {path} must be a JSON object with "
+            f"schema={CLAIM_BINDINGS_SCHEMA!r}"
+        )
+    bindings = payload.get("bindings")
+    if not isinstance(bindings, list):
+        return [], f"claim-bindings manifest {path} must contain a bindings array"
+    cleaned: list[dict[str, Any]] = []
+    for index, binding in enumerate(bindings):
+        if (
+            not isinstance(binding, dict)
+            or not isinstance(binding.get("artifact"), str)
+            or not isinstance(binding.get("field"), str)
+            or not binding["artifact"]
+            or not binding["field"]
+        ):
+            return [], (
+                f"claim-bindings manifest {path} entry #{index + 1} must provide "
+                "non-empty 'artifact' and 'field' strings"
+            )
+        cleaned.append({"artifact": binding["artifact"], "field": binding["field"]})
+    return cleaned, None
+
+
+def _resolve_dotted_field(payload: Any, dotted: str) -> Any:
+    current: Any = payload
+    for part in dotted.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def check_claim_bindings(
+    obligations: list[ClaimObligation],
+    bindings: list[dict[str, Any]],
+    readme_text: str,
+    *,
+    base_dir: Path | None = None,
+) -> list[str]:
+    """Verify each bound artifact field's value appears in the citing README block.
+
+    The search context is the full Markdown block (list item / paragraph)
+    containing the citation, so multi-line bullets bind their leading numbers
+    to a trailing citation.
+    """
+    readme_lines = readme_text.splitlines()
+
+    def block_text(line_number: int) -> str:
+        start = line_number - 1  # 0-indexed cite line
+        while start > 0 and readme_lines[start - 1].strip() and not readme_lines[
+            start - 1
+        ].lstrip().startswith("#"):
+            start -= 1
+        end = line_number  # exclusive
+        while end < len(readme_lines) and readme_lines[end].strip() and not readme_lines[
+            end
+        ].lstrip().startswith("#"):
+            end += 1
+        return "\n".join(readme_lines[start:end])
+
+    errors: list[str] = []
+    for binding in bindings:
+        artifact = binding["artifact"]
+        field = binding["field"]
+        cited = [
+            obligation
+            for obligation in obligations
+            if obligation.artifact_path == artifact
+        ]
+        if not cited:
+            errors.append(
+                f"BINDING UNCITED: {artifact} is bound for field '{field}' but no "
+                "README citation references it"
+            )
+            continue
+        try:
+            payload = json.loads(
+                ((base_dir or Path.cwd()) / artifact).read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(
+                f"BINDING UNREADABLE: {artifact} could not be loaded for field "
+                f"'{field}': {exc}"
+            )
+            continue
+        resolved = _resolve_dotted_field(payload, field)
+        if isinstance(resolved, bool) or resolved is None:
+            errors.append(
+                f"BINDING INVALID: {artifact}.{field} is missing or has an "
+                "unbindable type"
+            )
+            continue
+        expected = str(resolved)
+        if any(expected in block_text(o.line_number) for o in cited):
+            continue
+        errors.append(
+            f"BINDING MISMATCH: no README block citing {artifact} contains the "
+            f"current value {expected!r} of '{field}'"
+        )
+    return errors
 
 
 def check_readme(repo_root: Path, now: datetime | None = None) -> int:
@@ -1757,7 +1911,9 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
             ))
             continue
         assert artifact_path is not None and full_path is not None
-        claim_surface = classify_claim_surface(obligation.claim_text, artifact_path)
+        claim_surface = classify_claim_surface(
+            obligation.claim_text, artifact_path, obligation.citation_kind
+        )
 
         if not full_path.exists():
             print(
@@ -1880,7 +2036,7 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
                     print(f"INVALID: line {obligation.line_number}: {artifact_path}: {error}")
                     print(
                         "  Remediation: cite an artifact whose schema/run provenance matches "
-                        f"the README claim on line {obligation.line_number}, or remove the claim."
+                        "the current strict evidence contract."
                     )
 
             results.append(CitationCheck(
@@ -1899,6 +2055,15 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
             print(f"ERROR: Failed to check {artifact_path}: {e}")
             return 2
 
+    # Claim bindings: bound artifact fields must appear on their citing lines.
+    bindings, bindings_error = load_claim_bindings(repo_root)
+    if bindings_error is not None:
+        print(f"INVALID: {bindings_error}")
+        return 2
+    binding_errors = check_claim_bindings(obligations, bindings, readme_text)
+    for error in binding_errors:
+        print(error)
+
     # Summary
     print(f"\nSUMMARY:")
     print(f"  Total proof obligations: {len(obligations)}")
@@ -1909,6 +2074,7 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
     print(f"  Stale artifacts: {stale_count}")
     print(f"  Missing artifacts: {missing_count}")
     print(f"  Invalid artifact content checks: {content_error_count}")
+    print(f"  Claim bindings enforced: {len(bindings)} ({len(binding_errors)} mismatched)")
 
     if stale_count > 0:
         print(f"\nFAIL: {stale_count} cited artifact(s) are >14 days stale.")
@@ -1926,8 +2092,17 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
         print("Evidence claims must cite artifacts with matching run provenance and clean data.")
         return 1
 
-    print("\nPASS: All cited artifacts are fresh and content-valid.")
+    if binding_errors:
+        print(
+            f"\nFAIL: {len(binding_errors)} README claim binding(s) diverged from "
+            "current artifact values."
+        )
+        print("Update the README numbers or regenerate the cited artifact; never hand-patch artifacts.")
+        return 1
+
+    print("\nPASS: All cited artifacts are fresh, content-valid, and value-bound.")
     return 0
+
 
 
 def run_self_test() -> int:
@@ -2301,6 +2476,65 @@ def run_self_test() -> int:
                 "to planning artifacts"
             )
             return 2
+        parsed_forms = parse_citation_obligations(
+            "- Current claim *(from tests/perf/reports/budget_summary.json)*\n"
+            "- Retained result "
+            "*(from docs/planning/snapshot.json; historical snapshot)*\n"
+            "- Prose blob *(from the Git-pinned verdict blob above)*\n"
+        )
+        form_kinds = [obligation.citation_kind for obligation in parsed_forms]
+        if form_kinds != ["bare", "historical"]:
+            print(f"SELF-TEST FAIL: citation forms parsed as {form_kinds}")
+            return 2
+        if (
+            parsed_forms[0].claim_surface != "release_facing"
+            or parsed_forms[1].claim_surface != "historical_snapshot"
+        ):
+            print("SELF-TEST FAIL: bare/historical claim surfaces misclassified")
+            return 2
+        bindings_target = reports / "bindings_target.json"
+        bindings_target.write_text(
+            json.dumps({"summary": {"passed": 17, "total_gates": 20}}),
+            encoding="utf-8",
+        )
+        binding_fixture_text = (
+            "- Gate: 17/20 passed "
+            "*(from tests/perf/reports/bindings_target.json)*\n"
+        )
+        binding_obligations = parse_citation_obligations(binding_fixture_text)
+        happy_bindings = [
+            {
+                "artifact": "tests/perf/reports/bindings_target.json",
+                "field": "summary.passed",
+            },
+            {
+                "artifact": "tests/perf/reports/bindings_target.json",
+                "field": "summary.total_gates",
+            },
+        ]
+        if check_claim_bindings(
+            binding_obligations, happy_bindings, binding_fixture_text,
+            base_dir=generic_root,
+        ):
+            print("SELF-TEST FAIL: matching claim bindings must pass")
+            return 2
+        drifted_bindings = [
+            {
+                "artifact": "tests/perf/reports/bindings_target.json",
+                "field": "summary.passed",
+            }
+        ]
+        drifted_errors = check_claim_bindings(
+            binding_obligations,
+            drifted_bindings,
+            binding_fixture_text.replace("Gate: 17/20", "Gate: 16/20"),
+            base_dir=generic_root,
+        )
+        if len(drifted_errors) != 1 or "BINDING MISMATCH" not in drifted_errors[0]:
+            print(f"SELF-TEST FAIL: diverged binding must fail: {drifted_errors}")
+            return 2
+
+
 
         result, output = run_check(
             generic_root,
