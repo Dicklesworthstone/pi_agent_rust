@@ -195,6 +195,21 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             };
             Box::new(pi::tools::LearnTool::new(std::sync::Arc::new(store)))
         }
+        "submit_plan" => {
+            let state = pi::plan::PlanState::new();
+            let initial_mode = case
+                .setup
+                .iter()
+                .find_map(|step| match step {
+                    SetupStep::SetPlanMode { mode } => Some(mode.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("planning");
+            if initial_mode == "planning" {
+                state.enter_planning();
+            }
+            Box::new(pi::plan::SubmitPlanTool::new(state, false))
+        }
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {
             return TestResult::fail(&case_name, format!("Unknown tool: {tool_name}"));
@@ -829,6 +844,14 @@ fn run_setup_steps(steps: &[SetupStep], dir: &Path) -> Result<(), String> {
                     .retain(kind, content, tags, None)
                     .map_err(|error| format!("Failed to retain setup memory: {error}"))?;
             }
+            SetupStep::SetPlanMode { mode } => match mode.as_str() {
+                "off" | "planning" => {}
+                other => {
+                    return Err(format!(
+                        "Unknown setup plan mode '{other}'; expected off or planning"
+                    ));
+                }
+            },
         }
     }
     Ok(())

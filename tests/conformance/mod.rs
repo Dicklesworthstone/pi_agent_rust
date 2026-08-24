@@ -105,6 +105,9 @@ pub enum SetupStep {
         #[serde(default)]
         tags: Vec<String>,
     },
+    /// Configure the initial state for a session-coupled submit_plan fixture.
+    #[serde(rename = "set_plan_mode")]
+    SetPlanMode { mode: String },
 }
 
 /// Expected results for a test case.

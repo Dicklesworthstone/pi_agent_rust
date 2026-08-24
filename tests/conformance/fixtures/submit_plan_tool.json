@@ -1,0 +1,79 @@
+{
+  "version": "1.0",
+  "tool": "submit_plan",
+  "description": "SubmitPlanTool contract for bd-cv653.3.5 and bd-cv653.8.1: pending-review transition, minimum complete-plan boundary, and outside-plan refusal.",
+  "cases": [
+    {
+      "name": "submit_plan_enters_pending_review",
+      "description": "a complete plan submitted from planning mode enters the user-review state",
+      "requirement_ids": [
+        "PLAN-SUBMIT-1"
+      ],
+      "setup": [
+        {
+          "type": "set_plan_mode",
+          "mode": "planning"
+        }
+      ],
+      "input": {
+        "plan": "Goal: verify the change.\n1. Inspect the source.\n2. Apply the narrow repair.\nFiles: src/lib.rs\nVerify: cargo check."
+      },
+      "expected": {
+        "content_contains": [
+          "Plan submitted for review",
+          "Wait for the user's decision"
+        ],
+        "details_exact": {
+          "planReview": "pending"
+        }
+      }
+    },
+    {
+      "name": "submit_plan_rejects_incomplete_plan",
+      "description": "a plan below the minimum reviewable shape stays in planning mode and returns actionable guidance",
+      "requirement_ids": [
+        "PLAN-SUBMIT-2"
+      ],
+      "setup": [
+        {
+          "type": "set_plan_mode",
+          "mode": "planning"
+        }
+      ],
+      "input": {
+        "plan": "just do it"
+      },
+      "expected": {
+        "content_contains": [
+          "Plan is too short to review",
+          "files to touch",
+          "verification"
+        ],
+        "details_none": true
+      }
+    },
+    {
+      "name": "submit_plan_refuses_outside_plan_mode",
+      "description": "a complete plan cannot silently change session state when planning mode is off",
+      "requirement_ids": [
+        "PLAN-SUBMIT-ERR-1"
+      ],
+      "setup": [
+        {
+          "type": "set_plan_mode",
+          "mode": "off"
+        }
+      ],
+      "input": {
+        "plan": "Goal: verify the change.\n1. Inspect the source.\n2. Apply the narrow repair.\nFiles: src/lib.rs\nVerify: cargo check."
+      },
+      "expected": {
+        "content_contains": [
+          "submit_plan called outside of plan mode",
+          "Enter plan mode first"
+        ],
+        "details_none": true
+      }
+    }
+  ]
+}
