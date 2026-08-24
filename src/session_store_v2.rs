@@ -3136,6 +3136,62 @@ impl SessionStoreV2 {
         read_checkpoint_document(&self.checkpoint_path(checkpoint_seq), checkpoint_seq)
     }
 
+    /// Read all entries with `entry_seq <= to_entry_seq`.
+    pub fn read_entries_up_to_seq(&self, to_entry_seq: u64) -> Result<Vec<SegmentFrame>> {
+        let index_rows = self.read_index()?;
+        let mut frames = Vec::new();
+        let mut reader = SegmentFileReader::new(self);
+        for row in &index_rows {
+            if row.entry_seq > to_entry_seq {
+                break;
+            }
+            if let Some(frame) = reader.read_frame(row)? {
+                frames.push(frame);
+            }
+        }
+        validate_fetched_parent_graph(&index_rows, &frames)?;
+        Ok(frames)
+    }
+
+    /// Fork the session at a given checkpoint sequence to a new destination root.
+    /// Uses snapshot-consistent read and does not block background appends.
+    pub fn fork_at_checkpoint(&self, target_dir: &Path, checkpoint_seq: u64) -> Result<PathBuf> {
+        let checkpoint = self
+            .read_checkpoint(checkpoint_seq)?
+            .ok_or_else(|| Error::session(format!("checkpoint {checkpoint_seq} not found")))?;
+
+        let frames = self.read_entries_up_to_seq(checkpoint.head_entry_seq)?;
+        let mut target_store = Self::open(target_dir)?;
+        for frame in frames {
+            let payload_value: Value = serde_json::from_str(frame.payload.get())?;
+            target_store.append_entry(
+                frame.entry_id,
+                frame.parent_entry_id,
+                frame.entry_type,
+                payload_value,
+            )?;
+        }
+        target_store.checkpoint(format!("forked from checkpoint {checkpoint_seq}"))?;
+        Ok(target_dir.to_path_buf())
+    }
+
+    /// Export session snapshot frames up to `checkpoint_seq` as JSONL.
+    pub fn export_snapshot(&self, target_file: &Path, checkpoint_seq: u64) -> Result<()> {
+        let checkpoint = self
+            .read_checkpoint(checkpoint_seq)?
+            .ok_or_else(|| Error::session(format!("checkpoint {checkpoint_seq} not found")))?;
+
+        let frames = self.read_entries_up_to_seq(checkpoint.head_entry_seq)?;
+        let mut file = open_regular_file_for_write(target_file, true, ArtifactWriteMode::Replace)?;
+        for frame in &frames {
+            let serialized = serde_json::to_string(frame)?;
+            file.write_all(serialized.as_bytes())?;
+            file.write_all(b"\n")?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
     fn read_rollback_intent(&self) -> Result<Option<RollbackIntent>> {
         let tmp_dir = self.root.join("tmp");
         if !path_entry_exists(&tmp_dir)? {
