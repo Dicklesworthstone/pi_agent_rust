@@ -9410,6 +9410,21 @@ impl Tool for WriteTool {
             )));
         }
 
+        // Scheme URLs route through the router — never a silent filesystem
+        // fallback (bd-cv653.6.5).
+        if crate::url_router::has_scheme(&input.path) {
+            let details = crate::url_router::ssh_write_document(&input.path, &input.content)?;
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(format!(
+                    "Successfully wrote {} bytes to {}",
+                    input.content.len(),
+                    input.path
+                )))],
+                details: Some(details),
+                is_error: false,
+            });
+        }
+
         let path = resolve_path(&input.path, &self.cwd);
         let path = enforce_cwd_scope(&path, &self.cwd, "write", &self.workspace)?;
 

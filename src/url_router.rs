@@ -12,7 +12,9 @@
 //! placeholder vault). Unknown schemes error with the registered list —
 //! resolution NEVER silently falls back to the filesystem.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 
 use serde::Serialize;
 
@@ -647,6 +649,271 @@ fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// ssh://host/path writes (bd-cv653.6.5): confined hosts, batch-mode auth,
+// accept-new-then-strict host keys, atomic remote staging.
+// ---------------------------------------------------------------------------
+
+/// A parsed `ssh://host/path` write target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTarget {
+    pub host: String,
+    pub path: String,
+}
+
+/// Parse and validate an `ssh://host/path` URL for a write-side tool.
+///
+/// Rejects non-ssh schemes, empty components, and any `..` path segment so
+/// remote staging can never escape the intended directory.
+///
+/// # Errors
+/// Named `PI_SSH_*` validation errors.
+pub fn parse_ssh_target(url: &str) -> Result<SshTarget> {
+    let Some(("ssh", rest)) = split_scheme(url) else {
+        return Err(Error::validation(format!(
+            "PI_SSH_TARGET: '{url}' is not an ssh://host/path URL"
+        )));
+    };
+    let (host, remote_path) = rest.split_once('/').ok_or_else(|| {
+        Error::validation(format!(
+            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
+        ))
+    })?;
+    if host.is_empty() || remote_path.is_empty() {
+        return Err(Error::validation(format!(
+            "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
+        )));
+    }
+    if remote_path.split('/').any(|segment| segment == "..") {
+        return Err(Error::validation(format!(
+            "PI_SSH_TRAVERSAL: ssh:// paths must not contain '..' segments: '{rest}'"
+        )));
+    }
+    Ok(SshTarget {
+        host: host.to_string(),
+        path: remote_path.to_string(),
+    })
+}
+
+/// Literal host tokens from ssh_config text. Wildcard (`*`, `?`) and
+/// negation (`!host`) patterns never authorize a specific host.
+fn ssh_config_literal_hosts(config_text: &str) -> Vec<String> {
+    config_text
+        .lines()
+        .filter_map(|line| {
+            let mut tokens = line.trim().split_whitespace();
+            if !tokens.next()?.eq_ignore_ascii_case("host") {
+                return None;
+            }
+            Some(
+                tokens
+                    .filter(|pattern| {
+                        !pattern.is_empty()
+                            && !pattern.contains(['*', '?'])
+                            && !pattern.starts_with('!')
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+/// Confinement decision given config text and an explicit allowlist string
+/// (`PI_SSH_ALLOWED_HOSTS`, comma-separated). Pure so tests stay offline.
+fn ssh_host_allowed_with(
+    host: &str,
+    config_text: Option<&str>,
+    env_allowlist: Option<&str>,
+) -> bool {
+    if let Some(env) = env_allowlist
+        && env
+            .split(',')
+            .any(|candidate| candidate.trim().eq_ignore_ascii_case(host))
+    {
+        return true;
+    }
+    config_text.is_some_and(|text| {
+        ssh_config_literal_hosts(text)
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(host))
+    })
+}
+
+/// Reads are open (any reachable host); **writes** require the host to be
+/// listed literally in `~/.ssh/config` or in `PI_SSH_ALLOWED_HOSTS`.
+pub fn ssh_host_allowed(host: &str) -> bool {
+    let config_path = std::env::var_os("HOME").map_or_else(
+        || PathBuf::from(".ssh").join("config"),
+        |home| PathBuf::from(home).join(".ssh").join("config"),
+    );
+    let config = std::fs::read_to_string(config_path).ok();
+    let env = std::env::var("PI_SSH_ALLOWED_HOSTS").ok();
+    ssh_host_allowed_with(host, config.as_deref(), env.as_deref())
+}
+
+/// Shared ssh invocation flags: no interactive auth possible (BatchMode),
+/// bounded connect, and accept-new-then-strict host keys — a *changed* key
+/// still hard-fails and is classified by [`classify_ssh_failure`].
+#[must_use]
+pub fn ssh_command_flags() -> [&'static str; 6] {
+    [
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+    ]
+}
+
+/// Remediation surfaced when a cached host key no longer matches.
+pub const SSH_HOSTKEY_REMEDIATION: &str = "The remote host key differs from the cached entry in ~/.ssh/known_hosts. Verify the change out-of-band; if legitimate, remove the stale entry with `ssh-keygen -R <host>` and retry. Pi refuses to proceed automatically.";
+
+/// Failure taxonomy for ssh stderr text (host-key FSM per bd-cv653.6.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshFailureKind {
+    /// Cached key mismatch — always a hard failure with remediation.
+    HostKeyChanged,
+    /// Batch-mode auth rejected (no interactive retry exists).
+    AuthFailed,
+    /// ConnectTimeout elapsed.
+    ConnectTimeout,
+    Other,
+}
+
+#[must_use]
+pub fn classify_ssh_failure(stderr: &str) -> SshFailureKind {
+    let lowered = stderr.to_ascii_lowercase();
+    if lowered.contains("remote host identification has changed")
+        || lowered.contains("host key verification failed")
+        || lowered.contains("offending ecdsa")
+        || lowered.contains("offending ed25519")
+        || lowered.contains("offending rsa")
+    {
+        SshFailureKind::HostKeyChanged
+    } else if lowered.contains("permission denied") {
+        SshFailureKind::AuthFailed
+    } else if lowered.contains("connection timed out") || lowered.contains("timed out") {
+        SshFailureKind::ConnectTimeout
+    } else {
+        SshFailureKind::Other
+    }
+}
+
+/// Quote a single argument for consumption by the *remote* POSIX shell.
+fn sh_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// POSIX sh snippet writing stdin into `remote_path` atomically: mktemp in
+/// the target directory keeps rename(2) on one filesystem, existing
+/// permissions are preserved best-effort, and the EXIT trap removes the
+/// staging file if anything aborts before the rename.
+#[must_use]
+pub fn remote_atomic_write_script(remote_path: &str) -> String {
+    let quoted = sh_quote(remote_path);
+    format!(
+        "set -eu; d=$(dirname -- {quoted}); t=$(mktemp \"$d/.pi-ssh-write.XXXXXX\"); \
+         trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
+         if [ -e {quoted} ]; then chmod --reference={quoted} \"$t\"; fi; \
+         mv -f -- \"$t\" {quoted}"
+    )
+}
+
+/// Atomically write `content` to `ssh://host/path`.
+///
+/// Pipeline: parse/validate target → host confinement → spawn ssh with
+/// batch-mode + accept-new flags → stream content over stdin into a remote
+/// mktemp staging file → rename over the target.
+///
+/// # Errors
+/// `PI_SSH_HOST_NOT_ALLOWED` (confinement), `PI_SSH_HOSTKEY_CHANGED`
+/// (with [`SSH_HOSTKEY_REMEDIATION`]), `PI_SSH_AUTH_FAILED`,
+/// `PI_SSH_TIMEOUT`, `PI_SSH_WRITE_FAILED`.
+pub fn ssh_write_document(url: &str, content: &str) -> Result<serde_json::Value> {
+    let target = parse_ssh_target(url)?;
+    if !ssh_host_allowed(&target.host) {
+        return Err(Error::tool(
+            "write",
+            format!(
+                "PI_SSH_HOST_NOT_ALLOWED: host '{}' is not authorized for writes. \
+                 Add it literally to ~/.ssh/config (Host block) or PI_SSH_ALLOWED_HOSTS.",
+                target.host
+            ),
+        ));
+    }
+    let script = remote_atomic_write_script(&target.path);
+    let mut child = std::process::Command::new("ssh")
+        .args(ssh_command_flags())
+        .arg(&target.host)
+        .arg(&script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: failed to run ssh: {e}")))?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| Error::tool("write", "PI_SSH_BACKEND: missing ssh stdin"))?;
+        stdin
+            .write_all(content.as_bytes())
+            .and_then(|()| stdin.flush())
+            .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: streaming payload: {e}")))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| Error::tool("write", format!("PI_SSH_BACKEND: waiting on ssh: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Err(match classify_ssh_failure(&stderr) {
+            SshFailureKind::HostKeyChanged => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_HOSTKEY_CHANGED: {SSH_HOSTKEY_REMEDIATION} (ssh stderr: {})",
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::AuthFailed => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_AUTH_FAILED: batch-mode authentication rejected for '{}' (no interactive prompts over ssh://). ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::ConnectTimeout => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_TIMEOUT: connection to '{}' timed out. ssh stderr: {}",
+                    target.host,
+                    stderr.trim()
+                ),
+            ),
+            SshFailureKind::Other => Error::tool(
+                "write",
+                format!(
+                    "PI_SSH_WRITE_FAILED: ssh {host} write '{path}' failed: {stderr}",
+                    host = target.host,
+                    path = target.path,
+                    stderr = stderr.trim()
+                ),
+            ),
+        });
+    }
+    Ok(serde_json::json!({
+        "schema": URL_ROUTER_SCHEMA,
+        "scheme": "ssh",
+        "host": target.host,
+        "path": target.path,
+        "bytes": content.len(),
+        "atomic": true,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,5 +1012,72 @@ mod tests {
         assert_eq!(number, "1428");
         assert_eq!(sub.as_deref(), Some("diff"));
         assert!(parse_repo_number("notanumber").is_err());
+    }
+    #[test]
+    fn parse_ssh_target_validates() {
+        let ok = parse_ssh_target("ssh://yto/var/www/app.js").expect("ok");
+        assert_eq!(ok.host, "yto");
+        assert_eq!(ok.path, "var/www/app.js");
+        assert!(parse_ssh_target("file:///etc/hosts").is_err());
+        assert!(parse_ssh_target("ssh://hostonly").is_err());
+        assert!(parse_ssh_target("ssh://h/").is_err());
+        assert!(parse_ssh_target("ssh://h/a/../b").is_err());
+    }
+
+    #[test]
+    fn ssh_config_literal_hosts_skips_patterns() {
+        let hosts = ssh_config_literal_hosts(
+            "Host yto fmd\n  HostName 1.2.3.4\nhost css\nHost *\nHost !blocked\n",
+        );
+        assert_eq!(hosts, ["yto", "fmd", "css"]); // ubs:ignore length asserted
+    }
+
+    #[test]
+    fn ssh_host_confinement_sources() {
+        let config = Some("Host yto\n");
+        assert!(ssh_host_allowed_with("yto", config, None));
+        assert!(ssh_host_allowed_with("YTO", config, None)); // case-insensitive
+        assert!(!ssh_host_allowed_with("evil", config, None));
+        assert!(ssh_host_allowed_with("csd", None, Some("a, csd ,b")));
+        assert!(!ssh_host_allowed_with("x", Some("Host *\n"), None));
+    }
+
+    #[test]
+    fn ssh_flags_force_batch_and_accept_new() {
+        let flags = ssh_command_flags();
+        assert!(flags.contains(&"BatchMode=yes"));
+        assert!(flags.contains(&"StrictHostKeyChecking=accept-new"));
+    }
+
+    #[test]
+    fn remote_write_script_stages_atomically() {
+        let script = remote_atomic_write_script("/var/www/app.conf");
+        assert!(script.contains("mktemp \"$d/.pi-ssh-write.XXXXXX\""));
+        assert!(script.contains("mv -f -- \"$t\" '/var/www/app.conf'"));
+        assert!(script.contains("chmod --reference='/var/www/app.conf'"));
+        assert!(script.contains("trap 'rm -f \"$t\"' EXIT"));
+        // Quote escaping survives embedded single quotes.
+        let tricky = remote_atomic_write_script("/tmp/it's");
+        assert!(tricky.contains("'\\''"), "{tricky}");
+    }
+
+    #[test]
+    fn ssh_failures_classify() {
+        assert_eq!(
+            classify_ssh_failure("@@@@@@\r\nRemote host identification has changed."),
+            SshFailureKind::HostKeyChanged
+        );
+        assert_eq!(
+            classify_ssh_failure("Permission denied (publickey)."),
+            SshFailureKind::AuthFailed
+        );
+        assert_eq!(
+            classify_ssh_failure("Connection timed out"),
+            SshFailureKind::ConnectTimeout
+        );
+        assert_eq!(
+            classify_ssh_failure("bash: x: command not found"),
+            SshFailureKind::Other
+        );
     }
 }
