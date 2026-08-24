@@ -808,6 +808,21 @@ def run_self_test() -> int:
         and entry["retrieval_status"] == "reused_from_cache"
         for entry in cached_manifest["entries"]
     ), cached_manifest
+
+    wrong_correlation_manifest = build_staging_manifest(
+        **staging_args(
+            cached_root,
+            cache_dir=cache_dir,
+            expected_correlation_id="other-correlation",
+        )
+    )
+    assert wrong_correlation_manifest["summary"]["status"] == "blocked", (
+        wrong_correlation_manifest
+    )
+    assert any(
+        entry["reason"] == "correlation_id_mismatch"
+        for entry in wrong_correlation_manifest["rejected_evidence_cache_entries"]
+    ), wrong_correlation_manifest
     return 0
 
 

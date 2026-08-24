@@ -1182,72 +1182,7 @@ if [[ -f "$PREFLIGHT_BEFORE_REFRESH_PATH" ]]; then
   log_ok "Collected: $(basename "$PREFLIGHT_BEFORE_REFRESH_PATH")"
 fi
 
-staging_exit=0
-if run_budget_preflight \
-  "$PREFLIGHT_AFTER_RUN_PATH"; then
-  log_ok "Post-run budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
-else
-  staging_exit=$?
-  log_warn "Post-run budget preflight found blockers:"
-  log_warn "  results/$(basename "$PREFLIGHT_AFTER_RUN_PATH") (exit=$staging_exit)"
-fi
-
-if [[ -f "$PREFLIGHT_AFTER_RUN_PATH" ]]; then
-  artifact_count=$((artifact_count + 1))
-  log_ok "Collected: $(basename "$PREFLIGHT_AFTER_RUN_PATH")"
-fi
-
-if run_artifact_staging_manifest "$STAGING_MANIFEST_PATH"; then
-  log_ok "Artifact staging manifest passed: results/$(basename "$STAGING_MANIFEST_PATH")"
-else
-  staging_exit=$?
-  log_warn "Artifact staging manifest found blockers: results/$(basename "$STAGING_MANIFEST_PATH") (exit=$staging_exit)"
-fi
-
-if [[ -f "$STAGING_MANIFEST_PATH" ]]; then
-  artifact_count=$((artifact_count + 1))
-  staging_summary="$(
-    python3 - "$STAGING_MANIFEST_PATH" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    payload = json.load(handle)
-summary = payload.get("summary", {})
-print(
-    "|".join(
-        str(summary.get(key, 0))
-        for key in (
-            "status",
-            "missing_required_count",
-            "stale_required_count",
-            "present_required_count",
-        )
-    )
-    + "|"
-    + str(len(payload.get("blockers", [])))
-)
-PY
-  )"
-  IFS='|' read -r \
-    ARTIFACT_STAGING_STATUS \
-    ARTIFACT_STAGING_MISSING_REQUIRED \
-    ARTIFACT_STAGING_STALE_REQUIRED \
-    ARTIFACT_STAGING_PRESENT_REQUIRED \
-    ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
-  log_ok "Artifact staging manifest: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
-  log_ok "Artifact staging blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
-else
-  log_warn "Artifact staging manifest was not generated"
-fi
-
-if [[ "$ARTIFACT_STAGING_STATUS" == "blocked" && "${PI_PERF_STRICT:-0}" == "1" ]]; then
-  suite_fail=$((suite_fail + 1))
-  SUITE_RESULTS+=("{\"suite\":\"artifact_staging\",\"status\":\"fail\",\"exit_code\":$staging_exit,\"elapsed_ms\":0}")
-  log_warn "Strict mode: artifact staging blockers mark the run failed (blockers=$ARTIFACT_STAGING_BLOCKERS)"
-fi
-
-log_ok "Total artifacts collected: $artifact_count"
+log_ok "Artifacts collected before derived finalization: $artifact_count"
 
 # ─── Phase 5: Generate manifest ─────────────────────────────────────────────
 
@@ -1326,8 +1261,6 @@ BASELINE_CONFIDENCE_PATH="$OUTPUT_DIR/results/baseline_variance_confidence.json"
 if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   CORRELATION_ID="$CORRELATION_ID" \
-  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
-  GIT_DIRTY="$GIT_DIRTY" \
   TIMESTAMP="$TIMESTAMP" \
   BASELINE_CONFIDENCE_PATH="$BASELINE_CONFIDENCE_PATH" \
   python3 - <<'PY'
@@ -1341,8 +1274,6 @@ from pathlib import Path
 output_dir = Path(os.environ["OUTPUT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
 correlation_id = os.environ["CORRELATION_ID"]
-source_commit = os.environ["GIT_COMMIT_FULL"]
-source_dirty = os.environ["GIT_DIRTY"] == "true"
 timestamp = os.environ["TIMESTAMP"]
 baseline_confidence_path = Path(os.environ["BASELINE_CONFIDENCE_PATH"])
 
@@ -1558,8 +1489,6 @@ payload = {
     "schema": "pi.perf.baseline_variance_confidence.v1",
     "bead_id": "bd-3ar8v.1.5",
     "generated_at": datetime.now(timezone.utc).isoformat(),
-    "source_commit": source_commit,
-    "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
     "source_manifest_path": str(manifest_path),
@@ -1733,6 +1662,8 @@ STRATIFICATION_PATH="$OUTPUT_DIR/results/extension_benchmark_stratification.json
 if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
   TIMESTAMP="$TIMESTAMP" \
   STRATIFICATION_PATH="$STRATIFICATION_PATH" \
   python3 - <<'PY'
@@ -1745,6 +1676,8 @@ from pathlib import Path
 output_dir = Path(os.environ["OUTPUT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
 correlation_id = os.environ["CORRELATION_ID"]
+source_commit = os.environ["GIT_COMMIT_FULL"]
+source_dirty = os.environ["GIT_DIRTY"] == "true"
 timestamp = os.environ["TIMESTAMP"]
 stratification_path = Path(os.environ["STRATIFICATION_PATH"])
 
@@ -2170,6 +2103,8 @@ payload = {
     "schema": "pi.perf.extension_benchmark_stratification.v1",
     "bead_id": "bd-3ar8v.4.11",
     "generated_at": datetime.now(timezone.utc).isoformat(),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
     "profile": str(manifest.get("profile", "unknown")),

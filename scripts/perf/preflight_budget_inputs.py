@@ -1645,6 +1645,7 @@ def run_self_test() -> int:
         cache_git_commit: str = "test-commit",
         cache_profile: str = "perf",
         cache_ttl_hours: float = 24.0,
+        expected_correlation_id: str | None = None,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             repo_root=str(root),
@@ -1654,7 +1655,7 @@ def run_self_test() -> int:
             cache_ttl_hours=cache_ttl_hours,
             cache_profile=cache_profile,
             cache_git_commit=cache_git_commit,
-            expected_correlation_id=None,
+            expected_correlation_id=expected_correlation_id,
             skip_rch_check=True,
         )
 
@@ -2076,6 +2077,22 @@ def run_self_test() -> int:
         and item["evidence_source"] == "cache"
         for item in cached_payload["fresh_artifacts"]
     ), cached_payload
+
+    wrong_correlation_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-correlation-"))
+    write_fixture(wrong_correlation_root, include_policy=False)
+    wrong_correlation_cache_dir = write_cache_index(wrong_correlation_root)
+    wrong_correlation_code, wrong_correlation_payload = build_report(
+        build_args(
+            wrong_correlation_root,
+            cache_dir=wrong_correlation_cache_dir,
+            expected_correlation_id="other-correlation",
+        )
+    )
+    assert wrong_correlation_code == 1, wrong_correlation_payload
+    assert any(
+        entry["reason"] == "correlation_id_mismatch"
+        for entry in wrong_correlation_payload["rejected_evidence_cache_entries"]
+    ), wrong_correlation_payload
 
     stale_cache_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-stale-"))
     write_fixture(stale_cache_root, include_policy=False)
