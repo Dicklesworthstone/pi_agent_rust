@@ -121,6 +121,7 @@ files = [
     "waiver_ledger",
     "release_evidence_ledger",
     "nrun_evidence_protocol",
+    "sequential_budget_gate",
     "checkpoint",
     "eval",
     "url_router",

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "schema": "pi.sequential_gate.contract.v1",
+  "contract_id": "pi.contract.sequential_budget_gate.v1",
+  "title": "Anytime-Valid Sequential Budget Decision Gate Contract",
+  "version": "1.0.0",
+  "bead_id": "bd-sog97.11",
+  "policy_owner_role": "Release Engineering",
+  "created_at": "2026-08-24T00:10:40Z",
+  "status": "enforced",
+  "description": "Defines anytime-valid sequential hypothesis testing via e-processes and mixture sequential likelihood ratio tests for release performance budget evaluation with analytical error control (Ville inequality).",
+  "error_control": {
+    "alpha": 0.05,
+    "beta": 0.01,
+    "e_threshold_pass": 20.0,
+    "e_threshold_reject": 0.01,
+    "max_steps": 50,
+    "analytical_bound": "P(false_pass) <= alpha"
+  },
+  "required_decision_states": [
+    "EARLY_PASS",
+    "EARLY_REJECT",
+    "MAX_STEPS_PASS",
+    "MAX_STEPS_REJECT",
+    "INCONCLUSIVE"
+  ],
+  "required_trajectory_fields": [
+    "step",
+    "sample_value",
+    "weight",
+    "log_likelihood_ratio",
+    "accumulated_log_e",
+    "e_value",
+    "decision"
+  ],
+  "enforced_budgets": [
+    "startup_version_p95",
+    "binary_size_mb",
+    "context_graph_build_cold_p95",
+    "runtime_intelligence_eval_p95",
+    "ext_cold_load_simple_p95",
+    "tool_call_latency_mean"
+  ]
+}

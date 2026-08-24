@@ -908,3 +908,31 @@ Release-integrity performance budgets must not be evaluated on single test runs 
 - **Evaluator Tool**: `examples/nrun_evidence_evaluator.rs`
 - **Verification Gate**: `tests/nrun_evidence_protocol.rs`
 
+## Anytime-Valid Sequential Budget Decision Gate (RI-SEQ, DROPIN-R15)
+
+### Purpose & Theoretical Error Control
+
+Fixed-sample testing suffers from severe inflation of false-pass rates when evaluations are monitored continuously across builds or checkpoints. The sequential budget decision gate implements anytime-valid sequential hypothesis testing via **e-processes** and **sequential probability ratio testing (SPRT)**.
+
+By **Ville's inequality for non-negative supermartingales**:
+$$\mathbb{P}_{H_0}\left(\exists n \ge 1: E_n \ge \frac{1}{\alpha}\right) \le \alpha$$
+
+This provides guaranteed Type I error control ($\alpha \le 0.05$) regardless of stopping time or arbitrary evaluation frequency.
+
+### Sequential Decision Trajectory
+
+For each sample $X_i$ with standardized relative margin $z_i = \frac{T - X_i}{\sigma_0}$ (for maximum budgets) or $z_i = \frac{X_i - T}{\sigma_0}$ (for minimum budgets):
+- **Step Log-Likelihood Ratio**: $\Delta_i = w_i \cdot \left[ (\mu_1 - \mu_0) z_i - \frac{\mu_1^2 - \mu_0^2}{2} \right]$
+- **Accumulated e-value**: $E_n = \prod_{i=1}^n \exp(\Delta_i)$
+- **Early Pass Threshold**: $E_n \ge 1/\alpha = 20.0 \implies \text{EARLY\_PASS}$ (sufficient evidence of compliance without requiring further runs).
+- **Early Reject Threshold**: $E_n \le \beta = 0.01 \implies \text{EARLY\_REJECT}$ (decisive evidence of budget violation).
+- **Max Steps Boundary**: If sample budget $N_{\max} = 50$ is exhausted without crossing early thresholds, decision is made on whether $E_n \ge 1.0$.
+
+### Enforced Contracts & Artifacts
+
+- **Contract**: `docs/contracts/sequential-budget-gate-contract.json` (`pi.sequential_gate.contract.v1`)
+- **Evaluation Evidence**: `docs/evidence/sequential-budget-gate-evaluations.json` (`pi.sequential_gate.evaluation.v1`)
+- **Evaluator Tool**: `examples/sequential_budget_gate.rs`
+- **Verification Gate**: `tests/sequential_budget_gate.rs`
+
+

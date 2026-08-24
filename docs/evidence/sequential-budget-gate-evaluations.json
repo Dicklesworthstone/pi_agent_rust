@@ -1,0 +1,261 @@
+{
+  "schema": "pi.sequential_gate.evaluation.v1",
+  "generated_at": "2026-08-24T09:32:53.002940+00:00",
+  "contract_path": "docs/contracts/sequential-budget-gate-contract.json",
+  "alpha": 0.05,
+  "beta": 0.01,
+  "e_threshold_pass": 20.0,
+  "e_threshold_reject": 0.01,
+  "total_budgets": 6,
+  "passing_budgets": 4,
+  "failing_budgets": 2,
+  "overall_verdict": "FAIL",
+  "evaluations": [
+    {
+      "budget_name": "startup_version_p95",
+      "category": "startup",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 100.0,
+      "total_samples_available": 12,
+      "stopping_step": 1,
+      "final_e_value": 106.43133122912963,
+      "decision": "EARLY_PASS",
+      "final_verdict": "PASS",
+      "trajectory": [
+        {
+          "step": 1,
+          "sample_value": 4.15,
+          "weight": 1.0,
+          "log_likelihood_ratio": 4.6674999999999995,
+          "accumulated_log_e": 4.6674999999999995,
+          "e_value": 106.43133122912963,
+          "decision": "EARLY_PASS"
+        }
+      ]
+    },
+    {
+      "budget_name": "binary_size_mb",
+      "category": "binary_size",
+      "comparison": "maximum",
+      "unit": "MB",
+      "threshold": 48.0,
+      "total_samples_available": 10,
+      "stopping_step": 10,
+      "final_e_value": 27.425091247844918,
+      "decision": "EARLY_PASS",
+      "final_verdict": "PASS",
+      "trajectory": [
+        {
+          "step": 1,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 0.3311458333333331,
+          "e_value": 1.3925628595845345,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 2,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 0.6622916666666662,
+          "e_value": 1.939231317894256,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 3,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 0.9934374999999993,
+          "e_value": 2.7005015094427107,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 4,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 1.3245833333333323,
+          "e_value": 3.7606181043018934,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 5,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 1.6557291666666654,
+          "e_value": 5.236897101132016,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 6,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 1.9868749999999984,
+          "e_value": 7.292708402502359,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 7,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 2.3180208333333314,
+          "e_value": 10.155554867104847,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 8,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 2.6491666666666647,
+          "e_value": 14.142248526403165,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 9,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 2.980312499999998,
+          "e_value": 19.693970048883166,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 10,
+          "sample_value": 43.621,
+          "weight": 1.0,
+          "log_likelihood_ratio": 0.3311458333333331,
+          "accumulated_log_e": 3.311458333333331,
+          "e_value": 27.425091247844918,
+          "decision": "EARLY_PASS"
+        }
+      ]
+    },
+    {
+      "budget_name": "context_graph_build_cold_p95",
+      "category": "context_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 150.0,
+      "total_samples_available": 14,
+      "stopping_step": 1,
+      "final_e_value": 20.800977899475686,
+      "decision": "EARLY_PASS",
+      "final_verdict": "PASS",
+      "trajectory": [
+        {
+          "step": 1,
+          "sample_value": 55.2,
+          "weight": 1.0,
+          "log_likelihood_ratio": 3.0349999999999997,
+          "accumulated_log_e": 3.0349999999999997,
+          "e_value": 20.800977899475686,
+          "decision": "EARLY_PASS"
+        }
+      ]
+    },
+    {
+      "budget_name": "runtime_intelligence_eval_p95",
+      "category": "runtime_intelligence",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 25.0,
+      "total_samples_available": 10,
+      "stopping_step": 1,
+      "final_e_value": 103.4408549906184,
+      "decision": "EARLY_PASS",
+      "final_verdict": "PASS",
+      "trajectory": [
+        {
+          "step": 1,
+          "sample_value": 1.18,
+          "weight": 1.0,
+          "log_likelihood_ratio": 4.638999999999999,
+          "accumulated_log_e": 4.638999999999999,
+          "e_value": 103.4408549906184,
+          "decision": "EARLY_PASS"
+        }
+      ]
+    },
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "category": "extension",
+      "comparison": "maximum",
+      "unit": "ms",
+      "threshold": 5.0,
+      "total_samples_available": 12,
+      "stopping_step": 1,
+      "final_e_value": 0.005946217356472094,
+      "decision": "EARLY_REJECT",
+      "final_verdict": "FAIL",
+      "trajectory": [
+        {
+          "step": 1,
+          "sample_value": 11.85,
+          "weight": 1.0,
+          "log_likelihood_ratio": -5.125,
+          "accumulated_log_e": -5.125,
+          "e_value": 0.005946217356472094,
+          "decision": "EARLY_REJECT"
+        }
+      ]
+    },
+    {
+      "budget_name": "tool_call_latency_mean",
+      "category": "tool_call",
+      "comparison": "maximum",
+      "unit": "us",
+      "threshold": 200.0,
+      "total_samples_available": 10,
+      "stopping_step": 4,
+      "final_e_value": 0.0072627262798148915,
+      "decision": "EARLY_REJECT",
+      "final_verdict": "FAIL",
+      "trajectory": [
+        {
+          "step": 1,
+          "sample_value": 242.0,
+          "weight": 1.0,
+          "log_likelihood_ratio": -1.1749999999999998,
+          "accumulated_log_e": -1.1749999999999998,
+          "e_value": 0.3088189796880199,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 2,
+          "sample_value": 243.5,
+          "weight": 1.0,
+          "log_likelihood_ratio": -1.2125,
+          "accumulated_log_e": -2.3874999999999997,
+          "e_value": 0.09185904466872893,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 3,
+          "sample_value": 245.0,
+          "weight": 1.0,
+          "log_likelihood_ratio": -1.25,
+          "accumulated_log_e": -3.6374999999999997,
+          "e_value": 0.026318056932585314,
+          "decision": "CONTINUE"
+        },
+        {
+          "step": 4,
+          "sample_value": 246.5,
+          "weight": 1.0,
+          "log_likelihood_ratio": -1.2875,
+          "accumulated_log_e": -4.925,
+          "e_value": 0.0072627262798148915,
+          "decision": "EARLY_REJECT"
+        }
+      ]
+    }
+  ]
+}

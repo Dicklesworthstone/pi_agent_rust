@@ -4419,6 +4419,72 @@ else
     check_fail "nrun_evidence_protocol" "N-run contract or evidence file missing"
 fi
 
+# Gate 13c: Anytime-Valid Sequential Budget Decision Gate (RI-SEQ)
+SEQ_CONTRACT="$PROJECT_ROOT/docs/contracts/sequential-budget-gate-contract.json"
+SEQ_EVIDENCE="$PROJECT_ROOT/docs/evidence/sequential-budget-gate-evaluations.json"
+
+if [ -f "$SEQ_CONTRACT" ] && [ -f "$SEQ_EVIDENCE" ]; then
+    if SEQ_CHECK=$(python3 - "$SEQ_CONTRACT" "$SEQ_EVIDENCE" 2>&1 <<'PY'
+import json
+import sys
+from pathlib import Path
+
+contract_path = Path(sys.argv[1])
+evidence_path = Path(sys.argv[2])
+
+try:
+    with open(contract_path) as f:
+        contract = json.load(f)
+    with open(evidence_path) as f:
+        evidence = json.load(f)
+except Exception as e:
+    print(f"invalid:{e}")
+    sys.exit(0)
+
+if contract.get("schema") != "pi.sequential_gate.contract.v1":
+    print("invalid:contract schema mismatch")
+    sys.exit(0)
+
+if evidence.get("schema") != "pi.sequential_gate.evaluation.v1":
+    print("invalid:evidence schema mismatch")
+    sys.exit(0)
+
+evaluations = evidence.get("evaluations", [])
+if not evaluations:
+    print("invalid:empty evaluations in evidence")
+    sys.exit(0)
+
+for ev in evaluations:
+    if not ev.get("trajectory"):
+        print(f"invalid:empty trajectory for {ev.get('budget_name')}")
+        sys.exit(0)
+    verdict = ev.get("final_verdict")
+    decision = ev.get("decision")
+    if verdict not in ["PASS", "FAIL", "INCONCLUSIVE"]:
+        print(f"invalid:unknown verdict {verdict} for {ev.get('budget_name')}")
+        sys.exit(0)
+
+print(f"ok:{len(evaluations)}")
+PY
+); then
+        case "$SEQ_CHECK" in
+            ok:*)
+                check_pass "sequential_budget_gate" "evaluated ${SEQ_CHECK#ok:} sequential budget trajectories (Ville e-process)"
+                ;;
+            invalid:*)
+                check_fail "sequential_budget_gate" "sequential budget gate check failed (${SEQ_CHECK#invalid:})"
+                ;;
+            *)
+                check_fail "sequential_budget_gate" "unexpected sequential check output: $SEQ_CHECK"
+                ;;
+        esac
+    else
+        check_fail "sequential_budget_gate" "sequential budget gate evaluation failed: $SEQ_CHECK"
+    fi
+else
+    check_fail "sequential_budget_gate" "sequential gate contract or evidence file missing"
+fi
+
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'

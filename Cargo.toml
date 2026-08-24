@@ -167,6 +167,10 @@ name = "release_evidence_ledger"
 path = "examples/release_evidence_ledger.rs"
 
 [[example]]
+name = "sequential_budget_gate"
+path = "examples/sequential_budget_gate.rs"
+
+[[example]]
 name = "session_workload_bench"
 path = "examples/session_workload_bench.rs"
 
