@@ -958,7 +958,7 @@ fn extract_file_ops_from_message(
     }
 }
 
-fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
+pub(crate) fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String>) {
     let modified: HashSet<&String> = file_ops
         .edited
         .iter()

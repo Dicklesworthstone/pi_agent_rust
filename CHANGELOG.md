@@ -14,6 +14,23 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+### Added
+
+- **Host-mediated native-Responses compaction bridge** (gh
+  [#167](https://github.com/Dicklesworthstone/pi_agent_rust/issues/167)):
+  `ctx.compact(preparation, { strategy: "openai-responses-native", request })`
+  lets an extension (e.g. pi-better-compaction) compose the compact request —
+  including replaying its previously stored opaque window as `input` — while
+  the host sanitizes it (allowlisted fields only, credential-shaped keys
+  rejected, model pinned to the session's own), POSTs it to the provider's
+  sibling `…/responses/compact` endpoint under the session's credentials, and
+  returns `{ summary, firstKeptEntryId, tokensBefore, details }` with
+  `details.compactedWindow` (plus `compactResponseId`/`createdAt` when the
+  endpoint reports them). Credentials never cross into extension JS; any
+  bridge failure rejects so the plugin fails open to default compaction. The
+  round-trip runs under the dedicated long-running compact event budget
+  (gh #178).
+
 ## [v0.3.0] — 2026-08-21 — Release
 
 First published release since [v0.1.23](https://github.com/Dicklesworthstone/pi_agent_rust/releases/tag/v0.1.23).

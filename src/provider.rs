@@ -45,6 +45,30 @@ pub trait Provider: Send + Sync {
         context: &Context<'_>,
         options: &StreamOptions,
     ) -> crate::error::Result<Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>>;
+
+    /// Run the provider's *native* server-side compaction over a fully-built
+    /// request body and return the raw response JSON (gh #167).
+    ///
+    /// Only APIs with a real server-side compact endpoint implement this
+    /// (currently `openai-responses`, which POSTs the body to the sibling
+    /// `…/responses/compact` route). Credentials are resolved host-side from
+    /// `options` exactly like [`Provider::stream`]; callers must sanitize
+    /// `request_body` before handing it in (see the extension compaction
+    /// bridge in `agent.rs`). The default implementation reports the API as
+    /// unsupported so callers fail open to summary compaction.
+    async fn compact_native(
+        &self,
+        _request_body: &serde_json::Value,
+        _options: &StreamOptions,
+    ) -> crate::error::Result<serde_json::Value> {
+        Err(crate::error::Error::provider(
+            self.name().to_string(),
+            format!(
+                "native compaction is not supported by the {} API",
+                self.api()
+            ),
+        ))
+    }
 }
 
 // ============================================================================

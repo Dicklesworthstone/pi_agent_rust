@@ -9704,9 +9704,29 @@ export function rawKeyHint(key, description = "") {
 // returned Promise rejects -- pi's fail-open session_before_compact
 // handling then continues normal compaction; no placeholder summary is
 // ever fabricated.
-export async function compact(preparation, _model, _apiKey, _customInstructions, _signal) {
+// When the second argument is an options object carrying a string
+// `strategy` (gh #167: `compact(preparation, { strategy:
+// "openai-responses-native", request })`), the strategy and the
+// extension-composed request cross the bridge for host-side sanitization
+// and a host-credentialed POST to the provider's native compact endpoint.
+// A legacy Model object in that position (no `strategy` key) keeps the
+// original summary-compaction path. An AbortSignal in `options.signal` is
+// accepted but not propagated -- the host's dedicated compact event budget
+// (gh #178) bounds the round-trip instead.
+export async function compact(preparation, modelOrOptions, _apiKey, _customInstructions, _signal) {
   if (!globalThis.pi || typeof globalThis.pi.events !== "function") {
     throw new Error("compact() host bridge is unavailable in this runtime");
+  }
+  if (
+    modelOrOptions &&
+    typeof modelOrOptions === "object" &&
+    typeof modelOrOptions.strategy === "string"
+  ) {
+    return await globalThis.pi.events("compact", {
+      preparation: preparation ?? null,
+      strategy: modelOrOptions.strategy,
+      request: modelOrOptions.request ?? null,
+    });
   }
   return await globalThis.pi.events("compact", { preparation: preparation ?? null });
 }
@@ -21809,8 +21829,19 @@ function __pi_make_extension_ctx(ctx_payload) {
         // Host-side compaction bridge (gh #167 / bd-i28yz): summarizes the
         // given preparation with the SESSION's own provider, model, and
         // credentials. Rejects on malformed preparation or provider failure;
-        // no fabricated summary is ever returned.
-        compact: async (preparation) => pi.events('compact', { preparation: preparation ?? null }),
+        // no fabricated summary is ever returned. With an options object
+        // ({ strategy: 'openai-responses-native', request }) the host runs
+        // the provider's native compact endpoint instead and returns
+        // details.compactedWindow (still host-credentialed; the request is
+        // sanitized host-side and the model pinned to the session's own).
+        compact: async (preparation, options) =>
+            options && typeof options === 'object' && typeof options.strategy === 'string'
+                ? pi.events('compact', {
+                      preparation: preparation ?? null,
+                      strategy: options.strategy,
+                      request: options.request ?? null,
+                  })
+                : pi.events('compact', { preparation: preparation ?? null }),
     };
 }
 
@@ -25444,6 +25475,103 @@ mod tests {
             assert_eq!(probe["value"]["summary"], json!("bridged summary"));
             assert_eq!(probe["value"]["firstKeptEntryId"], json!("entry-9"));
             assert_eq!(probe["value"]["tokensBefore"], json!(4200));
+        });
+    }
+
+    /// gh #167: `compact(preparation, { strategy: "openai-responses-native",
+    /// request })` bridges strategy + extension-composed request to the host
+    /// compact op (still never a model/apiKey) and resolves with the bridged
+    /// native result shape.
+    #[test]
+    fn pi_coding_agent_compact_native_strategy_bridges_request() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.compactProbe = { done: false };
+                    import('@mariozechner/pi-coding-agent')
+                        .then((mod) => mod.compact(
+                            { firstKeptEntryId: 'entry-3', tokensBefore: 9000 },
+                            {
+                                strategy: 'openai-responses-native',
+                                request: {
+                                    model: 'gpt-5.2-codex',
+                                    instructions: 'compact this',
+                                    input: [{ type: 'message', role: 'user', content: [] }],
+                                },
+                            }))
+                        .then((value) => { globalThis.compactProbe.value = value; })
+                        .catch((error) => {
+                            globalThis.compactProbe.error = String((error && error.message) || error);
+                        })
+                        .finally(() => { globalThis.compactProbe.done = true; });
+                    ",
+                )
+                .await
+                .expect("invoke compact bridge");
+
+            let mut completed = false;
+            for _ in 0..32 {
+                drain_until_idle(&runtime, &clock).await;
+                let state = get_global_json(&runtime, "compactProbe").await;
+                if state.get("done").and_then(serde_json::Value::as_bool) == Some(true) {
+                    break;
+                }
+                for request in runtime.drain_hostcall_requests() {
+                    let HostcallKind::Events { op } = &request.kind else {
+                        panic!("expected events hostcall, got {:?}", request.kind);
+                    };
+                    assert_eq!(op.as_str(), "compact", "unexpected events op");
+                    assert_eq!(
+                        request.payload["strategy"],
+                        json!("openai-responses-native")
+                    );
+                    assert_eq!(request.payload["request"]["model"], json!("gpt-5.2-codex"));
+                    assert_eq!(
+                        request.payload["request"]["input"][0]["type"],
+                        json!("message")
+                    );
+                    assert_eq!(
+                        request.payload["preparation"]["firstKeptEntryId"],
+                        json!("entry-3")
+                    );
+                    // Never a credential across the bridge.
+                    assert_eq!(request.payload.get("apiKey"), None);
+                    runtime.complete_hostcall(
+                        request.call_id,
+                        HostcallOutcome::Success(json!({
+                            "summary": "[OpenAI native compaction checkpoint]",
+                            "firstKeptEntryId": "entry-3",
+                            "tokensBefore": 9000,
+                            "details": {
+                                "strategy": "openai-responses-native",
+                                "compactedWindow": [{ "type": "message", "role": "user", "content": [] }],
+                                "compactResponseId": "resp_42",
+                            },
+                        })),
+                    );
+                    completed = true;
+                }
+            }
+            assert!(completed, "compact() never issued the compact hostcall");
+
+            drain_until_idle(&runtime, &clock).await;
+            let probe = get_global_json(&runtime, "compactProbe").await;
+            assert_eq!(probe["done"], json!(true), "probe incomplete: {probe}");
+            assert_eq!(probe["error"], serde_json::Value::Null, "probe: {probe}");
+            assert_eq!(
+                probe["value"]["details"]["compactResponseId"],
+                json!("resp_42")
+            );
+            assert_eq!(
+                probe["value"]["details"]["compactedWindow"][0]["type"],
+                json!("message")
+            );
         });
     }
 

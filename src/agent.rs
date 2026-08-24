@@ -4750,6 +4750,227 @@ impl ExtensionHostActions for AgentSessionHostActions {
             Error::extension(format!("serialize extension compaction result: {err}"))
         })
     }
+
+    async fn compact_session_native(&self, preparation: Value, request: Value) -> Result<Value> {
+        // gh #167: host-mediated native-Responses compaction. The extension
+        // composes the compact request (so replay chains of previously
+        // stored windows keep working) but the host owns endpoint + auth:
+        // the request is reduced to an allowlist, credential-shaped keys are
+        // rejected loudly, the model is pinned to the session's own, and the
+        // POST happens inside the provider with the session's credentials.
+        // Every failure is an `Err` so the calling extension fails open to
+        // pi's default compaction (never a fabricated result).
+        let preparation = crate::compaction::compaction_preparation_from_value(&preparation)?;
+
+        let (provider, stream_options) = {
+            let state = self.ai_completion.lock().map_err(|_| {
+                Error::extension("extension completion host state mutex poisoned".to_string())
+            })?;
+            (Arc::clone(&state.provider), state.stream_options.clone())
+        };
+
+        if provider.api() != "openai-responses" {
+            return Err(Error::validation(format!(
+                "native compaction requires the session's provider to use the openai-responses API (current: {})",
+                provider.api()
+            )));
+        }
+
+        let sanitized = sanitize_native_compact_request(&request, provider.model_id())?;
+        let response = provider.compact_native(&sanitized, &stream_options).await?;
+
+        let (read_files, modified_files) =
+            crate::compaction::compute_file_lists(&preparation.file_ops);
+        shape_native_compact_result(
+            &response,
+            &preparation.first_kept_entry_id,
+            preparation.tokens_before,
+            read_files,
+            modified_files,
+        )
+    }
+}
+
+/// Top-level fields an extension-composed native compact request may carry
+/// across the bridge (gh #167). Everything else is dropped; credential-shaped
+/// keys are rejected loudly first (see
+/// [`sanitize_native_compact_request`]). Mirrors the optional extras
+/// pi-better-compaction copies from the previous live provider request.
+const NATIVE_COMPACT_REQUEST_ALLOWLIST: &[&str] = &[
+    "model",
+    "instructions",
+    "input",
+    "tools",
+    "parallel_tool_calls",
+    "reasoning",
+    "service_tier",
+    "prompt_cache_key",
+    "text",
+];
+
+/// Keys that suggest an attempt to smuggle credentials or auth material
+/// through the native compact bridge. Rejected with a hard error (not
+/// silently dropped) so a confused extension gets a diagnosable failure.
+const NATIVE_COMPACT_FORBIDDEN_KEYS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "authorization",
+    "auth",
+    "bearer",
+    "credentials",
+    "header",
+    "headers",
+    "key",
+    "token",
+];
+
+/// Validate and reduce an untrusted, extension-composed native compact
+/// request (gh #167): object shape enforced, credential-shaped keys rejected,
+/// `model` pinned to the session's own model id, `input` required to be an
+/// array, and only [`NATIVE_COMPACT_REQUEST_ALLOWLIST`] fields retained.
+fn sanitize_native_compact_request(request: &Value, session_model_id: &str) -> Result<Value> {
+    let Some(obj) = request.as_object() else {
+        return Err(Error::validation(
+            "native compact request must be a JSON object".to_string(),
+        ));
+    };
+
+    for key in obj.keys() {
+        let lowered = key.to_ascii_lowercase();
+        if NATIVE_COMPACT_FORBIDDEN_KEYS.contains(&lowered.as_str()) {
+            return Err(Error::validation(format!(
+                "native compact request must not carry credential material (offending key: `{key}`); the host supplies auth from the session"
+            )));
+        }
+    }
+
+    match obj.get("model") {
+        Some(Value::String(model)) if model == session_model_id => {}
+        Some(Value::String(model)) => {
+            return Err(Error::validation(format!(
+                "native compact request model `{model}` does not match the session model `{session_model_id}`; the bridge always compacts with the session's own model"
+            )));
+        }
+        _ => {
+            return Err(Error::validation(
+                "native compact request must carry a string `model` matching the session model"
+                    .to_string(),
+            ));
+        }
+    }
+
+    if !obj.get("input").is_some_and(Value::is_array) {
+        return Err(Error::validation(
+            "native compact request must carry an `input` array".to_string(),
+        ));
+    }
+
+    if let Some(instructions) = obj.get("instructions")
+        && !(instructions.is_string() || instructions.is_null())
+    {
+        return Err(Error::validation(
+            "native compact request `instructions` must be a string when present".to_string(),
+        ));
+    }
+
+    let mut sanitized = serde_json::Map::new();
+    let mut dropped: Vec<&str> = Vec::new();
+    for (key, value) in obj {
+        if NATIVE_COMPACT_REQUEST_ALLOWLIST.contains(&key.as_str()) {
+            if !value.is_null() {
+                sanitized.insert(key.clone(), value.clone());
+            }
+        } else {
+            dropped.push(key.as_str());
+        }
+    }
+    if !dropped.is_empty() {
+        tracing::debug!(
+            dropped = ?dropped,
+            "native compact request: dropped non-allowlisted fields"
+        );
+    }
+    Ok(Value::Object(sanitized))
+}
+
+/// Fallback summary recorded when the native compact output carries no
+/// assistant `output_text` (matches pi-better-compaction's own fallback).
+const NATIVE_COMPACT_FALLBACK_SUMMARY: &str = "[OpenAI native compaction checkpoint]";
+
+/// Shape the raw native compact response into the
+/// `session_before_compact`-compatible result (gh #167): `output` is
+/// required and becomes `details.compactedWindow` verbatim; assistant
+/// `output_text` (when present) becomes the human-readable summary.
+fn shape_native_compact_result(
+    response: &Value,
+    first_kept_entry_id: &str,
+    tokens_before: u64,
+    read_files: Vec<String>,
+    modified_files: Vec<String>,
+) -> Result<Value> {
+    let Some(output) = response.get("output").and_then(Value::as_array) else {
+        return Err(Error::provider(
+            "openai-responses".to_string(),
+            "native compact response is missing the `output` array".to_string(),
+        ));
+    };
+
+    let mut summary = String::new();
+    for item in output {
+        if item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("assistant")
+            && let Some(content) = item.get("content").and_then(Value::as_array)
+        {
+            for part in content {
+                if part.get("type").and_then(Value::as_str) == Some("output_text")
+                    && let Some(text) = part.get("text").and_then(Value::as_str)
+                {
+                    if !summary.is_empty() {
+                        summary.push('\n');
+                    }
+                    summary.push_str(text);
+                }
+            }
+        }
+    }
+    if summary.trim().is_empty() {
+        summary = NATIVE_COMPACT_FALLBACK_SUMMARY.to_string();
+    }
+
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "strategy".to_string(),
+        Value::String("openai-responses-native".to_string()),
+    );
+    details.insert("compactedWindow".to_string(), Value::Array(output.clone()));
+    if let Some(id) = response.get("id").and_then(Value::as_str)
+        && !id.is_empty()
+    {
+        details.insert(
+            "compactResponseId".to_string(),
+            Value::String(id.to_string()),
+        );
+    }
+    if let Some(created_at) = response.get("created_at")
+        && !created_at.is_null()
+    {
+        details.insert("createdAt".to_string(), created_at.clone());
+    }
+    details.insert(
+        "readFiles".to_string(),
+        Value::Array(read_files.into_iter().map(Value::String).collect()),
+    );
+    details.insert(
+        "modifiedFiles".to_string(),
+        Value::Array(modified_files.into_iter().map(Value::String).collect()),
+    );
+
+    Ok(serde_json::json!({
+        "summary": summary,
+        "firstKeptEntryId": first_kept_entry_id,
+        "tokensBefore": tokens_before,
+        "details": Value::Object(details),
+    }))
 }
 
 fn pi_ai_model_entry_value(entry: &ModelEntry) -> Value {
@@ -6603,6 +6824,202 @@ mod extensions_integration_tests {
                     .contains("compaction preparation must be a JSON object"),
                 "unexpected error: {err}"
             );
+        });
+    }
+
+    /// gh #167: the native compact request sanitizer pins the model, demands
+    /// an input array, rejects credential-shaped keys loudly, and reduces the
+    /// object to the allowlist.
+    #[test]
+    fn native_compact_request_sanitizer_enforces_contract() {
+        // Credential-shaped keys: hard error naming the key.
+        for key in ["apiKey", "api_key", "Authorization", "headers", "token"] {
+            let request = json!({
+                "model": "m-1",
+                "input": [],
+                (*key): "secret",
+            });
+            let err = sanitize_native_compact_request(&request, "m-1")
+                .expect_err("credential key must be rejected");
+            assert!(
+                err.to_string().contains("credential material"),
+                "unexpected error for {key}: {err}"
+            );
+        }
+
+        // Model must match the session's model.
+        let err = sanitize_native_compact_request(&json!({ "model": "other", "input": [] }), "m-1")
+            .expect_err("model mismatch must be rejected");
+        assert!(err.to_string().contains("does not match the session model"));
+        let err = sanitize_native_compact_request(&json!({ "input": [] }), "m-1")
+            .expect_err("missing model must be rejected");
+        assert!(err.to_string().contains("string `model`"));
+
+        // Input array required.
+        let err = sanitize_native_compact_request(&json!({ "model": "m-1" }), "m-1")
+            .expect_err("missing input must be rejected");
+        assert!(err.to_string().contains("`input` array"));
+
+        // Non-object rejected.
+        assert!(sanitize_native_compact_request(&json!("nope"), "m-1").is_err());
+
+        // Allowlisted extras survive; unknown benign fields are dropped.
+        let sanitized = sanitize_native_compact_request(
+            &json!({
+                "model": "m-1",
+                "instructions": "compact",
+                "input": [{ "type": "message" }],
+                "tools": [],
+                "parallel_tool_calls": true,
+                "reasoning": { "effort": "low" },
+                "service_tier": "default",
+                "prompt_cache_key": "cache-1",
+                "text": { "verbosity": "low" },
+                "stream": true,
+                "store": false,
+                "extension_junk": 42,
+            }),
+            "m-1",
+        )
+        .expect("valid request sanitizes");
+        let sanitized = sanitized.as_object().expect("object");
+        assert_eq!(sanitized.get("model"), Some(&json!("m-1")));
+        assert_eq!(sanitized.get("prompt_cache_key"), Some(&json!("cache-1")));
+        assert!(sanitized.contains_key("reasoning"));
+        assert!(!sanitized.contains_key("stream"), "stream must be dropped");
+        assert!(!sanitized.contains_key("store"), "store must be dropped");
+        assert!(!sanitized.contains_key("extension_junk"));
+    }
+
+    /// gh #167: native compact response shaping — `output` verbatim as
+    /// `details.compactedWindow`, assistant `output_text` as the summary
+    /// (checkpoint fallback otherwise), id/created_at echoed when present.
+    #[test]
+    fn native_compact_result_shaping_round_trips_window() {
+        let response = json!({
+            "id": "resp_9",
+            "created_at": 1_723_000_000,
+            "output": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "opaque item" }] },
+                { "type": "message", "role": "assistant", "status": "completed",
+                  "content": [{ "type": "output_text", "text": "native summary" }] }
+            ]
+        });
+        let shaped = shape_native_compact_result(
+            &response,
+            "entry-7",
+            120_000,
+            vec!["src/lib.rs".to_string()],
+            vec!["src/agent.rs".to_string()],
+        )
+        .expect("well-formed response shapes");
+        assert_eq!(shaped["summary"], json!("native summary"));
+        assert_eq!(shaped["firstKeptEntryId"], json!("entry-7"));
+        assert_eq!(shaped["tokensBefore"], json!(120_000));
+        assert_eq!(
+            shaped["details"]["strategy"],
+            json!("openai-responses-native")
+        );
+        assert_eq!(
+            shaped["details"]["compactedWindow"],
+            response["output"],
+            "window must be echoed verbatim"
+        );
+        assert_eq!(shaped["details"]["compactResponseId"], json!("resp_9"));
+        assert_eq!(shaped["details"]["createdAt"], json!(1_723_000_000));
+        assert_eq!(shaped["details"]["readFiles"], json!(["src/lib.rs"]));
+        assert_eq!(shaped["details"]["modifiedFiles"], json!(["src/agent.rs"]));
+
+        // No assistant output_text -> checkpoint fallback summary.
+        let opaque = json!({
+            "output": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "window 1" }] }
+            ]
+        });
+        let shaped = shape_native_compact_result(&opaque, "entry-1", 10, vec![], vec![])
+            .expect("opaque response shapes");
+        assert_eq!(shaped["summary"], json!(NATIVE_COMPACT_FALLBACK_SUMMARY));
+        assert!(shaped["details"].get("compactResponseId").is_none());
+
+        // Missing output -> Err (plugin fails open).
+        let err = shape_native_compact_result(&json!({ "id": "x" }), "entry-1", 10, vec![], vec![])
+            .expect_err("missing output must error");
+        assert!(err.to_string().contains("`output` array"));
+    }
+
+    /// gh #167: the host action refuses native compaction when the session's
+    /// provider is not on the openai-responses API, before any sanitization
+    /// or network activity.
+    #[test]
+    fn agent_host_actions_compact_session_native_requires_responses_api() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            let provider = Arc::new(PiAiCaptureProvider {
+                calls: Arc::clone(&calls),
+            });
+            let actions = AgentSessionHostActions {
+                session,
+                injected: Arc::new(StdMutex::new(ExtensionInjectedQueue::default())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_turn_active: Arc::new(AtomicBool::new(false)),
+                pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
+                ai_completion: Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
+                    provider,
+                    stream_options: StreamOptions::default(),
+                    models: Vec::new(),
+                })),
+            };
+
+            let preparation = json!({
+                "firstKeptEntryId": "entry-9",
+                "messagesToSummarize": [],
+                "turnPrefixMessages": [],
+                "isSplitTurn": false,
+                "tokensBefore": 4200,
+                "previousSummary": null,
+                "fileOps": { "read": [], "written": [], "edited": [] },
+                "settings": {
+                    "enabled": true,
+                    "contextWindowTokens": 128_000,
+                    "reserveTokens": 10_240,
+                    "keepRecentTokens": 12_800
+                }
+            });
+            let request = json!({ "model": "capture-model", "input": [] });
+
+            let err = actions
+                .compact_session_native(preparation.clone(), request)
+                .await
+                .expect_err("non-responses API must be refused");
+            assert!(
+                err.to_string().contains("openai-responses"),
+                "unexpected error: {err}"
+            );
+
+            // Malformed preparation is still rejected first.
+            let err = actions
+                .compact_session_native(json!({ "firstKeptEntryId": "" }), json!({}))
+                .await
+                .expect_err("malformed preparation must be rejected");
+            assert!(
+                err.to_string()
+                    .contains("`firstKeptEntryId` must be a non-empty string"),
+                "unexpected error: {err}"
+            );
+
+            // The capture provider was never streamed/POSTed.
+            let captured_len = match calls.lock() {
+                Ok(guard) => guard.len(),
+                Err(poisoned) => poisoned.into_inner().len(),
+            };
+            assert_eq!(captured_len, 0, "no provider call may happen on refusal");
         });
     }
 

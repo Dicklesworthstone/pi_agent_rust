@@ -261,6 +261,131 @@ fn authorization_override(
         })
 }
 
+/// Derive the sibling native-compact endpoint from a Responses base URL
+/// (gh #167): `…/responses` → `…/responses/compact`. Returns `None` when the
+/// base URL does not end in `/responses` (a custom shape we cannot safely
+/// extend), so callers fail open instead of POSTing to a guessed route.
+fn derive_compact_url(base_url: &str) -> Option<String> {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/responses") {
+        Some(format!("{base}/compact"))
+    } else {
+        None
+    }
+}
+
+impl OpenAIResponsesProvider {
+    /// POST a sanitized, extension-composed compact request to the native
+    /// `…/responses/compact` endpoint and return the raw response JSON
+    /// (gh #167). Auth mirrors [`Provider::stream`]: `options.api_key` /
+    /// `OPENAI_API_KEY` (keyless-local providers skip auth entirely), plus
+    /// codex-mode and compat headers. Credentials never appear in the
+    /// returned value.
+    async fn compact_native_impl(
+        &self,
+        request_body: &serde_json::Value,
+        options: &StreamOptions,
+    ) -> Result<serde_json::Value> {
+        let Some(url) = derive_compact_url(&self.base_url) else {
+            return Err(Error::provider(
+                self.name(),
+                format!(
+                    "cannot derive a /responses/compact endpoint from base URL {} — native compaction unavailable",
+                    self.base_url
+                ),
+            ));
+        };
+
+        // Auth resolution: identical policy to `stream()` above.
+        let authorization_header_value = authorization_override(options, self.compat.as_ref());
+        let auth_value = if authorization_header_value.is_some() || !self.auth_header {
+            None
+        } else {
+            let resolved = options
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+            match resolved {
+                Some(key) => Some(key),
+                None if crate::provider_metadata::provider_is_keyless_local(self.name()) => None,
+                None => {
+                    return Err(Error::provider(
+                        self.name(),
+                        "Missing API key for provider. Configure credentials with /login <provider> or set the provider's API key env var.",
+                    ));
+                }
+            }
+        };
+
+        let mut request = self
+            .client
+            .post(&url)
+            .header("Accept", "application/json");
+        if let Some(ref auth) = auth_value {
+            request = request.header("Authorization", format!("Bearer {auth}"));
+        }
+        if self.codex_mode {
+            let codex_bearer = authorization_header_value
+                .as_deref()
+                .and_then(bearer_token_from_authorization_header)
+                .or_else(|| auth_value.clone())
+                .ok_or_else(|| {
+                    Error::provider(
+                        self.name(),
+                        "OpenAI Codex mode requires a Bearer token. Provide one via /login openai-codex or an Authorization: Bearer <token> header.",
+                    )
+                })?;
+            let account_id = extract_chatgpt_account_id(&codex_bearer).ok_or_else(|| {
+                Error::provider(
+                    self.name(),
+                    "Invalid OpenAI Codex OAuth token (missing chatgpt_account_id claim). Run /login openai-codex again.",
+                )
+            })?;
+            request = request
+                .header("chatgpt-account-id", account_id)
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("User-Agent", "pi_agent_rust");
+            if let Some(session_id) = &options.session_id {
+                request = request.header("session_id", session_id);
+            }
+        }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
+        }
+        request = super::apply_headers_ignoring_blank_auth_overrides(
+            request,
+            &options.headers,
+            &["authorization"],
+        );
+
+        let request = request.json(request_body)?;
+        let response = Box::pin(request.send()).await?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read body: {e}>"));
+        if !(200..300).contains(&status) {
+            return Err(Error::provider(
+                self.name(),
+                format!("OpenAI compact endpoint error (HTTP {status}): {body}"),
+            ));
+        }
+        serde_json::from_str(&body).map_err(|err| {
+            Error::api(format!(
+                "OpenAI compact endpoint returned non-JSON (HTTP {status}): {err}"
+            ))
+        })
+    }
+}
+
 #[async_trait]
 impl Provider for OpenAIResponsesProvider {
     fn name(&self) -> &str {
@@ -273,6 +398,14 @@ impl Provider for OpenAIResponsesProvider {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    async fn compact_native(
+        &self,
+        request_body: &serde_json::Value,
+        options: &StreamOptions,
+    ) -> Result<serde_json::Value> {
+        self.compact_native_impl(request_body, options).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3738,6 +3871,113 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    }
+
+    /// gh #167: the compact endpoint is derived only from a `…/responses`
+    /// base URL; anything else refuses rather than guessing a route.
+    #[test]
+    fn derive_compact_url_requires_responses_suffix() {
+        assert_eq!(
+            derive_compact_url("https://api.openai.com/v1/responses"),
+            Some("https://api.openai.com/v1/responses/compact".to_string())
+        );
+        assert_eq!(
+            derive_compact_url("http://localhost:8080/v1/responses/"),
+            Some("http://localhost:8080/v1/responses/compact".to_string())
+        );
+        assert_eq!(derive_compact_url("https://api.openai.com/v1"), None);
+        assert_eq!(
+            derive_compact_url("https://chatgpt.com/backend-api/codex"),
+            None
+        );
+    }
+
+    /// gh #167: `compact_native` POSTs the sanitized body verbatim to the
+    /// sibling compact endpoint with the session's Bearer auth, and returns
+    /// the raw response JSON.
+    #[test]
+    fn compact_native_posts_body_with_session_auth() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let response_body = r#"{"id":"resp_1","created_at":123,"output":[{"type":"message","role":"user","content":[{"type":"input_text","text":"window"}]}]}"#;
+            let (base_url, rx) = spawn_test_server(200, "application/json", response_body);
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_base_url(format!("{base_url}/v1/responses"));
+            let options = StreamOptions {
+                api_key: Some("sk-compact-test".to_string()),
+                ..Default::default()
+            };
+            let body = serde_json::json!({
+                "model": "gpt-test",
+                "instructions": "compact this",
+                "input": [{ "type": "message", "role": "user", "content": [] }],
+            });
+
+            let result = provider
+                .compact_native(&body, &options)
+                .await
+                .expect("compact POST succeeds");
+            assert_eq!(result["id"], "resp_1");
+            assert_eq!(result["output"][0]["content"][0]["text"], "window");
+
+            let captured = rx.recv().expect("captured request");
+            assert_eq!(
+                captured.headers.get("authorization").map(String::as_str),
+                Some("Bearer sk-compact-test")
+            );
+            assert_eq!(
+                captured.headers.get("accept").map(String::as_str),
+                Some("application/json")
+            );
+            let sent: Value = serde_json::from_str(&captured.body).expect("body json");
+            assert_eq!(sent, body, "body must be sent verbatim");
+        });
+    }
+
+    /// gh #167: an underivable base URL refuses before any network activity,
+    /// and a non-2xx compact response surfaces as a provider error.
+    #[test]
+    fn compact_native_refuses_bad_base_url_and_surfaces_http_errors() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_base_url("http://127.0.0.1:9/custom-route");
+            let err = provider
+                .compact_native(
+                    &serde_json::json!({ "model": "gpt-test", "input": [] }),
+                    &StreamOptions {
+                        api_key: Some("sk-x".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("underivable base URL must refuse");
+            assert!(
+                err.to_string().contains("cannot derive"),
+                "unexpected error: {err}"
+            );
+
+            let (base_url, _rx) = spawn_test_server(500, "application/json", r#"{"error":"boom"}"#);
+            let provider = OpenAIResponsesProvider::new("gpt-test")
+                .with_base_url(format!("{base_url}/v1/responses"));
+            let err = provider
+                .compact_native(
+                    &serde_json::json!({ "model": "gpt-test", "input": [] }),
+                    &StreamOptions {
+                        api_key: Some("sk-x".to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("HTTP 500 must surface");
+            let message = err.to_string();
+            assert!(message.contains("HTTP 500"), "unexpected error: {message}");
+            assert!(message.contains("boom"), "unexpected error: {message}");
+        });
     }
 
     #[test]

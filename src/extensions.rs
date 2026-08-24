@@ -900,6 +900,23 @@ pub trait ExtensionHostActions: Send + Sync {
             "@mariozechner/pi-coding-agent compact host bridge is not configured".to_string(),
         ))
     }
+
+    /// Host-mediated *native* compaction bridge (gh #167):
+    /// `ctx.compact(preparation, { strategy: "openai-responses-native",
+    /// request })`. The host sanitizes the extension-composed `request`
+    /// (allowlisted fields only, credential-shaped keys rejected, model
+    /// pinned to the session's own), POSTs it to the session provider's
+    /// native compact endpoint under the session's credentials, and returns
+    /// `{ summary, firstKeptEntryId, tokensBefore, details }` where
+    /// `details.compactedWindow` carries the opaque response `output` items.
+    /// Credentials never cross into JS; any failure must surface as `Err`
+    /// so the calling extension fails open to summary compaction.
+    async fn compact_session_native(&self, _preparation: Value, _request: Value) -> Result<Value> {
+        Err(Error::extension(
+            "@mariozechner/pi-coding-agent native compact host bridge is not configured"
+                .to_string(),
+        ))
+    }
 }
 
 mod compatibility;
@@ -18469,11 +18486,34 @@ async fn dispatch_hostcall_events_ref(
             };
 
             let preparation = payload.get("preparation").cloned().unwrap_or(Value::Null);
-            match actions.compact_session(preparation).await {
-                Ok(value) => HostcallOutcome::Success(value),
-                Err(err) => HostcallOutcome::Error {
-                    code: "provider".to_string(),
-                    message: err.to_string(),
+            // Optional native strategy (gh #167): `strategy` +
+            // extension-composed `request` route to the host-mediated
+            // native compact bridge; absent/null keeps the summary bridge.
+            // Unknown strategies error loudly so callers fail open instead
+            // of silently getting the wrong compaction kind.
+            match payload.get("strategy").and_then(Value::as_str) {
+                None => match actions.compact_session(preparation).await {
+                    Ok(value) => HostcallOutcome::Success(value),
+                    Err(err) => HostcallOutcome::Error {
+                        code: "provider".to_string(),
+                        message: err.to_string(),
+                    },
+                },
+                Some("openai-responses-native") => {
+                    let request = payload.get("request").cloned().unwrap_or(Value::Null);
+                    match actions.compact_session_native(preparation, request).await {
+                        Ok(value) => HostcallOutcome::Success(value),
+                        Err(err) => HostcallOutcome::Error {
+                            code: "provider".to_string(),
+                            message: err.to_string(),
+                        },
+                    }
+                }
+                Some(other) => HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: format!(
+                        "compact: unsupported strategy `{other}` (supported: \"openai-responses-native\")"
+                    ),
                 },
             }
         }
