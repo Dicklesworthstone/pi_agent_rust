@@ -873,7 +873,7 @@ impl PiApp {
             git_dirty: false,
             context_pct: 0,
             cost_usd: total_cost,
-            tokens_used: (input + output_tokens) as u64,
+            tokens_used: input.saturating_add(output_tokens),
             subagent_count: 0,
             session_name: self.session_id.clone(),
             timestamp_str: String::new(),
