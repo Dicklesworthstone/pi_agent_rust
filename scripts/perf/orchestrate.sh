@@ -4318,7 +4318,7 @@ else
 fi
 
 staging_exit=0
-if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH"; then
+if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH" --artifact-readiness-only; then
   log_ok "Final budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
 else
   staging_exit=$?
@@ -4377,8 +4377,17 @@ fi
 
 post_generation_status="pass"
 post_generation_result_exit=0
-if [[ "$post_generation_exit" -ne 0 || "$staging_exit" -ne 0 || "$ARTIFACT_STAGING_STATUS" == "blocked" ]]; then
-  post_generation_result_exit=$((post_generation_exit != 0 ? post_generation_exit : staging_exit))
+if [[ "$post_generation_exit" -ne 0 \
+  || "$post_generation_budget_exit" -ne 0 \
+  || "$staging_exit" -ne 0 \
+  || "$ARTIFACT_STAGING_STATUS" == "blocked" ]]; then
+  if [[ "$post_generation_exit" -ne 0 ]]; then
+    post_generation_result_exit="$post_generation_exit"
+  elif [[ "$post_generation_budget_exit" -ne 0 ]]; then
+    post_generation_result_exit="$post_generation_budget_exit"
+  else
+    post_generation_result_exit="$staging_exit"
+  fi
   if [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
     post_generation_status="fail"
     suite_fail=$((suite_fail + 1))

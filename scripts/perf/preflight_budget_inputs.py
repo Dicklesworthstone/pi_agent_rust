@@ -1502,6 +1502,22 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     expected_correlation_id = args.expected_correlation_id or os.environ.get(
         "PI_PERF_EXPECTED_CORRELATION_ID"
     )
+    if args.artifact_readiness_only and not expected_correlation_id:
+        return (
+            2,
+            {
+                "schema": SCHEMA,
+                "generated_at": iso_now(),
+                "repo_root": str(repo_root),
+                "cargo_target_dir": str(target_dir),
+                "readiness_scope": "artifacts_only",
+                "report_blockers_ignored_for_readiness": False,
+                "readiness": "blocked",
+                "configuration_error": (
+                    "artifact_readiness_only_requires_expected_correlation_id"
+                ),
+            },
+        )
     cache_context = EvidenceCacheContext(
         repo_root=repo_root,
         target_dir=target_dir,
@@ -1605,7 +1621,9 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     dedup_suggestions = list(dict.fromkeys(suggestions))
     dedup_expected = list(dict.fromkeys(expected_outputs))
-    ready = not missing and not stale and not report_blockers
+    artifact_readiness_only = args.artifact_readiness_only
+    report_blockers_ignored_for_readiness = artifact_readiness_only and bool(report_blockers)
+    ready = not missing and not stale and (artifact_readiness_only or not report_blockers)
     cache_status.update(
         {
             "expected_git_commit": cache_context.git_commit,
@@ -1635,6 +1653,10 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "evidence_cache": cache_status,
         "rch": rch_status(args.skip_rch_check),
         "current_report": report,
+        "readiness_scope": (
+            "artifacts_only" if artifact_readiness_only else "artifacts_and_checked_in_report"
+        ),
+        "report_blockers_ignored_for_readiness": report_blockers_ignored_for_readiness,
         "readiness": "ready" if ready else "blocked",
         "missing_budget_artifacts": missing,
         "stale_artifacts": stale,
@@ -1700,6 +1722,7 @@ def run_self_test() -> int:
         cache_profile: str = "perf",
         cache_ttl_hours: float = 24.0,
         expected_correlation_id: str | None = None,
+        artifact_readiness_only: bool = False,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             repo_root=str(root),
@@ -1711,6 +1734,7 @@ def run_self_test() -> int:
             cache_git_commit=cache_git_commit,
             expected_correlation_id=expected_correlation_id,
             skip_rch_check=True,
+            artifact_readiness_only=artifact_readiness_only,
         )
 
     def write_cache_index(
@@ -2151,6 +2175,34 @@ def run_self_test() -> int:
     assert "budget_summary.no_data=1" in aggregate_payload["report_blockers"], (
         aggregate_payload
     )
+    unbound_artifact_only_code, unbound_artifact_only_payload = build_report(
+        build_args(aggregate_blocked_root, artifact_readiness_only=True)
+    )
+    assert unbound_artifact_only_code == 2, unbound_artifact_only_payload
+    assert unbound_artifact_only_payload["readiness"] == "blocked", (
+        unbound_artifact_only_payload
+    )
+    assert unbound_artifact_only_payload["configuration_error"] == (
+        "artifact_readiness_only_requires_expected_correlation_id"
+    ), unbound_artifact_only_payload
+    artifact_only_code, artifact_only_payload = build_report(
+        build_args(
+            aggregate_blocked_root,
+            expected_correlation_id="fixture-run",
+            artifact_readiness_only=True,
+        )
+    )
+    assert artifact_only_code == 0, artifact_only_payload
+    assert artifact_only_payload["readiness"] == "ready", artifact_only_payload
+    assert artifact_only_payload["readiness_scope"] == "artifacts_only", (
+        artifact_only_payload
+    )
+    assert artifact_only_payload["report_blockers_ignored_for_readiness"] is True, (
+        artifact_only_payload
+    )
+    assert artifact_only_payload["report_blockers"] == aggregate_payload["report_blockers"], (
+        artifact_only_payload
+    )
 
     blocked_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-blocked-"))
     write_fixture(blocked_root, include_policy=False)
@@ -2165,6 +2217,17 @@ def run_self_test() -> int:
         item["bead"] == EXTENSION_BLOCKER_BEAD
         for item in blocked_payload["recognized_blockers"]
     ), blocked_payload
+    blocked_artifact_only_code, blocked_artifact_only_payload = build_report(
+        build_args(
+            blocked_root,
+            expected_correlation_id="fixture-run",
+            artifact_readiness_only=True,
+        )
+    )
+    assert blocked_artifact_only_code == 1, blocked_artifact_only_payload
+    assert blocked_artifact_only_payload["readiness"] == "blocked", (
+        blocked_artifact_only_payload
+    )
     extension_commands = [
         command
         for item in blocked_payload["missing_budget_artifacts"]
@@ -2425,6 +2488,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--skip-rch-check",
         action="store_true",
         help="Do not run rch check --quiet; useful in hermetic self-tests.",
+    )
+    parser.add_argument(
+        "--artifact-readiness-only",
+        action="store_true",
+        help=(
+            "Exclude checked-in budget_summary blockers from readiness after a separate "
+            "authoritative current-run budget evaluation; blockers remain reported."
+        ),
     )
     parser.add_argument(
         "--host-fingerprint",

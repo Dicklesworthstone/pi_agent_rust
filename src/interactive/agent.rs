@@ -464,10 +464,128 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
     }
 }
 
+/// Strategy used to derive the head of a TUI tool card from its invocation.
+///
+/// This is the renderer registry promised by bd-cv653.9.2. Keeping the
+/// registry separate from the rendering logic makes missing tool coverage a
+/// testable condition instead of silently falling through to a generic card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolInvocationRenderer {
+    Field(&'static str),
+    Search {
+        pattern: &'static str,
+        scope: &'static str,
+    },
+    Action {
+        action: &'static str,
+        context: &'static [&'static str],
+        default_action: Option<&'static str>,
+    },
+    Questions,
+    Subagent,
+    Mcp,
+}
+
+/// Resolve every native agent-facing tool to its card renderer. Mounted MCP
+/// tools form a dynamic namespace and share one renderer; extension-defined
+/// tools retain the extension/custom-renderer fallback.
+fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
+    use ToolInvocationRenderer::{Action, Field, Mcp, Questions, Search, Subagent};
+
+    if tool_name.starts_with("mcp__") {
+        return Some(Mcp);
+    }
+
+    Some(match tool_name {
+        "bash" => Field("command"),
+        "read" | "write" | "edit" | "hashline_edit" | "ls" | "inspect_image" => Field("path"),
+        "grep" | "find" | "ast_grep" => Search {
+            pattern: "pattern",
+            scope: "path",
+        },
+        "eval" => Field("code"),
+        "web_search" | "recall" => Field("query"),
+        "generate_image" => Field("prompt"),
+        "tts" => Field("text"),
+        "retain" => Field("content"),
+        "reflect" => Field("question"),
+        "learn" => Field("lesson"),
+        "submit_plan" => Field("plan"),
+        "jobs" => Action {
+            action: "action",
+            context: &["jobId"],
+            default_action: None,
+        },
+        "hub" => Action {
+            action: "op",
+            context: &["name", "application"],
+            default_action: None,
+        },
+        "security_scan" => Action {
+            action: "op",
+            context: &["sarifOut", "fingerprint", "baseline"],
+            default_action: None,
+        },
+        "github" => Action {
+            action: "op",
+            context: &["repo", "number", "query", "run_id"],
+            default_action: None,
+        },
+        "ast_edit" => Action {
+            action: "action",
+            context: &["path", "proposalId"],
+            default_action: Some("stage"),
+        },
+        "lsp" => Action {
+            action: "action",
+            context: &["file", "symbol", "query", "method"],
+            default_action: None,
+        },
+        "debug" => Action {
+            action: "action",
+            context: &["program", "file", "expression", "command"],
+            default_action: None,
+        },
+        "computer" => Action {
+            action: "action",
+            context: &["output_path", "window_id", "display_id", "key"],
+            default_action: None,
+        },
+        "browser" => Action {
+            action: "action",
+            context: &["url", "selector", "tab", "key", "output_path"],
+            default_action: None,
+        },
+        "memory_edit" => Action {
+            action: "op",
+            context: &["id"],
+            default_action: None,
+        },
+        "manage_skill" => Action {
+            action: "op",
+            context: &["name"],
+            default_action: None,
+        },
+        "todo" => Action {
+            action: "op",
+            context: &["task", "phase"],
+            default_action: None,
+        },
+        "xdev" => Action {
+            action: "action",
+            context: &["name"],
+            default_action: None,
+        },
+        "ask" => Questions,
+        "subagent" => Subagent,
+        _ => return None,
+    })
+}
+
 /// Compact, single-line description of what a tool invocation will do,
-/// derived from its arguments (the bash command line, the file path, the
-/// search pattern, ...). Returns `None` for tools without an obvious
-/// one-line summary.
+/// derived through the per-tool renderer registry (the bash command line,
+/// file path, operation and target, first question, ...). A registered
+/// renderer may still return `None` for malformed/incomplete arguments.
 /// LOAD-BEARING VISIBILITY: `pub(crate)` is required by the ftui card
 /// framework (interactive_ftui re-exports and calls this from
 /// crate::interactive; bd-cv653.9.2). Sweeps that demote this to
@@ -494,18 +612,76 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
         out
     }
 
+    fn scalar_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+        let value = args.get(key)?;
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Number(number) => Some(number.to_string()),
+            serde_json::Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        }
+    }
+
+    fn action_summary(
+        args: &serde_json::Value,
+        action: &str,
+        context: &[&str],
+        default_action: Option<&str>,
+        max: usize,
+    ) -> Option<String> {
+        let action = str_arg(args, action).or(default_action)?;
+        let detail = context.iter().find_map(|key| scalar_arg(args, key));
+        Some(clip(
+            &detail.map_or_else(
+                || action.to_string(),
+                |detail| format!("{action} · {detail}"),
+            ),
+            max,
+        ))
+    }
+
     const MAX: usize = 96;
-    let summary = match tool_name {
-        "bash" => clip(str_arg(args, "command")?, MAX),
-        "read" | "write" | "edit" | "hashline_edit" | "ls" => clip(str_arg(args, "path")?, MAX),
-        "grep" | "find" => {
-            let pattern = str_arg(args, "pattern")?;
-            match str_arg(args, "path") {
-                Some(path) if !path.is_empty() => clip(&format!("{pattern} in {path}"), MAX),
+    let summary = match tool_invocation_renderer(tool_name)? {
+        ToolInvocationRenderer::Field(field) => clip(str_arg(args, field)?, MAX),
+        ToolInvocationRenderer::Search { pattern, scope } => {
+            let pattern = str_arg(args, pattern)?;
+            match str_arg(args, scope) {
+                Some(scope) if !scope.is_empty() => clip(&format!("{pattern} in {scope}"), MAX),
                 _ => clip(pattern, MAX),
             }
         }
-        _ => return None,
+        ToolInvocationRenderer::Action {
+            action,
+            context,
+            default_action,
+        } => action_summary(args, action, context, default_action, MAX)?,
+        ToolInvocationRenderer::Questions => {
+            let question = args
+                .get("questions")?
+                .as_array()?
+                .first()?
+                .get("question")?
+                .as_str()?;
+            clip(question, MAX)
+        }
+        ToolInvocationRenderer::Subagent => {
+            if let Some(task) = str_arg(args, "task") {
+                match str_arg(args, "agent") {
+                    Some(agent) => clip(&format!("{agent}: {task}"), MAX),
+                    None => clip(task, MAX),
+                }
+            } else if let Some(tasks) = args.get("tasks").and_then(serde_json::Value::as_array) {
+                format!("{} parallel tasks", tasks.len())
+            } else if let Some(chain) = args.get("chain").and_then(serde_json::Value::as_array) {
+                format!("{} chained tasks", chain.len())
+            } else {
+                return None;
+            }
+        }
+        ToolInvocationRenderer::Mcp => {
+            let mounted = tool_name.strip_prefix("mcp__")?;
+            clip(&format!("MCP {}", mounted.replace("__", " · ")), MAX)
+        }
     };
     if summary.is_empty() {
         None
@@ -3768,13 +3944,67 @@ mod stream_delta_batcher_tests {
     }
 }
 
-/// Coverage rule (bd-cv653.9.2 renderer registry): every core builtin that
-/// carries a derivable one-line summary must produce one, and tools without
-/// one stay on the generic fallback card. Also pins the hostile-input
-/// clipping contract (first line only, control characters dropped).
+/// Coverage rule (bd-cv653.9.2 renderer registry): every native agent-facing
+/// tool has an explicit renderer entry. Only extension-defined tools use the
+/// generic/custom-renderer fallback. These tests also pin representative
+/// argument shaping and hostile-input clipping.
 #[cfg(test)]
 mod tool_invocation_summary_coverage {
-    use super::tool_invocation_summary;
+    use super::{tool_invocation_renderer, tool_invocation_summary};
+
+    #[test]
+    fn every_native_tool_has_a_registered_card_renderer() {
+        let native_tools = [
+            "read",
+            "bash",
+            "edit",
+            "write",
+            "grep",
+            "find",
+            "ls",
+            "hashline_edit",
+            "jobs",
+            "hub",
+            "security_scan",
+            "web_search",
+            "eval",
+            "github",
+            "ast_grep",
+            "ast_edit",
+            "lsp",
+            "debug",
+            "inspect_image",
+            "generate_image",
+            "tts",
+            "computer",
+            "browser",
+            "subagent",
+            "retain",
+            "recall",
+            "reflect",
+            "memory_edit",
+            "learn",
+            "manage_skill",
+            "ask",
+            "todo",
+            "submit_plan",
+            "xdev",
+        ];
+        for name in native_tools {
+            assert!(
+                tool_invocation_renderer(name).is_some(),
+                "{name} must not use the generic card fallback"
+            );
+        }
+        assert!(
+            tool_invocation_renderer("mcp__docs__search").is_some(),
+            "the dynamic MCP namespace needs a renderer"
+        );
+        assert!(
+            tool_invocation_renderer("extension_owned_tool").is_none(),
+            "extension tools retain their custom/generic renderer bridge"
+        );
+    }
 
     #[test]
     fn path_tools_summarize_the_target() {
@@ -3828,12 +4058,41 @@ mod tool_invocation_summary_coverage {
     }
 
     #[test]
-    fn tools_without_derivable_summary_stay_none() {
+    fn newer_tool_families_render_meaningful_heads() {
+        assert_eq!(
+            tool_invocation_summary(
+                "ask",
+                &serde_json::json!({"questions": [{"question": "Which target?"}]})
+            )
+            .as_deref(),
+            Some("Which target?")
+        );
+        assert_eq!(
+            tool_invocation_summary(
+                "lsp",
+                &serde_json::json!({"action": "definition", "file": "src/main.rs"})
+            )
+            .as_deref(),
+            Some("definition · src/main.rs")
+        );
+        assert_eq!(
+            tool_invocation_summary(
+                "subagent",
+                &serde_json::json!({"agent": "reviewer", "task": "audit the patch"})
+            )
+            .as_deref(),
+            Some("reviewer: audit the patch")
+        );
+        assert_eq!(
+            tool_invocation_summary("mcp__docs__search", &serde_json::json!({})).as_deref(),
+            Some("MCP docs · search")
+        );
+    }
+
+    #[test]
+    fn registered_renderers_reject_incomplete_arguments() {
         for name in ["ask", "todo", "web_search", "submit_plan", "xdev"] {
-            assert!(
-                tool_invocation_summary(name, &serde_json::json!({})).is_none(),
-                "{name} must stay on the generic fallback card"
-            );
+            assert!(tool_invocation_summary(name, &serde_json::json!({})).is_none());
         }
     }
 }

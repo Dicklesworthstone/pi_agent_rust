@@ -583,6 +583,9 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 #[cfg(unix)]
+const FAKE_ORCHESTRATE_SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[cfg(unix)]
 #[allow(clippy::literal_string_with_formatting_args)] // bash ${VAR} syntax, not Rust fmt
 fn install_fake_orchestrate_toolchain(bin_dir: &Path) {
     let cargo_stub = r#"#!/usr/bin/env bash
@@ -659,8 +662,10 @@ path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="ut
 PY
     fi
     cat >"$target_dir/perf/legacy_extension_workloads.jsonl" <<'JSON'
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","summary":{"p50_ms":10.0}}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","per_call_us":20.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"node","summary":{"p50_ms":10.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"bun","summary":{"p50_ms":8.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"node","per_call_us":20.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"bun","per_call_us":15.0}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"node","elapsed_ms":2400.0}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"bun","elapsed_ms":1800.0}
 JSON
@@ -856,6 +861,26 @@ fi
 exit 0
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
+    let git_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse)
+    if [[ "${2:-}" == "--short" && "${3:-}" == "HEAD" ]]; then
+      printf '%s\n' '01234567'
+    elif [[ "${2:-}" == "HEAD" ]]; then
+      printf '%s\n' '0123456789abcdef0123456789abcdef01234567'
+    else
+      exit 64
+    fi
+    ;;
+  status)
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+    write_executable(&bin_dir.join("git"), git_stub);
 }
 
 #[cfg(unix)]
@@ -6886,6 +6911,9 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
     let final_preflight = content
         .find("run_budget_preflight \"$PREFLIGHT_AFTER_RUN_PATH\"")
         .expect("final budget preflight");
+    let initial_preflight = content
+        .find("run_budget_preflight \"$PREFLIGHT_BEFORE_REFRESH_PATH\"")
+        .expect("initial full-readiness preflight");
     let final_staging = content
         .find("run_artifact_staging_manifest \"$STAGING_MANIFEST_PATH\"")
         .expect("final artifact staging");
@@ -6913,6 +6941,21 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
             && final_preflight < final_staging
             && final_staging < checksums,
         "phase1 generation, Rust consumption, final preflight/staging, and checksums must remain causally ordered"
+    );
+    assert!(
+        initial_preflight < phase1_generation,
+        "the initial full-readiness preflight must remain before derived artifact generation"
+    );
+    assert_eq!(
+        content.matches("--artifact-readiness-only").count(),
+        1,
+        "only the final preflight after the authoritative Rust budget gate may use artifact-only readiness"
+    );
+    assert!(
+        content.contains(
+            "run_budget_preflight \"$PREFLIGHT_AFTER_RUN_PATH\" --artifact-readiness-only"
+        ),
+        "the final preflight must use correlation-bound artifact-only readiness"
     );
 }
 
@@ -7488,16 +7531,7 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
     let staging_entries = staging["entries"]
         .as_array()
         .expect("artifact staging entries array");
-    let source_commit = String::from_utf8(
-        Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(project_root())
-            .output()
-            .expect("resolve current Git commit")
-            .stdout,
-    )
-    .expect("Git commit must be UTF-8");
-    let source_commit = source_commit.trim();
+    let source_commit = FAKE_ORCHESTRATE_SOURCE_COMMIT;
     let expected_correlation_id = manifest["correlation_id"]
         .as_str()
         .expect("manifest correlation_id");
