@@ -327,8 +327,15 @@ pub struct CalibrationReport {
 impl CalibrationReport {
     /// Whether every field that affects fusion selection was measured.
     ///
-    /// False means a reported saving is partly modelled — which is a legitimate
-    /// state to be in, but not one to make a performance claim from.
+    /// False means a reported saving is partly modelled — a legitimate state to
+    /// be in, but not one to make a performance claim from.
+    ///
+    /// **This currently cannot return `true`.** `validate`, `convert`, and
+    /// `fused` are unmeasurable from the sources available today, so every
+    /// report lists at least those three. That is deliberate: the method is the
+    /// machine-checkable signal for when the harness has been extended far
+    /// enough to price them (bd-oxu87), and it should start returning `true` as
+    /// a *result* of that work rather than being relaxed to make it pass.
     #[must_use]
     pub fn is_fully_measured(&self) -> bool {
         self.unmeasured.is_empty()
