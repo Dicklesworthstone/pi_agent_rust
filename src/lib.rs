@@ -285,6 +285,8 @@ pub mod session_store_v2;
 pub mod skills_managed;
 pub mod sse;
 pub mod stats;
+#[doc(hidden)]
+pub mod status_line;
 pub mod stream_rules;
 #[doc(hidden)]
 pub mod subagents;

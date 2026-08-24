@@ -133,6 +133,7 @@ files = [
     "web_remote",
     "web_security",
     "btw_tan",
+    "status_line",
     "checkpoint",
     "eval",
     "url_router",
