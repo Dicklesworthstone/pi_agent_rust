@@ -1402,7 +1402,7 @@ RESULTJSON
 build_tests() {
     echo "[build] Compiling selected verification targets..."
     local build_log="$ARTIFACT_DIR/build.log"
-    local build_ok=true
+    local cargo_args=()
 
     for target in "${SELECTED_UNIT_TARGETS[@]}"; do
         if [[ ! -f "tests/${target}.rs" ]]; then
@@ -1410,10 +1410,7 @@ build_tests() {
             continue
         fi
         echo "[build]   unit:$target"
-        if ! run_cargo test --locked --test "$target" --no-run 2>>"$build_log"; then
-            echo "[build]   unit:$target FAILED" >&2
-            build_ok=false
-        fi
+        cargo_args+=("--test" "$target")
     done
 
     for suite in "${SELECTED_SUITES[@]}"; do
@@ -1422,19 +1419,18 @@ build_tests() {
             continue
         fi
         echo "[build]   e2e:$suite"
-        if ! run_cargo test --locked --test "$suite" --no-run 2>>"$build_log"; then
-            echo "[build]   e2e:$suite FAILED" >&2
-            build_ok=false
-        fi
+        cargo_args+=("--test" "$suite")
     done
 
-    if $build_ok; then
-        echo "[build] OK"
-        return 0
-    else
-        echo "[build] Some targets failed — see $build_log" >&2
-        return 1
+    if [[ ${#cargo_args[@]} -gt 0 ]]; then
+        if ! run_cargo test --locked "${cargo_args[@]}" --no-run 2>>"$build_log"; then
+            echo "[build] Some targets failed — see $build_log" >&2
+            return 1
+        fi
     fi
+
+    echo "[build] OK"
+    return 0
 }
 
 # ─── Run a Single Suite ──────────────────────────────────────────────────────
