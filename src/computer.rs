@@ -142,9 +142,8 @@ impl ComputerTool {
     }
 
     fn is_mock(&self) -> bool {
-        self.mock_mode.unwrap_or_else(|| {
-            std::env::var("PI_COMPUTER_MOCK").unwrap_or_default() == "1"
-        })
+        self.mock_mode
+            .unwrap_or_else(|| std::env::var("PI_COMPUTER_MOCK").unwrap_or_default() == "1")
     }
 }
 
@@ -284,7 +283,10 @@ impl Tool for ComputerTool {
                     displays.len(),
                     displays
                         .iter()
-                        .map(|d| format!("- [Display {}] {} ({}x{}, primary: {})", d.id, d.name, d.width, d.height, d.is_primary))
+                        .map(|d| format!(
+                            "- [Display {}] {} ({}x{}, primary: {})",
+                            d.id, d.name, d.width, d.height, d.is_primary
+                        ))
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
@@ -344,7 +346,10 @@ impl Tool for ComputerTool {
                     windows.len(),
                     windows
                         .iter()
-                        .map(|w| format!("- [Window {}] \"{}\" ({}) at ({}, {}) [{}x{}]", w.id, w.title, w.app_name, w.x, w.y, w.width, w.height))
+                        .map(|w| format!(
+                            "- [Window {}] \"{}\" ({}) at ({}, {}) [{}x{}]",
+                            w.id, w.title, w.app_name, w.x, w.y, w.width, w.height
+                        ))
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
@@ -382,12 +387,12 @@ impl Tool for ComputerTool {
 
                 // Minimal valid 1x1 PNG bytes
                 const MIN_VALID_PNG: &[u8] = &[
-                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-                    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-                    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-                    0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-                    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-                    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+                    0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+                    0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
+                    0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D,
+                    0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+                    0x60, 0x82,
                 ];
 
                 fs::write(&target_path, MIN_VALID_PNG).map_err(|e| {
@@ -457,7 +462,9 @@ impl Tool for ComputerTool {
                         text: format!("Synthesized {button} click{pos_str}"),
                         text_signature: None,
                     })],
-                    details: Some(json!({ "action": "mouse_click", "button": button, "x": x, "y": y })),
+                    details: Some(
+                        json!({ "action": "mouse_click", "button": button, "x": x, "y": y }),
+                    ),
                     is_error: false,
                 })
             }
@@ -493,7 +500,9 @@ impl Tool for ComputerTool {
                         text: format!("Typed text ({} characters)", text.chars().count()),
                         text_signature: None,
                     })],
-                    details: Some(json!({ "action": "key_type", "char_count": text.chars().count() })),
+                    details: Some(
+                        json!({ "action": "key_type", "char_count": text.chars().count() }),
+                    ),
                     is_error: false,
                 })
             }
@@ -515,7 +524,10 @@ impl Tool for ComputerTool {
             }
 
             "ax_tree" => {
-                let window_id = args.get("window_id").and_then(|v| v.as_u64()).unwrap_or(101);
+                let window_id = args
+                    .get("window_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(101);
 
                 let root_node = AxNode {
                     role: "AXApplication".to_string(),
@@ -523,33 +535,31 @@ impl Tool for ComputerTool {
                     value: None,
                     enabled: true,
                     focused: true,
-                    children: vec![
-                        AxNode {
-                            role: "AXWindow".to_string(),
-                            title: Some("Pi Agent".to_string()),
-                            value: None,
-                            enabled: true,
-                            focused: true,
-                            children: vec![
-                                AxNode {
-                                    role: "AXTextArea".to_string(),
-                                    title: None,
-                                    value: Some("prompt text input".to_string()),
-                                    enabled: true,
-                                    focused: true,
-                                    children: Vec::new(),
-                                },
-                                AxNode {
-                                    role: "AXButton".to_string(),
-                                    title: Some("Submit".to_string()),
-                                    value: None,
-                                    enabled: true,
-                                    focused: false,
-                                    children: Vec::new(),
-                                },
-                            ],
-                        },
-                    ],
+                    children: vec![AxNode {
+                        role: "AXWindow".to_string(),
+                        title: Some("Pi Agent".to_string()),
+                        value: None,
+                        enabled: true,
+                        focused: true,
+                        children: vec![
+                            AxNode {
+                                role: "AXTextArea".to_string(),
+                                title: None,
+                                value: Some("prompt text input".to_string()),
+                                enabled: true,
+                                focused: true,
+                                children: Vec::new(),
+                            },
+                            AxNode {
+                                role: "AXButton".to_string(),
+                                title: Some("Submit".to_string()),
+                                value: None,
+                                enabled: true,
+                                focused: false,
+                                children: Vec::new(),
+                            },
+                        ],
+                    }],
                 };
 
                 let tree_json = serde_json::to_string_pretty(&root_node).unwrap_or_default();
@@ -573,7 +583,10 @@ impl Tool for ComputerTool {
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
-                        text: format!("Clipboard content ({} chars):\n{text}", text.chars().count()),
+                        text: format!(
+                            "Clipboard content ({} chars):\n{text}",
+                            text.chars().count()
+                        ),
                         text_signature: None,
                     })],
                     details: Some(json!({ "char_count": text.chars().count(), "text": text })),
@@ -582,10 +595,9 @@ impl Tool for ComputerTool {
             }
 
             "clipboard_write" => {
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::tool("computer", "clipboard_write requires text parameter"))?;
+                let text = args.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::tool("computer", "clipboard_write requires text parameter")
+                })?;
 
                 let mut buf = self
                     .clipboard_buffer

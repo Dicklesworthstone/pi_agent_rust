@@ -120,7 +120,10 @@ fn test_computer_screenshot_writes_valid_png() {
         assert!(full_path.is_file(), "screenshot PNG must exist");
 
         let bytes = fs::read(&full_path).expect("read screenshot");
-        assert!(bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]), "must be valid PNG");
+        assert!(
+            bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+            "must be valid PNG"
+        );
 
         let details = output.details.as_ref().expect("details present");
         assert_eq!(details["display_id"], 1);
@@ -138,24 +141,45 @@ fn test_computer_mouse_actions() {
 
         // mouse_move
         let out_move = tool
-            .execute("call_m1", json!({ "action": "mouse_move", "x": 500, "y": 300 }), None)
+            .execute(
+                "call_m1",
+                json!({ "action": "mouse_move", "x": 500, "y": 300 }),
+                None,
+            )
             .await
             .expect("mouse_move");
-        assert_eq!(out_move.details.as_ref().map(|d| d["x"].as_i64()), Some(Some(500)));
+        assert_eq!(
+            out_move.details.as_ref().map(|d| d["x"].as_i64()),
+            Some(Some(500))
+        );
 
         // mouse_click
         let out_click = tool
-            .execute("call_m2", json!({ "action": "mouse_click", "button": "left", "x": 500, "y": 300 }), None)
+            .execute(
+                "call_m2",
+                json!({ "action": "mouse_click", "button": "left", "x": 500, "y": 300 }),
+                None,
+            )
             .await
             .expect("mouse_click");
-        assert_eq!(out_click.details.as_ref().map(|d| d["button"].as_str()), Some(Some("left")));
+        assert_eq!(
+            out_click.details.as_ref().map(|d| d["button"].as_str()),
+            Some(Some("left"))
+        );
 
         // mouse_drag
         let out_drag = tool
-            .execute("call_m3", json!({ "action": "mouse_drag", "x": 700, "y": 400 }), None)
+            .execute(
+                "call_m3",
+                json!({ "action": "mouse_drag", "x": 700, "y": 400 }),
+                None,
+            )
             .await
             .expect("mouse_drag");
-        assert_eq!(out_drag.details.as_ref().map(|d| d["x"].as_i64()), Some(Some(700)));
+        assert_eq!(
+            out_drag.details.as_ref().map(|d| d["x"].as_i64()),
+            Some(Some(700))
+        );
     });
 
     finish_case(&harness, "computer_mouse");
@@ -170,17 +194,31 @@ fn test_computer_keyboard_actions() {
 
         // key_type
         let out_type = tool
-            .execute("call_k1", json!({ "action": "key_type", "text": "cargo check" }), None)
+            .execute(
+                "call_k1",
+                json!({ "action": "key_type", "text": "cargo check" }),
+                None,
+            )
             .await
             .expect("key_type");
-        assert_eq!(out_type.details.as_ref().map(|d| d["char_count"].as_u64()), Some(Some(11)));
+        assert_eq!(
+            out_type.details.as_ref().map(|d| d["char_count"].as_u64()),
+            Some(Some(11))
+        );
 
         // key_press
         let out_press = tool
-            .execute("call_k2", json!({ "action": "key_press", "key": "Return" }), None)
+            .execute(
+                "call_k2",
+                json!({ "action": "key_press", "key": "Return" }),
+                None,
+            )
             .await
             .expect("key_press");
-        assert_eq!(out_press.details.as_ref().map(|d| d["key"].as_str()), Some(Some("Return")));
+        assert_eq!(
+            out_press.details.as_ref().map(|d| d["key"].as_str()),
+            Some(Some("Return"))
+        );
     });
 
     finish_case(&harness, "computer_keyboard");
@@ -193,7 +231,11 @@ fn test_computer_ax_tree_dump() {
     asupersync::test_utils::run_test(|| async {
         let tool = ComputerTool::new(harness.temp_dir()).with_mock(true);
         let output = tool
-            .execute("call_ax", json!({ "action": "ax_tree", "window_id": 101 }), None)
+            .execute(
+                "call_ax",
+                json!({ "action": "ax_tree", "window_id": 101 }),
+                None,
+            )
             .await
             .expect("ax_tree");
 
@@ -251,9 +293,13 @@ fn test_computer_audit_logging() {
         tool.execute("call_a1", json!({ "action": "list_displays" }), None)
             .await
             .expect("exec 1");
-        tool.execute("call_a2", json!({ "action": "key_type", "text": "ls -la" }), None)
-            .await
-            .expect("exec 2");
+        tool.execute(
+            "call_a2",
+            json!({ "action": "key_type", "text": "ls -la" }),
+            None,
+        )
+        .await
+        .expect("exec 2");
 
         let audit = tool.get_audit_log();
         assert_eq!(audit.len(), 2);
@@ -304,11 +350,8 @@ fn test_computer_opt_in_activation() {
         screenshot_dir: Some("screenshots".to_string()),
     });
 
-    let enabled_registry = ToolRegistry::new(
-        &["read", "computer"],
-        harness.temp_dir(),
-        Some(&config),
-    );
+    let enabled_registry =
+        ToolRegistry::new(&["read", "computer"], harness.temp_dir(), Some(&config));
 
     assert!(enabled_registry.get("computer").is_some());
 
