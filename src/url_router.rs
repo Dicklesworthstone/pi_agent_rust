@@ -606,23 +606,21 @@ fn resolve_github(
 // ---------------------------------------------------------------------------
 
 fn resolve_ssh(rest: &str) -> Result<ResolvedDoc> {
-    let (host, remote_path) = rest.split_once('/').ok_or_else(|| {
+    // split_once consumes the separator, so re-anchor to an absolute path:
+    // `ssh://host/var/www` must cat `/var/www`, not `~/var/www`.
+    let (host, tail) = rest.split_once('/').ok_or_else(|| {
         Error::validation(format!("ssh:// reference must be host/path, got '{rest}'"))
     })?;
-    if host.is_empty() || remote_path.is_empty() {
+    let remote_path = format!("/{tail}");
+    if host.is_empty() || tail.is_empty() {
         return Err(Error::validation(format!(
             "ssh:// reference must be host/path, got '{rest}'"
         )));
     }
     let output = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "ConnectTimeout=10",
-            host,
-            &format!("head -c {SSH_MAX_BYTES} -- '{remote_path}'"),
-        ])
+        .args(ssh_command_flags())
+        .arg(host)
+        .arg(format!("head -c {SSH_MAX_BYTES} -- '{remote_path}'"))
         .output()
         .map_err(|e| Error::tool("read", format!("PI_URL_BACKEND: failed to run ssh: {e}")))?;
     if !output.status.success() {
@@ -674,12 +672,14 @@ pub fn parse_ssh_target(url: &str) -> Result<SshTarget> {
             "PI_SSH_TARGET: '{url}' is not an ssh://host/path URL"
         )));
     };
-    let (host, remote_path) = rest.split_once('/').ok_or_else(|| {
+    // Absolute by construction — split_once eats the leading slash.
+    let (host, tail) = rest.split_once('/').ok_or_else(|| {
         Error::validation(format!(
             "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
         ))
     })?;
-    if host.is_empty() || remote_path.is_empty() {
+    let remote_path = format!("/{tail}");
+    if host.is_empty() || tail.is_empty() {
         return Err(Error::validation(format!(
             "PI_SSH_TARGET: ssh:// reference must be host/path, got '{rest}'"
         )));
@@ -822,16 +822,18 @@ fn sh_quote(value: &str) -> String {
 }
 
 /// POSIX sh snippet writing stdin into `remote_path` atomically: mktemp in
-/// the target directory keeps rename(2) on one filesystem, existing
-/// permissions are preserved best-effort, and the EXIT trap removes the
-/// staging file if anything aborts before the rename.
+/// the target directory keeps rename(2) on one filesystem, and when the
+/// target already exists it is copied to the staging file with `cp -p`
+/// FIRST — preserving mode/owner/timestamps portably (GNU chmod's
+/// `--reference` does not exist on BSD/macOS remotes). The EXIT trap
+/// removes the staging file if anything aborts before the rename.
 #[must_use]
 pub fn remote_atomic_write_script(remote_path: &str) -> String {
     let quoted = sh_quote(remote_path);
     format!(
         "set -eu; d=$(dirname -- {quoted}); t=$(mktemp \"$d/.pi-ssh-write.XXXXXX\"); \
-         trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
-         if [ -e {quoted} ]; then chmod --reference={quoted} \"$t\"; fi; \
+         trap 'rm -f \"$t\"' EXIT; \
+         if [ -e {quoted} ]; then cp -p -- {quoted} \"$t\"; fi; cat > \"$t\"; \
          mv -f -- \"$t\" {quoted}"
     )
 }
@@ -1098,7 +1100,7 @@ mod tests {
     fn parse_ssh_target_validates() {
         let ok = parse_ssh_target("ssh://yto/var/www/app.js").expect("ok");
         assert_eq!(ok.host, "yto");
-        assert_eq!(ok.path, "var/www/app.js");
+        assert_eq!(ok.path, "/var/www/app.js");
         assert!(parse_ssh_target("file:///etc/hosts").is_err());
         assert!(parse_ssh_target("ssh://hostonly").is_err());
         assert!(parse_ssh_target("ssh://h/").is_err());
@@ -1127,7 +1129,11 @@ mod tests {
     fn ssh_flags_force_batch_and_accept_new() {
         let flags = ssh_command_flags();
         assert!(flags.iter().any(|flag| flag == "BatchMode=yes"));
-        assert!(flags.iter().any(|flag| flag == "StrictHostKeyChecking=accept-new"));
+        assert!(
+            flags
+                .iter()
+                .any(|flag| flag == "StrictHostKeyChecking=accept-new")
+        );
     }
 
     #[test]
@@ -1135,7 +1141,7 @@ mod tests {
         let script = remote_atomic_write_script("/var/www/app.conf");
         assert!(script.contains("mktemp \"$d/.pi-ssh-write.XXXXXX\""));
         assert!(script.contains("mv -f -- \"$t\" '/var/www/app.conf'"));
-        assert!(script.contains("chmod --reference='/var/www/app.conf'"));
+        assert!(script.contains("cp -p -- '/var/www/app.conf'"));
         assert!(script.contains("trap 'rm -f \"$t\"' EXIT"));
         // Quote escaping survives embedded single quotes.
         let tricky = remote_atomic_write_script("/tmp/it's");

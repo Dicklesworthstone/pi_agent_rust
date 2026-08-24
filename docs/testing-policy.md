@@ -489,8 +489,12 @@ missing, but it must never compare the unproven number with a threshold.
   that binds the exact binary path, SHA-256, and byte length to Cargo profile
   `release`, profile family `release`, `opt-level = "z"`, and `strip = true`.
 - `idle_memory_rss` requires a `pi.perf.idle_rss_measurement.v1` record with the
-  measured PID, process name `pi`, allocator (`system` or `jemalloc`), idle-state
-  boundary, RSS bytes, and the measured executable's path and SHA-256.
+  Cargo release build command, allocator (`system` or `jemalloc`), measured
+  executable path and SHA-256, and at least five distinct interactive `pi`
+  process samples after the declared idle settle interval. The control reports
+  the conservative maximum RSS and exact max-minus-min spread, identifies the
+  PID carrying that maximum, and hash-binds the `benches/bench_env.rs`
+  fingerprint used during sampling.
 - `ext_cold_load_simple_p95` and `ext_cold_load_complex_p95` require a
   `pi.perf.cold_load_measurement.v1` record that hashes each Criterion estimate
   and embeds the `benches/bench_env.rs` governor, ASLR, THP, and noise-score

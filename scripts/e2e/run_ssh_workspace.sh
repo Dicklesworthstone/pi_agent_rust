@@ -28,6 +28,12 @@ SSHD_BIN="/usr/sbin/sshd"
 FIXTURE="$(mktemp -d "${TMPDIR:-/tmp}/pi-ssh-e2e-fixture.XXXXXX")"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/pi-ssh-e2e-work.XXXXXX")"
 
+
+# The fixture binds 127.0.0.1 on THIS machine, so the cargo invocation must
+# never be offloaded to a remote worker (its loopback is a different host).
+# An astronomic minimum-local-time estimate pins every admission decision
+# to local execution through the official knob.
+export RCH_MIN_LOCAL_TIME_MS=999999999
 PORT="$(python3 - <<'PY'
 import socket
 s = socket.socket()

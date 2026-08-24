@@ -3038,7 +3038,7 @@ fn read_idle_memory_rss(root: &Path) -> (Option<f64>, String) {
         Err(error) => return (None, error.to_string()),
     };
     let source = format!(
-        "{}#control=idle_rss_v1;control_sha256={};pid={};process={};allocator={};binary_sha256={};rss_bytes={}",
+        "{}#control=idle_rss_v1;control_sha256={};pid={};process={};allocator={};binary_sha256={};rss_bytes={};sample_count={};rss_spread_bytes={};settle_ms={};bench_env_sha256={};governor={};noise_score={}",
         display_source_path(root, &verified.control_path),
         verified.control_sha256,
         verified.pid,
@@ -3046,6 +3046,12 @@ fn read_idle_memory_rss(root: &Path) -> (Option<f64>, String) {
         verified.allocator,
         verified.binary_sha256,
         verified.rss_bytes,
+        verified.sample_count,
+        verified.rss_spread_bytes,
+        verified.settle_ms,
+        verified.bench_env_sha256,
+        verified.governor,
+        verified.noise_score,
     );
     (Some(verified.rss_bytes as f64 / 1024.0 / 1024.0), source)
 }
@@ -4718,6 +4724,118 @@ fn idle_memory_budget_rejects_test_harness_rss_as_release_evidence() {
         check_budget_with_strict_at_root(budget, true, tmp.path()).status,
         "NO_DATA"
     );
+}
+
+#[derive(Serialize)]
+struct IdleRssFixtureBenchEnv {
+    os: String,
+    arch: String,
+    cpu_brand: String,
+    cpu_cores: usize,
+    mem_total_mb: u64,
+    governor: String,
+    turbo_boost: String,
+    aslr: String,
+    thp: String,
+    noise_score: u8,
+    config_hash: String,
+}
+
+fn write_idle_rss_control_fixture(root: &Path) -> PathBuf {
+    let binary_path = root.join("target/release/pi");
+    std::fs::create_dir_all(binary_path.parent().expect("binary parent"))
+        .expect("create binary directory");
+    std::fs::write(&binary_path, b"fixture release pi").expect("write fixture release binary");
+    let binary_path = std::fs::canonicalize(binary_path).expect("canonical fixture binary");
+    let control_path = root.join("target/perf/release_evidence/idle_memory_rss.json");
+    std::fs::create_dir_all(control_path.parent().expect("control parent"))
+        .expect("create control directory");
+    let bench_env = IdleRssFixtureBenchEnv {
+        os: "Linux".to_string(),
+        arch: "x86_64".to_string(),
+        cpu_brand: "fixture cpu".to_string(),
+        cpu_cores: 8,
+        mem_total_mb: 16_384,
+        governor: "performance".to_string(),
+        turbo_boost: "disabled".to_string(),
+        aslr: "full".to_string(),
+        thp: "never".to_string(),
+        noise_score: 1,
+        config_hash: "a".repeat(64),
+    };
+    let bench_env_sha256 = pi::package_manager::hex_encode(&Sha256::digest(
+        serde_json::to_vec(
+            &serde_json::to_value(&bench_env).expect("normalize fixture benchmark environment"),
+        )
+        .expect("serialize fixture benchmark environment"),
+    ));
+    let control = json!({
+        "schema": "pi.perf.idle_rss_measurement.v1",
+        "generated_at": "2026-08-24T00:00:00Z",
+        "run_id": "fixture-run",
+        "correlation_id": "fixture-run",
+        "source_commit": "1234567890abcdef1234567890abcdef12345678",
+        "source_dirty": false,
+        "pid": 5004,
+        "process_name": "pi",
+        "allocator": "system",
+        "binary_path": binary_path,
+        "binary_sha256": sha256_file(&binary_path).expect("hash fixture binary"),
+        "rss_bytes": 24_117_248,
+        "idle_state": "startup_before_user_input",
+        "cargo_profile": "release",
+        "build_command": "cargo build --bin pi --release",
+        "sample_count": 5,
+        "samples": [
+            {"pid": 5000, "process_name": "pi", "rss_bytes": 20_971_520},
+            {"pid": 5001, "process_name": "pi", "rss_bytes": 22_020_096},
+            {"pid": 5002, "process_name": "pi", "rss_bytes": 23_068_672},
+            {"pid": 5003, "process_name": "pi", "rss_bytes": 22_544_384},
+            {"pid": 5004, "process_name": "pi", "rss_bytes": 24_117_248}
+        ],
+        "rss_spread_bytes": 3_145_728,
+        "settle_ms": 1_000,
+        "bench_env_source": "benches/bench_env.rs",
+        "bench_env": bench_env,
+        "bench_env_sha256": bench_env_sha256
+    });
+    std::fs::write(
+        &control_path,
+        serde_json::to_vec(&control).expect("serialize idle RSS fixture control"),
+    )
+    .expect("write idle RSS fixture control");
+    control_path
+}
+
+#[test]
+fn idle_memory_budget_consumes_multi_sample_release_control() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let control_path = write_idle_rss_control_fixture(tmp.path());
+    let (actual, source) = read_idle_memory_rss(tmp.path());
+    assert_eq!(actual, Some(23.0));
+    assert!(source.contains("#control=idle_rss_v1;"));
+    assert!(source.contains("sample_count=5;rss_spread_bytes=3145728;settle_ms=1000;"));
+    assert!(source.contains("governor=performance;noise_score=1"));
+
+    let mut control: Value = serde_json::from_slice(
+        &std::fs::read(&control_path).expect("read idle RSS fixture control"),
+    )
+    .expect("parse idle RSS fixture control");
+    control["samples"] = json!([
+        {"pid": 5000, "process_name": "pi", "rss_bytes": 20_971_520},
+        {"pid": 5001, "process_name": "pi", "rss_bytes": 22_020_096},
+        {"pid": 5002, "process_name": "pi", "rss_bytes": 23_068_672},
+        {"pid": 5003, "process_name": "pi", "rss_bytes": 22_544_384}
+    ]);
+    control["sample_count"] = json!(4);
+    std::fs::write(
+        &control_path,
+        serde_json::to_vec(&control).expect("serialize mutated idle RSS control"),
+    )
+    .expect("write mutated idle RSS control");
+    let (actual, source) = read_idle_memory_rss(tmp.path());
+    assert_eq!(actual, None);
+    assert!(source.contains("sample_count >= 5"));
 }
 
 #[test]

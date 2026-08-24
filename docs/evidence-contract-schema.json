@@ -495,8 +495,8 @@
                 "required_fields": {
                   "type": "array",
                   "uniqueItems": true,
-                  "minItems": 8,
-                  "maxItems": 8,
+                  "minItems": 17,
+                  "maxItems": 17,
                   "items": {
                     "type": "string",
                     "enum": [
@@ -507,7 +507,16 @@
                       "binary_path",
                       "binary_sha256",
                       "rss_bytes",
-                      "idle_state"
+                      "idle_state",
+                      "cargo_profile",
+                      "build_command",
+                      "sample_count",
+                      "samples",
+                      "rss_spread_bytes",
+                      "settle_ms",
+                      "bench_env_source",
+                      "bench_env",
+                      "bench_env_sha256"
                     ]
                   }
                 }

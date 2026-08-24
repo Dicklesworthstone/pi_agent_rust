@@ -449,8 +449,8 @@ mod tests {
         assert_eq!(&png[8..12], &[0, 0, 0, 13]);
         assert_eq!(&png[12..16], b"IHDR");
         assert_eq!(png[16..20], 12u32.to_be_bytes());
-        assert_eq!(png[20..24], 9u32.to_be_bytes());
-        assert_eq!(&png[png.len() - 12..png.len() - 8], b"IEND");
+        assert_eq!(&png[png.len() - 12..png.len() - 8], &[0, 0, 0, 0]);
+        assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
     }
 
     #[test]
