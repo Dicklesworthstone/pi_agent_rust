@@ -134,6 +134,7 @@ files = [
     "web_security",
     "btw_tan",
     "status_line",
+    "markdown_rich",
     "checkpoint",
     "eval",
     "url_router",

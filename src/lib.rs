@@ -212,6 +212,8 @@ pub mod lsp;
 #[doc(hidden)]
 pub mod magic_keywords;
 #[doc(hidden)]
+pub mod markdown_rich;
+#[doc(hidden)]
 pub mod mcp;
 #[doc(hidden)]
 pub mod media_tools;
