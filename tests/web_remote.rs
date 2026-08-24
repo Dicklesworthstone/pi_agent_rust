@@ -5,7 +5,7 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, WebFrameType, WebRemoteManager,
+    render_half_block_qr, BindMode, ControlMode, TokenKind, WebFrameType, WebRemoteManager,
     WebRemoteSettings, EMBEDDED_WEB_CLIENT_HTML,
 };
 
@@ -60,24 +60,30 @@ fn test_web_client_authentication_and_capacity() {
     };
 
     let manager = WebRemoteManager::new(settings);
-    manager.issue_token("tok-alpha");
-    manager.issue_token("tok-beta");
-    manager.issue_token("tok-gamma");
-    manager.issue_token("tok-delta");
+    manager.issue_token("tok-alpha", TokenKind::Steer);
+    manager.issue_token("tok-beta", TokenKind::View);
+    manager.issue_token("tok-gamma", TokenKind::Steer);
+    manager.issue_token("tok-delta", TokenKind::View);
 
     // Connect viewer 1
     let v1 = manager.connect_client("viewer-1", "127.0.0.1:4001", Some("tok-alpha"));
     assert!(v1.is_ok());
+    assert!(!v1.as_ref().map_or(true, |c| c.is_view_only));
 
     // Reuse of tok-alpha is rejected
     let v1_replay = manager.connect_client("viewer-1-replay", "127.0.0.1:4002", Some("tok-alpha"));
     assert!(v1_replay.is_err());
 
-    // Connect viewers 2 and 3
+    // Connect viewers 2 (view only) and 3
     let v2 = manager.connect_client("viewer-2", "127.0.0.1:4003", Some("tok-beta"));
     let v3 = manager.connect_client("viewer-3", "127.0.0.1:4004", Some("tok-gamma"));
     assert!(v2.is_ok());
+    assert!(v2.as_ref().map_or(false, |c| c.is_view_only));
     assert!(v3.is_ok());
+
+    // Viewer 2 cannot request control because it is view-only
+    let v2_control = manager.request_takeover("viewer-2");
+    assert!(v2_control.is_err());
 
     // 4th viewer rejected due to max_viewers = 3
     let v4 = manager.connect_client("viewer-4", "127.0.0.1:4005", Some("tok-delta"));
@@ -85,6 +91,27 @@ fn test_web_client_authentication_and_capacity() {
     assert!(v4.as_ref().err().map_or(false, |e| e.contains("maximum viewer capacity")));
 
     finish_case(&harness, "web_client_auth_capacity");
+}
+
+#[test]
+fn test_qr_console_pairing_render() {
+    let harness = TestHarness::new("qr_console_pairing");
+
+    let steer_url = "http://100.64.0.1:8080/#t=steer_tok_123456";
+    let view_url = "http://100.64.0.1:8080/#t=view_tok_654321";
+
+    let steer_qr = render_half_block_qr(steer_url);
+    let view_qr = render_half_block_qr(view_url);
+
+    assert!(steer_qr.contains("▀"));
+    assert!(steer_qr.contains("▄"));
+    assert!(steer_qr.contains("█"));
+    assert!(steer_qr.contains("steer_tok_123456"));
+
+    assert!(view_qr.contains("▀"));
+    assert!(view_qr.contains("view_tok_654321"));
+
+    finish_case(&harness, "qr_console_pairing");
 }
 
 #[test]

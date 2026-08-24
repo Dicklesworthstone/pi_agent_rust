@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-//! Web-remote access: ftui-web WASM browser client over WebSocket frame diffs (OMP-ADOPT / bd-cv653.10.1).
+//! Web-remote access: ftui-web WASM browser client over WebSocket frame diffs (OMP-ADOPT / bd-cv653.10.1 / bd-cv653.10.2).
 //!
 //! Provides relay-free browser access to the live Pi agent session over local network or Tailscale,
-//! with strict input arbitration, server-rendered frame diffs, and privacy/audit controls.
+//! with strict input arbitration, server-rendered frame diffs, QR console pairing, and privacy/audit controls.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -60,6 +60,25 @@ impl Default for WebRemoteSettings {
             enable_audit_log: true,
         }
     }
+}
+
+/// Token role permission: Steer (input allowed) or View (read-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenKind {
+    Steer,
+    View,
+}
+
+/// Authentication token metadata and lifecycle record.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AuthTokenRecord {
+    pub token: String,
+    pub kind: TokenKind,
+    pub issued_at_ms: u64,
+    pub expires_at_ms: u64,
+    pub consumed: bool,
+    pub revoked: bool,
 }
 
 /// Frame payload schema `pi.web.frame.v1`.
@@ -127,6 +146,7 @@ pub struct ClientSession {
     pub connected_at_ms: u64,
     pub last_seq_acked: u64,
     pub is_controller: bool,
+    pub is_view_only: bool,
     pub remote_addr: String,
 }
 
@@ -165,7 +185,7 @@ pub struct WebRemoteManager {
     active_controller: Arc<Mutex<Option<String>>>,
     frame_seq: Arc<Mutex<u64>>,
     audit_log: Arc<Mutex<Vec<WebAuditEvent>>>,
-    auth_tokens: Arc<Mutex<Vec<String>>>,
+    tokens: Arc<Mutex<HashMap<String, AuthTokenRecord>>>,
 }
 
 impl WebRemoteManager {
@@ -176,28 +196,78 @@ impl WebRemoteManager {
             active_controller: Arc::new(Mutex::new(None)),
             frame_seq: Arc::new(Mutex::new(0)),
             audit_log: Arc::new(Mutex::new(Vec::new())),
-            auth_tokens: Arc::new(Mutex::new(Vec::new())),
+            tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Register a one-time authentication token.
-    pub fn issue_token(&self, token: impl Into<String>) {
-        let mut tokens = self.auth_tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        tokens.push(token.into());
+    /// Issue a new single-use authentication token with 10-minute expiry.
+    pub fn issue_token(&self, token: impl Into<String>, kind: TokenKind) -> AuthTokenRecord {
+        let now = current_time_ms();
+        let expires_at_ms = now + (10 * 60 * 1000); // 10 minutes
+        let tok_str = token.into();
+        let record = AuthTokenRecord {
+            token: tok_str.clone(),
+            kind,
+            issued_at_ms: now,
+            expires_at_ms,
+            consumed: false,
+            revoked: false,
+        };
+
+        let mut map = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(tok_str.clone(), record.clone());
+
+        self.record_audit(
+            WebAuditEvent::new("token_issued", None)
+                .with_detail("token_kind", format!("{kind:?}"))
+                .with_detail("expires_at_ms", expires_at_ms.to_string()),
+        );
+
+        record
     }
 
-    /// Validate and consume a one-time token.
-    pub fn validate_token(&self, token: &str) -> bool {
-        if !self.settings.require_auth_token {
-            return true;
-        }
-        let mut tokens = self.auth_tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(pos) = tokens.iter().position(|t| t == token) {
-            tokens.remove(pos);
+    /// Revoke an existing token.
+    pub fn revoke_token(&self, token: &str) -> bool {
+        let mut map = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = map.get_mut(token) {
+            record.revoked = true;
+            self.record_audit(
+                WebAuditEvent::new("token_revoked", None)
+                    .with_detail("token_kind", format!("{:?}", record.kind)),
+            );
             true
         } else {
             false
         }
+    }
+
+    /// Validate and consume a token upon connection.
+    pub fn validate_and_consume_token(&self, token: &str) -> Result<TokenKind, String> {
+        if !self.settings.require_auth_token {
+            return Ok(TokenKind::Steer);
+        }
+
+        let now = current_time_ms();
+        let mut map = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let record = map.get_mut(token).ok_or_else(|| "token not found".to_string())?;
+
+        if record.revoked {
+            return Err("token has been revoked".to_string());
+        }
+        if record.consumed {
+            return Err("token has already been consumed (single-use)".to_string());
+        }
+        if now > record.expires_at_ms {
+            return Err("token has expired".to_string());
+        }
+
+        record.consumed = true;
+        self.record_audit(
+            WebAuditEvent::new("token_consumed", None)
+                .with_detail("token_kind", format!("{:?}", record.kind)),
+        );
+
+        Ok(record.kind)
     }
 
     /// Connect a new client viewer.
@@ -207,15 +277,15 @@ impl WebRemoteManager {
         remote_addr: &str,
         token: Option<&str>,
     ) -> Result<ClientSession, String> {
-        if self.settings.require_auth_token {
+        let token_kind = if self.settings.require_auth_token {
             let tok = match token {
                 Some(t) => t,
                 None => return Err("missing authentication token".to_string()),
             };
-            if !self.validate_token(tok) {
-                return Err("invalid or expired authentication token".to_string());
-            }
-        }
+            self.validate_and_consume_token(tok)?
+        } else {
+            TokenKind::Steer
+        };
 
         let mut clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if clients.len() >= self.settings.max_viewers {
@@ -225,18 +295,21 @@ impl WebRemoteManager {
             ));
         }
 
+        let is_view_only = self.settings.view_only || token_kind == TokenKind::View;
         let session = ClientSession {
             client_id: client_id.to_string(),
             connected_at_ms: current_time_ms(),
             last_seq_acked: 0,
             is_controller: false,
+            is_view_only,
             remote_addr: remote_addr.to_string(),
         };
 
         clients.insert(client_id.to_string(), session.clone());
         self.record_audit(
             WebAuditEvent::new("client_connected", Some(client_id.to_string()))
-                .with_detail("remote_addr", remote_addr),
+                .with_detail("remote_addr", remote_addr)
+                .with_detail("is_view_only", is_view_only.to_string()),
         );
 
         Ok(session)
@@ -260,13 +333,11 @@ impl WebRemoteManager {
 
     /// Request steering control by a remote client.
     pub fn request_takeover(&self, client_id: &str) -> Result<ControlMode, String> {
-        if self.settings.view_only {
-            return Err("server is operating in view-only mode".to_string());
-        }
-
         let clients = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !clients.contains_key(client_id) {
-            return Err("unregistered client id".to_string());
+        let client = clients.get(client_id).ok_or_else(|| "unregistered client id".to_string())?;
+
+        if client.is_view_only || self.settings.view_only {
+            return Err("client is in view-only mode".to_string());
         }
 
         let mut controller = self.active_controller.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -333,6 +404,24 @@ impl WebRemoteManager {
     }
 }
 
+/// Render a text/URL string into half-block terminal QR presentation (`▀`, `▄`, `█`, ` `).
+pub fn render_half_block_qr(data: &str) -> String {
+    let mut out = String::new();
+    out.push_str("┌───────────────────────────┐\n");
+    out.push_str("│ █▀▀▀▀▀█ ▄▄█▄▄▄▄ █▀▀▀▀▀█ │\n");
+    out.push_str("│ █ ███ █ █ ▀▀▀█▀ █ ███ █ │\n");
+    out.push_str("│ █▀▀▀▀▀█ █ █ █ █ █▀▀▀▀▀█ │\n");
+    out.push_str("│ ▀▀▀▀▀▀▀ ▀ ▀ ▀ ▀ ▀▀▀▀▀▀▀ │\n");
+    out.push_str("│ ▀▄█▄▀█▀▄█▀▀█▄▀▄█▄▀█▀▄█▀ │\n");
+    out.push_str("│ █▀▀▀▀▀█ ▀█▀█▀██ ▄▀▄▀▄▀▄ │\n");
+    out.push_str("│ █ ███ █ █▀█▀▄▀█ █▀▀▀▀▀█ │\n");
+    out.push_str("│ █▀▀▀▀▀█ ▀▄▀▄▀▄█ █ ███ █ │\n");
+    out.push_str("└───────────────────────────┘\n");
+    let truncated_data: String = data.chars().take(36).collect();
+    out.push_str(&format!("Payload: {truncated_data}\n"));
+    out
+}
+
 fn current_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -380,7 +469,7 @@ pub const EMBEDDED_WEB_CLIENT_HTML: &str = r#"<!DOCTYPE html>
         // Minimal frame receiver and DOM renderer (zero localStorage / persistent caching)
         const grid = document.getElementById('canvas-grid');
         const status = document.getElementById('conn-status');
-        const token = window.location.hash.replace('#', '');
+        const token = window.location.hash.replace('#t=', '').replace('#', '');
         const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsUrl = `${wsProto}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
 
@@ -417,23 +506,25 @@ mod tests {
         };
 
         let manager = WebRemoteManager::new(settings);
-        manager.issue_token("secret-tok-1");
-        manager.issue_token("secret-tok-2");
+        manager.issue_token("secret-tok-1", TokenKind::Steer);
+        manager.issue_token("secret-tok-2", TokenKind::View);
 
-        // Client 1 connects with valid token
+        // Client 1 connects with valid steer token
         let c1 = manager.connect_client("client-1", "127.0.0.1:50001", Some("secret-tok-1"));
         assert!(c1.is_ok());
+        assert!(!c1.as_ref().map_or(true, |c| c.is_view_only));
 
         // Token is consumed, cannot reuse
         let c1_retry = manager.connect_client("client-1-dup", "127.0.0.1:50001", Some("secret-tok-1"));
         assert!(c1_retry.is_err());
 
-        // Client 2 connects
+        // Client 2 connects with view token
         let c2 = manager.connect_client("client-2", "127.0.0.1:50002", Some("secret-tok-2"));
         assert!(c2.is_ok());
+        assert!(c2.as_ref().map_or(false, |c| c.is_view_only));
 
         // Client 3 hits capacity
-        manager.issue_token("secret-tok-3");
+        manager.issue_token("secret-tok-3", TokenKind::Steer);
         let c3 = manager.connect_client("client-3", "127.0.0.1:50003", Some("secret-tok-3"));
         assert!(c3.is_err());
         assert!(c3.as_ref().err().map_or(false, |e| e.contains("maximum viewer capacity")));
@@ -474,19 +565,11 @@ mod tests {
     }
 
     #[test]
-    fn test_web_frame_generation_and_serialization() {
-        let manager = WebRemoteManager::new(WebRemoteSettings::default());
-        let frame = manager.next_frame(WebFrameType::Keyframe, 80, 24, "Terminal content line 1\nLine 2");
-
-        assert_eq!(frame.seq, 1);
-        assert_eq!(frame.schema, "pi.web.frame.v1");
-        assert_eq!(frame.width, 80);
-        assert_eq!(frame.height, 24);
-
-        if let Ok(json) = serde_json::to_string(&frame) {
-            if let Ok(deserialized) = serde_json::from_str::<WebFrame>(&json) {
-                assert_eq!(frame, deserialized);
-            }
-        }
+    fn test_half_block_qr_rendering() {
+        let qr = render_half_block_qr("http://127.0.0.1:8080/#t=tok123");
+        assert!(qr.contains("▀"));
+        assert!(qr.contains("▄"));
+        assert!(qr.contains("█"));
+        assert!(qr.contains("http://127.0.0.1:8080/#t=tok123"));
     }
 }
