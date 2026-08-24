@@ -2773,6 +2773,148 @@ struct PerformanceBudgetDefinition {
     ci_enforced: bool,
 }
 
+fn perf_measurement_control_failure_ids(budget_name: &str) -> Option<&'static [&'static str]> {
+    match budget_name {
+        "binary_size_release" => Some(&[
+            "missing_binary_size_measurement_control",
+            "invalid_binary_size_measurement_control",
+        ]),
+        "idle_memory_rss" => Some(&[
+            "missing_idle_rss_measurement_control",
+            "invalid_idle_rss_measurement_control",
+        ]),
+        "ext_cold_load_simple_p95" | "ext_cold_load_complex_p95" => Some(&[
+            "missing_cold_load_measurement_control",
+            "invalid_cold_load_measurement_control",
+            "noisy_cold_load_measurement_control",
+        ]),
+        _ => None,
+    }
+}
+
+fn perf_lower_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn perf_proof_field<'a>(fields: &'a [&str], index: usize, key: &str) -> Result<&'a str, String> {
+    fields
+        .get(index)
+        .and_then(|field| field.strip_prefix(key))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("measurement negative-control proof requires {key}<value>"))
+}
+
+fn validate_perf_measurement_control_source(
+    budget_name: &str,
+    source: &str,
+    actual: f64,
+) -> Result<(), String> {
+    let (artifact_source, proof) = source.split_once("#control=").ok_or_else(|| {
+        format!(
+            "budget result {budget_name} with data lacks its required measurement negative-control proof"
+        )
+    })?;
+    if artifact_source.is_empty() || artifact_source.contains("#control=") {
+        return Err(format!(
+            "budget result {budget_name} has a malformed measurement artifact source"
+        ));
+    }
+    let fields: Vec<_> = proof.split(';').collect();
+    match budget_name {
+        "binary_size_release" => {
+            if fields.len() != 7
+                || fields[0] != "release_binary_v1"
+                || fields[4] != "profile=release"
+                || fields[5] != "opt_level=z"
+                || fields[6] != "strip=true"
+            {
+                return Err("binary_size_release has a malformed measurement proof".to_string());
+            }
+            let control_sha256 = perf_proof_field(&fields, 1, "control_sha256=")?;
+            let binary_sha256 = perf_proof_field(&fields, 2, "binary_sha256=")?;
+            let size_bytes = perf_proof_field(&fields, 3, "size_bytes=")?
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "binary_size_release size_bytes must be positive".to_string())?;
+            if !perf_lower_sha256(control_sha256) || !perf_lower_sha256(binary_sha256) {
+                return Err(
+                    "binary_size_release proof hashes must be lowercase SHA-256".to_string()
+                );
+            }
+            let measured_mb = size_bytes as f64 / 1024.0 / 1024.0;
+            if (actual - measured_mb).abs() > 1e-12 {
+                return Err(
+                    "binary_size_release actual does not match negative-control size_bytes"
+                        .to_string(),
+                );
+            }
+        }
+        "idle_memory_rss" => {
+            if fields.len() != 7 || fields[0] != "idle_rss_v1" || fields[3] != "process=pi" {
+                return Err("idle_memory_rss has a malformed measurement proof".to_string());
+            }
+            let control_sha256 = perf_proof_field(&fields, 1, "control_sha256=")?;
+            perf_proof_field(&fields, 2, "pid=")?
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "idle_memory_rss pid must be positive".to_string())?;
+            let allocator = perf_proof_field(&fields, 4, "allocator=")?;
+            let binary_sha256 = perf_proof_field(&fields, 5, "binary_sha256=")?;
+            let rss_bytes = perf_proof_field(&fields, 6, "rss_bytes=")?
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "idle_memory_rss rss_bytes must be positive".to_string())?;
+            if !matches!(allocator, "system" | "jemalloc")
+                || !perf_lower_sha256(control_sha256)
+                || !perf_lower_sha256(binary_sha256)
+            {
+                return Err("idle_memory_rss proof identity is invalid".to_string());
+            }
+            let measured_mb = rss_bytes as f64 / 1024.0 / 1024.0;
+            if (actual - measured_mb).abs() > 1e-12 {
+                return Err(
+                    "idle_memory_rss actual does not match negative-control rss_bytes".to_string(),
+                );
+            }
+        }
+        "ext_cold_load_simple_p95" | "ext_cold_load_complex_p95" => {
+            if fields.len() != 8 || fields[0] != "bench_env_v1" {
+                return Err(format!("{budget_name} has a malformed measurement proof"));
+            }
+            for (index, key) in [
+                (1, "control_sha256="),
+                (2, "artifact_sha256="),
+                (3, "bench_env_sha256="),
+            ] {
+                if !perf_lower_sha256(perf_proof_field(&fields, index, key)?) {
+                    return Err(format!(
+                        "{budget_name} proof hashes must be lowercase SHA-256"
+                    ));
+                }
+            }
+            let noise_score = perf_proof_field(&fields, 4, "noise_score=")?
+                .parse::<u8>()
+                .map_err(|_| format!("{budget_name} noise_score must be an integer"))?;
+            for (index, key) in [(5, "governor="), (6, "aslr="), (7, "thp=")] {
+                perf_proof_field(&fields, index, key)?;
+            }
+            if noise_score != 0 {
+                return Err(format!(
+                    "budget result {budget_name} admits a noisy bench-env fingerprint"
+                ));
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn perf_exact_object<'a>(
     value: &'a Value,
     required: &[&str],
@@ -3078,6 +3220,7 @@ fn validate_performance_budget_summary(
     let mut ci_with_data = 0usize;
     let mut ci_fail = 0usize;
     let mut ci_no_data = 0usize;
+    let mut missing_measurement_controls = HashSet::new();
     for (index, result) in results.iter().enumerate() {
         let label = format!("budget_results[{index}]");
         let object = perf_exact_object(
@@ -3113,7 +3256,7 @@ fn validate_performance_budget_summary(
                 "budget result {name} does not match its category/unit/threshold/CI definition"
             ));
         }
-        perf_nonempty_string(&object["source"], &format!("{label}.source"))?;
+        let source = perf_nonempty_string(&object["source"], &format!("{label}.source"))?;
 
         let status = object["status"]
             .as_str()
@@ -3129,7 +3272,14 @@ fn validate_performance_budget_summary(
         }
 
         if object["actual"].is_null() {
-            if strict_mode && definition.ci_enforced {
+            if perf_measurement_control_failure_ids(name).is_some() {
+                missing_measurement_controls.insert(name.to_string());
+                if status != "NO_DATA" || failure_reason.is_some() {
+                    return Err(format!(
+                        "budget {name} without a verified measurement control must be NO_DATA without a failure reason"
+                    ));
+                }
+            } else if strict_mode && definition.ci_enforced {
                 if status != "FAIL"
                     || failure_reason.and_then(Value::as_str) != Some("missing_measurement_data")
                 {
@@ -3157,6 +3307,9 @@ fn validate_performance_budget_summary(
                 return Err(format!(
                     "budget result {name} is inconsistent with actual={actual}, threshold={threshold}, and expected status={expected_status}"
                 ));
+            }
+            if perf_measurement_control_failure_ids(name).is_some() {
+                validate_perf_measurement_control_source(name, source, actual)?;
             }
         }
 
@@ -3191,6 +3344,7 @@ fn validate_performance_budget_summary(
     }
 
     let mut failure_fingerprints = HashSet::new();
+    let mut failure_ids_by_budget: HashMap<String, HashSet<String>> = HashMap::new();
     for (index, failure) in failures.iter().enumerate() {
         let label = format!("failing_data_contracts[{index}]");
         let object = perf_exact_object(
@@ -3213,11 +3367,32 @@ fn validate_performance_budget_summary(
                         "data-contract failure references unknown budget: {name}"
                     ));
                 }
+                failure_ids_by_budget
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(contract_id.to_string());
                 Some(name)
             }
         };
         if !failure_fingerprints.insert((contract_id, detail, remediation, budget_name)) {
             return Err(format!("duplicate data-contract failure at index {index}"));
+        }
+    }
+
+    for budget_name in missing_measurement_controls {
+        let allowed_ids = perf_measurement_control_failure_ids(&budget_name)
+            .expect("measurement-control budget was classified above");
+        let has_named_failure = failure_ids_by_budget
+            .get(&budget_name)
+            .is_some_and(|observed| {
+                allowed_ids
+                    .iter()
+                    .any(|allowed| observed.contains(*allowed))
+            });
+        if !has_named_failure {
+            return Err(format!(
+                "budget result {budget_name} without data lacks a named measurement-control failure"
+            ));
         }
     }
 
@@ -3946,11 +4121,31 @@ fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
             })
         })
         .collect();
-    let first_budget_name = budgets
-        .first()
-        .and_then(|budget| budget["name"].as_str())
-        .expect("canonical budget inventory must be non-empty")
-        .to_string();
+    let measurement_control_failures = [
+        (
+            "binary_size_release",
+            "missing_binary_size_measurement_control",
+        ),
+        ("idle_memory_rss", "missing_idle_rss_measurement_control"),
+        (
+            "ext_cold_load_simple_p95",
+            "missing_cold_load_measurement_control",
+        ),
+        (
+            "ext_cold_load_complex_p95",
+            "missing_cold_load_measurement_control",
+        ),
+    ]
+    .into_iter()
+    .map(|(budget_name, contract_id)| {
+        json!({
+            "contract_id": contract_id,
+            "budget_name": budget_name,
+            "detail": "measurement control missing",
+            "remediation": "regenerate the measurement control"
+        })
+    })
+    .collect::<Vec<_>>();
     json!({
         "schema": PERF_BUDGET_SUMMARY_SCHEMA,
         "generated_at": performance_fixture_timestamp(now),
@@ -3966,13 +4161,8 @@ fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
         "pass": 0,
         "fail": 0,
         "no_data": total_budgets,
-        "data_contract_failures_count": 1,
-        "failing_data_contracts": [{
-            "contract_id": "missing_or_stale_budget_artifact",
-            "budget_name": first_budget_name,
-            "detail": "measurement missing",
-            "remediation": "regenerate the measurement"
-        }],
+        "data_contract_failures_count": measurement_control_failures.len(),
+        "failing_data_contracts": measurement_control_failures,
         "budgets": budgets,
         "budget_results": budget_results,
         "claim_readiness": {
@@ -4019,6 +4209,25 @@ fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
     {
         result["actual"] = result["threshold"].clone();
         result["status"] = json!("PASS");
+        let proof_hash = "b".repeat(64);
+        match result["budget_name"].as_str() {
+            Some("binary_size_release") => {
+                result["source"] = json!(format!(
+                    "fixture://release/pi#control=release_binary_v1;control_sha256={proof_hash};binary_sha256={proof_hash};size_bytes=50331648;profile=release;opt_level=z;strip=true"
+                ));
+            }
+            Some("idle_memory_rss") => {
+                result["source"] = json!(format!(
+                    "fixture://idle-rss#control=idle_rss_v1;control_sha256={proof_hash};pid=4242;process=pi;allocator=system;binary_sha256={proof_hash};rss_bytes=52428800"
+                ));
+            }
+            Some("ext_cold_load_simple_p95" | "ext_cold_load_complex_p95") => {
+                result["source"] = json!(format!(
+                    "fixture://criterion#control=bench_env_v1;control_sha256={proof_hash};artifact_sha256={proof_hash};bench_env_sha256={proof_hash};noise_score=0;governor=performance;aslr=enabled;thp=never"
+                ));
+            }
+            _ => {}
+        }
     }
     summary["claim_readiness"] = json!({
         "status": "claim_ready",
@@ -7718,6 +7927,63 @@ fn performance_contract_rejects_count_or_status_inconsistency() {
         validate_performance_budget_summary(&non_ci_failure, now, Duration::hours(168), true)
             .expect_err("global authorization must reject a failed non-CI budget");
     assert!(error.contains("budget_failed"), "{error}");
+}
+
+#[test]
+fn performance_contract_rejects_forged_tampered_and_unproven_measurements() {
+    let now = Utc::now();
+
+    let mut forged = claim_ready_performance_summary_fixture(now);
+    let binary_index = forged["budget_results"]
+        .as_array()
+        .expect("fixture budget results")
+        .iter()
+        .position(|result| result["budget_name"] == "binary_size_release")
+        .expect("binary-size result");
+    forged["budget_results"][binary_index]["source"] = json!("fixture://release/pi");
+    let error = validate_performance_budget_summary(&forged, now, Duration::hours(168), true)
+        .expect_err("an unproven binary measurement must be rejected");
+    assert!(error.contains("negative-control proof"), "{error}");
+
+    let mut tampered = claim_ready_performance_summary_fixture(now);
+    let source = tampered["budget_results"][binary_index]["source"]
+        .as_str()
+        .expect("binary proof source")
+        .replace("size_bytes=50331648", "size_bytes=1");
+    tampered["budget_results"][binary_index]["source"] = json!(source);
+    let error = validate_performance_budget_summary(&tampered, now, Duration::hours(168), true)
+        .expect_err("a size claim detached from its measured bytes must be rejected");
+    assert!(error.contains("size_bytes"), "{error}");
+
+    let mut noisy = claim_ready_performance_summary_fixture(now);
+    let cold_index = noisy["budget_results"]
+        .as_array()
+        .expect("fixture budget results")
+        .iter()
+        .position(|result| result["budget_name"] == "ext_cold_load_simple_p95")
+        .expect("cold-load result");
+    let source = noisy["budget_results"][cold_index]["source"]
+        .as_str()
+        .expect("cold-load proof source")
+        .replace("noise_score=0", "noise_score=1");
+    noisy["budget_results"][cold_index]["source"] = json!(source);
+    let error = validate_performance_budget_summary(&noisy, now, Duration::hours(168), true)
+        .expect_err("a noisy benchmark environment must be rejected");
+    assert!(error.contains("noisy bench-env"), "{error}");
+
+    let mut unnamed_missing = blocked_performance_summary_fixture(now);
+    let failures = unnamed_missing["failing_data_contracts"]
+        .as_array_mut()
+        .expect("fixture failures");
+    failures.retain(|failure| failure["budget_name"] != "binary_size_release");
+    unnamed_missing["data_contract_failures_count"] = json!(failures.len());
+    let error =
+        validate_performance_budget_summary(&unnamed_missing, now, Duration::hours(168), false)
+            .expect_err("NO_DATA must identify the failed binary measurement control");
+    assert!(
+        error.contains("named measurement-control failure"),
+        "{error}"
+    );
 }
 
 #[test]

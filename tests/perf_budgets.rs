@@ -1040,9 +1040,7 @@ fn measurement_control_candidate_paths(
     dedup_paths(paths)
 }
 
-fn first_existing_control_path(
-    candidates: &[PathBuf],
-) -> Result<&Path, MeasurementControlError> {
+fn first_existing_control_path(candidates: &[PathBuf]) -> Result<&Path, MeasurementControlError> {
     candidates
         .iter()
         .find(|path| path.exists())
@@ -1066,26 +1064,19 @@ fn binary_size_control_candidates(root: &Path) -> Vec<PathBuf> {
 }
 
 fn cold_load_control_candidates(root: &Path) -> Vec<PathBuf> {
-    measurement_control_candidate_paths(
-        root,
-        "PERF_COLD_LOAD_CONTROL_PATH",
-        COLD_LOAD_CONTROL_FILE,
-    )
+    measurement_control_candidate_paths(root, "PERF_COLD_LOAD_CONTROL_PATH", COLD_LOAD_CONTROL_FILE)
 }
 
 fn idle_rss_control_candidates(root: &Path) -> Vec<PathBuf> {
-    measurement_control_candidate_paths(
-        root,
-        "PERF_IDLE_RSS_CONTROL_PATH",
-        IDLE_RSS_CONTROL_FILE,
-    )
+    measurement_control_candidate_paths(root, "PERF_IDLE_RSS_CONTROL_PATH", IDLE_RSS_CONTROL_FILE)
 }
 
 fn verify_binary_size_control_for_root(
     root: &Path,
 ) -> Result<VerifiedBinarySizeMeasurement, MeasurementControlError> {
     let candidates = binary_size_control_candidates(root);
-    let verified = verify_binary_size_measurement_control(first_existing_control_path(&candidates)?)?;
+    let verified =
+        verify_binary_size_measurement_control(first_existing_control_path(&candidates)?)?;
     let admissible_binary = binary_size_candidate_paths(root)
         .into_iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
@@ -1105,8 +1096,7 @@ fn verify_cold_load_control_for_root(
     let candidates = cold_load_control_candidates(root);
     let verified =
         verify_cold_load_measurement_control(first_existing_control_path(&candidates)?, extension)?;
-    let relative =
-        format!("criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json");
+    let relative = format!("criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json");
     let admissible_artifact = criterion_estimate_candidate_paths(root, &relative)
         .into_iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
@@ -2004,17 +1994,22 @@ fn evaluate_release_measurement_controls(root: &Path) -> Vec<DataContractFailure
             &error,
         ));
     }
-    if let Err(error) = verify_cold_load_control_for_root(root, "hello") {
-        let contract_id = match &error {
-            MeasurementControlError::Missing(_) => "missing_cold_load_measurement_control",
-            MeasurementControlError::Invalid(_) => "invalid_cold_load_measurement_control",
-            MeasurementControlError::Noisy { .. } => "noisy_cold_load_measurement_control",
-        };
-        failures.push(measurement_control_failure(
-            contract_id,
-            "ext_cold_load_simple_p95",
-            &error,
-        ));
+    for (extension, budget_name) in [
+        ("hello", "ext_cold_load_simple_p95"),
+        ("pirate", "ext_cold_load_complex_p95"),
+    ] {
+        if let Err(error) = verify_cold_load_control_for_root(root, extension) {
+            let contract_id = match &error {
+                MeasurementControlError::Missing(_) => "missing_cold_load_measurement_control",
+                MeasurementControlError::Invalid(_) => "invalid_cold_load_measurement_control",
+                MeasurementControlError::Noisy { .. } => "noisy_cold_load_measurement_control",
+            };
+            failures.push(measurement_control_failure(
+                contract_id,
+                budget_name,
+                &error,
+            ));
+        }
     }
     failures
 }
@@ -3052,10 +3047,7 @@ fn read_idle_memory_rss(root: &Path) -> (Option<f64>, String) {
         verified.binary_sha256,
         verified.rss_bytes,
     );
-    (
-        Some(verified.rss_bytes as f64 / 1024.0 / 1024.0),
-        source,
-    )
+    (Some(verified.rss_bytes as f64 / 1024.0 / 1024.0), source)
 }
 
 fn read_binary_size(root: &Path) -> (Option<f64>, String) {
@@ -3070,10 +3062,7 @@ fn read_binary_size(root: &Path) -> (Option<f64>, String) {
         verified.binary_sha256,
         verified.size_bytes,
     );
-    (
-        Some(verified.size_bytes as f64 / 1024.0 / 1024.0),
-        source,
-    )
+    (Some(verified.size_bytes as f64 / 1024.0 / 1024.0), source)
 }
 
 fn read_criterion_protocol_parse(root: &Path) -> (Option<f64>, String) {
@@ -4716,14 +4705,19 @@ fn classify_budget_status_promotes_ci_no_data_to_fail_under_strict() {
 
 #[test]
 fn idle_memory_budget_rejects_test_harness_rss_as_release_evidence() {
-    let (actual, source) = read_idle_memory_rss();
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let (actual, source) = read_idle_memory_rss(tmp.path());
     assert_eq!(actual, None);
-    assert!(source.contains("test-harness process RSS is inadmissible"));
+    assert!(source.contains("measurement control is missing"));
     let budget = BUDGETS
         .iter()
         .find(|budget| budget.name == "idle_memory_rss")
         .expect("idle-memory budget");
     assert_eq!(classify_budget_status(budget, actual, true), "FAIL");
+    assert_eq!(
+        check_budget_with_strict_at_root(budget, true, tmp.path()).status,
+        "NO_DATA"
+    );
 }
 
 #[test]
@@ -4741,6 +4735,61 @@ fn artifact_contract_flags_stale_evidence() {
     );
 }
 
+fn write_binary_size_control_fixture(root: &Path, source_dirty: bool) -> PathBuf {
+    let binary_path = root.join("target/release/pi");
+    std::fs::create_dir_all(binary_path.parent().expect("binary parent"))
+        .expect("create binary directory");
+    std::fs::write(&binary_path, b"fixture release pi").expect("write fixture release binary");
+    let binary_path = std::fs::canonicalize(binary_path).expect("canonical fixture binary");
+    let control_path = root.join("target/perf/release_evidence/binary_size_measurement.json");
+    std::fs::create_dir_all(control_path.parent().expect("control parent"))
+        .expect("create control directory");
+    let control = json!({
+        "schema": "pi.perf.binary_size_measurement.v1",
+        "generated_at": "2026-08-24T00:00:00Z",
+        "run_id": "fixture-run",
+        "correlation_id": "fixture-run",
+        "source_commit": "1234567890abcdef1234567890abcdef12345678",
+        "source_dirty": source_dirty,
+        "binary_path": binary_path,
+        "binary_sha256": sha256_file(&binary_path).expect("hash fixture binary"),
+        "size_bytes": 18,
+        "cargo_profile": "release",
+        "compiled_profile_family": "release",
+        "compiled_opt_level": "z",
+        "strip": true,
+        "profile_source": "Cargo.toml#profile.release",
+        "build_command": "cargo build --bin pi --release"
+    });
+    std::fs::write(
+        &control_path,
+        serde_json::to_vec(&control).expect("serialize fixture control"),
+    )
+    .expect("write fixture control");
+    control_path
+}
+
+#[test]
+fn binary_size_budget_requires_hash_bound_release_control() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    write_binary_size_control_fixture(tmp.path(), false);
+
+    let (actual, source) = read_binary_size(tmp.path());
+    assert_eq!(actual, Some(18.0 / 1024.0 / 1024.0));
+    assert!(source.contains("#control=release_binary_v1;"));
+    assert!(source.contains("profile=release;opt_level=z;strip=true"));
+
+    write_binary_size_control_fixture(tmp.path(), true);
+    let (actual, source) = read_binary_size(tmp.path());
+    assert_eq!(actual, None);
+    assert!(source.contains("source_dirty must be false"));
+    let failures = evaluate_release_measurement_controls(tmp.path());
+    assert!(failures.iter().any(|failure| {
+        failure.contract_id == "invalid_binary_size_measurement_control"
+            && failure.budget_name.as_deref() == Some("binary_size_release")
+    }));
+}
+
 #[test]
 fn binary_size_candidate_builder_is_release_only() {
     let target_dir = Path::new("/tmp/pi-agent-target");
@@ -4752,9 +4801,11 @@ fn binary_size_candidate_builder_is_release_only() {
 fn binary_size_candidate_builder_prefers_override_then_release() {
     let target_dir = Path::new("/tmp/pi-agent-target");
     let override_path = target_dir.join("custom-release/pi");
-    let candidates =
-        build_binary_size_candidate_paths(target_dir, Some(override_path.clone()), "");
-    assert_eq!(candidates, vec![override_path, target_dir.join("release/pi")]);
+    let candidates = build_binary_size_candidate_paths(target_dir, Some(override_path.clone()), "");
+    assert_eq!(
+        candidates,
+        vec![override_path, target_dir.join("release/pi")]
+    );
 }
 
 #[test]
@@ -4791,7 +4842,6 @@ fn binary_size_candidate_builder_dedups_override_matching_release() {
         build_binary_size_candidate_paths(target_dir, Some(release.clone()), "release");
     assert_eq!(candidates, vec![release]);
 }
-
 
 fn valid_context_intelligence_budget_artifact_fixture() -> Value {
     json!({
