@@ -56,6 +56,7 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const VCR_TEST_NAME: &str = "e2e_tui_tool_read";
 const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
+const VCR_RICH_MARKDOWN_TEST_NAME: &str = "e2e_tui_rich_markdown";
 const VCR_MULTI_TOOL_CHAIN_TEST_NAME: &str = "e2e_tui_multi_tool_chain";
 const VCR_SCROLL_FINALIZE_TEST_NAME: &str = "e2e_tui_scroll_finalize";
 const VCR_MODEL: &str = "claude-sonnet-4-20250514";
@@ -63,6 +64,8 @@ const VCR_MODEL_MAX_TOKENS: u32 = 64_000;
 const VCR_PROMPT: &str = "Read sample.txt";
 const VCR_BASIC_CHAT_PROMPT: &str = "Say hello";
 const VCR_BASIC_CHAT_RESPONSE: &str = "Hello! How can I help you today?";
+const VCR_RICH_MARKDOWN_PROMPT: &str = "Show the requested rich markdown";
+const VCR_RICH_MARKDOWN_RESPONSE: &str = r"Palette #33AAFF and math \alpha + \infty";
 const VCR_SCROLL_FINALIZE_PROMPT: &str = "Emit a long scrolling response";
 const VCR_SCROLL_FINALIZE_LAST_LINE: &str = "FINAL-LINE-SCROLL-FINALIZE";
 const SAMPLE_FILE_NAME: &str = "sample.txt";
@@ -323,12 +326,29 @@ fn vcr_scroll_finalize_response() -> String {
 
 /// Write a VCR cassette for a basic chat interaction (no tools, simple text response).
 fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
-    let cassette_path = dir.join(format!("{VCR_BASIC_CHAT_TEST_NAME}.json"));
+    write_vcr_text_chat_cassette(
+        dir,
+        system_prompt,
+        VCR_BASIC_CHAT_TEST_NAME,
+        VCR_BASIC_CHAT_PROMPT,
+        VCR_BASIC_CHAT_RESPONSE,
+    )
+}
+
+/// Write a VCR cassette for a single no-tools text turn.
+fn write_vcr_text_chat_cassette(
+    dir: &Path,
+    system_prompt: &str,
+    test_name: &str,
+    prompt: &str,
+    response_text: &str,
+) -> PathBuf {
+    let cassette_path = dir.join(format!("{test_name}.json"));
 
     let mut request = json!({
         "model": VCR_MODEL,
         "messages": [
-            { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
+            { "role": "user", "content": [ { "type": "text", "text": prompt } ] }
         ],
         "system": system_prompt,
         "max_tokens": VCR_MODEL_MAX_TOKENS,
@@ -365,7 +385,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
                 json!({
                     "type": "content_block_delta",
                     "index": 0,
-                    "delta": { "type": "text_delta", "text": VCR_BASIC_CHAT_RESPONSE }
+                    "delta": { "type": "text_delta", "text": response_text }
                 }),
             ),
             sse_chunk(
@@ -387,7 +407,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
 
     let cassette = Cassette {
         version: "1.0".to_string(),
-        test_name: VCR_BASIC_CHAT_TEST_NAME.to_string(),
+        test_name: test_name.to_string(),
         recorded_at: "1970-01-01T00:00:00Z".to_string(),
         interactions: vec![Interaction {
             request: RecordedRequest {
@@ -1065,6 +1085,46 @@ fn e2e_tui_startup_and_exit() {
         !session.steps().is_empty(),
         "Expected at least one recorded step"
     );
+}
+
+/// E2E chrome: the shipped TUI footer renders the status-line module.
+#[test]
+fn e2e_tui_startup_renders_powerline_status() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_startup_renders_powerline_status")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&base_interactive_args());
+    let pane = session.wait_and_capture("powerline", "ctx: 0%", STARTUP_TIMEOUT);
+    assert!(
+        pane.contains("ACT / ctx: 0%"),
+        "Expected compact powerline mode/context segments; got:\n{pane}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+}
+
+/// E2E chrome: the shipped TUI emits the delight OSC terminal title.
+#[test]
+fn e2e_tui_startup_sets_delight_terminal_title() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_startup_sets_delight_terminal_title")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    session.launch(&base_interactive_args());
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    let title = session.tmux.pane_title();
+    assert_eq!(title, "Pi · openai/gpt-4o-mini · ready");
+
+    session.exit_gracefully();
+    session.write_artifacts();
 }
 
 #[test]
@@ -1890,6 +1950,63 @@ fn e2e_tui_basic_chat_vcr() {
         "Expected >= 2 steps (startup + prompt), got {}",
         session.steps().len()
     );
+}
+
+/// E2E chrome: assistant text reaches the rich-markdown renderer in the
+/// shipped TUI rather than only exercising the module API in isolation.
+#[test]
+fn e2e_tui_rich_markdown_response_uses_chrome_renderer() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_rich_markdown_response_uses_chrome_renderer")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let cassette_dir = session.harness.temp_path("vcr");
+    let env_root = session.harness.temp_dir().join("env");
+    let system_prompt = build_vcr_system_prompt_for_args(
+        vcr_interactive_args_no_tools,
+        session.harness.temp_dir(),
+        &env_root,
+    );
+    let cassette_path = write_vcr_text_chat_cassette(
+        &cassette_dir,
+        &system_prompt,
+        VCR_RICH_MARKDOWN_TEST_NAME,
+        VCR_RICH_MARKDOWN_PROMPT,
+        VCR_RICH_MARKDOWN_RESPONSE,
+    );
+    session
+        .harness
+        .record_artifact("rich-markdown-cassette.json", &cassette_path);
+
+    session.set_env(VCR_ENV_MODE, "playback");
+    session.set_env(VCR_ENV_DIR, &cassette_dir.display().to_string());
+    session.set_env("PI_VCR_TEST_NAME", VCR_RICH_MARKDOWN_TEST_NAME);
+    session.set_env("PI_TEST_MODE", "1");
+
+    session.launch(&vcr_interactive_args_no_tools());
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    let pane = session.send_text_and_wait(
+        "rich_markdown_response",
+        VCR_RICH_MARKDOWN_PROMPT,
+        "■ #33AAFF",
+        COMMAND_TIMEOUT,
+    );
+
+    assert!(pane.contains('α'), "LaTeX alpha was not enriched:\n{pane}");
+    assert!(
+        pane.contains('∞'),
+        "LaTeX infinity was not enriched:\n{pane}"
+    );
+    assert!(
+        pane.contains("■ #33AAFF"),
+        "Hex swatch was not enriched:\n{pane}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
 }
 
 /// E2E interactive: regression for long streamed responses.

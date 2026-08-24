@@ -173,6 +173,16 @@ impl TmuxInstance {
         String::from_utf8_lossy(&output.stdout).to_string()
     }
 
+    /// Return the title most recently set by the process in the target pane.
+    pub fn pane_title(&self) -> String {
+        let target = self.target_pane();
+        let output = self.run_checked(
+            &["display-message", "-p", "-t", &target, "#{pane_title}"],
+            "display-message pane_title",
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
     fn try_capture_pane(&self) -> Option<String> {
         let target = self.target_pane();
         let output = self.tmux_output(&["capture-pane", "-t", &target, "-p", "-S", "-2000"]);
