@@ -32,7 +32,10 @@ struct CalibrateArgs {
     #[arg(long, default_value = "docs/evidence/nrun-measurement-series.json")]
     input: PathBuf,
     /// Output path for the calibration artifact.
-    #[arg(long, default_value = "docs/evidence/conformal-budget-calibration.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/conformal-budget-calibration.json"
+    )]
     output: PathBuf,
     /// Target empirical coverage level (e.g. 0.95 for 95% coverage).
     #[arg(long, default_value_t = 0.95)]
@@ -48,10 +51,16 @@ struct CalibrateArgs {
 #[derive(Debug, Args)]
 struct VerifyArgs {
     /// Path to the conformal calibration artifact.
-    #[arg(long, default_value = "docs/evidence/conformal-budget-calibration.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/conformal-budget-calibration.json"
+    )]
     input: PathBuf,
     /// Contract path for conformal calibration rules.
-    #[arg(long, default_value = "docs/contracts/conformal-budget-calibration-contract.json")]
+    #[arg(
+        long,
+        default_value = "docs/contracts/conformal-budget-calibration-contract.json"
+    )]
     contract: PathBuf,
 }
 
@@ -177,7 +186,9 @@ pub fn compute_conformal_threshold(
         Ok((threshold, q_idx, base_val))
     } else {
         // Upper quantile bound for latency/maximums: index = ceil((n + 1) * (1 - alpha))
-        let q_idx = (((n + 1) as f64) * (1.0 - alpha)).ceil().clamp(1.0, n as f64) as usize;
+        let q_idx = (((n + 1) as f64) * (1.0 - alpha))
+            .ceil()
+            .clamp(1.0, n as f64) as usize;
         let base_val = sorted.get(q_idx.saturating_sub(1)).copied().unwrap_or(0.0);
         let threshold = base_val * padding_multiplier.max(1.0);
         Ok((threshold, q_idx, base_val))
@@ -387,7 +398,11 @@ fn main() -> Result<()> {
 
             let amendment_dry_runs = if let Some(series) = ext_cold_load_series {
                 let (cal_thresh, _, _) = compute_conformal_threshold(
-                    &series.samples.iter().map(|s| s.raw_value).collect::<Vec<_>>(),
+                    &series
+                        .samples
+                        .iter()
+                        .map(|s| s.raw_value)
+                        .collect::<Vec<_>>(),
                     &series.comparison,
                     config.target_coverage,
                     config.conformal_padding_multiplier,
@@ -409,7 +424,8 @@ fn main() -> Result<()> {
             let artifact = ConformalCalibrationArtifact {
                 schema: CONFORMAL_ARTIFACT_SCHEMA.to_string(),
                 generated_at: Utc::now().to_rfc3339(),
-                contract_path: "docs/contracts/conformal-budget-calibration-contract.json".to_string(),
+                contract_path: "docs/contracts/conformal-budget-calibration-contract.json"
+                    .to_string(),
                 config,
                 total_budgets: calibrated_budgets.len(),
                 data_derived_count: data_derived,
@@ -433,8 +449,9 @@ fn main() -> Result<()> {
             );
         }
         CommandMode::Verify(args) => {
-            let artifact_text = fs::read_to_string(&args.input)
-                .with_context(|| format!("failed to read artifact from {}", args.input.display()))?;
+            let artifact_text = fs::read_to_string(&args.input).with_context(|| {
+                format!("failed to read artifact from {}", args.input.display())
+            })?;
             let artifact: ConformalCalibrationArtifact = serde_json::from_str(&artifact_text)?;
             let report = verify_conformal_artifact(&artifact, &args.contract);
             println!("{}", serde_json::to_string_pretty(&report)?);

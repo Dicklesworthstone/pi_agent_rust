@@ -144,7 +144,10 @@ pub fn compute_percentile(sorted_samples: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let idx = (((sorted_samples.len() as f64) * p).ceil() as usize).clamp(1, sorted_samples.len());
-    sorted_samples.get(idx.saturating_sub(1)).copied().unwrap_or(0.0)
+    sorted_samples
+        .get(idx.saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0)
 }
 
 pub fn compute_bootstrap_ci(samples: &[f64], resamples: usize) -> (f64, f64) {
@@ -260,7 +263,9 @@ impl std::fmt::Display for StartupIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LowRepetitions(cmd, n) => write!(f, "command {cmd} repetitions {n} < min 10"),
-            Self::ExceedsThreshold(cmd, p95, t) => write!(f, "command {cmd} p95 {p95:.2}ms exceeds threshold {t:.2}ms"),
+            Self::ExceedsThreshold(cmd, p95, t) => {
+                write!(f, "command {cmd} p95 {p95:.2}ms exceeds threshold {t:.2}ms")
+            }
         }
     }
 }
@@ -298,7 +303,11 @@ pub fn verify_startup_artifact(
             issues.push(StartupIssue::LowRepetitions(&cmd.command, cmd.repetitions));
         }
         if cmd.p95_ms > cmd.threshold_ms {
-            issues.push(StartupIssue::ExceedsThreshold(&cmd.command, cmd.p95_ms, cmd.threshold_ms));
+            issues.push(StartupIssue::ExceedsThreshold(
+                &cmd.command,
+                cmd.p95_ms,
+                cmd.threshold_ms,
+            ));
         }
     }
     errors.extend(issues.into_iter().map(|i| i.to_string()));
@@ -356,7 +365,11 @@ fn main() -> Result<()> {
                 size_bytes,
                 size_mb: size_mb_rounded,
                 threshold_mb: 48.0,
-                status: if size_mb_rounded <= 48.0 { "PASS".to_string() } else { "FAIL".to_string() },
+                status: if size_mb_rounded <= 48.0 {
+                    "PASS".to_string()
+                } else {
+                    "FAIL".to_string()
+                },
             };
 
             let env = detect_environment("380af591".to_string());
@@ -392,7 +405,8 @@ fn main() -> Result<()> {
                 args.warmup_runs,
             )?);
 
-            let all_pass = binary_size.status == "PASS" && commands.iter().all(|c| c.status == "PASS");
+            let all_pass =
+                binary_size.status == "PASS" && commands.iter().all(|c| c.status == "PASS");
 
             let artifact = StartupBenchmarkReportArtifact {
                 schema: STARTUP_ARTIFACT_SCHEMA.to_string(),
@@ -401,7 +415,11 @@ fn main() -> Result<()> {
                 environment: env,
                 binary_size,
                 commands,
-                overall_status: if all_pass { "PASS".to_string() } else { "FAIL".to_string() },
+                overall_status: if all_pass {
+                    "PASS".to_string()
+                } else {
+                    "FAIL".to_string()
+                },
             };
 
             let json_out = serde_json::to_string_pretty(&artifact)?;
@@ -417,8 +435,9 @@ fn main() -> Result<()> {
             );
         }
         CommandMode::Verify(args) => {
-            let artifact_text = fs::read_to_string(&args.input)
-                .with_context(|| format!("failed to read artifact from {}", args.input.display()))?;
+            let artifact_text = fs::read_to_string(&args.input).with_context(|| {
+                format!("failed to read artifact from {}", args.input.display())
+            })?;
             let artifact: StartupBenchmarkReportArtifact = serde_json::from_str(&artifact_text)?;
             let report = verify_startup_artifact(&artifact, &args.contract);
             println!("{}", serde_json::to_string_pretty(&report)?);
