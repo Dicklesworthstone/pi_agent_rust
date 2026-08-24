@@ -68,6 +68,8 @@ OUTPUT_DIR="${PERF_OUTPUT_DIR:-$TARGET_DIR/perf/runs/$TIMESTAMP}"
 PREFLIGHT_BEFORE_REFRESH_PATH="$OUTPUT_DIR/results/perf_budget_preflight_before_refresh.json"
 PREFLIGHT_AFTER_RUN_PATH="$OUTPUT_DIR/results/perf_budget_preflight.json"
 STAGING_MANIFEST_PATH="$OUTPUT_DIR/results/perf_artifact_staging_manifest.json"
+BUILD_TESTS_JSONL_PATH="$OUTPUT_DIR/logs/build_tests.jsonl"
+PERF_BUDGET_BINARY_ATTESTATION_PATH="$OUTPUT_DIR/results/perf_budgets_test_binary.json"
 PARALLELISM="${PERF_PARALLELISM:-1}"
 PGO_MODE="${PERF_PGO_MODE:-off}"
 PGO_PROFILE_DATA="${PERF_PGO_PROFILE_DATA:-$TARGET_DIR/perf/$CARGO_PROFILE/pgo_profile/pijs_workload.profdata}"
@@ -916,10 +918,81 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 
   # Build test binaries
   log_step "Building test binaries..."
-  if "${CARGO_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" 2>"$OUTPUT_DIR/logs/build_tests.log"; then
+  if VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+    "${CARGO_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" \
+      --message-format=json-render-diagnostics \
+      >"$BUILD_TESTS_JSONL_PATH" \
+      2>"$OUTPUT_DIR/logs/build_tests.log"; then
     log_ok "Test binaries built"
   else
     log_warn "Test binary build had warnings (see logs/build_tests.log)"
+  fi
+
+  if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
+    && (suite_selected "perf_budgets" || suite_selected "perf_regression"); then
+    if python3 - \
+      "$BUILD_TESTS_JSONL_PATH" \
+      "$TARGET_DIR" \
+      "$CARGO_PROFILE" \
+      "$PERF_BUDGET_BINARY_ATTESTATION_PATH" \
+      "$GIT_COMMIT_FULL" \
+      "$GIT_DIRTY" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+messages_path = Path(sys.argv[1])
+target_dir = Path(sys.argv[2])
+profile = sys.argv[3]
+attestation_path = Path(sys.argv[4])
+source_commit = sys.argv[5]
+source_dirty = sys.argv[6] == "true"
+candidates = []
+for line in messages_path.read_text(encoding="utf-8").splitlines():
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    target = message.get("target", {})
+    executable = message.get("executable")
+    if (
+        message.get("reason") == "compiler-artifact"
+        and target.get("name") == "perf_budgets"
+        and isinstance(executable, str)
+        and executable
+    ):
+        local_candidate = target_dir / profile / "deps" / Path(executable).name
+        if local_candidate.is_file() and local_candidate.stat().st_mode & 0o111:
+            candidates.append(local_candidate.resolve())
+if len(candidates) != 1:
+    raise SystemExit(
+        f"expected exactly one downloaded perf_budgets executable, found {len(candidates)}"
+    )
+binary_path = candidates[0]
+payload = {
+    "schema": "pi.perf.test_binary_attestation.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
+    "cargo_profile": profile,
+    "target_name": "perf_budgets",
+    "binary_path": str(binary_path),
+    "sha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
+}
+attestation_path.write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+    then
+      log_ok "Attested current-build perf_budgets test binary"
+    elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+      die "Failed to attest current-build perf_budgets test binary"
+    else
+      log_warn "Current-build perf_budgets binary attestation is unavailable"
+    fi
   fi
 
   # Build criterion benches if needed
@@ -1714,7 +1787,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
@@ -1723,6 +1796,10 @@ correlation_id = os.environ["CORRELATION_ID"]
 source_commit = os.environ["GIT_COMMIT_FULL"]
 source_dirty = os.environ["GIT_DIRTY"] == "true"
 timestamp = os.environ["TIMESTAMP"]
+run_started_at = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(
+    tzinfo=timezone.utc
+)
+source_clock_skew = timedelta(seconds=120)
 stratification_path = Path(os.environ["STRATIFICATION_PATH"])
 
 manifest_path = output_dir / "manifest.json"
@@ -1744,17 +1821,49 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = line.strip()
         if not line:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "__lineage_parse_error": "invalid_json",
+                    "line_number": line_number,
+                    "detail": str(error),
+                }
+            )
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+        else:
+            rows.append(
+                {
+                    "__lineage_parse_error": "non_object_json",
+                    "line_number": line_number,
+                }
+            )
     return rows
+
+
+def parse_record_timestamp(record: dict):
+    raw = record.get("timestamp", record.get("generated_at"))
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def parse_float(value):
@@ -1807,15 +1916,24 @@ def admit_dataset(path: Path, records: list[dict], correlation_field: str, requi
         observed_correlation = record.get(correlation_field)
         observed_commit = record.get("source_commit")
         observed_dirty = record.get("source_dirty")
+        observed_timestamp = parse_record_timestamp(record)
         reasons = []
         if record.get("__lineage_parse_error"):
             reasons.append(str(record["__lineage_parse_error"]))
         if observed_correlation != correlation_id:
             reasons.append("correlation_id_mismatch")
+        if record.get("run_id") != correlation_id:
+            reasons.append("run_id_mismatch")
         if observed_commit != source_commit:
             reasons.append("source_commit_mismatch")
         if observed_dirty is not False:
             reasons.append("source_dirty_not_false")
+        if observed_timestamp is None:
+            reasons.append("missing_or_invalid_timestamp")
+        elif observed_timestamp < run_started_at - source_clock_skew:
+            reasons.append("timestamp_before_run_start")
+        elif observed_timestamp > datetime.now(timezone.utc) + source_clock_skew:
+            reasons.append("timestamp_in_future")
         if reasons:
             rejected.append({"record_index": index, "reasons": reasons})
         else:
@@ -1830,6 +1948,9 @@ def admit_dataset(path: Path, records: list[dict], correlation_field: str, requi
         "correlation_field": correlation_field,
         "expected_correlation_id": correlation_id,
         "expected_source_commit": source_commit,
+        "expected_min_timestamp": (
+            run_started_at - source_clock_skew
+        ).isoformat().replace("+00:00", "Z"),
         "accepted_record_count": len(accepted),
         "rejected_record_count": len(rejected),
         "rejections": rejected,
@@ -2365,7 +2486,7 @@ import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
@@ -2376,6 +2497,10 @@ source_commit = os.environ["GIT_COMMIT_FULL"]
 source_dirty = os.environ["GIT_DIRTY"] == "true"
 strict_mode = os.environ["PI_PERF_STRICT"] == "1"
 timestamp = os.environ["TIMESTAMP"]
+run_started_at = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(
+    tzinfo=timezone.utc
+)
+source_clock_skew = timedelta(seconds=120)
 phase1_matrix_path = Path(os.environ["PHASE1_MATRIX_PATH"])
 parameter_sweeps_path = Path(os.environ["PARAMETER_SWEEPS_PATH"])
 opportunity_matrix_path = Path(os.environ["OPPORTUNITY_MATRIX_PATH"])
@@ -2429,6 +2554,22 @@ def load_jsonl(path: Path):
                 }
             )
     return rows
+
+
+def parse_record_timestamp(record):
+    raw = record.get("timestamp", record.get("generated_at"))
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def parse_float(value):
@@ -2546,14 +2687,23 @@ def admit_dataset(path, records, correlation_field):
     rejected = []
     for index, record in enumerate(records):
         reasons = []
+        observed_timestamp = parse_record_timestamp(record)
         if record.get("__lineage_parse_error"):
             reasons.append(str(record["__lineage_parse_error"]))
         if record.get(correlation_field) != correlation_id:
             reasons.append("correlation_id_mismatch")
+        if record.get("run_id") != correlation_id:
+            reasons.append("run_id_mismatch")
         if record.get("source_commit") != source_commit:
             reasons.append("source_commit_mismatch")
         if record.get("source_dirty") is not False:
             reasons.append("source_dirty_not_false")
+        if observed_timestamp is None:
+            reasons.append("missing_or_invalid_timestamp")
+        elif observed_timestamp < run_started_at - source_clock_skew:
+            reasons.append("timestamp_before_run_start")
+        elif observed_timestamp > datetime.now(timezone.utc) + source_clock_skew:
+            reasons.append("timestamp_in_future")
         if reasons:
             rejected.append({"record_index": index, "reasons": reasons})
         else:
@@ -2565,6 +2715,9 @@ def admit_dataset(path, records, correlation_field):
         "correlation_field": correlation_field,
         "expected_correlation_id": correlation_id,
         "expected_source_commit": source_commit,
+        "expected_min_timestamp": (
+            run_started_at - source_clock_skew
+        ).isoformat().replace("+00:00", "Z"),
         "accepted_record_count": len(accepted),
         "rejected_record_count": len(rejected),
         "rejections": rejected,
@@ -3878,6 +4031,7 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   GIT_DIRTY="$GIT_DIRTY" \
   POST_GENERATION_CONTRACT_PATH="$POST_GENERATION_CONTRACT_PATH" \
   python3 - <<'PY'
+import hashlib
 import json
 import math
 import os
@@ -3943,6 +4097,14 @@ def validate_source_datasets(path: Path, payload):
         accepted = dataset.get("accepted_record_count")
         rejected = dataset.get("rejected_record_count")
         required = dataset.get("required", True)
+        source_path = dataset.get("path")
+        expected_sha256 = dataset.get("sha256")
+        verify_source_bytes = (
+            required
+            or (isinstance(accepted, int) and accepted > 0)
+            or (isinstance(rejected, int) and rejected > 0)
+            or expected_sha256 is not None
+        )
         if required and (not isinstance(accepted, int) or accepted <= 0):
             failures.append(
                 {
@@ -3951,6 +4113,30 @@ def validate_source_datasets(path: Path, payload):
                     "source_path": dataset.get("path"),
                 }
             )
+        if verify_source_bytes and (not isinstance(source_path, str) or not source_path):
+            failures.append(
+                {"path": str(path), "reason": "missing_source_dataset_path"}
+            )
+        elif verify_source_bytes and not Path(source_path).is_file():
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "source_dataset_missing_after_derivation",
+                    "source_path": source_path,
+                }
+            )
+        elif verify_source_bytes:
+            observed_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+            if not isinstance(expected_sha256, str) or observed_sha256 != expected_sha256:
+                failures.append(
+                    {
+                        "path": str(path),
+                        "reason": "source_dataset_checksum_mismatch",
+                        "source_path": source_path,
+                        "expected_sha256": expected_sha256,
+                        "observed_sha256": observed_sha256,
+                    }
+                )
         if not isinstance(rejected, int) or rejected != 0:
             failures.append(
                 {
@@ -4058,15 +4244,43 @@ mkdir -p "$POST_GENERATION_BUDGET_DIR"
 post_generation_budget_exit=0
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   post_generation_budget_binary=""
-  for candidate in "$TARGET_DIR/$CARGO_PROFILE/deps/perf_budgets-"*; do
-    if [[ -f "$candidate" && -x "$candidate" ]] \
-      && [[ -z "$post_generation_budget_binary" || "$candidate" -nt "$post_generation_budget_binary" ]]; then
-      post_generation_budget_binary="$candidate"
-    fi
-  done
+  post_generation_budget_binary="$(
+    python3 - \
+      "$PERF_BUDGET_BINARY_ATTESTATION_PATH" \
+      "$GIT_COMMIT_FULL" \
+      "$GIT_DIRTY" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+attestation_path = Path(sys.argv[1])
+expected_commit = sys.argv[2]
+expected_dirty = sys.argv[3] == "true"
+try:
+    payload = json.loads(attestation_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid perf_budgets binary attestation: {error}")
+if payload.get("schema") != "pi.perf.test_binary_attestation.v1":
+    raise SystemExit("perf_budgets binary attestation schema mismatch")
+if payload.get("source_commit") != expected_commit:
+    raise SystemExit("perf_budgets binary attestation commit mismatch")
+if payload.get("source_dirty") is not expected_dirty:
+    raise SystemExit("perf_budgets binary attestation dirty-state mismatch")
+if payload.get("target_name") != "perf_budgets":
+    raise SystemExit("perf_budgets binary attestation target mismatch")
+binary_path = Path(str(payload.get("binary_path", "")))
+if not binary_path.is_file() or not binary_path.stat().st_mode & 0o111:
+    raise SystemExit("attested perf_budgets test binary is missing or not executable")
+observed_sha256 = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+if observed_sha256 != payload.get("sha256"):
+    raise SystemExit("attested perf_budgets test binary checksum mismatch")
+print(binary_path)
+PY
+  )" || post_generation_budget_binary=""
   if [[ -z "$post_generation_budget_binary" ]]; then
     post_generation_budget_exit=127
-    echo "No downloaded perf_budgets test binary found under $TARGET_DIR/$CARGO_PROFILE/deps" \
+    echo "No valid current-build perf_budgets test binary attestation found" \
       > "$POST_GENERATION_BUDGET_DIR/stderr.log"
   else
     PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \

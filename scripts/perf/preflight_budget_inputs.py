@@ -781,6 +781,16 @@ def validate_evidence_cache_entry(
             "freshness_failures": embedded_inspection["freshness_failures"],
             "freshness_reason": embedded_inspection["freshness_reason"],
         }
+    if (
+        context.expected_correlation_id
+        and embedded_inspection["correlation_id"] is None
+    ):
+        return None, {
+            **rejection_base,
+            "reason": "cache_artifact_missing_independent_lineage",
+            "cache_artifact_path": str(evidence_path),
+            "expected_correlation_id": context.expected_correlation_id,
+        }
 
     accepted = {
         "source_kind": "cache",
@@ -2206,6 +2216,24 @@ def run_self_test() -> int:
         in entry.get("freshness_failures", [])
         for entry in relabeled_payload["rejected_evidence_cache_entries"]
     ), relabeled_payload
+
+    provenance_free_cache_root = Path(
+        tempfile.mkdtemp(prefix="pi-perf-preflight-cache-provenance-free-")
+    )
+    write_fixture(provenance_free_cache_root, include_policy=False)
+    provenance_free_cache_dir = write_cache_index(provenance_free_cache_root)
+    provenance_free_code, provenance_free_payload = build_report(
+        build_args(
+            provenance_free_cache_root,
+            cache_dir=provenance_free_cache_dir,
+            expected_correlation_id="corr-123",
+        )
+    )
+    assert provenance_free_code == 1, provenance_free_payload
+    assert any(
+        entry["reason"] == "cache_artifact_missing_independent_lineage"
+        for entry in provenance_free_payload["rejected_evidence_cache_entries"]
+    ), provenance_free_payload
 
     stale_cache_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-stale-"))
     write_fixture(stale_cache_root, include_policy=False)

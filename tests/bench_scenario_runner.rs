@@ -17,6 +17,7 @@
 )]
 
 use futures::executor::block_on;
+use chrono::{SecondsFormat, Utc};
 use pi::error::Result;
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
@@ -1130,6 +1131,14 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             Value::String(scenario_correlation),
         );
         map.insert(
+            "timestamp".to_string(),
+            Value::String(Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)),
+        );
+        map.insert(
+            "run_id".to_string(),
+            Value::String(orchestration_correlation_id.clone()),
+        );
+        map.insert(
             "orchestration_correlation_id".to_string(),
             Value::String(orchestration_correlation_id),
         );
@@ -1513,6 +1522,8 @@ fn assert_record_required_fields(obj: &Map<String, Value>) {
         "missing non-empty disk_cache_policy"
     );
     assert!(obj.contains_key("correlation_id"), "missing correlation_id");
+    assert!(obj.contains_key("timestamp"), "missing timestamp");
+    assert!(obj.contains_key("run_id"), "missing run_id");
     assert!(
         obj.contains_key("orchestration_correlation_id"),
         "missing orchestration_correlation_id"
@@ -1652,6 +1663,17 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
     assert!(
         !orchestration_correlation_id.is_empty(),
         "orchestration_correlation_id must be non-empty"
+    );
+    assert_eq!(
+        obj.get("run_id").and_then(Value::as_str),
+        Some(orchestration_correlation_id),
+        "run_id must bind the record to its orchestration correlation"
+    );
+    assert!(
+        obj.get("timestamp")
+            .and_then(Value::as_str)
+            .is_some_and(|timestamp| !timestamp.trim().is_empty()),
+        "timestamp must be a non-empty string"
     );
 }
 
