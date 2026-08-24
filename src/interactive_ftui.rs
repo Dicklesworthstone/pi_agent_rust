@@ -132,9 +132,14 @@ const LOOP_STALL_BUDGET: Duration = Duration::from_millis(250);
 enum LoopPhase {
     /// Time inside `view()` — layout, styling, and widget rendering.
     Render,
-    /// Time inside `update()` for a terminal event (key, mouse, paste, resize).
+    /// Time inside `update()` for anything the terminal produced: keys, mouse,
+    /// paste, resize, and the spinner tick. Named for the dominant case rather
+    /// than split further, since omp's three-way attribution is what this
+    /// mirrors and a stalled tick is diagnosed the same way as a stalled key.
     Input,
-    /// Time inside `update()` for a bridged agent event (deltas, tool cards).
+    /// Time inside `update()` for anything the async side produced: bridged
+    /// agent events (deltas, tool cards) and the post-SIGTSTP resume, which
+    /// arrives on the same non-terminal path.
     AgentEvent,
 }
 

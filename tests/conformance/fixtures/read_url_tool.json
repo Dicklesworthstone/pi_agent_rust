@@ -1,0 +1,75 @@
+{
+  "version": "1.0",
+  "tool": "read_url",
+  "description": "ReadTool URL contract for bd-cv653.2.2 and bd-cv653.8.1: real loopback fetch and HTML conversion, pagination at the converted-content boundary, and HTTP status taxonomy.",
+  "cases": [
+    {
+      "name": "read_url_fetches_and_converts_html",
+      "description": "the real URL pipeline fetches a loopback HTML document and emits reader-mode markdown",
+      "requirement_ids": [
+        "READ-URL-HTML-1"
+      ],
+      "input": {
+        "path": "http://fixture.invalid/page",
+        "fixtureContentType": "text/html; charset=utf-8",
+        "fixtureBody": "<!doctype html><html><body><main><h1>Fixture Title</h1><p>Alpha body.</p></main></body></html>"
+      },
+      "expected": {
+        "content_contains": [
+          "Fixture Title",
+          "Alpha body."
+        ],
+        "details_exact": {
+          "contentType": "html",
+          "wireContentType": "text/html; charset=utf-8",
+          "extractor": "generic",
+          "offset": 1,
+          "limit": 2000,
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "read_url_paginates_converted_plaintext",
+      "description": "offset and limit apply after conversion and return the stable continuation notice",
+      "requirement_ids": [
+        "READ-URL-PAGINATION-1"
+      ],
+      "input": {
+        "path": "http://fixture.invalid/page.txt",
+        "offset": 2,
+        "limit": 2,
+        "fixtureContentType": "text/plain",
+        "fixtureBody": "one\ntwo\nthree\nfour\n"
+      },
+      "expected": {
+        "content_exact": "two\nthree\n\n[Showing lines 2-3 of 4. Use offset=4 to continue.]",
+        "details_exact": {
+          "contentType": "plaintext",
+          "wireContentType": "text/plain",
+          "extractor": "plaintext",
+          "totalLines": 4,
+          "offset": 2,
+          "limit": 2,
+          "truncated": true
+        }
+      }
+    },
+    {
+      "name": "read_url_surfaces_http_status_failures",
+      "description": "a non-success response fails with the status and final URL instead of converting the error page",
+      "requirement_ids": [
+        "READ-URL-HTTP-ERR-1"
+      ],
+      "input": {
+        "path": "http://fixture.invalid/unavailable",
+        "fixtureStatus": 503,
+        "fixtureContentType": "text/plain",
+        "fixtureBody": "temporarily unavailable"
+      },
+      "expect_error": true,
+      "error_contains": "HTTP 503 fetching http://127.0.0.1",
+      "expected": {}
+    }
+  ]
+}

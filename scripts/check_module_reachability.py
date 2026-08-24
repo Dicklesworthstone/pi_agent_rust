@@ -100,22 +100,37 @@ def declared_modules(lib_rs: Path) -> list[str]:
     return PUB_MOD_RE.findall(lib_rs.read_text(encoding="utf-8"))
 
 
-def module_files(src: Path, name: str) -> set[Path]:
-    """A module's own files: `src/foo.rs` plus everything under `src/foo/`.
+def is_module_owned_file(path: Path, src: Path, name: str) -> bool:
+    """True if path is `src/foo.rs` or inside `src/foo/`.
 
     References from inside a module to itself never prove reachability.
     """
-    owned = set()
-    flat = src / f"{name}.rs"
-    if flat.is_file():
-        owned.add(flat.resolve())
-    directory = src / name
-    if directory.is_dir():
-        owned.update(p.resolve() for p in directory.rglob("*.rs"))
-    return owned
+    if path == src / f"{name}.rs":
+        return True
+    try:
+        path.relative_to(src / name)
+        return True
+    except ValueError:
+        return False
 
 
-def referencing_lines(roots: list[Path], name: str) -> list[tuple[Path, int, str]]:
+def load_source_cache(roots: list[Path]) -> list[tuple[Path, str, list[str]]]:
+    cache: list[tuple[Path, str, list[str]]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.rs"):
+            try:
+                text = path.read_text(encoding="utf-8")
+                cache.append((path, text, text.splitlines()))
+            except (OSError, UnicodeDecodeError):
+                continue
+    return cache
+
+
+def referencing_lines(
+    sources: list[tuple[Path, str, list[str]]], name: str
+) -> list[tuple[Path, int, str]]:
     """Every `<name>::` occurrence under the given roots, as (path, line, text).
 
     Deliberately textual rather than syntactic: the question is "does any other
@@ -124,24 +139,20 @@ def referencing_lines(roots: list[Path], name: str) -> list[tuple[Path, int, str
     the module somewhere in shipped code, which is the signal we want.
     """
     hits: list[tuple[Path, int, str]] = []
+    needle = f"{name}::"
     pattern = re.compile(rf"\b{re.escape(name)}::")
-    for root in roots:
-        if not root.is_dir():
+    for path, text, lines in sources:
+        if needle not in text:
             continue
-        for path in root.rglob("*.rs"):
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError):
-                continue
-            if not pattern.search(text):
-                continue
-            for lineno, line in enumerate(text.splitlines(), start=1):
-                if pattern.search(line):
-                    hits.append((path.resolve(), lineno, line.strip()))
+        if not pattern.search(text):
+            continue
+        for lineno, line in enumerate(lines, start=1):
+            if needle in line and pattern.search(line):
+                hits.append((path, lineno, line.strip()))
     return hits
 
 
-def test_module_lines(path: Path) -> set[int]:
+def test_module_lines(lines: list[str]) -> set[int]:
     """1-indexed line numbers inside a `#[cfg(test)] mod ... { }` block.
 
     Brace-tracked rather than proximity-guessed. The naive version of this --
@@ -156,11 +167,6 @@ def test_module_lines(path: Path) -> set[int]:
     deliberately, and the failure mode is a module reported as reachable, which
     is the safe direction for a gate.
     """
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return set()
-
     inside: set[int] = set()
     depth = 0
     pending_cfg_test = False
@@ -190,7 +196,13 @@ def test_module_lines(path: Path) -> set[int]:
     return inside
 
 
-def classify(root: Path, name: str) -> tuple[str, list[str]]:
+def classify(
+    root: Path,
+    name: str,
+    sources: list[tuple[Path, str, list[str]]],
+    lines_by_path: dict[Path, list[str]],
+    test_lines: dict[Path, set[int]],
+) -> tuple[str, list[str]]:
     """Return (verdict, evidence) for one module.
 
     Verdict is `reachable`, `test_only`, or `unreferenced`.
@@ -202,21 +214,18 @@ def classify(root: Path, name: str) -> tuple[str, list[str]]:
     distinguish from "a user can reach it".
     """
     src = root / "src"
-    roots = [src, root / "examples", root / "benches"]
-    owned = module_files(src, name)
     evidence: list[str] = []
     saw_test_only = False
-    test_lines: dict[Path, set[int]] = {}
 
-    for path, lineno, text in referencing_lines(roots, name):
-        if path in owned:
+    for path, lineno, text in referencing_lines(sources, name):
+        if is_module_owned_file(path, src, name):
             continue
         try:
             rel = path.relative_to(root)
         except ValueError:
             rel = path
         if path not in test_lines:
-            test_lines[path] = test_module_lines(path)
+            test_lines[path] = test_module_lines(lines_by_path[path])
         if lineno in test_lines[path]:
             saw_test_only = True
             continue
@@ -254,8 +263,13 @@ def main() -> int:
     allowlisted: list[str] = []
     failures: list[tuple[str, str]] = []
 
+    roots = [src, root / "examples", root / "benches"]
+    sources = load_source_cache(roots)
+    lines_by_path = {path: lines for path, _, lines in sources}
+    test_lines: dict[Path, set[int]] = {}
+
     for name in sorted(modules):
-        verdict, _evidence = classify(root, name)
+        verdict, _evidence = classify(root, name, sources, lines_by_path, test_lines)
         if verdict == "reachable":
             reachable.append(name)
         elif name in ALLOWLIST:

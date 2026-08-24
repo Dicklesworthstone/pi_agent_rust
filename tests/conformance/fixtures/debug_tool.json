@@ -1,0 +1,53 @@
+{
+  "version": "1.0",
+  "tool": "debug",
+  "description": "DebugTool contract for bd-cv653.1.2 and bd-cv653.8.1: hermetic empty-session discovery plus named usage and missing-target errors before any adapter process is spawned.",
+  "cases": [
+    {
+      "name": "debug_sessions_reports_an_empty_registry",
+      "description": "sessions is a process-free happy path when no DAP session has been launched",
+      "requirement_ids": [
+        "DEBUG-SESSIONS-1"
+      ],
+      "input": {
+        "action": "sessions"
+      },
+      "expected": {
+        "content_contains": [
+          "\"action\":\"sessions\""
+        ],
+        "details_exact": {
+          "action": "sessions",
+          "sessions": []
+        }
+      }
+    },
+    {
+      "name": "debug_launch_requires_a_program",
+      "description": "launch rejects a missing program as DAP_USAGE before resolving or spawning an adapter",
+      "requirement_ids": [
+        "DEBUG-USAGE-1"
+      ],
+      "input": {
+        "action": "launch"
+      },
+      "expect_error": true,
+      "error_contains": "DAP_USAGE",
+      "expected": {}
+    },
+    {
+      "name": "debug_launch_names_a_missing_target",
+      "description": "a nonexistent target fails as DAP_TARGET_MISSING before any platform debugger lookup",
+      "requirement_ids": [
+        "DEBUG-TARGET-ERR-1"
+      ],
+      "input": {
+        "action": "launch",
+        "program": "/pi-fixture-definitely-missing/debug-target"
+      },
+      "expect_error": true,
+      "error_contains": "DAP_TARGET_MISSING",
+      "expected": {}
+    }
+  ]
+}

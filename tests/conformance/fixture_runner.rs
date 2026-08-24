@@ -49,6 +49,378 @@ impl pi::provider::Provider for FixtureReflectProvider {
     }
 }
 
+/// Test-only adapter around the real `pi stats` aggregation and rendering
+/// modules. Stats is a CLI surface rather than an agent Tool, so this keeps it
+/// in the same fixture/logging harness without adding a production tool.
+struct FixtureStatsTool {
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Tool for FixtureStatsTool {
+    fn name(&self) -> &str {
+        "stats"
+    }
+
+    fn label(&self) -> &str {
+        "stats"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic adapter for the pi stats CLI surface"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::read()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let string_field = |name: &str| input.get(name).and_then(Value::as_str).map(str::to_string);
+        let files = pi::stats::collect_session_files(
+            &self.cwd.join("sessions"),
+            input.get("project").and_then(Value::as_str),
+        );
+        let report = pi::stats::aggregate(
+            &files,
+            &pi::stats::StatsFilter {
+                since: string_field("since"),
+                until: string_field("until"),
+                provider: string_field("provider"),
+                model: string_field("model"),
+            },
+        );
+        let text = match input.get("format").and_then(Value::as_str) {
+            Some("json") => serde_json::to_string_pretty(&report)?,
+            Some("markdown" | "md") => pi::stats::render_markdown(&report),
+            _ => pi::stats::render_text(&report),
+        };
+        Ok(pi::tools::ToolOutput {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            details: Some(serde_json::to_value(&report)?),
+            is_error: false,
+        })
+    }
+}
+
+/// Test-only loopback adapter for the real ReadTool URL path. Each execution
+/// serves exactly one canned HTTP response, then joins the fixture server.
+struct FixtureReadUrlTool {
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Tool for FixtureReadUrlTool {
+    fn name(&self) -> &str {
+        "read_url"
+    }
+
+    fn label(&self) -> &str {
+        "read URL"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic loopback adapter for the ReadTool URL surface"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::network()
+    }
+
+    async fn execute(
+        &self,
+        tool_call_id: &str,
+        mut input: Value,
+        on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let object = input.as_object_mut().ok_or_else(|| {
+            pi::error::Error::validation("read_url fixture input must be an object")
+        })?;
+        let body = object
+            .remove("fixtureBody")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let content_type = object
+            .remove("fixtureContentType")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+        let status = object
+            .remove("fixtureStatus")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(200);
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error.to_string()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error.to_string()))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error.to_string()))?;
+        let raw = object
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path.ends_with(":raw"));
+        object.insert(
+            "path".to_string(),
+            Value::String(format!(
+                "http://{address}/fixture{}",
+                if raw { ":raw" } else { "" }
+            )),
+        );
+
+        let server = std::thread::spawn(move || -> Result<(), String> {
+            use std::io::Write as _;
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err("fixture HTTP server timed out waiting for request".into());
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(format!("fixture HTTP accept failed: {error}")),
+                }
+            };
+            let reason = match status {
+                200 => "OK",
+                404 => "Not Found",
+                503 => "Service Unavailable",
+                _ => "Fixture Status",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .map_err(|error| format!("fixture HTTP write failed: {error}"))
+        });
+
+        let result = pi::tools::ReadTool::new(&self.cwd)
+            .with_url_policy(true)
+            .execute(tool_call_id, input, on_update)
+            .await;
+        server
+            .join()
+            .map_err(|_| pi::error::Error::tool("read_url_fixture", "server thread panicked"))?
+            .map_err(|error| pi::error::Error::tool("read_url_fixture", error))?;
+        result
+    }
+}
+
+/// Test-only adapter around the production rolling matcher and pattern-test
+/// APIs. Stream rules are a CLI/session surface rather than an agent Tool.
+struct FixtureStreamRulesTool;
+
+#[async_trait::async_trait]
+impl Tool for FixtureStreamRulesTool {
+    fn name(&self) -> &str {
+        "stream_rules"
+    }
+
+    fn label(&self) -> &str {
+        "stream rules"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic adapter for the stream-rules matcher"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::read()
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let op = input.get("op").and_then(Value::as_str).unwrap_or("match");
+        let (text, details) = match op {
+            "match" => {
+                let rules: Vec<pi::stream_rules::StreamRule> = serde_json::from_value(
+                    input.get("rules").cloned().unwrap_or_else(|| json!([])),
+                )
+                .map_err(|error| pi::error::Error::validation(error.to_string()))?;
+                let channel = match input
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("assistant")
+                {
+                    "assistant" => pi::stream_rules::StreamChannel::AssistantText,
+                    "thinking" => pi::stream_rules::StreamChannel::Thinking,
+                    "tool_call_argument" => pi::stream_rules::StreamChannel::ToolCallArgument,
+                    other => {
+                        return Err(pi::error::Error::validation(format!(
+                            "unknown stream-rules channel {other:?}"
+                        )));
+                    }
+                };
+                let lookback = input
+                    .get("lookbackBytes")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .unwrap_or(pi::stream_rules::DEFAULT_ROLLING_LOOKBACK_BYTES);
+                let chunks = input
+                    .get("chunks")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut matcher = pi::stream_rules::RollingStreamMatcher::new(&rules, lookback);
+                let matched = chunks
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find_map(|chunk| matcher.feed(chunk, channel));
+                matched.map_or_else(
+                    || {
+                        (
+                            "No stream rule matched.".to_string(),
+                            json!({"action": "continue", "matched": false}),
+                        )
+                    },
+                    |matched| {
+                        (
+                            format!("{}: {}", matched.rule_id, matched.matched_excerpt),
+                            json!({
+                                "action": "abort_and_inject",
+                                "matched": true,
+                                "ruleId": matched.rule_id,
+                                "ruleName": matched.rule_name,
+                                "ruleBody": matched.rule_body,
+                                "matchedExcerpt": matched.matched_excerpt,
+                            }),
+                        )
+                    },
+                )
+            }
+            "test_pattern" => {
+                let pattern = input
+                    .get("pattern")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pi::error::Error::validation("test_pattern requires pattern"))?;
+                let sample = input
+                    .get("sample")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let matched =
+                    pi::stream_rules::StreamRuleStore::default().test_pattern(pattern, sample)?;
+                (
+                    matched.as_deref().map_or_else(
+                        || "No match.".to_string(),
+                        |value| format!("Match: {value}"),
+                    ),
+                    json!({"action": "test_pattern", "match": matched}),
+                )
+            }
+            other => {
+                return Err(pi::error::Error::validation(format!(
+                    "unknown stream-rules operation {other:?}"
+                )));
+            }
+        };
+        Ok(pi::tools::ToolOutput {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+}
+
+/// Test-only adapter for the production MCP discovery and trust-gated call
+/// paths. The full stdio/HTTP fixture server remains covered by tests/mcp.rs.
+struct FixtureMcpClientTool {
+    cwd: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl Tool for FixtureMcpClientTool {
+    fn name(&self) -> &str {
+        "mcp_client"
+    }
+
+    fn label(&self) -> &str {
+        "MCP client"
+    }
+
+    fn description(&self) -> &str {
+        "Hermetic adapter for MCP discovery and trust gates"
+    }
+
+    fn parameters(&self) -> Value {
+        json!({"type": "object"})
+    }
+
+    fn effects(&self) -> pi::tools::ToolEffects {
+        pi::tools::ToolEffects::network().union(pi::tools::ToolEffects::process())
+    }
+
+    async fn execute(
+        &self,
+        _tool_call_id: &str,
+        input: Value,
+        _on_update: Option<Box<dyn Fn(pi::tools::ToolUpdate) + Send + Sync>>,
+    ) -> pi::error::Result<pi::tools::ToolOutput> {
+        let manager = pi::mcp::McpManager::bootstrap(&self.cwd, &self.cwd.join("global"), &[])?;
+        let op = input.get("op").and_then(Value::as_str).unwrap_or("list");
+        let (text, details) = match op {
+            "list" => {
+                let servers = manager.list();
+                let details = json!({"op": "list", "servers": servers});
+                (serde_json::to_string_pretty(&details)?, details)
+            }
+            "call" => {
+                let server = input
+                    .get("server")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pi::error::Error::validation("MCP call requires server"))?;
+                let tool = input
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| pi::error::Error::validation("MCP call requires tool"))?;
+                let result = manager
+                    .call_tool(
+                        server,
+                        tool,
+                        input.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                    )
+                    .await?;
+                (serde_json::to_string_pretty(&result)?, result)
+            }
+            other => {
+                return Err(pi::error::Error::validation(format!(
+                    "unknown MCP fixture operation {other:?}"
+                )));
+            }
+        };
+        Ok(pi::tools::ToolOutput {
+            content: vec![ContentBlock::Text(pi::model::TextContent::new(text))],
+            details: Some(details),
+            is_error: false,
+        })
+    }
+}
+
 /// Run all test cases from a fixture file.
 pub async fn run_fixture_tests(fixture: &FixtureFile) -> Vec<TestResult> {
     let mut results = Vec::new();
@@ -85,6 +457,9 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
     // Create the tool
     let tool: Box<dyn Tool> = match tool_name {
         "read" => Box::new(pi::tools::ReadTool::new(temp_dir.path())),
+        "read_url" => Box::new(FixtureReadUrlTool {
+            cwd: temp_dir.path().to_path_buf(),
+        }),
         "bash" => Box::new(pi::tools::BashTool::new(temp_dir.path())),
         "edit" => Box::new(pi::tools::EditTool::new(temp_dir.path())),
         "write" => Box::new(pi::tools::WriteTool::new(temp_dir.path())),
@@ -94,6 +469,8 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "hashline_edit" => Box::new(pi::tools::HashlineEditTool::new(temp_dir.path())),
         "ast_grep" => Box::new(pi::ast_tools::AstGrepTool::new(temp_dir.path())),
         "ast_edit" => Box::new(pi::ast_tools::AstEditTool::new(temp_dir.path())),
+        "lsp" => Box::new(pi::lsp::LspTool::new(temp_dir.path(), None)),
+        "debug" => Box::new(pi::debug::DebugTool::new(temp_dir.path(), None)),
         "web_search" => Box::new(pi::web_search::WebSearchTool::new()),
         "xdev" => {
             // The dispatcher's snapshot is built from the real discoverable
@@ -125,6 +502,11 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "tts" => Box::new(pi::media_tools::TtsTool::new(temp_dir.path()).with_mock(true)),
         "computer" => Box::new(pi::computer::ComputerTool::new(temp_dir.path()).with_mock(true)),
         "browser" => Box::new(pi::browser::BrowserTool::new(temp_dir.path()).with_mock(true)),
+        "subagent" => Box::new(pi::subagents::SubagentTool::with_paths(
+            temp_dir.path().to_path_buf(),
+            temp_dir.path().join("global"),
+            temp_dir.path().join("child-fixture.sh"),
+        )),
         "ask" => Box::new(pi::ask::AskTool::new(pi::ask::AskPolicy::Recommended)),
         "todo" => Box::new(pi::todo::TodoTool::new(std::sync::Arc::new(
             asupersync::sync::Mutex::new(pi::session::Session::in_memory()),
@@ -132,6 +514,13 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "jobs" => Box::new(pi::tools::JobsTool),
         "hub" => Box::new(pi::tools::HubTool::new(temp_dir.path())),
         "eval" => Box::new(pi::eval::EvalTool::new(temp_dir.path())),
+        "stats" => Box::new(FixtureStatsTool {
+            cwd: temp_dir.path().to_path_buf(),
+        }),
+        "stream_rules" => Box::new(FixtureStreamRulesTool),
+        "mcp_client" => Box::new(FixtureMcpClientTool {
+            cwd: temp_dir.path().to_path_buf(),
+        }),
         "github" => {
             #[cfg(unix)]
             let gh_path = "/bin/sh";
@@ -202,6 +591,7 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
             };
             Box::new(pi::tools::LearnTool::new(std::sync::Arc::new(store)))
         }
+        "manage_skill" => Box::new(pi::tools::ManageSkillTool),
         "submit_plan" => {
             let state = pi::plan::PlanState::new();
             let initial_mode = case

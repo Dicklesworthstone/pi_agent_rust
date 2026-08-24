@@ -52,6 +52,7 @@
 #   PERF_REGRESSION_FULL      Forwarded to perf_regression (1 = full mode)
 #   PI_PERF_STRICT            Set to 1 to fail CI-enforced budgets on NO_DATA (auto-set for ci/full profiles)
 #   PERF_CARGO_RUNNER         Cargo runner mode: rch | auto | local (default: rch)
+#   RCH_REQUIRE_REMOTE        RCH proof mode: fail closed instead of falling back locally
 
 set -euo pipefail
 
@@ -68,6 +69,8 @@ OUTPUT_DIR="${PERF_OUTPUT_DIR:-$TARGET_DIR/perf/runs/$TIMESTAMP}"
 PREFLIGHT_BEFORE_REFRESH_PATH="$OUTPUT_DIR/results/perf_budget_preflight_before_refresh.json"
 PREFLIGHT_AFTER_RUN_PATH="$OUTPUT_DIR/results/perf_budget_preflight.json"
 STAGING_MANIFEST_PATH="$OUTPUT_DIR/results/perf_artifact_staging_manifest.json"
+BUILD_TESTS_JSONL_PATH="$OUTPUT_DIR/logs/build_tests.jsonl"
+PERF_BUDGET_BINARY_ATTESTATION_PATH="$OUTPUT_DIR/results/perf_budgets_test_binary.json"
 PARALLELISM="${PERF_PARALLELISM:-1}"
 PGO_MODE="${PERF_PGO_MODE:-off}"
 PGO_PROFILE_DATA="${PERF_PGO_PROFILE_DATA:-$TARGET_DIR/perf/$CARGO_PROFILE/pgo_profile/pijs_workload.profdata}"
@@ -181,9 +184,11 @@ run_budget_preflight() {
     --cache-ttl-hours "$EVIDENCE_CACHE_TTL_HOURS"
     --cache-profile "$CARGO_PROFILE"
     --cache-git-commit "$GIT_COMMIT_FULL"
+    --expected-correlation-id "$CORRELATION_ID"
     --skip-rch-check
   )
-  python3 "$SCRIPT_DIR/preflight_budget_inputs.py" "${args[@]}" "$@" > "$output_path"
+  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+    python3 "$SCRIPT_DIR/preflight_budget_inputs.py" "${args[@]}" "$@" > "$output_path"
 }
 
 run_artifact_staging_manifest() {
@@ -199,13 +204,15 @@ run_artifact_staging_manifest() {
     --cache-profile "$CARGO_PROFILE"
     --cache-git-commit "$GIT_COMMIT_FULL"
     --run-id "$CORRELATION_ID"
+    --expected-correlation-id "$CORRELATION_ID"
     --update-evidence-cache
     --output "$output_path"
   )
   if [[ -n "${PERF_REMOTE_TARGET_DIR:-}" ]]; then
     args+=(--remote-target-dir "$PERF_REMOTE_TARGET_DIR")
   fi
-  python3 "$SCRIPT_DIR/artifact_staging.py" "${args[@]}" "$@"
+  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+    python3 "$SCRIPT_DIR/artifact_staging.py" "${args[@]}" "$@"
 }
 
 # ─── CLI Parsing ─────────────────────────────────────────────────────────────
@@ -348,8 +355,15 @@ if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
   if ! command -v rch >/dev/null 2>&1; then
     die "PERF_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
   fi
+  if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+    export RCH_REQUIRE_REMOTE=1
+  fi
   if ! rch check --quiet >/dev/null 2>&1; then
-    die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+    if [[ "${RCH_REQUIRE_REMOTE:-0}" == "1" ]]; then
+      log_warn "'rch check' reports fleet degradation; proceeding with fail-closed remote execution."
+    else
+      die "'rch check' failed; refusing heavy local cargo fallback. Fix rch or pass --no-rch."
+    fi
   fi
   CARGO_RUNNER_MODE="rch"
   CARGO_RUNNER_ARGS=("rch" "exec" "--" "cargo")
@@ -360,6 +374,29 @@ elif [[ "$CARGO_RUNNER_REQUEST" == "auto" ]] && command -v rch >/dev/null 2>&1; 
   else
     log_warn "rch detected but unhealthy; auto mode will run cargo locally (set --require-rch to fail fast)."
   fi
+fi
+
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+  for required_env in \
+    BENCH_OUTPUT_DIR \
+    PERF_REGRESSION_OUTPUT \
+    PERF_RELEASE_BINARY_PATH \
+    CI_CORRELATION_ID \
+    VERGEN_GIT_SHA \
+    VERGEN_GIT_DIRTY \
+    RUST_TEST_THREADS \
+    PI_IDLE_RSS_RAW_RELATIVE_PATH \
+    PI_IDLE_RSS_SOURCE_COMMIT \
+    PI_IDLE_RSS_SOURCE_DIRTY \
+    PI_IDLE_RSS_CORRELATION_ID \
+    PI_BENCH_BUILD_PROFILE \
+    PI_PERF_STRICT; do
+    case ",${RCH_ENV_ALLOWLIST:-}," in
+      *",$required_env,"*) ;;
+      *) RCH_ENV_ALLOWLIST="${RCH_ENV_ALLOWLIST:+$RCH_ENV_ALLOWLIST,}$required_env" ;;
+    esac
+  done
+  export RCH_ENV_ALLOWLIST
 fi
 
 # ─── Profile-based suite selection ───────────────────────────────────────────
@@ -889,10 +926,81 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 
   # Build test binaries
   log_step "Building test binaries..."
-  if "${CARGO_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" 2>"$OUTPUT_DIR/logs/build_tests.log"; then
+  if VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+    "${CARGO_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" \
+      --message-format=json-render-diagnostics \
+      >"$BUILD_TESTS_JSONL_PATH" \
+      2>"$OUTPUT_DIR/logs/build_tests.log"; then
     log_ok "Test binaries built"
   else
     log_warn "Test binary build had warnings (see logs/build_tests.log)"
+  fi
+
+  if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
+    && (suite_selected "perf_budgets" || suite_selected "perf_regression"); then
+    if python3 - \
+      "$BUILD_TESTS_JSONL_PATH" \
+      "$TARGET_DIR" \
+      "$CARGO_PROFILE" \
+      "$PERF_BUDGET_BINARY_ATTESTATION_PATH" \
+      "$GIT_COMMIT_FULL" \
+      "$GIT_DIRTY" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+messages_path = Path(sys.argv[1])
+target_dir = Path(sys.argv[2])
+profile = sys.argv[3]
+attestation_path = Path(sys.argv[4])
+source_commit = sys.argv[5]
+source_dirty = sys.argv[6] == "true"
+candidates = []
+for line in messages_path.read_text(encoding="utf-8").splitlines():
+    try:
+        message = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    target = message.get("target", {})
+    executable = message.get("executable")
+    if (
+        message.get("reason") == "compiler-artifact"
+        and target.get("name") == "perf_budgets"
+        and isinstance(executable, str)
+        and executable
+    ):
+        local_candidate = target_dir / profile / "deps" / Path(executable).name
+        if local_candidate.is_file() and local_candidate.stat().st_mode & 0o111:
+            candidates.append(local_candidate.resolve())
+if len(candidates) != 1:
+    raise SystemExit(
+        f"expected exactly one downloaded perf_budgets executable, found {len(candidates)}"
+    )
+binary_path = candidates[0]
+payload = {
+    "schema": "pi.perf.test_binary_attestation.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
+    "cargo_profile": profile,
+    "target_name": "perf_budgets",
+    "binary_path": str(binary_path),
+    "sha256": hashlib.sha256(binary_path.read_bytes()).hexdigest(),
+}
+attestation_path.write_text(
+    json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+PY
+    then
+      log_ok "Attested current-build perf_budgets test binary"
+    elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+      die "Failed to attest current-build perf_budgets test binary"
+    else
+      log_warn "Current-build perf_budgets binary attestation is unavailable"
+    fi
   fi
 
   # Build criterion benches if needed
@@ -992,6 +1100,8 @@ run_test_suite() {
   PERF_REGRESSION_OUTPUT="$result_dir" \
   PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
   CI_CORRELATION_ID="$CORRELATION_ID" \
+  VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+  VERGEN_GIT_DIRTY="$GIT_DIRTY" \
   RUST_TEST_THREADS="$PARALLELISM" \
     "${CARGO_RUNNER_ARGS[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
     >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
@@ -1180,72 +1290,7 @@ if [[ -f "$PREFLIGHT_BEFORE_REFRESH_PATH" ]]; then
   log_ok "Collected: $(basename "$PREFLIGHT_BEFORE_REFRESH_PATH")"
 fi
 
-staging_exit=0
-if run_budget_preflight \
-  "$PREFLIGHT_AFTER_RUN_PATH"; then
-  log_ok "Post-run budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
-else
-  staging_exit=$?
-  log_warn "Post-run budget preflight found blockers:"
-  log_warn "  results/$(basename "$PREFLIGHT_AFTER_RUN_PATH") (exit=$staging_exit)"
-fi
-
-if [[ -f "$PREFLIGHT_AFTER_RUN_PATH" ]]; then
-  artifact_count=$((artifact_count + 1))
-  log_ok "Collected: $(basename "$PREFLIGHT_AFTER_RUN_PATH")"
-fi
-
-if run_artifact_staging_manifest "$STAGING_MANIFEST_PATH"; then
-  log_ok "Artifact staging manifest passed: results/$(basename "$STAGING_MANIFEST_PATH")"
-else
-  staging_exit=$?
-  log_warn "Artifact staging manifest found blockers: results/$(basename "$STAGING_MANIFEST_PATH") (exit=$staging_exit)"
-fi
-
-if [[ -f "$STAGING_MANIFEST_PATH" ]]; then
-  artifact_count=$((artifact_count + 1))
-  staging_summary="$(
-    python3 - "$STAGING_MANIFEST_PATH" <<'PY'
-import json
-import sys
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    payload = json.load(handle)
-summary = payload.get("summary", {})
-print(
-    "|".join(
-        str(summary.get(key, 0))
-        for key in (
-            "status",
-            "missing_required_count",
-            "stale_required_count",
-            "present_required_count",
-        )
-    )
-    + "|"
-    + str(len(payload.get("blockers", [])))
-)
-PY
-  )"
-  IFS='|' read -r \
-    ARTIFACT_STAGING_STATUS \
-    ARTIFACT_STAGING_MISSING_REQUIRED \
-    ARTIFACT_STAGING_STALE_REQUIRED \
-    ARTIFACT_STAGING_PRESENT_REQUIRED \
-    ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
-  log_ok "Artifact staging manifest: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
-  log_ok "Artifact staging blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
-else
-  log_warn "Artifact staging manifest was not generated"
-fi
-
-if [[ "$ARTIFACT_STAGING_STATUS" == "blocked" && "${PI_PERF_STRICT:-0}" == "1" ]]; then
-  suite_fail=$((suite_fail + 1))
-  SUITE_RESULTS+=("{\"suite\":\"artifact_staging\",\"status\":\"fail\",\"exit_code\":$staging_exit,\"elapsed_ms\":0}")
-  log_warn "Strict mode: artifact staging blockers mark the run failed (blockers=$ARTIFACT_STAGING_BLOCKERS)"
-fi
-
-log_ok "Total artifacts collected: $artifact_count"
+log_ok "Artifacts collected before derived finalization: $artifact_count"
 
 # ─── Phase 5: Generate manifest ─────────────────────────────────────────────
 
@@ -1624,16 +1669,32 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = line.strip()
         if not line:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "__lineage_parse_error": "invalid_json",
+                    "line_number": line_number,
+                    "detail": str(error),
+                }
+            )
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+        else:
+            rows.append(
+                {
+                    "__lineage_parse_error": "non_object_json",
+                    "line_number": line_number,
+                }
+            )
     return rows
 
 
@@ -1725,19 +1786,28 @@ STRATIFICATION_PATH="$OUTPUT_DIR/results/extension_benchmark_stratification.json
 if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
   TIMESTAMP="$TIMESTAMP" \
   STRATIFICATION_PATH="$STRATIFICATION_PATH" \
   python3 - <<'PY'
+import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
 correlation_id = os.environ["CORRELATION_ID"]
+source_commit = os.environ["GIT_COMMIT_FULL"]
+source_dirty = os.environ["GIT_DIRTY"] == "true"
 timestamp = os.environ["TIMESTAMP"]
+run_started_at = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(
+    tzinfo=timezone.utc
+)
+source_clock_skew = timedelta(seconds=120)
 stratification_path = Path(os.environ["STRATIFICATION_PATH"])
 
 manifest_path = output_dir / "manifest.json"
@@ -1759,17 +1829,49 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return []
     rows: list[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = line.strip()
         if not line:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "__lineage_parse_error": "invalid_json",
+                    "line_number": line_number,
+                    "detail": str(error),
+                }
+            )
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+        else:
+            rows.append(
+                {
+                    "__lineage_parse_error": "non_object_json",
+                    "line_number": line_number,
+                }
+            )
     return rows
+
+
+def parse_record_timestamp(record: dict):
+    raw = record.get("timestamp", record.get("generated_at"))
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def parse_float(value):
@@ -1815,10 +1917,75 @@ suite_result_by_name = {
     if isinstance(row, dict) and str(row.get("suite", "")).strip()
 }
 
-scenario_runner_records = load_jsonl(scenario_runner_path)
-workload_records = load_jsonl(workload_path)
-ext_bench_records = load_jsonl(ext_bench_path)
-legacy_records = load_jsonl(legacy_path)
+def admit_dataset(path: Path, records: list[dict], correlation_field: str, required: bool):
+    accepted = []
+    rejected = []
+    for index, record in enumerate(records):
+        observed_correlation = record.get(correlation_field)
+        observed_commit = record.get("source_commit")
+        observed_dirty = record.get("source_dirty")
+        observed_timestamp = parse_record_timestamp(record)
+        reasons = []
+        if record.get("__lineage_parse_error"):
+            reasons.append(str(record["__lineage_parse_error"]))
+        if observed_correlation != correlation_id:
+            reasons.append("correlation_id_mismatch")
+        if record.get("run_id") != correlation_id:
+            reasons.append("run_id_mismatch")
+        if observed_commit != source_commit:
+            reasons.append("source_commit_mismatch")
+        if observed_dirty is not False:
+            reasons.append("source_dirty_not_false")
+        if observed_timestamp is None:
+            reasons.append("missing_or_invalid_timestamp")
+        elif observed_timestamp < run_started_at - source_clock_skew:
+            reasons.append("timestamp_before_run_start")
+        elif observed_timestamp > datetime.now(timezone.utc) + source_clock_skew:
+            reasons.append("timestamp_in_future")
+        if reasons:
+            rejected.append({"record_index": index, "reasons": reasons})
+        else:
+            accepted.append(record)
+    digest = None
+    if path.is_file():
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return accepted, {
+        "path": str(path),
+        "sha256": digest,
+        "required": required,
+        "correlation_field": correlation_field,
+        "expected_correlation_id": correlation_id,
+        "expected_source_commit": source_commit,
+        "expected_min_timestamp": (
+            run_started_at - source_clock_skew
+        ).isoformat().replace("+00:00", "Z"),
+        "accepted_record_count": len(accepted),
+        "rejected_record_count": len(rejected),
+        "rejections": rejected,
+    }
+
+
+scenario_runner_records, scenario_dataset = admit_dataset(
+    scenario_runner_path,
+    load_jsonl(scenario_runner_path),
+    "orchestration_correlation_id",
+    True,
+)
+workload_records, workload_dataset = admit_dataset(
+    workload_path, load_jsonl(workload_path), "correlation_id", True
+)
+ext_bench_records, ext_bench_dataset = admit_dataset(
+    ext_bench_path, load_jsonl(ext_bench_path), "correlation_id", False
+)
+legacy_records, legacy_dataset = admit_dataset(
+    legacy_path, load_jsonl(legacy_path), "correlation_id", True
+)
+source_datasets = [
+    scenario_dataset,
+    workload_dataset,
+    ext_bench_dataset,
+    legacy_dataset,
+]
 
 comparison_rows = []
 if perf_comparison_path.exists():
@@ -2143,6 +2310,11 @@ layer_coverage = {
 }
 
 invalidity_reasons = []
+for dataset in source_datasets:
+    if dataset["required"] and dataset["accepted_record_count"] == 0:
+        invalidity_reasons.append(f"missing_current_run_source:{dataset['path']}")
+    if dataset["rejected_record_count"] > 0:
+        invalidity_reasons.append(f"mixed_source_lineage:{dataset['path']}")
 if not layer_coverage.get("full_e2e_long_session", False) and (
     layer_coverage.get("cold_load_init", False)
     or layer_coverage.get("per_call_dispatch_micro", False)
@@ -2162,6 +2334,8 @@ payload = {
     "schema": "pi.perf.extension_benchmark_stratification.v1",
     "bead_id": "bd-3ar8v.4.11",
     "generated_at": datetime.now(timezone.utc).isoformat(),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
     "profile": str(manifest.get("profile", "unknown")),
@@ -2177,6 +2351,7 @@ payload = {
         "lineage_contract": "all layers must share run_id + correlation_id lineage",
     },
     "layers": layers,
+    "source_datasets": source_datasets,
     "claim_integrity": {
         "anti_conflation": {
             "cold_load_wins_do_not_imply_per_call_or_e2e": True,
@@ -2307,22 +2482,33 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   PROJECT_ROOT="$PROJECT_ROOT" \
   TARGET_DIR="$TARGET_DIR" \
   CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
+  PI_PERF_STRICT="${PI_PERF_STRICT:-0}" \
   TIMESTAMP="$TIMESTAMP" \
   PHASE1_MATRIX_PATH="$PHASE1_MATRIX_PATH" \
   PARAMETER_SWEEPS_PATH="$PARAMETER_SWEEPS_PATH" \
   OPPORTUNITY_MATRIX_PATH="$OPPORTUNITY_MATRIX_PATH" \
   python3 - <<'PY'
+import hashlib
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
 project_root = Path(os.environ["PROJECT_ROOT"])
 target_dir = Path(os.environ["TARGET_DIR"])
 correlation_id = os.environ["CORRELATION_ID"]
+source_commit = os.environ["GIT_COMMIT_FULL"]
+source_dirty = os.environ["GIT_DIRTY"] == "true"
+strict_mode = os.environ["PI_PERF_STRICT"] == "1"
 timestamp = os.environ["TIMESTAMP"]
+run_started_at = datetime.strptime(timestamp, "%Y%m%dT%H%M%SZ").replace(
+    tzinfo=timezone.utc
+)
+source_clock_skew = timedelta(seconds=120)
 phase1_matrix_path = Path(os.environ["PHASE1_MATRIX_PATH"])
 parameter_sweeps_path = Path(os.environ["PARAMETER_SWEEPS_PATH"])
 opportunity_matrix_path = Path(os.environ["OPPORTUNITY_MATRIX_PATH"])
@@ -2349,17 +2535,49 @@ def load_jsonl(path: Path):
     if not path.exists():
         return []
     rows = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         line = line.strip()
         if not line:
             continue
         try:
             payload = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as error:
+            rows.append(
+                {
+                    "__lineage_parse_error": "invalid_json",
+                    "line_number": line_number,
+                    "detail": str(error),
+                }
+            )
             continue
         if isinstance(payload, dict):
             rows.append(payload)
+        else:
+            rows.append(
+                {
+                    "__lineage_parse_error": "non_object_json",
+                    "line_number": line_number,
+                }
+            )
     return rows
+
+
+def parse_record_timestamp(record):
+    raw = record.get("timestamp", record.get("generated_at"))
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    normalized = raw.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def parse_float(value):
@@ -2461,15 +2679,74 @@ if not required_sizes:
 
 effective_scenario_runner_path = scenario_runner_path
 scenario_runner_records = load_jsonl(scenario_runner_path)
-if not scenario_runner_records and scenario_runner_fallback_path.exists():
+if not scenario_runner_records and not strict_mode and scenario_runner_fallback_path.exists():
     scenario_runner_records = load_jsonl(scenario_runner_fallback_path)
     effective_scenario_runner_path = scenario_runner_fallback_path
 
 effective_workload_path = workload_path
 workload_records = load_jsonl(workload_path)
-if not workload_records and workload_fallback_path.exists():
+if not workload_records and not strict_mode and workload_fallback_path.exists():
     workload_records = load_jsonl(workload_fallback_path)
     effective_workload_path = workload_fallback_path
+
+
+def admit_dataset(path, records, correlation_field):
+    accepted = []
+    rejected = []
+    for index, record in enumerate(records):
+        reasons = []
+        observed_timestamp = parse_record_timestamp(record)
+        if record.get("__lineage_parse_error"):
+            reasons.append(str(record["__lineage_parse_error"]))
+        if record.get(correlation_field) != correlation_id:
+            reasons.append("correlation_id_mismatch")
+        if record.get("run_id") != correlation_id:
+            reasons.append("run_id_mismatch")
+        if record.get("source_commit") != source_commit:
+            reasons.append("source_commit_mismatch")
+        if record.get("source_dirty") is not False:
+            reasons.append("source_dirty_not_false")
+        if observed_timestamp is None:
+            reasons.append("missing_or_invalid_timestamp")
+        elif observed_timestamp < run_started_at - source_clock_skew:
+            reasons.append("timestamp_before_run_start")
+        elif observed_timestamp > datetime.now(timezone.utc) + source_clock_skew:
+            reasons.append("timestamp_in_future")
+        if reasons:
+            rejected.append({"record_index": index, "reasons": reasons})
+        else:
+            accepted.append(record)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+    return accepted, {
+        "path": str(path),
+        "sha256": digest,
+        "correlation_field": correlation_field,
+        "expected_correlation_id": correlation_id,
+        "expected_source_commit": source_commit,
+        "expected_min_timestamp": (
+            run_started_at - source_clock_skew
+        ).isoformat().replace("+00:00", "Z"),
+        "accepted_record_count": len(accepted),
+        "rejected_record_count": len(rejected),
+        "rejections": rejected,
+    }
+
+
+scenario_runner_records, scenario_dataset = admit_dataset(
+    effective_scenario_runner_path,
+    scenario_runner_records,
+    "orchestration_correlation_id",
+)
+workload_records, workload_dataset = admit_dataset(
+    effective_workload_path,
+    workload_records,
+    "correlation_id",
+)
+source_datasets = [scenario_dataset, workload_dataset]
+source_lineage_valid = all(
+    dataset["accepted_record_count"] > 0 and dataset["rejected_record_count"] == 0
+    for dataset in source_datasets
+)
 
 
 def parse_partition(record, metadata, scenario_id):
@@ -3558,6 +3835,8 @@ for guard_name, status in (
 
 required_cell_count = len(required_partitions) * len(required_sizes)
 phase5_ready = (
+    source_lineage_valid
+    and
     primary_status == "pass"
     and cells_with_complete_stage_breakdown == required_cell_count
     and len(missing_cells) == 0
@@ -3570,8 +3849,11 @@ payload = {
     "schema": "pi.perf.phase1_matrix_validation.v1",
     "bead_id": "bd-3ar8v.2.8",
     "generated_at": datetime.now(timezone.utc).isoformat(),
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
     "run_id": run_id,
     "correlation_id": correlation_id,
+    "source_datasets": source_datasets,
     "matrix_requirements": {
         "required_partition_tags": required_partitions,
         "required_session_message_sizes": required_sizes,
@@ -3656,6 +3938,8 @@ payload = {
         },
         "artifact_ready_for_phase5": phase5_ready,
         "fail_closed_conditions": [
+            "missing_current_run_source",
+            "mixed_source_lineage",
             "missing_matrix_source_record",
             "missing_stage_metrics",
             "missing_primary_wall_clock",
@@ -3742,6 +4026,449 @@ then
 else
   die "Failed to generate phase-1 matrix validation artifact"
 fi
+
+# ─── Phase 5g: Authoritative post-generation evidence gate ─────────────────
+
+log_phase "Phase 5g: Post-Generation Evidence Gate"
+
+POST_GENERATION_CONTRACT_PATH="$OUTPUT_DIR/results/post_generation_evidence_contract.json"
+post_generation_exit=0
+if OUTPUT_DIR="$OUTPUT_DIR" \
+  CORRELATION_ID="$CORRELATION_ID" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  GIT_DIRTY="$GIT_DIRTY" \
+  POST_GENERATION_CONTRACT_PATH="$POST_GENERATION_CONTRACT_PATH" \
+  python3 - <<'PY'
+import hashlib
+import json
+import math
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+output_dir = Path(os.environ["OUTPUT_DIR"])
+expected_correlation_id = os.environ["CORRELATION_ID"]
+expected_source_commit = os.environ["GIT_COMMIT_FULL"]
+expected_source_dirty = os.environ["GIT_DIRTY"] == "true"
+report_path = Path(os.environ["POST_GENERATION_CONTRACT_PATH"])
+phase1_path = output_dir / "results" / "phase1_matrix_validation.json"
+stratification_path = output_dir / "results" / "extension_benchmark_stratification.json"
+failures = []
+
+
+def load_artifact(path: Path, expected_schema: str):
+    if not path.is_file():
+        failures.append({"path": str(path), "reason": "missing_artifact"})
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        failures.append(
+            {"path": str(path), "reason": "invalid_json", "detail": str(error)}
+        )
+        return {}
+    if payload.get("schema") != expected_schema:
+        failures.append(
+            {
+                "path": str(path),
+                "reason": "schema_mismatch",
+                "expected": expected_schema,
+                "observed": payload.get("schema"),
+            }
+        )
+    for field, expected in (
+        ("source_commit", expected_source_commit),
+        ("source_dirty", expected_source_dirty),
+        ("correlation_id", expected_correlation_id),
+    ):
+        if payload.get(field) != expected:
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": f"{field}_mismatch",
+                    "expected": expected,
+                    "observed": payload.get(field),
+                }
+            )
+    return payload
+
+
+def validate_source_datasets(path: Path, payload):
+    datasets = payload.get("source_datasets", [])
+    if not isinstance(datasets, list) or not datasets:
+        failures.append({"path": str(path), "reason": "missing_source_datasets"})
+        return
+    for dataset in datasets:
+        if not isinstance(dataset, dict):
+            failures.append({"path": str(path), "reason": "invalid_source_dataset"})
+            continue
+        accepted = dataset.get("accepted_record_count")
+        rejected = dataset.get("rejected_record_count")
+        required = dataset.get("required", True)
+        source_path = dataset.get("path")
+        expected_sha256 = dataset.get("sha256")
+        verify_source_bytes = (
+            required
+            or (isinstance(accepted, int) and accepted > 0)
+            or (isinstance(rejected, int) and rejected > 0)
+            or expected_sha256 is not None
+        )
+        if required and (not isinstance(accepted, int) or accepted <= 0):
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "missing_current_run_source_records",
+                    "source_path": dataset.get("path"),
+                }
+            )
+        if verify_source_bytes and (not isinstance(source_path, str) or not source_path):
+            failures.append(
+                {"path": str(path), "reason": "missing_source_dataset_path"}
+            )
+        elif verify_source_bytes and not Path(source_path).is_file():
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "source_dataset_missing_after_derivation",
+                    "source_path": source_path,
+                }
+            )
+        elif verify_source_bytes:
+            observed_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+            if not isinstance(expected_sha256, str) or observed_sha256 != expected_sha256:
+                failures.append(
+                    {
+                        "path": str(path),
+                        "reason": "source_dataset_checksum_mismatch",
+                        "source_path": source_path,
+                        "expected_sha256": expected_sha256,
+                        "observed_sha256": observed_sha256,
+                    }
+                )
+        if not isinstance(rejected, int) or rejected != 0:
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "mixed_source_lineage",
+                    "source_path": dataset.get("path"),
+                    "rejected_record_count": rejected,
+                }
+            )
+
+
+phase1 = load_artifact(phase1_path, "pi.perf.phase1_matrix_validation.v1")
+validate_source_datasets(phase1_path, phase1)
+if phase1.get("consumption_contract", {}).get("artifact_ready_for_phase5") is not True:
+    failures.append({"path": str(phase1_path), "reason": "phase1_not_ready"})
+matrix_cells = phase1.get("matrix_cells", [])
+required_cell_count = phase1.get("matrix_requirements", {}).get("required_cell_count")
+if not isinstance(required_cell_count, int) or required_cell_count <= 0:
+    failures.append({"path": str(phase1_path), "reason": "invalid_required_cell_count"})
+elif not isinstance(matrix_cells, list) or len(matrix_cells) != required_cell_count:
+    failures.append(
+        {
+            "path": str(phase1_path),
+            "reason": "matrix_cell_count_mismatch",
+            "expected": required_cell_count,
+            "observed": len(matrix_cells) if isinstance(matrix_cells, list) else None,
+        }
+    )
+if isinstance(matrix_cells, list):
+    required_stages = ("open_ms", "append_ms", "save_ms", "index_ms")
+    for index, cell in enumerate(matrix_cells):
+        attribution = cell.get("stage_attribution", {}) if isinstance(cell, dict) else {}
+        invalid_stages = [
+            key
+            for key in required_stages
+            if not isinstance(attribution.get(key), (int, float))
+            or not math.isfinite(float(attribution[key]))
+            or float(attribution[key]) < 0.0
+        ]
+        if (
+            not isinstance(cell, dict)
+            or cell.get("status") != "pass"
+            or cell.get("missing_reasons") not in ([], None)
+            or invalid_stages
+        ):
+            failures.append(
+                {
+                    "path": str(phase1_path),
+                    "reason": "invalid_matrix_cell",
+                    "cell_index": index,
+                    "invalid_stages": invalid_stages,
+                }
+            )
+
+stratification = load_artifact(
+    stratification_path, "pi.perf.extension_benchmark_stratification.v1"
+)
+validate_source_datasets(stratification_path, stratification)
+required_layers = {"cold_load_init", "per_call_dispatch_micro", "full_e2e_long_session"}
+layers = stratification.get("layers", [])
+observed_layers = {
+    layer.get("layer_id")
+    for layer in layers
+    if isinstance(layer, dict) and layer.get("evidence_state") == "measured"
+}
+if observed_layers != required_layers:
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "required_layers_not_measured",
+            "expected": sorted(required_layers),
+            "observed": sorted(layer for layer in observed_layers if isinstance(layer, str)),
+        }
+    )
+claim_guard = stratification.get("claim_integrity", {}).get("cherry_pick_guard", {})
+if claim_guard.get("global_claim_valid") is not True:
+    failures.append(
+        {"path": str(stratification_path), "reason": "global_claim_not_valid"}
+    )
+
+report = {
+    "schema": "pi.perf.post_generation_evidence_contract.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "source_commit": expected_source_commit,
+    "source_dirty": expected_source_dirty,
+    "correlation_id": expected_correlation_id,
+    "status": "ready" if not failures else "blocked",
+    "failure_count": len(failures),
+    "failures": failures,
+    "artifacts": [str(phase1_path), str(stratification_path)],
+}
+report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+raise SystemExit(0 if not failures else 1)
+PY
+then
+  log_ok "Post-generation evidence contract passed"
+else
+  post_generation_exit=$?
+  log_warn "Post-generation evidence contract blocked: results/$(basename "$POST_GENERATION_CONTRACT_PATH")"
+fi
+artifact_count=$((artifact_count + 1))
+
+POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
+mkdir -p "$POST_GENERATION_BUDGET_DIR"
+post_generation_budget_exit=0
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+  post_generation_budget_binary=""
+  post_generation_budget_binary="$(
+    python3 - \
+      "$PERF_BUDGET_BINARY_ATTESTATION_PATH" \
+      "$GIT_COMMIT_FULL" \
+      "$GIT_DIRTY" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+attestation_path = Path(sys.argv[1])
+expected_commit = sys.argv[2]
+expected_dirty = sys.argv[3] == "true"
+try:
+    payload = json.loads(attestation_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid perf_budgets binary attestation: {error}")
+if payload.get("schema") != "pi.perf.test_binary_attestation.v1":
+    raise SystemExit("perf_budgets binary attestation schema mismatch")
+if payload.get("source_commit") != expected_commit:
+    raise SystemExit("perf_budgets binary attestation commit mismatch")
+if payload.get("source_dirty") is not expected_dirty:
+    raise SystemExit("perf_budgets binary attestation dirty-state mismatch")
+if payload.get("target_name") != "perf_budgets":
+    raise SystemExit("perf_budgets binary attestation target mismatch")
+binary_path = Path(str(payload.get("binary_path", "")))
+if not binary_path.is_file() or not binary_path.stat().st_mode & 0o111:
+    raise SystemExit("attested perf_budgets test binary is missing or not executable")
+observed_sha256 = hashlib.sha256(binary_path.read_bytes()).hexdigest()
+if observed_sha256 != payload.get("sha256"):
+    raise SystemExit("attested perf_budgets test binary checksum mismatch")
+print(binary_path)
+PY
+  )" || post_generation_budget_binary=""
+  if [[ -z "$post_generation_budget_binary" ]]; then
+    post_generation_budget_exit=127
+    echo "No valid current-build perf_budgets test binary attestation found" \
+      > "$POST_GENERATION_BUDGET_DIR/stderr.log"
+  else
+    PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+    PI_PERF_POST_GENERATION=1 \
+    CI_CORRELATION_ID="$CORRELATION_ID" \
+    "$post_generation_budget_binary" \
+      ci_enforced_budgets_fail_on_regression_or_missing_data --exact --nocapture \
+      > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+      2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
+      || post_generation_budget_exit=$?
+  fi
+else
+  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+  PI_PERF_POST_GENERATION=1 \
+  CI_CORRELATION_ID="$CORRELATION_ID" \
+  "${CARGO_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \
+    ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact --nocapture \
+    > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+    2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
+    || post_generation_budget_exit=$?
+fi
+
+post_generation_budget_status="pass"
+if [[ "$post_generation_budget_exit" -eq 0 ]]; then
+  suite_pass=$((suite_pass + 1))
+  log_ok "Post-generation perf budget data-contract evaluation passed"
+elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+  post_generation_budget_status="fail"
+  suite_fail=$((suite_fail + 1))
+  log_warn "Post-generation perf budget data-contract evaluation failed (exit=$post_generation_budget_exit)"
+else
+  post_generation_budget_status="skip"
+  suite_skip=$((suite_skip + 1))
+  log_warn "Post-generation perf budget data-contract evaluation skipped after failure (exit=$post_generation_budget_exit)"
+fi
+
+staging_exit=0
+if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH" --artifact-readiness-only; then
+  log_ok "Final budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
+else
+  staging_exit=$?
+  log_warn "Final budget preflight found blockers:"
+  log_warn "  results/$(basename "$PREFLIGHT_AFTER_RUN_PATH") (exit=$staging_exit)"
+fi
+
+if [[ -f "$PREFLIGHT_AFTER_RUN_PATH" ]]; then
+  artifact_count=$((artifact_count + 1))
+  log_ok "Collected: $(basename "$PREFLIGHT_AFTER_RUN_PATH")"
+fi
+
+if run_artifact_staging_manifest "$STAGING_MANIFEST_PATH"; then
+  log_ok "Final artifact staging passed: results/$(basename "$STAGING_MANIFEST_PATH")"
+else
+  staging_exit=$?
+  log_warn "Final artifact staging found blockers: results/$(basename "$STAGING_MANIFEST_PATH") (exit=$staging_exit)"
+fi
+
+if [[ -f "$STAGING_MANIFEST_PATH" ]]; then
+  artifact_count=$((artifact_count + 1))
+  staging_summary="$(
+    python3 - "$STAGING_MANIFEST_PATH" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    payload = json.load(handle)
+summary = payload.get("summary", {})
+print(
+    "|".join(
+        str(summary.get(key, 0))
+        for key in (
+            "status",
+            "missing_required_count",
+            "stale_required_count",
+            "present_required_count",
+        )
+    )
+    + "|"
+    + str(len(payload.get("blockers", [])))
+)
+PY
+  )"
+  IFS='|' read -r \
+    ARTIFACT_STAGING_STATUS \
+    ARTIFACT_STAGING_MISSING_REQUIRED \
+    ARTIFACT_STAGING_STALE_REQUIRED \
+    ARTIFACT_STAGING_PRESENT_REQUIRED \
+    ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
+  log_ok "Final artifact staging: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
+  log_ok "Final artifact blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
+else
+  log_warn "Final artifact staging manifest was not generated"
+fi
+
+post_generation_status="pass"
+post_generation_result_exit=0
+if [[ "$post_generation_exit" -ne 0 \
+  || "$post_generation_budget_exit" -ne 0 \
+  || "$staging_exit" -ne 0 \
+  || "$ARTIFACT_STAGING_STATUS" == "blocked" ]]; then
+  if [[ "$post_generation_exit" -ne 0 ]]; then
+    post_generation_result_exit="$post_generation_exit"
+  elif [[ "$post_generation_budget_exit" -ne 0 ]]; then
+    post_generation_result_exit="$post_generation_budget_exit"
+  else
+    post_generation_result_exit="$staging_exit"
+  fi
+  if [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+    post_generation_status="fail"
+    suite_fail=$((suite_fail + 1))
+  else
+    post_generation_status="skip"
+    suite_skip=$((suite_skip + 1))
+  fi
+else
+  suite_pass=$((suite_pass + 1))
+fi
+
+OUTPUT_DIR="$OUTPUT_DIR" \
+  ARTIFACT_COUNT="$artifact_count" \
+  SUITE_PASS="$suite_pass" \
+  SUITE_FAIL="$suite_fail" \
+  SUITE_SKIP="$suite_skip" \
+  POST_GENERATION_STATUS="$post_generation_status" \
+  POST_GENERATION_EXIT="$post_generation_result_exit" \
+  POST_GENERATION_BUDGET_STATUS="$post_generation_budget_status" \
+  POST_GENERATION_BUDGET_EXIT="$post_generation_budget_exit" \
+  ARTIFACT_STAGING_STATUS="$ARTIFACT_STAGING_STATUS" \
+  ARTIFACT_STAGING_MISSING_REQUIRED="$ARTIFACT_STAGING_MISSING_REQUIRED" \
+  ARTIFACT_STAGING_STALE_REQUIRED="$ARTIFACT_STAGING_STALE_REQUIRED" \
+  ARTIFACT_STAGING_BLOCKERS="$ARTIFACT_STAGING_BLOCKERS" \
+  python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+manifest_path = Path(os.environ["OUTPUT_DIR"]) / "manifest.json"
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+run_summary = manifest.setdefault("run_summary", {})
+passed = int(os.environ["SUITE_PASS"])
+failed = int(os.environ["SUITE_FAIL"])
+skipped = int(os.environ["SUITE_SKIP"])
+run_summary.update(
+    {
+        "total_suites": passed + failed + skipped,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "artifact_count": int(os.environ["ARTIFACT_COUNT"]),
+    }
+)
+manifest.setdefault("artifact_staging", {}).update(
+    {
+        "status": os.environ["ARTIFACT_STAGING_STATUS"],
+        "missing_required_count": int(os.environ["ARTIFACT_STAGING_MISSING_REQUIRED"]),
+        "stale_required_count": int(os.environ["ARTIFACT_STAGING_STALE_REQUIRED"]),
+        "blocker_count": int(os.environ["ARTIFACT_STAGING_BLOCKERS"]),
+    }
+)
+suite_results = manifest.setdefault("suite_results", [])
+suite_results.append(
+    {
+        "suite": "perf_budgets_post_generation",
+        "status": os.environ["POST_GENERATION_BUDGET_STATUS"],
+        "exit_code": int(os.environ["POST_GENERATION_BUDGET_EXIT"]),
+        "elapsed_ms": 0,
+    }
+)
+suite_results.append(
+    {
+        "suite": "post_generation_evidence",
+        "status": os.environ["POST_GENERATION_STATUS"],
+        "exit_code": int(os.environ["POST_GENERATION_EXIT"]),
+        "elapsed_ms": 0,
+    }
+)
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+PY
+
+log_ok "Total artifacts collected and finalized: $artifact_count"
 
 # ─── Phase 6: Generate checksums ────────────────────────────────────────────
 

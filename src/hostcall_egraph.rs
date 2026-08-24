@@ -56,6 +56,13 @@ pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 /// a trace that rewrites explosively.
 pub const DEFAULT_MAX_NODES: usize = 4_096;
 
+/// Default ceiling on trees produced by one enumeration of a class.
+///
+/// Generous next to the plans this actually sees — the canonical hostcall plan
+/// is five stages — while still bounding the Cartesian blowup a pathological
+/// graph could otherwise cause on the hostcall path.
+pub const DEFAULT_MAX_ENUMERATED: usize = 4_096;
+
 // ── Plan expression language ────────────────────────────────────────────────
 
 /// One stage of a hostcall execution plan.
@@ -243,8 +250,177 @@ pub struct CostModel {
     pub fused_default: u32,
 }
 
+/// Per-stage costs measured by the workload harness, in microseconds.
+///
+/// Mirrors the six-stage decomposition `examples/ext_workloads` emits as
+/// `pi.ext.hostcall_hotspot_matrix.v1`. Feed it to
+/// [`CostModel::from_measured_stages`] to replace the hand-written defaults
+/// with numbers from a real run (bd-oxu87).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeasuredStages {
+    pub marshal_us: f64,
+    pub queue_us: f64,
+    pub schedule_us: f64,
+    pub policy_us: f64,
+    pub execute_us: f64,
+    pub io_us: f64,
+    /// Typed-decode latency, when marshalling telemetry is available.
+    ///
+    /// The six-stage matrix reports one `marshal` figure and cannot separate
+    /// typed decode from JSON decode — but the marshalling path already times
+    /// both lanes per call and reports the difference as
+    /// `rewrite_observed_cost_delta` (see `src/extensions/protocol.rs`). Supply
+    /// the fast-lane figure here to calibrate the parameter the whole fast path
+    /// rests on, instead of leaving it modelled.
+    pub marshal_typed_us: Option<f64>,
+}
+
+impl MeasuredStages {
+    /// The six-stage matrix alone, with no marshalling telemetry.
+    #[must_use]
+    pub const fn from_stage_matrix(
+        marshal_us: f64,
+        queue_us: f64,
+        schedule_us: f64,
+        policy_us: f64,
+        execute_us: f64,
+        io_us: f64,
+    ) -> Self {
+        Self {
+            marshal_us,
+            queue_us,
+            schedule_us,
+            policy_us,
+            execute_us,
+            io_us,
+            marshal_typed_us: None,
+        }
+    }
+
+    /// Add the typed-decode latency from marshalling telemetry.
+    ///
+    /// `fast_candidate_latency_us` in `HostcallMarshallingArtifacts` is the
+    /// measurement; `baseline_latency_us` is already the `marshal_us` above, so
+    /// the pair gives both sides of the comparison the fast lane exists to win.
+    #[must_use]
+    pub const fn with_typed_marshal(mut self, fast_candidate_latency_us: f64) -> Self {
+        self.marshal_typed_us = Some(fast_candidate_latency_us);
+        self
+    }
+}
+
+/// What a calibration run could and could not measure.
+///
+/// The harness's six stages are coarser than [`StageOp`], so a measured run
+/// does **not** determine every field of a [`CostModel`]. Rather than let the
+/// difference disappear into plausible-looking numbers, calibration reports it:
+/// anything listed in `unmeasured` kept a conservative default, and any saving
+/// that depends on it is modelled, not measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationReport {
+    /// `CostModel` fields the run determined.
+    pub measured: Vec<&'static str>,
+    /// Fields the harness cannot distinguish, left at conservative defaults.
+    pub unmeasured: Vec<&'static str>,
+}
+
+impl CalibrationReport {
+    /// Whether every field that affects fusion selection was measured.
+    ///
+    /// False means a reported saving is partly modelled — which is a legitimate
+    /// state to be in, but not one to make a performance claim from.
+    #[must_use]
+    pub fn is_fully_measured(&self) -> bool {
+        self.unmeasured.is_empty()
+    }
+}
+
 impl CostModel {
+    /// Build a cost model from a measured run, reporting what it could not fix.
+    ///
+    /// # The mapping, and its limits
+    ///
+    /// Three [`StageOp`]s map onto a measured stage directly:
+    /// - [`StageOp::Marshal`] with [`Repr::Json`] <- `marshal_us`, the canonical
+    ///   decode the fast lane exists to avoid.
+    /// - [`StageOp::Policy`] <- `policy_us`.
+    /// - [`StageOp::Dispatch`] <- `queue_us + schedule_us`, the routing work
+    ///   between authorization and execution.
+    ///
+    /// `marshal_typed` is measured **when the caller supplies it** via
+    /// [`MeasuredStages::with_typed_marshal`]. The six-stage matrix cannot
+    /// distinguish typed decode from JSON decode, but the marshalling path
+    /// already times both lanes per call (`baseline_latency_us` and
+    /// `fast_candidate_latency_us` in `src/extensions/protocol.rs`, reported as
+    /// `rewrite_observed_cost_delta`). That is the parameter the entire fast
+    /// path rests on, so it is worth wiring through rather than modelling.
+    ///
+    /// The rest **cannot be derived from either source**, and calibration says
+    /// so instead of inventing them:
+    /// - `validate`, `convert`: the marshal figure covers decode and shape
+    ///   checking together; neither source splits them.
+    /// - `fused`: no measurement corresponds to an intrinsic that has not been
+    ///   built yet.
+    ///
+    /// Unmeasured fields keep [`Self::measured_default`]'s conservative values,
+    /// so a fusion whose benefit was never measured still has to beat the
+    /// baseline on numbers that do not flatter it.
+    ///
+    /// `execute_us` and `io_us` are deliberately unused: they price the work the
+    /// hostcall performs, which every plan pays identically. Including them
+    /// would inflate both sides of every comparison and shrink the apparent
+    /// difference between plans.
+    #[must_use]
+    pub fn from_measured_stages(stages: MeasuredStages) -> (Self, CalibrationReport) {
+        /// Round a microsecond figure into the model's integer cost units,
+        /// clamping at 1 so a measured stage never prices as free.
+        fn cost_of(us: f64) -> u32 {
+            if !us.is_finite() || us <= 0.0 {
+                return 1;
+            }
+            let rounded = us.round();
+            if rounded >= f64::from(u32::MAX) {
+                u32::MAX
+            } else {
+                (rounded as u32).max(1)
+            }
+        }
+
+        let mut model = Self::measured_default();
+        model.marshal_json = cost_of(stages.marshal_us);
+        model.policy = cost_of(stages.policy_us);
+        model.dispatch = cost_of(stages.queue_us + stages.schedule_us);
+
+        let mut measured = vec!["marshal_json", "policy", "dispatch"];
+        let mut unmeasured = vec!["validate", "convert", "fused"];
+
+        if let Some(typed_us) = stages.marshal_typed_us {
+            model.marshal_typed = cost_of(typed_us);
+            measured.push("marshal_typed");
+        } else {
+            unmeasured.push("marshal_typed");
+        }
+        // Both lists sorted so a report is comparable across runs regardless of
+        // which fields a given run happened to fill.
+        measured.sort_unstable();
+        unmeasured.sort_unstable();
+
+        (
+            model,
+            CalibrationReport {
+                measured,
+                unmeasured,
+            },
+        )
+    }
+
     /// Cost shape matching the harness's stage attribution.
+    ///
+    /// Hand-written, and **not** a calibrated measurement: it carries the shape
+    /// real runs report — JSON marshalling dominates, conversions are not free,
+    /// fused intrinsics cost less than the sum of their parts — so the search
+    /// behaves sensibly out of the box. Use [`Self::from_measured_stages`] when
+    /// a real run is available.
     #[must_use]
     pub fn measured_default() -> Self {
         let mut fused = BTreeMap::new();
@@ -480,6 +656,9 @@ pub enum SaturationOutcome {
     IterationBudget,
     /// The node ceiling was reached first.
     NodeBudget,
+    /// A class described more trees than the enumeration ceiling allows, so the
+    /// search could not read the graph back out in full.
+    EnumerationBudget,
 }
 
 impl SaturationOutcome {
@@ -488,6 +667,7 @@ impl SaturationOutcome {
             Self::Fixpoint => "fixpoint",
             Self::IterationBudget => "iteration_budget",
             Self::NodeBudget => "node_budget",
+            Self::EnumerationBudget => "enumeration_budget",
         }
     }
 
@@ -697,37 +877,58 @@ impl EGraph {
         self.node_count = node_count;
     }
 
-    /// Every concrete tree in a class, bounded by `depth`.
+    /// Every concrete tree in a class, bounded by `depth` and by `cap`.
     ///
     /// Used by saturation to feed whole subtrees to the shape-matching rules.
-    /// The depth bound is what keeps a cyclic class (entirely normal in an
-    /// e-graph, and exactly what a round-trip conversion rule creates) from
-    /// enumerating forever.
-    fn enumerate(&self, class: EClassId, depth: usize) -> Vec<PlanExpr> {
+    /// The depth bound keeps a cyclic class — entirely normal in an e-graph,
+    /// and exactly what a round-trip conversion rule creates — from enumerating
+    /// forever.
+    ///
+    /// The depth bound alone is not enough. This takes a Cartesian product over
+    /// child expansions, so a class holding `k` alternatives can yield up to
+    /// `k^depth` trees: bounded, but astronomically. `cap` bounds the actual
+    /// output, and exceeding it returns `None` rather than a truncated list.
+    ///
+    /// That distinction is the whole point. A truncated enumeration would make
+    /// saturation miss rewrites and the ambiguity check miss ties, and both
+    /// would then report success — silently converting "we ran out of room"
+    /// into "we proved this is optimal". `None` forces the caller to fail
+    /// closed instead.
+    fn enumerate(&self, class: EClassId, depth: usize, cap: usize) -> Option<Vec<PlanExpr>> {
         if depth == 0 {
-            return Vec::new();
+            return Some(Vec::new());
         }
         let root = self.find_const(class);
         let Some(nodes) = self.classes.get(&root.0) else {
-            return Vec::new();
+            return Some(Vec::new());
         };
 
-        let mut out = Vec::new();
+        let mut out: Vec<PlanExpr> = Vec::new();
         for node in nodes {
             if node.children.is_empty() {
                 out.push(PlanExpr::leaf(node.op.clone()));
+                if out.len() > cap {
+                    return None;
+                }
                 continue;
             }
             // Cartesian product over child expansions.
             let mut combos: Vec<Vec<PlanExpr>> = vec![Vec::new()];
             let mut viable = true;
             for child in &node.children {
-                let options = self.enumerate(*child, depth - 1);
+                let options = self.enumerate(*child, depth - 1, cap)?;
                 if options.is_empty() {
+                    // This child cannot be expanded within the depth bound, so
+                    // no complete tree runs through this node.
                     viable = false;
                     break;
                 }
-                let mut next = Vec::new();
+                // Check the product before building it: `combos.len() *
+                // options.len()` is the size we are about to materialize.
+                if combos.len().saturating_mul(options.len()) > cap {
+                    return None;
+                }
+                let mut next = Vec::with_capacity(combos.len() * options.len());
                 for combo in &combos {
                     for option in &options {
                         let mut extended = combo.clone();
@@ -745,9 +946,12 @@ impl EGraph {
                     op: node.op.clone(),
                     children,
                 });
+                if out.len() > cap {
+                    return None;
+                }
             }
         }
-        out
+        Some(out)
     }
 
     /// Cheapest tree in each class, by fixpoint over node costs.
@@ -824,6 +1028,14 @@ pub struct SaturationLimits {
     pub max_nodes: usize,
     /// Depth bound when enumerating a class into concrete trees.
     pub max_expr_depth: usize,
+    /// Ceiling on trees produced by a single enumeration.
+    ///
+    /// Separate from `max_nodes` because they bound different things: the node
+    /// budget limits how big the graph gets, this limits how many distinct
+    /// trees that graph can be read out as. Enumeration is a Cartesian product,
+    /// so a graph well inside its node budget can still describe astronomically
+    /// many trees. Exceeding this fails closed.
+    pub max_enumerated: usize,
 }
 
 impl Default for SaturationLimits {
@@ -832,6 +1044,7 @@ impl Default for SaturationLimits {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             max_nodes: DEFAULT_MAX_NODES,
             max_expr_depth: 12,
+            max_enumerated: DEFAULT_MAX_ENUMERATED,
         }
     }
 }
@@ -863,6 +1076,51 @@ impl EGraphDecision {
     #[must_use]
     pub const fn rewrote(&self) -> bool {
         self.fallback_reason.is_none()
+    }
+
+    /// Cost of the plan this decision settled on, rewritten or not.
+    ///
+    /// Unlike [`Self::selected_cost`], this is meaningful for a fallback too: a
+    /// decision that declined to rewrite still has a best-known plan, namely
+    /// the baseline it was handed.
+    #[must_use]
+    pub const fn best_cost(&self) -> u32 {
+        if self.rewrote() {
+            self.selected_cost
+        } else {
+            self.baseline_cost
+        }
+    }
+
+    /// Express this decision's best plan as a fraction of `reference`'s best
+    /// plan, rendered on `scale`.
+    ///
+    /// # Why this takes two decisions
+    ///
+    /// A ratio only means something when both sides measure the same kind of
+    /// thing. Comparing a decision against *its own* baseline answers "how much
+    /// did fusing help this plan?" — which is not the question a caller asking
+    /// "how expensive is the typed path relative to the canonical one?" is
+    /// asking. Answering the first and reporting it as the second is a category
+    /// error: the result is a real ratio, just not of the two things being
+    /// compared.
+    ///
+    /// So both sides are searched independently and their best plans compared.
+    /// `self` is the candidate, `reference` is what it is measured against, and
+    /// the result places the candidate on a scale where `reference` sits at
+    /// `scale`.
+    ///
+    /// Returns `None` when the reference is free (no ratio exists) or the
+    /// result does not fit the scale's type.
+    #[must_use]
+    pub fn relative_to(&self, reference: &Self, scale: u32) -> Option<u32> {
+        let reference_cost = reference.best_cost();
+        if reference_cost == 0 {
+            return None;
+        }
+        let scaled = u64::from(self.best_cost()).saturating_mul(u64::from(scale))
+            / u64::from(reference_cost);
+        u32::try_from(scaled).ok()
     }
 
     /// Hand the result to [`crate::hostcall_rewrite::HostcallRewriteEngine`],
@@ -1023,7 +1281,16 @@ impl HostcallEGraphEngine {
             let mut merges: Vec<(EClassId, PlanExpr, &'static str)> = Vec::new();
             for class_id in class_ids {
                 let class = EClassId(class_id);
-                for expr in graph.enumerate(class, self.limits.max_expr_depth) {
+                let Some(exprs) = graph.enumerate(
+                    class,
+                    self.limits.max_expr_depth,
+                    self.limits.max_enumerated,
+                ) else {
+                    // Cannot read this class back out in full, so we cannot
+                    // claim to have applied every rule to it.
+                    return (SaturationOutcome::EnumerationBudget, iterations);
+                };
+                for expr in exprs {
                     for rule in &rules {
                         if let Some(rewritten) = rule.apply(&expr) {
                             merges.push((class, rewritten, rule.id));
@@ -1096,6 +1363,7 @@ impl HostcallEGraphEngine {
         if !outcome.is_complete() {
             decision.fallback_reason = Some(match outcome {
                 SaturationOutcome::NodeBudget => "node_budget_exhausted",
+                SaturationOutcome::EnumerationBudget => "enumeration_budget_exhausted",
                 _ => "iteration_budget_exhausted",
             });
             return decision;
@@ -1117,12 +1385,20 @@ impl HostcallEGraphEngine {
         // minimum means the cost model does not actually prefer one; picking
         // either would make the choice an artifact of iteration order rather
         // than of measurement.
-        let tied: Vec<PlanExpr> = graph
-            .enumerate(root, self.limits.max_expr_depth)
-            .into_iter()
+        let Some(all_plans) =
+            graph.enumerate(root, self.limits.max_expr_depth, self.limits.max_enumerated)
+        else {
+            // Without a full enumeration we cannot rule out a tie, and an
+            // unchecked tie is exactly what this guard exists to prevent.
+            decision.outcome = SaturationOutcome::EnumerationBudget;
+            decision.fallback_reason = Some("enumeration_budget_exhausted");
+            return decision;
+        };
+        let distinct: BTreeSet<String> = all_plans
+            .iter()
             .filter(|candidate| candidate.cost(&self.model) == extracted_cost)
+            .map(PlanExpr::signature)
             .collect();
-        let distinct: BTreeSet<String> = tied.iter().map(PlanExpr::signature).collect();
         if distinct.len() > 1 {
             decision.fallback_reason = Some("ambiguous_min_cost");
             return decision;
@@ -1674,6 +1950,250 @@ mod tests {
         assert_eq!(json["rewrote"], false);
         assert_eq!(json["fallback_reason"], "egraph_disabled");
         assert_eq!(json["expected_cost_delta"], 0);
+    }
+
+    // ── Calibration ─────────────────────────────────────────────────────
+
+    fn sample_stages() -> MeasuredStages {
+        MeasuredStages::from_stage_matrix(41.2, 6.4, 5.1, 9.7, 820.0, 130.0)
+    }
+
+    #[test]
+    fn calibration_takes_the_three_stages_it_can_map() {
+        let (model, report) = CostModel::from_measured_stages(sample_stages());
+        assert_eq!(model.marshal_json, 41, "marshal rounds from 41.2");
+        assert_eq!(model.policy, 10, "policy rounds from 9.7");
+        assert_eq!(model.dispatch, 12, "dispatch is queue + schedule = 11.5");
+        assert_eq!(report.measured, ["dispatch", "marshal_json", "policy"]);
+    }
+
+    #[test]
+    fn calibration_admits_what_it_could_not_measure() {
+        // The honest half: the harness cannot separate typed decode from JSON
+        // decode, or price an intrinsic that does not exist yet. Those fields
+        // must be reported, not quietly filled in.
+        let (model, report) = CostModel::from_measured_stages(sample_stages());
+        assert!(!report.is_fully_measured());
+        for field in ["marshal_typed", "validate", "convert", "fused"] {
+            assert!(
+                report.unmeasured.contains(&field),
+                "{field} is not measurable from six-stage attribution"
+            );
+        }
+        let defaults = CostModel::measured_default();
+        assert_eq!(model.marshal_typed, defaults.marshal_typed);
+        assert_eq!(model.validate, defaults.validate);
+        assert_eq!(model.convert, defaults.convert);
+        assert_eq!(model.fused, defaults.fused);
+    }
+
+    #[test]
+    fn calibration_ignores_execute_and_io() {
+        // Every plan pays the same execute/io cost, so including it would
+        // inflate both sides and shrink the visible difference between plans.
+        let mut heavy = sample_stages();
+        heavy.execute_us = 50_000.0;
+        heavy.io_us = 90_000.0;
+        let (baseline_model, _) = CostModel::from_measured_stages(sample_stages());
+        let (heavy_model, _) = CostModel::from_measured_stages(heavy);
+        assert_eq!(baseline_model.marshal_json, heavy_model.marshal_json);
+        assert_eq!(baseline_model.policy, heavy_model.policy);
+        assert_eq!(baseline_model.dispatch, heavy_model.dispatch);
+    }
+
+    #[test]
+    fn a_measured_stage_never_prices_as_free() {
+        // A zero or nonsensical measurement must not make a stage cost nothing;
+        // that would let any plan containing it win by arithmetic accident.
+        let degenerate = MeasuredStages::from_stage_matrix(0.0, -3.0, f64::NAN, 0.000_1, 0.0, 0.0)
+            .with_typed_marshal(-1.0);
+        let (model, _) = CostModel::from_measured_stages(degenerate);
+        assert!(model.marshal_json >= 1);
+        assert!(model.policy >= 1);
+        assert!(model.dispatch >= 1);
+    }
+
+    #[test]
+    fn marshalling_telemetry_measures_the_parameter_the_fast_path_rests_on() {
+        // The six-stage matrix alone leaves marshal_typed modelled. The
+        // marshalling path already times the typed lane per call, so supplying
+        // it moves the single most decisive parameter onto the measured side.
+        let (_, matrix_only) = CostModel::from_measured_stages(sample_stages());
+        assert!(matrix_only.unmeasured.contains(&"marshal_typed"));
+        assert!(!matrix_only.measured.contains(&"marshal_typed"));
+
+        let (model, report) =
+            CostModel::from_measured_stages(sample_stages().with_typed_marshal(13.6));
+        assert_eq!(model.marshal_typed, 14, "typed marshal rounds from 13.6");
+        assert!(report.measured.contains(&"marshal_typed"));
+        assert!(!report.unmeasured.contains(&"marshal_typed"));
+
+        // Still not fully measured: validate/convert/fused remain modelled.
+        assert!(!report.is_fully_measured());
+        assert_eq!(report.unmeasured, ["convert", "fused", "validate"]);
+    }
+
+    #[test]
+    fn a_calibrated_model_still_refuses_unpriced_fusions() {
+        // Calibration must not weaken the fail-closed posture: fused costs are
+        // among the unmeasured fields, so clearing them still loses.
+        let (mut model, _) = CostModel::from_measured_stages(sample_stages());
+        model.fused.clear();
+        let engine = HostcallEGraphEngine::new(true).with_cost_model(model);
+        let decision = engine.optimize(&canonical_plan("tool.read"));
+        assert!(!decision.rewrote());
+    }
+
+    #[test]
+    fn relative_to_compares_two_searched_plans_not_a_plan_against_itself() {
+        // The bug this pins: measuring a decision against its OWN baseline
+        // answers "how much did fusing help?", which is not "how expensive is
+        // the typed path versus the canonical one?". Both sides get searched.
+        let engine = HostcallEGraphEngine::new(true);
+        let canonical = engine.optimize(&canonical_plan("tool.read"));
+        let typed = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
+
+        let relative = typed
+            .relative_to(&canonical, 100)
+            .expect("canonical is not free");
+        let expected =
+            u32::try_from(u64::from(typed.best_cost()) * 100 / u64::from(canonical.best_cost()))
+                .expect("in range");
+        assert_eq!(relative, expected);
+
+        // The typed path must land below the canonical one on its own scale --
+        // that is the whole claim the fast lane makes.
+        assert!(
+            relative < 100,
+            "typed {relative} should beat canonical at 100"
+        );
+    }
+
+    #[test]
+    fn best_cost_is_defined_for_a_fallback_too() {
+        // A decision that declined to rewrite still has a best-known plan: the
+        // baseline. Without this, a fallback could not participate in a ratio
+        // at all, and the caller would silently lose one side of it.
+        let disabled = HostcallEGraphEngine::new(false);
+        let fallback = disabled.optimize(&typed_plan_with_roundtrip("tool.read"));
+        assert!(!fallback.rewrote());
+        assert_eq!(fallback.best_cost(), fallback.baseline_cost);
+
+        let engine = HostcallEGraphEngine::new(true);
+        let rewritten = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
+        assert!(rewritten.rewrote());
+        assert_eq!(rewritten.best_cost(), rewritten.selected_cost);
+        assert!(rewritten.best_cost() < fallback.best_cost());
+    }
+
+    #[test]
+    fn relative_to_declines_when_the_reference_is_free() {
+        // A zero-cost reference has no ratio. Returning 0 or u32::MAX here
+        // would hand the caller a number with no meaning behind it.
+        let free = CostModel {
+            opcode: 0,
+            marshal_json: 0,
+            marshal_typed: 0,
+            marshal_bytes: 0,
+            validate: 0,
+            policy: 0,
+            dispatch: 0,
+            convert: 0,
+            fused: BTreeMap::new(),
+            fused_default: 0,
+        };
+        let engine = HostcallEGraphEngine::new(true).with_cost_model(free);
+        let zero = engine.optimize(&canonical_plan("tool.read"));
+        assert_eq!(zero.best_cost(), 0);
+        assert_eq!(zero.relative_to(&zero, 100), None);
+    }
+
+    #[test]
+    fn relative_to_is_linear_in_the_scale() {
+        // Doubling the scale doubles the result, so a caller can reason about
+        // the mapping instead of treating it as a black box.
+        let engine = HostcallEGraphEngine::new(true);
+        let canonical = engine.optimize(&canonical_plan("tool.read"));
+        let typed = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
+        let at_100 = typed.relative_to(&canonical, 100).expect("projects");
+        let at_200 = typed.relative_to(&canonical, 200).expect("projects");
+        // Integer division makes this approximate; allow one unit of rounding.
+        assert!(
+            at_200.abs_diff(at_100.saturating_mul(2)) <= 1,
+            "not linear: {at_100} at 100 vs {at_200} at 200"
+        );
+        assert_eq!(typed.relative_to(&canonical, 0), Some(0));
+    }
+
+    #[test]
+    fn an_enumeration_blowup_falls_back_instead_of_truncating() {
+        // A tiny cap stands in for the Cartesian blowup a pathological graph
+        // could cause. The engine must NOT quietly enumerate a prefix and then
+        // report a fixpoint -- that would turn "we ran out of room" into "we
+        // proved this is optimal".
+        let engine = HostcallEGraphEngine::new(true).with_limits(SaturationLimits {
+            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_nodes: DEFAULT_MAX_NODES,
+            max_expr_depth: 12,
+            max_enumerated: 1,
+        });
+        let decision = engine.optimize(&typed_plan_with_roundtrip("tool.read"));
+        assert!(!decision.rewrote(), "must not rewrite on a partial view");
+        assert_eq!(
+            decision.fallback_reason,
+            Some("enumeration_budget_exhausted")
+        );
+        assert_eq!(decision.outcome, SaturationOutcome::EnumerationBudget);
+        assert!(!decision.outcome.is_complete());
+        assert_eq!(decision.plan, decision.baseline);
+    }
+
+    #[test]
+    fn the_default_enumeration_cap_is_not_hit_by_real_plans() {
+        // The cap must bound pathology without perturbing ordinary use, or it
+        // would silently disable the search on the plans it exists to optimize.
+        let engine = HostcallEGraphEngine::new(true);
+        for opcode in ["tool.read", "tool.write", "session.get_state"] {
+            for plan in [canonical_plan(opcode), typed_plan_with_roundtrip(opcode)] {
+                let decision = engine.optimize(&plan);
+                assert_ne!(
+                    decision.outcome,
+                    SaturationOutcome::EnumerationBudget,
+                    "{opcode}: real plan should not exhaust the default cap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_typed_path_beats_the_canonical_path_on_a_shared_scale() {
+        // Mirrors what src/extensions/protocol.rs::egraph_fast_opcode_cost
+        // computes: both plans searched, then compared. If this inverts, the
+        // fast lane would be priced as the more expensive option.
+        let engine = HostcallEGraphEngine::new(true);
+        let canonical = engine.optimize(&canonical_plan("tool.read"));
+        let typed = engine.optimize(&PlanExpr::unary(
+            StageOp::Dispatch,
+            PlanExpr::unary(
+                StageOp::Validate,
+                PlanExpr::unary(
+                    StageOp::Marshal(Repr::Typed),
+                    PlanExpr::unary(StageOp::Policy, opcode_leaf()),
+                ),
+            ),
+        ));
+        assert!(
+            typed.best_cost() < canonical.best_cost(),
+            "typed {} should cost less than canonical {}",
+            typed.best_cost(),
+            canonical.best_cost()
+        );
+        let on_scale = typed.relative_to(&canonical, 100).expect("projects");
+        assert!(
+            on_scale < 100,
+            "typed should land under 100, got {on_scale}"
+        );
+        assert!(on_scale > 0, "a real plan is not free");
     }
 
     #[test]

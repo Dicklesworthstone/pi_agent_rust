@@ -64,7 +64,8 @@ pub trait Provider: Send + Sync {
         Err(crate::error::Error::provider(
             self.name().to_string(),
             format!(
-                "native compaction is not supported by the {} API",
+                "provider {} does not implement native compaction (api: {})",
+                self.name(),
                 self.api()
             ),
         ))

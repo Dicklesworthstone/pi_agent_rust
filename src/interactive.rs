@@ -2075,7 +2075,8 @@ fn build_startup_welcome_message(config: &Config, available_models: &[ModelEntry
         return String::new();
     }
 
-    let mut message = String::from("  Welcome to Pi!\n");
+    let welcome = crate::overlay_system::WelcomeScreen::default();
+    let mut message = format!("  {}\n", welcome.greeting);
     message.push_str("  Type a message to begin, or /help for commands.\n");
 
     if available_models

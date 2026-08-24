@@ -298,13 +298,27 @@ fn live_view_renders_default_welcome_and_powerline_status() {
 
     let view = app.view();
 
-    assert!(view.contains("Welcome to Pi Agent"), "view: {view}");
+    assert!(view.contains("Welcome to Pi!"), "view: {view}");
     assert!(view.contains("Tip: Type /help"), "view: {view}");
     assert!(view.contains("ACT"), "powerline mode missing: {view}");
     assert!(
         view.contains("ctx: 0%"),
         "powerline context missing: {view}"
     );
+}
+
+#[test]
+fn quiet_startup_does_not_render_welcome_screen_fallback() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.config.quiet_startup = Some(true);
+    app.startup_welcome.clear();
+
+    let view = app.view();
+
+    assert!(!view.contains("Welcome to Pi!"), "view: {view}");
+    assert!(!view.contains("Tip: Type /help"), "view: {view}");
 }
 
 #[test]

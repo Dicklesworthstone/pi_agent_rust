@@ -18489,15 +18489,23 @@ async fn dispatch_hostcall_events_ref(
             // native compact bridge; absent/null keeps the summary bridge.
             // Unknown strategies error loudly so callers fail open instead
             // of silently getting the wrong compaction kind.
-            match payload.get("strategy").and_then(Value::as_str) {
-                None => match actions.compact_session(preparation).await {
+            match payload.get("strategy") {
+                None | Some(Value::Null) => match actions.compact_session(preparation).await {
                     Ok(value) => HostcallOutcome::Success(value),
                     Err(err) => HostcallOutcome::Error {
                         code: "provider".to_string(),
                         message: err.to_string(),
                     },
                 },
-                Some("openai-responses-native") => {
+                // A non-string strategy is a caller bug: error loudly rather
+                // than silently running the wrong compaction kind.
+                Some(other) if !other.is_string() => HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: format!(
+                        "compact: `strategy` must be a string when present, got {other}"
+                    ),
+                },
+                Some(Value::String(strategy)) if strategy == "openai-responses-native" => {
                     let request = payload.get("request").cloned().unwrap_or(Value::Null);
                     match actions.compact_session_native(preparation, request).await {
                         Ok(value) => HostcallOutcome::Success(value),
@@ -18507,12 +18515,16 @@ async fn dispatch_hostcall_events_ref(
                         },
                     }
                 }
-                Some(other) => HostcallOutcome::Error {
-                    code: "invalid_request".to_string(),
-                    message: format!(
-                        "compact: unsupported strategy `{other}` (supported: \"openai-responses-native\")"
-                    ),
-                },
+                // Remaining case: a string strategy we do not support.
+                Some(other) => {
+                    let label = other.as_str().unwrap_or_default();
+                    HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: format!(
+                            "compact: unsupported strategy `{label}` (supported: \"openai-responses-native\")"
+                        ),
+                    }
+                }
             }
         }
         EventsHostcallOp::RegisterCommand => {

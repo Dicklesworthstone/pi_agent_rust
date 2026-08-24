@@ -35,6 +35,44 @@ HOST_TOPOLOGY_SCHEMA = "pi.perf.host_topology_fingerprint.v1"
 DEFAULT_MAX_ARTIFACT_AGE_HOURS = 24.0
 DEFAULT_EVIDENCE_CACHE_TTL_HOURS = 168.0
 EXTENSION_BLOCKER_BEAD = "bd-2zcs5.51"
+FUTURE_TIMESTAMP_TOLERANCE_SECONDS = 300.0
+EMBEDDED_PROVENANCE_REQUIREMENTS = {
+    "pi.perf.workload.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.ext.rust_bench.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.ext.legacy_bench.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.perf.phase1_matrix_validation.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+    "pi.perf.extension_benchmark_stratification.v1": (
+        "embedded_timestamp",
+        "source_commit",
+        "source_dirty",
+        "run_id",
+        "correlation_id",
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -64,6 +102,7 @@ class EvidenceCacheContext:
     git_commit: str
     build_profile: str
     max_ttl_hours: float
+    expected_correlation_id: str | None
 
 
 def utc_now() -> datetime:
@@ -656,6 +695,16 @@ def validate_evidence_cache_entry(
             "run_id_present": run_id is not None,
             "correlation_id_present": correlation_id is not None,
         }
+    if (
+        context.expected_correlation_id is not None
+        and correlation_id != context.expected_correlation_id
+    ):
+        return None, {
+            **rejection_base,
+            "reason": "correlation_id_mismatch",
+            "expected_correlation_id": context.expected_correlation_id,
+            "observed_correlation_id": correlation_id,
+        }
 
     if entry_string(entry, "command") is None:
         return None, {
@@ -729,6 +778,32 @@ def validate_evidence_cache_entry(
             "reason": "artifact_schema_mismatch",
             "expected_artifact_schema": detected_schema,
             "observed_artifact_schema": recorded_schema,
+        }
+
+    embedded_inspection = inspect_direct_artifact(
+        evidence_path,
+        effective_ttl_hours,
+        now,
+        expected_git_commit=context.git_commit,
+        expected_correlation_id=context.expected_correlation_id,
+    )
+    if not embedded_inspection["is_fresh"]:
+        return None, {
+            **rejection_base,
+            "reason": "cache_artifact_provenance_invalid",
+            "cache_artifact_path": str(evidence_path),
+            "freshness_failures": embedded_inspection["freshness_failures"],
+            "freshness_reason": embedded_inspection["freshness_reason"],
+        }
+    if (
+        context.expected_correlation_id
+        and embedded_inspection["correlation_id"] is None
+    ):
+        return None, {
+            **rejection_base,
+            "reason": "cache_artifact_missing_independent_lineage",
+            "cache_artifact_path": str(evidence_path),
+            "expected_correlation_id": context.expected_correlation_id,
         }
 
     accepted = {
@@ -806,25 +881,194 @@ def file_age_hours(path: Path, now: datetime) -> float | None:
     return (now - modified).total_seconds() / 3600.0
 
 
+def _direct_artifact_records(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    if path.suffix not in {".json", ".jsonl"}:
+        return [], []
+
+    failures: list[str] = []
+    records: list[dict[str, Any]] = []
+    try:
+        if path.suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                records.append(payload)
+            else:
+                failures.append("invalid_json_object")
+            return records, failures
+
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    failures.append("invalid_jsonl_record")
+                    continue
+                records.append(payload)
+    except (OSError, json.JSONDecodeError):
+        failures.append("invalid_json" if path.suffix == ".json" else "invalid_jsonl_record")
+    if path.suffix == ".jsonl" and not records and not failures:
+        failures.append("empty_jsonl")
+    return records, failures
+
+
+def _consistent_embedded_value(
+    records: list[dict[str, Any]], key: str, failures: list[str]
+) -> Any:
+    present = [record[key] for record in records if key in record]
+    if not present:
+        return None
+    if len(present) != len(records):
+        failures.append(f"partial_{key}")
+        return None
+    canonical = {json.dumps(value, sort_keys=True) for value in present}
+    if len(canonical) != 1:
+        failures.append(f"conflicting_{key}")
+        return None
+    return present[0]
+
+
+def inspect_direct_artifact(
+    path: Path,
+    max_age_hours: float,
+    now: datetime,
+    *,
+    expected_git_commit: str | None = None,
+    expected_correlation_id: str | None = None,
+) -> dict[str, Any]:
+    """Inspect direct evidence without allowing checkout mtime to mask provenance."""
+    mtime_age = file_age_hours(path, now)
+    failures: list[str] = []
+    records, parse_failures = _direct_artifact_records(path)
+    failures.extend(parse_failures)
+
+    embedded_times: list[tuple[str, datetime]] = []
+    timestamp_presence = 0
+    for record in records:
+        timestamp_key = "generated_at" if "generated_at" in record else "timestamp"
+        if timestamp_key not in record:
+            continue
+        timestamp_presence += 1
+        parsed = parse_utc_timestamp(record.get(timestamp_key))
+        if parsed is None:
+            failures.append("malformed_embedded_timestamp")
+            continue
+        embedded_times.append((str(record[timestamp_key]), parsed))
+
+    if timestamp_presence and timestamp_presence != len(records):
+        failures.append("partial_embedded_timestamp")
+
+    freshness_basis = "embedded_timestamp" if timestamp_presence else "filesystem_mtime"
+    embedded_timestamp: str | None = None
+    if embedded_times:
+        embedded_timestamp, oldest_timestamp = min(embedded_times, key=lambda item: item[1])
+        age_hours = (now - oldest_timestamp).total_seconds() / 3600.0
+        if age_hours < -(FUTURE_TIMESTAMP_TOLERANCE_SECONDS / 3600.0):
+            failures.append("embedded_timestamp_in_future")
+        elif age_hours > max_age_hours:
+            failures.append("embedded_timestamp_stale")
+    else:
+        age_hours = mtime_age
+        if timestamp_presence == 0 and (age_hours is None or age_hours > max_age_hours):
+            failures.append("filesystem_mtime_stale")
+
+    source_commit = _consistent_embedded_value(records, "source_commit", failures)
+    source_dirty = _consistent_embedded_value(records, "source_dirty", failures)
+    run_id = _consistent_embedded_value(records, "run_id", failures)
+    orchestration_correlation_id = _consistent_embedded_value(
+        records, "orchestration_correlation_id", failures
+    )
+    correlation_id = (
+        orchestration_correlation_id
+        if orchestration_correlation_id is not None
+        else _consistent_embedded_value(records, "correlation_id", failures)
+    )
+    schema = _consistent_embedded_value(records, "schema", failures)
+    field_presence = {
+        key: sum(1 for record in records if key in record)
+        for key in (
+            "source_commit",
+            "source_dirty",
+            "run_id",
+            "correlation_id",
+            "orchestration_correlation_id",
+        )
+    }
+
+    requirements = EMBEDDED_PROVENANCE_REQUIREMENTS.get(schema, ())
+    for requirement in requirements:
+        if requirement == "embedded_timestamp":
+            if timestamp_presence == 0:
+                failures.append("missing_embedded_timestamp")
+            continue
+        if field_presence[requirement] == 0:
+            failures.append(f"missing_{requirement}")
+
+    if field_presence["source_commit"]:
+        if not isinstance(source_commit, str) or not source_commit.strip():
+            failures.append("invalid_source_commit")
+        elif (
+            expected_git_commit
+            and expected_git_commit != "unknown"
+            and source_commit != expected_git_commit
+        ):
+            failures.append("source_commit_mismatch")
+    if field_presence["source_dirty"] and source_dirty is not False:
+        failures.append("source_dirty_not_false")
+    for key, value in (("run_id", run_id), ("correlation_id", correlation_id)):
+        if field_presence[key] and (not isinstance(value, str) or not value.strip()):
+            failures.append(f"invalid_{key}")
+    if expected_correlation_id:
+        observed_id = correlation_id if correlation_id is not None else run_id
+        if observed_id is not None and observed_id != expected_correlation_id:
+            failures.append("correlation_id_mismatch")
+
+    failures = list(dict.fromkeys(failures))
+    return {
+        "source_kind": "direct",
+        "path": str(path),
+        "is_fresh": not failures,
+        "freshness_basis": freshness_basis,
+        "freshness_reason": failures[0] if failures else "fresh",
+        "freshness_failures": failures,
+        "age_hours": age_hours,
+        "mtime_age_hours": mtime_age,
+        "embedded_timestamp": embedded_timestamp,
+        "max_age_hours": max_age_hours,
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "artifact_schema": schema,
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "orchestration_correlation_id": orchestration_correlation_id,
+        "reused_evidence": False,
+    }
+
+
 def existing_fresh_candidates(
-    candidates: tuple[Path, ...], max_age_hours: float, now: datetime
+    candidates: tuple[Path, ...],
+    max_age_hours: float,
+    now: datetime,
+    *,
+    expected_git_commit: str | None = None,
+    expected_correlation_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     fresh: list[dict[str, Any]] = []
     stale: list[dict[str, Any]] = []
     for path in candidates:
         if not path.is_file():
             continue
-        age = file_age_hours(path, now)
-        artifact = {
-            "source_kind": "direct",
-            "path": str(path),
-            "age_hours": age,
-            "max_age_hours": max_age_hours,
-            "size_bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-            "reused_evidence": False,
-        }
-        if age is not None and age <= max_age_hours:
+        artifact = inspect_direct_artifact(
+            path,
+            max_age_hours,
+            now,
+            expected_git_commit=expected_git_commit,
+            expected_correlation_id=expected_correlation_id,
+        )
+        if artifact["is_fresh"]:
             fresh.append(artifact)
         else:
             stale.append(artifact)
@@ -1255,6 +1499,25 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         target_dir,
         args.evidence_cache_dir or os.environ.get("PI_PERF_EVIDENCE_CACHE_DIR"),
     )
+    expected_correlation_id = args.expected_correlation_id or os.environ.get(
+        "PI_PERF_EXPECTED_CORRELATION_ID"
+    )
+    if args.artifact_readiness_only and not expected_correlation_id:
+        return (
+            2,
+            {
+                "schema": SCHEMA,
+                "generated_at": iso_now(),
+                "repo_root": str(repo_root),
+                "cargo_target_dir": str(target_dir),
+                "readiness_scope": "artifacts_only",
+                "report_blockers_ignored_for_readiness": False,
+                "readiness": "blocked",
+                "configuration_error": (
+                    "artifact_readiness_only_requires_expected_correlation_id"
+                ),
+            },
+        )
     cache_context = EvidenceCacheContext(
         repo_root=repo_root,
         target_dir=target_dir,
@@ -1267,6 +1530,7 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         or os.environ.get("CARGO_PROFILE")
         or "perf",
         max_ttl_hours=args.cache_ttl_hours,
+        expected_correlation_id=expected_correlation_id,
     )
     cache_entries, cache_status = load_evidence_cache_entries(cache_dir)
     contracts = parse_budget_contracts(repo_root / "tests/perf_budgets.rs")
@@ -1282,7 +1546,13 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     groups = artifact_groups(repo_root, target_dir)
     for group in groups:
-        group_fresh, group_stale = existing_fresh_candidates(group.candidates, max_age_hours, now)
+        group_fresh, group_stale = existing_fresh_candidates(
+            group.candidates,
+            max_age_hours,
+            now,
+            expected_git_commit=cache_context.git_commit,
+            expected_correlation_id=expected_correlation_id,
+        )
         cache_fresh, cache_rejected = evidence_cache_for_group(
             cache_entries,
             group,
@@ -1351,7 +1621,9 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     dedup_suggestions = list(dict.fromkeys(suggestions))
     dedup_expected = list(dict.fromkeys(expected_outputs))
-    ready = not missing and not stale and not report_blockers
+    artifact_readiness_only = args.artifact_readiness_only
+    report_blockers_ignored_for_readiness = artifact_readiness_only and bool(report_blockers)
+    ready = not missing and not stale and (artifact_readiness_only or not report_blockers)
     cache_status.update(
         {
             "expected_git_commit": cache_context.git_commit,
@@ -1381,6 +1653,10 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "evidence_cache": cache_status,
         "rch": rch_status(args.skip_rch_check),
         "current_report": report,
+        "readiness_scope": (
+            "artifacts_only" if artifact_readiness_only else "artifacts_and_checked_in_report"
+        ),
+        "report_blockers_ignored_for_readiness": report_blockers_ignored_for_readiness,
         "readiness": "ready" if ready else "blocked",
         "missing_budget_artifacts": missing,
         "stale_artifacts": stale,
@@ -1445,6 +1721,8 @@ def run_self_test() -> int:
         cache_git_commit: str = "test-commit",
         cache_profile: str = "perf",
         cache_ttl_hours: float = 24.0,
+        expected_correlation_id: str | None = None,
+        artifact_readiness_only: bool = False,
     ) -> argparse.Namespace:
         return argparse.Namespace(
             repo_root=str(root),
@@ -1454,7 +1732,9 @@ def run_self_test() -> int:
             cache_ttl_hours=cache_ttl_hours,
             cache_profile=cache_profile,
             cache_git_commit=cache_git_commit,
+            expected_correlation_id=expected_correlation_id,
             skip_rch_check=True,
+            artifact_readiness_only=artifact_readiness_only,
         )
 
     def write_cache_index(
@@ -1467,11 +1747,22 @@ def run_self_test() -> int:
         ttl_hours: float = 24.0,
         run_id: str | None = "run-123",
         correlation_id: str | None = "corr-123",
+        embedded_correlation_id: str | None = None,
     ) -> Path:
         cache_dir = root / "target/perf/evidence_cache"
         artifact_path = cache_dir / "artifacts" / contract_id / "estimates.json"
         artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_text('{"mean":{"point_estimate":1000.0}}\n', encoding="utf-8")
+        artifact_payload: dict[str, Any] = {"mean": {"point_estimate": 1000.0}}
+        if embedded_correlation_id is not None:
+            artifact_payload.update(
+                {
+                    "generated_at": iso_now(),
+                    "source_commit": cache_git_commit,
+                    "source_dirty": False,
+                    "correlation_id": embedded_correlation_id,
+                }
+            )
+        artifact_path.write_text(json.dumps(artifact_payload) + "\n", encoding="utf-8")
         entry = {
             "schema": EVIDENCE_CACHE_ENTRY_SCHEMA,
             "contract_id": contract_id,
@@ -1546,17 +1837,50 @@ def run_self_test() -> int:
         for path in estimate_paths:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(fresh_payload), encoding="utf-8")
+        generated_at = iso_now()
         (root / "target/perf/perf/pijs_workload_perf.jsonl").write_text(
-            '{"schema":"pi.perf.workload.v1","iterations":2000,"tool_calls_per_iteration":1,"total_calls":2000,"build_profile_verified":true}\n',
+            json.dumps(
+                {
+                    "schema": "pi.perf.workload.v1",
+                    "timestamp": generated_at,
+                    "source_commit": "test-commit",
+                    "source_dirty": False,
+                    "run_id": "fixture-run",
+                    "correlation_id": "fixture-run",
+                    "iterations": 2000,
+                    "tool_calls_per_iteration": 1,
+                    "total_calls": 2000,
+                    "build_profile_verified": True,
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         (root / "target/release/pi").write_bytes(b"binary")
         (root / "tests/perf/reports/extension_benchmark_stratification.json").write_text(
-            '{"schema":"pi.perf.extension_benchmark_stratification.v1"}',
+            json.dumps(
+                {
+                    "schema": "pi.perf.extension_benchmark_stratification.v1",
+                    "generated_at": generated_at,
+                    "source_commit": "test-commit",
+                    "source_dirty": False,
+                    "run_id": "fixture-run",
+                    "correlation_id": "fixture-run",
+                }
+            ),
             encoding="utf-8",
         )
         (root / "target/perf/results/phase1_matrix_validation.json").write_text(
-            '{"schema":"pi.perf.phase1_matrix_validation.v1"}',
+            json.dumps(
+                {
+                    "schema": "pi.perf.phase1_matrix_validation.v1",
+                    "generated_at": generated_at,
+                    "source_commit": "test-commit",
+                    "source_dirty": False,
+                    "run_id": "fixture-run",
+                    "correlation_id": "fixture-run",
+                }
+            ),
             encoding="utf-8",
         )
         context_budget_path = root / "target/perf/context_intelligence/perf_budget.json"
@@ -1622,6 +1946,199 @@ def run_self_test() -> int:
             encoding="utf-8",
         )
 
+    provenance_root = Path(tempfile.mkdtemp(prefix="pi-perf-direct-provenance-"))
+    provenance_now = utc_now()
+    fresh_timestamp = provenance_now.isoformat().replace("+00:00", "Z")
+    expected_commit = "a" * 40
+    expected_correlation = "allowed-run"
+
+    stale_embedded = provenance_root / "stale.json"
+    stale_embedded.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": "2000-01-01T00:00:00Z",
+                "run_id": expected_correlation,
+                "correlation_id": expected_correlation,
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_inspection = inspect_direct_artifact(
+        stale_embedded,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert stale_inspection["is_fresh"] is False, stale_inspection
+    assert stale_inspection["freshness_reason"] == "embedded_timestamp_stale", (
+        stale_inspection
+    )
+    assert stale_inspection["mtime_age_hours"] < 1.0, stale_inspection
+
+    fresh_embedded = provenance_root / "fresh.json"
+    fresh_embedded.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": fresh_timestamp,
+                "source_commit": expected_commit,
+                "source_dirty": False,
+                "run_id": "timestamp-derived-run-id",
+                "correlation_id": expected_correlation,
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_mtime = provenance_now.timestamp() - (48.0 * 3600.0)
+    os.utime(fresh_embedded, (old_mtime, old_mtime))
+    fresh_inspection = inspect_direct_artifact(
+        fresh_embedded,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert fresh_inspection["is_fresh"] is True, fresh_inspection
+    assert fresh_inspection["freshness_basis"] == "embedded_timestamp", fresh_inspection
+    assert fresh_inspection["mtime_age_hours"] > 24.0, fresh_inspection
+
+    scenario_jsonl = provenance_root / "scenario-runner.jsonl"
+    scenario_records = [
+        {
+            "schema": "pi.ext.rust_bench.v1",
+            "timestamp": fresh_timestamp,
+            "source_commit": expected_commit,
+            "source_dirty": False,
+            "run_id": expected_correlation,
+            "correlation_id": scenario_correlation,
+            "orchestration_correlation_id": expected_correlation,
+        }
+        for scenario_correlation in ("scenario-a", "scenario-b")
+    ]
+    scenario_jsonl.write_text(
+        "\n".join(json.dumps(record) for record in scenario_records) + "\n",
+        encoding="utf-8",
+    )
+    scenario_inspection = inspect_direct_artifact(
+        scenario_jsonl,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert scenario_inspection["is_fresh"] is True, scenario_inspection
+    assert scenario_inspection["correlation_id"] == expected_correlation, (
+        scenario_inspection
+    )
+    assert (
+        scenario_inspection["orchestration_correlation_id"] == expected_correlation
+    ), scenario_inspection
+
+    mixed_scenario_records = [dict(record) for record in scenario_records]
+    mixed_scenario_records[-1]["orchestration_correlation_id"] = "foreign-correlation"
+    scenario_jsonl.write_text(
+        "\n".join(json.dumps(record) for record in mixed_scenario_records) + "\n",
+        encoding="utf-8",
+    )
+    mixed_scenario_inspection = inspect_direct_artifact(
+        scenario_jsonl,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert mixed_scenario_inspection["is_fresh"] is False, mixed_scenario_inspection
+    assert (
+        "conflicting_orchestration_correlation_id"
+        in mixed_scenario_inspection["freshness_failures"]
+    ), mixed_scenario_inspection
+
+    mutation_cases = (
+        ("wrong-commit", {"source_commit": "b" * 40}, "source_commit_mismatch"),
+        ("dirty", {"source_dirty": True}, "source_dirty_not_false"),
+        (
+            "wrong-correlation",
+            {"correlation_id": "different-run"},
+            "correlation_id_mismatch",
+        ),
+        (
+            "malformed-time",
+            {"generated_at": "definitely-not-a-timestamp"},
+            "malformed_embedded_timestamp",
+        ),
+    )
+    base_payload = json.loads(fresh_embedded.read_text(encoding="utf-8"))
+    for name, mutation, expected_failure in mutation_cases:
+        path = provenance_root / f"{name}.json"
+        payload = {**base_payload, **mutation}
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        inspection = inspect_direct_artifact(
+            path,
+            24.0,
+            provenance_now,
+            expected_git_commit=expected_commit,
+            expected_correlation_id=expected_correlation,
+        )
+        assert inspection["is_fresh"] is False, inspection
+        assert expected_failure in inspection["freshness_failures"], inspection
+
+    missing_lineage = provenance_root / "missing-lineage.json"
+    missing_lineage_payload = dict(base_payload)
+    missing_lineage_payload.pop("correlation_id")
+    missing_lineage.write_text(json.dumps(missing_lineage_payload), encoding="utf-8")
+    missing_lineage_inspection = inspect_direct_artifact(
+        missing_lineage,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert missing_lineage_inspection["is_fresh"] is False, missing_lineage_inspection
+    assert "missing_correlation_id" in missing_lineage_inspection["freshness_failures"], (
+        missing_lineage_inspection
+    )
+
+    mixed_jsonl = provenance_root / "mixed.jsonl"
+    mixed_jsonl.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "schema": "pi.perf.workload.v1",
+                    "timestamp": timestamp,
+                    "source_commit": expected_commit,
+                    "source_dirty": False,
+                    "run_id": expected_correlation,
+                    "correlation_id": expected_correlation,
+                }
+            )
+            for timestamp in (fresh_timestamp, "2000-01-01T00:00:00Z")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    mixed_inspection = inspect_direct_artifact(
+        mixed_jsonl,
+        24.0,
+        provenance_now,
+        expected_git_commit=expected_commit,
+        expected_correlation_id=expected_correlation,
+    )
+    assert mixed_inspection["is_fresh"] is False, mixed_inspection
+    assert mixed_inspection["freshness_reason"] == "embedded_timestamp_stale", (
+        mixed_inspection
+    )
+
+    criterion_json = provenance_root / "estimates.json"
+    criterion_json.write_text('{"mean":{"point_estimate":1000.0}}\n', encoding="utf-8")
+    binary = provenance_root / "pi"
+    binary.write_bytes(b"binary")
+    for path in (criterion_json, binary):
+        inspection = inspect_direct_artifact(path, 24.0, provenance_now)
+        assert inspection["is_fresh"] is True, inspection
+        assert inspection["freshness_basis"] == "filesystem_mtime", inspection
+
     ok_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-ok-"))
     write_fixture(ok_root, include_policy=True)
     ok_code, ok_payload = build_report(build_args(ok_root))
@@ -1658,6 +2175,34 @@ def run_self_test() -> int:
     assert "budget_summary.no_data=1" in aggregate_payload["report_blockers"], (
         aggregate_payload
     )
+    unbound_artifact_only_code, unbound_artifact_only_payload = build_report(
+        build_args(aggregate_blocked_root, artifact_readiness_only=True)
+    )
+    assert unbound_artifact_only_code == 2, unbound_artifact_only_payload
+    assert unbound_artifact_only_payload["readiness"] == "blocked", (
+        unbound_artifact_only_payload
+    )
+    assert unbound_artifact_only_payload["configuration_error"] == (
+        "artifact_readiness_only_requires_expected_correlation_id"
+    ), unbound_artifact_only_payload
+    artifact_only_code, artifact_only_payload = build_report(
+        build_args(
+            aggregate_blocked_root,
+            expected_correlation_id="fixture-run",
+            artifact_readiness_only=True,
+        )
+    )
+    assert artifact_only_code == 0, artifact_only_payload
+    assert artifact_only_payload["readiness"] == "ready", artifact_only_payload
+    assert artifact_only_payload["readiness_scope"] == "artifacts_only", (
+        artifact_only_payload
+    )
+    assert artifact_only_payload["report_blockers_ignored_for_readiness"] is True, (
+        artifact_only_payload
+    )
+    assert artifact_only_payload["report_blockers"] == aggregate_payload["report_blockers"], (
+        artifact_only_payload
+    )
 
     blocked_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-blocked-"))
     write_fixture(blocked_root, include_policy=False)
@@ -1672,6 +2217,17 @@ def run_self_test() -> int:
         item["bead"] == EXTENSION_BLOCKER_BEAD
         for item in blocked_payload["recognized_blockers"]
     ), blocked_payload
+    blocked_artifact_only_code, blocked_artifact_only_payload = build_report(
+        build_args(
+            blocked_root,
+            expected_correlation_id="fixture-run",
+            artifact_readiness_only=True,
+        )
+    )
+    assert blocked_artifact_only_code == 1, blocked_artifact_only_payload
+    assert blocked_artifact_only_payload["readiness"] == "blocked", (
+        blocked_artifact_only_payload
+    )
     extension_commands = [
         command
         for item in blocked_payload["missing_budget_artifacts"]
@@ -1700,6 +2256,61 @@ def run_self_test() -> int:
         and item["evidence_source"] == "cache"
         for item in cached_payload["fresh_artifacts"]
     ), cached_payload
+
+    wrong_correlation_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-correlation-"))
+    write_fixture(wrong_correlation_root, include_policy=False)
+    wrong_correlation_cache_dir = write_cache_index(wrong_correlation_root)
+    wrong_correlation_code, wrong_correlation_payload = build_report(
+        build_args(
+            wrong_correlation_root,
+            cache_dir=wrong_correlation_cache_dir,
+            expected_correlation_id="other-correlation",
+        )
+    )
+    assert wrong_correlation_code == 1, wrong_correlation_payload
+    assert any(
+        entry["reason"] == "correlation_id_mismatch"
+        for entry in wrong_correlation_payload["rejected_evidence_cache_entries"]
+    ), wrong_correlation_payload
+
+    relabeled_cache_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-relabeled-"))
+    write_fixture(relabeled_cache_root, include_policy=False)
+    relabeled_cache_dir = write_cache_index(
+        relabeled_cache_root,
+        embedded_correlation_id="foreign-correlation",
+    )
+    relabeled_code, relabeled_payload = build_report(
+        build_args(
+            relabeled_cache_root,
+            cache_dir=relabeled_cache_dir,
+            expected_correlation_id="corr-123",
+        )
+    )
+    assert relabeled_code == 1, relabeled_payload
+    assert any(
+        entry["reason"] == "cache_artifact_provenance_invalid"
+        and "correlation_id_mismatch"
+        in entry.get("freshness_failures", [])
+        for entry in relabeled_payload["rejected_evidence_cache_entries"]
+    ), relabeled_payload
+
+    provenance_free_cache_root = Path(
+        tempfile.mkdtemp(prefix="pi-perf-preflight-cache-provenance-free-")
+    )
+    write_fixture(provenance_free_cache_root, include_policy=False)
+    provenance_free_cache_dir = write_cache_index(provenance_free_cache_root)
+    provenance_free_code, provenance_free_payload = build_report(
+        build_args(
+            provenance_free_cache_root,
+            cache_dir=provenance_free_cache_dir,
+            expected_correlation_id="corr-123",
+        )
+    )
+    assert provenance_free_code == 1, provenance_free_payload
+    assert any(
+        entry["reason"] == "cache_artifact_missing_independent_lineage"
+        for entry in provenance_free_payload["rejected_evidence_cache_entries"]
+    ), provenance_free_payload
 
     stale_cache_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-cache-stale-"))
     write_fixture(stale_cache_root, include_policy=False)
@@ -1870,9 +2481,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Expected cached evidence git commit. Defaults to PI_PERF_GIT_COMMIT or current HEAD.",
     )
     parser.add_argument(
+        "--expected-correlation-id",
+        help="When set, embedded correlation_id (or run_id fallback) must match this value.",
+    )
+    parser.add_argument(
         "--skip-rch-check",
         action="store_true",
         help="Do not run rch check --quiet; useful in hermetic self-tests.",
+    )
+    parser.add_argument(
+        "--artifact-readiness-only",
+        action="store_true",
+        help=(
+            "Exclude checked-in budget_summary blockers from readiness after a separate "
+            "authoritative current-run budget evaluation; blockers remain reported."
+        ),
     )
     parser.add_argument(
         "--host-fingerprint",

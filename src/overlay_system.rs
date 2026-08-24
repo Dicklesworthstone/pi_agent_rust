@@ -7,7 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
 
 /// Overlay surface types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,7 +100,7 @@ pub struct WelcomeScreen {
 impl Default for WelcomeScreen {
     fn default() -> Self {
         Self {
-            greeting: "Welcome to Pi Agent".to_string(),
+            greeting: "Welcome to Pi!".to_string(),
             recent_sessions: Vec::new(),
             tips: vec![
                 "Tip: Type /help to see all available slash commands and shortcuts.".to_string(),

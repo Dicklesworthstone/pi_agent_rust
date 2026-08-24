@@ -1,0 +1,85 @@
+{
+  "version": "1.0",
+  "tool": "mcp_client",
+  "description": "MCP client contract for bd-cv653.6.1 and bd-cv653.8.1: hermetic project discovery, fail-closed pending trust, and stable unknown-server taxonomy. Full canned-server round trips remain in tests/mcp.rs.",
+  "cases": [
+    {
+      "name": "mcp_client_discovers_project_servers_without_connecting",
+      "description": "listing exposes a project MCP server and its pending trust state without spawning its nonexistent command",
+      "requirement_ids": [
+        "MCP-DISCOVERY-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": ".pi/mcp.json",
+          "content": "{\"mcpServers\":{\"docs\":{\"command\":\"/pi-fixture-definitely-missing/docs-mcp\"}}}"
+        }
+      ],
+      "input": {
+        "op": "list"
+      },
+      "expected": {
+        "content_contains": [
+          "\"name\": \"docs\"",
+          "\"provenance\": \".pi\"",
+          "\"trust\": \"pending\"",
+          "/pi-fixture-definitely-missing/docs-mcp"
+        ],
+        "details": {
+          "op": "list",
+          "servers": [
+            {
+              "name": "docs",
+              "provenance": ".pi",
+              "trust": "pending",
+              "health": "not started",
+              "tools": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "mcp_client_refuses_pending_servers_before_spawn",
+      "description": "calling a discovered but untrusted server fails with the named remedy before resolving its command",
+      "requirement_ids": [
+        "MCP-TRUST-BOUNDARY-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": ".pi/mcp.json",
+          "content": "{\"mcpServers\":{\"guarded\":{\"command\":\"/pi-fixture-definitely-missing/guarded-mcp\"}}}"
+        }
+      ],
+      "input": {
+        "op": "call",
+        "server": "guarded",
+        "tool": "echo",
+        "arguments": {
+          "text": "must not execute"
+        }
+      },
+      "expect_error": true,
+      "error_contains": "MCP_TRUST_PENDING",
+      "expected": {}
+    },
+    {
+      "name": "mcp_client_names_unknown_servers",
+      "description": "an absent server fails with MCP_UNKNOWN_SERVER instead of an untyped transport error",
+      "requirement_ids": [
+        "MCP-UNKNOWN-ERR-1"
+      ],
+      "input": {
+        "op": "call",
+        "server": "absent",
+        "tool": "echo",
+        "arguments": {}
+      },
+      "expect_error": true,
+      "error_contains": "MCP_UNKNOWN_SERVER",
+      "expected": {}
+    }
+  ]
+}

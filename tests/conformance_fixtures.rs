@@ -164,6 +164,7 @@ macro_rules! fixture_test {
 
 // Tool fixture tests
 fixture_test!(test_read_fixtures, "read_tool");
+fixture_test!(test_read_url_fixtures, "read_url_tool");
 fixture_test!(test_edit_fixtures, "edit_tool");
 fixture_test!(test_bash_fixtures, "bash_tool");
 fixture_test!(test_grep_fixtures, "grep_tool");
@@ -173,6 +174,8 @@ fixture_test!(test_ls_fixtures, "ls_tool");
 fixture_test!(test_hashline_edit_fixtures, "hashline_edit_tool");
 fixture_test!(test_ast_grep_fixtures, "ast_grep_tool");
 fixture_test!(test_ast_edit_fixtures, "ast_edit_tool");
+fixture_test!(test_lsp_fixtures, "lsp_tool");
+fixture_test!(test_debug_fixtures, "debug_tool");
 fixture_test!(test_xdev_fixtures, "xdev_tool");
 fixture_test!(test_web_search_fixtures, "web_search_tool");
 fixture_test!(test_cli_flag_fixtures, "cli_flags");
@@ -181,11 +184,16 @@ fixture_test!(test_generate_image_fixtures, "generate_image_tool");
 fixture_test!(test_tts_fixtures, "tts_tool");
 fixture_test!(test_computer_fixtures, "computer_tool");
 fixture_test!(test_browser_fixtures, "browser_tool");
+#[cfg(unix)]
+fixture_test!(test_subagent_fixtures, "subagent_tool");
 fixture_test!(test_ask_fixtures, "ask_tool");
 fixture_test!(test_todo_fixtures, "todo_tool");
 fixture_test!(test_jobs_fixtures, "jobs_tool");
 fixture_test!(test_hub_fixtures, "hub_tool");
 fixture_test!(test_eval_fixtures, "eval_tool");
+fixture_test!(test_stats_fixtures, "stats_tool");
+fixture_test!(test_stream_rules_fixtures, "stream_rules_tool");
+fixture_test!(test_mcp_client_fixtures, "mcp_client_tool");
 #[cfg(unix)]
 fixture_test!(test_github_fixtures, "github_tool");
 fixture_test!(test_retain_fixtures, "retain_tool");
@@ -193,6 +201,7 @@ fixture_test!(test_recall_fixtures, "recall_tool");
 fixture_test!(test_memory_edit_fixtures, "memory_edit_tool");
 fixture_test!(test_reflect_fixtures, "reflect_tool");
 fixture_test!(test_learn_fixtures, "learn_tool");
+fixture_test!(test_manage_skill_fixtures, "manage_skill_tool");
 fixture_test!(test_submit_plan_fixtures, "submit_plan_tool");
 fixture_test!(test_security_scan_fixtures, "security_scan_tool");
 
@@ -231,6 +240,7 @@ fn test_truncation_fixtures() {
 fn test_all_fixtures_exist() {
     let expected_fixtures = [
         "read_tool",
+        "read_url_tool",
         "edit_tool",
         "bash_tool",
         "grep_tool",
@@ -238,6 +248,8 @@ fn test_all_fixtures_exist() {
         "find_tool",
         "ls_tool",
         "hashline_edit_tool",
+        "lsp_tool",
+        "debug_tool",
         "truncation",
         "cli_flags",
         "web_search_tool",
@@ -246,17 +258,22 @@ fn test_all_fixtures_exist() {
         "tts_tool",
         "computer_tool",
         "browser_tool",
+        "subagent_tool",
         "ask_tool",
         "todo_tool",
         "jobs_tool",
         "hub_tool",
         "eval_tool",
+        "stats_tool",
+        "stream_rules_tool",
+        "mcp_client_tool",
         "github_tool",
         "retain_tool",
         "recall_tool",
         "memory_edit_tool",
         "reflect_tool",
         "learn_tool",
+        "manage_skill_tool",
         "submit_plan_tool",
         "security_scan_tool",
     ];

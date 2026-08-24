@@ -192,8 +192,14 @@ impl SubagentTool {
         Ok(TanCompletion::from_result(result))
     }
 
-    #[cfg(test)]
-    fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
+    /// Construct with explicit discovery and child-runtime paths.
+    ///
+    /// This seam is intentionally narrow: embedders and hermetic conformance
+    /// tests can exercise the real child protocol without consulting the
+    /// process-global agent directory or current executable.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
         Self {
             cwd,
             global_dir,

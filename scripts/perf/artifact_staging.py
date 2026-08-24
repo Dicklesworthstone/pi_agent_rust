@@ -28,9 +28,10 @@ from preflight_budget_inputs import (
     current_toolchain,
     context_criterion_relative,
     evidence_cache_for_group,
-    file_age_hours,
+    inspect_direct_artifact,
     iso_now,
     load_evidence_cache_entries,
+    parse_utc_timestamp,
     read_json,
     resolve_cache_dir,
     resolve_target_dir,
@@ -114,10 +115,22 @@ def artifact_entry(
     max_age_hours: float,
     now: datetime,
     runner_mode: str,
+    expected_git_commit: str,
+    expected_correlation_id: str | None,
 ) -> dict[str, Any]:
-    age = file_age_hours(candidate, now)
     exists = candidate.is_file()
-    is_fresh = exists and age is not None and age <= max_age_hours
+    inspection = (
+        inspect_direct_artifact(
+            candidate,
+            max_age_hours,
+            now,
+            expected_git_commit=expected_git_commit,
+            expected_correlation_id=expected_correlation_id,
+        )
+        if exists
+        else None
+    )
+    is_fresh = bool(inspection and inspection["is_fresh"])
     status = "present" if is_fresh else "stale" if exists else "missing"
     retrieval_status = {
         "present": "retrieved",
@@ -150,10 +163,19 @@ def artifact_entry(
         "local_staged_path": staged_path_str,
         "size_bytes": size_bytes,
         "mtime_utc": mtime_utc(candidate) if exists else None,
-        "age_hours": age,
+        "age_hours": inspection.get("age_hours") if inspection else None,
+        "mtime_age_hours": inspection.get("mtime_age_hours") if inspection else None,
         "max_age_hours": max_age_hours,
         "sha256": sha256_file(candidate) if exists else None,
         "artifact_schema": artifact_schema(candidate) if exists else None,
+        "freshness_basis": inspection.get("freshness_basis") if inspection else None,
+        "freshness_reason": inspection.get("freshness_reason") if inspection else "missing",
+        "freshness_failures": inspection.get("freshness_failures", []) if inspection else [],
+        "embedded_timestamp": inspection.get("embedded_timestamp") if inspection else None,
+        "source_commit": inspection.get("source_commit") if inspection else None,
+        "source_dirty": inspection.get("source_dirty") if inspection else None,
+        "run_id": inspection.get("run_id") if inspection else None,
+        "correlation_id": inspection.get("correlation_id") if inspection else None,
         "runner_mode": runner_mode,
         "suggested_commands": list(group.suggested_commands),
         "blocker": group.blocker,
@@ -258,8 +280,6 @@ def update_evidence_cache_index(
         if isinstance(entry, dict)
     }
 
-    expires_at = (now + timedelta(hours=context.max_ttl_hours)).isoformat().replace("+00:00", "Z")
-    created_at = now.isoformat().replace("+00:00", "Z")
     toolchain = current_toolchain()
     host_fingerprint = current_host_fingerprint()
 
@@ -279,6 +299,15 @@ def update_evidence_cache_index(
             status["skipped_entry_count"] += 1
             continue
 
+        created_at = staging_entry.get("embedded_timestamp")
+        parsed_created_at = parse_utc_timestamp(created_at)
+        if parsed_created_at is None:
+            parsed_created_at = now
+            created_at = now.isoformat().replace("+00:00", "Z")
+        expires_at = (parsed_created_at + timedelta(hours=context.max_ttl_hours)).isoformat().replace(
+            "+00:00", "Z"
+        )
+
         cache_path = cache_artifact_destination(context.cache_dir, contract_id, source_path, sha)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         if not cache_path.exists():
@@ -295,8 +324,10 @@ def update_evidence_cache_index(
             "toolchain": toolchain,
             "host_fingerprint": host_fingerprint,
             "build_profile": context.build_profile,
-            "run_id": run_id,
-            "correlation_id": run_id,
+            "run_id": staging_entry.get("run_id") or run_id,
+            "correlation_id": staging_entry.get("correlation_id") or run_id,
+            "source_commit": staging_entry.get("source_commit"),
+            "source_dirty": staging_entry.get("source_dirty"),
             "sha256": sha,
             "artifact_schema": staging_entry.get("artifact_schema"),
             "created_at": created_at,
@@ -339,6 +370,7 @@ def build_staging_manifest(
     cache_profile: str,
     cache_ttl_hours: float,
     run_id: str | None,
+    expected_correlation_id: str | None,
     update_evidence_cache: bool,
 ) -> dict[str, Any]:
     groups = artifact_groups(repo_root, target_dir)
@@ -349,6 +381,7 @@ def build_staging_manifest(
         git_commit=cache_git_commit,
         build_profile=cache_profile,
         max_ttl_hours=cache_ttl_hours,
+        expected_correlation_id=expected_correlation_id,
     )
     cache_entries, cache_status = load_evidence_cache_entries(cache_dir)
     entries: list[dict[str, Any]] = []
@@ -371,6 +404,8 @@ def build_staging_manifest(
                 max_age_hours=max_age_hours,
                 now=now,
                 runner_mode=runner_mode,
+                expected_git_commit=cache_git_commit,
+                expected_correlation_id=expected_correlation_id,
             )
             for candidate in group.candidates
         ]
@@ -508,17 +543,47 @@ def write_fixture(root: Path, include_policy: bool) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('{"mean":{"point_estimate":1000.0}}\n', encoding="utf-8")
 
+    generated_at = iso_now()
     (root / "target/perf/perf/pijs_workload_perf.jsonl").write_text(
-        '{"schema":"pi.perf.workload.v1","tool_calls_per_iteration":1}\n',
+        json.dumps(
+            {
+                "schema": "pi.perf.workload.v1",
+                "timestamp": generated_at,
+                "source_commit": "test-commit",
+                "source_dirty": False,
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+                "tool_calls_per_iteration": 1,
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     (root / "target/release/pi").write_bytes(b"binary")
     (root / "tests/perf/reports/extension_benchmark_stratification.json").write_text(
-        '{"schema":"pi.perf.extension_benchmark_stratification.v1"}',
+        json.dumps(
+            {
+                "schema": "pi.perf.extension_benchmark_stratification.v1",
+                "generated_at": generated_at,
+                "source_commit": "test-commit",
+                "source_dirty": False,
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
         encoding="utf-8",
     )
     (root / "target/perf/results/phase1_matrix_validation.json").write_text(
-        '{"schema":"pi.perf.phase1_matrix_validation.v1"}',
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": generated_at,
+                "source_commit": "test-commit",
+                "source_dirty": False,
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
         encoding="utf-8",
     )
     context_budget_path = root / "target/perf/context_intelligence/perf_budget.json"
@@ -556,7 +621,13 @@ def write_fixture(root: Path, include_policy: bool) -> None:
 
 
 def run_self_test() -> int:
-    def staging_args(root: Path, *, cache_dir: Path | None = None, update_cache: bool = False) -> dict[str, Any]:
+    def staging_args(
+        root: Path,
+        *,
+        cache_dir: Path | None = None,
+        update_cache: bool = False,
+        expected_correlation_id: str | None = None,
+    ) -> dict[str, Any]:
         return {
             "repo_root": root,
             "target_dir": root / "target",
@@ -570,6 +641,7 @@ def run_self_test() -> int:
             "cache_profile": "perf",
             "cache_ttl_hours": 24.0,
             "run_id": "self-test-run",
+            "expected_correlation_id": expected_correlation_id,
             "update_evidence_cache": update_cache,
         }
 
@@ -619,6 +691,96 @@ def run_self_test() -> int:
     ), policy_entries[0]
     assert policy_entries[0]["retrieval_status"] == "retrieved", policy_entries[0]
 
+    stale_provenance_root = Path(tempfile.mkdtemp(prefix="pi-perf-staging-stale-lineage-"))
+    write_fixture(stale_provenance_root, include_policy=True)
+    stale_phase1 = stale_provenance_root / "target/perf/results/phase1_matrix_validation.json"
+    stale_phase1.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": "2000-01-01T00:00:00Z",
+                "run_id": "self-test-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+    stale_manifest = build_staging_manifest(
+        **staging_args(
+            stale_provenance_root,
+            update_cache=True,
+            expected_correlation_id="self-test-run",
+        )
+    )
+    assert stale_manifest["summary"]["status"] == "blocked", stale_manifest
+    assert any(
+        entry["contract_id"] == "phase1_matrix_validation"
+        and entry["status"] == "stale"
+        and entry["freshness_reason"] == "embedded_timestamp_stale"
+        and entry["mtime_age_hours"] < 1.0
+        for entry in stale_manifest["entries"]
+    ), stale_manifest
+    stale_cache_entries, _ = load_evidence_cache_entries(
+        stale_provenance_root / "target/perf/evidence_cache"
+    )
+    assert not any(
+        entry.get("contract_id") == "phase1_matrix_validation"
+        for entry in stale_cache_entries
+    ), stale_cache_entries
+
+    fresh_provenance_root = Path(tempfile.mkdtemp(prefix="pi-perf-staging-fresh-lineage-"))
+    write_fixture(fresh_provenance_root, include_policy=True)
+    fresh_phase1 = fresh_provenance_root / "target/perf/results/phase1_matrix_validation.json"
+    fresh_phase1.write_text(
+        json.dumps(
+            {
+                "schema": "pi.perf.phase1_matrix_validation.v1",
+                "generated_at": iso_now(),
+                "source_commit": "test-commit",
+                "source_dirty": False,
+                "run_id": "timestamp-derived-run",
+                "correlation_id": "self-test-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+    old_mtime = utc_now().timestamp() - (48.0 * 3600.0)
+    os.utime(fresh_phase1, (old_mtime, old_mtime))
+    fresh_manifest = build_staging_manifest(
+        **staging_args(
+            fresh_provenance_root,
+            update_cache=True,
+            expected_correlation_id="self-test-run",
+        )
+    )
+    assert fresh_manifest["summary"]["status"] == "ready", fresh_manifest
+    assert any(
+        entry["contract_id"] == "phase1_matrix_validation"
+        and entry["status"] == "present"
+        and entry["freshness_basis"] == "embedded_timestamp"
+        and entry["mtime_age_hours"] > 24.0
+        for entry in fresh_manifest["entries"]
+    ), fresh_manifest
+    fresh_cache_entries, _ = load_evidence_cache_entries(
+        fresh_provenance_root / "target/perf/evidence_cache"
+    )
+    fresh_phase1_entry = next(
+        entry
+        for entry in fresh_manifest["entries"]
+        if entry["contract_id"] == "phase1_matrix_validation"
+        and entry["status"] == "present"
+    )
+    fresh_phase1_cache = next(
+        entry
+        for entry in fresh_cache_entries
+        if entry.get("contract_id") == "phase1_matrix_validation"
+    )
+    assert fresh_phase1_cache["created_at"] == fresh_phase1_entry["embedded_timestamp"], (
+        fresh_phase1_cache
+    )
+    assert fresh_phase1_cache["run_id"] == "timestamp-derived-run", fresh_phase1_cache
+    assert fresh_phase1_cache["correlation_id"] == "self-test-run", fresh_phase1_cache
+
     blocked_root = Path(tempfile.mkdtemp(prefix="pi-perf-staging-blocked-"))
     write_fixture(blocked_root, include_policy=False)
     blocked_manifest = build_staging_manifest(**staging_args(blocked_root))
@@ -646,6 +808,21 @@ def run_self_test() -> int:
         and entry["retrieval_status"] == "reused_from_cache"
         for entry in cached_manifest["entries"]
     ), cached_manifest
+
+    wrong_correlation_manifest = build_staging_manifest(
+        **staging_args(
+            cached_root,
+            cache_dir=cache_dir,
+            expected_correlation_id="other-correlation",
+        )
+    )
+    assert wrong_correlation_manifest["summary"]["status"] == "blocked", (
+        wrong_correlation_manifest
+    )
+    assert any(
+        entry["reason"] == "correlation_id_mismatch"
+        for entry in wrong_correlation_manifest["rejected_evidence_cache_entries"]
+    ), wrong_correlation_manifest
     return 0
 
 
@@ -681,6 +858,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Expected cached evidence git commit. Defaults to PI_PERF_GIT_COMMIT or current HEAD.",
     )
     parser.add_argument("--run-id", help="Run/correlation ID to store when updating the evidence cache.")
+    parser.add_argument(
+        "--expected-correlation-id",
+        help="When set, embedded correlation_id (or run_id fallback) must match this value.",
+    )
     parser.add_argument(
         "--update-evidence-cache",
         action="store_true",
@@ -729,6 +910,8 @@ def main(argv: list[str]) -> int:
         or "perf",
         cache_ttl_hours=args.cache_ttl_hours,
         run_id=args.run_id or run_id_from_env(),
+        expected_correlation_id=args.expected_correlation_id
+        or os.environ.get("PI_PERF_EXPECTED_CORRELATION_ID"),
         update_evidence_cache=args.update_evidence_cache,
     )
     text = json.dumps(manifest, indent=2, sort_keys=True) + "\n"

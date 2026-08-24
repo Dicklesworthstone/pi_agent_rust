@@ -20,6 +20,17 @@ const __dirname = path.dirname(__filename);
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_KIND = process.versions.bun ? "bun" : "node";
 const RUNTIME_LABEL = `portable_${RUNTIME_KIND}_extension_api`;
+const CORRELATION_ID = process.env.CI_CORRELATION_ID?.trim() || null;
+const SOURCE_COMMIT = process.env.VERGEN_GIT_SHA?.trim() || null;
+const SOURCE_DIRTY = process.env.VERGEN_GIT_DIRTY !== "false";
+const GENERATED_AT = new Date().toISOString();
+const EVIDENCE_PROVENANCE = Object.freeze({
+	timestamp: GENERATED_AT,
+	run_id: CORRELATION_ID,
+	correlation_id: CORRELATION_ID,
+	source_commit: SOURCE_COMMIT,
+	source_dirty: SOURCE_DIRTY,
+});
 const COMPILED_MODULES = new Map();
 const COMPILED_SOURCES = new Map();
 
@@ -292,6 +303,7 @@ async function scenarioLoadInitCold(extName, entryPath, { cwd, runs }) {
 
 	return {
 		schema: "pi.ext.legacy_bench.v1",
+		...EVIDENCE_PROVENANCE,
 		runtime: RUNTIME_LABEL,
 		runtime_kind: RUNTIME_KIND,
 		runtime_family: "portable_extension_api",
@@ -329,6 +341,7 @@ async function scenarioToolCall(extName, entryPath, toolName, toolInput, { cwd, 
 
 	return {
 		schema: "pi.ext.legacy_bench.v1",
+		...EVIDENCE_PROVENANCE,
 		runtime: "legacy_pi_mono",
 		scenario: `ext_tool_call/${toolName}`,
 		extension: extName,
@@ -378,6 +391,7 @@ async function scenarioEventHook(extName, entryPath, { cwd, iterations }) {
 
 	return {
 		schema: "pi.ext.legacy_bench.v1",
+		...EVIDENCE_PROVENANCE,
 		runtime: "legacy_pi_mono",
 		scenario: "ext_event_hook/before_agent_start",
 		extension: extName,
@@ -448,6 +462,7 @@ async function scenarioFullE2ELongSession(helloEntry, pirateEntry, { cwd, iterat
 
 	return {
 		schema: "pi.ext.legacy_bench.v1",
+		...EVIDENCE_PROVENANCE,
 		runtime: RUNTIME_LABEL,
 		runtime_kind: RUNTIME_KIND,
 		runtime_family: "portable_extension_api",

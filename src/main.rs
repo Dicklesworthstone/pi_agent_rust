@@ -2637,11 +2637,16 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 enable_audit_log: true,
             };
             let manager = pi::web_remote::WebRemoteManager::new(settings);
+            let token = manager.issue_token(
+                format!("tok-{}", uuid::Uuid::new_v4().simple()),
+                pi::web_remote::TokenKind::Steer,
+            );
             println!(
                 "Pi Agent Web Remote server listening on {}:{} (view_only={})",
                 bind, port, view_only
             );
             println!("Web client interface: http://127.0.0.1:{}", port);
+            println!("Pairing token: {}", token.token);
         }
         cli::Commands::Gallery { format } => {
             let matrix = pi::gallery::GalleryMatrix::new();

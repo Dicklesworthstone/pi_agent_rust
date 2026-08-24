@@ -1,0 +1,69 @@
+{
+  "version": "1.0",
+  "tool": "lsp",
+  "description": "LspTool contract for bd-cv653.1.1 and bd-cv653.8.1: hermetic status discovery, cache-only glob diagnostics, and named action validation without spawning a language server.",
+  "cases": [
+    {
+      "name": "lsp_status_lists_configured_servers_without_spawning",
+      "description": "status is a hermetic happy path that exposes configured defaults while leaving the live registry empty",
+      "requirement_ids": [
+        "LSP-STATUS-1"
+      ],
+      "input": {
+        "action": "status"
+      },
+      "expected": {
+        "content_contains": [
+          "\"action\":\"status\"",
+          "rust-analyzer"
+        ],
+        "details_exact": {
+          "action": "status",
+          "live": []
+        }
+      }
+    },
+    {
+      "name": "lsp_glob_diagnostics_use_only_the_empty_cache",
+      "description": "glob diagnostics are answered from the live-server cache and therefore never spawn a server",
+      "requirement_ids": [
+        "LSP-DIAGNOSTICS-BOUNDARY-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "src/lib.rs",
+          "content": "fn fixture() {}\n"
+        }
+      ],
+      "input": {
+        "action": "diagnostics",
+        "file": "src/**/*.rs"
+      },
+      "expected": {
+        "details_exact": {
+          "action": "diagnostics",
+          "glob": "src/**/*.rs",
+          "files": 0,
+          "entries": []
+        }
+      }
+    },
+    {
+      "name": "lsp_rejects_unknown_actions_with_the_stable_taxonomy",
+      "description": "an unsupported action is a named usage result and enumerates the supported contract",
+      "requirement_ids": [
+        "LSP-ERR-1"
+      ],
+      "input": {
+        "action": "frobnicate"
+      },
+      "expected": {
+        "content_contains": [
+          "unknown lsp action",
+          "diagnostics|definition|references|hover|symbols"
+        ]
+      }
+    }
+  ]
+}

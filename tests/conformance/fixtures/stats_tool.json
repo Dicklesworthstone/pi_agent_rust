@@ -1,0 +1,128 @@
+{
+  "version": "1.0",
+  "tool": "stats",
+  "description": "Local pi stats contract for bd-cv653.7.7 and bd-cv653.8.1: exact aggregate math, composed provider/time attribution, and malformed-line tolerance over hermetic session JSONL.",
+  "cases": [
+    {
+      "name": "stats_aggregates_usage_tools_and_compactions",
+      "description": "a known local session produces the hand-computed v1 aggregate and text rendering",
+      "requirement_ids": [
+        "STATS-AGGREGATE-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "sessions/project-alpha/session.jsonl",
+          "content": "{\"type\":\"message\",\"timestamp\":\"2026-08-20T10:00:00Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":10,\"output\":20,\"cacheRead\":2,\"cacheWrite\":3,\"totalTokens\":35,\"cost\":{\"total\":0.01}}}}\n{\"type\":\"message\",\"timestamp\":\"2026-08-20T10:01:00Z\",\"message\":{\"role\":\"toolResult\",\"toolName\":\"read\"}}\n{\"type\":\"compaction\",\"timestamp\":\"2026-08-20T10:02:00Z\"}\n"
+        }
+      ],
+      "input": {
+        "format": "text"
+      },
+      "expected": {
+        "content_contains": [
+          "Sessions: 1  Messages: 1  Compactions: 1",
+          "Tokens: in 10  out 20  cache-r 2  cache-w 3  total 35",
+          "read"
+        ],
+        "details": {
+          "schema": "pi.stats.v1",
+          "sessions": 1,
+          "messages": 1,
+          "tokens": {
+            "input": 10,
+            "output": 20,
+            "cache_read": 2,
+            "cache_write": 3,
+            "total": 35
+          },
+          "compactions": 1,
+          "tool_calls_total": 1,
+          "tool_calls": [
+            {
+              "tool": "read",
+              "count": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "stats_provider_and_time_filters_keep_tool_attribution",
+      "description": "a provider-filtered session retains the following tool result through the admitted assistant attribution anchor",
+      "requirement_ids": [
+        "STATS-FILTER-BOUNDARY-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "sessions/project-alpha/session.jsonl",
+          "content": "{\"type\":\"message\",\"timestamp\":\"2026-08-20T10:00:00Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":7,\"output\":11,\"totalTokens\":18,\"cost\":{\"total\":0.5}}}}\n{\"type\":\"message\",\"timestamp\":\"2026-08-20T10:01:00Z\",\"message\":{\"role\":\"toolResult\",\"toolName\":\"grep\"}}\n{\"type\":\"message\",\"timestamp\":\"2026-08-21T10:00:00Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-4o\",\"usage\":{\"input\":100,\"output\":200,\"totalTokens\":300,\"cost\":{\"total\":1.0}}}}\n"
+        }
+      ],
+      "input": {
+        "format": "json",
+        "since": "2026-08-20",
+        "until": "2026-08-20",
+        "provider": "anthropic"
+      },
+      "expected": {
+        "content_contains": [
+          "\"schema\": \"pi.stats.v1\"",
+          "\"tool\": \"grep\""
+        ],
+        "details": {
+          "sessions": 1,
+          "messages": 1,
+          "tokens": {
+            "input": 7,
+            "output": 11,
+            "total": 18
+          },
+          "tool_calls_total": 1,
+          "tool_calls": [
+            {
+              "tool": "grep",
+              "count": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "stats_skips_a_malformed_line_and_keeps_later_usage",
+      "description": "one malformed JSONL record is isolated instead of discarding the rest of the local session",
+      "requirement_ids": [
+        "STATS-MALFORMED-ERR-1"
+      ],
+      "setup": [
+        {
+          "type": "create_file",
+          "path": "sessions/project-alpha/session.jsonl",
+          "content": "this is not json\n{\"type\":\"message\",\"timestamp\":\"2026-08-22T10:00:00Z\",\"message\":{\"role\":\"assistant\",\"provider\":\"openai\",\"model\":\"gpt-4o\",\"usage\":{\"input\":3,\"output\":5,\"totalTokens\":8,\"cost\":{\"total\":0.1}}}}\n"
+        }
+      ],
+      "input": {
+        "format": "markdown"
+      },
+      "expected": {
+        "content_contains": [
+          "# pi stats",
+          "- Sessions: 1",
+          "- Messages: 1",
+          "- Tokens (in/out/total): 3 / 5 / 8"
+        ],
+        "details": {
+          "schema": "pi.stats.v1",
+          "sessions": 1,
+          "messages": 1,
+          "tokens": {
+            "input": 3,
+            "output": 5,
+            "total": 8
+          }
+        }
+      }
+    }
+  ]
+}

@@ -583,6 +583,9 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 #[cfg(unix)]
+const FAKE_ORCHESTRATE_SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+#[cfg(unix)]
 #[allow(clippy::literal_string_with_formatting_args)] // bash ${VAR} syntax, not Rust fmt
 fn install_fake_orchestrate_toolchain(bin_dir: &Path) {
     let cargo_stub = r#"#!/usr/bin/env bash
@@ -659,8 +662,10 @@ path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="ut
 PY
     fi
     cat >"$target_dir/perf/legacy_extension_workloads.jsonl" <<'JSON'
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","summary":{"p50_ms":10.0}}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","per_call_us":20.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"node","summary":{"p50_ms":10.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"bun","summary":{"p50_ms":8.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"node","per_call_us":20.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"bun","per_call_us":15.0}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"node","elapsed_ms":2400.0}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"bun","elapsed_ms":1800.0}
 JSON
@@ -748,10 +753,157 @@ JSON
 {"schema":"pi.perf.workload.v1","scenario":"200x10","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":1200,"per_call_us":45,"calls_per_sec":1666}
 JSON
     ;;
+  perf_budgets)
+    if [[ "${PI_PERF_POST_GENERATION:-0}" == "1" ]]; then
+      case " $* " in
+        *" ci_enforced_budgets_fail_on_regression_or_missing_data "*" --exact "*) ;;
+        *)
+          echo "post-generation perf_budgets invocation omitted the exact data-contract test" >&2
+          exit 64
+          ;;
+      esac
+      python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+evidence_dir = Path(sys.argv[1])
+expected_correlation_id = sys.argv[2]
+for name in (
+    "extension_benchmark_stratification.json",
+    "phase1_matrix_validation.json",
+):
+    path = evidence_dir / name
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("correlation_id") != expected_correlation_id:
+        raise SystemExit(f"{name}: correlation_id mismatch")
+(evidence_dir / "perf_budgets_post_generation_invocation.json").write_text(
+    json.dumps(
+        {
+            "schema": "pi.perf.fake_post_generation_invocation.v1",
+            "correlation_id": expected_correlation_id,
+            "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
+            "exact": True,
+        },
+        sort_keys=True,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+    fi
+    ;;
 esac
+
+if [[ -n "${CI_CORRELATION_ID:-}" ]]; then
+  python3 - "$target_dir" "$CI_CORRELATION_ID" "$(git rev-parse HEAD)" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+target_dir = Path(sys.argv[1])
+correlation_id = sys.argv[2]
+source_commit = sys.argv[3]
+generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+artifacts = (
+    ("scenario_runner.jsonl", "orchestration_correlation_id"),
+    ("pijs_workload.jsonl", "correlation_id"),
+    ("ext_bench_harness.jsonl", "correlation_id"),
+    ("legacy_extension_workloads.jsonl", "correlation_id"),
+)
+for relative_path, correlation_field in artifacts:
+    path = target_dir / "perf" / relative_path
+    if not path.is_file():
+        continue
+    records = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    for record in records:
+        record["timestamp"] = generated_at
+        record["run_id"] = correlation_id
+        record[correlation_field] = correlation_id
+        record["source_commit"] = source_commit
+        record["source_dirty"] = False
+    if (
+        relative_path == "scenario_runner.jsonl"
+        and records
+    ):
+        if (
+            os.environ.get("PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW") == "1"
+            and not any(
+                record.get("orchestration_correlation_id") == "foreign-correlation"
+                for record in records
+            )
+        ):
+            foreign = dict(records[-1])
+            foreign["orchestration_correlation_id"] = "foreign-correlation"
+            foreign["total_ms"] = 0.001
+            records.append(foreign)
+        if os.environ.get("PI_FAKE_INJECT_STALE_SCENARIO_ROW") == "1":
+            stale = dict(records[-1])
+            stale["timestamp"] = "2000-01-01T00:00:00Z"
+            stale["total_ms"] = 0.002
+            records.append(stale)
+    path.write_text(
+        "\n".join(json.dumps(record, separators=(",", ":")) for record in records)
+        + "\n",
+        encoding="utf-8",
+    )
+PY
+  if [[ "${PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW:-0}" == "1" ]]; then
+    printf '{not-json\n' >>"$target_dir/perf/scenario_runner.jsonl"
+  fi
+fi
 exit 0
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
+    let rch_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  check)
+    exit 2
+    ;;
+  exec)
+    if [[ "${RCH_REQUIRE_REMOTE:-0}" != "1" ]]; then
+      echo "rch exec was not placed in fail-closed proof mode" >&2
+      exit 65
+    fi
+    shift
+    if [[ "${1:-}" == "--" ]]; then
+      shift
+    fi
+    exec "$@"
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+    write_executable(&bin_dir.join("rch"), rch_stub);
+    let git_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+  rev-parse)
+    if [[ "${2:-}" == "--short" && "${3:-}" == "HEAD" ]]; then
+      printf '%s\n' '01234567'
+    elif [[ "${2:-}" == "HEAD" ]]; then
+      printf '%s\n' '0123456789abcdef0123456789abcdef01234567'
+    else
+      exit 64
+    fi
+    ;;
+  status)
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#;
+    write_executable(&bin_dir.join("git"), git_stub);
 }
 
 #[cfg(unix)]
@@ -6768,6 +6920,69 @@ fn orchestrate_script_emits_budget_input_negative_controls_before_consumption() 
 }
 
 #[test]
+fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
+    let script_path = project_root().join("scripts/perf/orchestrate.sh");
+    let content = fs::read_to_string(&script_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", script_path.display()));
+
+    let phase1_generation = content
+        .find("Phase-1 matrix validation written")
+        .expect("phase1 derived-artifact generation");
+    let post_generation_budget = content
+        .find("POST_GENERATION_BUDGET_DIR=")
+        .expect("post-generation Rust budget gate");
+    let final_preflight = content
+        .find("run_budget_preflight \"$PREFLIGHT_AFTER_RUN_PATH\"")
+        .expect("final budget preflight");
+    let initial_preflight = content
+        .find("run_budget_preflight \"$PREFLIGHT_BEFORE_REFRESH_PATH\"")
+        .expect("initial full-readiness preflight");
+    let final_staging = content
+        .find("run_artifact_staging_manifest \"$STAGING_MANIFEST_PATH\"")
+        .expect("final artifact staging");
+    let checksums = content
+        .find("# ─── Phase 6: Generate checksums")
+        .expect("checksum generation phase");
+
+    for token in [
+        "--message-format=json-render-diagnostics",
+        "pi.perf.test_binary_attestation.v1",
+        "perf_budgets binary attestation commit mismatch",
+        "perf_budgets test binary checksum mismatch",
+        "source_dataset_checksum_mismatch",
+        "timestamp_before_run_start",
+    ] {
+        assert!(
+            content.contains(token),
+            "post-generation evidence gate must include token: {token}"
+        );
+    }
+
+    assert!(
+        phase1_generation < post_generation_budget
+            && post_generation_budget < final_preflight
+            && final_preflight < final_staging
+            && final_staging < checksums,
+        "phase1 generation, Rust consumption, final preflight/staging, and checksums must remain causally ordered"
+    );
+    assert!(
+        initial_preflight < phase1_generation,
+        "the initial full-readiness preflight must remain before derived artifact generation"
+    );
+    assert_eq!(
+        content.matches("--artifact-readiness-only").count(),
+        1,
+        "only the final preflight after the authoritative Rust budget gate may use artifact-only readiness"
+    );
+    assert!(
+        content.contains(
+            "run_budget_preflight \"$PREFLIGHT_AFTER_RUN_PATH\" --artifact-readiness-only"
+        ),
+        "the final preflight must use correlation-bound artifact-only readiness"
+    );
+}
+
+#[test]
 fn orchestrate_script_emits_phase1_matrix_validation_contract() {
     let script_path = project_root().join("scripts/perf/orchestrate.sh");
     let content = fs::read_to_string(&script_path)
@@ -6837,7 +7052,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .arg("full")
         .arg("--skip-build")
         .arg("--skip-env-check")
-        .arg("--no-rch")
+        .arg("--require-rch")
         .current_dir(project_root())
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", &target_dir)
@@ -7331,7 +7546,202 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         "weighted global_ranking weighted_contribution_pct values should sum to ~100, got {contribution_sum}"
     );
 
+    let staging_path = output_dir.join("results/perf_artifact_staging_manifest.json");
+    let staging: Value = serde_json::from_str(
+        &fs::read_to_string(&staging_path).expect("read final artifact staging manifest"),
+    )
+    .expect("parse final artifact staging manifest");
+    let staging_entries = staging["entries"]
+        .as_array()
+        .expect("artifact staging entries array");
+    let source_commit = FAKE_ORCHESTRATE_SOURCE_COMMIT;
+    let expected_correlation_id = manifest["correlation_id"]
+        .as_str()
+        .expect("manifest correlation_id");
+    for (contract_id, artifact_name) in [
+        (
+            "extension_benchmark_stratification",
+            "extension_benchmark_stratification.json",
+        ),
+        ("phase1_matrix_validation", "phase1_matrix_validation.json"),
+    ] {
+        let expected_source_path = output_dir.join("results").join(artifact_name);
+        let entry = staging_entries
+            .iter()
+            .find(|entry| {
+                entry["contract_id"].as_str() == Some(contract_id)
+                    && entry["evidence_source"].as_str() == Some("direct")
+                    && entry["status"].as_str() == Some("present")
+                    && entry["source_path"].as_str()
+                        == Some(expected_source_path.to_string_lossy().as_ref())
+            })
+            .unwrap_or_else(|| {
+                panic!("missing direct current-run staging entry for {contract_id}")
+            });
+        assert_eq!(
+            entry["correlation_id"].as_str(),
+            Some(expected_correlation_id),
+            "staged {contract_id} correlation must match the run manifest"
+        );
+        assert_eq!(
+            entry["source_commit"].as_str(),
+            Some(source_commit),
+            "staged {contract_id} commit must match the source checkout"
+        );
+        assert_eq!(
+            entry["source_dirty"].as_bool(),
+            Some(false),
+            "staged {contract_id} must be clean-source evidence"
+        );
+    }
+    assert!(
+        manifest["suite_results"].as_array().is_some_and(|results| {
+            results.iter().any(|result| {
+                result["suite"].as_str() == Some("perf_budgets_post_generation")
+                    && result["status"].as_str() == Some("pass")
+                    && result["exit_code"].as_i64() == Some(0)
+            })
+        }),
+        "manifest must record a passing post-generation perf budget consumer"
+    );
+    let post_generation_invocation: Value = serde_json::from_str(
+        &fs::read_to_string(
+            output_dir.join("results/perf_budgets_post_generation_invocation.json"),
+        )
+        .expect("read post-generation budget invocation marker"),
+    )
+    .expect("parse post-generation budget invocation marker");
+    assert_eq!(
+        post_generation_invocation["correlation_id"].as_str(),
+        Some(expected_correlation_id),
+        "post-generation budget invocation must consume the current run"
+    );
+    assert_eq!(
+        post_generation_invocation["test_filter"].as_str(),
+        Some("ci_enforced_budgets_fail_on_regression_or_missing_data"),
+        "post-generation budget invocation must select the data-contract test"
+    );
+    assert_eq!(
+        post_generation_invocation["exact"].as_bool(),
+        Some(true),
+        "post-generation budget invocation must use an exact test filter"
+    );
+    let post_generation_contract: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("results/post_generation_evidence_contract.json"))
+            .expect("read positive post-generation evidence contract"),
+    )
+    .expect("parse positive post-generation evidence contract");
+    assert_eq!(
+        post_generation_contract["status"].as_str(),
+        Some("ready"),
+        "current direct derived artifacts must pass the post-generation contract"
+    );
+    assert_eq!(
+        post_generation_contract["failure_count"].as_u64(),
+        Some(0),
+        "current direct phase1 and stratification artifacts must have zero contract failures"
+    );
+
     let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+fn assert_orchestrate_rejects_scenario_mutation(env_name: &str, expected_reason: &str) {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(env_name, "1")]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when a mutated source row is present"
+    );
+
+    let results_dir = temp_root.join("run/results");
+    let matrix: Value = serde_json::from_str(
+        &fs::read_to_string(results_dir.join("phase1_matrix_validation.json"))
+            .expect("read phase1 matrix artifact"),
+    )
+    .expect("parse phase1 matrix artifact");
+    let scenario_dataset = matrix["source_datasets"]
+        .as_array()
+        .and_then(|datasets| {
+            datasets.iter().find(|dataset| {
+                dataset["correlation_field"].as_str() == Some("orchestration_correlation_id")
+            })
+        })
+        .expect("phase1 scenario source dataset");
+    assert!(
+        scenario_dataset["accepted_record_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0),
+        "the current-correlation control rows must remain admissible"
+    );
+    assert_eq!(
+        scenario_dataset["rejected_record_count"].as_u64(),
+        Some(1),
+        "the single source mutation must be rejected"
+    );
+    assert!(
+        scenario_dataset["rejections"]
+            .as_array()
+            .is_some_and(|rejections| {
+                rejections.iter().any(|rejection| {
+                    rejection["reasons"].as_array().is_some_and(|reasons| {
+                        reasons
+                            .iter()
+                            .any(|reason| reason.as_str() == Some(expected_reason))
+                    })
+                })
+            }),
+        "scenario mutation must report its causal rejection reason: {expected_reason}"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false),
+        "mixed lineage must fail the phase1 consumption contract closed"
+    );
+
+    let contract: Value = serde_json::from_str(
+        &fs::read_to_string(results_dir.join("post_generation_evidence_contract.json"))
+            .expect("read post-generation contract"),
+    )
+    .expect("parse post-generation contract");
+    assert_eq!(contract["status"].as_str(), Some("blocked"));
+    assert!(
+        contract["failures"].as_array().is_some_and(|failures| {
+            failures.iter().any(|failure| {
+                failure["reason"].as_str() == Some("mixed_source_lineage")
+                    && failure["source_path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with("scenario_runner.jsonl"))
+            })
+        }),
+        "post-generation validation must identify the mixed scenario lineage"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_foreign_source_lineage_before_finalization() {
+    assert_orchestrate_rejects_scenario_mutation(
+        "PI_FAKE_INJECT_FOREIGN_SCENARIO_ROW",
+        "correlation_id_mismatch",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_stale_same_lineage_before_finalization() {
+    assert_orchestrate_rejects_scenario_mutation(
+        "PI_FAKE_INJECT_STALE_SCENARIO_ROW",
+        "timestamp_before_run_start",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_malformed_source_row_before_finalization() {
+    assert_orchestrate_rejects_scenario_mutation(
+        "PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW",
+        "invalid_json",
+    );
 }
 
 #[cfg(unix)]
@@ -7339,7 +7749,10 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
 fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_INDEX_STAGE_SAMPLE", "1")]);
-    assert_orchestrate_success(&output);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when a required stage sample is missing"
+    );
 
     let matrix_path = temp_root
         .join("run")
@@ -7480,7 +7893,10 @@ fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
 fn orchestrate_phase1_matrix_treats_missing_swarm_metrics_as_incomplete() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_SWARM_METRICS", "1")]);
-    assert_orchestrate_success(&output);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when required swarm metrics are missing"
+    );
 
     let matrix_path = temp_root
         .join("run")
@@ -7533,7 +7949,10 @@ fn orchestrate_phase1_matrix_treats_missing_swarm_metrics_as_incomplete() {
 fn orchestrate_phase1_weighted_attribution_missing_when_no_stage_cells_are_valid() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_ALL_STAGE_SAMPLES", "1")]);
-    assert_orchestrate_success(&output);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when every stage attribution is missing"
+    );
 
     let matrix_path = temp_root
         .join("run")

@@ -427,6 +427,7 @@ if [[ ${#SELECTED_UNIT_TARGETS[@]} -eq 0 && "$SKIP_UNIT" == false ]]; then
         focused)
             SELECTED_UNIT_TARGETS=(
                 "${ALL_UNIT_FILES[@]}"
+                conformance_fixtures
                 ext_conformance_matrix
                 node_buffer_shim
                 node_bun_api_matrix
