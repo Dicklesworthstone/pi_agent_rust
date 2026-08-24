@@ -129,6 +129,8 @@ pub mod crypto_shim;
 // its unconditional helpers — gating the declaration broke default builds.
 #[doc(hidden)]
 pub mod debug;
+#[doc(hidden)]
+pub mod delight;
 pub mod dialects;
 #[doc(hidden)]
 pub mod doctor;

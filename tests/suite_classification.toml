@@ -136,6 +136,7 @@ files = [
     "status_line",
     "markdown_rich",
     "overlay_system",
+    "delight",
     "checkpoint",
     "eval",
     "url_router",
