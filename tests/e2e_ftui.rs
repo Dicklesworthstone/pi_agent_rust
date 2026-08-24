@@ -469,7 +469,7 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
         .to_string()
     }
 
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     loop {
         let state = process_state(pid);
         if state.starts_with('T') {
@@ -492,7 +492,7 @@ fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
     session.tmux.send_literal("fg");
     session.tmux.send_key("Enter");
 
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     loop {
         let state = process_state(pid);
         if !state.is_empty() && !state.starts_with('T') {
