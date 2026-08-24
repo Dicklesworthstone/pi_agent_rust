@@ -141,9 +141,17 @@ pub fn evaluate_gated_series(
         };
 
         let budget_verdict = if comparison == "minimum" {
-            if p95 >= threshold { "PASS".to_string() } else { "FAIL".to_string() }
+            if p95 >= threshold {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            }
         } else {
-            if p95 <= threshold { "PASS".to_string() } else { "FAIL".to_string() }
+            if p95 <= threshold {
+                "PASS".to_string()
+            } else {
+                "FAIL".to_string()
+            }
         };
 
         GatedBudgetResult {
@@ -172,9 +180,18 @@ impl std::fmt::Display for VarianceIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidSchema(b, s) => write!(f, "invalid topology schema for {b}: {s}"),
-            Self::NotRejected(b, score, max) => write!(f, "budget {b} with noise_score {score} > {max} was not REJECTED_NO_DATA"),
-            Self::HasEmpiricalValue(b, score) => write!(f, "budget {b} with noise_score {score} has empirical_value, violating no-averaging invariant"),
-            Self::CleanRejected(b, score, max) => write!(f, "clean budget {b} with noise_score {score} <= {max} was rejected"),
+            Self::NotRejected(b, score, max) => write!(
+                f,
+                "budget {b} with noise_score {score} > {max} was not REJECTED_NO_DATA"
+            ),
+            Self::HasEmpiricalValue(b, score) => write!(
+                f,
+                "budget {b} with noise_score {score} has empirical_value, violating no-averaging invariant"
+            ),
+            Self::CleanRejected(b, score, max) => write!(
+                f,
+                "clean budget {b} with noise_score {score} <= {max} was rejected"
+            ),
         }
     }
 }
@@ -205,7 +222,10 @@ pub fn verify_variance_artifact(
 
     for r in &artifact.results {
         if r.environment.schema != HOST_TOPOLOGY_SCHEMA {
-            issues.push(VarianceIssue::InvalidSchema(&r.budget_name, &r.environment.schema));
+            issues.push(VarianceIssue::InvalidSchema(
+                &r.budget_name,
+                &r.environment.schema,
+            ));
         }
 
         if r.environment.noise_score > artifact.max_admissible_noise_score {
@@ -275,8 +295,14 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
     let text = fs::read_to_string(contract_path)?;
     let val: serde_json::Value = serde_json::from_str(&text)?;
 
-    assert_eq!(val.get("schema").and_then(|v| v.as_str()), Some(VARIANCE_CONTRACT_SCHEMA));
-    assert_eq!(val.get("bead_id").and_then(|v| v.as_str()), Some("bd-sog97.21"));
+    assert_eq!(
+        val.get("schema").and_then(|v| v.as_str()),
+        Some(VARIANCE_CONTRACT_SCHEMA)
+    );
+    assert_eq!(
+        val.get("bead_id").and_then(|v| v.as_str()),
+        Some("bd-sog97.21")
+    );
     assert_eq!(
         val.get("gating_rules")
             .and_then(|gr| gr.get("max_admissible_noise_score_strict"))
@@ -290,27 +316,51 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
 #[test]
 fn noise_score_computation_all_factors() {
     // 0 noise: performance governor, no turbo, THP never, ASLR disabled
-    assert_eq!(compute_noise_score("performance", "disabled", "never", "disabled"), 0);
+    assert_eq!(
+        compute_noise_score("performance", "disabled", "never", "disabled"),
+        0
+    );
 
     // Governor penalty (+3)
-    assert_eq!(compute_noise_score("powersave", "disabled", "never", "disabled"), 3);
+    assert_eq!(
+        compute_noise_score("powersave", "disabled", "never", "disabled"),
+        3
+    );
 
     // Turbo penalty (+2)
-    assert_eq!(compute_noise_score("performance", "enabled", "never", "disabled"), 2);
+    assert_eq!(
+        compute_noise_score("performance", "enabled", "never", "disabled"),
+        2
+    );
 
     // THP penalty (+1)
-    assert_eq!(compute_noise_score("performance", "disabled", "always", "disabled"), 1);
+    assert_eq!(
+        compute_noise_score("performance", "disabled", "always", "disabled"),
+        1
+    );
 
     // ASLR penalty (+1)
-    assert_eq!(compute_noise_score("performance", "disabled", "never", "full"), 1);
+    assert_eq!(
+        compute_noise_score("performance", "disabled", "never", "full"),
+        1
+    );
 
     // Max penalty (+7)
-    assert_eq!(compute_noise_score("powersave", "enabled", "always", "full"), 7);
+    assert_eq!(
+        compute_noise_score("powersave", "enabled", "always", "full"),
+        7
+    );
 }
 
 #[test]
 fn clean_run_accepted_into_evidence() {
-    let clean_env = create_host_topology_fingerprint("performance", "disabled", "never", "disabled", "380af591");
+    let clean_env = create_host_topology_fingerprint(
+        "performance",
+        "disabled",
+        "never",
+        "disabled",
+        "380af591",
+    );
     assert_eq!(clean_env.noise_score, 0);
 
     let samples = vec![4.5, 4.8, 5.0, 5.2, 5.5];
@@ -333,7 +383,8 @@ fn clean_run_accepted_into_evidence() {
 
 #[test]
 fn noisy_run_rejected_with_named_reason_and_no_data() {
-    let noisy_env = create_host_topology_fingerprint("powersave", "enabled", "always", "full", "380af591");
+    let noisy_env =
+        create_host_topology_fingerprint("powersave", "enabled", "always", "full", "380af591");
     assert_eq!(noisy_env.noise_score, 7);
 
     let samples = vec![4.5, 4.8, 5.0, 5.2, 5.5];
@@ -350,14 +401,28 @@ fn noisy_run_rejected_with_named_reason_and_no_data() {
 
     assert_eq!(result.gate_status, "REJECTED_NO_DATA");
     assert_eq!(result.budget_verdict, "NO_DATA");
-    assert!(result.empirical_value.is_none(), "noisy runs must never be averaged into compliance");
-    assert!(result.rejection_reason.unwrap().contains("noise score 7 exceeds maximum allowed threshold 0"));
+    assert!(
+        result.empirical_value.is_none(),
+        "noisy runs must never be averaged into compliance"
+    );
+    assert!(
+        result
+            .rejection_reason
+            .unwrap()
+            .contains("noise score 7 exceeds maximum allowed threshold 0")
+    );
 }
 
 #[test]
 fn mock_artifact_passes_verification() -> Result<()> {
     let contract_path = Path::new("docs/contracts/variance-gating-contract.json");
-    let clean_env = create_host_topology_fingerprint("performance", "disabled", "never", "disabled", "380af591");
+    let clean_env = create_host_topology_fingerprint(
+        "performance",
+        "disabled",
+        "never",
+        "disabled",
+        "380af591",
+    );
 
     let artifact = VarianceGateArtifact {
         schema: VARIANCE_ARTIFACT_SCHEMA.to_string(),
@@ -367,20 +432,18 @@ fn mock_artifact_passes_verification() -> Result<()> {
         total_evaluated: 1,
         accepted_count: 1,
         rejected_noise_count: 0,
-        results: vec![
-            GatedBudgetResult {
-                budget_name: "startup_version_p95".to_string(),
-                category: "startup".to_string(),
-                threshold: 100.0,
-                comparison: "maximum".to_string(),
-                unit: "ms".to_string(),
-                environment: clean_env,
-                gate_status: "ACCEPTED".to_string(),
-                rejection_reason: None,
-                empirical_value: Some(5.5),
-                budget_verdict: "PASS".to_string(),
-            },
-        ],
+        results: vec![GatedBudgetResult {
+            budget_name: "startup_version_p95".to_string(),
+            category: "startup".to_string(),
+            threshold: 100.0,
+            comparison: "maximum".to_string(),
+            unit: "ms".to_string(),
+            environment: clean_env,
+            gate_status: "ACCEPTED".to_string(),
+            rejection_reason: None,
+            empirical_value: Some(5.5),
+            budget_verdict: "PASS".to_string(),
+        }],
         overall_status: "PASS".to_string(),
     };
 
@@ -396,7 +459,8 @@ fn mock_artifact_passes_verification() -> Result<()> {
 #[test]
 fn tamper_detection_in_variance_artifact() -> Result<()> {
     let contract_path = Path::new("docs/contracts/variance-gating-contract.json");
-    let noisy_env = create_host_topology_fingerprint("powersave", "enabled", "never", "disabled", "380af591");
+    let noisy_env =
+        create_host_topology_fingerprint("powersave", "enabled", "never", "disabled", "380af591");
 
     let artifact = VarianceGateArtifact {
         schema: VARIANCE_ARTIFACT_SCHEMA.to_string(),
@@ -406,20 +470,18 @@ fn tamper_detection_in_variance_artifact() -> Result<()> {
         total_evaluated: 1,
         accepted_count: 1, // tamper: should be 0
         rejected_noise_count: 0,
-        results: vec![
-            GatedBudgetResult {
-                budget_name: "startup_version_p95".to_string(),
-                category: "startup".to_string(),
-                threshold: 100.0,
-                comparison: "maximum".to_string(),
-                unit: "ms".to_string(),
-                environment: noisy_env,
-                gate_status: "ACCEPTED".to_string(), // tamper: noisy env accepted
-                rejection_reason: None,
-                empirical_value: Some(5.5), // tamper: averaged in
-                budget_verdict: "PASS".to_string(),
-            },
-        ],
+        results: vec![GatedBudgetResult {
+            budget_name: "startup_version_p95".to_string(),
+            category: "startup".to_string(),
+            threshold: 100.0,
+            comparison: "maximum".to_string(),
+            unit: "ms".to_string(),
+            environment: noisy_env,
+            gate_status: "ACCEPTED".to_string(), // tamper: noisy env accepted
+            rejection_reason: None,
+            empirical_value: Some(5.5), // tamper: averaged in
+            budget_verdict: "PASS".to_string(),
+        }],
         overall_status: "PASS".to_string(),
     };
 

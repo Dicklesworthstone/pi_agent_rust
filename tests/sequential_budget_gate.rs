@@ -34,7 +34,10 @@ struct EvaluateArgs {
     #[arg(long, default_value = "docs/evidence/nrun-measurement-series.json")]
     input: PathBuf,
     /// Output path for the sequential evaluation artifact.
-    #[arg(long, default_value = "docs/evidence/sequential-budget-gate-evaluations.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/sequential-budget-gate-evaluations.json"
+    )]
     output: PathBuf,
     /// Type I error budget (alpha).
     #[arg(long, default_value_t = DEFAULT_ALPHA)]
@@ -47,10 +50,16 @@ struct EvaluateArgs {
 #[derive(Debug, Args)]
 struct VerifyArgs {
     /// Path to the sequential budget evaluation artifact.
-    #[arg(long, default_value = "docs/evidence/sequential-budget-gate-evaluations.json")]
+    #[arg(
+        long,
+        default_value = "docs/evidence/sequential-budget-gate-evaluations.json"
+    )]
     input: PathBuf,
     /// Contract path for protocol rules.
-    #[arg(long, default_value = "docs/contracts/sequential-budget-gate-contract.json")]
+    #[arg(
+        long,
+        default_value = "docs/contracts/sequential-budget-gate-contract.json"
+    )]
     contract: PathBuf,
 }
 
@@ -172,7 +181,10 @@ pub fn run_sequential_test(
     max_steps: usize,
 ) -> Result<SequentialBudgetResult> {
     if series.samples.is_empty() {
-        bail!("cannot run sequential test on empty series {}", series.budget_name);
+        bail!(
+            "cannot run sequential test on empty series {}",
+            series.budget_name
+        );
     }
 
     let e_pass_threshold = 1.0 / alpha.clamp(0.0001, 0.5);
@@ -186,8 +198,12 @@ pub fn run_sequential_test(
 
     for (step_idx, sample) in series.samples.iter().enumerate() {
         let step = step_idx + 1;
-        let step_log_lr =
-            compute_step_log_lr(sample.raw_value, sample.weight, series.threshold, &series.comparison);
+        let step_log_lr = compute_step_log_lr(
+            sample.raw_value,
+            sample.weight,
+            series.threshold,
+            &series.comparison,
+        );
 
         log_e = (log_e + step_log_lr).clamp(-100.0, 100.0);
         let e_val = log_e.exp();
@@ -231,7 +247,15 @@ pub fn run_sequential_test(
     let trajectory = intermediate_traces
         .into_iter()
         .map(
-            |(step, sample_value, weight, log_likelihood_ratio, accumulated_log_e, e_value, decision)| {
+            |(
+                step,
+                sample_value,
+                weight,
+                log_likelihood_ratio,
+                accumulated_log_e,
+                e_value,
+                decision,
+            )| {
                 SequentialStepTrace {
                     step,
                     sample_value,
@@ -270,7 +294,10 @@ impl std::fmt::Display for SeqIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidEValue(name, val) => write!(f, "invalid e-value {val} in budget {name}"),
-            Self::VerdictMismatch(name, expected, recorded) => write!(f, "verdict mismatch for {name}: expected {expected}, recorded {recorded}"),
+            Self::VerdictMismatch(name, expected, recorded) => write!(
+                f,
+                "verdict mismatch for {name}: expected {expected}, recorded {recorded}"
+            ),
             Self::TrajectoryEmpty(name) => write!(f, "empty trajectory for budget {name}"),
         }
     }
@@ -318,7 +345,10 @@ pub fn verify_sequential_artifact(
         }
 
         if eval.final_e_value.is_nan() || eval.final_e_value < 0.0 {
-            issues.push(SeqIssue::InvalidEValue(&eval.budget_name, eval.final_e_value));
+            issues.push(SeqIssue::InvalidEValue(
+                &eval.budget_name,
+                eval.final_e_value,
+            ));
         }
 
         let expected_verdict = match eval.decision.as_str() {
@@ -328,7 +358,11 @@ pub fn verify_sequential_artifact(
         };
 
         if eval.final_verdict != expected_verdict {
-            issues.push(SeqIssue::VerdictMismatch(&eval.budget_name, expected_verdict, &eval.final_verdict));
+            issues.push(SeqIssue::VerdictMismatch(
+                &eval.budget_name,
+                expected_verdict,
+                &eval.final_verdict,
+            ));
         }
 
         if eval.final_verdict == "PASS" {
@@ -384,10 +418,26 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
     let text = fs::read_to_string(contract_path)?;
     let val: serde_json::Value = serde_json::from_str(&text)?;
 
-    assert_eq!(val.get("schema").and_then(|v| v.as_str()), Some(SEQUENTIAL_GATE_CONTRACT_SCHEMA));
-    assert_eq!(val.get("bead_id").and_then(|v| v.as_str()), Some("bd-sog97.11"));
-    assert_eq!(val.get("error_control").and_then(|ec| ec.get("alpha")).and_then(|a| a.as_f64()), Some(0.05));
-    assert_eq!(val.get("error_control").and_then(|ec| ec.get("e_threshold_pass")).and_then(|a| a.as_f64()), Some(20.0));
+    assert_eq!(
+        val.get("schema").and_then(|v| v.as_str()),
+        Some(SEQUENTIAL_GATE_CONTRACT_SCHEMA)
+    );
+    assert_eq!(
+        val.get("bead_id").and_then(|v| v.as_str()),
+        Some("bd-sog97.11")
+    );
+    assert_eq!(
+        val.get("error_control")
+            .and_then(|ec| ec.get("alpha"))
+            .and_then(|a| a.as_f64()),
+        Some(0.05)
+    );
+    assert_eq!(
+        val.get("error_control")
+            .and_then(|ec| ec.get("e_threshold_pass"))
+            .and_then(|a| a.as_f64()),
+        Some(20.0)
+    );
 
     Ok(())
 }
@@ -396,13 +446,25 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
 fn step_log_lr_conformance_and_properties() {
     let lr_pass = compute_step_log_lr(80.0, 1.0, 100.0, "maximum");
     let lr_fail = compute_step_log_lr(120.0, 1.0, 100.0, "maximum");
-    assert!(lr_pass > 0.0, "conforming sample should have positive log LR");
-    assert!(lr_fail < 0.0, "violating sample should have negative log LR");
+    assert!(
+        lr_pass > 0.0,
+        "conforming sample should have positive log LR"
+    );
+    assert!(
+        lr_fail < 0.0,
+        "violating sample should have negative log LR"
+    );
 
     let lr_min_pass = compute_step_log_lr(120.0, 1.0, 100.0, "minimum");
     let lr_min_fail = compute_step_log_lr(80.0, 1.0, 100.0, "minimum");
-    assert!(lr_min_pass > 0.0, "conforming min sample should have positive log LR");
-    assert!(lr_min_fail < 0.0, "violating min sample should have negative log LR");
+    assert!(
+        lr_min_pass > 0.0,
+        "conforming min sample should have positive log LR"
+    );
+    assert!(
+        lr_min_fail < 0.0,
+        "violating min sample should have negative log LR"
+    );
 }
 
 #[test]
@@ -477,7 +539,10 @@ fn early_stopping_on_overwhelming_pass() -> Result<()> {
     let result = run_sequential_test(&series, DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_MAX_STEPS)?;
     assert_eq!(result.decision, "EARLY_PASS");
     assert_eq!(result.final_verdict, "PASS");
-    assert!(result.stopping_step <= 10, "should early stop in <= 10 steps on strong pass");
+    assert!(
+        result.stopping_step <= 10,
+        "should early stop in <= 10 steps on strong pass"
+    );
     assert!(result.final_e_value >= 20.0);
 
     Ok(())
@@ -509,7 +574,10 @@ fn early_stopping_on_overwhelming_reject() -> Result<()> {
     let result = run_sequential_test(&series, DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_MAX_STEPS)?;
     assert_eq!(result.decision, "EARLY_REJECT");
     assert_eq!(result.final_verdict, "FAIL");
-    assert!(result.stopping_step <= 10, "should early stop in <= 10 steps on strong reject");
+    assert!(
+        result.stopping_step <= 10,
+        "should early stop in <= 10 steps on strong reject"
+    );
     assert!(result.final_e_value <= DEFAULT_BETA);
 
     Ok(())
@@ -539,7 +607,11 @@ fn live_sequential_artifact_passes_verification() -> Result<()> {
         evaluations.push(result);
     }
 
-    let overall_verdict = if failing == 0 { "PASS".to_string() } else { "FAIL".to_string() };
+    let overall_verdict = if failing == 0 {
+        "PASS".to_string()
+    } else {
+        "FAIL".to_string()
+    };
 
     let artifact = SequentialBudgetEvaluationArtifact {
         schema: SEQUENTIAL_GATE_EVALUATION_SCHEMA.to_string(),
@@ -558,7 +630,11 @@ fn live_sequential_artifact_passes_verification() -> Result<()> {
 
     let report = verify_sequential_artifact(&artifact, contract_path);
     assert_eq!(report.status, "pass");
-    assert!(report.errors.is_empty(), "expected 0 errors, got {:?}", report.errors);
+    assert!(
+        report.errors.is_empty(),
+        "expected 0 errors, got {:?}",
+        report.errors
+    );
     assert_eq!(report.evaluated_budgets, 6);
 
     Ok(())
@@ -573,7 +649,12 @@ fn tamper_detection_in_sequential_evaluations() -> Result<()> {
 
     let mut evaluations = Vec::new();
     for series in &series_input.series {
-        evaluations.push(run_sequential_test(series, DEFAULT_ALPHA, DEFAULT_BETA, DEFAULT_MAX_STEPS)?);
+        evaluations.push(run_sequential_test(
+            series,
+            DEFAULT_ALPHA,
+            DEFAULT_BETA,
+            DEFAULT_MAX_STEPS,
+        )?);
     }
 
     let mut artifact = SequentialBudgetEvaluationArtifact {
@@ -591,7 +672,11 @@ fn tamper_detection_in_sequential_evaluations() -> Result<()> {
         evaluations,
     };
 
-    if let Some(eval) = artifact.evaluations.iter_mut().find(|e| e.final_verdict == "FAIL") {
+    if let Some(eval) = artifact
+        .evaluations
+        .iter_mut()
+        .find(|e| e.final_verdict == "FAIL")
+    {
         eval.final_verdict = "PASS".to_string();
     }
     let report = verify_sequential_artifact(&artifact, contract_path);
@@ -600,4 +685,3 @@ fn tamper_detection_in_sequential_evaluations() -> Result<()> {
 
     Ok(())
 }
-

@@ -75,7 +75,10 @@ pub fn compute_percentile(sorted_samples: &[f64], p: f64) -> f64 {
         return 0.0;
     }
     let idx = (((sorted_samples.len() as f64) * p).ceil() as usize).clamp(1, sorted_samples.len());
-    sorted_samples.get(idx.saturating_sub(1)).copied().unwrap_or(0.0)
+    sorted_samples
+        .get(idx.saturating_sub(1))
+        .copied()
+        .unwrap_or(0.0)
 }
 
 pub fn compute_bootstrap_ci(samples: &[f64], resamples: usize) -> (f64, f64) {
@@ -117,7 +120,9 @@ impl std::fmt::Display for StartupIssue<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::LowRepetitions(cmd, n) => write!(f, "command {cmd} repetitions {n} < min 10"),
-            Self::ExceedsThreshold(cmd, p95, t) => write!(f, "command {cmd} p95 {p95:.2}ms exceeds threshold {t:.2}ms"),
+            Self::ExceedsThreshold(cmd, p95, t) => {
+                write!(f, "command {cmd} p95 {p95:.2}ms exceeds threshold {t:.2}ms")
+            }
         }
     }
 }
@@ -155,7 +160,11 @@ pub fn verify_startup_artifact(
             issues.push(StartupIssue::LowRepetitions(&cmd.command, cmd.repetitions));
         }
         if cmd.p95_ms > cmd.threshold_ms {
-            issues.push(StartupIssue::ExceedsThreshold(&cmd.command, cmd.p95_ms, cmd.threshold_ms));
+            issues.push(StartupIssue::ExceedsThreshold(
+                &cmd.command,
+                cmd.p95_ms,
+                cmd.threshold_ms,
+            ));
         }
     }
     errors.extend(issues.into_iter().map(|i| i.to_string()));
@@ -183,8 +192,14 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
     let text = fs::read_to_string(contract_path)?;
     let val: serde_json::Value = serde_json::from_str(&text)?;
 
-    assert_eq!(val.get("schema").and_then(|v| v.as_str()), Some(STARTUP_CONTRACT_SCHEMA));
-    assert_eq!(val.get("bead_id").and_then(|v| v.as_str()), Some("bd-sog97.17"));
+    assert_eq!(
+        val.get("schema").and_then(|v| v.as_str()),
+        Some(STARTUP_CONTRACT_SCHEMA)
+    );
+    assert_eq!(
+        val.get("bead_id").and_then(|v| v.as_str()),
+        Some("bd-sog97.17")
+    );
 
     Ok(())
 }
@@ -199,8 +214,14 @@ fn percentile_and_bootstrap_ci_math() -> Result<()> {
     assert_eq!(p50, 50.0);
 
     let (lower, upper) = compute_bootstrap_ci(&sorted_samples, 500);
-    assert!(lower >= 40.0 && lower <= 55.0, "lower {lower} in plausible range");
-    assert!(upper >= 45.0 && upper <= 60.0, "upper {upper} in plausible range");
+    assert!(
+        lower >= 40.0 && lower <= 55.0,
+        "lower {lower} in plausible range"
+    );
+    assert!(
+        upper >= 45.0 && upper <= 60.0,
+        "upper {upper} in plausible range"
+    );
 
     Ok(())
 }
@@ -305,20 +326,18 @@ fn tamper_detection_in_startup_artifact() -> Result<()> {
             threshold_mb: 48.0,
             status: "FAIL".to_string(),
         },
-        commands: vec![
-            CommandBenchmarkResult {
-                command: "--version".to_string(),
-                metric_name: "startup_version_p95".to_string(),
-                threshold_ms: 100.0,
-                repetitions: 5, // under minimum 10
-                mean_ms: 10.5,
-                p95_ms: 112.1, // exceeds 100.0
-                ci95_lower_ms: 10.1,
-                ci95_upper_ms: 11.0,
-                status: "FAIL".to_string(),
-                samples: vec![],
-            },
-        ],
+        commands: vec![CommandBenchmarkResult {
+            command: "--version".to_string(),
+            metric_name: "startup_version_p95".to_string(),
+            threshold_ms: 100.0,
+            repetitions: 5, // under minimum 10
+            mean_ms: 10.5,
+            p95_ms: 112.1, // exceeds 100.0
+            ci95_lower_ms: 10.1,
+            ci95_upper_ms: 11.0,
+            status: "FAIL".to_string(),
+            samples: vec![],
+        }],
         overall_status: "FAIL".to_string(),
     };
 

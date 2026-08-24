@@ -41,10 +41,23 @@ ALLOWLIST: dict[str, str] = {}
 # not separate files and are not what this gate is about.
 PUB_MOD_RE = re.compile(r"^\s*pub mod\s+([a-z_][a-z0-9_]*)\s*;", re.MULTILINE)
 
-# A cfg(test) module or a #[test] fn inside src/ still counts as a test-only
-# reference: the feature is not reachable from a user action just because a unit
-# test pokes it.
-TEST_MARKER_RE = re.compile(r"#\[cfg\(test\)\]|#\[test\]|mod tests")
+# `#[cfg(test)]` immediately preceding a `mod ... {`. Only a test *module* is
+# skipped wholesale; a bare `#[cfg(test)]` on a single field or fn says nothing
+# about the code after it.
+CFG_TEST_RE = re.compile(r"^\s*#\[cfg\(test\)\]\s*$")
+MOD_OPEN_RE = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[a-z_][a-z0-9_]*\s*\{")
+
+# Rust tokens that can carry an unbalanced brace. Stripped before depth
+# counting so a `"}"` inside a string cannot close a real block.
+STRING_LIKE_RE = re.compile(
+    r"""
+      r\#*"(?:[^"\\]|\\.)*"\#*   # raw string (approximate: no embedded quote+hash)
+    | "(?:[^"\\]|\\.)*"          # normal string
+    | '(?:[^'\\]|\\.)'           # char literal
+    | //.*$                      # line comment
+    """,
+    re.VERBOSE,
+)
 
 
 def repo_root() -> Path:
@@ -105,20 +118,53 @@ def referencing_lines(src: Path, name: str) -> list[tuple[Path, int, str]]:
     return hits
 
 
-def is_test_context(path: Path, lineno: int) -> bool:
-    """Whether a hit sits in test-only code.
+def test_module_lines(path: Path) -> set[int]:
+    """1-indexed line numbers inside a `#[cfg(test)] mod ... { }` block.
 
-    Approximated by scanning the 400 lines above it for a test marker. Rust
-    convention puts `#[cfg(test)] mod tests` at the end of a file, so a hit
-    below such a marker is inside it. The window bounds the cost on very large
-    files; a hit further than that from any marker is production code.
+    Brace-tracked rather than proximity-guessed. The naive version of this --
+    "was there a test marker in the preceding N lines" -- misfires badly on real
+    source: src/interactive/view.rs carries a bare `#[cfg(test)]` on a single
+    item at line 707, which would falsely mark the next several hundred lines of
+    production rendering code as test-only.
+
+    Braces inside strings, char literals, and line comments are stripped before
+    counting so a `"}"` in a message cannot close a block early. Block comments
+    are not stripped; an unbalanced brace inside one would need to be written
+    deliberately, and the failure mode is a module reported as reachable, which
+    is the safe direction for a gate.
     """
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except (OSError, UnicodeDecodeError):
-        return False
-    start = max(0, lineno - 400)
-    return bool(TEST_MARKER_RE.search("\n".join(lines[start:lineno])))
+        return set()
+
+    inside: set[int] = set()
+    depth = 0
+    pending_cfg_test = False
+    block_depth: int | None = None
+
+    for idx, raw in enumerate(lines, start=1):
+        line = STRING_LIKE_RE.sub("", raw)
+
+        if block_depth is None and pending_cfg_test and MOD_OPEN_RE.match(line):
+            # Enter: this line's opening brace puts us at block_depth + 1.
+            block_depth = depth
+
+        if block_depth is not None:
+            inside.add(idx)
+
+        depth += line.count("{") - line.count("}")
+
+        if block_depth is not None and depth <= block_depth:
+            block_depth = None  # matching close brace seen
+
+        # A `#[cfg(test)]` arms only the declaration that directly follows it.
+        if CFG_TEST_RE.match(raw):
+            pending_cfg_test = True
+        elif line.strip() and not line.lstrip().startswith("#["):
+            pending_cfg_test = False
+
+    return inside
 
 
 def classify(src: Path, name: str) -> tuple[str, list[str]]:
@@ -129,12 +175,15 @@ def classify(src: Path, name: str) -> tuple[str, list[str]]:
     owned = module_files(src, name)
     evidence: list[str] = []
     saw_test_only = False
+    test_lines: dict[Path, set[int]] = {}
 
     for path, lineno, text in referencing_lines(src, name):
         if path in owned:
             continue
         rel = path.relative_to(src.parent)
-        if is_test_context(path, lineno):
+        if path not in test_lines:
+            test_lines[path] = test_module_lines(path)
+        if lineno in test_lines[path]:
             saw_test_only = True
             continue
         evidence.append(f"{rel}:{lineno}: {text[:100]}")

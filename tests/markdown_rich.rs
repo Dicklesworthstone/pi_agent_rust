@@ -5,8 +5,8 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::markdown_rich::{
-    format_osc8_link, latex_to_unicode, render_hex_swatches, render_mermaid_diagram,
-    HighlightLanguage,
+    HighlightLanguage, format_osc8_link, latex_to_unicode, render_hex_swatches,
+    render_mermaid_diagram,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {
@@ -28,18 +28,54 @@ fn finish_case(harness: &TestHarness, case: &str) {
 fn test_syntax_highlight_languages() {
     let harness = TestHarness::new("syntax_highlight_languages");
 
-    assert_eq!(HighlightLanguage::from_fence_tag("rust"), HighlightLanguage::Rust);
-    assert_eq!(HighlightLanguage::from_fence_tag("rs"), HighlightLanguage::Rust);
-    assert_eq!(HighlightLanguage::from_fence_tag("python"), HighlightLanguage::Python);
-    assert_eq!(HighlightLanguage::from_fence_tag("javascript"), HighlightLanguage::JavaScript);
-    assert_eq!(HighlightLanguage::from_fence_tag("typescript"), HighlightLanguage::TypeScript);
-    assert_eq!(HighlightLanguage::from_fence_tag("bash"), HighlightLanguage::Bash);
-    assert_eq!(HighlightLanguage::from_fence_tag("go"), HighlightLanguage::Go);
-    assert_eq!(HighlightLanguage::from_fence_tag("json"), HighlightLanguage::Json);
-    assert_eq!(HighlightLanguage::from_fence_tag("toml"), HighlightLanguage::Toml);
-    assert_eq!(HighlightLanguage::from_fence_tag("yaml"), HighlightLanguage::Yaml);
-    assert_eq!(HighlightLanguage::from_fence_tag("diff"), HighlightLanguage::Diff);
-    assert_eq!(HighlightLanguage::from_fence_tag("unknown_lang"), HighlightLanguage::Plain);
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("rust"),
+        HighlightLanguage::Rust
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("rs"),
+        HighlightLanguage::Rust
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("python"),
+        HighlightLanguage::Python
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("javascript"),
+        HighlightLanguage::JavaScript
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("typescript"),
+        HighlightLanguage::TypeScript
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("bash"),
+        HighlightLanguage::Bash
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("go"),
+        HighlightLanguage::Go
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("json"),
+        HighlightLanguage::Json
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("toml"),
+        HighlightLanguage::Toml
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("yaml"),
+        HighlightLanguage::Yaml
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("diff"),
+        HighlightLanguage::Diff
+    );
+    assert_eq!(
+        HighlightLanguage::from_fence_tag("unknown_lang"),
+        HighlightLanguage::Plain
+    );
 
     finish_case(&harness, "syntax_highlight_languages");
 }

@@ -64,7 +64,10 @@ fn test_resume_latency_and_tail_read() {
             Some("msg_0050")
         );
     }
-    assert!(resume_ms < 50.0, "resume latency should be < 50ms, was {resume_ms}ms");
+    assert!(
+        resume_ms < 50.0,
+        "resume latency should be < 50ms, was {resume_ms}ms"
+    );
 
     harness
         .log()
@@ -123,8 +126,7 @@ fn test_fork_and_export_snapshot_consistency() {
     assert!(fork_res.is_ok(), "fork at checkpoint");
 
     // Verify forked store has exactly 20 entries
-    let forked_store_res =
-        SessionStoreV2::open_for_inspection(&fork_dir, MAX_SEGMENT_BYTES);
+    let forked_store_res = SessionStoreV2::open_for_inspection(&fork_dir, MAX_SEGMENT_BYTES);
     assert!(forked_store_res.is_ok(), "open forked store");
     if let Ok(forked_store) = forked_store_res {
         let forked_all_res = forked_store.read_all_entries();
