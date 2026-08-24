@@ -2,8 +2,20 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostcallRewritePlanKind {
+    /// The canonical marshalling path: always correct, never the fastest.
     BaselineCanonical,
+    /// Hash-dispatch fusion on a typed opcode, authorized by params-hash and
+    /// args-shape-hash equivalence with the baseline.
     FastOpcodeFusion,
+    /// A plan the equality-saturation search found by fusing adjacent stages
+    /// into one intrinsic (`crate::hostcall_egraph`).
+    ///
+    /// Distinct from [`Self::FastOpcodeFusion`] because the two are authorized
+    /// by different evidence: that one by hash equivalence against the
+    /// canonical path, this one by a rewrite chain whose every step preserves
+    /// opcode identity and policy-stage count. Keeping them apart means
+    /// telemetry can say which argument justified a given fast path.
+    FusedIntrinsic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

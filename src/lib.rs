@@ -94,9 +94,9 @@ pub mod autocomplete;
 #[doc(hidden)]
 pub mod bash_mediation;
 #[doc(hidden)]
-pub mod btw;
-#[doc(hidden)]
 pub mod browser;
+#[doc(hidden)]
+pub mod btw;
 #[doc(hidden)]
 pub mod buffer_shim;
 pub mod checkpoint;
@@ -111,9 +111,9 @@ pub mod compaction_snap;
 pub mod compaction_worker;
 pub mod completions;
 #[doc(hidden)]
-pub mod config;
-#[doc(hidden)]
 pub mod computer;
+#[doc(hidden)]
+pub mod config;
 #[doc(hidden)]
 pub mod conformance;
 #[doc(hidden)]
@@ -175,9 +175,9 @@ pub mod failover;
 pub mod file_lock;
 #[doc(hidden)]
 pub mod flake_classifier;
-pub mod gc;
 #[doc(hidden)]
 pub mod gallery;
+pub mod gc;
 #[doc(hidden)]
 pub mod github;
 pub mod handoff;
@@ -188,6 +188,7 @@ pub mod hostcall_io_uring_lane;
 #[doc(hidden)]
 pub mod hostcall_queue;
 #[doc(hidden)]
+pub mod hostcall_egraph;
 pub mod hostcall_rewrite;
 #[doc(hidden)]
 pub mod hostcall_s3_fifo;
@@ -247,6 +248,8 @@ pub mod pi_wasm;
 pub mod plan;
 #[doc(hidden)]
 pub mod platform;
+#[doc(hidden)]
+pub mod pmu_telemetry;
 pub mod profiler;
 #[doc(hidden)]
 pub mod provider;
@@ -329,8 +332,8 @@ pub mod validation_broker;
 pub mod vcr;
 #[doc(hidden)]
 pub mod version_check;
-pub mod web_search;
 pub mod web_remote;
+pub mod web_search;
 pub mod workspace;
 pub mod workspace_trust;
 #[doc(hidden)]

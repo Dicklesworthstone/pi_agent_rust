@@ -166,17 +166,13 @@ impl Tool for InspectImageTool {
             ));
         }
 
-        let metadata = fs::metadata(&target_path).map_err(|e| {
-            Error::tool("inspect_image", format!("cannot stat image file: {e}"))
-        })?;
+        let metadata = fs::metadata(&target_path)
+            .map_err(|e| Error::tool("inspect_image", format!("cannot stat image file: {e}")))?;
 
         if metadata.len() > MAX_IMAGE_FILE_SIZE_BYTES {
             return Err(Error::tool(
                 "inspect_image",
-                format!(
-                    "image file exceeds 20 MiB limit: {} bytes",
-                    metadata.len()
-                ),
+                format!("image file exceeds 20 MiB limit: {} bytes", metadata.len()),
             ));
         }
 
@@ -196,14 +192,16 @@ impl Tool for InspectImageTool {
             _ => {
                 return Err(Error::tool(
                     "inspect_image",
-                    format!("unsupported image extension: .{ext} (expected png, jpg, webp, gif, svg, bmp)"),
+                    format!(
+                        "unsupported image extension: .{ext} (expected png, jpg, webp, gif, svg, bmp)"
+                    ),
                 ));
             }
         };
 
-        let is_mock = self.mock_mode.unwrap_or_else(|| {
-            std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1"
-        });
+        let is_mock = self
+            .mock_mode
+            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
 
         let analysis_text = if is_mock {
             format!(
@@ -236,7 +234,8 @@ impl Tool for InspectImageTool {
             if !has_key {
                 return Err(Error::tool(
                     "inspect_image",
-                    format!("missing API key for vision provider {provider} (set {provider_upper}_API_KEY)",
+                    format!(
+                        "missing API key for vision provider {provider} (set {provider_upper}_API_KEY)",
                         provider_upper = provider.to_ascii_uppercase()
                     ),
                 ));
@@ -384,9 +383,7 @@ impl Tool for GenerateImageTool {
             .get("output_path")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!("images/generated_{}.png", Uuid::new_v4().simple())
-            });
+            .unwrap_or_else(|| format!("images/generated_{}.png", Uuid::new_v4().simple()));
 
         let target_path = if Path::new(&output_path_str).is_absolute() {
             PathBuf::from(&output_path_str)
@@ -402,21 +399,23 @@ impl Tool for GenerateImageTool {
 
         // Minimal valid 1x1 PNG bytes for fixture / VCR fallback
         const MIN_VALID_PNG: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-            0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-            0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-            0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-            0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
+            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
         ];
 
-        let is_mock = self.mock_mode.unwrap_or_else(|| {
-            std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1"
-        });
+        let is_mock = self
+            .mock_mode
+            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
 
         if is_mock {
             fs::write(&target_path, MIN_VALID_PNG).map_err(|e| {
-                Error::tool("generate_image", format!("failed to write generated image: {e}"))
+                Error::tool(
+                    "generate_image",
+                    format!("failed to write generated image: {e}"),
+                )
             })?;
         } else {
             let key_env = match provider {
@@ -440,12 +439,17 @@ impl Tool for GenerateImageTool {
             if !has_key {
                 return Err(Error::tool(
                     "generate_image",
-                    format!("missing API key for image generation provider {provider} (set {key_env})"),
+                    format!(
+                        "missing API key for image generation provider {provider} (set {key_env})"
+                    ),
                 ));
             }
 
             fs::write(&target_path, MIN_VALID_PNG).map_err(|e| {
-                Error::tool("generate_image", format!("failed to write generated image: {e}"))
+                Error::tool(
+                    "generate_image",
+                    format!("failed to write generated image: {e}"),
+                )
             })?;
         }
 
@@ -587,7 +591,11 @@ impl Tool for TtsTool {
         if text.chars().count() > MAX_TTS_TEXT_CHARS {
             return Err(Error::tool(
                 "tts",
-                format!("text length {} exceeds max allowed {} chars", text.chars().count(), MAX_TTS_TEXT_CHARS),
+                format!(
+                    "text length {} exceeds max allowed {} chars",
+                    text.chars().count(),
+                    MAX_TTS_TEXT_CHARS
+                ),
             ));
         }
 
@@ -597,18 +605,13 @@ impl Tool for TtsTool {
             .or(self.default_voice.as_deref())
             .unwrap_or("eve");
 
-        let format = args
-            .get("format")
-            .and_then(|v| v.as_str())
-            .unwrap_or("wav");
+        let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("wav");
 
         let output_path_str = args
             .get("output_path")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-            .unwrap_or_else(|| {
-                format!("audio/speech_{}.{}", Uuid::new_v4().simple(), format)
-            });
+            .unwrap_or_else(|| format!("audio/speech_{}.{}", Uuid::new_v4().simple(), format));
 
         let target_path = if Path::new(&output_path_str).is_absolute() {
             PathBuf::from(&output_path_str)
@@ -617,9 +620,8 @@ impl Tool for TtsTool {
         };
 
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| {
-                Error::tool("tts", format!("cannot create output dir: {e}"))
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| Error::tool("tts", format!("cannot create output dir: {e}")))?;
         }
 
         // Minimal valid 44-byte standard WAV header + silence
@@ -629,24 +631,23 @@ impl Tool for TtsTool {
             0x57, 0x41, 0x56, 0x45, // "WAVE"
             0x66, 0x6D, 0x74, 0x20, // "fmt "
             0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
-            0x01, 0x00,             // AudioFormat (1 = PCM)
-            0x01, 0x00,             // NumChannels (1 = Mono)
+            0x01, 0x00, // AudioFormat (1 = PCM)
+            0x01, 0x00, // NumChannels (1 = Mono)
             0x44, 0xAC, 0x00, 0x00, // SampleRate (44100 Hz)
             0x88, 0x58, 0x01, 0x00, // ByteRate (44100 * 1 * 2 = 88200)
-            0x02, 0x00,             // BlockAlign (1 * 2 = 2)
-            0x10, 0x00,             // BitsPerSample (16)
+            0x02, 0x00, // BlockAlign (1 * 2 = 2)
+            0x10, 0x00, // BitsPerSample (16)
             0x64, 0x61, 0x74, 0x61, // "data"
             0x00, 0x00, 0x00, 0x00, // Subchunk2Size (0 bytes data)
         ];
 
-        let is_mock = self.mock_mode.unwrap_or_else(|| {
-            std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1"
-        });
+        let is_mock = self
+            .mock_mode
+            .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
 
         if is_mock {
-            fs::write(&target_path, MIN_VALID_WAV).map_err(|e| {
-                Error::tool("tts", format!("failed to write audio file: {e}"))
-            })?;
+            fs::write(&target_path, MIN_VALID_WAV)
+                .map_err(|e| Error::tool("tts", format!("failed to write audio file: {e}")))?;
         } else {
             let has_key = if let Some(ref k) = self.api_key {
                 !k.trim().is_empty()
@@ -661,9 +662,8 @@ impl Tool for TtsTool {
                 ));
             }
 
-            fs::write(&target_path, MIN_VALID_WAV).map_err(|e| {
-                Error::tool("tts", format!("failed to write audio file: {e}"))
-            })?;
+            fs::write(&target_path, MIN_VALID_WAV)
+                .map_err(|e| Error::tool("tts", format!("failed to write audio file: {e}")))?;
         }
 
         let written_bytes = fs::metadata(&target_path)

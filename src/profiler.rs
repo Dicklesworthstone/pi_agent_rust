@@ -172,6 +172,23 @@ pub fn top_from_folded(content: &str, top_n: usize) -> (u64, Vec<(String, u64)>)
     (grand, rows)
 }
 
+/// Evaluate a hardware PMU sample against the default microarchitectural regression budget.
+#[must_use]
+pub fn evaluate_pmu_budget(
+    sample: &crate::pmu_telemetry::PmuSample,
+) -> crate::pmu_telemetry::PmuBudgetVerdict {
+    crate::pmu_telemetry::PmuRegressionBudget::default().evaluate(sample)
+}
+
+/// Analyze a hardware PMU sample to score optimization opportunities and diagnose bottlenecks.
+#[must_use]
+pub fn score_pmu_opportunity(
+    component_name: &str,
+    sample: &crate::pmu_telemetry::PmuSample,
+) -> crate::pmu_telemetry::PmuOptimizationOpportunity {
+    crate::pmu_telemetry::PmuOpportunityRanker::score_candidate(component_name, sample)
+}
+
 #[cfg(feature = "profiler")]
 #[cfg(test)]
 mod tests {

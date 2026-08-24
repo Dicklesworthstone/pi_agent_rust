@@ -112,9 +112,8 @@ impl BrowserTool {
     }
 
     fn is_mock(&self) -> bool {
-        self.mock_mode.unwrap_or_else(|| {
-            std::env::var("PI_BROWSER_MOCK").unwrap_or_default() == "1"
-        })
+        self.mock_mode
+            .unwrap_or_else(|| std::env::var("PI_BROWSER_MOCK").unwrap_or_default() == "1")
     }
 
     fn check_domain(&self, url: &str) -> Result<()> {
@@ -249,10 +248,9 @@ impl Tool for BrowserTool {
 
         match action {
             "open" | "goto" => {
-                let url = args
-                    .get("url")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::tool("browser", format!("{action} requires url parameter")))?;
+                let url = args.get("url").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::tool("browser", format!("{action} requires url parameter"))
+                })?;
 
                 self.check_domain(url)?;
 
@@ -325,7 +323,9 @@ impl Tool for BrowserTool {
                         text: format!("Closed tab {tab_name}. Remaining tabs: {}", remaining.len()),
                         text_signature: None,
                     })],
-                    details: Some(json!({ "closed_tab": tab_name, "remaining_count": remaining.len() })),
+                    details: Some(
+                        json!({ "closed_tab": tab_name, "remaining_count": remaining.len() }),
+                    ),
                     is_error: false,
                 })
             }
@@ -362,12 +362,15 @@ impl Tool for BrowserTool {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-                let current_info = tabs.get(&tab_name).cloned().unwrap_or_else(|| BrowserTabInfo {
-                    name: tab_name.clone(),
-                    url: "about:blank".to_string(),
-                    title: "Blank Tab".to_string(),
-                    is_active: true,
-                });
+                let current_info = tabs
+                    .get(&tab_name)
+                    .cloned()
+                    .unwrap_or_else(|| BrowserTabInfo {
+                        name: tab_name.clone(),
+                        url: "about:blank".to_string(),
+                        title: "Blank Tab".to_string(),
+                        is_active: true,
+                    });
 
                 let elements = vec![
                     BrowserElementRef {
@@ -403,7 +406,10 @@ impl Tool for BrowserTool {
                         current_info.title,
                         elements
                             .iter()
-                            .map(|e| format!("- [{}] <{}> (role: {}) \"{}\" ({})", e.ref_id, e.tag, e.role, e.text, e.selector))
+                            .map(|e| format!(
+                                "- [{}] <{}> (role: {}) \"{}\" ({})",
+                                e.ref_id, e.tag, e.role, e.text, e.selector
+                            ))
                             .collect::<Vec<_>>()
                             .join("\n")
                     ),
@@ -435,7 +441,10 @@ impl Tool for BrowserTool {
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
-                        text: format!("Evaluation result: {}", serde_json::to_string(&result_value).unwrap_or_default()),
+                        text: format!(
+                            "Evaluation result: {}",
+                            serde_json::to_string(&result_value).unwrap_or_default()
+                        ),
                         text_signature: None,
                     })],
                     details: Some(json!({ "result": result_value })),
@@ -454,7 +463,9 @@ impl Tool for BrowserTool {
                         text: format!("Clicked element {selector} in tab {tab_name}"),
                         text_signature: None,
                     })],
-                    details: Some(json!({ "action": "click", "selector": selector, "tab": tab_name })),
+                    details: Some(
+                        json!({ "action": "click", "selector": selector, "tab": tab_name }),
+                    ),
                     is_error: false,
                 })
             }
@@ -463,18 +474,24 @@ impl Tool for BrowserTool {
                 let selector = args
                     .get("selector")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::tool("browser", format!("{action} requires selector parameter")))?;
-                let text = args
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::tool("browser", format!("{action} requires text parameter")))?;
+                    .ok_or_else(|| {
+                        Error::tool("browser", format!("{action} requires selector parameter"))
+                    })?;
+                let text = args.get("text").and_then(|v| v.as_str()).ok_or_else(|| {
+                    Error::tool("browser", format!("{action} requires text parameter"))
+                })?;
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
-                        text: format!("Entered text into {selector} in tab {tab_name} ({} chars)", text.chars().count()),
+                        text: format!(
+                            "Entered text into {selector} in tab {tab_name} ({} chars)",
+                            text.chars().count()
+                        ),
                         text_signature: None,
                     })],
-                    details: Some(json!({ "action": action, "selector": selector, "char_count": text.chars().count() })),
+                    details: Some(
+                        json!({ "action": action, "selector": selector, "char_count": text.chars().count() }),
+                    ),
                     is_error: false,
                 })
             }
@@ -495,30 +512,37 @@ impl Tool for BrowserTool {
                 })
             }
 
-            "scroll" => {
-                Ok(ToolOutput {
-                    content: vec![ContentBlock::Text(TextContent {
-                        text: format!("Scrolled tab {tab_name} viewport"),
-                        text_signature: None,
-                    })],
-                    details: Some(json!({ "action": "scroll", "tab": tab_name })),
-                    is_error: false,
-                })
-            }
+            "scroll" => Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent {
+                    text: format!("Scrolled tab {tab_name} viewport"),
+                    text_signature: None,
+                })],
+                details: Some(json!({ "action": "scroll", "tab": tab_name })),
+                is_error: false,
+            }),
 
             "wait_for" => {
                 let selector = args
                     .get("selector")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| Error::tool("browser", "wait_for requires selector parameter"))?;
-                let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000);
+                    .ok_or_else(|| {
+                        Error::tool("browser", "wait_for requires selector parameter")
+                    })?;
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5000);
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
-                        text: format!("Selector {selector} appeared within {timeout_ms}ms in tab {tab_name}"),
+                        text: format!(
+                            "Selector {selector} appeared within {timeout_ms}ms in tab {tab_name}"
+                        ),
                         text_signature: None,
                     })],
-                    details: Some(json!({ "selector": selector, "timeout_ms": timeout_ms, "found": true })),
+                    details: Some(
+                        json!({ "selector": selector, "timeout_ms": timeout_ms, "found": true }),
+                    ),
                     is_error: false,
                 })
             }
@@ -529,7 +553,11 @@ impl Tool for BrowserTool {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| {
-                        format!("screenshots/browser_tab_{}_{}.png", tab_name, Uuid::new_v4().simple())
+                        format!(
+                            "screenshots/browser_tab_{}_{}.png",
+                            tab_name,
+                            Uuid::new_v4().simple()
+                        )
                     });
 
                 let target_path = if Path::new(&output_path_str).is_absolute() {
@@ -546,16 +574,19 @@ impl Tool for BrowserTool {
 
                 // Minimal valid 1x1 PNG bytes
                 const MIN_VALID_PNG: &[u8] = &[
-                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-                    0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-                    0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-                    0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-                    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-                    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
+                    0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
+                    0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
+                    0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D,
+                    0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
+                    0x60, 0x82,
                 ];
 
                 fs::write(&target_path, MIN_VALID_PNG).map_err(|e| {
-                    Error::tool("browser", format!("failed to write browser screenshot PNG: {e}"))
+                    Error::tool(
+                        "browser",
+                        format!("failed to write browser screenshot PNG: {e}"),
+                    )
                 })?;
 
                 let written_bytes = fs::metadata(&target_path)
@@ -564,7 +595,11 @@ impl Tool for BrowserTool {
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
-                        text: format!("Captured tab {tab_name} screenshot to {}\nSize: {} bytes", target_path.display(), written_bytes),
+                        text: format!(
+                            "Captured tab {tab_name} screenshot to {}\nSize: {} bytes",
+                            target_path.display(),
+                            written_bytes
+                        ),
                         text_signature: None,
                     })],
                     details: Some(json!({

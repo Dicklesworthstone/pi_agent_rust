@@ -317,10 +317,7 @@ impl OpenAIResponsesProvider {
             }
         };
 
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Accept", "application/json");
+        let mut request = self.client.post(&url).header("Accept", "application/json");
         if let Some(ref auth) = auth_value {
             request = request.header("Authorization", format!("Bearer {auth}"));
         }

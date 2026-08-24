@@ -12716,11 +12716,9 @@ impl JsExtensionRuntimeHandle {
 
 mod native_runtime;
 
-pub type ExtensionRuntimeEngineSelection =
-    native_runtime::ExtensionRuntimeEngineSelection;
+pub type ExtensionRuntimeEngineSelection = native_runtime::ExtensionRuntimeEngineSelection;
 pub type ExtensionRuntimeHandle = native_runtime::ExtensionRuntimeHandle;
-pub type NativeRustExtensionRuntimeHandle =
-    native_runtime::NativeRustExtensionRuntimeHandle;
+pub type NativeRustExtensionRuntimeHandle = native_runtime::NativeRustExtensionRuntimeHandle;
 
 const JS_EXTENSION_ENTRY_EXTS: &[&str] = &["ts", "tsx", "jsx", "js", "mjs", "cjs", "mts", "cts"];
 

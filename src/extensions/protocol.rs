@@ -7,6 +7,11 @@
 // seams use explicit dependencies.
 use super::*;
 
+// Equality-saturation rewrite search (bd-3ar8v.4.22). Named explicitly rather
+// than riding the glob above: it feeds the marshalling candidate list, so the
+// dependency should be visible at the top of the file.
+use crate::hostcall_egraph::{HostcallEGraphEngine, PlanExpr, Repr, StageOp};
+
 // ============================================================================
 // Protocol (v1)
 // ============================================================================
@@ -246,6 +251,71 @@ const HOSTCALL_SUPERINSTRUCTION_RECOMPILE_INTERVAL: u64 = 16;
 fn hostcall_rewrite_engine() -> &'static HostcallRewriteEngine {
     static ENGINE: OnceLock<HostcallRewriteEngine> = OnceLock::new();
     ENGINE.get_or_init(HostcallRewriteEngine::from_env)
+}
+
+fn hostcall_egraph_engine() -> &'static HostcallEGraphEngine {
+    static ENGINE: OnceLock<HostcallEGraphEngine> = OnceLock::new();
+    ENGINE.get_or_init(HostcallEGraphEngine::from_env)
+}
+
+/// Derive the fast-opcode candidate's cost from an equality-saturation search
+/// instead of the hardcoded constant (bd-3ar8v.4.22).
+///
+/// **This can only ever refine a candidate the caller already proved safe.** It
+/// is called from inside the branch where the fast path's params hash and args
+/// shape hash both matched the baseline; that hash equivalence remains the sole
+/// authorization for taking the fast lane. The search contributes a measured
+/// cost and the rule that produced it — it cannot enable a fast path the hash
+/// check would have rejected, because it never runs when that check fails.
+///
+/// Returns `None` when the search declines (disabled, no cheaper plan, budget
+/// exhausted, ambiguous tie), leaving the caller on the static constant. A
+/// search that cannot justify a number does not get to supply one.
+fn egraph_fast_opcode_cost(opcode: CommonHostcallOpcode) -> Option<(u32, &'static str)> {
+    let engine = hostcall_egraph_engine();
+    // The fast lane decodes straight into typed form, so that is the plan whose
+    // cost we are asking about.
+    let baseline = PlanExpr::unary(
+        StageOp::Dispatch,
+        PlanExpr::unary(
+            StageOp::Validate,
+            PlanExpr::unary(
+                StageOp::Marshal(Repr::Typed),
+                PlanExpr::unary(
+                    StageOp::Policy,
+                    PlanExpr::leaf(StageOp::Opcode(opcode.code().to_string())),
+                ),
+            ),
+        ),
+    );
+    let decision = engine.optimize(&baseline);
+    if !decision.rewrote() {
+        return None;
+    }
+    // The two cost models are on different scales -- the search prices stages
+    // in its own units, these constants are a 100-point index -- so the raw
+    // number cannot be compared against HOSTCALL_REWRITE_COST_BASELINE. Carry
+    // over the *ratio* the search established instead, which is the part that
+    // is scale-free.
+    let ratio_num = u64::from(decision.selected_cost);
+    let ratio_den = u64::from(decision.baseline_cost);
+    if ratio_den == 0 {
+        return None;
+    }
+    let projected = u32::try_from(
+        ratio_num.saturating_mul(u64::from(HOSTCALL_REWRITE_COST_BASELINE)) / ratio_den,
+    )
+    .unwrap_or(HOSTCALL_REWRITE_COST_BASELINE);
+
+    // Neither model is calibrated, so take the more conservative of the two
+    // rather than the more flattering one. Today the search is the pessimist,
+    // which is the direction an uncalibrated estimate should err in: it can
+    // shrink the claimed saving, never inflate it.
+    let estimated = projected.max(HOSTCALL_REWRITE_COST_FAST_OPCODE);
+    if estimated >= HOSTCALL_REWRITE_COST_BASELINE {
+        return None;
+    }
+    Some((estimated, HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION))
 }
 
 #[derive(Debug, Default)]
@@ -510,10 +580,17 @@ impl<'a> HostcallPayloadArena<'a> {
                     fallback_reason = None;
                     fast_candidate_latency_us = fast_latency;
                     fast_candidate_hashes = Some((fast_params_hash, fast_args_shape_hash));
+                    // Hash equivalence just authorized the fast lane. The
+                    // e-graph search may refine what that lane is estimated to
+                    // cost; when it declines, the static constant stands.
+                    let (estimated_cost, rule_id) = egraph_fast_opcode_cost(opcode).unwrap_or((
+                        HOSTCALL_REWRITE_COST_FAST_OPCODE,
+                        HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION,
+                    ));
                     rewrite_candidates.push(HostcallRewritePlan {
                         kind: HostcallRewritePlanKind::FastOpcodeFusion,
-                        estimated_cost: HOSTCALL_REWRITE_COST_FAST_OPCODE,
-                        rule_id: HOSTCALL_REWRITE_RULE_FAST_OPCODE_FUSION,
+                        estimated_cost,
+                        rule_id,
                     });
                 } else {
                     fallback_reason =

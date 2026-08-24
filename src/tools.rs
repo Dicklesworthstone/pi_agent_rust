@@ -5332,28 +5332,28 @@ impl ToolRegistry {
                     let vision_provider = config
                         .and_then(|c| c.media.as_ref())
                         .and_then(|m| m.vision_provider.clone());
-                    tools.push(Box::new(crate::media_tools::InspectImageTool::with_defaults(
-                        cwd,
-                        vision_provider,
-                        vision_model,
-                    )));
+                    tools.push(Box::new(
+                        crate::media_tools::InspectImageTool::with_defaults(
+                            cwd,
+                            vision_provider,
+                            vision_model,
+                        ),
+                    ));
                 }
                 "generate_image" => {
                     let provider = config
                         .and_then(|c| c.media.as_ref())
                         .and_then(|m| m.image_gen_provider.clone());
-                    tools.push(Box::new(crate::media_tools::GenerateImageTool::with_provider(
-                        cwd,
-                        provider,
-                    )));
+                    tools.push(Box::new(
+                        crate::media_tools::GenerateImageTool::with_provider(cwd, provider),
+                    ));
                 }
                 "tts" => {
                     let voice = config
                         .and_then(|c| c.media.as_ref())
                         .and_then(|m| m.tts_voice.clone());
                     tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
-                        cwd,
-                        voice,
+                        cwd, voice,
                     )));
                 }
                 "computer" => {
@@ -5418,23 +5418,25 @@ impl ToolRegistry {
             if media_cfg.enable_inspect_image.unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "inspect_image")
             {
-                tools.push(Box::new(crate::media_tools::InspectImageTool::with_defaults(
-                    cwd,
-                    media_cfg.vision_provider.clone(),
-                    media_cfg.vision_model.clone(),
-                )));
+                tools.push(Box::new(
+                    crate::media_tools::InspectImageTool::with_defaults(
+                        cwd,
+                        media_cfg.vision_provider.clone(),
+                        media_cfg.vision_model.clone(),
+                    ),
+                ));
             }
             if media_cfg.enable_generate_image.unwrap_or(false)
                 && !tools.iter().any(|t| t.name() == "generate_image")
             {
-                tools.push(Box::new(crate::media_tools::GenerateImageTool::with_provider(
-                    cwd,
-                    media_cfg.image_gen_provider.clone(),
-                )));
+                tools.push(Box::new(
+                    crate::media_tools::GenerateImageTool::with_provider(
+                        cwd,
+                        media_cfg.image_gen_provider.clone(),
+                    ),
+                ));
             }
-            if media_cfg.enable_tts.unwrap_or(false)
-                && !tools.iter().any(|t| t.name() == "tts")
-            {
+            if media_cfg.enable_tts.unwrap_or(false) && !tools.iter().any(|t| t.name() == "tts") {
                 tools.push(Box::new(crate::media_tools::TtsTool::with_voice(
                     cwd,
                     media_cfg.tts_voice.clone(),
@@ -5449,8 +5451,7 @@ impl ToolRegistry {
             {
                 let require_approval = comp_cfg.require_approval.unwrap_or(true);
                 tools.push(Box::new(
-                    crate::computer::ComputerTool::new(cwd)
-                        .with_require_approval(require_approval),
+                    crate::computer::ComputerTool::new(cwd).with_require_approval(require_approval),
                 ));
             }
         }

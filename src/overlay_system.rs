@@ -106,7 +106,8 @@ impl Default for WelcomeScreen {
             tips: vec![
                 "Tip: Type /help to see all available slash commands and shortcuts.".to_string(),
                 "Tip: Use @<filename> to autocomplete and reference project files.".to_string(),
-                "Tip: Use !<command> to execute bash commands directly in the conversation.".to_string(),
+                "Tip: Use !<command> to execute bash commands directly in the conversation."
+                    .to_string(),
                 "Tip: Type /model to interactively switch AI models and providers.".to_string(),
                 "Tip: Press Ctrl+P to quickly cycle between model roles.".to_string(),
             ],
