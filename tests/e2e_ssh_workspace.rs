@@ -16,7 +16,6 @@
 use std::path::{Path, PathBuf};
 mod common;
 
-use std::path::Path;
 
 use asupersync::test_utils;
 use pi::model::ContentBlock;
@@ -176,6 +175,7 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
                 None,
             )
             .await;
+        let err = stale.expect_err("stale anchor must be rejected");
         assert!(
             err.to_string().contains("Hash validation failed"),
             "unexpected error: {err}"
@@ -213,4 +213,3 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
     });
 }
 
-use std::path::PathBuf;
