@@ -987,13 +987,25 @@ Every performance budget in the system must be explicitly classified:
 When an amended threshold is needed (e.g. for `ext_cold_load_simple_p95` in the risk register), the amendment procedure requires:
 - Cryptographic provenance series hash (`evidence_provenance_hash`).
 - Calibration over $N \ge 10$ clean runs with $\ge 95\%$ coverage guarantee.
+- A 95% bootstrap confidence interval for the measured p95 that excludes the superseded threshold.
 - Formal justification rationale recorded in the calibration artifact.
-- Named approver role (`Release Engineering / Runtime Autonomy`).
+- Named approver role and identity, bound to an auditable Agent Mail approval message.
+
+The approved `ext_cold_load_simple_p95` amendment is recorded in
+`docs/evidence/ext-cold-load-budget-amendment.json`. It uses 20 independent
+Criterion processes on a clean RCH-built perf binary. The consumer's historical
+metric name says p95, but its implementation reads Criterion's
+`mean.point_estimate`; the amendment preserves that exact comparison seam and
+states the mismatch explicitly. The amended threshold is the 95% split-conformal
+upper quantile with 1.10 safety padding, rounded upward to six decimal places.
+This amendment changes only that named CI budget and does not authorize release
+or strict replacement claims.
 
 ### Enforced Contracts & Artifacts
 
 - **Contract**: `docs/contracts/conformal-budget-calibration-contract.json` (`pi.conformal_calibration.contract.v1`)
 - **Evaluation Evidence**: `docs/evidence/conformal-budget-calibration.json` (`pi.conformal_calibration.v1`)
+- **Approved Amendment**: `docs/evidence/ext-cold-load-budget-amendment.json` (`pi.conformal_budget_amendment.v1`)
 - **Evaluator Tool**: `examples/conformal_budget_calibration.rs`
 - **Verification Gate**: `tests/conformal_budget_calibration.rs`
 
@@ -1038,7 +1050,6 @@ To ensure benchmark integrity and prevent noisy host environments from producing
 - **Evaluation Evidence**: `docs/evidence/variance-gate-evaluations.json` (`pi.perf.variance_gate_report.v1`)
 - **Evaluator Tool**: `examples/variance_gate.rs`
 - **Verification Gate**: `tests/variance_gating.rs`
-
 
 
 

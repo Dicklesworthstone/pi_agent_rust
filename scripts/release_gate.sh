@@ -3437,7 +3437,7 @@ MEASUREMENT_CONTROL_FAILURE_IDS = {
         "noisy_cold_load_measurement_control",
     },
 }
-CANONICAL_BUDGET_INVENTORY_SHA256 = "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663"
+CANONICAL_BUDGET_INVENTORY_SHA256 = "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6"
 
 
 class ContractError(ValueError):
@@ -4554,21 +4554,30 @@ fi
 # Gate 13e: Conformal Budget Calibration & Amendment (RI-CONFORMAL)
 CONFORMAL_CONTRACT="$PROJECT_ROOT/docs/contracts/conformal-budget-calibration-contract.json"
 CONFORMAL_EVIDENCE="$PROJECT_ROOT/docs/evidence/conformal-budget-calibration.json"
+CONFORMAL_AMENDMENT="$PROJECT_ROOT/docs/evidence/ext-cold-load-budget-amendment.json"
 
-if [ -f "$CONFORMAL_CONTRACT" ] && [ -f "$CONFORMAL_EVIDENCE" ]; then
-    if CONFORMAL_CHECK=$(python3 - "$CONFORMAL_CONTRACT" "$CONFORMAL_EVIDENCE" 2>&1 <<'PY'
+if [ -f "$CONFORMAL_CONTRACT" ] && [ -f "$CONFORMAL_EVIDENCE" ] && [ -f "$CONFORMAL_AMENDMENT" ]; then
+    if CONFORMAL_CHECK=$(python3 - "$CONFORMAL_CONTRACT" "$CONFORMAL_EVIDENCE" "$CONFORMAL_AMENDMENT" 2>&1 <<'PY'
+import hashlib
 import json
+import math
+import random
+import re
+import statistics
 import sys
 from pathlib import Path
 
 contract_path = Path(sys.argv[1])
 evidence_path = Path(sys.argv[2])
+amendment_path = Path(sys.argv[3])
 
 try:
     with open(contract_path) as f:
         contract = json.load(f)
     with open(evidence_path) as f:
         evidence = json.load(f)
+    with open(amendment_path) as f:
+        amendment = json.load(f)
 except Exception as e:
     print(f"invalid:{e}")
     sys.exit(0)
@@ -4604,7 +4613,169 @@ if not amendments:
     print("invalid:empty amendment_dry_runs in evidence")
     sys.exit(0)
 
-print(f"ok:{len(calibrated)}:{data_derived}:{len(amendments)}")
+expected_amendment_path = "docs/evidence/ext-cold-load-budget-amendment.json"
+if contract.get("formal_amendment_path") != expected_amendment_path:
+    print("invalid:contract formal_amendment_path mismatch")
+    sys.exit(0)
+
+if amendment.get("schema") != "pi.conformal_budget_amendment.v1":
+    print("invalid:formal amendment schema mismatch")
+    sys.exit(0)
+if amendment.get("bead_id") != "bd-sog97.5":
+    print("invalid:formal amendment bead_id mismatch")
+    sys.exit(0)
+if amendment.get("contract_path") != "docs/contracts/conformal-budget-calibration-contract.json":
+    print("invalid:formal amendment contract_path mismatch")
+    sys.exit(0)
+if amendment.get("budget_name") != "ext_cold_load_simple_p95" or amendment.get("decision") != "APPROVED":
+    print("invalid:formal amendment decision or budget mismatch")
+    sys.exit(0)
+if amendment.get("unit") != "ms" or amendment.get("basis") != "DATA_DERIVED_CONFORMAL":
+    print("invalid:formal amendment unit or basis mismatch")
+    sys.exit(0)
+
+previous = amendment.get("previous_threshold")
+amended = amendment.get("amended_threshold")
+if not isinstance(previous, (int, float)) or not isinstance(amended, (int, float)):
+    print("invalid:formal amendment thresholds must be numeric")
+    sys.exit(0)
+if previous != 5.0:
+    print("invalid:formal amendment previous threshold mismatch")
+    sys.exit(0)
+
+measurement = amendment.get("measurement", {})
+series = measurement.get("series_ms", [])
+estimate_hashes = measurement.get("criterion_estimates_sha256", [])
+log_hashes = measurement.get("run_logs_sha256", [])
+if measurement.get("source_dirty") is not False:
+    print("invalid:formal amendment source must be clean")
+    sys.exit(0)
+if measurement.get("noise_score") != 0:
+    print("invalid:formal amendment measurement noise_score must be zero")
+    sys.exit(0)
+if re.fullmatch(r"[0-9a-f]{40}", measurement.get("source_commit", "")) is None:
+    print("invalid:formal amendment source commit is malformed")
+    sys.exit(0)
+if amendment.get("source_commit") != measurement.get("source_commit"):
+    print("invalid:formal amendment source commit binding mismatch")
+    sys.exit(0)
+for hash_field in ("binary_sha256", "hello_fixture_sha256", "pirate_fixture_sha256", "bench_env_config_hash"):
+    if re.fullmatch(r"[0-9a-f]{64}", measurement.get(hash_field, "")) is None:
+        print(f"invalid:formal amendment {hash_field} is malformed")
+        sys.exit(0)
+for hash_field in (
+    "evidence_manifest_sha256",
+    "bench_env_json_sha256",
+    "original_host_state_sha256",
+    "source_runs_jsonl_sha256",
+):
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", measurement.get(hash_field, "")) is None:
+        print(f"invalid:formal amendment {hash_field} is malformed")
+        sys.exit(0)
+if measurement.get("criterion_samples_per_process") != 10:
+    print("invalid:formal amendment Criterion sample count mismatch")
+    sys.exit(0)
+if measurement.get("consumer_field") != "criterion.mean.point_estimate":
+    print("invalid:formal amendment consumer field mismatch")
+    sys.exit(0)
+if measurement.get("sample_processes") != len(series) or len(series) < 20:
+    print("invalid:formal amendment requires at least 20 independent processes")
+    sys.exit(0)
+if len(estimate_hashes) != len(series) or len(set(estimate_hashes)) != len(series):
+    print("invalid:formal amendment Criterion estimate hashes must be complete and unique")
+    sys.exit(0)
+if len(log_hashes) != len(series) or len(set(log_hashes)) != len(series):
+    print("invalid:formal amendment run-log hashes must be complete and unique")
+    sys.exit(0)
+if any(not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0 for value in series):
+    print("invalid:formal amendment series contains a non-positive or non-finite value")
+    sys.exit(0)
+if any(re.fullmatch(r"[0-9a-f]{64}", value or "") is None for value in estimate_hashes + log_hashes):
+    print("invalid:formal amendment contains a malformed run hash")
+    sys.exit(0)
+
+canonical_series = json.dumps(series, separators=(",", ":"), ensure_ascii=False)
+if measurement.get("series_canonicalization") != "python_json.dumps(separators=(',', ':'), ensure_ascii=False)":
+    print("invalid:formal amendment series canonicalization mismatch")
+    sys.exit(0)
+if measurement.get("series_values_canonical_json") != canonical_series:
+    print("invalid:formal amendment canonical series text mismatch")
+    sys.exit(0)
+series_sha = hashlib.sha256(canonical_series.encode()).hexdigest()
+if measurement.get("series_values_sha256") != f"sha256:{series_sha}":
+    print("invalid:formal amendment series hash mismatch")
+    sys.exit(0)
+stats = amendment.get("statistical_justification", {})
+bootstrap = stats.get("bootstrap_p95_ci95", {})
+conformal = stats.get("split_conformal", {})
+sorted_series = sorted(series)
+expected_stats = {
+    "sample_mean_ms": statistics.mean(series),
+    "sample_stddev_ms": statistics.stdev(series),
+    "sample_median_ms": statistics.median(series),
+    "sample_min_ms": min(series),
+    "sample_max_ms": max(series),
+    "empirical_p95_nearest_rank_ms": sorted_series[math.ceil(0.95 * len(series)) - 1],
+}
+if any(
+    not isinstance(stats.get(field), (int, float))
+    or abs(stats[field] - expected) > 1e-12
+    for field, expected in expected_stats.items()
+):
+    print("invalid:formal amendment summary statistics do not reproduce from the series")
+    sys.exit(0)
+lower = bootstrap.get("lower_ms")
+upper = bootstrap.get("upper_ms")
+if bootstrap.get("resamples") != 100000 or bootstrap.get("seed") != 20260824:
+    print("invalid:formal amendment bootstrap protocol mismatch")
+    sys.exit(0)
+if bootstrap.get("method") != "nonparametric percentile bootstrap of nearest-rank p95":
+    print("invalid:formal amendment bootstrap method mismatch")
+    sys.exit(0)
+if not all(isinstance(value, (int, float)) and math.isfinite(value) for value in (lower, upper)):
+    print("invalid:formal amendment bootstrap bounds are not finite")
+    sys.exit(0)
+if not previous < lower <= upper:
+    print("invalid:bootstrap CI does not exclude the previous threshold")
+    sys.exit(0)
+bootstrap_rng = random.Random(bootstrap["seed"])
+nearest_rank_index = math.ceil(0.95 * len(series)) - 1
+bootstrap_values = sorted(
+    sorted(bootstrap_rng.choice(series) for _ in series)[nearest_rank_index]
+    for _ in range(bootstrap["resamples"])
+)
+expected_lower = bootstrap_values[math.floor(0.025 * len(bootstrap_values))]
+expected_upper = bootstrap_values[math.ceil(0.975 * len(bootstrap_values)) - 1]
+if abs(lower - expected_lower) > 1e-12 or abs(upper - expected_upper) > 1e-12:
+    print("invalid:formal amendment bootstrap bounds do not reproduce from the series")
+    sys.exit(0)
+if conformal.get("target_coverage") != 0.95 or conformal.get("padding_multiplier") != 1.1:
+    print("invalid:formal amendment conformal parameters mismatch")
+    sys.exit(0)
+expected_threshold = math.ceil(max(series) * 1.1 * 1_000_000) / 1_000_000
+if conformal.get("quantile_index") != len(series) or abs(amended - expected_threshold) > 1e-12:
+    print("invalid:formal amendment threshold does not match the conformal upper quantile")
+    sys.exit(0)
+if (
+    abs(conformal.get("base_value_ms", math.inf) - max(series)) > 1e-12
+    or abs(conformal.get("unrounded_threshold_ms", math.inf) - max(series) * 1.1) > 1e-12
+    or conformal.get("rounding") != "ceiling_to_six_decimal_places"
+    or conformal.get("threshold_ms") != amended
+):
+    print("invalid:formal amendment conformal derivation metadata mismatch")
+    sys.exit(0)
+approval = amendment.get("approval", {})
+if approval.get("approver_role") != "Release Engineering / Runtime Autonomy":
+    print("invalid:formal amendment approver role mismatch")
+    sys.exit(0)
+if not isinstance(approval.get("approver_identity"), str) or not approval["approver_identity"].strip():
+    print("invalid:formal amendment approver identity is missing")
+    sys.exit(0)
+if not isinstance(approval.get("agent_mail_approval_message_id"), int) or approval["agent_mail_approval_message_id"] <= 0:
+    print("invalid:formal amendment Agent Mail approval id is missing")
+    sys.exit(0)
+
+print(f"ok:{len(calibrated)}:{data_derived}:{len(amendments)}:1")
 PY
 ); then
         case "$CONFORMAL_CHECK" in
@@ -4613,7 +4784,8 @@ PY
                 TOTAL_B="$(echo "$CONF_INFO" | cut -d: -f1)"
                 DATA_D="$(echo "$CONF_INFO" | cut -d: -f2)"
                 AMENDS="$(echo "$CONF_INFO" | cut -d: -f3)"
-                check_pass "conformal_budget_calibration" "calibrated $TOTAL_B budgets ($DATA_D data-derived, $AMENDS amendment dry-runs at >=95% coverage)"
+                FORMAL_AMENDS="$(echo "$CONF_INFO" | cut -d: -f4)"
+                check_pass "conformal_budget_calibration" "calibrated $TOTAL_B budgets ($DATA_D data-derived, $AMENDS amendment dry-runs, $FORMAL_AMENDS approved amendment at >=95% coverage)"
                 ;;
             invalid:*)
                 check_fail "conformal_budget_calibration" "conformal calibration check failed (${CONFORMAL_CHECK#invalid:})"
@@ -4626,7 +4798,7 @@ PY
         check_fail "conformal_budget_calibration" "conformal budget calibration evaluation failed: $CONFORMAL_CHECK"
     fi
 else
-    check_fail "conformal_budget_calibration" "conformal contract or evidence file missing"
+    check_fail "conformal_budget_calibration" "conformal contract, evidence, or formal amendment file missing"
 fi
 
 # Gate 13f: Fresh Release Startup Performance & Binary Size (RI-STARTUP)

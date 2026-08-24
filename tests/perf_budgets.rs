@@ -113,9 +113,9 @@ const BUDGETS: &[Budget] = &[
         category: "extension",
         metric: "p95 cold load time",
         unit: "ms",
-        threshold: 5.0,
+        threshold: 29.180416,
         comparison: BudgetComparison::Maximum,
-        methodology: "criterion: load_init_cold for simple single-file extensions (10 samples)",
+        methodology: "criterion: load_init_cold mean point estimate for simple single-file extensions; 20 independent 10-sample processes, conformal amendment bd-sog97.5",
         ci_enforced: true,
     },
     Budget {
@@ -3280,8 +3280,8 @@ fn budget_inventory_has_stable_cross_language_serialization() {
     ));
     assert_eq!(
         budget_inventory_sha256(),
-        "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663",
-        "canonical v0.2.0 budget inventory drifted"
+        "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6",
+        "canonical budget inventory drifted"
     );
 }
 

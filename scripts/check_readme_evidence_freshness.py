@@ -43,7 +43,7 @@ from typing import NamedTuple
 
 PERF_BUDGET_SUMMARY_SCHEMA = "pi.perf.budget_summary.v2"
 PERF_BUDGET_INVENTORY_SHA256 = (
-    "4e24380af0ca4fe8fd94850d63e607868d15d704a42d434bdb1c762e7e327663"
+    "85ea5705c7472c3e7b85b6e31552ee57f245406e5b8c636b6555f3bbda7f6cc6"
 )
 PERF_SUMMARY_FIELDS = frozenset(
     {

@@ -527,3 +527,231 @@ fn tamper_detection_in_conformal_artifact() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn approved_cold_load_amendment_is_hash_bound_and_non_vacuous() -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+
+    let contract: serde_json::Value = serde_json::from_str(&fs::read_to_string(
+        "docs/contracts/conformal-budget-calibration-contract.json",
+    )?)?;
+    let amendment_path = contract
+        .get("formal_amendment_path")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("contract must name the formal amendment path"))?;
+    assert_eq!(
+        amendment_path,
+        "docs/evidence/ext-cold-load-budget-amendment.json"
+    );
+
+    let amendment: serde_json::Value = serde_json::from_str(&fs::read_to_string(amendment_path)?)?;
+    assert_eq!(
+        amendment.get("schema").and_then(serde_json::Value::as_str),
+        Some("pi.conformal_budget_amendment.v1")
+    );
+    assert_eq!(
+        amendment
+            .get("decision")
+            .and_then(serde_json::Value::as_str),
+        Some("APPROVED")
+    );
+    assert_eq!(
+        amendment
+            .get("budget_name")
+            .and_then(serde_json::Value::as_str),
+        Some("ext_cold_load_simple_p95")
+    );
+    assert_eq!(
+        amendment.get("bead_id").and_then(serde_json::Value::as_str),
+        Some("bd-sog97.5")
+    );
+    let measurement = amendment
+        .get("measurement")
+        .ok_or_else(|| anyhow::anyhow!("amendment must contain measurement evidence"))?;
+    assert_eq!(
+        amendment
+            .get("source_commit")
+            .and_then(serde_json::Value::as_str),
+        measurement
+            .get("source_commit")
+            .and_then(serde_json::Value::as_str)
+    );
+
+    let previous = amendment
+        .get("previous_threshold")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("previous threshold must be numeric"))?;
+    let amended = amendment
+        .get("amended_threshold")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("amended threshold must be numeric"))?;
+    assert_eq!(
+        measurement
+            .get("source_dirty")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        measurement
+            .get("noise_score")
+            .and_then(serde_json::Value::as_u64),
+        Some(0)
+    );
+    for (field, expected) in [
+        (
+            "evidence_manifest_sha256",
+            "sha256:2f821475ee38d7f3b75a566b78e3579013b5d9cdabf8e880199973562fa192f1",
+        ),
+        (
+            "bench_env_json_sha256",
+            "sha256:3adc5af4d48e29e1d72a80579445ee682ad4f24b4907530d99032e8fb4387ac7",
+        ),
+        (
+            "original_host_state_sha256",
+            "sha256:586f7c7aa12a4404d043a8435c4407b1e3967745fa55d0a20eaa4843faea8371",
+        ),
+        (
+            "source_runs_jsonl_sha256",
+            "sha256:76b07b716c867564a48cf320974dfd7cf206b4a06f3627cf195b2ef8de4e7dd7",
+        ),
+    ] {
+        let hash = measurement
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("{field} must be a string"))?;
+        assert_eq!(
+            hash, expected,
+            "{field} must bind the accepted raw evidence"
+        );
+        assert_eq!(hash.len(), 71, "{field} must be a tagged SHA-256");
+        let digest = hash
+            .strip_prefix("sha256:")
+            .ok_or_else(|| anyhow::anyhow!("{field} must be tagged as SHA-256"))?;
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    let series = measurement
+        .get("series_ms")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("measurement series must be an array"))?;
+    assert_eq!(series.len(), 20);
+    assert_eq!(
+        measurement
+            .get("sample_processes")
+            .and_then(serde_json::Value::as_u64),
+        Some(20)
+    );
+    assert_eq!(
+        measurement
+            .get("series_canonicalization")
+            .and_then(serde_json::Value::as_str),
+        Some("python_json.dumps(separators=(',', ':'), ensure_ascii=False)")
+    );
+    let series_json = measurement
+        .get("series_values_canonical_json")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("canonical series text must be a string"))?;
+    let canonical_series: serde_json::Value = serde_json::from_str(series_json)?;
+    assert_eq!(
+        canonical_series.as_array().map(Vec::as_slice),
+        Some(series.as_slice())
+    );
+    let series_sha = format!(
+        "sha256:{}",
+        pi::package_manager::hex_encode(&Sha256::digest(series_json.as_bytes()))
+    );
+    assert_eq!(
+        measurement
+            .get("series_values_sha256")
+            .and_then(serde_json::Value::as_str),
+        Some(series_sha.as_str())
+    );
+
+    let values = series
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("series values must be numeric"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let max_value = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let expected_threshold = (max_value * 1.10 * 1_000_000.0).ceil() / 1_000_000.0;
+    assert!((amended - expected_threshold).abs() <= 1e-12);
+    let statistical_justification = amendment
+        .get("statistical_justification")
+        .ok_or_else(|| anyhow::anyhow!("amendment must contain statistical justification"))?;
+    let split_conformal = statistical_justification
+        .get("split_conformal")
+        .ok_or_else(|| {
+            anyhow::anyhow!("statistical justification must contain split conformal evidence")
+        })?;
+    assert_eq!(
+        split_conformal
+            .get("quantile_index")
+            .and_then(serde_json::Value::as_u64),
+        Some(20)
+    );
+
+    let bootstrap = statistical_justification
+        .get("bootstrap_p95_ci95")
+        .ok_or_else(|| {
+            anyhow::anyhow!("statistical justification must contain bootstrap evidence")
+        })?;
+    let lower = bootstrap
+        .get("lower_ms")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("bootstrap lower bound must be numeric"))?;
+    let upper = bootstrap
+        .get("upper_ms")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| anyhow::anyhow!("bootstrap upper bound must be numeric"))?;
+    assert!(
+        previous < lower,
+        "bootstrap CI must exclude the old threshold"
+    );
+    assert!(lower <= upper);
+    assert!(upper <= amended);
+
+    for field in ["criterion_estimates_sha256", "run_logs_sha256"] {
+        let hashes = measurement
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("{field} must be an array"))?;
+        assert_eq!(hashes.len(), series.len());
+        let unique = hashes
+            .iter()
+            .map(|hash| hash.as_str().unwrap_or_default())
+            .collect::<HashSet<_>>();
+        assert_eq!(unique.len(), series.len(), "{field} must be unique per run");
+        assert!(
+            unique.iter().all(|hash| {
+                hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        );
+    }
+
+    let approval = amendment
+        .get("approval")
+        .ok_or_else(|| anyhow::anyhow!("amendment must contain approval evidence"))?;
+    assert_eq!(
+        approval
+            .get("approver_role")
+            .and_then(serde_json::Value::as_str),
+        Some("Release Engineering / Runtime Autonomy")
+    );
+    assert!(
+        approval
+            .get("approver_identity")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| !v.is_empty())
+    );
+    assert!(
+        approval
+            .get("agent_mail_approval_message_id")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|id| id > 0)
+    );
+
+    Ok(())
+}
