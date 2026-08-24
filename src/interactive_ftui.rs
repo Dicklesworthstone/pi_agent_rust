@@ -57,13 +57,17 @@ use std::collections::VecDeque;
 ///
 /// `Model::Message` must be `From<Event>`, so terminal input arrives through
 /// [`PiFtuiMsg::Term`]; everything async arrives through [`PiFtuiMsg::Agent`]
-/// via [`AgentEventSubscription`].
+/// via [`AgentEventSubscription`]. [`PiFtuiMsg::Resumed`] is produced by the
+/// suspend task after the process returns from a SIGTSTP stop (ctrl+z).
 #[derive(Debug)]
 pub enum PiFtuiMsg {
     /// A raw terminal event (key, mouse, resize, paste, focus, ...).
     Term(Event),
     /// An agent/system event bridged from the async side.
     Agent(PiMsg),
+    /// The process came back from a SIGTSTP suspension: the terminal has
+    /// been re-acquired and the next frame must repaint everything.
+    Resumed,
 }
 
 impl From<Event> for PiFtuiMsg {
@@ -139,6 +143,75 @@ fn drain_agent_events(
                 return;
             }
         }
+    }
+}
+
+/// Restore the terminal to shell-safe cooked state and stop the process
+/// until the shell foregrounds it again (ctrl+z → `fg`, bd-cv653.9.1
+/// round-4). Returns the post-resume terminal size so the caller can feed a
+/// repaint.
+///
+/// Mirrors exactly the features `ProgramConfig` enables by default —
+/// bracketed paste, SGR mouse, alternate screen (fullscreen only); kitty
+/// keyboard and focus reporting stay off, so no sequences are needed for
+/// them. Disabling a feature that was never enabled is ignored by the
+/// terminal, which keeps this robust against capability probing.
+///
+/// The stop itself is `raise(SIGTSTP)` with the signal at its default
+/// disposition: the whole process freezes inside this call and execution
+/// continues on SIGCONT (`fg`). Between the restore writes and the raise
+/// there is a sub-tick window in which a render could theoretically fire;
+/// the model freezes spinner ticks while suspending so pending frames stay
+/// byte-identical and the diff engine emits nothing.
+#[cfg(unix)]
+fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
+    use std::io::{stdout, Write};
+
+    use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+
+    // Cooked mode first: the shell must own echo/signal handling while we
+    // are stopped. Raw mode is process-global termios state, safe to toggle
+    // from a task thread.
+    disable_raw_mode()?;
+    {
+        let mut out = stdout();
+        out.write_all(b"\x1b[?2004l")?; // bracketed paste off
+        out.write_all(b"\x1b[?1006l\x1b[?1002l\x1b[?1000l")?; // SGR mouse off
+        if alt_screen {
+            out.write_all(b"\x1b[?1049l")?; // leave alternate screen
+        }
+        out.write_all(b"\x1b[?25h")?; // show cursor
+        out.flush()?;
+    }
+
+    // Stops the process here; resumes after `fg`.
+    signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
+
+    // --- continued ---
+    enable_raw_mode()?;
+    {
+        let mut out = stdout();
+        if alt_screen {
+            out.write_all(b"\x1b[?1049h")?; // re-enter alternate screen
+        }
+        out.write_all(b"\x1b[?2004h")?; // bracketed paste on
+        out.write_all(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h")?; // mouse on (SGR)
+        out.write_all(b"\x1b[?25l")?; // hide cursor
+        out.flush()?;
+    }
+    size()
+}
+
+/// Build the blocking task behind [`AppAction::Suspend`]: park the terminal,
+/// stop until continued, then hand back a message that clears the suspend
+/// state and triggers a full repaint.
+#[cfg(unix)]
+fn suspend_task(
+    alt_screen: bool,
+) -> impl FnOnce() -> PiFtuiMsg + Send + 'static {
+    move || match perform_terminal_suspend(alt_screen) {
+        Ok((width, height)) => PiFtuiMsg::Term(Event::Resize { width, height }),
+        Err(err) => PiFtuiMsg::Agent(PiMsg::AgentError(format!("suspend/resume: {err}"))),
     }
 }
 
@@ -624,6 +697,14 @@ pub struct PiFtuiModel {
     /// the bridge each cycle, and the one instance the runtime actually starts
     /// takes the receiver out of this slot (see [`AgentEventSubscription`]).
     agent_rx: Arc<Mutex<Option<Receiver<PiMsg>>>>,
+    /// Whether the program owns the alternate screen (fullscreen launch).
+    /// The suspend path mirrors only the features actually enabled.
+    alt_screen: bool,
+    /// Set while a ctrl+z suspension is in flight: freezes spinner ticks so
+    /// the pre-stop frames stay byte-identical (the diff engine then emits
+    /// nothing into the restored cooked terminal). Cleared by
+    /// [`PiFtuiMsg::Resumed`].
+    suspending: bool,
 }
 
 /// Vertical frame regions, top to bottom. The clamp/normalize string hacks of
@@ -694,12 +775,15 @@ impl PiFtuiModel {
             ask_reply_tx: None,
             term: (80, 24),
             scroll_from_tail: 0,
+            agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
+
+            alt_screen: false,
+            suspending: false,
             input: TextArea::new()
                 .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
                 .with_focus(true)
                 .with_soft_wrap(true),
             submit_tx: None,
-            agent_rx: Arc::new(Mutex::new(Some(agent_rx))),
         }
     }
 
@@ -744,6 +828,15 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_available_sessions(mut self, sessions: Vec<(String, String)>) -> Self {
         self.available_sessions = sessions;
+        self
+    }
+
+    /// Record whether the program runs fullscreen (alternate screen). The
+    /// suspend path mirrors only the features actually enabled; the launch
+    /// path calls this with `!inline`.
+    #[must_use]
+    pub fn with_alt_screen(mut self, alt_screen: bool) -> Self {
+        self.alt_screen = alt_screen;
         self
     }
 
@@ -1489,6 +1582,12 @@ impl PiFtuiModel {
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
         match event {
             Event::Tick => {
+                // While a ctrl+z stop is in flight the model must not
+                // change: byte-identical frames keep the diff engine silent
+                // in the window between terminal restore and SIGTSTP.
+                if self.suspending {
+                    return Cmd::none();
+                }
                 // Spinner heartbeat: advance and reschedule only while the
                 // agent is working, so idle sessions stay fully parked.
                 if self.state == AgentUiState::Working {
@@ -1524,7 +1623,10 @@ impl PiFtuiModel {
                     .map(|binding| self.keybindings.matching_actions(&binding))
                     .unwrap_or_default();
                 let pick = |wanted: AppAction| actions.contains(&wanted).then_some(wanted);
-                let action = pick(AppAction::PageUp)
+                // Suspend wins over everything (vim semantics): ctrl+z is
+                // unambiguous, and backgrounding must work mid-edit too.
+                let action = pick(AppAction::Suspend)
+                    .or_else(|| pick(AppAction::PageUp))
                     .or_else(|| pick(AppAction::PageDown))
                     .or_else(|| pick(AppAction::Submit))
                     .or_else(|| pick(AppAction::NewLine))
@@ -1542,6 +1644,22 @@ impl PiFtuiModel {
                     });
                 let page = self.body_height().saturating_sub(1).max(1);
                 match action {
+                    Some(AppAction::Suspend) => {
+                        // Freeze model mutations synchronously (the flag is
+                        // what keeps pre-stop frames byte-identical), then
+                        // hand the terminal dance to a task: it restores
+                        // cooked mode, stops on SIGTSTP, re-acquires the
+                        // terminal after SIGCONT, and reports back.
+                        #[cfg(unix)]
+                        {
+                            self.suspending = true;
+                            return Cmd::task(suspend_task(self.alt_screen));
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            return Cmd::none();
+                        }
+                    }
                     Some(AppAction::PageUp) => return self.consume_scroll(|m| m.scroll_up(page)),
                     Some(AppAction::PageDown) => {
                         return self.consume_scroll(|m| m.scroll_down(page));
@@ -1600,6 +1718,9 @@ impl PiFtuiModel {
             },
             Event::Resize { width, height } => {
                 self.term = (*width, *height);
+                // The suspend task reports back through a Resize; the flag
+                // unfreezes tick-driven model changes from here on.
+                self.suspending = false;
                 // Re-clamp: a taller window may make the old offset overshoot.
                 self.scroll_from_tail = self.scroll_from_tail.min(self.max_scroll_from_tail());
             }
@@ -1775,6 +1896,13 @@ impl Model for PiFtuiModel {
         match msg {
             PiFtuiMsg::Term(event) => self.handle_term(&event),
             PiFtuiMsg::Agent(agent) => self.handle_agent(agent),
+            // Back from a SIGTSTP stop: the suspend task already re-acquired
+            // raw mode / alt screen / mouse; the next frame repaints the
+            // freshly-cleared alternate buffer in full.
+            PiFtuiMsg::Resumed => {
+                self.suspending = false;
+                Cmd::none()
+            }
         }
     }
 
@@ -2997,6 +3125,7 @@ pub fn run(
         .with_palette(FtuiPalette::from_theme(theme))
         .with_available_models(available_models)
         .with_available_sessions(available_sessions)
+        .with_alt_screen(!inline)
         .with_ext_reply_channel(ext_reply_tx);
     // Inline mode preserves shell scrollback (bead acceptance #2): the UI
     // anchors at the bottom, auto-sized to content within bounds; alt-screen
@@ -3061,6 +3190,56 @@ mod tests {
         assert_eq!(transcript[0].text, "hello world");
         assert_eq!(transcript[0].role, EntryRole::Assistant);
         assert!(sim.model().streaming.is_empty());
+    }
+
+    #[test]
+    fn ctrl_z_suspends_and_freezes_ticks_until_resumed() {
+        let (_tx, mut model) = new_model();
+        model.state = AgentUiState::Working;
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // ctrl+z routes to AppAction::Suspend: sets the freeze flag and
+        // hands back the blocking terminal task (the simulator never runs
+        // it, so no real signal/termios side effects here).
+        sim.inject_event(key(KeyCode::Char('z'), Modifiers::CTRL));
+        assert!(sim.model().suspending);
+
+        // Ticks while suspending must not mutate the model: byte-identical
+        // pre-stop frames keep the diff engine silent in the window between
+        // terminal restore and SIGTSTP delivery.
+        let before = sim.model().spinner.current_frame;
+        sim.send(PiFtuiMsg::Term(Event::Tick));
+        assert_eq!(sim.model().spinner.current_frame, before);
+
+        // The suspend task reports back through a Resize after SIGCONT:
+        // unfreezes ticks and adopts the post-resume size.
+        sim.send(PiFtuiMsg::Term(Event::Resize { width: 100, height: 30 }));
+        assert!(!sim.model().suspending);
+        assert_eq!(sim.model().term, (100, 30));
+
+        // Normal tick behavior resumes.
+        let before = sim.model().spinner.current_frame;
+        sim.send(PiFtuiMsg::Term(Event::Tick));
+        assert_eq!(sim.model().spinner.current_frame, before + 1);
+    }
+
+    #[test]
+    fn resumed_message_clears_suspend_freeze() {
+        let (_tx, mut model) = new_model();
+        model.suspending = true;
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Resumed);
+        assert!(!sim.model().suspending);
+    }
+
+    #[test]
+    fn with_alt_screen_records_launch_mode_for_suspend() {
+        let (_tx, model) = new_model();
+        assert!(!model.alt_screen);
+        let model = model.with_alt_screen(true);
+        assert!(model.alt_screen);
     }
 
     #[test]
