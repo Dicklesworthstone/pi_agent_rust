@@ -93,6 +93,8 @@ async fn run_test_case(tool_name: &str, case: &TestCase) -> TestResult {
         "todo" => Box::new(pi::todo::TodoTool::new(std::sync::Arc::new(
             asupersync::sync::Mutex::new(pi::session::Session::in_memory()),
         ))),
+        "jobs" => Box::new(pi::tools::JobsTool),
+        "hub" => Box::new(pi::tools::HubTool::new(temp_dir.path())),
         "eval" => Box::new(pi::eval::EvalTool::new(temp_dir.path())),
         "security_scan" => Box::new(pi::security_scan::SecurityScanTool::new(temp_dir.path())),
         _ => {

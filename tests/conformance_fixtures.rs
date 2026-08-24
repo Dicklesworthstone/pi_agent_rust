@@ -183,6 +183,8 @@ fixture_test!(test_computer_fixtures, "computer_tool");
 fixture_test!(test_browser_fixtures, "browser_tool");
 fixture_test!(test_ask_fixtures, "ask_tool");
 fixture_test!(test_todo_fixtures, "todo_tool");
+fixture_test!(test_jobs_fixtures, "jobs_tool");
+fixture_test!(test_hub_fixtures, "hub_tool");
 fixture_test!(test_eval_fixtures, "eval_tool");
 fixture_test!(test_security_scan_fixtures, "security_scan_tool");
 
@@ -238,6 +240,8 @@ fn test_all_fixtures_exist() {
         "browser_tool",
         "ask_tool",
         "todo_tool",
+        "jobs_tool",
+        "hub_tool",
         "eval_tool",
         "security_scan_tool",
     ];
