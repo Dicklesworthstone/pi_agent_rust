@@ -1,0 +1,45 @@
+[RCH] local (no admissible workers: insufficient_slots=4,insufficient_total_slots=5,active_project_exclusion=1)
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/baseline_modeling.rs (/tmp/rch_target_pi_agent_rust_rose_carp/debug/deps/baseline_modeling-78cfd6f9695a6f2c)
+
+running 32 tests
+test artifact_hash_chain_is_valid ... ok
+test baseline_byte_determinism_across_serialization ... ok
+test baseline_computes_per_capability_profiles ... ok
+test baseline_custom_thresholds_propagate ... ok
+test baseline_error_rate_from_outcome_errors ... ok
+test baseline_extreme_risk_scores_bounded ... ok
+test baseline_filters_by_extension_id ... ok
+test baseline_generation_deterministic_across_calls ... ok
+test baseline_handles_duplicate_risk_scores ... ok
+test baseline_handles_many_capabilities ... ok
+test baseline_isolates_extensions_in_shared_ledger ... ok
+test baseline_json_roundtrip_preserves_all_fields ... ok
+test baseline_mad_is_zero_for_constant_scores ... ok
+test baseline_markov_captures_transition_counts ... ok
+test baseline_markov_empty_transitions_uses_uniform_prior ... ok
+test baseline_markov_matrix_rows_sum_to_one ... ok
+test baseline_markov_stationary_distribution_sums_to_one ... ok
+test baseline_p5_and_p95_bracket_data ... ok
+test baseline_rejects_empty_ledger ... ok
+test baseline_rejects_nonexistent_extension ... ok
+test baseline_schema_is_stable ... ok
+test baseline_single_entry_produces_valid_model ... ok
+test baseline_smoothing_prior_affects_transition_probabilities ... ok
+test baseline_two_entries_different_capabilities ... ok
+test drift_anomaly_has_human_readable_explanation ... ok
+test drift_detected_for_risk_score_outlier ... ok
+test drift_markov_transition_anomaly ... ok
+test drift_not_detected_for_normal_observations ... ok
+test drift_not_triggered_when_transitions_match_baseline ... ok
+test drift_report_fields_populated_correctly ... ok
+test drift_report_json_roundtrip ... ok
+test drift_unknown_capability_returns_empty_anomalies ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+

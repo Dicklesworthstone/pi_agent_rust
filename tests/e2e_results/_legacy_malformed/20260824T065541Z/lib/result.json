@@ -1,0 +1,15 @@
+{
+  "schema": "pi.e2e.result.v1",
+  "result_kind": "lib",
+  "correlation_id": "20260824T065541Z-unsharded",
+  "target": "lib",
+  "exit_code": 101,
+  "duration_ms": 1271430,
+  "passed": 0,
+  "failed": 0,
+  "ignored": 0,
+  "total": 0,
+  "log_file": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T065541Z/lib/output.log",
+  "diagnostic_artifacts": {"artifact_index_jsonl":null,"output_log":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T065541Z/lib/output.log","sha256":"sha256:e8abade63e312b52ed1758f7e32c0e5594491828a12a7dc3b32a88bff4fd84fb","size_bytes":802396},"schema":"pi.e2e.diagnostic_artifacts.v1","test_log_jsonl":null},
+  "timestamp": "20260824T065541Z"
+}

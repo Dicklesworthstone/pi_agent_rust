@@ -1,0 +1,20 @@
+[RCH] local (no admissible workers: insufficient_slots=4,insufficient_total_slots=5,active_project_exclusion=1)
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/algorithms.rs (/tmp/rch_target_pi_agent_rust_rose_carp/debug/deps/algorithms-c569456f1fd02b97)
+
+running 7 tests
+test ess_gate::dominant_importance_weight_collapses_effective_sample_size_and_denies_gate ... ok
+test ess_gate::equal_importance_weights_preserve_effective_sample_size_and_pass_gate ... ok
+test oco_regret_rollback::loss_below_threshold_updates_regret_without_rollback ... ok
+test oco_regret_rollback::loss_spike_above_threshold_rolls_back_to_safe_profile ... ok
+test runtime_risk_ledger::runtime_risk_ledger_cli_verifies_replays_and_calibrates_round_trip ... ok
+test shadow_dual_backoff::forced_divergence_triggers_policy_backoff_for_configured_request_count ... ok
+test shadow_dual_backoff::matching_shadow_samples_do_not_trigger_divergence_backoff ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 157.69s
+

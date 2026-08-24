@@ -1,0 +1,17 @@
+{
+  "schema": "pi.e2e.result.v1",
+  "result_kind": "unit",
+  "correlation_id": "20260824T074259Z-unsharded",
+  "target": "baseline_modeling",
+  "exit_code": 0,
+  "duration_ms": 3507,
+  "passed": 32,
+  "failed": 0,
+  "ignored": 0,
+  "total": 32,
+  "log_file": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/baseline_modeling/output.log",
+  "test_log_jsonl": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/baseline_modeling/test-log.jsonl",
+  "artifact_index_jsonl": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/baseline_modeling/artifact-index.jsonl",
+  "diagnostic_artifacts": {"artifact_index_jsonl":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/baseline_modeling/artifact-index.jsonl","sha256":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size_bytes":0},"output_log":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/baseline_modeling/output.log","sha256":"sha256:591771317a1c619f971ad2ae74a5c01962eb7b3663af2c6ff58b5e57013f7af0","size_bytes":2521},"schema":"pi.e2e.diagnostic_artifacts.v1","test_log_jsonl":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/baseline_modeling/test-log.jsonl","sha256":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size_bytes":0}},
+  "timestamp": "20260824T074259Z"
+}

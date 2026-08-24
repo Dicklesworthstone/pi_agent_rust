@@ -1,0 +1,24 @@
+  [2m2026-08-24T06:54:38.617948Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mFailed to query daemon: Daemon response timed out after 120s, attempting recovery[0m
+    [2;3mat[0m rch/src/hook.rs:2072 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:54:38.623890Z[0m [33m WARN[0m [1;33mrch::hook::incident[0m[33m: [33mhook incident recorded, [1;33mreason_code[0m[33m: RCH-I010, [1;33mfailure_class[0m[33m: "daemon socket refused", [1;33mselected_mode[0m[33m: Local, [1;33mlocal_fallback_allowed[0m[33m: true[0m
+    [2;3mat[0m rch/src/hook.rs:1256 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:54:38.625026Z[0m [32m INFO[0m [1;32mrch::hook::auto_start[0m[32m: [32mDaemon unavailable, attempting auto-start[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:450 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:54:38.633928Z[0m [32m INFO[0m [1;32mrch::hook::auto_start_lock[0m[32m: [32mdoctor.autostart_lock.acquired, [1;32mpath[0m[32m: /tmp/rch/hook_autostart.lock, [1;32mpid[0m[32m: 71789[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:54:38.937635Z[0m [33m WARN[0m [1;33mrch::hook::auto_start[0m[33m: [33mSocket exists but daemon not responding (after lock-protected re-probe)[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:479 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:54:38.937903Z[0m [33m WARN[0m [1;33mrch::hook::auto_start[0m[33m: [33mSocket still accepts connections or could not be proven stale; refusing to replace a possible live daemon[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:484 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:54:38.938122Z[0m [33m WARN[0m [1;33mrch::hook::incident[0m[33m: [33mhook incident recorded, [1;33mreason_code[0m[33m: RCH-I011, [1;33mfailure_class[0m[33m: "local fallback", [1;33mselected_mode[0m[33m: Local, [1;33mlocal_fallback_allowed[0m[33m: true[0m
+    [2;3mat[0m rch/src/hook.rs:1256 [2;3mon[0m ThreadId(1)
+
+[RCH] local (daemon unavailable)
+error: target `hostcall_queue_loom` in package `pi_agent_rust` requires the features: `loom-tests`
+Consider enabling them by passing, e.g., `--features="loom-tests"`

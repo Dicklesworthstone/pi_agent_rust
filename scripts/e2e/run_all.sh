@@ -1760,6 +1760,19 @@ write_summary() {
 }
 SUMMARYJSON
 
+    # Contract validation: ensure written summary is a valid JSON object matching schema pi.e2e.summary.v1
+    python3 - <<PY || { echo "[summary] ERROR: Generated summary.json failed contract validation" >&2; exit 1; }
+import json, sys
+with open("$summary_file", "r") as f:
+    data = json.load(f)
+if not isinstance(data, dict):
+    sys.exit(f"summary.json must be a JSON object, got {type(data).__name__}")
+if data.get("schema") != "pi.e2e.summary.v1":
+    sys.exit(f"summary.json schema must be 'pi.e2e.summary.v1', got {data.get('schema')!r}")
+if not data.get("correlation_id"):
+    sys.exit("summary.json must have a non-empty correlation_id")
+PY
+
     # Lint status.
     local lint_status="skip"
     if ! $SKIP_LINT; then

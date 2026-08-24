@@ -1,0 +1,31 @@
+{
+  "schema": "pi.e2e.environment.v1",
+  "generated_at": "2026-08-24T06:51:31Z",
+  "timestamp": "20260824T065131Z",
+  "profile": "focused",
+  "rerun_from": null,
+  "diff_from": null,
+  "rustc": "rustc 1.98.0-nightly (c397dae80 2026-07-02)",
+  "cargo": "cargo 1.98.0-nightly (a335d47ff 2026-06-26)",
+  "cargo_runner": "rch exec -- cargo",
+  "cargo_exec_prefix": ["rch", "exec", "--"],
+  "os": "Darwin 25.2.0 arm64",
+  "git_sha": "296dadee96036ebbe1a125a56e9c011f3413ef25",
+  "git_branch": "main",
+  "source_commit": "296dadee96036ebbe1a125a56e9c011f3413ef25",
+  "source_snapshot": "sha256:cd8fec99da7169618ddb418d9e353edae0369f9a32784c787817366a43d5ff23",
+  "parallelism": 1,
+  "log_level": "info",
+  "artifact_dir": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T065131Z",
+  "correlation_id": "20260824T065131Z-unsharded",
+  "shard": {
+    "kind": "none",
+    "name": "unsharded",
+    "index": null,
+    "total": null
+  },
+  "cargo_target_dir": "/tmp/rch_target_pi_agent_rust_rose_carp",
+  "vcr_mode": "unset",
+  "unit_targets": ["accuracy_performance_sec63", "agent_tools_coverage", "algorithms", "ast_tools", "baseline_modeling", "baseline_modeling_evidence", "bash_mediation", "bayesian_explanation_evidence", "bench_schema", "branch_edge_failure_coverage", "capability_denial_matrix", "capability_policy_model", "capability_policy_scoped", "checkpoint", "ci_artifact_retention", "ci_strict_gates_validation", "cli_edge_cases", "commit_split", "compaction", "compaction_bug", "config_precedence", "context_intelligence_closeout_gate_contract", "cooperative_priority_lane_evaluation", "crash_consistency", "cross_surface_parity", "cross_surface_swarm_conformance_matrix", "debug", "dropin_config_differential", "dropin_session_error_parity", "e2e_artifact_retention_triage", "e2e_replay_bundle_validation", "edit_empty_string_repro", "enforcement_state_machine_sec34", "error_types", "eval", "explanation_calibration_replay", "ext_conformance_matrix", "extension_flag_passthrough", "extension_flag_passthrough_fixtures", "extension_scoring", "extension_scoring_ope", "extension_scoring_voi_meanfield", "extensions_auth_error_coverage", "extensions_policy_negative", "extensions_registration", "fourth_wave_self_healing_closeout_gate_contract", "franken_node_benchmark_resource_gate_contract", "franken_node_claim_contract", "franken_node_compat_harness", "franken_node_compatibility_doctor_contract", "franken_node_deterministic_replay_contract", "franken_node_event_loop_io_parity_contract", "franken_node_executable_conformance_harness_contract", "franken_node_kernel_extraction_boundary_manifest", "franken_node_migration_assistant_contract", "franken_node_multi_tier_execution_contract", "franken_node_package_interop_contract", "franken_node_practical_finish_contract", "franken_node_remediation_backlog_contract", "franken_node_runtime_integration_contract", "franken_node_runtime_substrate_contract", "franken_node_security_sandbox_contract", "franken_node_semantic_compat_contract", "franken_node_shadow_canary_rollout_contract", "franken_node_unified_test_certification_contract", "fts5_spike", "fuzz_regression", "fuzz_regression_generated", "gc", "handoff_generator", "hostcall_queue_ebr", "hostcall_queue_loom", "hostcall_s3_fifo_policy", "hub", "incident_evidence_bundle", "incident_evidence_bundle_sec53", "install_time_security_scanner", "interactive_commands_unit", "jobs", "json_mode_parity", "ledger_calibration_sec35", "lsp", "magic_keywords", "mcp", "memory", "mock_spec_schema", "mock_spec_validation", "model_selector_cycling", "model_serialization", "node_buffer_shim", "node_bun_api_matrix", "node_crypto_shim", "node_http_shim", "non_mock_compliance_gate", "non_mock_rubric_gate", "npm_module_stubs", "perf_budgets", "perf_comparison", "perf_regression", "performance_comparison", "phase3_cross_module_integration", "phase3_security_invariants", "policy_profile_hardening", "proof_carrying_swarm_test_fabric_closeout_gate_contract", "provider_backward_lock", "provider_closure_truth_table", "provider_discrepancy_classification", "provider_registry_guardrails", "provider_session_coverage", "provider_unit_checklist", "qa_docs_policy_validation", "rch_artifact_sync_preflight", "redaction_test", "repro_edit_newline_shift", "repro_exec_mediation_bypass", "repro_read_large_file", "repro_symlink_monotonicity", "reproduce_index_gap", "resource_edge_cases", "review", "risk_scorer_golden_fixtures", "rpc_extension_ui_scenarios", "runtime_intelligence_closeout_gate_contract", "runtime_risk_quantile_evidence", "runtime_risk_quantile_validation", "scheduler_repro", "sdk_api", "sdk_unit", "sec_compatibility_conformance", "sec_traceability_matrix", "secrets", "security_alert_integration", "security_budgets", "security_conformance_benign", "self_update", "semantic_context_graph_contract", "semantic_workspace_graph_contract", "session_conformance", "session_import", "session_store_v2", "skills_managed", "snapcompact", "snapcompact_provider", "stream_rules", "swarm_progress_slo_closeout_gate_contract", "swarm_progress_slo_contract", "swarm_replay_closeout_gate_contract", "swarm_replay_trace_contract", "trust_onboarding_killswitch_sec52", "url_router", "validate_e2e_artifact_schema", "validation_broker_closeout_gate_contract", "validation_broker_contract", "validation_broker_store", "vcr_parity_validation", "worktree_iso"],
+  "e2e_suites": ["e2e_ast_tools", "e2e_extension_registration", "e2e_tools"]
+}

@@ -1,0 +1,4 @@
+[RCH] local (no admissible workers: insufficient_slots=2,insufficient_total_slots=6,active_project_exclusion=1)
+   Compiling pi_agent_rust v0.3.0 (/Users/jemanuel/projects/pi_agent_rust)
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker

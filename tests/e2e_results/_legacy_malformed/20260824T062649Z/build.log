@@ -1,0 +1,963 @@
+  [2m2026-08-24T06:27:49.594923Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (0 slots remaining after reservation, speed 72.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:27:53.324133Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:27:53.324242Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:27:54.851253Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:513 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:27:54.851611Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 49 pattern(s) from .rchignore (total: 120)[0m
+    [2;3mat[0m rch/src/transfer.rs:1551 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:27:54.851632Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/pi_agent_rust -> /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2895 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:28:25.956646Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 31105ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2968 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:28:25.956696Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 72977 files, 2582557 bytes in 31105ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:783 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:28:33.570294Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --locked --test accuracy_performance_sec63 --no-run[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:840 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:28:33.570595Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_pi_agent_rust_rose_carp -> /Users/jemanuel/projects/pi_agent_rust/.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c[0m
+    [2;3mat[0m rch/src/transfer.rs:1413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:28:33.570636Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 3600[0m
+    [2;3mat[0m rch/src/transfer.rs:2155 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.189
+   Compiling memchr v2.8.3
+   Compiling serde_core v1.0.229
+   Compiling once_cell v1.21.4
+   Compiling regex-syntax v0.8.11
+   Compiling version_check v0.9.5
+   Compiling thiserror v2.0.20
+   Compiling find-msvc-tools v0.1.11
+   Compiling shlex v2.0.1
+   Compiling fastrand v2.5.0
+   Compiling cc v1.4.3
+   Compiling parking_lot_core v0.9.12
+   Compiling equivalent v1.0.2
+   Compiling serde v1.0.229
+   Compiling scopeguard v1.2.0
+   Compiling itoa v1.0.18
+   Compiling generic-array v0.14.7
+   Compiling lock_api v0.4.14
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.12.0
+   Compiling stable_deref_trait v1.2.1
+   Compiling typenum v1.20.1
+   Compiling crc32fast v1.5.0
+   Compiling autocfg v1.5.1
+   Compiling syn v2.0.119
+   Compiling syn v3.0.3
+   Compiling allocator-api2 v0.2.21
+   Compiling cpufeatures v0.2.17
+   Compiling smallvec v1.15.2
+   Compiling aho-corasick v1.1.5
+   Compiling num-traits v0.2.19
+   Compiling zerocopy v0.8.56
+   Compiling rustversion v1.0.23
+   Compiling crossbeam-utils v0.8.22
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling pin-project-lite v0.2.17
+   Compiling zmij v1.0.23
+   Compiling unicode-normalization v0.1.25
+   Compiling same-file v1.0.6
+   Compiling gix-trace v0.1.21
+   Compiling bitflags v2.13.1
+   Compiling regex-automata v0.4.18
+   Compiling log v0.4.33
+   Compiling walkdir v2.5.0
+   Compiling hybrid-array v0.4.14
+   Compiling anyhow v1.0.104
+   Compiling foldhash v0.2.0
+   Compiling parking_lot v0.12.5
+   Compiling zlib-rs v0.5.5
+   Compiling crypto-common v0.2.2
+   Compiling prodash v30.0.1
+   Compiling num-integer v0.1.47
+   Compiling tracing-core v0.1.36
+   Compiling subtle v2.6.1
+   Compiling synstructure v0.13.2
+   Compiling hashbrown v0.17.1
+   Compiling rustix v1.1.4
+   Compiling heapless v0.8.0
+   Compiling byteorder v1.5.0
+   Compiling getrandom v0.3.4
+   Compiling semver v1.0.28
+   Compiling bstr v1.13.1
+   Compiling hash32 v0.3.1
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.20
+   Compiling displaydoc v0.2.7
+   Compiling cmov v0.5.4
+   Compiling serde_json v1.0.151
+   Compiling zerocopy-derive v0.8.56
+   Compiling zeroize_derive v1.5.0
+   Compiling tracing-attributes v0.1.31
+   Compiling gix-utils v0.3.5
+   Compiling linux-raw-sys v0.12.1
+   Compiling ctutils v0.4.2
+   Compiling zeroize v1.9.0
+   Compiling block-buffer v0.12.1
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling siphasher v1.0.3
+   Compiling gix-validate v0.10.1
+   Compiling bytes v1.12.1
+   Compiling digest v0.10.7
+   Compiling gix-path v0.10.22
+   Compiling faster-hex v0.10.0
+   Compiling tracing v0.1.44
+   Compiling gix-features v0.45.2
+   Compiling rustc_version v0.4.1
+   Compiling cpufeatures v0.3.0
+   Compiling num-conv v0.2.2
+   Compiling time-core v0.1.8
+   Compiling powerfmt v0.2.0
+   Compiling sha1 v0.10.7
+   Compiling lazy_static v1.5.0
+   Compiling num_threads v0.1.7
+   Compiling inout v0.2.2
+   Compiling getrandom v0.2.17
+   Compiling deranged v0.5.8
+   Compiling sha1-checked v0.10.0
+   Compiling errno v0.3.14
+   Compiling zerofrom-derive v0.1.7
+   Compiling signal-hook-registry v1.4.8
+   Compiling ahash v0.8.12
+   Compiling gix-hash v0.21.2
+   Compiling jiff-core v0.1.0
+   Compiling cipher v0.5.2
+   Compiling yoke-derive v0.8.2
+   Compiling hashbrown v0.16.1
+   Compiling base64ct v1.8.3
+   Compiling zerofrom v0.1.8
+   Compiling winnow v0.7.15
+   Compiling const-oid v0.10.2
+   Compiling num-bigint v0.4.8
+   Compiling rand_core v0.6.4
+   Compiling time-macros v0.2.27
+   Compiling digest v0.11.3
+   Compiling jiff v0.2.35
+   Compiling gix-hashtable v0.11.0
+   Compiling yoke v0.8.3
+   Compiling zerovec-derive v0.11.4
+   Compiling ring v0.17.14
+   Compiling percent-encoding v2.3.2
+   Compiling minimal-lexical v0.2.1
+   Compiling fnv v1.0.7
+   Compiling pem-rfc7468 v0.7.0
+   Compiling nom v7.1.3
+   Compiling universal-hash v0.6.1
+   Compiling memmap2 v0.9.11
+   Compiling time v0.3.47
+   Compiling futures-core v0.3.34
+   Compiling zerovec v0.11.7
+   Compiling new_debug_unreachable v1.0.6
+   Compiling const-oid v0.9.6
+   Compiling curve25519-dalek v4.1.3
+   Compiling der v0.7.10
+   Compiling signature v2.2.0
+   Compiling rustls-pki-types v1.15.1
+   Compiling asn1-rs-impl v0.2.0
+   Compiling asn1-rs-derive v0.6.0
+   Compiling ppv-lite86 v0.2.21
+   Compiling memoffset v0.9.1
+   Compiling tree-sitter-language v0.1.7
+   Compiling rusticata-macros v4.1.0
+   Compiling hashbrown v0.14.5
+   Compiling futures-io v0.3.34
+   Compiling cpubits v0.1.1
+   Compiling cfg_aliases v0.2.2
+   Compiling nix v0.31.3
+   Compiling tempfile v3.27.0
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling static_assertions v1.1.0
+   Compiling spki v0.7.3
+   Compiling asn1-rs v0.7.2
+   Compiling oid-registry v0.8.1
+   Compiling gix-date v0.12.1
+   Compiling slab v0.4.12
+   Compiling untrusted v0.9.0
+   Compiling signal-hook v0.4.4
+   Compiling data-encoding v2.11.1
+   Compiling either v1.17.0
+   Compiling pkcs8 v0.10.2
+   Compiling polyval v0.7.3
+   Compiling gix-actor v0.37.1
+   Compiling itertools v0.14.0
+   Compiling rand_chacha v0.3.1
+   Compiling tinystr v0.8.4
+   Compiling gix-object v0.54.1
+   Compiling ed25519 v2.2.3
+   Compiling hmac v0.13.0
+   Compiling chacha20 v0.10.1
+   Compiling aead v0.6.1
+   Compiling sharded-slab v0.1.7
+   Compiling gix-fs v0.18.2
+   Compiling sha2 v0.10.9
+   Compiling matchers v0.2.0
+   Compiling tracing-log v0.2.0
+   Compiling thread_local v1.1.10
+   Compiling rustls v0.23.43
+   Compiling bincode-next v3.1.1
+   Compiling writeable v0.6.4
+   Compiling strsim v0.11.1
+   Compiling virtue-next v0.1.3
+   Compiling nu-ansi-term v0.50.3
+   Compiling litemap v0.8.3
+   Compiling unicode-width v0.2.2
+   Compiling rustls-webpki v0.103.14
+   Compiling icu_locale_core v2.3.0
+   Compiling prost-derive v0.14.4
+   Compiling tracing-subscriber v0.3.23
+   Compiling dashmap v6.2.1
+   Compiling ed25519-dalek v2.2.0
+   Compiling der-parser v10.0.0
+   Compiling bincode_derive-next v3.1.1
+   Compiling rand v0.8.7
+   Compiling ghash v0.6.0
+   Compiling signatory v0.27.1
+   Compiling aes v0.9.2
+   Compiling potential_utf v0.1.6
+   Compiling poly1305 v0.9.1
+   Compiling zerotrie v0.2.5
+   Compiling sha2 v0.11.0
+   Compiling franken-kernel v0.4.4
+   Compiling franken-evidence v0.4.4
+   Compiling ctr v0.10.1
+   Compiling gix-chunk v0.4.12
+   Compiling pin-project-internal v1.1.13
+   Compiling rmp v0.8.15
+   Compiling rapidhash v4.5.1
+   Compiling blake3 v1.8.6
+   Compiling icu_normalizer_data v2.3.0
+   Compiling utf8_iter v1.0.4
+   Compiling parking v2.2.1
+   Compiling icu_properties_data v2.3.0
+   Compiling pastey v0.2.3
+   Compiling asupersync v0.4.4
+   Compiling unty-next v0.1.2
+   Compiling futures-lite v2.6.1
+   Compiling rmp-serde v1.3.1
+   Compiling icu_collections v2.3.0
+   Compiling franken-decision v0.4.4
+   Compiling aes-gcm v0.11.0
+   Compiling prost v0.14.4
+   Compiling chacha20poly1305 v0.11.0
+   Compiling pin-project v1.1.13
+   Compiling icu_provider v2.3.0
+   Compiling nkeys v0.4.5
+   Compiling x509-parser v0.18.1
+   Compiling gix-tempfile v20.0.1
+   Compiling rustls-pemfile v2.2.0
+   Compiling webpki-roots v1.0.9
+   Compiling polling v3.11.0
+   Compiling xattr v1.6.1
+   Compiling sha1 v0.11.0
+   Compiling gix-quote v0.6.2
+   Compiling visibility v0.1.1
+   Compiling swc_macros_common v1.0.1
+   Compiling crossbeam-queue v0.3.13
+   Compiling sysinfo v0.39.6
+   Compiling socket2 v0.6.5
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling hex v0.4.3
+   Compiling base64 v0.23.1
+   Compiling arrayref v0.3.9
+   Compiling gix-lock v20.0.1
+   Compiling gix-glob v0.23.0
+   Compiling fsqlite-error v0.3.5
+   Compiling xxhash-rust v0.8.18
+   Compiling simdutf8 v0.1.5
+   Compiling icu_properties v2.3.0
+   Compiling icu_normalizer v2.3.0
+   Compiling gix-commitgraph v0.31.0
+   Compiling phf_shared v0.13.1
+   Compiling unicode-bom v2.0.3
+   Compiling heck v0.5.0
+   Compiling rustc-hash v2.1.3
+   Compiling ident_case v1.0.1
+   Compiling phf_generator v0.13.1
+   Compiling darling_core v0.20.11
+   Compiling kstring v2.0.2
+   Compiling gix-revwalk v0.25.0
+   Compiling triomphe v0.1.16
+   Compiling phf_shared v0.11.3
+   Compiling crossbeam-epoch v0.9.20
+   Compiling scoped-tls v1.0.1
+   Compiling hstr v4.0.1
+   Compiling gix-attributes v0.29.0
+   Compiling form_urlencoded v1.2.2
+   Compiling bytes-str v0.2.8
+   Compiling phf_generator v0.11.3
+   Compiling crc32c v0.6.8
+   Compiling indexmap v2.14.0
+   Compiling idna_adapter v1.2.2
+   Compiling gix-sec v0.12.2
+   Compiling idna v1.1.0
+   Compiling shell-words v1.1.1
+   Compiling object v0.39.1
+   Compiling foldhash v0.1.5
+   Compiling phf_macros v0.11.3
+   Compiling swc_atoms v10.0.0
+   Compiling better_scoped_tls v1.0.1
+   Compiling swc_visit v2.0.1
+   Compiling gix-ref v0.57.0
+   Compiling url v2.5.8
+   Compiling from_variant v3.0.0
+   Compiling ast_node v7.0.0
+   Compiling gix-config-value v0.16.0
+   Compiling swc_eq_ignore_macros v1.0.1
+   Compiling bumpalo v3.20.3
+   Compiling io-uring v0.7.14
+   Compiling crossbeam-deque v0.8.7
+   Compiling siphasher v0.3.11
+   Compiling phf v0.11.3
+   Compiling gix-command v0.6.5
+   Compiling darling_macro v0.20.11
+   Compiling gix-traverse v0.51.1
+   Compiling is-macro v0.3.7
+   Compiling swc_common v26.0.0
+   Compiling string_enum v1.0.2
+   Compiling darling v0.20.11
+   Compiling gix-packetline v0.20.0
+   Compiling regex v1.13.1
+   Compiling gix-bitmap v0.2.16
+   Compiling filetime v0.2.29
+   Compiling encoding_rs v0.8.35
+   Compiling unicode-segmentation v1.13.3
+   Compiling unicode-id-start v1.4.0
+   Compiling signal-hook v0.3.18
+   Compiling gix-index v0.45.1
+   Compiling gix-pathspec v0.14.0
+   Compiling phf_codegen v0.13.1
+   Compiling convert_case v0.10.0
+   Compiling string_cache_codegen v0.6.1
+   Compiling gix-ignore v0.18.0
+   Compiling advisory-lock v0.3.0
+   Compiling bit-vec v0.8.0
+   Compiling iana-time-zone v0.1.65
+   Compiling web_atoms v0.2.6
+   Compiling chrono v0.4.45
+   Compiling bit-set v0.8.0
+   Compiling derive_more-impl v2.1.1
+   Compiling gix-worktree v0.46.0
+   Compiling swc_ecma_ast v29.0.0
+   Compiling derive_builder_core v0.20.2
+   Compiling hashbrown v0.15.5
+   Compiling phf_macros v0.13.1
+   Compiling rand v0.10.2
+   Compiling gix-url v0.34.0
+   Compiling password-hash v0.5.0
+   Compiling blake2 v0.10.6
+   Compiling mio v1.2.2
+   Compiling camino v1.2.5
+   Compiling dragonbox_ecma v0.1.12
+   Compiling precomputed-hash v0.1.1
+   Compiling ar_archive_writer v0.5.3
+   Compiling litrs v1.0.0
+   Compiling argon2 v0.5.3
+   Compiling string_cache v0.9.0
+   Compiling derive_builder_macro v0.20.2
+   Compiling phf v0.13.1
+   Compiling signal-hook-mio v0.2.5
+   Compiling imara-diff v0.1.8
+   Compiling derive_more v2.1.1
+   Compiling gix-filter v0.24.1
+   Compiling gix-discover v0.45.0
+   Compiling gix-revision v0.39.0
+   Compiling document-features v0.2.12
+   Compiling clru v0.6.3
+   Compiling castaway v0.2.4
+   Compiling psm v0.1.32
+   Compiling vergen-lib v9.1.0
+   Compiling stacker v0.1.25
+   Compiling ryu v1.0.23
+   Compiling utf8parse v0.2.2
+   Compiling anstyle-parse v1.0.0
+   Compiling gix-diff v0.57.1
+   Compiling compact_str v0.7.1
+   Compiling crossterm v0.29.0
+   Compiling gix-refspec v0.35.0
+   Compiling gix-pack v0.64.1
+   Compiling gix-dir v0.19.0
+   Compiling derive_builder v0.20.2
+   Compiling gix-transport v0.52.1
+   Compiling gix-config v0.50.0
+   Compiling gix-shallow v0.7.0
+   Compiling tendril v0.5.1
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling maybe-async v0.2.11
+   Compiling swc_ecma_visit v29.0.0
+   Compiling cargo-platform v0.3.3
+   Compiling arc-swap v1.9.2
+   Compiling vergen v9.1.0
+   Compiling num_cpus v1.17.0
+   Compiling par-core v2.0.0
+   Compiling toml_write v0.1.2
+   Compiling anstyle v1.0.14
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling ref-cast v1.0.26
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling gix-protocol v0.55.0
+   Compiling anstream v1.0.0
+   Compiling gix-odb v0.74.0
+   Compiling cargo_metadata v0.23.1
+   Compiling markup5ever v0.38.0
+   Compiling gix-status v0.24.0
+   Compiling gix-submodule v0.24.0
+   Compiling tree-sitter v0.26.12
+   Compiling num-rational v0.4.2
+   Compiling ref-cast-impl v1.0.26
+   Compiling vergen-gix v9.1.0
+   Compiling toml_edit v0.22.27
+   Compiling event-listener v5.4.2
+   Compiling rquickjs-sys v0.12.2
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling adler2 v2.0.1
+   Compiling futures-sink v0.3.34
+   Compiling clap_lex v1.1.0
+   Compiling thiserror v1.0.69
+   Compiling seq-macro v0.3.6
+   Compiling pulldown-cmark v0.13.4
+   Compiling cfg_aliases v0.1.1
+   Compiling simd-adler32 v0.3.10
+   Compiling nix v0.28.0
+   Compiling clap_builder v4.6.6
+   Compiling miniz_oxide v0.8.9
+   Compiling proc-macro-error2 v2.0.1
+   Compiling swc_ecma_parser v45.0.0
+   Compiling futures-channel v0.3.34
+   Compiling event-listener-strategy v0.5.4
+   Compiling gix v0.77.0
+   Compiling fancy-regex v0.17.0
+   Compiling swc_ecma_utils v35.0.0
+   Compiling toml v0.8.23
+   Compiling clap_derive v4.6.4
+   Compiling swc_config_macro v1.0.1
+   Compiling getopts v0.2.24
+   Compiling colored v2.2.0
+   Compiling thiserror-impl v1.0.69
+   Compiling futures-macro v0.3.34
+   Compiling lru v0.18.2
+   Compiling num-iter v0.1.46
+   Compiling num-complex v0.4.6
+   Compiling tree-sitter-javascript v0.25.0
+   Compiling tree-sitter-go v0.25.0
+   Compiling tree-sitter-typescript v0.23.2
+   Compiling tree-sitter-bash v0.25.1
+   Compiling tree-sitter-ruby v0.23.1
+   Compiling tree-sitter-rust v0.24.2
+   Compiling tree-sitter-python v0.25.0
+   Compiling streaming-iterator v0.1.9
+   Compiling unicode-general-category v1.1.0
+   Compiling borrow-or-share v0.2.4
+   Compiling unicase v2.9.0
+   Compiling unicode-width v0.1.14
+   Compiling base64 v0.22.1
+   Compiling futures-task v0.3.34
+   Compiling pulldown-cmark-escape v0.11.0
+   Compiling charmed-lipgloss v0.2.0
+   Compiling futures-util v0.3.34
+   Compiling fluent-uri v0.4.1
+   Compiling swc_ecma_transforms_base v49.0.0
+   Compiling num v0.4.3
+   Compiling clap v4.6.6
+   Compiling swc_config v6.0.0
+   Compiling swc_ecma_hooks v1.0.0
+   Compiling flate2 v1.1.9
+   Compiling async-lock v3.4.2
+   Compiling charmed-bubbletea-macros v0.2.0
+   Compiling html5ever v0.38.0
+   Compiling xml5ever v0.38.0
+   Compiling globset v0.4.20
+   Compiling rand_core v0.9.5
+   Compiling grep-matcher v0.1.9
+   Compiling relative-path v2.0.1
+   Compiling rayon-core v1.13.0
+   Compiling vsimd v0.8.0
+   Compiling option-ext v0.2.0
+   Compiling winnow v1.0.4
+   Compiling outref v0.5.2
+   Compiling lru v0.12.5
+   Compiling swc_ecma_transforms_react v55.0.0
+   Compiling rquickjs-core v0.12.2
+   Compiling dirs-sys v0.5.0
+   Compiling markup5ever_rcdom v0.38.0+unofficial
+   Compiling pi_agent_rust v0.3.0 (/data/projects/pi_agent_rust)
+   Compiling uuid-simd v0.8.0
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling ignore v0.4.33
+   Compiling charmed-bubbletea v0.2.0
+   Compiling futures-executor v0.3.34
+   Compiling fraction v0.15.4
+   Compiling filedescriptor v0.8.3
+   Compiling referencing v0.42.2
+   Compiling ast-grep-core v0.40.5
+   Compiling lru v0.16.4
+   Compiling encoding_rs_io v0.1.8
+   Compiling swc_allocator v5.0.0
+   Compiling swc_ecma_codegen_macros v2.0.2
+   Compiling pbkdf2 v0.13.0
+   Compiling half v2.7.1
+   Compiling email_address v0.2.9
+   Compiling salsa20 v0.11.0
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling serde_spanned v1.1.1
+   Compiling generator v0.8.9
+   Compiling stdio-override v0.2.0
+   Compiling serial2 v0.2.38
+   Compiling os_pipe v1.2.3
+   Compiling alloca v0.4.0
+   Compiling ucd-trie v0.1.7
+   Compiling charmed-harmonica v0.2.0
+   Compiling smawk v0.3.3
+   Compiling unicode-linebreak v0.1.5
+   Compiling downcast-rs v1.2.1
+   Compiling num-cmp v0.1.0
+   Compiling bytecount v0.6.9
+   Compiling ascii v1.1.0
+   Compiling leb128fmt v0.1.0
+   Compiling plotters-backend v0.3.7
+   Compiling ciborium-io v0.2.2
+   Compiling similar v2.7.0
+   Compiling toml_writer v1.1.2+spec-1.1.0
+   Compiling wasm-encoder v0.256.0
+   Compiling rquickjs v0.12.2
+   Compiling jsonschema v0.42.2
+   Compiling ciborium-ll v0.2.2
+   Compiling textwrap v0.16.2
+   Compiling toml v1.1.4+spec-1.1.0
+   Compiling plotters-svg v0.3.7
+   Compiling swc_ecma_codegen v32.0.0
+   Compiling json5 v1.3.1
+   Compiling portable-pty v0.9.0
+   Compiling charmed-bubbles v0.2.0
+   Compiling grep-searcher v0.1.17
+   Compiling rich_rust v0.2.2
+   Compiling ast-grep-language v0.40.5
+   Compiling scrypt v0.12.0
+   Compiling swc_ecma_transforms_typescript v55.0.0
+   Compiling futures v0.3.34
+   Compiling htmd v0.5.5
+   Compiling dirs v6.0.0
+   Compiling charmed-glamour v0.2.0
+   Compiling grep-regex v0.1.14
+   Compiling clap_complete v4.6.9
+   Compiling tiktoken-rs v0.12.0
+   Compiling itertools v0.13.0
+   Compiling ctrlc v3.5.2
+   Compiling fs4 v1.1.0
+   Compiling md-5 v0.11.0
+   Compiling async-trait v0.1.92
+   Compiling uuid v1.24.0
+   Compiling wait-timeout v0.2.1
+   Compiling vte v0.14.1
+   Compiling quick-error v1.2.3
+   Compiling glob v0.3.4
+   Compiling cast v0.3.0
+   Compiling enable-ansi-support v0.2.1
+   Compiling rusty-fork v0.3.1
+   Compiling strip-ansi-escapes v0.2.1
+   Compiling rayon v1.12.0
+   Compiling wast v256.0.0
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling rand v0.9.5
+   Compiling rand_xorshift v0.4.0
+   Compiling criterion-plot v0.8.2
+   Compiling rand_chacha v0.9.0
+   Compiling tinytemplate v1.2.1
+   Compiling derive_arbitrary v1.4.2
+   Compiling console v0.16.4
+   Compiling page_size v0.6.0
+   Compiling anes v0.1.6
+   Compiling diff v0.1.13
+   Compiling unarray v0.1.4
+   Compiling oorandom v11.1.5
+   Compiling yansi v1.0.1
+   Compiling proptest v1.11.0
+   Compiling insta v1.48.0
+   Compiling loom v0.7.2 (https://github.com/ongardie-atomix/loom?rev=2b7c402034cc041b5e325384c67bb43bff93c048#2b7c4020)
+   Compiling arbitrary v1.4.2
+   Compiling pretty_assertions v1.4.1
+   Compiling criterion v0.8.2
+   Compiling wat v1.256.0
+   Compiling fsqlite-types v0.3.5
+   Compiling fsqlite-observability v0.3.5
+   Compiling fsqlite-func v0.3.5
+   Compiling fsqlite-ast v0.3.5
+   Compiling fsqlite-vfs v0.3.5
+   Compiling fsqlite-parser v0.3.5
+   Compiling fsqlite-ext-fts5 v0.3.5
+   Compiling fsqlite-planner v0.3.5
+   Compiling fsqlite-wal v0.3.5
+   Compiling fsqlite-pager v0.3.5
+   Compiling fsqlite-btree v0.3.5
+   Compiling fsqlite-mvcc v0.3.5
+   Compiling fsqlite-vdbe v0.3.5
+   Compiling fsqlite-core v0.3.5
+   Compiling fsqlite v0.3.5
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4m 20s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable tests/accuracy_performance_sec63.rs (.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c/debug/deps/accuracy_performance_sec63-5e53f72db4848a6b)
+  [2m2026-08-24T06:32:55.753146Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 262184ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:964 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:32:55.804113Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:32:55.804190Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:3645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:32:55.804690Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 20 retrieval exclude pattern(s) from .rchignore (total: 25)[0m
+    [2;3mat[0m rch/src/transfer.rs:1861 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:32:57.838688Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2034ms (1 files, 13907 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3700 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:32:57.838743Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 13907 bytes in 2034ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (308.3s)
+  [2m2026-08-24T06:33:04.183634Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (0 slots remaining after reservation, speed 72.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:07.207896Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:07.208003Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:08.587041Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:513 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:08.587666Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 49 pattern(s) from .rchignore (total: 120)[0m
+    [2;3mat[0m rch/src/transfer.rs:1551 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:08.587712Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/pi_agent_rust -> /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2895 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:38.235282Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 29647ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2968 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:38.239514Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 72980 files, 2564965 bytes in 29647ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:783 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:44.687174Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --locked --test agent_tools_coverage --no-run[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:840 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:44.687268Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_pi_agent_rust_rose_carp -> /Users/jemanuel/projects/pi_agent_rust/.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c[0m
+    [2;3mat[0m rch/src/transfer.rs:1413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:44.687306Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 3600[0m
+    [2;3mat[0m rch/src/transfer.rs:2155 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+   Compiling pi_agent_rust v0.3.0 (/data/projects/pi_agent_rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.27s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable tests/agent_tools_coverage.rs (.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c/debug/deps/agent_tools_coverage-0a19bfde741137c0)
+  [2m2026-08-24T06:33:51.676836Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 6989ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:964 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:51.867481Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:51.867529Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:3645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:51.870153Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 20 retrieval exclude pattern(s) from .rchignore (total: 25)[0m
+    [2;3mat[0m rch/src/transfer.rs:1861 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:54.204050Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2336ms (1 files, 13907 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3700 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:33:54.204132Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 13907 bytes in 2336ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (50.1s)
+  [2m2026-08-24T06:35:42.080805Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (0 slots remaining after reservation, speed 72.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:35:45.033035Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:35:45.033122Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:35:46.627966Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:513 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:35:46.628832Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 49 pattern(s) from .rchignore (total: 120)[0m
+    [2;3mat[0m rch/src/transfer.rs:1551 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:35:46.628936Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/pi_agent_rust -> /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2895 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:08.830963Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 22202ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2968 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:08.831218Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 72980 files, 2555126 bytes in 22202ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:783 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:15.832510Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --locked --test algorithms --no-run[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:840 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:15.832644Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_pi_agent_rust_rose_carp -> /Users/jemanuel/projects/pi_agent_rust/.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c[0m
+    [2;3mat[0m rch/src/transfer.rs:1413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:15.832680Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 3600[0m
+    [2;3mat[0m rch/src/transfer.rs:2155 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+   Compiling pi_agent_rust v0.3.0 (/data/projects/pi_agent_rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.84s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable tests/algorithms.rs (.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c/debug/deps/algorithms-aa1d6d3269a98d7c)
+  [2m2026-08-24T06:36:21.522699Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 5689ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:964 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:21.637206Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:21.640162Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:3645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:21.641608Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 20 retrieval exclude pattern(s) from .rchignore (total: 25)[0m
+    [2;3mat[0m rch/src/transfer.rs:1861 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:24.048887Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2408ms (1 files, 13907 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3700 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:24.048931Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 13907 bytes in 2408ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (42.1s)
+  [2m2026-08-24T06:36:29.306337Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (0 slots remaining after reservation, speed 72.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:33.180590Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:33.180655Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:34.707112Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:513 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:34.707387Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 49 pattern(s) from .rchignore (total: 120)[0m
+    [2;3mat[0m rch/src/transfer.rs:1551 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:36:34.707440Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/pi_agent_rust -> /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2895 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:05.479353Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 30772ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2968 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:05.479432Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 72981 files, 2556722 bytes in 30772ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:783 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:12.831881Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --locked --test ast_tools --no-run[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:840 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:12.831968Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_pi_agent_rust_rose_carp -> /Users/jemanuel/projects/pi_agent_rust/.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c[0m
+    [2;3mat[0m rch/src/transfer.rs:1413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:12.832016Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 3600[0m
+    [2;3mat[0m rch/src/transfer.rs:2155 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+   Compiling pi_agent_rust v0.3.0 (/data/projects/pi_agent_rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.68s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable tests/ast_tools.rs (.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c/debug/deps/ast_tools-06924a7ca0534a8f)
+  [2m2026-08-24T06:37:23.644564Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 10812ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:964 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:23.875426Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:23.875468Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:3645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:23.876025Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 20 retrieval exclude pattern(s) from .rchignore (total: 25)[0m
+    [2;3mat[0m rch/src/transfer.rs:1861 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:26.159993Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2284ms (1 files, 13907 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3700 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:26.160036Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 13907 bytes in 2284ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (57.0s)
+  [2m2026-08-24T06:37:44.781080Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (0 slots remaining after reservation, speed 72.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:48.277830Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:48.277955Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:49.966427Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:513 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:49.966756Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 49 pattern(s) from .rchignore (total: 120)[0m
+    [2;3mat[0m rch/src/transfer.rs:1551 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:37:49.966790Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/pi_agent_rust -> /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2895 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:15.012106Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 25045ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2968 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:15.012210Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 72981 files, 2555085 bytes in 25045ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:783 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:22.463841Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --locked --test baseline_modeling --no-run[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:840 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:22.463928Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_pi_agent_rust_rose_carp -> /Users/jemanuel/projects/pi_agent_rust/.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c[0m
+    [2;3mat[0m rch/src/transfer.rs:1413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:22.463954Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 3600[0m
+    [2;3mat[0m rch/src/transfer.rs:2155 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+   Compiling pi_agent_rust v0.3.0 (/data/projects/pi_agent_rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.22s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable tests/baseline_modeling.rs (.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c/debug/deps/baseline_modeling-d6201bfb5bde7a11)
+  [2m2026-08-24T06:38:28.434899Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 5970ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:964 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:28.654295Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:28.654335Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:3645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:28.654777Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 20 retrieval exclude pattern(s) from .rchignore (total: 25)[0m
+    [2;3mat[0m rch/src/transfer.rs:1861 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:30.745167Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2090ms (1 files, 13907 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3700 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:30.745222Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 13907 bytes in 2090ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (46.0s)
+  [2m2026-08-24T06:38:35.892864Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (0 slots remaining after reservation, speed 72.4)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:39.856218Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:39.856312Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:41.467347Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:513 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:41.467837Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 49 pattern(s) from .rchignore (total: 120)[0m
+    [2;3mat[0m rch/src/transfer.rs:1551 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:38:41.467892Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /Users/jemanuel/projects/pi_agent_rust -> /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2895 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:01.565600Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 20097ms[0m
+    [2;3mat[0m rch/src/transfer.rs:2968 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:01.565719Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 72981 files, 2555457 bytes in 20097ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:783 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:07.987188Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test --locked --test baseline_modeling_evidence --no-run[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:840 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:07.987309Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /tmp/rch_target_pi_agent_rust_rose_carp -> /Users/jemanuel/projects/pi_agent_rust/.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c[0m
+    [2;3mat[0m rch/src/transfer.rs:1413 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:07.987335Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mWrapping command with external timeout protection, [1;32mkind[0m[32m: cargo test, [1;32mtimeout_secs[0m[32m: 3600[0m
+    [2;3mat[0m rch/src/transfer.rs:2155 [2;3mon[0m ThreadId(1)
+
+Warning: Permanently added '109.123.245.77' (ED25519) to the list of known hosts.
+[bubbletea-macros] Deriving Model for: PiApp
+[bubbletea-macros] Deriving Model for: SessionPicker
+[bubbletea-macros] Deriving Model for: ConfigUiApp
+   Compiling pi_agent_rust v0.3.0 (/data/projects/pi_agent_rust)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.49s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+  Executable tests/baseline_modeling_evidence.rs (.rch-target-vmi1227854-pool-1af5e15f9432abf81a64bcefa1eaae0c/debug/deps/baseline_modeling_evidence-4bff1abd1a7bb58f)
+  [2m2026-08-24T06:39:14.051343Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 6064ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:964 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:14.141398Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1039 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:14.141561Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /Users/jemanuel/projects/pi_agent_rust on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:3645 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:14.142234Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mLoaded 20 retrieval exclude pattern(s) from .rchignore (total: 25)[0m
+    [2;3mat[0m rch/src/transfer.rs:1861 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:16.264171Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2122ms (1 files, 13907 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:3700 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:39:16.264243Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 13907 bytes in 2122ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:1071 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (40.6s)
+  [2m2026-08-24T06:41:21.582780Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mFailed to query daemon: Daemon response timed out after 120s, attempting recovery[0m
+    [2;3mat[0m rch/src/hook.rs:2072 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:41:21.589644Z[0m [33m WARN[0m [1;33mrch::hook::incident[0m[33m: [33mhook incident recorded, [1;33mreason_code[0m[33m: RCH-I010, [1;33mfailure_class[0m[33m: "daemon socket refused", [1;33mselected_mode[0m[33m: Local, [1;33mlocal_fallback_allowed[0m[33m: true[0m
+    [2;3mat[0m rch/src/hook.rs:1256 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:41:21.590921Z[0m [32m INFO[0m [1;32mrch::hook::auto_start[0m[32m: [32mDaemon unavailable, attempting auto-start[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:450 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T06:41:21.599097Z[0m [32m INFO[0m [1;32mrch::hook::auto_start_lock[0m[32m: [32mdoctor.autostart_lock.acquired, [1;32mpath[0m[32m: /tmp/rch/hook_autostart.lock, [1;32mpid[0m[32m: 59793[0m
+    [2;3mat[0m rch/src/hook/auto_start.rs:252 [2;3mon[0m ThreadId(1)
+
+[RCH] local (selection error: queue_timeout)
+    Blocking waiting for file lock on build directory

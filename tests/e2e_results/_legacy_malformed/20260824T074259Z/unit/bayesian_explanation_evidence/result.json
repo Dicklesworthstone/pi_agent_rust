@@ -1,0 +1,17 @@
+{
+  "schema": "pi.e2e.result.v1",
+  "result_kind": "unit",
+  "correlation_id": "20260824T074259Z-unsharded",
+  "target": "bayesian_explanation_evidence",
+  "exit_code": 1,
+  "duration_ms": 24546,
+  "passed": 0,
+  "failed": 1153651,
+  "ignored": 0,
+  "total": 1153651,
+  "log_file": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/bayesian_explanation_evidence/output.log",
+  "test_log_jsonl": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/bayesian_explanation_evidence/test-log.jsonl",
+  "artifact_index_jsonl": "/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/bayesian_explanation_evidence/artifact-index.jsonl",
+  "diagnostic_artifacts": {"artifact_index_jsonl":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/bayesian_explanation_evidence/artifact-index.jsonl","sha256":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size_bytes":0},"output_log":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/bayesian_explanation_evidence/output.log","sha256":"sha256:16609ce60bd27c599e4c2a65c44c39e5a811bde76235adac0cdbbe745d781a1b","size_bytes":1127},"schema":"pi.e2e.diagnostic_artifacts.v1","test_log_jsonl":{"path":"/Users/jemanuel/projects/pi_agent_rust/tests/e2e_results/20260824T074259Z/unit/bayesian_explanation_evidence/test-log.jsonl","sha256":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","size_bytes":0}},
+  "timestamp": "20260824T074259Z"
+}

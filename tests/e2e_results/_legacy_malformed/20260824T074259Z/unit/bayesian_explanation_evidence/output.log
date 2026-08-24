@@ -1,0 +1,13 @@
+  [2m2026-08-24T08:08:32.533486Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1153651 at root@38.242.134.66 (0 slots remaining after reservation, speed 47.1)[0m
+    [2;3mat[0m rch/src/hook.rs:2310 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T08:08:33.007933Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for pi_agent_rust (hash: 5efb998aae66b83a)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:426 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T08:08:33.007982Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 1 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:448 [2;3mon[0m ThreadId(1)
+
+  [2m2026-08-24T08:08:53.083191Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mRemote execution failed on vmi1153651 with SSH timeout; refusing local fallback: SSH command timed out after 20s[0m
+    [2;3mat[0m rch/src/hook.rs:2658 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1153651 failed [RCH-E104] SSH command timed out (no local fallback)
