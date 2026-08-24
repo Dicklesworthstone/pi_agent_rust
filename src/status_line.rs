@@ -109,33 +109,57 @@ impl StatusSegment {
 
     #[must_use]
     pub fn render(&self, ctx: &StatusContext) -> Option<String> {
+        self.render_with_icons(ctx, true)
+    }
+
+    fn render_with_icons(&self, ctx: &StatusContext, use_icons: bool) -> Option<String> {
+        fn text(value: &str) -> Option<String> {
+            let sanitized: String = value
+                .chars()
+                .filter(|character| !character.is_control())
+                .collect();
+            let sanitized = sanitized.trim();
+            (!sanitized.is_empty()).then(|| sanitized.to_string())
+        }
+
         match self.id {
             SegmentId::Model => {
-                if ctx.model.is_empty() {
-                    None
+                let model = text(ctx.model)?;
+                if use_icons {
+                    Some(format!("󰚩 {model}"))
                 } else {
-                    Some(format!("󰚩 {}", ctx.model))
+                    Some(model)
                 }
             }
-            SegmentId::Thinking => ctx.thinking_level.map(|lvl| format!("󱜙 {lvl}")),
-            SegmentId::Mode => {
-                if ctx.mode.is_empty() {
-                    None
+            SegmentId::Thinking => {
+                let level = text(ctx.thinking_level?)?;
+                Some(if use_icons {
+                    format!("󱜙 {level}")
                 } else {
-                    Some(ctx.mode.to_uppercase())
-                }
+                    format!("think:{level}")
+                })
+            }
+            SegmentId::Mode => {
+                let mode = text(ctx.mode)?;
+                Some(mode.to_uppercase())
             }
             SegmentId::Path => {
-                if ctx.cwd.is_empty() {
-                    None
+                let cwd = text(ctx.cwd)?;
+                if use_icons {
+                    Some(format!(" {cwd}"))
                 } else {
-                    Some(format!(" {}", ctx.cwd))
+                    Some(cwd)
                 }
             }
-            SegmentId::Git => ctx.git_branch.map(|branch| {
+            SegmentId::Git => {
+                let branch = text(ctx.git_branch?)?;
                 let status_icon = if ctx.git_dirty { "*" } else { "" };
-                format!(" {branch}{status_icon}")
-            }),
+                Some(if use_icons {
+                    format!(" {branch}{status_icon}")
+                } else {
+                    format!("git:{branch}{status_icon}")
+                })
+            }
             SegmentId::ContextPct => Some(format!("ctx: {}%", ctx.context_pct)),
             SegmentId::Cost => {
                 if ctx.cost_usd > 0.0 {
@@ -153,25 +177,24 @@ impl StatusSegment {
             }
             SegmentId::Subagents => {
                 if ctx.subagent_count > 0 {
-                    Some(format!("󰭻 {}", ctx.subagent_count))
+                    Some(if use_icons {
+                        format!("󰭻 {}", ctx.subagent_count)
+                    } else {
+                        format!("agents:{}", ctx.subagent_count)
+                    })
                 } else {
                     None
                 }
             }
             SegmentId::SessionName => {
-                if ctx.session_name.is_empty() {
-                    None
+                let session_name = text(ctx.session_name)?;
+                if use_icons {
+                    Some(format!("🏷 {session_name}"))
                 } else {
-                    Some(format!("🏷 {}", ctx.session_name))
+                    Some(format!("session:{session_name}"))
                 }
             }
-            SegmentId::Time => {
-                if ctx.timestamp_str.is_empty() {
-                    None
-                } else {
-                    Some(ctx.timestamp_str.to_string())
-                }
-            }
+            SegmentId::Time => text(ctx.timestamp_str),
         }
     }
 }
@@ -254,7 +277,7 @@ impl PowerlineStatusLine {
     pub fn render(&self, ctx: &StatusContext, available_width: usize) -> String {
         let mut rendered_segments = Vec::new();
         for seg in &self.segments {
-            if let Some(text) = seg.render(ctx) {
+            if let Some(text) = seg.render_with_icons(ctx, self.preset != StatusLinePreset::Ascii) {
                 rendered_segments.push((seg.priority, text));
             }
         }
@@ -292,6 +315,9 @@ impl PowerlineStatusLine {
             .map(|(_, text)| text)
             .collect::<Vec<_>>()
             .join(&sep_str)
+            .chars()
+            .take(available_width)
+            .collect()
     }
 }
 
@@ -369,7 +395,48 @@ mod tests {
 
         // Narrow terminal: lower priority segments dropped
         let narrow = status_line.render(&ctx, 35);
-        assert!(narrow.len() <= 35 || !narrow.contains(" / "));
+        assert!(narrow.chars().count() <= 35);
+    }
+
+    #[test]
+    fn test_status_line_clamps_a_single_long_segment() {
+        let ctx = StatusContext {
+            model: "model-name-that-is-much-too-long",
+            ..StatusContext::default()
+        };
+        let status_line = PowerlineStatusLine::with_preset(StatusLinePreset::Minimal);
+        let rendered = status_line.render(&ctx, 8);
+        assert_eq!(rendered.chars().count(), 8);
+    }
+
+    #[test]
+    fn test_ascii_preset_uses_only_ascii_chrome() {
+        let ctx = StatusContext {
+            model: "gpt-4o",
+            mode: "act",
+            git_branch: Some("main"),
+            git_dirty: true,
+            context_pct: 42,
+            ..StatusContext::default()
+        };
+        let status_line = PowerlineStatusLine::with_preset(StatusLinePreset::Ascii);
+        let rendered = status_line.render(&ctx, 120);
+        assert!(rendered.is_ascii(), "ASCII preset rendered {rendered:?}");
+        assert!(rendered.contains("git:main*"));
+    }
+
+    #[test]
+    fn test_status_line_strips_controls_from_context_fields() {
+        let ctx = StatusContext {
+            model: "safe\x1b]2;bad\nmodel",
+            mode: "act",
+            ..StatusContext::default()
+        };
+        let status_line = PowerlineStatusLine::with_preset(StatusLinePreset::Minimal);
+        let rendered = status_line.render(&ctx, 120);
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains('\n'));
+        assert!(rendered.contains("safe]2;badmodel"));
     }
 
     #[test]
