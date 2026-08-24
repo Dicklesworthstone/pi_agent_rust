@@ -172,12 +172,17 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     let env_root = session.harness.temp_dir().join("env");
     std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
     let pid_file = session.harness.temp_path("pi.pid");
+    // Outer-script xtrace to a file: survives instant session death and
+    // names the exact line that killed the wrapper before pi drew anything
+    // (same diagnostic the VCR mid-stream lane uses).
+    let trace_log = session.harness.temp_path("wrapper-trace.log");
 
     // Custom wrapper: pi runs in the FOREGROUND (it needs the tty for raw
     // mode) inside an inner `sh -c 'echo $$ > pid; exec pi ...'` — the exec
     // makes the recorded pid become pi's. After the kill the outer script
     // continues to the marker and hands the pane to an interactive shell.
     let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    let _ = writeln!(script, "exec 2>{}\nset -x", trace_log.display());
     for (key, sub) in [
         ("PI_CODING_AGENT_DIR", "agent"),
         ("PI_CONFIG_PATH", "config.toml"),
@@ -207,7 +212,11 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     // foreground process group is stale, and a job-control-less shell never
     // reclaims it — every later keystroke vanishes. A real user's shell has
     // job control and recovers; model that.
-    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i -m\n");
+    // `2>/dev/tty` gives the recovery shell its tty stderr back: the
+    // wrapper's xtrace redirect would otherwise make `sh -i` decide it is
+    // non-interactive (POSIX sh checks stdin AND stderr), suppressing the
+    // prompt and confounding the echo probe.
+    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i -m 2>/dev/tty\n");
 
     let script_path = session.harness.temp_path("sigkill-run.sh");
     std::fs::write(&script_path, &script).expect("write sigkill script"); // ubs:ignore test setup expect
@@ -221,6 +230,9 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         perms.set_mode(0o755);
         std::fs::set_permissions(&script_path, perms).expect("chmod sigkill script"); // ubs:ignore test setup expect
     }
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
 
     // Full launch: the banner proves raw mode/alt-screen/mouse are active.
     // Loud assert with environment forensics: wait_for_pane_contains
@@ -231,9 +243,11 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
         .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
     let wrapper_env = std::fs::read_to_string(session.harness.temp_path("wrapper-env.txt"))
         .unwrap_or_else(|_| String::from("<no dump>"));
+    let wrapper_trace = std::fs::read_to_string(&trace_log).unwrap_or_else(|_| String::from("<no trace>"));
+    let script_present = script_path.exists();
     assert!(
         startup_pane.contains("ftui preview stack"),
-        "startup banner never appeared; session_alive={}; wrapper_env:\n{wrapper_env}\nscript:\n{script}\npane:\n{startup_pane}",
+        "startup banner never appeared; session_alive={}; script_present={script_present}; wrapper_env:\n{wrapper_env}\nwrapper_trace:\n{wrapper_trace}\nscript:\n{script}\npane:\n{startup_pane}",
         session.tmux.session_exists()
     );
 
@@ -258,7 +272,8 @@ fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_acti
     // pane is the diagnostic.
     let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
         let pane = session.tmux.capture_pane();
-        panic!("read pi pid failed: {err}\npane:\n{pane}");
+        let trace = std::fs::read_to_string(&trace_log).unwrap_or_default();
+        panic!("read pi pid failed: {err}\npane:\n{pane}\nwrapper trace:\n{trace}");
     });
     let pid: i32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
     // Literal /bin/kill path is deliberate: portable signal delivery without
