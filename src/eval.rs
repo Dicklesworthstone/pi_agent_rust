@@ -65,6 +65,7 @@ impl PyKernel {
                 Error::tool("eval", format!("EVAL_SPAWN: {err}"))
             }
         })?;
+        crate::tools::attach_child_job_discipline(&child);
         let stdin = child
             .stdin
             .take()

@@ -890,6 +890,7 @@ impl ChildRunner {
                 return result;
             }
         };
+        crate::tools::attach_child_job_discipline(&child);
         let mut child = ChildProcessGuard::new(child);
         result.pid = Some(child.id());
         result.status = SubagentStatus::Running;

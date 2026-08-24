@@ -3122,6 +3122,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     crate::tools::isolate_command_process_group(&mut command);
 
                     let mut child = command.spawn().map_err(|err| err.to_string())?;
+                    crate::tools::attach_child_job_discipline(&child);
                     let pid = child.id();
 
                     let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
@@ -3288,6 +3289,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 crate::tools::isolate_command_process_group(&mut command);
 
                 let mut child = command.spawn().map_err(|err| err.to_string())?;
+                crate::tools::attach_child_job_discipline(&child);
                 let pid = child.id();
 
                 let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;

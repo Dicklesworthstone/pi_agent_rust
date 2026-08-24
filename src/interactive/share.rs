@@ -30,6 +30,7 @@ pub(super) async fn run_command_output(
         .stderr(Stdio::piped());
     crate::tools::isolate_command_process_group(&mut child);
     let child = child.spawn()?;
+    crate::tools::attach_child_job_discipline(&child);
     let pid = child.id();
 
     let (tx, rx) = std_mpsc::channel();

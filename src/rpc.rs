@@ -5685,6 +5685,7 @@ async fn run_bash_rpc(
     let mut child = child
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+    crate::tools::attach_child_job_discipline(&child);
 
     let Some(stdout) = child.stdout.take() else {
         return Err(Error::tool("bash", "Missing stdout".to_string()));

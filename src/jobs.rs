@@ -267,6 +267,7 @@ pub fn spawn_background(
     let mut child = cmd
         .spawn()
         .map_err(|e| Error::tool("bash", format!("Failed to spawn shell: {e}")))?;
+    crate::tools::attach_child_job_discipline(&child);
     let pid = child.id();
     let stdout = child
         .stdout

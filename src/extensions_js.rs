@@ -19668,6 +19668,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                 crate::tools::isolate_command_process_group(&mut command);
 
                                 let mut child = command.spawn().map_err(|e| e.to_string())?;
+                                crate::tools::attach_child_job_discipline(&child);
                                 let pid = child.id();
 
                                 let stdout_pipe =
@@ -30058,11 +30059,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 self.0.insert(field.name().to_string(), value.to_string());
             }
 
-            fn record_debug(
-                &mut self,
-                field: &tracing::field::Field,
-                value: &dyn std::fmt::Debug,
-            ) {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
                 self.0
                     .insert(field.name().to_string(), format!("{value:?}"));
             }

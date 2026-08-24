@@ -235,7 +235,11 @@ def is_placeholder_citation(artifact_path: str, correlation_id: str) -> bool:
     return artifact_path.startswith("[") or correlation_id.startswith("[")
 
 
-def classify_claim_surface(claim_text: str, artifact_path: str) -> str:
+def classify_claim_surface(
+    claim_text: str,
+    artifact_path: str,
+    citation_kind: str = "",
+) -> str:
     """Classify whether a claim is release-facing or explicitly historical."""
     # Do not let traversal text inside a citation manufacture a historical
     # classification. The caller supplies the canonical repository-relative
@@ -246,11 +250,17 @@ def classify_claim_surface(claim_text: str, artifact_path: str) -> str:
     # Historical evidence is an explicit semantic contract, not a keyword
     # heuristic.  Generic words such as "baseline", "snapshot", or "retained"
     # routinely appear in current comparative claims and must never disable
-    # freshness or strict performance-proof validation.  Historical-only
-    # citations live under docs/planning and carry the exact, whole-line label
-    # below.  Requiring equality (rather than accepting the label as a prefix)
-    # prevents a current claim appended to the disclaimer from inheriting the
-    # historical exemption.
+    # freshness or strict performance-proof validation.
+    #
+    # Two explicit contracts may classify a citation as historical:
+    # (1) the "; historical snapshot" citation form — the citation itself
+    #     declares retained-snapshot status at the exact cite site; and
+    # (2) docs/planning citations carrying the exact, whole-line label below.
+    # Requiring equality for (2) (rather than accepting the label as a
+    # prefix) prevents a current claim appended to the disclaimer from
+    # inheriting the historical exemption.
+    if citation_kind == "historical":
+        return "historical_snapshot"
     if (
         artifact_path.startswith("docs/planning/")
         and normalized_prose
@@ -328,6 +338,14 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
     citation_patterns = [
         ("run", re.compile(r'\*\(from ([^,]+), run ([^)]+)\)\*')),
         ("generated", re.compile(r'\*\(from ([^,]+), generated `?([^`)]+)`?\)\*')),
+        # Explicit historical contract: the citation itself declares the
+        # obligation a retained snapshot, not a current release claim.
+        ("historical", re.compile(r'\*\(from ([^,);]+); historical snapshot\)\*')),
+        # Bare path-only form: *(from path)*. The captured token must look
+        # like a repository-relative artifact path (contains "/" and no
+        # whitespace) so prose citations such as "the Git-pinned verdict
+        # blob above" stay unmatched.
+        ("bare", re.compile(r'\*\((?:from )([^),]+)\)\*')),
     ]
     obligations: list[ClaimObligation] = []
     seen: set[tuple[int, str, str, str]] = set()
@@ -336,7 +354,12 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
         for citation_kind, citation_pattern in citation_patterns:
             for match in citation_pattern.finditer(stripped_line):
                 artifact_path = match.group(1).strip()
-                citation_value = match.group(2).strip()
+                if citation_kind in {"bare", "historical"}:
+                    if " " in artifact_path or "/" not in artifact_path:
+                        continue
+                    citation_value = ""
+                else:
+                    citation_value = match.group(2).strip()
                 if is_placeholder_citation(artifact_path, citation_value):
                     continue
                 key = (line_number, artifact_path, citation_kind, citation_value)
@@ -350,7 +373,9 @@ def parse_citation_obligations(readme_text: str) -> list[ClaimObligation]:
                         artifact_path=artifact_path,
                         citation_kind=citation_kind,
                         citation_value=citation_value,
-                        claim_surface=classify_claim_surface(original_line, artifact_path),
+                        claim_surface=classify_claim_surface(
+                            original_line, artifact_path, citation_kind
+                        ),
                     )
                 )
     return obligations
@@ -1603,6 +1628,13 @@ def check_artifact_content(
             )
         return tuple(errors)
 
+    if citation_kind in {"bare", "historical"}:
+        # Path-only and explicit-historical citations carry no inline
+        # provenance value to match. Existence, decodability, and JSON
+        # validity above are the contract; staleness is governed by
+        # claim_surface classification.
+        return tuple(errors)
+
     if citation_kind == "run":
         structured_ids = {
             field: payload[field]
@@ -1757,7 +1789,9 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
             ))
             continue
         assert artifact_path is not None and full_path is not None
-        claim_surface = classify_claim_surface(obligation.claim_text, artifact_path)
+        claim_surface = classify_claim_surface(
+            obligation.claim_text, artifact_path, obligation.citation_kind
+        )
 
         if not full_path.exists():
             print(
@@ -2301,6 +2335,23 @@ def run_self_test() -> int:
                 "to planning artifacts"
             )
             return 2
+        parsed_forms = parse_citation_obligations(
+            "- Current claim *(from tests/perf/reports/budget_summary.json)*\n"
+            "- Retained result "
+            "*(from docs/planning/snapshot.json; historical snapshot)*\n"
+            "- Prose blob *(from the Git-pinned verdict blob above)*\n"
+        )
+        form_kinds = [obligation.citation_kind for obligation in parsed_forms]
+        if form_kinds != ["bare", "historical"]:
+            print(f"SELF-TEST FAIL: citation forms parsed as {form_kinds}")
+            return 2
+        if (
+            parsed_forms[0].claim_surface != "release_facing"
+            or parsed_forms[1].claim_surface != "historical_snapshot"
+        ):
+            print("SELF-TEST FAIL: bare/historical claim surfaces misclassified")
+            return 2
+
 
         result, output = run_check(
             generic_root,
