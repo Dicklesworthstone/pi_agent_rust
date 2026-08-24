@@ -132,3 +132,53 @@ fn test_pmu_opportunity_ranker() {
 
     finish_case(&harness, "pmu_opportunity_ranker");
 }
+
+#[test]
+fn test_pmu_edge_cases_and_categories() {
+    let harness = TestHarness::new("pmu_edge_cases_and_categories");
+
+    // Zero-cycle sample shouldn't divide by zero or panic
+    let zero_sample = PmuSample::default();
+    assert_eq!(zero_sample.ipc(), 0.0);
+    assert_eq!(zero_sample.llc_miss_rate(), 0.0);
+    assert_eq!(zero_sample.branch_miss_rate(), 0.0);
+    assert_eq!(zero_sample.frontend_stall_ratio(), 0.0);
+    assert_eq!(zero_sample.backend_stall_ratio(), 0.0);
+    assert_eq!(zero_sample.total_stall_ratio(), 0.0);
+
+    let zero_opp = PmuOpportunityRanker::score_candidate("zero_sample", &zero_sample);
+    assert_eq!(zero_opp.estimated_speedup, 1.0);
+    assert_eq!(zero_opp.bottleneck_category, "compute_bound");
+    assert_eq!(zero_opp.confidence, 0.50);
+
+    // Branch-heavy candidate
+    let branch_sample = PmuSample {
+        cycles: 60_000,
+        instructions: 40_000,
+        llc_references: 100,
+        llc_misses: 5,
+        branch_instructions: 10_000,
+        branch_misses: 1_200, // 12% branch mispredict rate > 8%
+        frontend_stall_cycles: 5_000,
+        backend_stall_cycles: 10_000,
+    };
+    let branch_opp = PmuOpportunityRanker::score_candidate("branch_heavy", &branch_sample);
+    assert_eq!(branch_opp.bottleneck_category, "branch_mispredict_heavy");
+    assert_eq!(branch_opp.confidence, 0.95);
+
+    // Frontend starvation candidate
+    let frontend_sample = PmuSample {
+        cycles: 60_000,
+        instructions: 30_000,
+        llc_references: 100,
+        llc_misses: 5,
+        branch_instructions: 2_000,
+        branch_misses: 20,
+        frontend_stall_cycles: 20_000, // 33% frontend stall ratio > 25%
+        backend_stall_cycles: 2_000,
+    };
+    let frontend_opp = PmuOpportunityRanker::score_candidate("frontend_heavy", &frontend_sample);
+    assert_eq!(frontend_opp.bottleneck_category, "frontend_instruction_starvation");
+
+    finish_case(&harness, "pmu_edge_cases_and_categories");
+}
