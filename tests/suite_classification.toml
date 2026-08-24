@@ -341,6 +341,7 @@ files = [
     "e2e_soak_stability",
     "e2e_swarm_flight_recorder",
     "e2e_tools",
+    "e2e_ssh_workspace",
     "e2e_ts_extension_loading",
     "e2e_tui",
     "e2e_tui_features",

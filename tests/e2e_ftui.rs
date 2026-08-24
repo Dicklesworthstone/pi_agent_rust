@@ -376,6 +376,148 @@ fn e2e_ftui_sigkill_recoverable_with_stty_sane() {
 /// BEFORE pi launches stays visible above the live UI (no alt-screen
 /// takeover). The fullscreen control group proves the assertion has teeth:
 /// there the alt screen hides the sentinel while the UI runs.
+/// Ctrl+z suspend/resume (bd-cv653.9.1 round-4): SIGTSTP hands the tty back
+/// to the wrapping shell (job-control `-m` sh reports "Stopped"), `fg`
+/// delivers SIGCONT, and pi must re-acquire raw mode + alternate screen and
+/// repaint. Ordered waits prove each transition: the initial banner lives in
+/// the alternate screen and vanishes from capture on suspend, so a second
+/// sighting after `fg` can only come from the resumed repaint.
+#[test]
+fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
+    use std::fmt::Write as _;
+
+    let Some((_lock, session)) = new_locked_session("e2e_ftui_ctrl_z_suspend_fg_resumes") else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+    let Some(binary) = std::env::var_os("CARGO_BIN_EXE_pi") else {
+        eprintln!("Skipping: CARGO_BIN_EXE_pi not set");
+        return;
+    };
+    let binary = std::path::PathBuf::from(binary);
+
+    let env_root = session.harness.temp_dir().join("env"); // ubs:ignore test setup expect
+    std::fs::create_dir_all(&env_root).expect("create env root"); // ubs:ignore test setup expect
+    let pid_file = session.harness.temp_path("pi.pid");
+    let trace_log = session.harness.temp_path("wrapper-trace.log");
+
+    let mut script = String::from("#!/usr/bin/env sh\nset -u\n");
+    let _ = writeln!(script, "exec 2>{}\nset -x", trace_log.display());
+    for (key, sub) in [
+        ("PI_CODING_AGENT_DIR", "agent"),
+        ("PI_CONFIG_PATH", "config.toml"),
+        ("PI_SESSIONS_DIR", "sessions"),
+        ("PI_PACKAGE_DIR", "packages"),
+    ] {
+        let _ = writeln!(script, "export {key}={}", env_root.join(sub).display());
+    }
+    script.push_str("export PI_TEST_MODE=1\nexport OPENAI_API_KEY=pi-e2e-suspend-dummy\n");
+    let _ = writeln!(
+        script,
+        "/bin/sh -c 'echo $$ > {pid}; exec {bin} --ftui --no-session \
+         --provider openai --model gpt-4o-mini --no-skills \
+         --no-prompt-templates --no-extensions --no-themes'",
+        pid = pid_file.display(),
+        bin = binary.display()
+    );
+    script.push_str("echo PI-WAIT-DONE\nexec /bin/sh -i -m 2>/dev/tty\n");
+
+    let script_path = session.harness.temp_path("suspend-run.sh");
+    std::fs::write(&script_path, &script).expect("write suspend script"); // ubs:ignore test setup expect
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat suspend script") // ubs:ignore test setup expect
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod suspend script"); // ubs:ignore test setup expect
+    }
+    session
+        .tmux
+        .start_session(session.harness.temp_dir(), &script_path);
+
+    // 1) Live launch on the ftui runtime.
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", STARTUP_TIMEOUT);
+    assert!(
+        pane.contains("ftui preview stack"),
+        "startup banner never appeared; pane:\n{pane}"
+    );
+
+    // 2) Ctrl+z: pi raises SIGTSTP against itself after restoring cooked
+    // mode, so the kernel stops its process group. Detect the stop through
+    // the recorded pid's process state ('T') rather than pane text: the
+    // stopped foreground process cannot echo anything, and shell job notices
+    // race our keystrokes into the stopped process's input buffer.
+    let pid_text = std::fs::read_to_string(&pid_file).unwrap_or_else(|err| {
+        let pane = session.tmux.capture_pane();
+        panic!("read pi pid failed: {err}\npane:\n{pane}");
+    });
+    let pid: u32 = pid_text.trim().parse().expect("parse pi pid"); // ubs:ignore test assertion expect
+
+    fn process_state(pid: u32) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .map(|out| out.stdout)
+                .unwrap_or_default(),
+        )
+        .trim()
+        .to_string()
+    }
+
+    let start = Instant::now();
+    loop {
+        let state = process_state(pid);
+        if state.starts_with('T') {
+            break;
+        }
+        assert!(
+            !state.is_empty(),
+            "pi pid {pid} vanished instead of stopping"
+        );
+        assert!(
+            start.elapsed() < COMMAND_TIMEOUT,
+            "pi pid {pid} never entered stopped state (state={state})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // 3) `fg` resumes pi: SIGCONT wakes the suspend task, which re-enters
+    // raw mode + alt screen and forces the full repaint. Confirm both the
+    // banner repaint AND the process actually leaving the stopped state.
+    session.tmux.send_literal("fg");
+    session.tmux.send_key("Enter");
+
+    let start = Instant::now();
+    loop {
+        let state = process_state(pid);
+        if !state.is_empty() && !state.starts_with('T') {
+            break;
+        }
+        assert!(
+            start.elapsed() < COMMAND_TIMEOUT,
+            "pi pid {pid} never left stopped state after fg"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let pane = session
+        .tmux
+        .wait_for_pane_contains("ftui preview stack", COMMAND_TIMEOUT);
+    assert!(
+        pane.contains("ftui preview stack"),
+        "banner never repainted after fg; pi did not resume cleanly; pane:\n{pane}"
+    );
+
+    // 4) The resumed session still exits cleanly on ctrl+c (RAII teardown).
+    quit_and_assert_clean(&session);
+    session.tmux.kill_server();
+}
+
 fn launch_with_sentinel(session: &TuiSession, sentinel: &str, inline: bool) {
     use std::fmt::Write as _;
 

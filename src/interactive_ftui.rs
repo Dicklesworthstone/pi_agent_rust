@@ -184,8 +184,16 @@ fn perform_terminal_suspend(alt_screen: bool) -> std::io::Result<(u16, u16)> {
         out.flush()?;
     }
 
+    let _ = std::fs::write(
+        "/tmp/ftui-suspend-markers",
+        format!("entered-raise pid={}\n", std::process::id()),
+    );
     // Stops the process here; resumes after `fg`.
     signal_hook::low_level::raise(signal_hook::consts::signal::SIGTSTP)?;
+    let _ = std::fs::write(
+        "/tmp/ftui-suspend-markers",
+        format!("resumed pid={}\n", std::process::id()),
+    );
 
     // --- continued ---
     enable_raw_mode()?;
@@ -705,6 +713,10 @@ pub struct PiFtuiModel {
     /// nothing into the restored cooked terminal). Cleared by
     /// [`PiFtuiMsg::Resumed`].
     suspending: bool,
+    /// Test seam replacing the real SIGTSTP task (which would stop or fail
+    /// on a headless test host). `None` in production.
+    #[cfg(test)]
+    suspend_task_override: Option<Box<dyn FnOnce() -> PiFtuiMsg + Send>>,
 }
 
 /// Vertical frame regions, top to bottom. The clamp/normalize string hacks of
@@ -779,6 +791,8 @@ impl PiFtuiModel {
 
             alt_screen: false,
             suspending: false,
+            #[cfg(test)]
+            suspend_task_override: None,
             input: TextArea::new()
                 .with_placeholder("Type a message (Enter to send, Alt+Enter for newline)")
                 .with_focus(true)
@@ -837,6 +851,19 @@ impl PiFtuiModel {
     #[must_use]
     pub fn with_alt_screen(mut self, alt_screen: bool) -> Self {
         self.alt_screen = alt_screen;
+        self
+    }
+
+    /// Swap in a fake suspend task (tests only): the simulator executes
+    /// `Cmd::Task` closures synchronously, so the real SIGTSTP closure would
+    /// touch termios (and stop the process) inside a unit test.
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_suspend_task(
+        mut self,
+        task: impl FnOnce() -> PiFtuiMsg + Send + 'static,
+    ) -> Self {
+        self.suspend_task_override = Some(Box::new(task));
         self
     }
 
@@ -1650,10 +1677,21 @@ impl PiFtuiModel {
                         // hand the terminal dance to a task: it restores
                         // cooked mode, stops on SIGTSTP, re-acquires the
                         // terminal after SIGCONT, and reports back.
+                        self.suspending = true;
                         #[cfg(unix)]
                         {
-                            self.suspending = true;
-                            return Cmd::task(suspend_task(self.alt_screen));
+                            let _ = std::fs::write(
+                                "/tmp/ftui-suspend-markers",
+                                format!("dispatched pid={}\n", std::process::id()),
+                            );
+                            #[cfg(test)]
+                            let task = self
+                                .suspend_task_override
+                                .take()
+                                .unwrap_or_else(|| Box::new(suspend_task(self.alt_screen)));
+                            #[cfg(not(test))]
+                            let task = suspend_task(self.alt_screen);
+                            return Cmd::task(task);
                         }
                         #[cfg(not(unix))]
                         {
@@ -3152,7 +3190,7 @@ pub fn run(
 mod tests {
     use super::*;
     use crate::model::StopReason;
-    use ftui::runtime::simulator::ProgramSimulator;
+    use ftui::runtime::simulator::{CmdRecord, ProgramSimulator};
     use ftui::{KeyEvent, KeyEventKind};
     use std::sync::mpsc;
 
@@ -3190,6 +3228,70 @@ mod tests {
         assert_eq!(transcript[0].text, "hello world");
         assert_eq!(transcript[0].role, EntryRole::Assistant);
         assert!(sim.model().streaming.is_empty());
+    }
+
+    #[test]
+    fn ctrl_z_dispatches_suspend_task_and_fake_resumes() {
+        let (_tx, model) = new_model();
+        let model = model
+            .with_alt_screen(true)
+            .with_suspend_task(|| PiFtuiMsg::Resumed);
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // The simulator executes Cmd::Task closures synchronously: our fake
+        // stands in for the real SIGTSTP closure (which would touch termios
+        // and stop the process on this host). End state: freeze requested,
+        // fake ran, Resumed cleared it.
+        sim.inject_event(key(KeyCode::Char('z'), Modifiers::CTRL));
+        assert!(!sim.model().suspending);
+        assert!(sim
+            .command_log()
+            .iter()
+            .any(|record| matches!(record, CmdRecord::Task)));
+    }
+
+    #[test]
+    fn suspend_freeze_gates_ticks_until_resize_clears_it() {
+        let (_tx, mut model) = new_model();
+        model.state = AgentUiState::Working;
+        model.suspending = true;
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+
+        // Frozen: ticks must not mutate the model — byte-identical pre-stop
+        // frames keep the diff engine silent between terminal restore and
+        // SIGTSTP delivery.
+        let before = sim.model().spinner.current_frame;
+        sim.send(PiFtuiMsg::Term(Event::Tick));
+        assert_eq!(sim.model().spinner.current_frame, before);
+
+        // The suspend task reports back through a Resize after SIGCONT:
+        // unfreezes ticks and adopts the post-resume size.
+        sim.send(PiFtuiMsg::Term(Event::Resize { width: 100, height: 30 }));
+        assert!(!sim.model().suspending);
+        assert_eq!(sim.model().term, (100, 30));
+        let before = sim.model().spinner.current_frame;
+        sim.send(PiFtuiMsg::Term(Event::Tick));
+        assert_eq!(sim.model().spinner.current_frame, before + 1);
+    }
+
+    #[test]
+    fn resumed_message_clears_suspend_freeze() {
+        let (_tx, mut model) = new_model();
+        model.suspending = true;
+        let mut sim = ProgramSimulator::new(model);
+        sim.init();
+        sim.send(PiFtuiMsg::Resumed);
+        assert!(!sim.model().suspending);
+    }
+
+    #[test]
+    fn with_alt_screen_records_launch_mode_for_suspend() {
+        let (_tx, model) = new_model();
+        assert!(!model.alt_screen);
+        let model = model.with_alt_screen(true);
+        assert!(model.alt_screen);
     }
 
     #[test]
