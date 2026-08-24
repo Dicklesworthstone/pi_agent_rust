@@ -68,6 +68,11 @@ fixture_test!(test_ast_edit_fixtures, "ast_edit_tool");
 fixture_test!(test_xdev_fixtures, "xdev_tool");
 fixture_test!(test_web_search_fixtures, "web_search_tool");
 fixture_test!(test_cli_flag_fixtures, "cli_flags");
+fixture_test!(test_media_fixtures, "media_tools");
+fixture_test!(test_computer_fixtures, "computer_tool");
+fixture_test!(test_browser_fixtures, "browser_tool");
+fixture_test!(test_ask_fixtures, "ask_tool");
+fixture_test!(test_todo_fixtures, "todo_tool");
 
 /// Run truncation tests from fixtures.
 #[test]
@@ -113,6 +118,12 @@ fn test_all_fixtures_exist() {
         "hashline_edit_tool",
         "truncation",
         "cli_flags",
+        "web_search_tool",
+        "media_tools",
+        "computer_tool",
+        "browser_tool",
+        "ask_tool",
+        "todo_tool",
     ];
 
     for fixture_name in &expected_fixtures {

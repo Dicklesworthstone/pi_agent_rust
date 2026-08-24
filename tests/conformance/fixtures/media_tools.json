@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "tool": "inspect_image",
+  "description": "Media trio tool contract (bd-cv653.2.7): schema validation, boundary checks, and named errors without external networks.",
+  "cases": [
+    {
+      "name": "inspect_image_requires_path",
+      "description": "missing path is a named validation error",
+      "requirement_ids": ["MEDIA-1"],
+      "expect_error": true,
+      "error_contains": "path",
+      "input": {},
+      "expected": {}
+    },
+    {
+      "name": "inspect_image_empty_path_error",
+      "description": "empty path string produces an error",
+      "requirement_ids": ["MEDIA-2"],
+      "expect_error": true,
+      "error_contains": "path",
+      "input": {"path": ""},
+      "expected": {}
+    },
+    {
+      "name": "inspect_image_missing_file_error",
+      "description": "nonexistent image file produces file not found error",
+      "requirement_ids": ["MEDIA-3"],
+      "expect_error": true,
+      "error_contains": "file",
+      "input": {"path": "nonexistent_image_12345.png"},
+      "expected": {}
+    }
+  ]
+}

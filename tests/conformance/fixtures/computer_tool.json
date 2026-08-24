@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "tool": "computer",
+  "description": "Computer desktop automation tool contract (bd-cv653.2.5): action dispatch and schema validation.",
+  "cases": [
+    {
+      "name": "computer_requires_action",
+      "description": "missing action produces a validation error",
+      "requirement_ids": ["COMP-1"],
+      "expect_error": true,
+      "error_contains": "action",
+      "input": {},
+      "expected": {}
+    },
+    {
+      "name": "computer_unknown_action_error",
+      "description": "unsupported action produces named error",
+      "requirement_ids": ["COMP-2"],
+      "expect_error": true,
+      "error_contains": "unknown",
+      "input": {"action": "invalid_action_xyz"},
+      "expected": {}
+    },
+    {
+      "name": "computer_mouse_move_requires_coords",
+      "description": "mouse_move without x/y coordinates fails",
+      "requirement_ids": ["COMP-3"],
+      "expect_error": true,
+      "error_contains": "coordinate",
+      "input": {"action": "mouse_move"},
+      "expected": {}
+    }
+  ]
+}

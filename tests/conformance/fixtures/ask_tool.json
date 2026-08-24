@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "tool": "ask",
+  "description": "Ask tool contract (bd-cv653.3.8): question prompt and choices schema validation.",
+  "cases": [
+    {
+      "name": "ask_requires_question",
+      "description": "missing question string produces validation error",
+      "requirement_ids": ["ASK-1"],
+      "expect_error": true,
+      "error_contains": "question",
+      "input": {},
+      "expected": {}
+    },
+    {
+      "name": "ask_empty_question_error",
+      "description": "empty question string produces error",
+      "requirement_ids": ["ASK-2"],
+      "expect_error": true,
+      "error_contains": "question",
+      "input": {"question": ""},
+      "expected": {}
+    },
+    {
+      "name": "ask_requires_choices_or_text",
+      "description": "ask tool validates options list structure",
+      "requirement_ids": ["ASK-3"],
+      "expect_error": true,
+      "error_contains": "options",
+      "input": {"question": "Select target?", "options": []},
+      "expected": {}
+    }
+  ]
+}

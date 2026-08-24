@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "tool": "todo",
+  "description": "Todo task tracking tool contract (bd-cv653.3.9): tasks array and phase validation.",
+  "cases": [
+    {
+      "name": "todo_requires_action_or_items",
+      "description": "empty input to todo produces validation error",
+      "requirement_ids": ["TODO-1"],
+      "expect_error": true,
+      "error_contains": "action",
+      "input": {},
+      "expected": {}
+    },
+    {
+      "name": "todo_unknown_action_error",
+      "description": "unsupported todo action produces named error",
+      "requirement_ids": ["TODO-2"],
+      "expect_error": true,
+      "error_contains": "unknown",
+      "input": {"action": "wipe_all"},
+      "expected": {}
+    },
+    {
+      "name": "todo_add_requires_title",
+      "description": "add action requires task title",
+      "requirement_ids": ["TODO-3"],
+      "expect_error": true,
+      "error_contains": "title",
+      "input": {"action": "add"},
+      "expected": {}
+    }
+  ]
+}

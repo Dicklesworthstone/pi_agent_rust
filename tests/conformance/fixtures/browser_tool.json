@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "tool": "browser",
+  "description": "Browser automation tool contract (bd-cv653.2.4): multi-tab lifecycle and CDP validation.",
+  "cases": [
+    {
+      "name": "browser_requires_action",
+      "description": "missing action produces a validation error",
+      "requirement_ids": ["BROWSER-1"],
+      "expect_error": true,
+      "error_contains": "action",
+      "input": {},
+      "expected": {}
+    },
+    {
+      "name": "browser_unknown_action_error",
+      "description": "unsupported browser action produces named error",
+      "requirement_ids": ["BROWSER-2"],
+      "expect_error": true,
+      "error_contains": "unknown",
+      "input": {"action": "destroy_all_browsers"},
+      "expected": {}
+    },
+    {
+      "name": "browser_goto_requires_url",
+      "description": "goto action requires url parameter",
+      "requirement_ids": ["BROWSER-3"],
+      "expect_error": true,
+      "error_contains": "url",
+      "input": {"action": "goto"},
+      "expected": {}
+    }
+  ]
+}
