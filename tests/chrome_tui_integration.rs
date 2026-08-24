@@ -78,11 +78,14 @@ fn test_chrome_modules_tui_integration() {
         .log()
         .info("delight", "title and sparkline rendered");
 
-    // 5. Gallery matrix verification
-    let matrix = pi::gallery::GalleryMatrix::new();
-    let json_report = matrix.render_report_json();
+    // 5. Gallery entry point verification through the shipped CLI.
+    let gallery = std::process::Command::new(env!("CARGO_BIN_EXE_pi"))
+        .args(["gallery", "--format", "json"])
+        .output()
+        .expect("run pi gallery");
+    assert!(gallery.status.success(), "pi gallery failed: {gallery:?}");
+    let json_report = String::from_utf8(gallery.stdout).expect("gallery stdout is UTF-8");
     assert!(json_report.contains("pi.gallery.matrix.v1"));
-    assert!(!matrix.items.is_empty());
     harness
         .log()
         .info("gallery", "gallery matrix report generated");

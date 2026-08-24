@@ -3161,7 +3161,7 @@ impl SessionStoreV2 {
             .ok_or_else(|| Error::session(format!("checkpoint {checkpoint_seq} not found")))?;
 
         let frames = self.read_entries_up_to_seq(checkpoint.head_entry_seq)?;
-        let mut target_store = Self::open(target_dir)?;
+        let mut target_store = Self::create(target_dir, self.max_segment_bytes)?;
         for frame in frames {
             let payload_value: Value = serde_json::from_str(frame.payload.get())?;
             target_store.append_entry(

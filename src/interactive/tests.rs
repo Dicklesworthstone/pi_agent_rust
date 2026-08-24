@@ -283,6 +283,45 @@ fn render_header_uses_cycle_thinking_binding_hint() {
 
     assert!(header.contains("shift+tab: thinking"), "header: {header}");
     assert!(!header.contains("ctrl+t: thinking"), "header: {header}");
+    assert!(
+        header.contains("\x1b]0;Pi · gpt-5.2 · ready\x07"),
+        "live header must emit the delight terminal title: {header:?}"
+    );
+}
+
+#[test]
+fn live_view_renders_default_welcome_and_powerline_status() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.startup_welcome.clear();
+
+    let view = app.view();
+
+    assert!(view.contains("Welcome to Pi Agent"), "view: {view}");
+    assert!(view.contains("Tip: Type /help"), "view: {view}");
+    assert!(view.contains("ACT"), "powerline mode missing: {view}");
+    assert!(
+        view.contains("ctx: 0%"),
+        "powerline context missing: {view}"
+    );
+}
+
+#[test]
+fn live_view_applies_rich_markdown_enhancements() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(200, 40);
+    app.messages.push(ConversationMessage::new(
+        MessageRole::Assistant,
+        "Use #ff5500 for \\alpha.".to_string(),
+        None,
+    ));
+
+    let view = app.view();
+
+    assert!(view.contains('α'), "LaTeX enhancement missing: {view}");
+    assert!(view.contains("■ #ff5500"), "hex swatch missing: {view}");
 }
 
 #[test]
