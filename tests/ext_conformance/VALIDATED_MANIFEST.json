@@ -7421,20 +7421,12 @@
         "registers_providers": false,
         "subscribes_events": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ],
         "uses_exec": true,
         "uses_http": false,
@@ -7457,20 +7449,12 @@
         "flags": [],
         "event_handlers": [
           "model_select",
-          "session_branch",
           "session_shutdown",
           "session_start",
-          "session_switch",
-          "sub-core:action",
           "sub-core:ready",
-          "sub-core:request",
-          "sub-core:settings:patch",
           "sub-core:settings:updated",
           "sub-core:update-all",
-          "sub-core:update-current",
-          "tool_result",
-          "turn_end",
-          "turn_start"
+          "sub-core:update-current"
         ]
       }
     },
