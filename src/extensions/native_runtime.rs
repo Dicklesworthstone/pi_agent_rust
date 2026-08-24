@@ -1,4 +1,4 @@
-//! Active deterministic native extension runtime scaffold.
+//! Active deterministic native descriptor extension runtime.
 
 use super::{
     Error, ExtensionRepairEvent, ExtensionToolDef, JsExtensionLoadSpec, JsExtensionRuntimeHandle,

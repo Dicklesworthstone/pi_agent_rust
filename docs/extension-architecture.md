@@ -390,7 +390,7 @@ touching real tools, network, or filesystem.
 | `src/extensions/exec_mediation.rs` | Dangerous-command classification and secret-broker policy implementation |
 | `src/extensions/permission_drift.rs` | Permission snapshot drift classification and evidence |
 | `src/extensions/event_coalescer_impl.rs` | Coalesced event-dispatch implementation |
-| `src/extensions/native_runtime_duplicate_scaffold.rs` | Active deterministic native descriptor runtime |
+| `src/extensions/native_runtime.rs` | Active deterministic native descriptor runtime |
 | `src/extensions/native_runtime_experimental.rs` | Retained, compile-disabled native runtime prototype |
 | `src/extensions/wasm_host.rs` | Feature-gated Wasmtime component host and its conformance tests |
 | `src/extensions/compatibility.rs` | Extension compatibility scanner |
