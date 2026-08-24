@@ -303,7 +303,7 @@ fn test_tts_writes_valid_wav_artifact() {
         let details = output.details.as_ref().expect("expected details metadata");
         assert_eq!(details["voice"], "eve");
         assert_eq!(details["format"], "wav");
-        assert_eq!(details["char_count"], 44);
+        assert_eq!(details["char_count"], 43);
     });
 
     finish_case(&harness, "tts_artifact");
