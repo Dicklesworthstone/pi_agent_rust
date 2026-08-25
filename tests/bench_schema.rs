@@ -708,6 +708,25 @@ fn run_persistence_fault_runner_with_fake_rch(
 #[cfg(unix)]
 #[test]
 fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed() {
+    let runner = fs::read_to_string(
+        project_root().join("scripts/e2e/run_persistence_fault_injection.sh"),
+    )
+    .expect("read persistence fault runner");
+    assert!(
+        runner.contains("time.monotonic_ns() // 1_000_000"),
+        "duration measurement must use a portable monotonic clock"
+    );
+    assert!(
+        !runner.contains("date +%s%N"),
+        "the runner must not depend on GNU date nanoseconds"
+    );
+    for token in ["fcntl.LOCK_EX", "RUN_NONCE", "PERSISTENCE_REPORT_LOCK_HELD"] {
+        assert!(
+            runner.contains(token),
+            "concurrent RCH report retrieval guard must include {token}"
+        );
+    }
+
     let success_root = unique_temp_dir("persistence-rch-success");
     let success_correlation = "persistence-rch-success-correlation";
     let success = run_persistence_fault_runner_with_fake_rch(
@@ -727,7 +746,18 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
             .expect("read successful integrity summary"),
     )
     .expect("parse successful integrity summary");
+    assert_eq!(success_summary["run_id"], success_correlation);
     assert_eq!(success_summary["correlation_id"], success_correlation);
+    assert!(
+        success_summary["source_commit"]
+            .as_str()
+            .is_some_and(|value| value.len() == 40),
+        "persistence summary must bind the full source commit"
+    );
+    assert!(
+        success_summary["source_dirty"].is_boolean(),
+        "persistence summary must bind source dirty state"
+    );
     assert_eq!(success_summary["overall_passed"], true);
     for case in success_summary["cases"]
         .as_array()
@@ -7350,13 +7380,20 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     let fault_injection_passed = !extra_env.iter().any(|(key, value)| {
         *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1"
     });
+    let fault_injection_source_commit = if extra_env.iter().any(|(key, value)| {
+        *key == "PI_FAKE_FOREIGN_PERSISTENCE_SOURCE" && *value == "1"
+    }) {
+        "ffffffffffffffffffffffffffffffffffffffff"
+    } else {
+        FAKE_ORCHESTRATE_SOURCE_COMMIT
+    };
     fs::write(
         &fault_injection_summary,
         serde_json::to_vec(&json!({
             "schema": "pi.e2e.persistence_fault_injection.summary.v1",
             "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
             "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
-            "source_commit": FAKE_ORCHESTRATE_SOURCE_COMMIT,
+            "source_commit": fault_injection_source_commit,
             "source_dirty": false,
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "overall_passed": fault_injection_passed,
@@ -7439,6 +7476,44 @@ fn orchestrate_rejects_failed_persistence_summary_for_phase5() {
         matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
         Some(false),
         "failed persistence evidence must block Phase 5 readiness"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_foreign_persistence_summary_source() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_FOREIGN_PERSISTENCE_SOURCE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must reject persistence evidence from another source commit"
+    );
+
+    let matrix_path = temp_root
+        .join("run")
+        .join("results")
+        .join("phase1_matrix_validation.json");
+    let matrix: Value =
+        serde_json::from_str(&fs::read_to_string(&matrix_path).expect("read matrix artifact"))
+            .expect("parse matrix artifact");
+
+    assert_eq!(
+        matrix["regression_guards"]["security"].as_str(),
+        Some("missing"),
+        "foreign-source persistence evidence must not be admitted as current"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false),
+        "foreign-source persistence evidence must block Phase 5 readiness"
+    );
+    assert!(
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
+            ["fault_injection_summary_path"]
+            .is_null(),
+        "a rejected persistence summary must not be linked as consumed evidence"
     );
 }
 

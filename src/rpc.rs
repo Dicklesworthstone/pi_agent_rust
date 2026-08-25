@@ -5113,7 +5113,9 @@ async fn maybe_auto_compact(
                         result: None,
                         aborted: false,
                         will_retry: false,
-                        error_message: Some(format!("Failed to persist compaction to session: {err}")),
+                        error_message: Some(format!(
+                            "Failed to persist compaction to session: {err}"
+                        )),
                     }));
                 }
             }
@@ -10055,5 +10057,100 @@ export default function init(pi) {
                 "must reject: {label}"
             );
         }
+    }
+
+    /// bd-m83oo: bash RPC execution preserves command results and never returns
+    /// a retryable error on persistence failure, while surfacing structured persistence state.
+    #[test]
+    fn bash_rpc_persistence_surfaces_state_without_command_failure() {
+        let success_payload = json!({
+            "output": "hello world\n",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+            "fullOutputPath": null,
+            "persisted": true,
+            "persistenceStatus": {
+                "event": "session.persistence.healthy",
+                "severity": "ok",
+                "summary": "Session history persisted.",
+                "action": "No action required.",
+                "sliIds": ["sli_resume_ready_p95_ms"],
+                "pendingMessageCount": 0,
+            }
+        });
+        let ok_resp = response_ok(Some("cmd-1".to_string()), "bash", Some(success_payload));
+        assert!(ok_resp.contains("\"success\":true"));
+        assert!(ok_resp.contains("\"persisted\":true"));
+        assert!(ok_resp.contains("\"event\":\"session.persistence.healthy\""));
+        assert!(!ok_resp.contains("persistenceWarning"));
+
+        let mut warning_payload = json!({
+            "output": "side effect executed\n",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+            "fullOutputPath": null,
+            "persisted": false,
+            "persistenceStatus": {
+                "event": "session.persistence.backlog",
+                "severity": "warning",
+                "summary": "Session history persistence failed after bash execution.",
+                "action": "Trigger manual save or verify session storage permissions.",
+                "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
+                "pendingMessageCount": 1,
+                "errorMessage": "Disk full",
+            }
+        });
+        warning_payload["persistenceWarning"] =
+            json!("Failed to persist bash execution to session: Disk full");
+
+        let warn_resp = response_ok(Some("cmd-2".to_string()), "bash", Some(warning_payload));
+        assert!(
+            warn_resp.contains("\"success\":true"),
+            "command must remain success to prevent unsafe retry"
+        );
+        assert!(warn_resp.contains("\"persisted\":false"));
+        assert!(warn_resp.contains(
+            "\"persistenceWarning\":\"Failed to persist bash execution to session: Disk full\""
+        ));
+        assert!(warn_resp.contains("\"event\":\"session.persistence.backlog\""));
+    }
+
+    /// bd-m83oo: auto-compaction must not emit an unqualified successful durable
+    /// completion event when persistence fails.
+    #[test]
+    fn auto_compaction_end_event_emits_error_when_persistence_fails() {
+        let success_event = agent_event(AgentEvent::AutoCompactionEnd {
+            result: Some(json!({
+                "summary": "compacted summary",
+                "firstKeptEntryId": "entry-10",
+                "tokensBefore": 5000,
+                "tokensAfter": 1200,
+                "details": {},
+            })),
+            aborted: false,
+            will_retry: false,
+            error_message: None,
+        });
+        assert!(success_event.contains("\"type\":\"agent_event\""));
+        assert!(success_event.contains("\"event\":\"auto_compaction_end\""));
+        assert!(success_event.contains("\"summary\":\"compacted summary\""));
+        assert!(!success_event.contains("\"errorMessage\""));
+
+        let failure_event = agent_event(AgentEvent::AutoCompactionEnd {
+            result: None,
+            aborted: false,
+            will_retry: false,
+            error_message: Some(
+                "Failed to persist compaction to session: disk write error".to_string(),
+            ),
+        });
+        assert!(failure_event.contains("\"type\":\"agent_event\""));
+        assert!(failure_event.contains("\"event\":\"auto_compaction_end\""));
+        assert!(!failure_event.contains("\"summary\""));
+        assert!(failure_event.contains(
+            "\"errorMessage\":\"Failed to persist compaction to session: disk write error\""
+        ));
     }
 }
