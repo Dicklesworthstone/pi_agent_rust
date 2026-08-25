@@ -1128,7 +1128,7 @@ run_test_suite() {
     fi
 
     if [[ "$exit_code" -eq 0 \
-      && -f "$retrieved_result_dir/extension_bench.jsonl" \
+      && -s "$retrieved_result_dir/extension_bench.jsonl" \
       && ! -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
       cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
       if [[ -f "$retrieved_result_dir/extension_bench_summary.md" ]]; then
