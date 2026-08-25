@@ -904,6 +904,9 @@ PY
 if [[ -z "$CORRELATION_ID" ]]; then
   CORRELATION_ID="$(generate_correlation_id)"
 fi
+if [[ ! "$CORRELATION_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$ ]]; then
+  die "CI_CORRELATION_ID must be 1-128 path-safe characters ([A-Za-z0-9._:-]) and start with an alphanumeric character"
+fi
 
 # ─── Setup output directory ─────────────────────────────────────────────────
 
@@ -1276,7 +1279,10 @@ for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").spl
     binary_sha256 = environment.get("binary_sha256")
     if not isinstance(binary_path, str) or not binary_path.strip():
         raise SystemExit(f"line {line_number}: binary_path is missing")
-    binary_parent = Path(binary_path).parent
+    binary = Path(binary_path)
+    if not binary.is_absolute():
+        raise SystemExit(f"line {line_number}: binary_path must be absolute")
+    binary_parent = binary.parent
     executable_profile_from_path = (
         binary_parent.parent.name
         if binary_parent.name in {"deps", "examples"}
@@ -1358,6 +1364,12 @@ run_test_suite() {
       || -L "$retrieved_result_dir/extension_bench_summary.md" ]]; then
       log_fail "Refusing stale RCH extension benchmark artifacts at $rch_target_subdir"
       exit_code=87
+    elif [[ -e "$result_dir/extension_bench.jsonl" \
+      || -L "$result_dir/extension_bench.jsonl" \
+      || -e "$result_dir/extension_bench_summary.md" \
+      || -L "$result_dir/extension_bench_summary.md" ]]; then
+      log_fail "Refusing preexisting accepted extension benchmark artifacts"
+      exit_code=95
     else
       BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
       PI_BENCH_RUN_ID="$benchmark_run_id" \
@@ -1438,7 +1450,13 @@ run_test_suite() {
       if [[ "$exit_code" -eq 0 \
         && -s "$retrieved_result_dir/extension_bench_summary.md" \
         && ! -L "$retrieved_result_dir/extension_bench_summary.md" ]]; then
-        cp "$retrieved_result_dir/extension_bench_summary.md" "$result_dir/extension_bench_summary.md"
+        if [[ -e "$result_dir/extension_bench_summary.md" \
+          || -L "$result_dir/extension_bench_summary.md" ]]; then
+          log_fail "Refusing preexisting accepted extension benchmark summary"
+          exit_code=97
+        else
+          cp "$retrieved_result_dir/extension_bench_summary.md" "$result_dir/extension_bench_summary.md"
+        fi
       fi
     elif [[ "$exit_code" -eq 0 ]]; then
       log_fail "RCH completed $suite_name without retrieving extension_bench.jsonl from $rch_target_subdir"
@@ -1585,8 +1603,15 @@ artifact_count=0
 collect_jsonl() {
   local src="$1"
   local dst_name="$2"
+  local dst="$OUTPUT_DIR/results/$dst_name"
+  if [[ -L "$src" ]]; then
+    die "Refusing symlinked JSONL source: $src"
+  fi
   if [[ -f "$src" ]]; then
-    cp "$src" "$OUTPUT_DIR/results/$dst_name"
+    if [[ "$src" != "$dst" && ( -e "$dst" || -L "$dst" ) ]]; then
+      die "Refusing preexisting collected JSONL destination: $dst"
+    fi
+    cp "$src" "$dst"
     artifact_count=$((artifact_count + 1))
     log_ok "Collected: $dst_name ($(wc -l < "$src") records)"
   fi

@@ -1251,13 +1251,17 @@ JSON
         benchmark_run_id="stale-benchmark-run"
       fi
       binary_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      config_hash="$(python3 - "$extension_commit" "$binary_sha256" <<'PY'
+      binary_path="/target/perf/deps/perf_bench_harness-stub"
+      if [[ "${PI_FAKE_WRONG_RCH_EXTENSION_BINARY_PROFILE:-0}" == "1" ]]; then
+        binary_path="/target/release/deps/perf_bench_harness-stub"
+      fi
+      config_hash="$(python3 - "$extension_commit" "$binary_sha256" "$binary_path" <<'PY'
 import hashlib
 import json
 import sys
 
 payload = {
-    "binary_path": "/target/perf/deps/perf_bench_harness-stub",
+    "binary_path": sys.argv[3],
     "binary_sha256": sys.argv[2],
     "build_fingerprint_contract": "cargo_build_fingerprint.v1",
     "build_fingerprint_verified": True,
@@ -1281,7 +1285,7 @@ PY
         config_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       fi
       cat >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl" <<JSON
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"/target/perf/deps/perf_bench_harness-stub","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
       printf '%s\n' '# fake extension benchmark summary' \
         >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench_summary.md"
@@ -8051,6 +8055,32 @@ fn orchestrate_rejects_non_positive_build_jobs_before_remote_invocation() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_rejects_path_unsafe_correlation_id_before_remote_invocation() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("CI_CORRELATION_ID", "../escaped-run"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a correlation ID used in artifact paths must reject traversal"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("CI_CORRELATION_ID must be 1-128 path-safe characters"),
+        "unsafe correlation ID failure must name the path-safety contract: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "unsafe correlation IDs must fail before benchmark invocation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_rejects_non_perf_rch_extension_profile_before_invocation() {
     let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
         ("PI_FAKE_PERF_ONLY", "1"),
@@ -8155,6 +8185,34 @@ fn orchestrate_rejects_unbound_benchmark_config_hash() {
             .join("run/results/perf_bench_harness/extension_bench.jsonl")
             .exists(),
         "unbound provenance output must not enter the accepted result directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_benchmark_binary_from_non_perf_path() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_WRONG_RCH_EXTENSION_BINARY_PROFILE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "a self-consistent record must not relabel a release-path executable as perf"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("binary path does not identify profile perf"),
+        "binary path/profile mismatch must be diagnosed independently of config_hash: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "wrong-profile executable evidence must not enter the accepted result directory"
     );
 }
 

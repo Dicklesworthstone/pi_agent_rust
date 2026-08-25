@@ -34,7 +34,7 @@ use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
-use crate::session::SessionMessage;
+use crate::session::{AutosaveFlushTrigger, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -3116,8 +3116,9 @@ async fn preserve_terminal_rpc_input(
         }
     };
     let session_store = Arc::clone(&guard.session);
-    let (messages, previous_leaf) = {
-        let mut inner = match OwnedMutexGuard::lock(Arc::clone(&session_store), cx).await {
+    let save_enabled = guard.save_enabled();
+    let candidate_result = {
+        let inner = match OwnedMutexGuard::lock(Arc::clone(&session_store), cx).await {
             Ok(inner) => inner,
             Err(err) => {
                 let lock_error = format!("inner session lock failed: {err}");
@@ -3130,40 +3131,40 @@ async fn preserve_terminal_rpc_input(
                 return Err(Error::session(lock_error));
             }
         };
-        let previous_leaf = inner.leaf_id().map(str::to_string);
+        // Build and flush a private candidate so a failed durability attempt
+        // cannot leave orphan entries, navigation changes, or autosave tickets
+        // in the live session. Terminal preservation is rare and correctness is
+        // more important here than avoiding one full session clone.
+        let mut candidate = inner.clone();
         for delivery in steering.iter().chain(&follow_up) {
-            inner.append_model_message(delivery.clone().into_message());
+            candidate.append_model_message(delivery.clone().into_message());
         }
-        (inner.to_messages_for_current_path(), previous_leaf)
-    };
-    guard.agent.replace_messages(messages);
-    if let Err(persist_err) = guard.persist_session().await {
-        let recovery_cx = AgentCx::for_request();
-        let rollback_messages = {
-            let mut inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &recovery_cx)
+        let persist_result = if save_enabled {
+            candidate
+                .flush_autosave(AutosaveFlushTrigger::Periodic)
                 .await
-                .map_err(|rollback_err| {
-                    Error::session(format!(
-                        "{persist_err}; failed to roll back terminal input: {rollback_err}"
-                    ))
-                })?;
-            match previous_leaf.as_deref() {
-                Some(leaf_id) if inner.navigate_to(leaf_id) => {}
-                Some(leaf_id) => {
-                    return Err(Error::session(format!(
-                        "{persist_err}; failed to restore terminal-input leaf {leaf_id}"
-                    )));
-                }
-                None => inner.reset_leaf(),
-            }
-            inner.to_messages_for_current_path()
+        } else {
+            Ok(())
         };
-        guard.agent.replace_messages(rollback_messages);
-        restore_terminal_rpc_input(shared_state, steering, follow_up)
-            .await
-            .map_err(|restore_err| Error::session(format!("{persist_err}; {restore_err}")))?;
-        return Err(persist_err);
-    }
+        persist_result.map(|()| (inner, candidate))
+    };
+
+    let (mut inner, candidate) = match candidate_result {
+        Ok(committed) => committed,
+        Err(persist_err) => {
+            drop(guard);
+            let restore_result =
+                restore_terminal_rpc_input(shared_state, steering, follow_up).await;
+            return match restore_result {
+                Ok(()) => Err(persist_err),
+                Err(restore_err) => Err(Error::session(format!("{persist_err}; {restore_err}"))),
+            };
+        }
+    };
+    let messages = candidate.to_messages_for_current_path();
+    *inner = candidate;
+    drop(inner);
+    guard.agent.replace_messages(messages);
     Ok(queued_count)
 }
 
@@ -4928,7 +4929,7 @@ mod retry_tests {
                 }
             }
 
-            let (session, shared_state) = prompt_task.await.expect("prompt task join");
+            let (session, shared_state) = prompt_task.await;
 
             for line in out_rx.try_iter() {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -9772,7 +9773,6 @@ export default function init(pi) {
             let tools = ToolRegistry::new(&[], temp.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session_value = Session::create_with_dir(Some(temp.path().join("sessions")));
-            let session_path = session_value.path.clone().expect("durable session path");
             let inner_session = Arc::new(asupersync::sync::Mutex::new(session_value));
             let agent_session = AgentSession::new(
                 agent,
@@ -9833,6 +9833,13 @@ export default function init(pi) {
                     .is_some_and(|error| error.contains("invalid API key from gated provider")),
                 "terminal error must remain observable: {terminal_event}"
             );
+            let session_path = inner_session
+                .lock(&AgentCx::for_request())
+                .await
+                .expect("terminal session lock after agent_end")
+                .path
+                .clone()
+                .expect("terminal agent_end must follow the first durable save");
             let reopened = Session::open(session_path.to_string_lossy().as_ref())
                 .await
                 .expect("reopen terminal session immediately after agent_end");
@@ -9853,10 +9860,7 @@ export default function init(pi) {
                 durable_accepted_count, 1,
                 "terminal agent_end must follow durable accepted input"
             );
-            server
-                .await
-                .expect("RPC server join")
-                .expect("RPC server run");
+            server.await.expect("RPC server run");
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
             let remaining_events = out_rx
@@ -10113,6 +10117,15 @@ export default function init(pi) {
                 .await
                 .expect("rolled-back inner session");
             assert!(
+                inner.entries.is_empty(),
+                "failed candidate must not leave orphan entries"
+            );
+            assert_eq!(
+                inner.autosave_metrics().pending_mutations,
+                0,
+                "failed candidate must not contaminate the live autosave queue"
+            );
+            assert!(
                 inner.to_messages_for_current_path().iter().all(|message| {
                     !matches!(
                         message,
@@ -10190,14 +10203,28 @@ export default function init(pi) {
             }
             cancel_cx.set_cancel_requested(true);
 
-            let result = preserve_task.await.expect("preservation task join");
+            let preserve_task = async { preserve_task.await };
+            futures::pin_mut!(preserve_task);
+            let result = match asupersync::time::timeout(
+                wall_now(),
+                Duration::from_secs(5),
+                preserve_task,
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(timeout_err) => {
+                    drop(held_session);
+                    panic!("cancelled session-lock waiter did not finish: {timeout_err}");
+                }
+            };
+            drop(held_session);
             assert!(
                 result
                     .expect_err("cancelled outer session lock must fail")
                     .to_string()
                     .contains("session lock failed")
             );
-            drop(held_session);
 
             let state = shared_state
                 .lock(&setup_cx)
@@ -10835,7 +10862,7 @@ export default function init(pi) {
             release_compaction
                 .send(entered_cx.cx(), ())
                 .expect("release auto-compaction provider");
-            compact_task.await.expect("auto-compaction task");
+            compact_task.await;
 
             let events = out_rx
                 .try_iter()
