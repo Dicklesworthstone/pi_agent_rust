@@ -623,6 +623,13 @@ if [[ "${TEST_ARTIFACT_INDEX_PATH:-}" != "test-results.xml" ]]; then
   echo "unexpected remote artifact index path: ${TEST_ARTIFACT_INDEX_PATH:-unset}" >&2
   exit 69
 fi
+case " $* " in
+  *" --exact "*) ;;
+  *)
+    echo "persistence runner omitted libtest --exact: $*" >&2
+    exit 70
+    ;;
+esac
 
 case " $* " in
   *" jsonl_fault_injection_flush_windows_preserve_integrity "*)
@@ -645,7 +652,7 @@ case " $* " in
     ;;
   *)
     echo "unexpected fake cargo test: $*" >&2
-    exit 70
+    exit 71
     ;;
 esac
 
@@ -660,11 +667,15 @@ artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"type\":\"artifact\",\"tes
 if [[ "${PI_FAKE_MALFORMED_ARTIFACT_INDEX:-0}" == "1" ]]; then
   artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"test\":\"$test_name\",\"name\":\"$summary_name\"}"
 fi
-log_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":1,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"level\":\"info\",\"category\":\"fault\",\"message\":\"$fault_message\"}"
+diagnostic_test_name="$test_name"
+if [[ "${PI_FAKE_WRONG_TEST_LOG_IDENTITY:-0}" == "1" ]]; then
+  diagnostic_test_name="wrong-$test_name"
+fi
+log_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$diagnostic_test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":1,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"level\":\"info\",\"category\":\"fault\",\"message\":\"$fault_message\"}"
 if [[ "${PI_FAKE_MALFORMED_TEST_LOG:-0}" == "1" ]]; then
   log_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$test_name\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"category\":\"fault\",\"message\":\"$fault_message\"}"
 fi
-payload_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":2,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"level\":\"info\",\"category\":\"artifact_payload\",\"message\":\"inline JSON artifact bytes\",\"context\":{\"artifact_name\":\"$summary_name\",\"content_encoding\":\"base64\",\"content_sha256\":\"$summary_sha\",\"content_base64\":\"$summary_base64\"}}"
+payload_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$diagnostic_test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":2,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"level\":\"info\",\"category\":\"artifact_payload\",\"message\":\"inline JSON artifact bytes\",\"context\":{\"artifact_name\":\"$summary_name\",\"content_encoding\":\"base64\",\"content_sha256\":\"$summary_sha\",\"content_base64\":\"$summary_base64\"}}"
 cat >"$TEST_LOG_JSONL_PATH" <<JSON
 $log_record
 $payload_record
@@ -676,13 +687,21 @@ printf '%s\n' "$artifact_record" >"$TEST_ARTIFACT_INDEX_PATH"
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy)]
+enum FakePersistenceFault {
+    None,
+    OmitSqliteReports,
+    MalformedArtifactIndex,
+    MalformedTestLog,
+    TamperedSummaryPayload,
+    WrongTestLogIdentity,
+}
+
+#[cfg(unix)]
 fn run_persistence_fault_runner_with_fake_rch(
     temp_root: &Path,
     correlation_id: &str,
-    omit_sqlite_reports: bool,
-    malformed_artifact_index: bool,
-    malformed_test_log: bool,
-    tampered_summary_payload: bool,
+    fault: FakePersistenceFault,
 ) -> std::process::Output {
     let bin_dir = temp_root.join("bin");
     let target_dir = temp_root.join("target");
@@ -712,17 +731,23 @@ fn run_persistence_fault_runner_with_fake_rch(
         .env("PERSISTENCE_MIN_REPO_FREE_MB", "1")
         .env("PERSISTENCE_MIN_TMP_FREE_MB", "1")
         .env("PI_FAKE_INVOCATION_LOG", &invocation_log);
-    if omit_sqlite_reports {
-        command.env("PI_FAKE_OMIT_SQLITE_REPORTS", "1");
-    }
-    if malformed_artifact_index {
-        command.env("PI_FAKE_MALFORMED_ARTIFACT_INDEX", "1");
-    }
-    if malformed_test_log {
-        command.env("PI_FAKE_MALFORMED_TEST_LOG", "1");
-    }
-    if tampered_summary_payload {
-        command.env("PI_FAKE_TAMPERED_SUMMARY_PAYLOAD", "1");
+    match fault {
+        FakePersistenceFault::None => {}
+        FakePersistenceFault::OmitSqliteReports => {
+            command.env("PI_FAKE_OMIT_SQLITE_REPORTS", "1");
+        }
+        FakePersistenceFault::MalformedArtifactIndex => {
+            command.env("PI_FAKE_MALFORMED_ARTIFACT_INDEX", "1");
+        }
+        FakePersistenceFault::MalformedTestLog => {
+            command.env("PI_FAKE_MALFORMED_TEST_LOG", "1");
+        }
+        FakePersistenceFault::TamperedSummaryPayload => {
+            command.env("PI_FAKE_TAMPERED_SUMMARY_PAYLOAD", "1");
+        }
+        FakePersistenceFault::WrongTestLogIdentity => {
+            command.env("PI_FAKE_WRONG_TEST_LOG_IDENTITY", "1");
+        }
     }
     command.output().expect("run persistence fault runner")
 }
@@ -754,10 +779,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     let success = run_persistence_fault_runner_with_fake_rch(
         &success_root,
         success_correlation,
-        false,
-        false,
-        false,
-        false,
+        FakePersistenceFault::None,
     );
     assert!(
         success.status.success(),
@@ -802,6 +824,38 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         assert_eq!(case["test_log_records"], 2);
         assert_eq!(case["artifact_records"], 1);
         assert_eq!(case["checks"]["summary_artifact_bytes_verified"], true);
+        assert_eq!(case["checks"]["summary_artifact_path_confined"], true);
+    }
+    for (case_id, summary_name) in [
+        ("jsonl", "jsonl-fault-window-summary.json"),
+        ("sqlite", "sqlite-fault-window-summary.json"),
+    ] {
+        let case_dir = success_root.join("artifacts").join(case_id);
+        let artifact_index = fs::read_to_string(case_dir.join("artifact-index.jsonl"))
+            .expect("read canonical artifact index");
+        let summary_record: Value = serde_json::from_str(
+            artifact_index
+                .lines()
+                .find(|line| line.contains(summary_name))
+                .expect("summary artifact row"),
+        )
+        .expect("parse summary artifact row");
+        let indexed_path = Path::new(
+            summary_record["path"]
+                .as_str()
+                .expect("canonical summary path"),
+        );
+        assert_eq!(indexed_path.parent(), Some(case_dir.as_path()));
+        assert!(indexed_path.is_file(), "canonical summary artifact must exist");
+        assert_eq!(
+            indexed_path.file_name().and_then(|name| name.to_str()),
+            Some(summary_name)
+        );
+        assert_eq!(
+            summary_record["remote_path"],
+            format!("/tmp/{summary_name}"),
+            "remote-only path must be preserved as provenance, not retained as the canonical path"
+        );
     }
     let manifest: Value = serde_json::from_slice(
         &fs::read(success_root.join("artifacts/run-manifest.json"))
@@ -819,10 +873,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     let missing = run_persistence_fault_runner_with_fake_rch(
         &missing_root,
         "persistence-rch-missing-correlation",
-        true,
-        false,
-        false,
-        false,
+        FakePersistenceFault::OmitSqliteReports,
     );
     assert!(
         !missing.status.success(),
@@ -847,10 +898,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     let malformed = run_persistence_fault_runner_with_fake_rch(
         &malformed_root,
         "persistence-rch-malformed-correlation",
-        false,
-        true,
-        false,
-        false,
+        FakePersistenceFault::MalformedArtifactIndex,
     );
     assert!(
         !malformed.status.success(),
@@ -877,10 +925,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     let malformed_log = run_persistence_fault_runner_with_fake_rch(
         &malformed_log_root,
         "persistence-rch-malformed-log-correlation",
-        false,
-        false,
-        true,
-        false,
+        FakePersistenceFault::MalformedTestLog,
     );
     assert!(
         !malformed_log.status.success(),
@@ -906,10 +951,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     let tampered_payload = run_persistence_fault_runner_with_fake_rch(
         &tampered_payload_root,
         "persistence-rch-tampered-payload-correlation",
-        false,
-        false,
-        false,
-        true,
+        FakePersistenceFault::TamperedSummaryPayload,
     );
     assert!(
         !tampered_payload.status.success(),
@@ -929,6 +971,30 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
             false,
             "retrieved inline bytes must match the remote artifact digest"
         );
+    }
+
+    let wrong_test_root = unique_temp_dir("persistence-rch-wrong-test");
+    let wrong_test = run_persistence_fault_runner_with_fake_rch(
+        &wrong_test_root,
+        "persistence-rch-wrong-test-correlation",
+        FakePersistenceFault::WrongTestLogIdentity,
+    );
+    assert!(
+        !wrong_test.status.success(),
+        "current-correlation diagnostics from the wrong test must fail closed"
+    );
+    let wrong_test_summary: Value = serde_json::from_slice(
+        &fs::read(wrong_test_root.join("artifacts/integrity-summary.json"))
+            .expect("read wrong-test integrity summary"),
+    )
+    .expect("parse wrong-test integrity summary");
+    for case in wrong_test_summary["cases"]
+        .as_array()
+        .expect("wrong-test summary cases")
+    {
+        assert_eq!(case["checks"]["test_identity_current"], false);
+        assert_eq!(case["checks"]["diagnostic_log_schema_valid"], false);
+        assert_eq!(case["checks"]["summary_artifact_bytes_verified"], false);
     }
 }
 
