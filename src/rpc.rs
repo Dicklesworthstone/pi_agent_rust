@@ -3349,6 +3349,7 @@ async fn run_prompt_with_retry(
                             OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
                         {
                             let runtime_provider = guard.agent.provider().name().to_string();
+                            let runtime_model_id = guard.agent.provider().model_id().to_string();
                             let session_store = Arc::clone(&guard.session);
                             let inner_session =
                                 OwnedMutexGuard::lock(session_store, &cx).await.ok();
