@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// The keyword actions Pi supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeywordAction {
-    /// Set the turn's thinking level to the model's max (clamped downstream).
+    /// Set the turn's thinking level to the active model's pre-clamped max.
     Ultrathink,
     /// Inject the parallel-orchestration directive.
     Orchestrate,
