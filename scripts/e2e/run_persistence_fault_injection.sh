@@ -609,6 +609,10 @@ def inline_summary_bytes_are_valid(
         expected_mid_flush = [base_message]
         expected_post_flush = [base_message, post_message]
     if summary != {
+        "schema": "pi.e2e.persistence_fault_case_summary.v1",
+        "case_id": case_id,
+        "test_name": expected_test_name,
+        "correlation_id": correlation_id,
         "scenario": f"{case_id}_fault_windows",
         "windows": {
             "pre_flush": [base_message],

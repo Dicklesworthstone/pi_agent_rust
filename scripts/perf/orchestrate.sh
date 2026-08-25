@@ -1089,13 +1089,15 @@ declare -a SUITE_RESULTS=()
 validate_retrieved_extension_bench_jsonl() {
   local artifact_path="$1"
   local expected_profile="$2"
-  python3 - "$artifact_path" "$expected_profile" <<'PY'
+  local expected_commit="$3"
+  python3 - "$artifact_path" "$expected_profile" "$expected_commit" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 artifact_path = Path(sys.argv[1])
 expected_profile = sys.argv[2]
+expected_commit = sys.argv[3]
 records = []
 for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").splitlines(), 1):
     if not line.strip():
@@ -1113,6 +1115,8 @@ for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").spl
     environment = record.get("env")
     if not isinstance(environment, dict) or environment.get("build_profile") != expected_profile:
         raise SystemExit(f"line {line_number}: build profile does not match {expected_profile}")
+    if environment.get("git_commit") != expected_commit:
+        raise SystemExit(f"line {line_number}: git commit does not match {expected_commit}")
     records.append(record)
 
 if not records:
@@ -1168,6 +1172,7 @@ run_test_suite() {
           --test "$target_name" \
           --cargo-profile "$CARGO_PROFILE" \
           --test-threads 1 \
+          -- bench_extension_scenarios --exact \
         >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
         || exit_code=$?
     fi
@@ -1176,7 +1181,7 @@ run_test_suite() {
       && -s "$retrieved_result_dir/extension_bench.jsonl" \
       && ! -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
       if validate_retrieved_extension_bench_jsonl \
-        "$retrieved_result_dir/extension_bench.jsonl" "$CARGO_PROFILE"; then
+        "$retrieved_result_dir/extension_bench.jsonl" "$CARGO_PROFILE" "$GIT_COMMIT_FULL"; then
         cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
       else
         log_fail "RCH retrieved an invalid extension_bench.jsonl from $rch_target_subdir"

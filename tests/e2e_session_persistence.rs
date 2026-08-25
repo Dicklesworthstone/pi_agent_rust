@@ -1842,6 +1842,11 @@ fn multi_turn_persistence() {
 fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_jsonl_fault_injection_flush_windows";
     let harness = TestHarness::new(test_name);
+    let correlation_id = match harness.log().ci_correlation_id() {
+        Some(value) => value,
+        None => harness.log().trace_id(),
+    }
+    .to_string();
     harness.section("jsonl_fault_injection");
 
     run_async_test(async {
@@ -1941,6 +1946,10 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             &harness,
             "jsonl-fault-window-summary.json",
             &json!({
+                "schema": "pi.e2e.persistence_fault_case_summary.v1",
+                "case_id": "jsonl",
+                "test_name": test_name,
+                "correlation_id": correlation_id,
                 "scenario": "jsonl_fault_windows",
                 "windows": {
                     "pre_flush": pre_texts,
@@ -1962,6 +1971,11 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
 fn sqlite_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_sqlite_fault_injection_flush_windows";
     let harness = TestHarness::new(test_name);
+    let correlation_id = match harness.log().ci_correlation_id() {
+        Some(value) => value,
+        None => harness.log().trace_id(),
+    }
+    .to_string();
     harness.section("sqlite_fault_injection");
 
     run_async_test(async {
@@ -2054,6 +2068,10 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             &harness,
             "sqlite-fault-window-summary.json",
             &json!({
+                "schema": "pi.e2e.persistence_fault_case_summary.v1",
+                "case_id": "sqlite",
+                "test_name": test_name,
+                "correlation_id": correlation_id,
                 "scenario": "sqlite_fault_windows",
                 "windows": {
                     "pre_flush": pre_texts,

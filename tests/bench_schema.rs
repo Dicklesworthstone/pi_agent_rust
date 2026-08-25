@@ -637,14 +637,14 @@ case " $* " in
     test_name="e2e_jsonl_fault_injection_flush_windows"
     fault_message="jsonl mid-flush failure"
     summary_name="jsonl-fault-window-summary.json"
-    summary_payload='{"scenario":"jsonl_fault_windows","windows":{"pre_flush":["jsonl-base"],"mid_flush":["jsonl-base","jsonl-midflush-pending"],"post_flush":["jsonl-base","jsonl-midflush-pending","jsonl-postflush-persisted"]}}'
+    summary_windows='{"pre_flush":["jsonl-base"],"mid_flush":["jsonl-base","jsonl-midflush-pending"],"post_flush":["jsonl-base","jsonl-midflush-pending","jsonl-postflush-persisted"]}'
     ;;
   *" sqlite_fault_injection_flush_windows_preserve_integrity "*)
     case_id="sqlite"
     test_name="e2e_sqlite_fault_injection_flush_windows"
     fault_message="sqlite mid-flush failure"
     summary_name="sqlite-fault-window-summary.json"
-    summary_payload='{"scenario":"sqlite_fault_windows","windows":{"pre_flush":["sqlite-base"],"mid_flush":["sqlite-base"],"post_flush":["sqlite-base","sqlite-postflush-persisted"]}}'
+    summary_windows='{"pre_flush":["sqlite-base"],"mid_flush":["sqlite-base"],"post_flush":["sqlite-base","sqlite-postflush-persisted"]}'
     if [[ "${PI_FAKE_OMIT_SQLITE_REPORTS:-0}" == "1" ]]; then
       printf '%s\n' "$case_id" >>"${PI_FAKE_INVOCATION_LOG:?}"
       exit 0
@@ -657,6 +657,11 @@ case " $* " in
 esac
 
 printf '%s\n' "$case_id" >>"${PI_FAKE_INVOCATION_LOG:?}"
+summary_correlation="${CI_CORRELATION_ID:?}"
+if [[ "${PI_FAKE_WRONG_SUMMARY_IDENTITY:-0}" == "1" ]]; then
+  summary_correlation="stale-summary-correlation"
+fi
+summary_payload="{\"schema\":\"pi.e2e.persistence_fault_case_summary.v1\",\"case_id\":\"$case_id\",\"test_name\":\"$test_name\",\"correlation_id\":\"$summary_correlation\",\"scenario\":\"${case_id}_fault_windows\",\"windows\":$summary_windows}"
 summary_size="$(python3 -c 'import sys; print(len(sys.argv[1].encode()))' "$summary_payload")"
 summary_sha="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$summary_payload")"
 summary_base64="$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())' "$summary_payload")"
@@ -695,6 +700,7 @@ enum FakePersistenceFault {
     MalformedTestLog,
     TamperedSummaryPayload,
     WrongTestLogIdentity,
+    WrongSummaryIdentity,
 }
 
 #[cfg(unix)]
@@ -747,6 +753,9 @@ fn run_persistence_fault_runner_with_fake_rch(
         }
         FakePersistenceFault::WrongTestLogIdentity => {
             command.env("PI_FAKE_WRONG_TEST_LOG_IDENTITY", "1");
+        }
+        FakePersistenceFault::WrongSummaryIdentity => {
+            command.env("PI_FAKE_WRONG_SUMMARY_IDENTITY", "1");
         }
     }
     command.output().expect("run persistence fault runner")
@@ -994,6 +1003,31 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     {
         assert_eq!(case["checks"]["test_identity_current"], false);
         assert_eq!(case["checks"]["diagnostic_log_schema_valid"], false);
+        assert_eq!(case["checks"]["summary_artifact_bytes_verified"], false);
+    }
+
+    let wrong_summary_root = unique_temp_dir("persistence-rch-wrong-summary");
+    let wrong_summary = run_persistence_fault_runner_with_fake_rch(
+        &wrong_summary_root,
+        "persistence-rch-wrong-summary-correlation",
+        FakePersistenceFault::WrongSummaryIdentity,
+    );
+    assert!(
+        !wrong_summary.status.success(),
+        "self-consistent summary bytes with stale embedded identity must fail closed"
+    );
+    let wrong_summary_report: Value = serde_json::from_slice(
+        &fs::read(wrong_summary_root.join("artifacts/integrity-summary.json"))
+            .expect("read wrong-summary integrity summary"),
+    )
+    .expect("parse wrong-summary integrity summary");
+    for case in wrong_summary_report["cases"]
+        .as_array()
+        .expect("wrong-summary cases")
+    {
+        assert_eq!(case["checks"]["test_identity_current"], true);
+        assert_eq!(case["checks"]["diagnostic_log_schema_valid"], true);
+        assert_eq!(case["checks"]["summary_artifact_schema_valid"], true);
         assert_eq!(case["checks"]["summary_artifact_bytes_verified"], false);
     }
 }
