@@ -149,7 +149,7 @@ fn is_void_html_tag(name: &str) -> bool {
     )
 }
 
-fn is_ascii_markup_name_start(byte: u8) -> bool {
+const fn is_ascii_markup_name_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':')
 }
 
