@@ -417,16 +417,18 @@ fn code_and_paths_leave_request_untouched() {
 }
 
 #[test]
-fn block_keyword_activation_lands_in_session_custom_entry() {
-    let case = "block_keyword_activation_lands_in_session_custom_entry";
+fn block_keyword_activation_persists_in_session_custom_entry() {
+    let case = "block_keyword_activation_persists_in_session_custom_entry";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     let (agent, _capture) = build_agent(&root, None);
-    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    let session = Arc::new(AsyncMutex::new(Session::create_with_dir(Some(
+        harness.temp_path("sessions"),
+    ))));
     let mut agent_session = AgentSession::new(
         agent,
         Arc::clone(&session),
-        false,
+        true,
         ResolvedCompactionSettings::default(),
     );
 
@@ -455,7 +457,23 @@ fn block_keyword_activation_lands_in_session_custom_entry() {
     assert_eq!(telemetry["schema"], json!("pi.magic_keyword.v1"));
     assert_eq!(telemetry["word"], json!("ultrathink"));
     assert_eq!(telemetry["action"], json!("ultrathink"));
+    let persisted_path = guard.path.clone().expect("autosave created session file");
     drop(guard);
+
+    let reopened = block_on_local(Session::open(persisted_path.to_string_lossy().as_ref()))
+        .expect("reopen autosaved session");
+    assert!(reopened.entries_for_current_path().into_iter().any(|entry| {
+        matches!(
+            entry,
+            SessionEntry::Custom(custom)
+                if custom.custom_type == "magic_keyword"
+                    && custom.data.as_ref().is_some_and(|data| {
+                        data["schema"] == json!("pi.magic_keyword.v1")
+                            && data["word"] == json!("ultrathink")
+                            && data["action"] == json!("ultrathink")
+                    })
+        )
+    }));
     finish_case(&harness, case);
 }
 
