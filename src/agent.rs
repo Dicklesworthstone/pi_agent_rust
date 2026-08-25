@@ -2100,10 +2100,7 @@ impl Agent {
         result
     }
 
-    fn apply_magic_keyword_effects(
-        &mut self,
-        hits: &[crate::magic_keywords::KeywordActivation],
-    ) {
+    fn apply_magic_keyword_effects(&mut self, hits: &[crate::magic_keywords::KeywordActivation]) {
         let keyword_max_thinking_level = self.keyword_max_thinking_level;
         for hit in hits {
             if hit.action == "ultrathink" {
@@ -12170,10 +12167,7 @@ impl AgentSession {
                 .await;
 
             self.agent.set_system_prompt(base_system_prompt);
-            match result {
-                Ok(message) => Ok(message),
-                Err(err) => Err(err),
-            }
+            result
         }
         .await;
         self.extensions_turn_active.store(false, Ordering::SeqCst);

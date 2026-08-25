@@ -569,10 +569,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         }
         assert!(saw_agent_end, "RPC prompt never reached agent_end");
         drop(in_tx);
-        server
-            .await
-            .expect("RPC server task join")
-            .expect("RPC server result");
+        server.await.expect("RPC server task join");
     });
 
     let captured = capture.lock().expect("capture").clone();

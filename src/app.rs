@@ -128,9 +128,11 @@ pub fn prepare_initial_message(
     let processed = process_file_arguments(file_args, cwd, auto_resize_images, workspace)?;
     let mut initial_message = processed.text;
     let has_message = !messages.is_empty();
-    let keyword_scan_source = has_message
-        .then(|| messages.remove(0))
-        .unwrap_or_default();
+    let keyword_scan_source = if has_message {
+        messages.remove(0)
+    } else {
+        String::new()
+    };
     initial_message.push_str(&keyword_scan_source);
 
     if initial_message.is_empty() && processed.images.is_empty() && !has_message {

@@ -9,6 +9,36 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum number of visible ASCII characters retained from an image MIME type.
+pub(crate) const MAX_IMAGE_MIME_TYPE_LEN: usize = 80;
+
+/// Normalize untrusted image MIME metadata before it enters model/session state.
+///
+/// MIME labels are metadata rather than terminal text. Retain only the bounded
+/// ASCII token prefix used by media types so control sequences, bidi controls,
+/// parameters, and trailing prose cannot reach downstream renderers/providers.
+pub(crate) fn sanitize_image_mime_type(mime_type: &str) -> String {
+    let sanitized: String = mime_type
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-'))
+        .take(MAX_IMAGE_MIME_TYPE_LEN)
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn deserialize_image_mime_type<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mime_type = String::deserialize(deserializer)?;
+    Ok(sanitize_image_mime_type(&mime_type))
+}
+
 // ============================================================================
 // Message Types
 // ============================================================================
@@ -214,6 +244,7 @@ pub struct ThinkingContent {
 #[serde(rename_all = "camelCase")]
 pub struct ImageContent {
     pub data: String, // Base64 encoded
+    #[serde(deserialize_with = "deserialize_image_mime_type")]
     pub mime_type: String,
 }
 
@@ -1045,6 +1076,29 @@ mod tests {
     }
 
     #[test]
+    fn content_block_image_deserialization_sanitizes_mime_type() {
+        let hostile = serde_json::json!({
+            "type": "image",
+            "data": "aGVsbG8=",
+            "mimeType": "  image/png\u{001b}[2J\u{202e}evil",
+        });
+        let parsed: ContentBlock =
+            serde_json::from_value(hostile).expect("deserialize hostile image MIME metadata");
+        assert!(matches!(
+            parsed,
+            ContentBlock::Image(ImageContent { mime_type, .. }) if mime_type == "image/png"
+        ));
+
+        let overlong = format!("image/{}", "a".repeat(MAX_IMAGE_MIME_TYPE_LEN));
+        let parsed: ImageContent = serde_json::from_value(serde_json::json!({
+            "data": "aGVsbG8=",
+            "mimeType": overlong,
+        }))
+        .expect("deserialize overlong image MIME metadata");
+        assert_eq!(parsed.mime_type.len(), MAX_IMAGE_MIME_TYPE_LEN);
+    }
+
+    #[test]
     fn content_block_tool_call_roundtrip() {
         let block = ContentBlock::ToolCall(ToolCall {
             id: "tc_1".to_string(),
@@ -1602,7 +1656,10 @@ mod tests {
                 interesting_text_strategy(),
             ],
         )
-            .prop_map(|(data, mime_type)| ImageContent { data, mime_type })
+            .prop_map(|(data, mime_type)| ImageContent {
+                data,
+                mime_type: sanitize_image_mime_type(&mime_type),
+            })
     }
 
     fn tool_call_strategy() -> impl Strategy<Value = ToolCall> {

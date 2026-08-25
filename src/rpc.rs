@@ -5924,7 +5924,7 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
         };
         images.push(ImageContent {
             data: data.to_string(),
-            mime_type: media_type.to_string(),
+            mime_type: crate::model::sanitize_image_mime_type(media_type),
         });
     }
     Ok(images)
@@ -8651,6 +8651,22 @@ export default function init(pi) {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/png");
         assert_eq!(images[0].data, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn parse_prompt_images_sanitizes_mime_type_at_ingress() {
+        let val = json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "mediaType": " image/jpeg\u{001b}]2;owned\u{0007}",
+                "data": "abc"
+            }
+        }]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/jpeg");
+        assert!(!images[0].mime_type.chars().any(char::is_control));
     }
 
     #[test]

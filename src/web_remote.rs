@@ -488,8 +488,7 @@ pub fn render_half_block_qr(data: &str) -> String {
     out.push_str("│ █ ███ █ █▀█▀▄▀█ █▀▀▀▀▀█ │\n");
     out.push_str("│ █▀▀▀▀▀█ ▀▄▀▄▀▄█ █ ███ █ │\n");
     out.push_str("└───────────────────────────┘\n");
-    let truncated_data: String = data.chars().take(36).collect();
-    let _ = writeln!(out, "Payload: {truncated_data}");
+    let _ = writeln!(out, "Payload: {data}");
     out
 }
 
@@ -540,7 +539,7 @@ pub const EMBEDDED_WEB_CLIENT_HTML: &str = r#"<!DOCTYPE html>
         <pre id="canvas-grid"></pre>
     </div>
     <script>
-        // Minimal frame receiver and DOM renderer (zero localStorage / persistent caching)
+        // Minimal frame receiver and DOM renderer (zero persistent client-side storage / caching)
         const grid = document.getElementById('canvas-grid');
         const status = document.getElementById('conn-status');
         const token = window.location.hash.replace('#t=', '').replace('#', '');

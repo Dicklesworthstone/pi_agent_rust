@@ -43,10 +43,10 @@ impl Dialect {
     }
 }
 
-/// Heuristically classify a model for offline benchmarking and migration
-/// suggestions (bd-cv653.7.8). Runtime response repair does not call this:
-/// only an explicit model-catalog `dialect` opt-in can enable Xmlish repair.
-/// Callers must never treat Harmony as a text-repair dialect.
+/// Heuristically classify a model for offline benchmarking and migration suggestions (bd-cv653.7.8).
+///
+/// Runtime response repair does not call this: only an explicit model-catalog `dialect` opt-in
+/// can enable Xmlish repair. Callers must never treat Harmony as a text-repair dialect.
 #[must_use]
 pub fn dialect_for_model(provider: &str, model_id: &str) -> Dialect {
     const XMLISH_MARKERS: &[&str] = &[
