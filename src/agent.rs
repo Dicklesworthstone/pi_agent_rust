@@ -1309,6 +1309,10 @@ fn path_like_inputs(arguments: &Value) -> Vec<&str> {
 impl Agent {
     /// Create a new agent with the given provider and tools.
     pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry, config: AgentConfig) -> Self {
+        let keyword_max_thinking_level = config
+            .stream_options
+            .thinking_level
+            .unwrap_or(crate::model::ThinkingLevel::Off);
         Self {
             provider,
             tools,
@@ -1325,7 +1329,7 @@ impl Agent {
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
             keyword_ledger: Vec::new(),
-            keyword_max_thinking_level: crate::model::ThinkingLevel::Max,
+            keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
         }
     }
