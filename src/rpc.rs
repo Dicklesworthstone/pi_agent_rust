@@ -4737,7 +4737,7 @@ mod retry_tests {
             shared.auto_compaction_enabled = false;
             shared
                 .push_follow_up(QueuedAgentMessage::from_authored_message(
-                    build_user_message("accepted follow-up during failed turn", &[]),
+                    build_user_message("preexisting queued follow-up", &[]),
                 ))
                 .expect("queue terminal follow-up");
             let shared_state = Arc::new(Mutex::new(shared));
@@ -4754,6 +4754,7 @@ mod retry_tests {
                 .join("auth.json");
             let auth = AuthStorage::load(auth_path).expect("auth load");
 
+            let prompt_task_handle = runtime_handle.clone();
             let options = RpcOptions {
                 config,
                 resources: ResourceLoader::empty(false),
@@ -4765,32 +4766,56 @@ mod retry_tests {
                 ask_tool: None,
             };
 
-            let retry_abort_for_thread = Arc::clone(&retry_abort);
-            let abort_thread = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                retry_abort_for_thread.store(true, Ordering::SeqCst);
-            });
-
-            run_prompt_with_retry(
-                Arc::clone(&session),
-                Arc::clone(&shared_state),
-                is_streaming,
-                is_compacting,
-                Arc::new(std::sync::Mutex::new(())),
-                abort_handle_slot,
-                out_tx,
-                retry_abort,
-                options,
-                "hello".to_string(),
-                None,
-                Vec::new(),
-                AgentCx::for_request(),
-            )
-            .await;
-            abort_thread.join().expect("abort thread join");
-
             let mut timeline = Vec::new();
             let mut last_agent_end_error = None::<String>;
+            let retry_abort_for_signal = Arc::clone(&retry_abort);
+            let prompt_task = prompt_task_handle.spawn(async move {
+                run_prompt_with_retry(
+                    Arc::clone(&session),
+                    Arc::clone(&shared_state),
+                    is_streaming,
+                    is_compacting,
+                    Arc::new(std::sync::Mutex::new(())),
+                    abort_handle_slot,
+                    out_tx,
+                    retry_abort,
+                    options,
+                    "hello".to_string(),
+                    None,
+                    Vec::new(),
+                    AgentCx::for_request(),
+                )
+                .await;
+                (session, shared_state)
+            });
+
+            let retry_start_deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match out_rx.try_recv() {
+                    Ok(line) => {
+                        let value = serde_json::from_str::<Value>(&line)
+                            .expect("retry timeline event JSON");
+                        let kind = value["type"].as_str().expect("retry event type");
+                        timeline.push(kind.to_string());
+                        if kind == "auto_retry_start" {
+                            retry_abort_for_signal.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        assert!(
+                            std::time::Instant::now() < retry_start_deadline,
+                            "timed out waiting for causal auto_retry_start event"
+                        );
+                        sleep(wall_now(), Duration::from_millis(5)).await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("RPC retry output disconnected before auto_retry_start");
+                    }
+                }
+            }
+
+            let (session, shared_state) = prompt_task.await.expect("prompt task join");
 
             for line in out_rx.try_iter() {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
@@ -4861,7 +4886,7 @@ mod retry_tests {
                                 SessionMessage::User {
                                     content: UserContent::Text(text),
                                     ..
-                                } if text == "accepted follow-up during failed turn"
+                                } if text == "preexisting queued follow-up"
                             )
                     ))
                     .count(),
@@ -7422,6 +7447,74 @@ mod tests {
         }
     }
 
+    struct GatedTerminalErrorProvider {
+        entered: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
+        gate: Mutex<Option<asupersync::channel::oneshot::Receiver<()>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for GatedTerminalErrorProvider {
+        fn name(&self) -> &str {
+            "gated-terminal-error-provider"
+        }
+
+        fn api(&self) -> &str {
+            "gated-terminal-error-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "gated-terminal-error-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let cx = AgentCx::for_current_or_request();
+            if let Some(entered) = self.entered.lock().expect("entered signal lock").take() {
+                entered
+                    .send(cx.cx(), ())
+                    .expect("signal terminal provider entry");
+            }
+            let gate = self.gate.lock().expect("terminal gate lock").take();
+            if let Some(mut gate) = gate {
+                let _ = gate.recv(cx.cx()).await;
+            }
+
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                stop_details: None,
+                error_message: Some("invalid API key from gated provider".to_string()),
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Error,
+                    message,
+                }),
+            ])))
+        }
+    }
+
     #[derive(Default)]
     struct RpcDeadlineProbeState {
         calls: std::sync::atomic::AtomicUsize,
@@ -9535,6 +9628,114 @@ export default function init(pi) {
                     }) if text == "generated ultrathink workflowz payload; argument=orchestrate"
                 )
             }));
+        });
+    }
+
+    #[test]
+    fn terminal_provider_error_preserves_follow_up_acknowledged_while_streaming() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (entered, mut wait_for_entry) = asupersync::channel::oneshot::channel::<()>();
+            let (release, gate) = asupersync::channel::oneshot::channel::<()>();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let provider: Arc<dyn Provider> = Arc::new(GatedTerminalErrorProvider {
+                entered: Mutex::new(Some(entered)),
+                gate: Mutex::new(Some(gate)),
+                calls: Arc::clone(&calls),
+            });
+            let tools = ToolRegistry::new(&[], temp.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let prompt = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"terminal prompt"}"#,
+                "terminal prompt acknowledgment",
+            )
+            .await;
+            assert_ok(&prompt, "prompt");
+
+            let entry_cx = AgentCx::for_request();
+            wait_for_entry
+                .recv(entry_cx.cx())
+                .await
+                .expect("terminal provider entered");
+
+            let follow_up = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"2","type":"follow_up","message":"accepted during terminal turn"}"#,
+                "terminal follow-up acknowledgment",
+            )
+            .await;
+            assert_ok(&follow_up, "follow_up");
+            drop(in_tx);
+
+            let release_cx = AgentCx::for_request();
+            release
+                .send(release_cx.cx(), ())
+                .expect("release terminal provider");
+
+            let terminal_event = loop {
+                let line = recv_line(&out_rx, "terminal provider completion")
+                    .await
+                    .expect("terminal provider event");
+                let value = parse_response(&line);
+                if value["type"] == "agent_end" {
+                    break value;
+                }
+            };
+            assert!(
+                terminal_event["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("invalid API key from gated provider")),
+                "terminal error must remain observable: {terminal_event}"
+            );
+            server.await.expect("RPC server join").expect("RPC server run");
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let session_cx = AgentCx::for_request();
+            let session = inner_session
+                .lock(&session_cx)
+                .await
+                .expect("terminal session lock");
+            let accepted_count = session
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text == "accepted during terminal turn"
+                    )
+                })
+                .count();
+            assert_eq!(
+                accepted_count, 1,
+                "acknowledged follow-up must be recorded exactly once after terminal failure"
+            );
         });
     }
 

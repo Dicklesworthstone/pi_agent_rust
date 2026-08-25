@@ -197,8 +197,8 @@ fn unanchored_artifacts_ignore_blocks_nested_required_artifacts() -> Result<(), 
             (
                 Ok(REQUIRED_ARTIFACT),
                 Ok(".rchignore"),
-                Ok(2),
-                Ok("artifacts/**"),
+                Ok(1),
+                Ok("artifacts/"),
                 Ok("required_path_excluded"),
             )
         )
@@ -210,6 +210,89 @@ fn unanchored_artifacts_ignore_blocks_nested_required_artifacts() -> Result<(), 
         )));
     }
 
+    Ok(())
+}
+
+#[test]
+fn project_rch_config_exclude_blocks_required_artifact() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    write_required_artifact(repo)?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\"tests/ext_conformance/artifacts/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "project transfer excludes are part of RCH's effective source filter\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let excluded_by_config = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok(".rch/config.toml"),
+                Ok("tests/ext_conformance/artifacts/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !excluded_by_config {
+        return Err(test_error(format!(
+            "config exclusion failure must identify .rch/config.toml\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn required_artifact_symlink_fails_preflight() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let target = repo.join("outside-artifact.json");
+    fs::write(&target, "{\"schema\":\"fixture\"}\n")?;
+    let artifact = repo.join(REQUIRED_ARTIFACT);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("required artifact path should have a parent"))?,
+    )?;
+    symlink(&target, &artifact)?;
+    fs::write(repo.join(".rchignore"), "# no excludes\n")?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a symlink must not satisfy required source-artifact presence\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let non_regular = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "required_path_not_regular")
+    });
+    if !non_regular {
+        return Err(test_error(format!(
+            "symlink rejection must report required_path_not_regular\n{}",
+            output_debug(&output)
+        )));
+    }
     Ok(())
 }
 
@@ -587,6 +670,44 @@ fn postcondition_rejects_symlinked_generated_artifact() -> Result<(), Box<dyn Er
     if !has_symlink_diagnostic {
         return Err(test_error(format!(
             "symlink rejection must report a regular-file violation\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn postcondition_baseline_rejects_preexisting_symlink() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let target = repo.join("actual-artifact.json");
+    fs::write(&target, "{\"stale\":true}\n")?;
+    let link = repo.join(GENERATED_ARTIFACT);
+    fs::create_dir_all(
+        link.parent()
+            .ok_or_else(|| test_error("generated artifact should have a parent"))?,
+    )?;
+    symlink(&target, &link)?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "baseline capture must reject a preexisting symlinked output\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_snapshot_not_regular_file")
+    });
+    if !rejected {
+        return Err(test_error(format!(
+            "preexisting symlink must fail with before_snapshot_not_regular_file\n{}",
             output_debug(&output)
         )));
     }

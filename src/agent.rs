@@ -14329,6 +14329,155 @@ mod tests {
     }
 
     #[test]
+    fn continuation_preflights_owning_source_before_consuming_staged_follow_up() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            agent.queue_follow_up(user_message("older staged follow-up"));
+
+            let owning_source_fetched = StdArc::new(AtomicBool::new(false));
+            let fetched_for_source = StdArc::clone(&owning_source_fetched);
+            let queued_owning = StdArc::new(StdTestMutex::new(Some(queued_user_message(
+                "new owning follow-up",
+            ))));
+            let queued_for_source = StdArc::clone(&queued_owning);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    fetched_for_source.store(true, Ordering::SeqCst);
+                    let queued_for_source = StdArc::clone(&queued_for_source);
+                    Box::pin(async move {
+                        queued_for_source
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .into_iter()
+                            .collect()
+                    })
+                };
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
+
+            let events = StdArc::new(StdTestMutex::new(Vec::new()));
+            let events_for_failed_preflight = StdArc::clone(&events);
+            let result = agent
+                .run_continue_with_follow_up_on_ready_with_abort(
+                    None,
+                    || false,
+                    move |event| {
+                        events_for_failed_preflight
+                            .lock()
+                            .expect("event capture")
+                            .push(event);
+                    },
+                )
+                .await;
+            assert!(result.is_err(), "failed source preflight must stop the run");
+            assert!(
+                owning_source_fetched.load(Ordering::SeqCst),
+                "an older staged batch must not bypass the owning fetcher"
+            );
+            assert!(events.lock().expect("event capture").is_empty());
+            assert!(calls.lock().expect("provider calls").is_empty());
+            assert_eq!(agent.message_queue.follow_up.len(), 2);
+            assert_user_text(
+                &agent.message_queue.follow_up[0].delivery.message,
+                "older staged follow-up",
+            );
+            assert_user_text(
+                &agent.message_queue.follow_up[1].delivery.message,
+                "new owning follow-up",
+            );
+
+            agent
+                .run_continue_with_follow_up_with_abort(None, |_| {})
+                .await
+                .expect("resume retained follow-ups after successful preflight");
+            let recorded_calls = calls.lock().expect("provider calls").clone();
+            assert_eq!(recorded_calls.len(), 1);
+            assert_eq!(recorded_calls[0].messages.len(), 2);
+            assert_user_text(&recorded_calls[0].messages[0], "older staged follow-up");
+            assert_user_text(&recorded_calls[0].messages[1], "new owning follow-up");
+        });
+    }
+
+    #[test]
+    fn max_time_restores_undelivered_steering_for_next_production_run() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    max_time: Some(std::time::Duration::ZERO),
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            agent.queue_steering(user_message("accepted steering one"));
+            agent.queue_steering(user_message("accepted steering two"));
+
+            let capped = agent
+                .run_with_message_with_abort(user_message("initial prompt"), None, |_| {})
+                .await
+                .expect("time-capped run");
+            assert!(assistant_text_content(&capped.content).contains("time cap reached"));
+            assert!(calls.lock().expect("provider calls").is_empty());
+            assert_eq!(agent.message_queue.steering.len(), 2);
+            assert_user_text(
+                &agent.message_queue.steering[0].delivery.message,
+                "accepted steering one",
+            );
+            assert_user_text(
+                &agent.message_queue.steering[1].delivery.message,
+                "accepted steering two",
+            );
+
+            agent.config.max_time = None;
+            agent
+                .run_with_message_with_abort(user_message("resume prompt"), None, |_| {})
+                .await
+                .expect("next production run");
+            assert!(agent.message_queue.steering.is_empty());
+            let recorded_calls = calls.lock().expect("provider calls").clone();
+            assert_eq!(recorded_calls.len(), 1);
+            let user_texts = recorded_calls[0]
+                .messages
+                .iter()
+                .filter_map(|message| match message {
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                user_texts,
+                vec![
+                    "initial prompt",
+                    "resume prompt",
+                    "accepted steering one",
+                    "accepted steering two"
+                ]
+            );
+        });
+    }
+
+    #[test]
     fn continuation_follow_up_first_preserves_full_admitted_batch() {
         let runtime = RuntimeBuilder::current_thread()
             .build()

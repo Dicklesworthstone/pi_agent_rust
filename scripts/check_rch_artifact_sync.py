@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import json
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,14 +36,11 @@ DEFAULT_REQUIRED_PATHS = (
 
 @dataclass(frozen=True)
 class IgnoreRule:
-    line: int
+    source: str
+    line: int | None
     pattern: str
     anchored: bool
     negated: bool
-
-    @property
-    def source(self) -> str:
-        return ".rchignore"
 
 
 def normalize_posix_path(path: str) -> str:
@@ -73,10 +71,70 @@ def load_ignore_rules(ignore_file: Path) -> tuple[list[IgnoreRule], list[str]]:
         stripped = stripped.replace("\\", "/")
         rules.append(
             IgnoreRule(
+                source=".rchignore",
                 line=line_number,
                 pattern=stripped,
                 anchored=stripped.startswith("/"),
                 negated=negated,
+            )
+        )
+    return rules, errors
+
+
+def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
+    """Load the project-level transfer excludes that replace lower config layers."""
+    if not config_file.exists():
+        return [], []
+
+    try:
+        content = config_file.read_text(encoding="utf-8")
+        payload = tomllib.loads(content)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return [], [f"failed to read RCH config {config_file}: {exc}"]
+
+    transfer = payload.get("transfer")
+    if transfer is None:
+        return [], []
+    if not isinstance(transfer, dict):
+        return [], [f"RCH config transfer section is not a table: {config_file}"]
+    patterns = transfer.get("exclude_patterns")
+    if patterns is None:
+        return [], []
+    if not isinstance(patterns, list):
+        return [], [f"RCH config transfer.exclude_patterns is not an array: {config_file}"]
+
+    lines = content.splitlines()
+    rules: list[IgnoreRule] = []
+    errors: list[str] = []
+    for index, raw_pattern in enumerate(patterns):
+        if not isinstance(raw_pattern, str):
+            errors.append(
+                "RCH config transfer.exclude_patterns contains a non-string "
+                f"entry at index {index}: {config_file}"
+            )
+            continue
+        pattern = raw_pattern.strip().replace("\\", "/")
+        if not pattern:
+            errors.append(
+                "RCH config transfer.exclude_patterns contains an empty "
+                f"entry at index {index}: {config_file}"
+            )
+            continue
+        line_number = next(
+            (
+                line_index
+                for line_index, line in enumerate(lines, start=1)
+                if pattern in line
+            ),
+            None,
+        )
+        rules.append(
+            IgnoreRule(
+                source=".rch/config.toml",
+                line=line_number,
+                pattern=pattern,
+                anchored=pattern.startswith("/"),
+                negated=False,
             )
         )
     return rules, errors
@@ -192,19 +250,50 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
 
 def build_postcondition_baseline(repo_root: Path, generated_artifacts: list[str]) -> dict[str, Any]:
     snapshots = []
+    violations: list[dict[str, Any]] = []
     for raw_path in generated_artifacts:
         snapshot = artifact_snapshot(repo_root, raw_path)
         snapshots.append({"path": snapshot["path"], "snapshot": snapshot})
+        if snapshot.get("error"):
+            violations.append(
+                {
+                    "path": snapshot["path"],
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_snapshot_error",
+                    "message": (
+                        "failed to capture the generated artifact baseline: "
+                        f"{snapshot['path']}"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        elif snapshot.get("kind") not in {"missing", "file"}:
+            violations.append(
+                {
+                    "path": snapshot["path"],
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_snapshot_not_regular_file",
+                    "message": (
+                        "generated artifact baseline is neither missing nor a regular file: "
+                        f"{snapshot['path']} ({snapshot.get('kind', 'unknown')})"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
     return {
         "schema": SCHEMA,
         "mode": "postcondition-baseline",
-        "status": "pass",
+        "status": "fail" if violations else "pass",
         "repo_root": str(repo_root),
         "generated_artifacts": snapshots,
-        "violations": [],
+        "violations": violations,
         "summary": {
             "generated_artifact_count": len(snapshots),
-            "violation_count": 0,
+            "violation_count": len(violations),
         },
     }
 
@@ -308,6 +397,18 @@ def build_postcondition_report(
                 "recommended_action": POSTCONDITION_ACTION,
             }
         )
+    if before_manifest_payload.get("status") != "pass":
+        manifest_violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_status_mismatch",
+                "message": "before manifest did not record a successful baseline capture",
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
     try:
         resolved_manifest_root = str(Path(str(manifest_repo_root)).resolve())
     except (OSError, TypeError, ValueError):
@@ -346,6 +447,8 @@ def build_postcondition_report(
         after = artifact_snapshot(repo_root, raw_path)
         updated = (
             before is not None
+            and not before.get("error")
+            and not after.get("error")
             and after.get("kind") == "file"
             and snapshot_changed(before, after)
         )
@@ -470,6 +573,37 @@ def evaluate_required_paths(
         final_ignored = False
         final_rule: IgnoreRule | None = None
 
+        if (
+            Path(raw_path).is_absolute()
+            or not rel_path
+            or rel_path == ".."
+            or rel_path.startswith("../")
+            or "/../" in rel_path
+        ):
+            required_results.append(
+                {
+                    "path": rel_path,
+                    "exists": False,
+                    "kind": "invalid",
+                    "matched_rules": [],
+                    "included": False,
+                }
+            )
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "required_paths",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "invalid_required_path",
+                    "message": (
+                        "required artifact path must be a normalized repo-relative path: "
+                        f"{raw_path}"
+                    ),
+                }
+            )
+            continue
+
         for rule in rules:
             matched = rule_matches(rule, rel_path)
             if not matched:
@@ -477,14 +611,44 @@ def evaluate_required_paths(
             matched_rules.append(matched_rule_payload(rule, matched=True))
             final_ignored = not rule.negated
             final_rule = rule
+            # RCH passes excludes to rsync in effective-config order. Rsync's
+            # filter evaluation is first-match-wins, and RCH has no include
+            # rules that could reverse an earlier exclusion.
+            break
 
-        exists = full_path.exists()
+        try:
+            metadata = full_path.lstat()
+        except FileNotFoundError:
+            metadata = None
+        except OSError as exc:
+            metadata = None
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "required_paths",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "required_path_inspection_error",
+                    "message": f"failed to inspect required path {rel_path}: {exc}",
+                }
+            )
+        exists = metadata is not None
+        if full_path.is_symlink():
+            kind = "symlink"
+        elif full_path.is_dir():
+            kind = "directory"
+        elif full_path.is_file():
+            kind = "file"
+        elif exists:
+            kind = "other"
+        else:
+            kind = "missing"
         path_result = {
             "path": rel_path,
             "exists": exists,
-            "kind": "directory" if full_path.is_dir() else "file" if full_path.is_file() else "missing",
+            "kind": kind,
             "matched_rules": matched_rules,
-            "included": exists and not final_ignored,
+            "included": exists and kind in {"file", "directory"} and not final_ignored,
         }
         required_results.append(path_result)
 
@@ -501,7 +665,22 @@ def evaluate_required_paths(
             )
             continue
 
+        if kind not in {"file", "directory"}:
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "required_paths",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "required_path_not_regular",
+                    "message": f"required path is not a regular file or directory: {rel_path} ({kind})",
+                }
+            )
+
         if final_ignored and final_rule is not None:
+            location = final_rule.source
+            if final_rule.line is not None:
+                location = f"{location}:{final_rule.line}"
             violations.append(
                 {
                     "path": rel_path,
@@ -510,7 +689,7 @@ def evaluate_required_paths(
                     "pattern": final_rule.pattern,
                     "reason": "required_path_excluded",
                     "message": (
-                        f"{rel_path} is excluded by {final_rule.source}:{final_rule.line} "
+                        f"{rel_path} is excluded by {location} "
                         f"pattern {final_rule.pattern!r}"
                     ),
                 }
@@ -519,15 +698,23 @@ def evaluate_required_paths(
     return required_results, violations
 
 
-def build_report(repo_root: Path, ignore_file: Path, required_paths: list[str]) -> dict[str, Any]:
-    rules, load_errors = load_ignore_rules(ignore_file)
+def build_report(
+    repo_root: Path,
+    ignore_file: Path,
+    config_file: Path,
+    required_paths: list[str],
+) -> dict[str, Any]:
+    config_rules, config_errors = load_config_rules(config_file)
+    ignore_rules, ignore_errors = load_ignore_rules(ignore_file)
+    rules = config_rules + ignore_rules
+    load_errors = config_errors + ignore_errors
     required_results, violations = evaluate_required_paths(repo_root, rules, required_paths)
 
     for error in load_errors:
         violations.append(
             {
                 "path": str(ignore_file),
-                "source": ".rchignore",
+                "source": "rch_transfer_config",
                 "line": None,
                 "pattern": None,
                 "reason": "ignore_file_error",
@@ -541,6 +728,7 @@ def build_report(repo_root: Path, ignore_file: Path, required_paths: list[str]) 
         "status": "fail" if violations else "pass",
         "repo_root": str(repo_root),
         "ignore_file": str(ignore_file),
+        "config_file": str(config_file),
         "required_paths": required_results,
         "violations": violations,
         "summary": {
@@ -605,6 +793,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Path to .rchignore. Defaults to <repo-root>/.rchignore.",
     )
     parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Path to project RCH config. Defaults to <repo-root>/.rch/config.toml.",
+    )
+    parser.add_argument(
         "--required-path",
         action="append",
         dest="required_paths",
@@ -635,6 +828,11 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     repo_root = Path(args.repo_root).resolve()
     ignore_file = Path(args.ignore_file).resolve() if args.ignore_file else repo_root / ".rchignore"
+    config_file = (
+        Path(args.config_file).resolve()
+        if args.config_file
+        else repo_root / ".rch/config.toml"
+    )
     required_paths = args.required_paths or list(DEFAULT_REQUIRED_PATHS)
 
     if args.mode == "postcondition":
@@ -670,7 +868,7 @@ def main(argv: list[str]) -> int:
                 args.before_manifest.resolve(),
             )
     else:
-        report = build_report(repo_root, ignore_file, required_paths)
+        report = build_report(repo_root, ignore_file, config_file, required_paths)
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
