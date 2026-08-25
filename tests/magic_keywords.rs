@@ -21,7 +21,9 @@ use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::auth::AuthStorage;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
-use pi::model::{ContentBlock, StreamEvent, TextContent, ThinkingLevel};
+use pi::model::{
+    ContentBlock, Message, StreamEvent, TextContent, ThinkingLevel, UserContent, UserMessage,
+};
 use pi::provider::{Context, StreamOptions};
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, run as run_rpc};
@@ -225,6 +227,37 @@ fn directives_injected_exactly_once() {
         prompt.matches("`workflowz` for this turn").count(),
         1,
         "workflowz directive must appear exactly once"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn directive_is_injected_once_across_multiple_user_prompts() {
+    let case = "directive_is_injected_once_across_multiple_user_prompts";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    let prompts = [
+        "orchestrate the first slice",
+        "orchestrate the second slice",
+    ]
+    .into_iter()
+    .map(|text| {
+        Message::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    })
+    .collect();
+
+    block_on_local(agent.run_with_messages_with_abort(prompts, None, |_| {}))
+        .expect("run multiple prompts");
+    let capture = capture.lock().expect("capture").clone();
+    let prompt = capture.system_prompts[0].as_deref().expect("system prompt");
+    assert_eq!(
+        prompt.matches("`orchestrate` for this turn").count(),
+        1,
+        "the directive must remain idempotent across the entire turn"
     );
     finish_case(&harness, case);
 }

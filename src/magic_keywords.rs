@@ -403,10 +403,9 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
-        let ch = message[index..]
-            .chars()
-            .next()
-            .expect("index is before message length");
+        let Some(ch) = message[index..].chars().next() else {
+            break;
+        };
         index += ch.len_utf8();
         if line_indented_code || !html_stack.is_empty() {
             flush_token(&mut token, &mut activations, &mut seen);
