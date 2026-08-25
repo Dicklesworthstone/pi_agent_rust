@@ -1262,8 +1262,9 @@ JSON
     ;;
   perf_budgets)
     if [[ "${PI_PERF_POST_GENERATION:-0}" == "1" ]]; then
-      if [[ "${PI_FAKE_RCH_STRICT_PINNED:-0}" != "0" ]]; then
-        echo "post-generation perf_budgets must use the ordinary evidence-transfer runner" >&2
+      if [[ "${PI_FAKE_RCH_STRICT_PINNED:-0}" != "1" \
+        || "${PI_FAKE_RCH_HAS_OVERLAY:-0}" != "1" ]]; then
+        echo "post-generation perf_budgets must use a clean current-evidence overlay" >&2
         exit 74
       fi
       case " $* " in
@@ -1397,25 +1398,39 @@ case "${1:-}" in
       shift
     fi
     strict_pinned=0
+    has_overlay=0
     if [[ "${1:-}" == "--base" ]]; then
       if (( $# < 6 )) \
         || [[ "${2:-}" != "$(git rev-parse HEAD)" ]] \
-        || [[ "${3:-}" != "--clean-overlay" ]] \
-        || [[ "${4:-}" != "--no-overlay" ]] \
-        || [[ "${5:-}" != "--" ]] \
-        || [[ "${6:-}" != "cargo" ]]; then
+        || [[ "${3:-}" != "--clean-overlay" ]]; then
         echo "strict RCH execution used an invalid clean committed-source pin" >&2
         exit 67
       fi
       strict_pinned=1
-      shift 5
+      if [[ "${4:-}" == "--no-overlay" \
+        && "${5:-}" == "--" \
+        && "${6:-}" == "cargo" ]]; then
+        shift 5
+      elif [[ "${4:-}" == "--overlay-path" \
+        && -n "${5:-}" \
+        && "${6:-}" == "--" \
+        && "${7:-}" == "cargo" ]]; then
+        has_overlay=1
+        shift 6
+      else
+        echo "strict RCH execution used an invalid overlay contract" >&2
+        exit 67
+      fi
     elif [[ "${1:-}" == "--" ]]; then
       shift
     else
       echo "unexpected fake RCH exec arguments: $*" >&2
       exit 68
     fi
-    if PI_FAKE_RCH_EXECUTED=1 PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" "$@"; then
+    if PI_FAKE_RCH_EXECUTED=1 \
+      PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" \
+      PI_FAKE_RCH_HAS_OVERLAY="$has_overlay" \
+      "$@"; then
       if [[ "${PI_FAKE_RCH_LOCAL_FALLBACK:-0}" == "1" ]]; then
         echo "[RCH] local (fixture fallback)" >&2
       else

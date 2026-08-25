@@ -4597,6 +4597,8 @@ artifact_count=$((artifact_count + 1))
 POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
 mkdir -p "$POST_GENERATION_BUDGET_DIR"
 post_generation_budget_exit=0
+POST_GENERATION_EVIDENCE_DIR="$OUTPUT_DIR/results"
+declare -a POST_GENERATION_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION; do
     case ",${RCH_ENV_ALLOWLIST:-}," in
@@ -4605,15 +4607,56 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     esac
   done
   export RCH_ENV_ALLOWLIST
+
+  post_generation_stage_key="$({ printf '%s\0' "$CORRELATION_ID" "$TIMESTAMP" "$$"; } | sha256sum | cut -d' ' -f1)"
+  POST_GENERATION_STAGE_RELATIVE=".rch-tmp/pi-perf-evidence/$post_generation_stage_key"
+  POST_GENERATION_STAGE_ABSOLUTE="$PROJECT_ROOT/$POST_GENERATION_STAGE_RELATIVE"
+  if [[ -e "$POST_GENERATION_STAGE_ABSOLUTE" \
+    || -L "$POST_GENERATION_STAGE_ABSOLUTE" ]]; then
+    die "Refusing preexisting post-generation RCH evidence stage: $POST_GENERATION_STAGE_RELATIVE"
+  fi
+  mkdir -p "$POST_GENERATION_STAGE_ABSOLUTE"
+  cp -R "$OUTPUT_DIR/results/." "$POST_GENERATION_STAGE_ABSOLUTE/"
+  POST_GENERATION_EVIDENCE_DIR="$POST_GENERATION_STAGE_RELATIVE"
+  POST_GENERATION_RUNNER_ARGS=(
+    "rch" "exec"
+    "--no-color"
+    "--base" "$GIT_COMMIT_FULL"
+    "--clean-overlay"
+    "--overlay-path" "$POST_GENERATION_STAGE_RELATIVE"
+    "--" "cargo"
+  )
 fi
-PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+PERF_EVIDENCE_DIR="$POST_GENERATION_EVIDENCE_DIR" \
 PI_PERF_POST_GENERATION=1 \
 CI_CORRELATION_ID="$CORRELATION_ID" \
-"${CARGO_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \
+RCH_QUIET=0 \
+RCH_VISIBILITY=summary \
+"${POST_GENERATION_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \
   ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact --nocapture \
   > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
   2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
   || post_generation_budget_exit=$?
+
+if [[ "$post_generation_budget_exit" -eq 0 && "$CARGO_RUNNER_MODE" == "rch" ]]; then
+  if ! grep -Eqs '^\[RCH\] remote [^[:space:]]+ \([^)]+\)$' \
+    "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+    "$POST_GENERATION_BUDGET_DIR/stderr.log"; then
+    log_fail "Post-generation perf budget gate has no remote-success marker"
+    post_generation_budget_exit=97
+  elif grep -Eqs '^\[RCH\] local( |$)' \
+    "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+    "$POST_GENERATION_BUDGET_DIR/stderr.log"; then
+    log_fail "Post-generation perf budget gate reported local execution"
+    post_generation_budget_exit=98
+  elif ! grep -Eqs \
+    "^\\[RCH\\] clean-overlay receipt: base=$GIT_COMMIT_FULL overlay-fingerprint=[0-9a-f]{64}$" \
+    "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+    "$POST_GENERATION_BUDGET_DIR/stderr.log"; then
+    log_fail "Post-generation perf budget gate has no current-commit clean-overlay receipt"
+    post_generation_budget_exit=99
+  fi
+fi
 
 post_generation_budget_status="pass"
 if [[ "$post_generation_budget_exit" -eq 0 ]]; then
