@@ -663,6 +663,12 @@ fn validate_post_generation_evidence_inventory(
                 entry.logical_input_id
             ));
         }
+        if entry.logical_input_id != format!("file:{}", entry.path) {
+            return Err(format!(
+                "logical_input_id {:?} does not match inventory path {:?}",
+                entry.logical_input_id, entry.path
+            ));
+        }
         if entry.sha256.len() != 64
             || !entry
                 .sha256
@@ -729,8 +735,10 @@ fn validate_post_generation_record_lineage(
         }
         Some(_) | None => {}
     }
-    if record.get("source_dirty").and_then(Value::as_bool) == Some(true) {
-        return Err("post-generation evidence must have source_dirty=false".to_string());
+    if record.get("source_dirty").and_then(Value::as_bool) != Some(false) {
+        return Err(
+            "post-generation evidence must declare source_dirty as boolean false".to_string(),
+        );
     }
     Ok(())
 }
@@ -1678,9 +1686,14 @@ fn context_intelligence_budget_metric_key(budget_name: &str) -> Option<&'static 
 }
 
 fn context_intelligence_budget_candidate_paths(root: &Path) -> Vec<PathBuf> {
+    if post_generation_mode_is_active() {
+        return perf_evidence_dirs(root)
+            .into_iter()
+            .map(|dir| dir.join("context_intelligence/perf_budget.json"))
+            .collect();
+    }
     let mut paths = Vec::new();
-    if !post_generation_mode_is_active()
-        && let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON")
+    if let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON")
     {
         let trimmed = path.trim();
         if !trimmed.is_empty()
@@ -1699,9 +1712,7 @@ fn context_intelligence_budget_candidate_paths(root: &Path) -> Vec<PathBuf> {
             &dir,
         ));
     }
-    if !post_generation_mode_is_active() {
-        paths.push(root.join("tests/perf/reports/context_intelligence_planner_budget.json"));
-    }
+    paths.push(root.join("tests/perf/reports/context_intelligence_planner_budget.json"));
     dedup_paths(paths)
 }
 
@@ -2475,7 +2486,7 @@ fn evaluate_context_intelligence_budget_contract(
         Ok(payload) => payload,
         Err(failure) => return vec![failure],
     };
-    if let Err(detail) = validate_post_generation_record_lineage(root, &payload, false) {
+    if let Err(detail) = validate_post_generation_record_lineage(root, &payload, true) {
         failures.push(context_intelligence_failure(
             "invalid_post_generation_evidence_lineage",
             None,
@@ -3514,33 +3525,30 @@ fn read_context_intelligence_budget_metric(
     budget_name: &str,
     criterion_bench_name: Option<&str>,
 ) -> (Option<f64>, String) {
+    if let Some(bench_name) = criterion_bench_name {
+        return read_criterion_context_intelligence(root, bench_name);
+    }
     let Some(metric_key) = context_intelligence_budget_metric_key(budget_name) else {
         return (
             None,
             format!("no context intelligence metric key for {budget_name}"),
         );
     };
-    for path in context_intelligence_budget_candidate_paths(root) {
-        let Some(payload) = read_json_file(&path) else {
-            continue;
-        };
-        if payload.get("schema").and_then(Value::as_str) != Some(CONTEXT_INTELLIGENCE_PERF_SCHEMA) {
-            continue;
-        }
-        if let Some(value) = context_intelligence_metric_value(&payload, metric_key) {
-            return (Some(value), display_source_path(root, &path));
-        }
+    match load_context_intelligence_budget_payload(root, max_artifact_age_hours()) {
+        Ok((path, payload)) => context_intelligence_metric_value(&payload, metric_key).map_or_else(
+            || {
+                (
+                    None,
+                    format!("no context intelligence budget artifact metric {metric_key}"),
+                )
+            },
+            |value| (Some(value), display_source_path(root, &path)),
+        ),
+        Err(_) => (
+            None,
+            format!("no context intelligence budget artifact metric {metric_key}"),
+        ),
     }
-
-    criterion_bench_name.map_or_else(
-        || {
-            (
-                None,
-                format!("no context intelligence budget artifact metric {metric_key}"),
-            )
-        },
-        |bench_name| read_criterion_context_intelligence(root, bench_name),
-    )
 }
 
 fn read_scenario_runner_per_call(root: &Path, scenario: &str) -> (Option<f64>, String) {

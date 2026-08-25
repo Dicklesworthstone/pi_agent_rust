@@ -13,6 +13,7 @@
 //! - Available cores for isolation
 
 use sha2::{Digest, Sha256};
+use std::path::{Component, PathBuf};
 use std::sync::OnceLock;
 use sysinfo::System;
 
@@ -213,7 +214,7 @@ pub fn print_env_banner_once() {
 #[allow(dead_code)]
 pub fn criterion_config() -> criterion::Criterion {
     print_env_banner_once();
-    criterion::Criterion::default()
+    criterion_with_isolated_output(criterion::Criterion::default())
 }
 
 /// Return a Criterion configuration for system-level benchmarks
@@ -222,7 +223,45 @@ pub fn criterion_config() -> criterion::Criterion {
 #[allow(dead_code)]
 pub fn criterion_config_system() -> criterion::Criterion {
     print_env_banner_once();
-    criterion::Criterion::default()
+    criterion_with_isolated_output(criterion::Criterion::default())
         .sample_size(20)
         .measurement_time(std::time::Duration::from_secs(10))
+}
+
+/// Resolve the orchestrator-assigned, run-isolated Criterion output directory.
+///
+/// The value is deliberately target-relative so RCH can rewrite
+/// `CARGO_TARGET_DIR` on the worker and still retrieve `criterion/**` into the
+/// matching local target directory.
+#[must_use]
+pub fn criterion_output_directory() -> Option<PathBuf> {
+    let relative = PathBuf::from(std::env::var_os("PI_CRITERION_OUTPUT_SUBDIR")?);
+    assert!(
+        !relative.as_os_str().is_empty()
+            && !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "PI_CRITERION_OUTPUT_SUBDIR must be a non-empty normalized relative path"
+    );
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR").map_or_else(
+        || manifest_dir.join("target"),
+        |raw| {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                path
+            } else {
+                manifest_dir.join(path)
+            }
+        },
+    );
+    Some(target_dir.join("criterion").join(relative))
+}
+
+fn criterion_with_isolated_output(criterion: criterion::Criterion) -> criterion::Criterion {
+    match criterion_output_directory() {
+        Some(path) => criterion.output_directory(&path),
+        None => criterion,
+    }
 }

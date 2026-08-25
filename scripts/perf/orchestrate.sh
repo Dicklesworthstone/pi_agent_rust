@@ -429,6 +429,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     PI_IDLE_RSS_SOURCE_DIRTY \
     PI_IDLE_RSS_CORRELATION_ID \
     PI_BENCH_BUILD_PROFILE \
+    PI_CRITERION_OUTPUT_SUBDIR \
     PI_PERF_STRICT; do
     case ",${RCH_ENV_ALLOWLIST:-}," in
       *",$required_env,"*) ;;
@@ -626,7 +627,7 @@ write_cold_load_measurement_control() {
 
   python3 - \
     "$result_dir/stderr.log" \
-    "$TARGET_DIR/criterion" \
+    "$TARGET_DIR/criterion/pi-perf-runs/$CORRELATION_ID/criterion_extensions" \
     "$control_path" \
     "$benchmark_exit_code" \
     "$GIT_COMMIT_FULL" \
@@ -1580,12 +1581,23 @@ run_criterion_bench() {
   suite_start=$(epoch_ms)
 
   local result_dir="$OUTPUT_DIR/results/$suite_name"
+  local criterion_run_subdir="pi-perf-runs/$CORRELATION_ID/$suite_name"
+  local criterion_dir="$TARGET_DIR/criterion/$criterion_run_subdir"
   mkdir -p "$result_dir"
 
   exit_code=0
-  "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
-    >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
-    || exit_code=$?
+  if [[ -e "$criterion_dir" || -L "$criterion_dir" ]]; then
+    log_fail "Refusing preexisting Criterion run output: $criterion_dir"
+    exit_code=88
+  else
+    PI_CRITERION_OUTPUT_SUBDIR="$criterion_run_subdir" \
+    CI_CORRELATION_ID="$CORRELATION_ID" \
+    VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+      "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
+      >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
+      || exit_code=$?
+  fi
 
   suite_end=$(epoch_ms)
   suite_elapsed=$((suite_end - suite_start))
@@ -1602,8 +1614,7 @@ run_criterion_bench() {
   fi
 
   # Copy criterion output if it exists
-  local criterion_dir="$TARGET_DIR/criterion/$bench_name"
-  if [[ -d "$criterion_dir" ]]; then
+  if [[ "$exit_code" -eq 0 && -d "$criterion_dir" && ! -L "$criterion_dir" ]]; then
     cp -r "$criterion_dir" "$result_dir/criterion/" 2>/dev/null || true
   fi
 
@@ -4767,6 +4778,7 @@ if ! PROJECT_ROOT="$PROJECT_ROOT" \
   POST_GENERATION_STAGE_RELATIVE="$POST_GENERATION_STAGE_RELATIVE" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   CORRELATION_ID="$CORRELATION_ID" \
+  SELECTED_SUITES="${SELECTED_SUITES[*]}" \
   python3 - <<'PY'
 import hashlib
 import json
@@ -4800,24 +4812,66 @@ for index, part in enumerate(stage_relative.parts):
 
 sources = [
     (output_dir / "results", PurePosixPath("."), True),
-    (target_dir / "criterion", PurePosixPath("criterion"), False),
     (target_dir / "perf" / "release_evidence", PurePosixPath("release_evidence"), False),
 ]
+criterion_suites = {
+    "criterion_tools",
+    "criterion_extensions",
+    "criterion_system",
+    "criterion_semantic_context",
+}
+selected_suites = set(os.environ["SELECTED_SUITES"].split())
+criterion_run_root = (
+    target_dir / "criterion" / "pi-perf-runs" / os.environ["CORRELATION_ID"]
+)
 optional_files = [
     (target_dir / "release" / "pi", PurePosixPath("release/pi")),
-    (
-        target_dir / "perf" / "context_intelligence_planner_budget.json",
-        PurePosixPath("context_intelligence_planner_budget.json"),
-    ),
-    (
-        target_dir / "perf" / "results" / "context_intelligence_planner_budget.json",
-        PurePosixPath("results/context_intelligence_planner_budget.json"),
-    ),
-    (
-        target_dir / "perf" / "context_intelligence" / "perf_budget.json",
-        PurePosixPath("context_intelligence/perf_budget.json"),
-    ),
 ]
+required_files = []
+criterion_required_inputs = {
+    "criterion_extensions": [
+        "ext_load_init/load_init_cold/hello/new/estimates.json",
+        "ext_load_init/load_init_cold/pirate/new/estimates.json",
+        "ext_policy/evaluate/prompt_allow/new/estimates.json",
+        "ext_policy/evaluate/prompt_prompt/new/estimates.json",
+        "ext_policy/evaluate/prompt_deny/new/estimates.json",
+        "ext_policy/evaluate/strict_allow/new/estimates.json",
+        "ext_policy/evaluate/strict_deny/new/estimates.json",
+        "ext_policy/evaluate/permissive_allow/new/estimates.json",
+        "ext_protocol/parse_and_validate/host_call_small/new/estimates.json",
+        "ext_protocol/parse_and_validate/log_big/new/estimates.json",
+    ],
+    "criterion_system": [
+        "startup/version/warm/new/estimates.json",
+        "startup/help/warm/new/estimates.json",
+        "startup/list_models/warm/new/estimates.json",
+    ],
+    "criterion_semantic_context": [
+        "semantic_context/graph_build_cold/large_workspace/new/estimates.json",
+        "semantic_context/graph_build_warm/large_workspace/new/estimates.json",
+        "semantic_context/incremental_update/large_workspace/new/estimates.json",
+        "semantic_context/planning/large_workspace/new/estimates.json",
+        "semantic_context/bundle_serialization/large_workspace/new/estimates.json",
+    ],
+}
+for suite, relative_paths in criterion_required_inputs.items():
+    if suite not in selected_suites:
+        continue
+    suite_root = criterion_run_root / suite
+    required_files.extend(
+        (suite_root.joinpath(*PurePosixPath(relative).parts), PurePosixPath("criterion") / relative)
+        for relative in relative_paths
+    )
+if "criterion_semantic_context" in selected_suites:
+    required_files.append(
+        (
+            criterion_run_root
+            / "criterion_semantic_context"
+            / "context_intelligence"
+            / "perf_budget.json",
+            PurePosixPath("context_intelligence/perf_budget.json"),
+        )
+    )
 
 entries = []
 destinations = set()
@@ -5001,6 +5055,8 @@ if pijs_artifact.is_file():
 for source, destination in optional_files:
     if source.exists() or source.is_symlink():
         copy_regular_file(source, destination)
+for source, destination in required_files:
+    copy_regular_file(source, destination)
 if not entries:
     raise SystemExit("post-generation evidence stage contains no regular files")
 

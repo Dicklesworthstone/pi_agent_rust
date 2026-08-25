@@ -217,13 +217,27 @@ fn write_context_budget_artifact(
     });
 
     let target_dir = resolved_target_dir();
-    let output_path = target_dir.join("perf/context_intelligence/perf_budget.json");
+    let output_root = bench_env::criterion_output_directory()
+        .unwrap_or_else(|| target_dir.join("criterion"));
+    let output_path = output_root.join("context_intelligence/perf_budget.json");
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("create semantic context perf budget dir");
     }
+    let correlation_id = std::env::var("CI_CORRELATION_ID")
+        .unwrap_or_else(|_| "standalone-unclaimable".to_string());
+    let source_commit = std::env::var("VERGEN_GIT_SHA")
+        .unwrap_or_else(|_| "unknown".to_string());
+    let source_dirty = std::env::var("VERGEN_GIT_DIRTY")
+        .ok()
+        .and_then(|value| value.parse::<bool>().ok())
+        .unwrap_or(true);
     let payload = json!({
         "schema": PERF_BUDGET_SCHEMA,
         "generated_at": chrono::Utc::now().to_rfc3339(),
+        "run_id": correlation_id,
+        "correlation_id": correlation_id,
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
         "environment": {
             "cargo_target_dir": target_dir.display().to_string(),
             "tmpdir": resolved_tmpdir().display().to_string(),
