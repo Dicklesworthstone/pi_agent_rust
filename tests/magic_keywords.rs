@@ -168,6 +168,23 @@ fn ultrathink_uses_model_clamped_max() {
 }
 
 #[test]
+fn ultrathink_does_not_guess_capabilities_for_unknown_model() {
+    let case = "ultrathink_does_not_guess_capabilities_for_unknown_model";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+
+    block_on_local(agent.run("please ultrathink this design", |_| {})).expect("run");
+    let capture = capture.lock().expect("capture").clone();
+    assert_eq!(
+        capture.thinking.first(),
+        Some(&Some(ThinkingLevel::Off)),
+        "an unregistered provider must fail closed instead of receiving raw Max"
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
 fn block_content_text_activates_keywords() {
     let case = "block_content_text_activates_keywords";
     let harness = TestHarness::new(case);
