@@ -7426,10 +7426,7 @@ mod tests {
             .iter()
             .find(|entry| entry.model.id == "qwen-default")
             .expect("default model");
-        assert_eq!(
-            opt_in.tool_call_dialect(),
-            crate::dialects::Dialect::Xmlish
-        );
+        assert_eq!(opt_in.tool_call_dialect(), crate::dialects::Dialect::Xmlish);
         assert_eq!(
             defaulted.tool_call_dialect(),
             crate::dialects::Dialect::Native
