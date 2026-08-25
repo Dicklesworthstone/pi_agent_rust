@@ -2098,13 +2098,11 @@ impl Agent {
                     .join("\n"),
             ),
         };
-        let hits: Vec<_> = crate::magic_keywords::detect(
-            &scan_text,
-            self.config.keyword_settings.as_ref(),
-        )
-        .into_iter()
-        .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
-        .collect();
+        let hits: Vec<_> =
+            crate::magic_keywords::detect(&scan_text, self.config.keyword_settings.as_ref())
+                .into_iter()
+                .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
+                .collect();
         if hits.is_empty() {
             return;
         }
@@ -2115,10 +2113,8 @@ impl Agent {
                 self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
             }
         }
-        let directives = crate::magic_keywords::directives_for(
-            &hits,
-            self.config.keyword_settings.as_ref(),
-        );
+        let directives =
+            crate::magic_keywords::directives_for(&hits, self.config.keyword_settings.as_ref());
         if !directives.is_empty() {
             let block = directives.join("\n");
             match &mut self.config.system_prompt {
@@ -10205,7 +10201,7 @@ impl AgentSession {
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
         let provider = self.agent.provider();
-        let entry = registry.find(provider.name(), provider.model_id()).cloned();
+        let entry = registry.find(provider.name(), provider.model_id());
         let keyword_max = entry
             .as_ref()
             .map_or(self.agent.keyword_max_thinking_level, |entry| {
@@ -13691,7 +13687,11 @@ mod tests {
                 Ok(calls) => calls,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            assert_eq!(calls.len(), 2, "follow-up must trigger a second provider turn");
+            assert_eq!(
+                calls.len(),
+                2,
+                "follow-up must trigger a second provider turn"
+            );
             assert_eq!(
                 calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::High),
