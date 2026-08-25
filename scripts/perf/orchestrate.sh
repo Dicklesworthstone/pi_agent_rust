@@ -4805,8 +4805,9 @@ for index, part in enumerate(stage_relative.parts):
     except FileNotFoundError:
         cursor.mkdir()
         metadata = cursor.lstat()
-    elif final:
-        raise SystemExit(f"refusing preexisting post-generation evidence stage: {cursor}")
+    else:
+        if final:
+            raise SystemExit(f"refusing preexisting post-generation evidence stage: {cursor}")
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
         raise SystemExit(f"post-generation evidence stage has unsafe ancestor: {cursor}")
 
@@ -4814,12 +4815,6 @@ sources = [
     (output_dir / "results", PurePosixPath("."), True),
     (target_dir / "perf" / "release_evidence", PurePosixPath("release_evidence"), False),
 ]
-criterion_suites = {
-    "criterion_tools",
-    "criterion_extensions",
-    "criterion_system",
-    "criterion_semantic_context",
-}
 selected_suites = set(os.environ["SELECTED_SUITES"].split())
 criterion_run_root = (
     target_dir / "criterion" / "pi-perf-runs" / os.environ["CORRELATION_ID"]

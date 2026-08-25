@@ -1047,6 +1047,7 @@ if [[ "${PI_FAKE_RCH_EXECUTED:-0}" != "1" ]]; then
 fi
 target_dir="${CARGO_TARGET_DIR:-target}"
 test_name=""
+bench_name=""
 for ((i=1; i<=$#; i++)); do
   if [[ "${!i}" == "--test" ]]; then
     j=$((i+1))
@@ -1054,9 +1055,69 @@ for ((i=1; i<=$#; i++)); do
       test_name="${!j}"
     fi
   fi
+  if [[ "${!i}" == "--bench" ]]; then
+    j=$((i+1))
+    if [[ $j -le $# ]]; then
+      bench_name="${!j}"
+    fi
+  fi
 done
 
 mkdir -p "$target_dir/perf"
+
+if [[ -n "$bench_name" ]]; then
+  criterion_root="$target_dir/criterion/${PI_CRITERION_OUTPUT_SUBDIR:?}"
+  mkdir -p "$criterion_root/report"
+  printf '%s\n' '<html>current isolated fixture report</html>' >"$criterion_root/report/index.html"
+  printf '%s\n' '[bench-env] os=linux arch=x86_64 cpu="fixture" cores=8 mem_mb=1024 governor=performance turbo=disabled aslr=disabled thp=never noise_score=0 config_hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' >&2
+  write_estimate() {
+    local path="$criterion_root/$1"
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' '{"mean":{"point_estimate":1.0},"median":{"point_estimate":1.0},"median_abs_dev":{"point_estimate":0.0}}' >"$path"
+  }
+  case "$bench_name" in
+    tools)
+      write_estimate "truncation/head/1000/new/estimates.json"
+      ;;
+    extensions)
+      for relative in \
+        ext_load_init/load_init_cold/hello/new/estimates.json \
+        ext_load_init/load_init_cold/pirate/new/estimates.json \
+        ext_policy/evaluate/prompt_allow/new/estimates.json \
+        ext_policy/evaluate/prompt_prompt/new/estimates.json \
+        ext_policy/evaluate/prompt_deny/new/estimates.json \
+        ext_policy/evaluate/strict_allow/new/estimates.json \
+        ext_policy/evaluate/strict_deny/new/estimates.json \
+        ext_policy/evaluate/permissive_allow/new/estimates.json \
+        ext_protocol/parse_and_validate/host_call_small/new/estimates.json \
+        ext_protocol/parse_and_validate/log_big/new/estimates.json; do
+        write_estimate "$relative"
+      done
+      ;;
+    system)
+      for relative in \
+        startup/version/warm/new/estimates.json \
+        startup/help/warm/new/estimates.json \
+        startup/list_models/warm/new/estimates.json; do
+        write_estimate "$relative"
+      done
+      ;;
+    semantic_context)
+      for relative in \
+        semantic_context/graph_build_cold/large_workspace/new/estimates.json \
+        semantic_context/graph_build_warm/large_workspace/new/estimates.json \
+        semantic_context/incremental_update/large_workspace/new/estimates.json \
+        semantic_context/planning/large_workspace/new/estimates.json \
+        semantic_context/bundle_serialization/large_workspace/new/estimates.json; do
+        write_estimate "$relative"
+      done
+      mkdir -p "$criterion_root/context_intelligence"
+      cat >"$criterion_root/context_intelligence/perf_budget.json" <<JSON
+{"schema":"pi.semantic_context.performance_budget.v1","generated_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","source_commit":"${VERGEN_GIT_SHA:?}","source_dirty":false,"environment":{"cargo_target_dir":"$target_dir","tmpdir":"/tmp"},"host":{"os":"linux","arch":"x86_64"},"determinism":{"randomized_file_order_checked":true,"matched":true},"cache_hit_miss":{"cold_graph_build":"miss","warm_graph_build":"hit","incremental_update":"miss"},"metrics":{"context_graph_build_cold_ms":{"value_ms":1.0},"context_graph_build_warm_ms":{"value_ms":1.0},"context_incremental_update_ms":{"value_ms":1.0},"context_planning_ms":{"value_ms":1.0},"context_bundle_serialization_ms":{"value_ms":1.0},"context_bundle_estimated_bytes":{"bytes":8192.0}}}
+JSON
+      ;;
+  esac
+fi
 
 case "$test_name" in
   bench_scenario_runner)
@@ -1452,7 +1513,7 @@ case "${1:-}" in
       echo "rch exec was not placed in fail-closed proof mode" >&2
       exit 65
     fi
-    for key in BENCH_OUTPUT_TARGET_SUBDIR BENCH_QUICK BENCH_ITERATIONS PI_BENCH_RUN_ID CARGO_BUILD_JOBS; do
+    for key in BENCH_OUTPUT_TARGET_SUBDIR BENCH_QUICK BENCH_ITERATIONS PI_BENCH_RUN_ID CARGO_BUILD_JOBS PI_CRITERION_OUTPUT_SUBDIR; do
       case ",${RCH_ENV_ALLOWLIST:-}," in
         *",$key,"*) ;;
         *)
@@ -1512,7 +1573,7 @@ case "${1:-}" in
       exit 68
     fi
     if [[ "$has_overlay" == "1" ]]; then
-      for key in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do
+      for key in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT CI_CORRELATION_ID PI_PERF_STRICT; do
         case ",${RCH_ENV_ALLOWLIST:-}," in
           *",$key,"*) ;;
           *)
@@ -7898,8 +7959,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             "PI_FAKE_GIT_REV_PARSE_STATE_FILE",
             target_dir.join("git-rev-parse-count"),
         )
-        .env("CI_CORRELATION_ID", FAKE_ORCHESTRATE_CORRELATION_ID)
-        .env("PERF_SKIP_CRITERION", "1");
+        .env("CI_CORRELATION_ID", FAKE_ORCHESTRATE_CORRELATION_ID);
     if !omit_require_rch_cli {
         command.arg("--require-rch");
     }

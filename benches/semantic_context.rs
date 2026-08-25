@@ -234,7 +234,7 @@ fn write_context_budget_artifact(
     let payload = json!({
         "schema": PERF_BUDGET_SCHEMA,
         "generated_at": chrono::Utc::now().to_rfc3339(),
-        "run_id": correlation_id,
+        "run_id": &correlation_id,
         "correlation_id": correlation_id,
         "source_commit": source_commit,
         "source_dirty": source_dirty,
