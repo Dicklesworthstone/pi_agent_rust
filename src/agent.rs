@@ -1280,6 +1280,10 @@ pub struct Agent {
     /// across multiple repaired assistant messages.
     dialect_repair_sequence: AtomicU64,
 
+    /// Explicit catalog-selected tool-call dialect. Native is the fail-closed
+    /// default; model-name heuristics never enable runtime repair.
+    tool_call_dialect: crate::dialects::Dialect,
+
     /// Magic-keyword activations this run (bd-cv653.3.6), drained by the
     /// session wrapper into session Custom entries for auditability.
     keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
@@ -1351,6 +1355,7 @@ impl Agent {
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
             dialect_repair_sequence: AtomicU64::new(0),
+            tool_call_dialect: crate::dialects::Dialect::Native,
             keyword_ledger: Vec::new(),
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
@@ -1363,9 +1368,7 @@ impl Agent {
     /// structured calls already present, tools enabled, one repair per
     /// message, candidate names must be registered tools.
     fn maybe_repair_dialect_tool_calls(&self, msg: AssistantMessage) -> AssistantMessage {
-        use crate::dialects::{
-            Dialect, dialect_for_model, extract_text_tool_calls, strip_candidates,
-        };
+        use crate::dialects::{Dialect, extract_text_tool_calls, strip_candidates};
 
         if !extract_tool_calls(&msg.content).is_empty() {
             return msg; // structured calls present — nothing to repair
@@ -1376,24 +1379,23 @@ impl Agent {
         if self.tools.tools().is_empty() {
             return msg;
         }
-        let provider = self.provider();
-        if dialect_for_model(provider.name(), provider.model_id()) != Dialect::Xmlish {
+        if self.tool_call_dialect != Dialect::Xmlish {
             return msg;
         }
 
-        let candidate_block = msg
-            .content
-            .iter()
-            .enumerate()
-            .find_map(|(index, block)| match block {
-                ContentBlock::Text(text) => {
-                    let candidates = extract_text_tool_calls(&text.text, &|name| {
-                        self.tools.get(name).is_some()
-                    });
-                    (!candidates.is_empty()).then_some((index, candidates))
-                }
-                _ => None,
-            });
+        let candidate_block =
+            msg.content
+                .iter()
+                .enumerate()
+                .find_map(|(index, block)| match block {
+                    ContentBlock::Text(text) => {
+                        let candidates = extract_text_tool_calls(&text.text, &|name| {
+                            self.tools.get(name).is_some()
+                        });
+                        (!candidates.is_empty()).then_some((index, candidates))
+                    }
+                    _ => None,
+                });
         let Some((block_index, candidates)) = candidate_block else {
             return msg;
         };
@@ -1402,9 +1404,7 @@ impl Agent {
             unreachable!("candidate search only returns text blocks");
         };
         let remaining = strip_candidates(&original_text.text, &candidates);
-        let repair_sequence = self
-            .dialect_repair_sequence
-            .fetch_add(1, Ordering::Relaxed);
+        let repair_sequence = self.dialect_repair_sequence.fetch_add(1, Ordering::Relaxed);
         let mut replacement = Vec::with_capacity(1 + candidates.len());
         if !remaining.is_empty() {
             // The candidate block changed, so its provider signature no longer
@@ -1580,11 +1580,17 @@ impl Agent {
         // carry a high thinking cap from the previous model. Registry-aware
         // switch paths immediately install the target model's clamped cap.
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
+        self.tool_call_dialect = crate::dialects::Dialect::Native;
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
     pub const fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
         self.keyword_max_thinking_level = level;
+    }
+
+    /// Install the model-catalog-selected tool-call dialect.
+    pub const fn set_tool_call_dialect(&mut self, dialect: crate::dialects::Dialect) {
+        self.tool_call_dialect = dialect;
     }
 
     /// Register async fetchers for queued steering/follow-up messages.
@@ -10185,12 +10191,17 @@ impl AgentSession {
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
         let provider = self.agent.provider();
-        let keyword_max = registry
-            .find(provider.name(), provider.model_id())
+        let entry = registry.find(provider.name(), provider.model_id()).cloned();
+        let keyword_max = entry
+            .as_ref()
             .map_or(self.agent.keyword_max_thinking_level, |entry| {
                 entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
             });
         self.agent.set_keyword_max_thinking_level(keyword_max);
+        self.agent.set_tool_call_dialect(entry.as_ref().map_or(
+            crate::dialects::Dialect::Native,
+            ModelEntry::tool_call_dialect,
+        ));
         self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
         // Keep the extension ctx catalog in sync when the registry is
         // replaced after extension boot (e.g. after merging extension
@@ -10312,6 +10323,8 @@ impl AgentSession {
         self.agent.stream_options_mut().thinking_level = Some(next_thinking);
         let keyword_max = self.keyword_max_thinking_level_for_model(provider_id, model_id);
         self.agent.set_keyword_max_thinking_level(keyword_max);
+        let dialect = self.tool_call_dialect_for_model(provider_id, model_id);
+        self.agent.set_tool_call_dialect(dialect);
         self.refresh_extension_completion_host_state();
 
         {
@@ -10412,6 +10425,19 @@ impl AgentSession {
             })
     }
 
+    fn tool_call_dialect_for_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> crate::dialects::Dialect {
+        self.model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider_id, model_id))
+            .map_or(crate::dialects::Dialect::Native, |entry| {
+                entry.tool_call_dialect()
+            })
+    }
+
     fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
         let normalize = |key_opt: Option<String>| {
             key_opt.and_then(|key| {
@@ -10473,9 +10499,11 @@ impl AgentSession {
             self.clamp_thinking_level_for_model(&active_provider_id, &active_model_id, requested);
         let keyword_max =
             self.keyword_max_thinking_level_for_model(&active_provider_id, &active_model_id);
+        let dialect = self.tool_call_dialect_for_model(&active_provider_id, &active_model_id);
 
         self.agent.stream_options_mut().thinking_level = Some(effective);
         self.agent.set_keyword_max_thinking_level(keyword_max);
+        self.agent.set_tool_call_dialect(dialect);
         self.refresh_extension_completion_host_state();
 
         let thinking_changed = !effective.eq(&current_thinking);
@@ -15877,7 +15905,8 @@ mod tests {
             fail_after_tool_once: false,
         });
         let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+        agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
         let original = AssistantMessage {
             content: vec![
                 ContentBlock::Thinking(ThinkingContent {
@@ -15933,7 +15962,10 @@ mod tests {
         ));
         let first_id = extract_tool_calls(&first.content)[0].id.clone();
         let second_id = extract_tool_calls(&second.content)[0].id.clone();
-        assert_ne!(first_id, second_id, "repaired call IDs must be session-unique");
+        assert_ne!(
+            first_id, second_id,
+            "repaired call IDs must be session-unique"
+        );
     }
 
     #[test]
@@ -15952,8 +15984,7 @@ mod tests {
                     model_id,
                     fail_after_tool_once: false,
                 });
-                let control_tools =
-                    ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+                let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
                 let mut control_agent = Agent::new(
                     Arc::clone(&control) as Arc<dyn Provider>,
                     control_tools,
@@ -15983,11 +16014,14 @@ mod tests {
                 let cx = asupersync::Cx::for_request();
                 let inner = session.lock(&cx).await.expect("control session lock");
                 assert!(
-                    inner.entries_for_current_path().iter().all(|entry| !matches!(
-                        entry,
-                        crate::session::SessionEntry::Custom(custom)
-                            if custom.custom_type == "dialect_repair"
-                    )),
+                    inner
+                        .entries_for_current_path()
+                        .iter()
+                        .all(|entry| !matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "dialect_repair"
+                        )),
                     "{model_id} must not persist repair telemetry"
                 );
             }
@@ -16002,7 +16036,8 @@ mod tests {
                 fail_after_tool_once: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
             let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
                 temp.path().join("sessions"),
             ))));
@@ -16109,7 +16144,8 @@ mod tests {
                 fail_after_tool_once: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
             let mut durable_session =
                 Session::create_with_dir(Some(temp.path().join("resume-sessions")));
             durable_session.append_model_message(Message::User(UserMessage {
@@ -16175,11 +16211,12 @@ mod tests {
                 fail_after_tool_once: true,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let agent = Agent::new(
+            let mut agent = Agent::new(
                 Arc::clone(&provider) as Arc<dyn Provider>,
                 tools,
                 AgentConfig::default(),
             );
+            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
             let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
                 temp.path().join("retry-sessions"),
             ))));

@@ -1215,6 +1215,7 @@ impl PiApp {
         agent_guard.set_keyword_max_thinking_level(
             target_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
+        agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
         drop(agent_guard);
 

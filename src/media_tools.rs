@@ -22,11 +22,11 @@ pub const MAX_TTS_TEXT_CHARS: usize = 4096;
 
 // Minimal valid 1x1 PNG bytes for fixture / VCR fallback
 const MIN_VALID_PNG: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
-    0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
 ];
 
 // Minimal valid 44-byte standard WAV header + silence
@@ -404,13 +404,10 @@ impl Tool for GenerateImageTool {
             .and_then(|v| v.as_str())
             .unwrap_or("1024x1024");
 
-        let output_path_str = args
-            .get("output_path")
-            .and_then(Value::as_str)
-            .map_or_else(
-                || format!("images/generated_{}.png", Uuid::new_v4().simple()),
-                ToString::to_string,
-            );
+        let output_path_str = args.get("output_path").and_then(Value::as_str).map_or_else(
+            || format!("images/generated_{}.png", Uuid::new_v4().simple()),
+            ToString::to_string,
+        );
 
         let target_path = if Path::new(&output_path_str).is_absolute() {
             PathBuf::from(&output_path_str)
@@ -448,10 +445,10 @@ impl Tool for GenerateImageTool {
                 }
             };
 
-            let has_key = self.api_key.as_deref().map_or_else(
-                || std::env::var(key_env).is_ok(),
-                |k| !k.trim().is_empty(),
-            );
+            let has_key = self
+                .api_key
+                .as_deref()
+                .map_or_else(|| std::env::var(key_env).is_ok(), |k| !k.trim().is_empty());
 
             if !has_key {
                 return Err(Error::tool(
@@ -470,8 +467,8 @@ impl Tool for GenerateImageTool {
             })?;
         }
 
-        let written_bytes = fs::metadata(&target_path)
-            .map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
+        let written_bytes =
+            fs::metadata(&target_path).map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
 
         let result_msg = format!(
             "Successfully generated image and saved to {}\n\
@@ -626,13 +623,10 @@ impl Tool for TtsTool {
 
         let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("wav");
 
-        let output_path_str = args
-            .get("output_path")
-            .and_then(Value::as_str)
-            .map_or_else(
-                || format!("audio/speech_{}.{}", Uuid::new_v4().simple(), format),
-                ToString::to_string,
-            );
+        let output_path_str = args.get("output_path").and_then(Value::as_str).map_or_else(
+            || format!("audio/speech_{}.{}", Uuid::new_v4().simple(), format),
+            ToString::to_string,
+        );
 
         let target_path = if Path::new(&output_path_str).is_absolute() {
             PathBuf::from(&output_path_str)
@@ -669,8 +663,8 @@ impl Tool for TtsTool {
                 .map_err(|e| Error::tool("tts", format!("failed to write audio file: {e}")))?;
         }
 
-        let written_bytes = fs::metadata(&target_path)
-            .map_or(MIN_VALID_WAV.len() as u64, |m| m.len());
+        let written_bytes =
+            fs::metadata(&target_path).map_or(MIN_VALID_WAV.len() as u64, |m| m.len());
 
         let result_msg = format!(
             "Successfully synthesized speech audio to {}\n\

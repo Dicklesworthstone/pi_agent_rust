@@ -186,9 +186,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
                 (None, b']') if !processing_instruction => {
                     declaration_brackets = declaration_brackets.saturating_sub(1);
                 }
-                (None, b'?')
-                    if processing_instruction && bytes.get(index + 1) == Some(&b'>') =>
-                {
+                (None, b'?') if processing_instruction && bytes.get(index + 1) == Some(&b'>') => {
                     return Some((index + 2, HtmlMarkup::Opaque));
                 }
                 (None, b'>') if !processing_instruction && declaration_brackets == 0 => {
@@ -206,16 +204,17 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         index += 1;
     }
     let name_start = index;
-    if !bytes.get(index).copied().is_some_and(is_ascii_markup_name_start) {
+    if !bytes
+        .get(index)
+        .copied()
+        .is_some_and(is_ascii_markup_name_start)
+    {
         return None;
     }
     index += 1;
-    while bytes
-        .get(index)
-        .is_some_and(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
-        })
-    {
+    while bytes.get(index).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
+    }) {
         index += 1;
     }
     match bytes.get(index) {
@@ -276,7 +275,10 @@ fn char_len_at(message: &str, index: usize) -> usize {
     message
         .get(index..)
         .and_then(|tail| tail.chars().next())
-        .map_or_else(|| message.len().saturating_sub(index).max(1), char::len_utf8)
+        .map_or_else(
+            || message.len().saturating_sub(index).max(1),
+            char::len_utf8,
+        )
 }
 
 fn boundary_enters_path_context(token: &str, boundary: char, next: Option<char>) -> bool {
@@ -287,7 +289,9 @@ fn boundary_enters_path_context(token: &str, boundary: char, next: Option<char>)
         ':' => {
             next.is_some_and(|next| !next.is_whitespace()) && {
                 let mut chars = token.chars();
-                chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+                chars
+                    .next()
+                    .is_some_and(|first| first.is_ascii_alphabetic())
                     && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
             }
         }

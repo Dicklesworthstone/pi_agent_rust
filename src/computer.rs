@@ -27,11 +27,11 @@ use uuid::Uuid;
 
 // Minimal valid 1x1 PNG bytes
 const MIN_VALID_PNG: &[u8] = &[
-    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
-    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
-    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
-    0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
-    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
 ];
 
 // ============================================================================
@@ -380,13 +380,10 @@ impl Tool for ComputerTool {
             }
 
             "screenshot" => {
-                let output_path_str = args
-                    .get("output_path")
-                    .and_then(Value::as_str)
-                    .map_or_else(
-                        || format!("screenshots/screenshot_{}.png", Uuid::new_v4().simple()),
-                        ToString::to_string,
-                    );
+                let output_path_str = args.get("output_path").and_then(Value::as_str).map_or_else(
+                    || format!("screenshots/screenshot_{}.png", Uuid::new_v4().simple()),
+                    ToString::to_string,
+                );
 
                 let target_path = if Path::new(&output_path_str).is_absolute() {
                     PathBuf::from(&output_path_str)
@@ -404,8 +401,8 @@ impl Tool for ComputerTool {
                     Error::tool("computer", format!("failed to write screenshot PNG: {e}"))
                 })?;
 
-                let written_bytes = fs::metadata(&target_path)
-                    .map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
+                let written_bytes =
+                    fs::metadata(&target_path).map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
 
                 let display_target = args.get("display_id").and_then(Value::as_u64);
                 let window_target = args.get("window_id").and_then(Value::as_u64);
@@ -525,10 +522,7 @@ impl Tool for ComputerTool {
             }
 
             "ax_tree" => {
-                let window_id = args
-                    .get("window_id")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(101);
+                let window_id = args.get("window_id").and_then(Value::as_u64).unwrap_or(101);
 
                 let root_node = AxNode {
                     role: "AXApplication".to_string(),
