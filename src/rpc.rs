@@ -6673,9 +6673,9 @@ mod tests {
             provider,
             ToolRegistry::new(&[], Path::new("."), None),
             AgentConfig {
-                stream_options: StreamOptions {
+                stream_options: crate::provider::StreamOptions {
                     api_key: Some("test-key".to_string()),
-                    ..StreamOptions::default()
+                    ..crate::provider::StreamOptions::default()
                 },
                 ..AgentConfig::default()
             },
