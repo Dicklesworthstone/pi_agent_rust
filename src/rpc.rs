@@ -3038,6 +3038,44 @@ pub async fn run(
 // Prompt Execution
 // =============================================================================
 
+async fn preserve_terminal_rpc_input(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    cx: &AgentCx,
+) -> Result<usize> {
+    let queued = {
+        let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+            .await
+            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+        let mut queued = Vec::with_capacity(state.pending_count());
+        queued.extend(state.steering.drain(..));
+        queued.extend(state.follow_up.drain(..));
+        queued
+    };
+    if queued.is_empty() {
+        return Ok(0);
+    }
+
+    let queued_count = queued.len();
+    let mut guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let messages = {
+        let mut inner = guard
+            .session
+            .lock(cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        for delivery in queued {
+            inner.append_model_message(delivery.into_message());
+        }
+        inner.to_messages_for_current_path()
+    };
+    guard.agent.replace_messages(messages);
+    guard.persist_session().await?;
+    Ok(queued_count)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_prompt_with_retry(
     session: Arc<Mutex<AgentSession>>,
@@ -3392,6 +3430,22 @@ async fn run_prompt_with_retry(
     }
 
     if !success {
+        // Close the admission window before preserving any acknowledged input
+        // that the terminal provider error/abort left in the shared queues.
+        // Messages are recorded exactly once but are not executed after a
+        // failed or explicitly aborted turn, avoiding both silent loss at EOF
+        // and surprising post-abort side effects.
+        {
+            let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+            is_compacting.store(true, Ordering::SeqCst);
+        }
+        if let Err(err) = preserve_terminal_rpc_input(&session, &shared_state, &cx).await {
+            let preservation_error = format!("failed to preserve queued RPC input: {err}");
+            final_error = Some(final_error.map_or_else(
+                || preservation_error.clone(),
+                |terminal| format!("{terminal}; {preservation_error}"),
+            ));
+        }
         // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
         // drain only guarantees flush-before-shutdown for events queued while
         // a flag is still set (gh #137).
@@ -5315,6 +5369,18 @@ fn should_auto_compact(tokens_before: u64, context_window: u32, reserve_tokens: 
     tokens_before > window.saturating_sub(reserve)
 }
 
+fn emit_auto_compaction_error(
+    out_tx: &std::sync::mpsc::SyncSender<String>,
+    error_message: impl Into<String>,
+) {
+    let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
+        result: None,
+        aborted: false,
+        will_retry: false,
+        error_message: Some(error_message.into()),
+    }));
+}
+
 #[allow(clippy::too_many_lines)]
 async fn maybe_auto_compact(
     session: Arc<Mutex<AgentSession>>,
@@ -5328,11 +5394,11 @@ async fn maybe_auto_compact(
     // correct terminal state on every exit.
     let _compacting_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
     let cx = AgentCx::for_current_or_request();
-    let (path_entries, context_window, reserve_tokens, settings) = {
+    let (origin_session_id, path_entries, context_window, reserve_tokens, settings) = {
         let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
             return;
         };
-        let (path_entries, context_window) = {
+        let (origin_session_id, path_entries, context_window) = {
             let runtime_provider = guard.agent.provider().name().to_string();
             let runtime_model_id = guard.agent.provider().model_id().to_string();
             let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
@@ -5347,12 +5413,13 @@ async fn maybe_auto_compact(
             ) else {
                 return;
             };
+            let origin_session_id = inner_session.header.id.clone();
             let path_entries = inner_session
                 .entries_for_current_path()
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            (path_entries, entry.model.context_window)
+            (origin_session_id, path_entries, entry.model.context_window)
         };
 
         let reserve_tokens = options.config.compaction_reserve_tokens();
@@ -5373,7 +5440,13 @@ async fn maybe_auto_compact(
             render_mode: options.config.compaction_render_mode(),
         };
 
-        (path_entries, context_window, reserve_tokens, settings)
+        (
+            origin_session_id,
+            path_entries,
+            context_window,
+            reserve_tokens,
+            settings,
+        )
     };
 
     let Some(prep) = prepare_compaction(&path_entries, settings) else {
@@ -5394,6 +5467,7 @@ async fn maybe_auto_compact(
     // between a clear and a trailing AutoCompactionEnd emission (gh #137).
     let (provider, key) = {
         let Ok(guard) = session.lock(cx.cx()).await else {
+            emit_auto_compaction_error(&out_tx, "Session lock failed during auto-compaction");
             return;
         };
         let Some(key) = guard.agent.stream_options().api_key.clone() else {
@@ -5433,12 +5507,27 @@ async fn maybe_auto_compact(
             };
 
             let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
+                emit_auto_compaction_error(
+                    &out_tx,
+                    "Session lock failed while applying auto-compaction",
+                );
                 return;
             };
             let (messages, tokens_after) = {
                 let Ok(mut inner_session) = guard.session.lock(cx.cx()).await else {
+                    emit_auto_compaction_error(
+                        &out_tx,
+                        "Inner session lock failed while applying auto-compaction",
+                    );
                     return;
                 };
+                if inner_session.header.id != origin_session_id {
+                    emit_auto_compaction_error(
+                        &out_tx,
+                        "Active session changed while auto-compaction was running",
+                    );
+                    return;
+                }
                 inner_session.append_compaction(
                     result.summary.clone(),
                     result.first_kept_entry_id.clone(),
