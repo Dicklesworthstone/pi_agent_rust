@@ -22,7 +22,8 @@ use pi::auth::AuthStorage;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::model::{
-    ContentBlock, Message, StreamEvent, TextContent, ThinkingLevel, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingLevel,
+    UserContent, UserMessage,
 };
 use pi::provider::{Context, StreamOptions};
 use pi::resources::ResourceLoader;
@@ -127,6 +128,17 @@ impl pi::provider::Provider for CaptureProvider {
             Ok(StreamEvent::TextEnd {
                 content_index: 0,
                 content: "done".to_string(),
+            }),
+            Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("done"))],
+                    api: "capture-api".to_string(),
+                    provider: "capture".to_string(),
+                    model: "capture-model".to_string(),
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
             }),
         ])))
     }
@@ -467,6 +479,10 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
             )
             .expect("parse RPC event");
             if event["type"] == "agent_end" {
+                assert!(
+                    event["error"].is_null(),
+                    "RPC agent turn ended with an error: {event}"
+                );
                 saw_agent_end = true;
                 break;
             }

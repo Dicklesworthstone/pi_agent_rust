@@ -149,6 +149,10 @@ fn is_void_html_tag(name: &str) -> bool {
     )
 }
 
+fn is_ascii_markup_name_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || matches!(byte, b'_' | b':')
+}
+
 /// Parse one HTML/XML construct starting at `start`, consuming attributes and
 /// comments as one suppressed unit. Quoted `>` bytes inside attributes do not
 /// end a tag. An unterminated comment consumes the rest of the message: the
@@ -168,16 +172,33 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
 
     let mut index = start + 1;
     if matches!(bytes.get(index), Some(b'!') | Some(b'?')) {
-        let terminator = if bytes.get(index) == Some(&b'?') {
-            "?>"
-        } else {
-            ">"
-        };
-        let tail = message.get(index + 1..)?;
-        let end = tail.find(terminator).map_or(bytes.len(), |relative| {
-            index + 1 + relative + terminator.len()
-        });
-        return Some((end, HtmlMarkup::Opaque));
+        let processing_instruction = bytes.get(index) == Some(&b'?');
+        index += 1;
+        let mut quote = None;
+        let mut declaration_brackets = 0usize;
+        while let Some(&byte) = bytes.get(index) {
+            match (quote, byte) {
+                (Some(expected), current) if current == expected => quote = None,
+                (None, b'\'' | b'"') => quote = Some(byte),
+                (None, b'[') if !processing_instruction => {
+                    declaration_brackets = declaration_brackets.saturating_add(1);
+                }
+                (None, b']') if !processing_instruction => {
+                    declaration_brackets = declaration_brackets.saturating_sub(1);
+                }
+                (None, b'?')
+                    if processing_instruction && bytes.get(index + 1) == Some(&b'>') =>
+                {
+                    return Some((index + 2, HtmlMarkup::Opaque));
+                }
+                (None, b'>') if !processing_instruction && declaration_brackets == 0 => {
+                    return Some((index + 1, HtmlMarkup::Opaque));
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        return Some((bytes.len(), HtmlMarkup::Opaque));
     }
 
     let closing = bytes.get(index) == Some(&b'/');
@@ -185,7 +206,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         index += 1;
     }
     let name_start = index;
-    if !bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+    if !bytes.get(index).copied().is_some_and(is_ascii_markup_name_start) {
         return None;
     }
     index += 1;
@@ -588,6 +609,22 @@ mod tests {
             words("see <https://example.com/ultrathink> then orchestrate"),
             ["orchestrate"],
             "Markdown autolinks are not opening HTML tags"
+        );
+        assert!(
+            words("<_guard>ultrathink</_guard>").is_empty(),
+            "XML names may begin with an underscore"
+        );
+        assert!(
+            words("<:guard>ultrathink</:guard>").is_empty(),
+            "XML names may begin with a namespace separator"
+        );
+        assert!(
+            words("<!DOCTYPE guard [ <!ENTITY mode 'ultrathink'> ]>").is_empty(),
+            "keywords inside an internal declaration subset are markup"
+        );
+        assert!(
+            words("<?guard mode='?> ultrathink'?>").is_empty(),
+            "a quoted processing-instruction terminator must not expose markup"
         );
     }
 
