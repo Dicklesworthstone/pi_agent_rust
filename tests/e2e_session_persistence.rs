@@ -1926,14 +1926,38 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "atomic rename must publish the complete rewritten JSONL header"
         );
 
-        // Post-flush crash window: persisted mutation survives exactly once.
-        let mut post = reopened_mid;
-        post.append_message(SessionMessage::User {
-            content: UserContent::Text("jsonl-postflush-persisted".to_string()),
-            timestamp: Some(0),
-        });
-        post.save().await.expect("post-flush save should succeed");
-        drop(post);
+        // Post-flush crash window: the child hard-exits only after the renamed
+        // snapshot crosses the platform's parent-directory durability seam.
+        drop(reopened_mid);
+        let post_failpoint = "jsonl_after_parent_sync";
+        let post_marker_path = marker_root.path().join("jsonl-postflush-hard-exit.marker");
+        let post_child = run_persistence_failpoint_child(
+            &stable_path,
+            &post_marker_path,
+            "jsonl",
+            post_failpoint,
+            "jsonl-postflush-persisted",
+        );
+        assert_eq!(
+            post_child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "JSONL post-flush child must terminate after parent sync\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&post_child.stdout),
+            String::from_utf8_lossy(&post_child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&post_marker_path)
+                .expect("read JSONL post-flush checkpoint marker"),
+            format!(
+                "{post_failpoint}\n{}\n",
+                if cfg!(unix) {
+                    "parent_sync_completed=unix_fsync"
+                } else {
+                    "parent_sync_completed=platform_noop"
+                }
+            ),
+            "JSONL post-flush hard exit must carry the completed platform sync witness"
+        );
 
         let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
             .await
@@ -2056,16 +2080,31 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "SQLite recovery must roll back transactional metadata with the entry"
         );
 
-        // Post-flush crash window.
-        let mut post = reopened_mid;
-        post.append_message(SessionMessage::User {
-            content: UserContent::Text("sqlite-postflush-persisted".to_string()),
-            timestamp: Some(0),
-        });
-        post.save()
-            .await
-            .expect("sqlite post-flush save should succeed");
-        drop(post);
+        // Post-flush crash window: the child hard-exits after COMMIT without
+        // unwinding or closing the live backend connection.
+        drop(reopened_mid);
+        let post_failpoint = "sqlite_after_commit";
+        let post_marker_path = marker_root.path().join("sqlite-postflush-hard-exit.marker");
+        let post_child = run_persistence_failpoint_child(
+            &stable_path,
+            &post_marker_path,
+            "sqlite",
+            post_failpoint,
+            "sqlite-postflush-persisted",
+        );
+        assert_eq!(
+            post_child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "SQLite post-flush child must terminate after COMMIT\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&post_child.stdout),
+            String::from_utf8_lossy(&post_child.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&post_marker_path)
+                .expect("read SQLite post-flush checkpoint marker"),
+            format!("{post_failpoint}\ncommit_completed=true\n"),
+            "SQLite post-flush hard exit must carry completed COMMIT evidence"
+        );
 
         let reopened_post = Session::open(stable_path.to_string_lossy().as_ref())
             .await

@@ -2249,6 +2249,10 @@ pub async fn append_entries(
         match append_result {
             Ok((saved_header, saved_entries)) => {
                 map_sqlite_result(conn.execute_raw("COMMIT"))?;
+                crate::session::persistence_test_failpoint(
+                    "sqlite_after_commit",
+                    Some("commit_completed=true"),
+                )?;
                 map_sqlite_result(conn.close())?;
                 ensure_private_sqlite_permissions(path)?;
                 Ok((saved_header, saved_entries))

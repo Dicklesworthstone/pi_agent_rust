@@ -222,6 +222,18 @@ fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn sync_jsonl_parent_dir_with_witness(path: &Path) -> std::io::Result<&'static str> {
+    sync_parent_dir(path)?;
+    #[cfg(unix)]
+    {
+        Ok("parent_sync_completed=unix_fsync")
+    }
+    #[cfg(not(unix))]
+    {
+        Ok("parent_sync_completed=platform_noop")
+    }
+}
+
 #[cfg(unix)]
 fn absolute_lexical_path(path: &Path) -> std::io::Result<PathBuf> {
     if path.is_absolute() {
@@ -1394,7 +1406,9 @@ fn persist_jsonl_snapshot_locked(
         .persist(path)
         .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
     persistence_test_failpoint("jsonl_after_rename_before_parent_sync", None)?;
-    sync_parent_dir(path).map_err(|e| crate::Error::Io(Box::new(e)))
+    let parent_sync_witness =
+        sync_jsonl_parent_dir_with_witness(path).map_err(|e| crate::Error::Io(Box::new(e)))?;
+    persistence_test_failpoint("jsonl_after_parent_sync", Some(parent_sync_witness))
 }
 
 fn save_jsonl_full_rewrite_blocking(
