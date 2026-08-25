@@ -3110,7 +3110,7 @@ async fn preserve_terminal_rpc_input(
     };
     let session_store = Arc::clone(&guard.session);
     let (messages, previous_leaf) = {
-        let mut inner = match session_store.lock(cx).await {
+        let mut inner = match OwnedMutexGuard::lock(Arc::clone(&session_store), cx).await {
             Ok(inner) => inner,
             Err(err) => {
                 let lock_error = format!("inner session lock failed: {err}");
@@ -3133,11 +3133,13 @@ async fn preserve_terminal_rpc_input(
     if let Err(persist_err) = guard.persist_session().await {
         let recovery_cx = AgentCx::for_request();
         let rollback_messages = {
-            let mut inner = session_store.lock(&recovery_cx).await.map_err(|rollback_err| {
-                Error::session(format!(
-                    "{persist_err}; failed to roll back terminal input: {rollback_err}"
-                ))
-            })?;
+            let mut inner = OwnedMutexGuard::lock(Arc::clone(&session_store), &recovery_cx)
+                .await
+                .map_err(|rollback_err| {
+                    Error::session(format!(
+                        "{persist_err}; failed to roll back terminal input: {rollback_err}"
+                    ))
+                })?;
             match previous_leaf.as_deref() {
                 Some(leaf_id) if inner.navigate_to(leaf_id) => {}
                 Some(leaf_id) => {
@@ -3337,8 +3339,10 @@ async fn run_prompt_with_retry(
                             OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
                         {
                             let runtime_provider = guard.agent.provider().name().to_string();
-                            let runtime_model_id = guard.agent.provider().model_id().to_string();
-                            guard.session.lock(&cx).await.map_or(None, |inner| {
+                            let session_store = Arc::clone(&guard.session);
+                            let inner_session =
+                                OwnedMutexGuard::lock(session_store, &cx).await.ok();
+                            inner_session.and_then(|inner| {
                                 current_or_runtime_model_entry(
                                     &inner,
                                     &runtime_provider,
@@ -3873,6 +3877,8 @@ async fn run_extension_command(
         return;
     }
 
+    let deferred_agent_end = Arc::new(std::sync::Mutex::new(None::<AgentEvent>));
+
     let result = {
         let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
             Ok(guard) => guard,
@@ -3893,8 +3899,12 @@ async fn run_extension_command(
             .extensions
             .as_ref()
             .map(|region| region.manager().clone());
-        let event_handler =
-            rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions, None);
+        let event_handler = rpc_agent_event_handler(
+            out_tx.clone(),
+            runtime_handle,
+            extensions,
+            Some(Arc::clone(&deferred_agent_end)),
+        );
         guard
             .execute_extension_command_with_abort(
                 &command_name,
@@ -3910,17 +3920,27 @@ async fn run_extension_command(
         *guard = None;
     }
 
-    // Emit the terminal event BEFORE clearing is_streaming so the stdin-EOF
-    // drain flushes it before shutdown (gh #137).
+    // Emit exactly one terminal event after AgentSession has completed its
+    // persistence work, but before clearing streaming so EOF drains it.
+    let terminal_messages = deferred_agent_end
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .and_then(|event| match event {
+            AgentEvent::AgentEnd { messages, .. } => Some(messages),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut payload = json!({
+        "type": "agent_end",
+        "messages": terminal_messages,
+        "error": Value::Null,
+    });
     if let Err(err) = result {
-        let mut payload = json!({
-            "type": "agent_end",
-            "messages": [],
-            "error": err.to_string(),
-        });
+        payload["error"] = Value::String(err.to_string());
         payload["errorHints"] = error_hints_value(&err);
-        let _ = out_tx.send(event(&payload));
     }
+    let _ = out_tx.send(event(&payload));
     is_streaming.store(false, Ordering::SeqCst);
 }
 
@@ -9904,6 +9924,41 @@ export default function init(pi) {
     }
 
     #[test]
+    fn session_transition_blocker_rejects_private_staged_follow_up_after_task_loss() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let cx = AgentCx::for_request();
+            session
+                .lock(&cx)
+                .await
+                .expect("agent session lock")
+                .agent
+                .queue_follow_up(build_user_message("old-session follow-up", &[]));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let reason = rpc_session_transition_blocker(
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &std::sync::Mutex::new(()),
+                &session,
+                &bash_state,
+                &cx,
+            )
+            .await
+            .expect("transition blocker");
+            assert_eq!(
+                reason,
+                Some("An accepted follow-up is still pending; resume it before changing sessions")
+            );
+        });
+    }
+
+    #[test]
     fn terminal_queue_preservation_drains_and_records_acknowledged_input_exactly_once() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
@@ -9961,6 +10016,96 @@ export default function init(pi) {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(user_text, vec!["accepted steering", "accepted follow-up"]);
+        });
+    }
+
+    #[test]
+    fn terminal_queue_preservation_rolls_back_and_requeues_after_flush_failure() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let blocked_root = tempfile::tempdir().expect("tempdir");
+            let blocked_session_dir = blocked_root.path().join("not-a-directory");
+            std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
+            let session_value = Session::create_with_dir(Some(blocked_session_dir));
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(session_value));
+            let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let cx = AgentCx::for_request();
+            {
+                let mut state = shared_state.lock(&cx).await.expect("shared state lock");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("failed-flush steering", &[]),
+                    ))
+                    .expect("queue steering");
+                state
+                    .push_follow_up(QueuedAgentMessage::from_authored_message(
+                        build_user_message("failed-flush follow-up", &[]),
+                    ))
+                    .expect("queue follow-up");
+            }
+
+            let err = preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                .await
+                .expect_err("blocked session directory must fail persistence");
+            assert!(
+                err.to_string().contains("not-a-directory")
+                    || err.to_string().contains("Not a directory")
+                    || err.to_string().contains("Failed"),
+                "unexpected persistence error: {err}"
+            );
+
+            let state = shared_state.lock(&cx).await.expect("restored queues");
+            assert_eq!(state.pending_count(), 2);
+            assert!(matches!(
+                state.steering.front().map(QueuedAgentMessage::message),
+                Some(Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                })) if text == "failed-flush steering"
+            ));
+            assert!(matches!(
+                state.follow_up.front().map(QueuedAgentMessage::message),
+                Some(Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                })) if text == "failed-flush follow-up"
+            ));
+            drop(state);
+
+            let inner = inner_session
+                .lock(&cx)
+                .await
+                .expect("rolled-back inner session");
+            assert!(
+                inner.to_messages_for_current_path().iter().all(|message| {
+                    !matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text.starts_with("failed-flush")
+                    )
+                }),
+                "failed durable append must not remain on the active in-memory path"
+            );
         });
     }
 
