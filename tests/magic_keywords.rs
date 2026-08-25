@@ -828,7 +828,6 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             drop(in_tx);
             server
                 .await
-                .expect("RPC server task join")
                 .expect("RPC server run");
             let remaining = out_rx
                 .lock()
