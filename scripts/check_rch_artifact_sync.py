@@ -485,7 +485,9 @@ def before_snapshots_by_path(
             snapshot = item.get("before")
         if not isinstance(snapshot, dict):
             snapshot = item
-        path = snapshot.get("path") or item.get("path")
+        snapshot_path = snapshot.get("path")
+        item_path = item.get("path")
+        path = snapshot_path or item_path
         if not isinstance(path, str) or not path.strip():
             violations.append(
                 {
@@ -500,6 +502,64 @@ def before_snapshots_by_path(
             )
             continue
         normalized_path, _ = resolve_required_path(repo_root, path)
+        if isinstance(snapshot_path, str) and isinstance(item_path, str):
+            normalized_item_path, _ = resolve_required_path(repo_root, item_path)
+            normalized_snapshot_path, _ = resolve_required_path(repo_root, snapshot_path)
+            if normalized_item_path != normalized_snapshot_path:
+                violations.append(
+                    {
+                        "path": normalized_path,
+                        "source": "postcondition",
+                        "line": None,
+                        "pattern": None,
+                        "reason": "before_manifest_snapshot_path_mismatch",
+                        "message": (
+                            "before manifest artifact entry and snapshot disagree on path: "
+                            f"{normalized_item_path} != {normalized_snapshot_path}"
+                        ),
+                        "recommended_action": POSTCONDITION_ACTION,
+                    }
+                )
+                continue
+        exists = snapshot.get("exists")
+        kind = snapshot.get("kind")
+        sha256 = snapshot.get("sha256")
+        size_bytes = snapshot.get("size_bytes")
+        mtime_ns = snapshot.get("mtime_ns")
+        valid_file_snapshot = (
+            exists is True
+            and kind == "file"
+            and isinstance(sha256, str)
+            and len(sha256) == 64
+            and all(character in "0123456789abcdef" for character in sha256)
+            and type(size_bytes) is int
+            and size_bytes >= 0
+            and type(mtime_ns) is int
+            and mtime_ns >= 0
+        )
+        valid_missing_snapshot = (
+            exists is False
+            and kind == "missing"
+            and sha256 is None
+            and size_bytes is None
+            and mtime_ns is None
+        )
+        if snapshot.get("error") or not (valid_file_snapshot or valid_missing_snapshot):
+            violations.append(
+                {
+                    "path": normalized_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_manifest_snapshot_invalid",
+                    "message": (
+                        "before manifest contains a malformed generated-artifact snapshot: "
+                        f"{normalized_path}"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+            continue
         if normalized_path in snapshots:
             violations.append(
                 {

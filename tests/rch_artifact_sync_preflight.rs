@@ -818,6 +818,47 @@ fn postcondition_rejects_duplicate_baseline_artifact_identity() -> Result<(), Bo
 }
 
 #[test]
+fn postcondition_rejects_malformed_baseline_snapshot() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "malformed-snapshot negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    baseline["generated_artifacts"][0]["snapshot"]["exists"] = Value::Null;
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "a malformed baseline snapshot must fail closed\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let malformed_rejected = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_snapshot_invalid")
+    });
+    if !malformed_rejected {
+        return Err(test_error(format!(
+            "malformed snapshot must report before_manifest_snapshot_invalid\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
 fn postcondition_rejects_metadata_only_changes_with_identical_bytes() -> Result<(), Box<dyn Error>>
 {
     let temp = tempfile::tempdir()?;
