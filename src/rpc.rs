@@ -3037,35 +3037,64 @@ pub async fn run(
 // Prompt Execution
 // =============================================================================
 
+async fn restore_terminal_rpc_input(
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    mut steering: VecDeque<QueuedAgentMessage>,
+    mut follow_up: VecDeque<QueuedAgentMessage>,
+    cx: &AgentCx,
+) -> Result<()> {
+    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("state restore lock failed: {err}")))?;
+    steering.append(&mut state.steering);
+    follow_up.append(&mut state.follow_up);
+    state.steering = steering;
+    state.follow_up = follow_up;
+    Ok(())
+}
+
 async fn preserve_terminal_rpc_input(
     session: &Arc<Mutex<AgentSession>>,
     shared_state: &Arc<Mutex<RpcSharedState>>,
     cx: &AgentCx,
 ) -> Result<usize> {
-    let queued = {
+    let (steering, follow_up) = {
         let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
             .await
             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-        let mut queued = Vec::with_capacity(state.pending_count());
-        queued.extend(state.steering.drain(..));
-        queued.extend(state.follow_up.drain(..));
-        queued
+        (
+            std::mem::take(&mut state.steering),
+            std::mem::take(&mut state.follow_up),
+        )
     };
-    if queued.is_empty() {
+    if steering.is_empty() && follow_up.is_empty() {
         return Ok(0);
     }
 
-    let queued_count = queued.len();
-    let mut guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
-        .await
-        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let queued_count = steering.len() + follow_up.len();
+    let mut guard = match OwnedMutexGuard::lock(Arc::clone(session), cx).await {
+        Ok(guard) => guard,
+        Err(err) => {
+            let lock_error = format!("session lock failed: {err}");
+            restore_terminal_rpc_input(shared_state, steering, follow_up, cx)
+                .await
+                .map_err(|restore_err| Error::session(format!("{lock_error}; {restore_err}")))?;
+            return Err(Error::session(lock_error));
+        }
+    };
+    let session_store = Arc::clone(&guard.session);
     let messages = {
-        let mut inner = guard
-            .session
-            .lock(cx)
-            .await
-            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        for delivery in queued {
+        let mut inner = match session_store.lock(cx).await {
+            Ok(inner) => inner,
+            Err(err) => {
+                let lock_error = format!("inner session lock failed: {err}");
+                restore_terminal_rpc_input(shared_state, steering, follow_up, cx)
+                    .await
+                    .map_err(|restore_err| Error::session(format!("{lock_error}; {restore_err}")))?;
+                return Err(Error::session(lock_error));
+            }
+        };
+        for delivery in steering.into_iter().chain(follow_up) {
             inner.append_model_message(delivery.into_message());
         }
         inner.to_messages_for_current_path()

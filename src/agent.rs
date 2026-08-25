@@ -1097,6 +1097,15 @@ impl MessageQueue {
         seq
     }
 
+    fn restore_steering_front_lossless(&mut self, deliveries: Vec<QueuedAgentMessage>) {
+        let mut restored = deliveries
+            .into_iter()
+            .map(|delivery| self.next_entry(delivery))
+            .collect::<VecDeque<_>>();
+        restored.append(&mut self.steering);
+        self.steering = restored;
+    }
+
     fn push_follow_up(&mut self, delivery: QueuedAgentMessage) -> u64 {
         self.push(QueueKind::FollowUp, delivery)
     }
@@ -2414,6 +2423,29 @@ impl Agent {
             self.apply_magic_keyword_effects(&retry_hits);
         }
 
+        // A resumed follow-up must fetch and validate the owning surface before
+        // emitting lifecycle events or consuming any older staged follow-up.
+        // Always poll the owning source: a private staged batch does not prove
+        // that the exact RPC batch which triggered this continuation was fetched.
+        let mut follow_up_staged = false;
+        let mut required_initial_follow_up_pending = initial_follow_up;
+        if initial_follow_up {
+            self.fetch_initial_follow_up_messages().await;
+            follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
+            if !follow_up_staged {
+                return Err(Error::session(
+                    "accepted follow-up was unavailable at continuation boundary",
+                ));
+            }
+            if let Some(on_ready) = initial_queue_ready.take()
+                && !on_ready()
+            {
+                return Err(Error::session(
+                    "required follow-up source was unavailable at continuation boundary",
+                ));
+            }
+        }
+
         let agent_start_event = AgentEvent::AgentStart {
             session_id: session_id.clone(),
         };
@@ -2447,22 +2479,11 @@ impl Agent {
 
         // Delivery boundary: ordinary continuation starts with steering; the
         // RPC late-follow-up repair explicitly starts with follow-ups instead.
-        let mut follow_up_staged = false;
-        let mut required_initial_follow_up_pending = initial_follow_up;
         let mut pending_messages = if initial_follow_up {
-            if self.message_queue.follow_up_batch_len() == 0 {
-                self.fetch_initial_follow_up_messages().await;
-            }
-            follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
             Vec::new()
         } else {
             self.drain_steering_messages().await
         };
-        if initial_follow_up && !follow_up_staged {
-            return Err(Error::session(
-                "accepted follow-up was unavailable at continuation boundary",
-            ));
-        }
         let mut turn_recovery =
             crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
@@ -2481,6 +2502,12 @@ impl Agent {
                     && let Some(cap) = max_time
                     && run_started.elapsed() >= cap
                 {
+                    // The owning surface already acknowledged these messages.
+                    // Put the undelivered batch back at the front before
+                    // returning the time-cap marker so a later run can resume
+                    // it in the original order.
+                    self.message_queue
+                        .restore_steering_front_lossless(std::mem::take(&mut pending_messages));
                     let marker = format!(
                         "time cap reached after {}s (--max-time); stopping at the turn boundary",
                         cap.as_secs()
@@ -2518,8 +2545,6 @@ impl Agent {
                 on_event(turn_start_event);
 
                 let delivering_follow_up = follow_up_staged;
-                let delivering_required_initial_follow_up =
-                    delivering_follow_up && required_initial_follow_up_pending;
                 if delivering_follow_up {
                     // Follow-ups are new logical user turns. Restore the
                     // caller's baseline before scanning their keywords so
@@ -2557,15 +2582,6 @@ impl Agent {
                         message: message.clone(),
                     });
                     new_messages.push(message);
-                }
-
-                if delivering_required_initial_follow_up
-                    && let Some(on_ready) = initial_queue_ready.take()
-                    && !on_ready()
-                {
-                    return Err(Error::session(
-                        "required follow-up source was unavailable at continuation boundary",
-                    ));
                 }
 
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
