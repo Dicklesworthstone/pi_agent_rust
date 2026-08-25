@@ -9733,11 +9733,13 @@ export default function init(pi) {
             });
             let tools = ToolRegistry::new(&[], temp.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+            let session_value = Session::create_with_dir(Some(temp.path().join("sessions")));
+            let session_path = session_value.path.clone().expect("durable session path");
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(session_value));
             let agent_session = AgentSession::new(
                 agent,
                 Arc::clone(&inner_session),
-                false,
+                true,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
             let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
@@ -9793,11 +9795,44 @@ export default function init(pi) {
                     .is_some_and(|error| error.contains("invalid API key from gated provider")),
                 "terminal error must remain observable: {terminal_event}"
             );
+            let reopened = Session::open(session_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen terminal session immediately after agent_end");
+            let durable_accepted_count = reopened
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text == "accepted during terminal turn"
+                    )
+                })
+                .count();
+            assert_eq!(
+                durable_accepted_count, 1,
+                "terminal agent_end must follow durable accepted input"
+            );
             server
                 .await
                 .expect("RPC server join")
                 .expect("RPC server run");
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let remaining_events = out_rx
+                .lock()
+                .expect("terminal output lock")
+                .try_iter()
+                .map(|line| parse_response(&line))
+                .collect::<Vec<_>>();
+            assert!(
+                remaining_events
+                    .iter()
+                    .all(|event| event["type"] != "agent_end"),
+                "terminal provider run emitted duplicate agent_end events: {remaining_events:?}"
+            );
 
             let session_cx = AgentCx::for_request();
             let session = inner_session
