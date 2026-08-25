@@ -2073,6 +2073,67 @@ impl Agent {
         result
     }
 
+    /// Apply magic-keyword effects for one user-authored message delivered
+    /// during the current run. The caller owns the turn-wide de-duplication
+    /// set so initial prompts, steering, and follow-ups share one activation
+    /// boundary and cannot inject the same directive repeatedly.
+    fn apply_magic_keywords_for_message(
+        &mut self,
+        message: &Message,
+        turn_keyword_words: &mut std::collections::HashSet<String>,
+    ) {
+        let Message::User(user) = message else {
+            return;
+        };
+        let scan_text = match &user.content {
+            UserContent::Text(text) => Cow::Borrowed(text.as_str()),
+            UserContent::Blocks(blocks) => Cow::Owned(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        };
+        let hits: Vec<_> = crate::magic_keywords::detect(
+            &scan_text,
+            self.config.keyword_settings.as_ref(),
+        )
+        .into_iter()
+        .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
+        .collect();
+        if hits.is_empty() {
+            return;
+        }
+
+        let keyword_max_thinking_level = self.keyword_max_thinking_level;
+        for hit in &hits {
+            if hit.action == "ultrathink" {
+                self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
+            }
+        }
+        let directives = crate::magic_keywords::directives_for(
+            &hits,
+            self.config.keyword_settings.as_ref(),
+        );
+        if !directives.is_empty() {
+            let block = directives.join("\n");
+            match &mut self.config.system_prompt {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&block);
+                }
+                none_slot => {
+                    *none_slot = Some(block);
+                }
+            }
+        }
+        self.keyword_ledger.extend(hits);
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_loop_inner(
         &mut self,
@@ -2109,55 +2170,7 @@ impl Agent {
             // active model's pre-clamped maximum; orchestrate/workflowz/custom words
             // append their directive to the system prompt (appended, never
             // inserted, so provider prompt caches stay valid).
-            if let Message::User(user) = &prompt {
-                let scan_text = match &user.content {
-                    UserContent::Text(text) => Cow::Borrowed(text.as_str()),
-                    UserContent::Blocks(blocks) => Cow::Owned(
-                        blocks
-                            .iter()
-                            .filter_map(|block| match block {
-                                ContentBlock::Text(text) => Some(text.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ),
-                };
-                let hits: Vec<_> = crate::magic_keywords::detect(
-                    &scan_text,
-                    self.config.keyword_settings.as_ref(),
-                )
-                .into_iter()
-                .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
-                .collect();
-                if !hits.is_empty() {
-                    let mut directives = Vec::new();
-                    let keyword_max_thinking_level = self.keyword_max_thinking_level;
-                    for hit in &hits {
-                        if hit.action == "ultrathink" {
-                            self.stream_options_mut().thinking_level =
-                                Some(keyword_max_thinking_level);
-                        }
-                    }
-                    directives.extend(crate::magic_keywords::directives_for(
-                        &hits,
-                        self.config.keyword_settings.as_ref(),
-                    ));
-                    if !directives.is_empty() {
-                        let block = directives.join("\n");
-                        match &mut self.config.system_prompt {
-                            Some(existing) => {
-                                existing.push_str("\n\n");
-                                existing.push_str(&block);
-                            }
-                            none_slot => {
-                                *none_slot = Some(block);
-                            }
-                        }
-                    }
-                    self.keyword_ledger.extend(hits);
-                }
-            }
+            self.apply_magic_keywords_for_message(&prompt, &mut turn_keyword_words);
             self.messages.push(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),
@@ -2222,6 +2235,7 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
+                    self.apply_magic_keywords_for_message(&message, &mut turn_keyword_words);
                     // Advisor notes get a dedicated event on delivery
                     // (bd-cv653.3.3) so RPC/ACP surfaces can render them.
                     if let Message::User(user) = &message
@@ -13146,6 +13160,7 @@ mod tests {
     struct CapturedProviderContext {
         system_prompt: Option<String>,
         messages: Vec<Message>,
+        thinking_level: Option<crate::model::ThinkingLevel>,
     }
 
     #[derive(Debug)]
@@ -13185,7 +13200,7 @@ mod tests {
         async fn stream(
             &self,
             context: &Context<'_>,
-            _options: &StreamOptions,
+            options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
         > {
@@ -13195,6 +13210,7 @@ mod tests {
                 .push(CapturedProviderContext {
                     system_prompt: context.system_prompt.as_ref().map(ToString::to_string),
                     messages: context.messages.iter().cloned().collect(),
+                    thinking_level: options.thinking_level,
                 });
             let final_message = assistant_message("captured");
             Ok(Box::pin(futures::stream::iter(vec![Ok(
@@ -13639,6 +13655,68 @@ mod tests {
             assert_user_text(&calls[0].messages[0], "hello");
             assert!(calls[0].system_prompt.is_none());
             drop(calls);
+        });
+    }
+
+    #[test]
+    fn queued_steering_and_follow_up_messages_apply_magic_keywords_on_delivery() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+            agent.queue_steering(user_message("ultrathink before continuing"));
+            agent.queue_follow_up(user_message("orchestrate the follow-up"));
+
+            agent
+                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
+                .await
+                .expect("queued messages complete");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(calls.len(), 2, "follow-up must trigger a second provider turn");
+            assert_eq!(
+                calls[0].thinking_level,
+                Some(crate::model::ThinkingLevel::High),
+                "queued steering ultrathink must affect its first outbound request"
+            );
+            assert!(
+                calls[0]
+                    .system_prompt
+                    .as_deref()
+                    .is_none_or(|prompt| !prompt.contains("invoked `orchestrate`")),
+                "the later follow-up directive must not leak into the first request"
+            );
+            assert!(
+                calls[1]
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
+                "queued follow-up orchestrate must affect its outbound request"
+            );
+            drop(calls);
+
+            let activations = agent.drain_keyword_ledger();
+            assert_eq!(activations.len(), 2);
+            assert_eq!(activations[0].word, "ultrathink");
+            assert_eq!(activations[1].word, "orchestrate");
         });
     }
 
