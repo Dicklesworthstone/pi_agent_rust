@@ -2144,6 +2144,11 @@ async fn run(
         )
         .map_err(anyhow::Error::new)?;
         agent_session.agent.set_provider(provider);
+        agent_session.agent.set_keyword_max_thinking_level(
+            selection
+                .model_entry
+                .clamp_thinking_level(pi::model::ThinkingLevel::Max),
+        );
         {
             let stream_options = agent_session.agent.stream_options_mut();
             stream_options.api_key.clone_from(&resolved_key);
@@ -8607,6 +8612,9 @@ async fn try_print_failover(
             continue;
         };
         session.agent.set_provider(provider_impl);
+        session.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(pi::model::ThinkingLevel::Max),
+        );
         session.agent.stream_options_mut().api_key.clone_from(&key);
         session
             .agent
