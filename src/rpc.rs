@@ -3068,103 +3068,54 @@ pub async fn run(
 // Prompt Execution
 // =============================================================================
 
-async fn restore_terminal_rpc_input(
-    shared_state: &Arc<Mutex<RpcSharedState>>,
-    mut steering: VecDeque<QueuedAgentMessage>,
-    mut follow_up: VecDeque<QueuedAgentMessage>,
-) -> Result<()> {
-    // Rollback must not inherit the cancellation/deadline that made the
-    // session lock fail, or the accepted messages would still be lost.
-    let recovery_cx = AgentCx::for_request();
-    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), &recovery_cx)
-        .await
-        .map_err(|err| Error::session(format!("state restore lock failed: {err}")))?;
-    steering.append(&mut state.steering);
-    follow_up.append(&mut state.follow_up);
-    state.steering = steering;
-    state.follow_up = follow_up;
-    Ok(())
-}
-
 async fn preserve_terminal_rpc_input(
     session: &Arc<Mutex<AgentSession>>,
     shared_state: &Arc<Mutex<RpcSharedState>>,
     cx: &AgentCx,
 ) -> Result<usize> {
-    let (steering, follow_up) = {
-        let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
-            .await
-            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-        (
-            std::mem::take(&mut state.steering),
-            std::mem::take(&mut state.follow_up),
-        )
-    };
-    if steering.is_empty() && follow_up.is_empty() {
+    // Acquire locks before touching either queue. If this future is cancelled
+    // while waiting, the accepted inputs are still authoritative in shared
+    // state. The session -> shared-state order matches the Agent fetch path.
+    let mut guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let session_store = Arc::clone(&guard.session);
+    let save_enabled = guard.save_enabled();
+    let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+    if state.steering.is_empty() && state.follow_up.is_empty() {
         return Ok(0);
     }
 
-    let queued_count = steering.len() + follow_up.len();
-    let mut guard = match OwnedMutexGuard::lock(Arc::clone(session), cx).await {
-        Ok(guard) => guard,
-        Err(err) => {
-            let lock_error = format!("session lock failed: {err}");
-            restore_terminal_rpc_input(shared_state, steering, follow_up)
-                .await
-                .map_err(|restore_err| Error::session(format!("{lock_error}; {restore_err}")))?;
-            return Err(Error::session(lock_error));
-        }
-    };
-    let session_store = Arc::clone(&guard.session);
-    let save_enabled = guard.save_enabled();
-    let candidate_result = {
-        let inner = match OwnedMutexGuard::lock(Arc::clone(&session_store), cx).await {
-            Ok(inner) => inner,
-            Err(err) => {
-                let lock_error = format!("inner session lock failed: {err}");
-                drop(guard);
-                restore_terminal_rpc_input(shared_state, steering, follow_up)
-                    .await
-                    .map_err(|restore_err| {
-                        Error::session(format!("{lock_error}; {restore_err}"))
-                    })?;
-                return Err(Error::session(lock_error));
-            }
-        };
-        // Build and flush a private candidate so a failed durability attempt
-        // cannot leave orphan entries, navigation changes, or autosave tickets
-        // in the live session. Terminal preservation is rare and correctness is
-        // more important here than avoiding one full session clone.
-        let mut candidate = inner.clone();
-        for delivery in steering.iter().chain(&follow_up) {
-            candidate.append_model_message(delivery.clone().into_message());
-        }
-        let persist_result = if save_enabled {
-            candidate
-                .flush_autosave(AutosaveFlushTrigger::Periodic)
-                .await
-        } else {
-            Ok(())
-        };
-        persist_result.map(|()| (inner, candidate))
+    let queued_count = state.steering.len() + state.follow_up.len();
+    let rollback_session = inner.clone();
+    let steering = state.steering.drain(..).collect::<VecDeque<_>>();
+    let follow_up = state.follow_up.drain(..).collect::<VecDeque<_>>();
+    for delivery in steering.iter().chain(&follow_up) {
+        inner.append_model_message(delivery.clone().into_message());
+    }
+    guard
+        .agent
+        .replace_messages(inner.to_messages_for_current_path());
+
+    if save_enabled
+        && let Err(persist_err) = inner
+            .flush_autosave(AutosaveFlushTrigger::Periodic)
+            .await
+    {
+        *inner = rollback_session;
+        guard
+            .agent
+            .replace_messages(inner.to_messages_for_current_path());
+        state.steering = steering;
+        state.follow_up = follow_up;
+        return Err(persist_err);
     };
 
-    let (mut inner, candidate) = match candidate_result {
-        Ok(committed) => committed,
-        Err(persist_err) => {
-            drop(guard);
-            let restore_result =
-                restore_terminal_rpc_input(shared_state, steering, follow_up).await;
-            return match restore_result {
-                Ok(()) => Err(persist_err),
-                Err(restore_err) => Err(Error::session(format!("{persist_err}; {restore_err}"))),
-            };
-        }
-    };
-    let messages = candidate.to_messages_for_current_path();
-    *inner = candidate;
-    drop(inner);
-    guard.agent.replace_messages(messages);
     Ok(queued_count)
 }
 
