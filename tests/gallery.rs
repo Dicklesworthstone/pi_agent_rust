@@ -4,7 +4,7 @@ mod common;
 
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
-use pi::gallery::{ComponentState, GalleryCategory, GalleryMatrix};
+use pi::gallery::{GalleryCategory, GalleryMatrix};
 
 fn finish_case(harness: &TestHarness, case: &str) {
     harness
