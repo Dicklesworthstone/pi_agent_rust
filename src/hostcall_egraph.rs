@@ -363,7 +363,7 @@ impl CalibrationReport {
     /// enough to price them (bd-oxu87), and it should start returning `true` as
     /// a *result* of that work rather than being relaxed to make it pass.
     #[must_use]
-    pub fn is_fully_measured(&self) -> bool {
+    pub const fn is_fully_measured(&self) -> bool {
         self.unmeasured.is_empty()
     }
 }
@@ -407,6 +407,16 @@ impl CostModel {
     pub fn from_measured_stages(stages: MeasuredStages) -> (Self, CalibrationReport) {
         /// Round a microsecond figure into the model's integer cost units,
         /// clamping at 1 so a measured stage never prices as free.
+        // The cast below is guarded on both sides: the early return excludes
+        // non-finite and non-positive values, and the branch excludes anything
+        // at or above u32::MAX (which f64 represents exactly). What remains is
+        // a positive integral f64 strictly inside u32's range, so the
+        // conversion is exact rather than merely probable.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "value is proven positive and below u32::MAX by the guards above"
+        )]
         fn cost_of(us: f64) -> u32 {
             if !us.is_finite() || us <= 0.0 {
                 return 1;

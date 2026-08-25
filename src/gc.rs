@@ -320,6 +320,10 @@ impl GarbageCollector {
 
     /// Check whether a session file is protected (pinned, custom named, or active).
     pub fn is_session_protected(path: &Path) -> bool {
+        /// Cap on the session header read below. A header line is a small JSON
+        /// object; this only bounds a pathological file with no newline.
+        const MAX_HEADER_BYTES: u64 = 64 * 1024;
+
         // If file doesn't exist or is directory, not protected as session
         if !path.is_file() {
             return false;
@@ -357,7 +361,6 @@ impl GarbageCollector {
         // slurping a multi-gigabyte history to look at its first line would
         // make `pi gc` cost time proportional to the data it is deciding
         // whether to keep.
-        const MAX_HEADER_BYTES: u64 = 64 * 1024;
         if let Ok(file) = fs::File::open(path) {
             let mut first_line = String::new();
             let mut reader = std::io::BufReader::new(file.take(MAX_HEADER_BYTES));
