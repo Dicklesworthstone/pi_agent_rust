@@ -703,11 +703,8 @@ fn run_persistence_fault_runner_with_fake_rch(
 fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed() {
     let success_root = unique_temp_dir("persistence-rch-success");
     let success_correlation = "persistence-rch-success-correlation";
-    let success = run_persistence_fault_runner_with_fake_rch(
-        &success_root,
-        success_correlation,
-        false,
-    );
+    let success =
+        run_persistence_fault_runner_with_fake_rch(&success_root, success_correlation, false);
     assert!(
         success.status.success(),
         "fake RCH evidence run should pass. stdout={}\nstderr={}",
