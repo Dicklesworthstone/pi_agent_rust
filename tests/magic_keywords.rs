@@ -1,29 +1,38 @@
 //! Integration tests for magic keywords (bd-cv653.3.6).
 //!
 //! Acceptance coverage:
-//! 1. `please ultrathink this design` → the outbound request runs at
-//!    `ThinkingLevel::Max` (clamped downstream), proven via a capture
-//!    provider.
+//! 1. `please ultrathink this design` → the outbound request runs at the
+//!    active model's clamped maximum, proven via a capture provider.
 //! 2. `orchestrate`/`workflowz` inject the correct directive exactly once per
 //!    turn (system prompt contains it once).
 //! 3. Settings disable each keyword (no level change, no directive injected).
 //! 4. Code/fence/XML/path occurrences leave the request untouched.
+//! 5. Block-content prompts activate and persist replayable telemetry.
 //!
 //! Logging: structured JSONL per tests/common/logging.rs, v2-validated,
 //! recorded as artifacts.
 
 mod common;
 
+use asupersync::sync::Mutex as AsyncMutex;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
-use pi::agent::{Agent, AgentConfig};
-use pi::model::{StreamEvent, ThinkingLevel};
+use pi::agent::{Agent, AgentConfig, AgentSession};
+use pi::auth::AuthStorage;
+use pi::compaction::ResolvedCompactionSettings;
+use pi::config::Config;
+use pi::model::{ContentBlock, StreamEvent, TextContent, ThinkingLevel};
 use pi::provider::{Context, StreamOptions};
+use pi::resources::ResourceLoader;
+use pi::rpc::{RpcOptions, run as run_rpc};
+use pi::session::{Session, SessionEntry};
 use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 fn finish_case(harness: &TestHarness, case: &str) {
     harness
@@ -44,6 +53,22 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
         .build()
         .expect("failed to build test runtime");
     runtime.block_on(future)
+}
+
+async fn recv_rpc_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> String {
+    let started = Instant::now();
+    loop {
+        match rx.lock().expect("RPC output lock").try_recv() {
+            Ok(line) => return line,
+            Err(TryRecvError::Disconnected) => panic!("{label}: RPC output disconnected"),
+            Err(TryRecvError::Empty) => {}
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{label}: timed out waiting for RPC output"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
+    }
 }
 
 /// Records the options + system prompt of every request, then streams a
@@ -118,11 +143,12 @@ fn build_agent(
 }
 
 #[test]
-fn ultrathink_raises_turn_to_max() {
-    let case = "ultrathink_raises_turn_to_max";
+fn ultrathink_uses_model_clamped_max() {
+    let case = "ultrathink_uses_model_clamped_max";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
 
     block_on_local(agent.run("please ultrathink this design", |_| {})).expect("run");
     let capture = capture.lock().expect("capture").clone();
@@ -132,9 +158,35 @@ fn ultrathink_raises_turn_to_max() {
     );
     assert_eq!(
         capture.thinking.first(),
-        Some(&Some(ThinkingLevel::Max)),
-        "ultrathink must raise the turn to max: {:?}",
+        Some(&Some(ThinkingLevel::High)),
+        "ultrathink must use the active model's clamped max: {:?}",
         capture.thinking
+    );
+    finish_case(&harness, case);
+}
+
+#[test]
+fn block_content_text_activates_keywords() {
+    let case = "block_content_text_activates_keywords";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
+
+    block_on_local(agent.run_with_content(
+        vec![ContentBlock::Text(TextContent::new(
+            "please ultrathink and orchestrate this".to_string(),
+        ))],
+        |_| {},
+    ))
+    .expect("run block content");
+    let capture = capture.lock().expect("capture").clone();
+    assert_eq!(capture.thinking.first(), Some(&Some(ThinkingLevel::High)));
+    assert!(
+        capture.system_prompts[0]
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("`orchestrate` for this turn")),
+        "block text must receive the same directive handling as plain text"
     );
     finish_case(&harness, case);
 }
@@ -242,22 +294,148 @@ fn code_and_paths_leave_request_untouched() {
 }
 
 #[test]
-fn keyword_activation_lands_in_ledger() {
-    let case = "keyword_activation_lands_in_ledger";
+fn block_keyword_activation_lands_in_session_custom_entry() {
+    let case = "block_keyword_activation_lands_in_session_custom_entry";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let (mut agent, _capture) = build_agent(&root, None);
+    let (agent, _capture) = build_agent(&root, None);
+    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    let mut agent_session = AgentSession::new(
+        agent,
+        Arc::clone(&session),
+        false,
+        ResolvedCompactionSettings::default(),
+    );
 
-    block_on_local(agent.run("ultrathink this", |_| {})).expect("run");
-    let activations = agent.drain_keyword_ledger();
+    block_on_local(agent_session.run_with_content(
+        vec![ContentBlock::Text(TextContent::new(
+            "ultrathink this".to_string(),
+        ))],
+        |_| {},
+    ))
+    .expect("run block content through session wrapper");
+
+    let guard = session.try_lock().expect("session lock");
+    let telemetry = guard
+        .entries_for_current_path()
+        .into_iter()
+        .find_map(|entry| match entry {
+            SessionEntry::Custom(custom) if custom.custom_type == "magic_keyword" => {
+                custom.data.as_ref()
+            }
+            _ => None,
+        })
+        .expect("magic keyword Custom telemetry entry");
     harness
         .log()
-        .info("verify", format!("activations: {activations:?}"));
-    assert_eq!(activations.len(), 1);
-    assert_eq!(activations[0].word, "ultrathink");
-    assert_eq!(activations[0].action, "ultrathink");
-    // Drained: a second drain is empty.
-    assert!(agent.drain_keyword_ledger().is_empty());
-    let _ = json!({"schema": "pi.magic_keyword.v1"});
+        .info("verify", format!("telemetry: {telemetry}"));
+    assert_eq!(telemetry["schema"], json!("pi.magic_keyword.v1"));
+    assert_eq!(telemetry["word"], json!("ultrathink"));
+    assert_eq!(telemetry["action"], json!("ultrathink"));
+    finish_case(&harness, case);
+}
+
+#[test]
+fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
+    let case = "rpc_prompt_observes_clamped_thinking_directive_and_telemetry";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
+
+    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    {
+        let mut guard = session.try_lock().expect("session header lock");
+        guard.header.provider = Some("capture".to_string());
+        guard.header.model_id = Some("capture-model".to_string());
+        guard.header.thinking_level = Some("medium".to_string());
+    }
+    let agent_session = AgentSession::new(
+        agent,
+        Arc::clone(&session),
+        false,
+        ResolvedCompactionSettings::default(),
+    );
+    let auth_dir = tempfile::tempdir().expect("auth tempdir");
+    let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth storage");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("RPC test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async {
+        let options = RpcOptions {
+            config: Config::default(),
+            resources: ResourceLoader::empty(false),
+            available_models: Vec::new(),
+            scoped_models: Vec::new(),
+            cli_api_key: None,
+            auth,
+            runtime_handle: handle.clone(),
+            ask_tool: None,
+        };
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server =
+            handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
+        let cx = asupersync::Cx::for_testing();
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"1","type":"prompt","message":"please ultrathink and orchestrate this"}"#
+                    .to_string(),
+            )
+            .await
+            .expect("send RPC prompt");
+
+        let ack: serde_json::Value = serde_json::from_str(
+            recv_rpc_line(&out_rx, "RPC prompt acknowledgment")
+                .await
+                .trim(),
+        )
+        .expect("parse RPC prompt acknowledgment");
+        assert_eq!(ack["type"], "response");
+        assert_eq!(ack["command"], "prompt");
+        assert_eq!(ack["success"], true);
+
+        let mut saw_agent_end = false;
+        for _ in 0..100 {
+            let event: serde_json::Value = serde_json::from_str(
+                recv_rpc_line(&out_rx, "RPC magic-keyword event")
+                    .await
+                    .trim(),
+            )
+            .expect("parse RPC event");
+            if event["type"] == "agent_end" {
+                saw_agent_end = true;
+                break;
+            }
+        }
+        assert!(saw_agent_end, "RPC prompt never reached agent_end");
+        drop(in_tx);
+        assert!(server.await.is_ok(), "RPC server did not stop cleanly");
+    });
+
+    let captured = capture.lock().expect("capture").clone();
+    assert_eq!(captured.thinking.first(), Some(&Some(ThinkingLevel::High)));
+    assert!(
+        captured.system_prompts[0]
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("`orchestrate` for this turn")),
+        "RPC outbound request must contain the orchestration directive"
+    );
+    let guard = session.try_lock().expect("session telemetry lock");
+    assert!(guard.entries_for_current_path().into_iter().any(|entry| {
+        matches!(
+            entry,
+            SessionEntry::Custom(custom)
+                if custom.custom_type == "magic_keyword"
+                    && custom.data.as_ref().is_some_and(|data| {
+                        data["schema"] == json!("pi.magic_keyword.v1")
+                            && data["word"] == json!("ultrathink")
+                    })
+        )
+    }));
     finish_case(&harness, case);
 }

@@ -82,6 +82,28 @@ pub struct KeywordActivation {
     pub action: String,
 }
 
+/// Stable schema carried by every session telemetry entry.
+pub const KEYWORD_TELEMETRY_SCHEMA_V1: &str = "pi.magic_keyword.v1";
+
+/// Append activation telemetry to the session's replayable custom-entry
+/// stream. Both the SDK/RPC wrapper and the interactive TUI call this shared
+/// function so audit behavior cannot drift between surfaces.
+pub fn append_session_telemetry(
+    session: &mut crate::session::Session,
+    activations: &[KeywordActivation],
+) {
+    for activation in activations {
+        session.append_custom_entry(
+            "magic_keyword".to_string(),
+            Some(serde_json::json!({
+                "schema": KEYWORD_TELEMETRY_SCHEMA_V1,
+                "word": activation.word,
+                "action": activation.action,
+            })),
+        );
+    }
+}
+
 /// Orchestration directive (omp parity: parallel task decomposition with
 /// per-phase verification).
 pub const ORCHESTRATE_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `orchestrate` for this turn. Decompose the task into independent slices and run them as parallel subagents with a verification phase per slice; converge on a verified result rather than a single-pass answer.\n</system-reminder>";
@@ -90,12 +112,137 @@ pub const ORCHESTRATE_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `or
 /// barrier semantics matching our subagent chain/parallel shapes).
 pub const WORKFLOWZ_DIRECTIVE: &str = "<system-reminder>\nThe user invoked `workflowz` for this turn. Execute as a deterministic multi-subagent workflow: name each node, wire dependencies explicitly, run independent nodes as parallel waves with barriers between stages, and verify each wave before proceeding.\n</system-reminder>";
 
-/// Tokenizer state: only Prose tokens are keyword-eligible.
+/// Tokenizer state: only prose tokens are keyword-eligible. Delimiter lengths
+/// are retained so a shorter or longer backtick run cannot escape a code span
+/// or fence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScanState {
     Prose,
-    InlineCode,
-    FencedCode,
+    InlineCode { delimiter_len: usize },
+    FencedCode { marker: u8, delimiter_len: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HtmlMarkup {
+    Opening { name: String, self_closing: bool },
+    Closing { name: String },
+    Opaque,
+}
+
+fn is_void_html_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+/// Parse one HTML/XML construct starting at `start`, consuming attributes and
+/// comments as one suppressed unit. Quoted `>` bytes inside attributes do not
+/// end a tag. An unterminated comment consumes the rest of the message: the
+/// safe interpretation is markup, never executable prose.
+fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)> {
+    let bytes = message.as_bytes();
+    if bytes.get(start) != Some(&b'<') {
+        return None;
+    }
+    if bytes.get(start..start + 4) == Some(b"<!--") {
+        let end = message[start + 4..]
+            .find("-->")
+            .map_or(bytes.len(), |relative| start + 4 + relative + 3);
+        return Some((end, HtmlMarkup::Opaque));
+    }
+
+    let mut index = start + 1;
+    if matches!(bytes.get(index), Some(b'!') | Some(b'?')) {
+        let terminator = if bytes.get(index) == Some(&b'?') {
+            "?>"
+        } else {
+            ">"
+        };
+        let end = message[index + 1..]
+            .find(terminator)
+            .map_or(bytes.len(), |relative| {
+                index + 1 + relative + terminator.len()
+            });
+        return Some((end, HtmlMarkup::Opaque));
+    }
+
+    let closing = bytes.get(index) == Some(&b'/');
+    if closing {
+        index += 1;
+    }
+    let name_start = index;
+    if !bytes.get(index).is_some_and(u8::is_ascii_alphabetic) {
+        return None;
+    }
+    index += 1;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'_'))
+    {
+        index += 1;
+    }
+    match bytes.get(index) {
+        Some(b'>') | Some(b' ' | b'\t' | b'\r' | b'\n') => {}
+        Some(b'/') if bytes.get(index + 1) == Some(&b'>') => {}
+        _ => return None,
+    }
+    let name = message[name_start..index].to_ascii_lowercase();
+
+    let mut quote = None;
+    let mut end = None;
+    while let Some(&byte) = bytes.get(index) {
+        match (quote, byte) {
+            (Some(expected), current) if current == expected => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => {
+                end = Some(index + 1);
+                break;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    let end = end?;
+    if closing {
+        return Some((end, HtmlMarkup::Closing { name }));
+    }
+    let before_close = message[start..end - 1].trim_end();
+    Some((
+        end,
+        HtmlMarkup::Opening {
+            self_closing: before_close.ends_with('/') || is_void_html_tag(&name),
+            name,
+        },
+    ))
+}
+
+fn run_len(bytes: &[u8], start: usize, marker: u8) -> usize {
+    bytes[start..]
+        .iter()
+        .take_while(|byte| **byte == marker)
+        .count()
+}
+
+fn fence_close_has_only_indent_after(message: &str, after_run: usize) -> bool {
+    message[after_run..]
+        .split_once('\n')
+        .map_or(&message[after_run..], |(line_tail, _)| line_tail)
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
 }
 
 /// Detect enabled keywords in a user message. Returns each action at most
@@ -105,248 +252,201 @@ enum ScanState {
 pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordActivation> {
     let mut activations = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
     let mut state = ScanState::Prose;
     let mut token = String::new();
-    let mut chars = message.chars().peekable();
-    // Track tag sections by counting open/close of the same tag name.
-    let mut tag_depth: i32 = 0;
-    // Which fence char opened the current fenced block: tildes only close
-    // tilde fences and backticks only close backtick fences (CommonMark),
-    // so a ~~~ inside a ``` block stays code.
-    let mut fence_char = '`';
-    // Line-shape tracking for indented code blocks (4+ spaces / tab at
-    // line start): tokens on such a line are keyword-ineligible.
+    let mut html_stack: Vec<String> = Vec::new();
     let mut line_start = true;
     let mut leading_spaces = 0usize;
     let mut line_indented_code = false;
+    let mut index = 0usize;
+    let bytes = message.as_bytes();
 
     let flush_token = |token: &mut String,
-                       state: ScanState,
-                       tag_depth: i32,
                        activations: &mut Vec<KeywordActivation>,
                        seen: &mut std::collections::HashSet<String>| {
-        if state == ScanState::Prose && tag_depth == 0 {
-            let word = token.as_str();
-            for action in [
-                KeywordAction::Ultrathink,
-                KeywordAction::Orchestrate,
-                KeywordAction::Workflowz,
-            ] {
-                if word == action.word()
-                    && settings.is_none_or(|s| s.enabled(action))
-                    && seen.insert(action.as_str().to_string())
+        let word = token.as_str();
+        for action in [
+            KeywordAction::Ultrathink,
+            KeywordAction::Orchestrate,
+            KeywordAction::Workflowz,
+        ] {
+            if word == action.word()
+                && settings.is_none_or(|s| s.enabled(action))
+                && seen.insert(action.as_str().to_string())
+            {
+                activations.push(KeywordActivation {
+                    word: action.word().to_string(),
+                    action: action.as_str().to_string(),
+                });
+            }
+        }
+        if let Some(settings) = settings
+            && let Some(extra) = &settings.extra
+        {
+            for custom in extra {
+                if !custom.word.is_empty()
+                    && word == custom.word
+                    && seen.insert(custom.word.clone())
                 {
                     activations.push(KeywordActivation {
-                        word: action.word().to_string(),
-                        action: action.as_str().to_string(),
+                        word: custom.word.clone(),
+                        action: "custom".to_string(),
                     });
-                }
-            }
-            if let Some(settings) = settings
-                && let Some(extra) = &settings.extra
-            {
-                for custom in extra {
-                    if word == custom.word && seen.insert(custom.word.clone()) {
-                        activations.push(KeywordActivation {
-                            word: custom.word.clone(),
-                            action: "custom".to_string(),
-                        });
-                    }
                 }
             }
         }
         token.clear();
     };
 
-    while let Some(ch) = chars.next() {
-        // Line boundaries reset the indented-code line shape.
-        if ch == '\n' {
-            flush_token(
-                &mut token,
-                if line_indented_code {
-                    ScanState::InlineCode
-                } else {
-                    state
-                },
-                tag_depth,
-                &mut activations,
-                &mut seen,
-            );
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\n' {
+            flush_token(&mut token, &mut activations, &mut seen);
             line_start = true;
             leading_spaces = 0;
             line_indented_code = false;
+            index += 1;
             continue;
         }
-        if line_start && (ch == ' ' || ch == '\t') {
-            // CommonMark: 4+ leading spaces (or a tab) opens an indented
-            // code line — keywords there are literal code, not commands.
-            leading_spaces += if ch == '\t' { 4 } else { 1 };
+        if line_start && matches!(byte, b' ' | b'\t') {
+            leading_spaces += if byte == b'\t' { 4 } else { 1 };
             if leading_spaces >= 4 {
                 line_indented_code = true;
             }
+            index += 1;
             continue;
         }
 
-        // Fences: ``` toggles fenced state (prose only).
-        if ch == '`' {
+        if line_indented_code {
             line_start = false;
-            let mut backticks = 1;
-            while chars.peek() == Some(&'`') {
-                chars.next();
-                backticks += 1;
-            }
-            if backticks >= 3 {
-                if state == ScanState::FencedCode {
-                    if fence_char == '`' {
-                        state = ScanState::Prose;
-                    }
-                } else {
-                    state = ScanState::FencedCode;
-                    fence_char = '`';
-                }
-            } else if state == ScanState::Prose {
-                state = ScanState::InlineCode;
-            } else if state == ScanState::InlineCode {
-                state = ScanState::Prose;
-            }
-            flush_token(
-                &mut token,
-                ScanState::InlineCode,
-                tag_depth,
-                &mut activations,
-                &mut seen,
-            );
+            index += message[index..].chars().next().map_or(1, char::len_utf8);
             continue;
         }
 
-        // Tilde fences: ~~~ at line start toggles fenced state; matching
-        // fence chars only (a ~~~ inside a ``` block is content).
-        if ch == '~' && line_start {
-            line_start = false;
-            let mut tildes = 1;
-            while chars.peek() == Some(&'~') {
-                chars.next();
-                tildes += 1;
-            }
-            if tildes >= 3 {
-                if state == ScanState::FencedCode {
-                    if fence_char == '~' {
-                        state = ScanState::Prose;
-                    }
-                } else {
-                    state = ScanState::FencedCode;
-                    fence_char = '~';
+        if let ScanState::FencedCode {
+            marker,
+            delimiter_len,
+        } = state
+        {
+            if line_start && leading_spaces <= 3 && byte == marker {
+                let count = run_len(bytes, index, marker);
+                let after_run = index + count;
+                if count >= delimiter_len && fence_close_has_only_indent_after(message, after_run) {
+                    state = ScanState::Prose;
+                    index = after_run;
+                    line_start = false;
+                    continue;
                 }
-                flush_token(
-                    &mut token,
-                    ScanState::InlineCode,
-                    tag_depth,
-                    &mut activations,
-                    &mut seen,
-                );
+            }
+            line_start = false;
+            index += message[index..].chars().next().map_or(1, char::len_utf8);
+            continue;
+        }
+
+        if let ScanState::InlineCode { delimiter_len } = state {
+            if byte == b'`' {
+                let count = run_len(bytes, index, b'`');
+                if count == delimiter_len {
+                    state = ScanState::Prose;
+                }
+                index += count;
             } else {
-                for _ in 0..tildes {
-                    token.push('~');
-                }
+                index += message[index..].chars().next().map_or(1, char::len_utf8);
             }
+            line_start = false;
             continue;
+        }
+
+        if line_start && matches!(byte, b'`' | b'~') {
+            let count = run_len(bytes, index, byte);
+            if count >= 3 {
+                flush_token(&mut token, &mut activations, &mut seen);
+                state = ScanState::FencedCode {
+                    marker: byte,
+                    delimiter_len: count,
+                };
+                index += count;
+                line_start = false;
+                continue;
+            }
         }
         line_start = false;
 
-        // Tag sections: <tag> ... </tag> (prose only, any tag name).
-        if state != ScanState::FencedCode && ch == '<' {
-            let is_close = chars.peek() == Some(&'/');
-            if is_close {
-                chars.next();
-            }
-            let mut tag = String::new();
-            let mut valid = false;
-            while let Some(&next) = chars.peek() {
-                if next == '>' {
-                    chars.next();
-                    valid = !tag.is_empty()
-                        && tag
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == ':');
-                    break;
-                }
-                if next.is_whitespace() {
-                    break;
-                }
-                tag.push(next);
-                chars.next();
-            }
-            flush_token(
-                &mut token,
-                if line_indented_code {
-                    ScanState::InlineCode
-                } else {
-                    state
-                },
-                tag_depth,
-                &mut activations,
-                &mut seen,
-            );
-            if valid {
-                tag_depth = if is_close {
-                    (tag_depth - 1).max(0)
-                } else {
-                    tag_depth + 1
-                };
-            }
-            // When the '<' wasn't a tag it's literal — the flush above is
-            // the boundary behavior either way.
+        if byte == b'`' {
+            let count = run_len(bytes, index, b'`');
+            flush_token(&mut token, &mut activations, &mut seen);
+            state = ScanState::InlineCode {
+                delimiter_len: count,
+            };
+            index += count;
             continue;
         }
 
-        // Word boundaries: whitespace, string edges, sentence punctuation.
+        if byte == b'<'
+            && let Some((end, markup)) = parse_html_markup(message, index)
+        {
+            flush_token(&mut token, &mut activations, &mut seen);
+            match markup {
+                HtmlMarkup::Opening { name, self_closing } => {
+                    if !self_closing {
+                        html_stack.push(name);
+                    }
+                }
+                HtmlMarkup::Closing { name } => {
+                    if html_stack.last() == Some(&name) {
+                        html_stack.pop();
+                    }
+                }
+                HtmlMarkup::Opaque => {}
+            }
+            index = end;
+            continue;
+        }
+
+        let ch = message[index..]
+            .chars()
+            .next()
+            .expect("index is before message length");
+        index += ch.len_utf8();
+        if line_indented_code || !html_stack.is_empty() {
+            flush_token(&mut token, &mut activations, &mut seen);
+            continue;
+        }
+
         let is_boundary = ch.is_whitespace()
             || matches!(
                 ch,
-                ',' | '.' | '!' | '?' | ':' | ';' | '(' | ')' | '"' | '\''
+                ',' | '.'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | ';'
+                    | '('
+                    | ')'
+                    | '"'
+                    | '\''
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '*'
             );
         if is_boundary {
-            flush_token(
-                &mut token,
-                if line_indented_code {
-                    ScanState::InlineCode
-                } else {
-                    state
-                },
-                tag_depth,
-                &mut activations,
-                &mut seen,
-            );
+            flush_token(&mut token, &mut activations, &mut seen);
             continue;
         }
-
-        // Paths/URLs: a token containing '/' is never a keyword.
         token.push(ch);
     }
-    flush_token(
-        &mut token,
-        if line_indented_code {
-            ScanState::InlineCode
-        } else {
-            state
-        },
-        tag_depth,
-        &mut activations,
-        &mut seen,
-    );
-
-    // Tokens containing '/' (paths/URLs) are ineligible — post-filter.
-    activations.retain(|activation| !activation.word.contains('/'));
+    if state == ScanState::Prose && html_stack.is_empty() && !line_indented_code {
+        flush_token(&mut token, &mut activations, &mut seen);
+    }
     activations
 }
 
 /// Map activations to their injected directives.
 ///
 /// Path safety is structural: `/` is not a boundary, so a path like
-/// /tmp/ultrathink reads as one token and never equals a keyword; the
-/// activation-level retain in `detect` is belt-and-braces for future
-/// keyword shapes.
+/// /tmp/ultrathink reads as one token and never equals a keyword.
 #[must_use]
 pub fn directives_for(
     activations: &[KeywordActivation],
@@ -396,6 +496,26 @@ mod tests {
         assert!(words("`ultrathink` in backticks").is_empty());
         assert!(words("```\nultrathink\n```").is_empty());
         assert!(words("some `code ultrathink code` here").is_empty());
+        assert!(
+            words("``code ` ultrathink still code``").is_empty(),
+            "a shorter backtick run must not close a longer code span"
+        );
+        assert_eq!(
+            words("``code ` ultrathink still code`` then orchestrate"),
+            ["orchestrate"]
+        );
+        assert!(
+            words("```rust\nultrathink\n``\nworkflowz\n```").is_empty(),
+            "a shorter fence must not expose fenced content"
+        );
+        assert!(
+            words("````rust\nultrathink\n```\nworkflowz\n````").is_empty(),
+            "a shorter matching-marker fence must not close a longer fence"
+        );
+        assert!(
+            words("prefix ``` ultrathink ``` suffix").is_empty(),
+            "mid-line backtick runs are code spans, not fences"
+        );
     }
 
     #[test]
@@ -421,6 +541,11 @@ mod tests {
             words("    ultrathink as code\nbut ultrathink here is prose"),
             ["ultrathink"]
         );
+        assert_eq!(
+            words("    ```\nultrathink is prose on the next line"),
+            ["ultrathink"],
+            "an indented fence marker is code, not an opening fence"
+        );
         // 1-3 leading spaces are still prose.
         assert_eq!(words("   ultrathink with three spaces"), ["ultrathink"]);
     }
@@ -429,6 +554,28 @@ mod tests {
     fn xml_sections_never_trigger() {
         assert!(words("<system-reminder>ultrathink</system-reminder>").is_empty());
         assert!(words("<think>ultrathink</think>").is_empty());
+        assert!(
+            words("<div data-mode=\"ultrathink\">workflowz</div>").is_empty(),
+            "attributes and element bodies are both markup"
+        );
+        assert!(
+            words("<!-- ultrathink and orchestrate -->").is_empty(),
+            "HTML comments are not prose"
+        );
+        assert_eq!(
+            words("<div><span>ultrathink</span></div> then workflowz"),
+            ["workflowz"]
+        );
+        assert_eq!(
+            words("before <br data-mode='ultrathink'> orchestrate"),
+            ["orchestrate"],
+            "void tags must not suppress following prose"
+        );
+        assert_eq!(
+            words("see <https://example.com/ultrathink> then orchestrate"),
+            ["orchestrate"],
+            "Markdown autolinks are not opening HTML tags"
+        );
     }
 
     #[test]
@@ -476,5 +623,18 @@ mod tests {
         assert_eq!(found.len(), 1);
         let directives = directives_for(&found, Some(&settings));
         assert_eq!(directives, vec!["<sys>go deep</sys>".to_string()]);
+    }
+
+    #[test]
+    fn empty_custom_keyword_never_activates() {
+        let settings = KeywordSettings {
+            extra: Some(vec![CustomKeyword {
+                word: String::new(),
+                directive: "must not inject".to_string(),
+            }]),
+            ..Default::default()
+        };
+        assert!(detect("ordinary prose", Some(&settings)).is_empty());
+        assert!(detect("", Some(&settings)).is_empty());
     }
 }
