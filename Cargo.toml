@@ -527,11 +527,12 @@ debug = true
 debug = "line-tables-only"
 incremental = false
 
-# Performance benchmarking profile: opt-level=3, with debug info.
+# Performance benchmarking profile: optimized with bounded remote-build latency.
 [profile.perf]
 inherits = "release"
 opt-level = 3
 lto = "thin"
+codegen-units = 8
 debug = 1
 strip = false
 
