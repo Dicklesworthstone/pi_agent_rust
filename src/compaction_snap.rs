@@ -382,10 +382,11 @@ pub struct StripStats {
     pub affected_messages: usize,
 }
 
-/// Strip snapcompact frames from compaction summary messages when the active
-/// model cannot accept image inputs (bd-cv653.7.6 AC 4). Only messages whose
-/// first block carries [`COMPACTION_SUMMARY_PREFIX`] are touched — user-pasted
-/// images are never removed here.
+/// Strip snapcompact frames from compaction summary messages.
+///
+/// Strips when the active model cannot accept image inputs (bd-cv653.7.6 AC 4).
+/// Only messages whose first block carries [`COMPACTION_SUMMARY_PREFIX`] are
+/// touched — user-pasted images are never removed here.
 ///
 /// Returns stats; logs one structured line per affected span with a stable
 /// reason code so degradation is diagnosable from logs alone.
@@ -508,7 +509,7 @@ mod tests {
         assert_eq!(extracted, payload);
 
         // Schema mismatch fails closed; missing details fail closed.
-        let mut bad = details.clone();
+        let mut bad = details;
         if let Some(obj) = bad.get_mut(SNAPCOMPACT_DETAILS_KEY) {
             if let Some(map) = obj.as_object_mut() {
                 map.insert(
@@ -556,7 +557,7 @@ mod tests {
                 .iter()
                 .all(|b| matches!(b, ContentBlock::Image(i) if i.mime_type == "image/png"))
         );
-        if let Message::User(u) = attach_frames(base.clone(), None) {
+        if let Message::User(u) = attach_frames(base, None) {
             assert!(
                 matches!(&u.content, UserContent::Text(t) if t == "summary body"),
                 "no payload is a no-op"

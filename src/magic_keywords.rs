@@ -171,7 +171,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
     }
 
     let mut index = start + 1;
-    if matches!(bytes.get(index), Some(b'!') | Some(b'?')) {
+    if matches!(bytes.get(index), Some(b'!' | b'?')) {
         let processing_instruction = bytes.get(index) == Some(&b'?');
         index += 1;
         let mut quote = None;
@@ -217,7 +217,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         index += 1;
     }
     match bytes.get(index) {
-        Some(b'>') | Some(b' ' | b'\t' | b'\r' | b'\n') => {}
+        Some(b'>' | b' ' | b'\t' | b'\r' | b'\n') => {}
         Some(b'/') if bytes.get(index + 1) == Some(&b'>') => {}
         _ => return None,
     }
@@ -274,7 +274,7 @@ fn char_len_at(message: &str, index: usize) -> usize {
     message
         .get(index..)
         .and_then(|tail| tail.chars().next())
-        .map_or(message.len().saturating_sub(index).max(1), char::len_utf8)
+        .map_or_else(|| message.len().saturating_sub(index).max(1), char::len_utf8)
 }
 
 /// Detect enabled keywords in a user message. Returns each action at most

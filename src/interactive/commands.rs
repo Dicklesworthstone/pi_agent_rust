@@ -1135,6 +1135,7 @@ impl PiApp {
         });
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(super) fn sync_runtime_selection_from_session_header(&mut self) -> Result<(), String> {
         let previous_entry = self.model_entry.clone();
         let Ok(mut agent_guard) = self.agent.try_lock() else {

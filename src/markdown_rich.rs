@@ -160,150 +160,156 @@ pub fn render_hex_swatches(text: &str) -> String {
 /// The individual enhancement functions intentionally operate on plain text.
 /// Callers rendering Markdown should use this boundary so syntax-bearing text
 /// reaches the Markdown parser byte-for-byte intact.
-#[must_use]
-pub fn enrich_markdown(markdown: &str) -> String {
-    fn fence_marker(line: &str) -> Option<(u8, usize)> {
-        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
-        if indent > 3 {
-            return None;
-        }
-        let rest = line.as_bytes().get(indent..)?;
-        let marker = *rest.first()?;
-        if !matches!(marker, b'`' | b'~') {
-            return None;
-        }
-        let len = rest.iter().take_while(|byte| **byte == marker).count();
-        (len >= 3).then_some((marker, len))
+fn fence_marker(line: &str) -> Option<(u8, usize)> {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return None;
     }
-
-    fn closes_fence(line: &str, marker: u8, minimum_len: usize) -> bool {
-        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
-        if indent > 3 {
-            return false;
-        }
-        let Some(rest) = line.as_bytes().get(indent..) else {
-            return false;
-        };
-        let len = rest.iter().take_while(|byte| **byte == marker).count();
-        len >= minimum_len && rest[len..].iter().all(u8::is_ascii_whitespace)
+    let rest = line.as_bytes().get(indent..)?;
+    let marker = *rest.first()?;
+    if !matches!(marker, b'`' | b'~') {
+        return None;
     }
+    let len = rest.iter().take_while(|byte| **byte == marker).count();
+    (len >= 3).then_some((marker, len))
+}
 
-    fn is_indented_code(line: &str) -> bool {
-        line.starts_with('\t') || line.as_bytes().starts_with(b"    ")
+fn closes_fence(line: &str, marker: u8, minimum_len: usize) -> bool {
+    let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+    if indent > 3 {
+        return false;
     }
+    let Some(rest) = line.as_bytes().get(indent..) else {
+        return false;
+    };
+    let len = rest.iter().take_while(|byte| **byte == marker).count();
+    len >= minimum_len && rest[len..].iter().all(u8::is_ascii_whitespace)
+}
 
-    fn enrich_plain(text: &str) -> String {
-        fn is_path_or_url(chunk: &str) -> bool {
-            chunk.contains('/')
-                || chunk.contains("://")
-                || chunk.contains(":\\")
-                || chunk.starts_with("\\\\")
-        }
+fn is_indented_code(line: &str) -> bool {
+    line.starts_with('\t') || line.as_bytes().starts_with(b"    ")
+}
 
-        let mut out = String::with_capacity(text.len());
-        let mut start = 0;
-        let mut whitespace = None;
-        for (index, character) in text.char_indices() {
-            let is_whitespace = character.is_whitespace();
-            if whitespace.is_some_and(|current| current != is_whitespace) {
-                let chunk = &text[start..index];
-                if whitespace == Some(true) || is_path_or_url(chunk) {
-                    out.push_str(chunk);
-                } else {
-                    out.push_str(&render_hex_swatches(&latex_to_unicode(chunk)));
-                }
-                start = index;
+fn is_path_or_url(chunk: &str) -> bool {
+    chunk.contains('/')
+        || chunk.contains("://")
+        || chunk.contains(":\\")
+        || chunk.starts_with("\\\\")
+}
+
+fn enrich_plain(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut start = 0;
+    let mut whitespace = None;
+    for (index, character) in text.char_indices() {
+        let is_whitespace = character.is_whitespace();
+        if whitespace.is_some_and(|current| current != is_whitespace) {
+            let chunk = &text[start..index];
+            if whitespace == Some(true) || is_path_or_url(chunk) {
+                out.push_str(chunk);
+            } else {
+                out.push_str(&render_hex_swatches(&latex_to_unicode(chunk)));
             }
-            whitespace = Some(is_whitespace);
+            start = index;
         }
-        let chunk = &text[start..];
-        if whitespace == Some(true) || is_path_or_url(chunk) {
-            out.push_str(chunk);
-        } else {
-            out.push_str(&render_hex_swatches(&latex_to_unicode(chunk)));
-        }
-        out
+        whitespace = Some(is_whitespace);
     }
+    let chunk = &text[start..];
+    if whitespace == Some(true) || is_path_or_url(chunk) {
+        out.push_str(chunk);
+    } else {
+        out.push_str(&render_hex_swatches(&latex_to_unicode(chunk)));
+    }
+    out
+}
 
-    fn inline_code_end(text: &str, start: usize) -> Option<usize> {
-        let bytes = text.as_bytes();
-        let delimiter_len = bytes[start..]
+fn inline_code_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let delimiter_len = bytes[start..]
+        .iter()
+        .take_while(|byte| **byte == b'`')
+        .count();
+    let mut cursor = start + delimiter_len;
+    while cursor < bytes.len() {
+        if bytes[cursor] != b'`' {
+            cursor += 1;
+            continue;
+        }
+        let run_len = bytes[cursor..]
             .iter()
             .take_while(|byte| **byte == b'`')
             .count();
-        let mut cursor = start + delimiter_len;
-        while cursor < bytes.len() {
-            if bytes[cursor] != b'`' {
+        if run_len == delimiter_len {
+            return Some(cursor + run_len);
+        }
+        cursor += run_len;
+    }
+    None
+}
+
+fn link_destination_end(text: &str, start: usize) -> Option<usize> {
+    if !text[start..].starts_with("](") {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut depth = 1_usize;
+    let mut cursor = start + 2;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = (cursor + 2).min(bytes.len()),
+            b'(' => {
+                depth += 1;
                 cursor += 1;
-                continue;
             }
-            let run_len = bytes[cursor..]
-                .iter()
-                .take_while(|byte| **byte == b'`')
-                .count();
-            if run_len == delimiter_len {
-                return Some(cursor + run_len);
-            }
-            cursor += run_len;
-        }
-        None
-    }
-
-    fn link_destination_end(text: &str, start: usize) -> Option<usize> {
-        if !text[start..].starts_with("](") {
-            return None;
-        }
-        let bytes = text.as_bytes();
-        let mut depth = 1_usize;
-        let mut cursor = start + 2;
-        while cursor < bytes.len() {
-            match bytes[cursor] {
-                b'\\' => cursor = (cursor + 2).min(bytes.len()),
-                b'(' => {
-                    depth += 1;
-                    cursor += 1;
+            b')' => {
+                depth -= 1;
+                cursor += 1;
+                if depth == 0 {
+                    return Some(cursor);
                 }
-                b')' => {
-                    depth -= 1;
-                    cursor += 1;
-                    if depth == 0 {
-                        return Some(cursor);
-                    }
-                }
-                _ => cursor += 1,
             }
+            _ => cursor += 1,
         }
-        None
     }
+    None
+}
 
-    fn enrich_inline(text: &str) -> String {
-        let bytes = text.as_bytes();
-        let mut out = String::with_capacity(text.len());
-        let mut plain_start = 0;
-        let mut cursor = 0;
-        while cursor < bytes.len() {
-            let protected_end = match bytes[cursor] {
-                b'`' => inline_code_end(text, cursor),
-                b']' => link_destination_end(text, cursor),
-                b'<' => text[cursor + 1..]
-                    .find('>')
-                    .map(|offset| cursor + offset + 2),
-                _ => None,
-            };
-            if let Some(end) = protected_end {
-                out.push_str(&enrich_plain(&text[plain_start..cursor]));
-                out.push_str(&text[cursor..end]);
-                cursor = end;
-                plain_start = end;
-            } else {
-                let character_len = text[cursor..].chars().next().map_or(1, char::len_utf8);
-                cursor += character_len;
-            }
+fn enrich_inline(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut plain_start = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let protected_end = match bytes[cursor] {
+            b'`' => inline_code_end(text, cursor),
+            b']' => link_destination_end(text, cursor),
+            b'<' => text[cursor + 1..]
+                .find('>')
+                .map(|offset| cursor + offset + 2),
+            _ => None,
+        };
+        if let Some(end) = protected_end {
+            out.push_str(&enrich_plain(&text[plain_start..cursor]));
+            out.push_str(&text[cursor..end]);
+            cursor = end;
+            plain_start = end;
+        } else {
+            let character_len = text[cursor..].chars().next().map_or(1, char::len_utf8);
+            cursor += character_len;
         }
-        out.push_str(&enrich_plain(&text[plain_start..]));
-        out
     }
+    out.push_str(&enrich_plain(&text[plain_start..]));
+    out
+}
 
+/// Apply prose-only Markdown enhancements without rewriting literal code,
+/// link destinations, URLs, or filesystem paths.
+///
+/// The individual enhancement functions intentionally operate on plain text.
+/// Callers rendering Markdown should use this boundary so syntax-bearing text
+/// reaches the Markdown parser byte-for-byte intact.
+#[must_use]
+pub fn enrich_markdown(markdown: &str) -> String {
     let mut out = String::with_capacity(markdown.len() + 32);
     let mut active_fence = None;
     for line in markdown.split_inclusive('\n') {
