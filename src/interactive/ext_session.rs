@@ -122,10 +122,11 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             let Ok(mut queue) = self.user_queue.lock() else {
                 return Ok(());
             };
+            let queued = QueuedAgentMessage::generated(build_user_message(message.text));
             match deliver_as {
-                ExtensionDeliverAs::FollowUp => queue.push_follow_up(message.text),
+                ExtensionDeliverAs::FollowUp => queue.push_follow_up(queued),
                 ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => {
-                    queue.push_steering(message.text);
+                    queue.push_steering(queued);
                 }
             }
             return Ok(());
@@ -135,7 +136,7 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         let _ = enqueue_pi_event(
             &self.event_tx,
             &cx,
-            PiMsg::EnqueuePendingInput(PendingInput::Text(message.text)),
+            PiMsg::EnqueuePendingInput(PendingInput::GeneratedText(message.text)),
         )
         .await;
         Ok(())
@@ -1045,7 +1046,7 @@ mod tests {
             assert!(matches!(first, PiMsg::System(text) if text == "busy"));
             assert!(matches!(
                 second,
-                PiMsg::EnqueuePendingInput(PendingInput::Text(text))
+                PiMsg::EnqueuePendingInput(PendingInput::GeneratedText(text))
                     if text == "hello from extension"
             ));
         });

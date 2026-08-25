@@ -2346,17 +2346,20 @@ async fn run(
                     pi::agent_hub::drain_steer_file(&path)
                         .into_iter()
                         .map(|body| {
-                            pi::model::Message::User(pi::model::UserMessage {
-                                content: pi::model::UserContent::Text(body),
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map_or(0, |d| {
-                                        i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
-                                    }),
-                            })
+                            pi::agent::QueuedAgentMessage::generated(pi::model::Message::User(
+                                pi::model::UserMessage {
+                                    content: pi::model::UserContent::Text(body),
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map_or(0, |d| {
+                                            i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+                                        }),
+                                },
+                            ))
                         })
                         .collect()
-                }) as futures::future::BoxFuture<'static, Vec<pi::model::Message>>
+                })
+                    as futures::future::BoxFuture<'static, Vec<pi::agent::QueuedAgentMessage>>
             });
             agent_session
                 .agent

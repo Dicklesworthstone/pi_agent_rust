@@ -11,7 +11,9 @@
 #![allow(clippy::ignored_unit_patterns)]
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::agent::{AbortHandle, AgentEvent, AgentSession, InputSource, QueueMode};
+use crate::agent::{
+    AbortHandle, AgentEvent, AgentSession, InputSource, QueueMode, QueuedAgentMessage,
+};
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
 use crate::compaction::{
@@ -430,8 +432,8 @@ fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) 
 
 #[derive(Debug)]
 struct RpcSharedState {
-    steering: VecDeque<Message>,
-    follow_up: VecDeque<Message>,
+    steering: VecDeque<QueuedAgentMessage>,
+    follow_up: VecDeque<QueuedAgentMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     auto_compaction_enabled: bool,
@@ -488,7 +490,7 @@ impl RpcSharedState {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn push_steering(&mut self, message: Message) -> Result<()> {
+    fn push_steering(&mut self, message: QueuedAgentMessage) -> Result<()> {
         if self.pending_count() >= MAX_RPC_PENDING_MESSAGES {
             return Err(Error::session(
                 "Steering queue is full (Do you have too many pending commands?)",
@@ -498,7 +500,7 @@ impl RpcSharedState {
         Ok(())
     }
 
-    fn push_follow_up(&mut self, message: Message) -> Result<()> {
+    fn push_follow_up(&mut self, message: QueuedAgentMessage) -> Result<()> {
         if self.pending_count() >= MAX_RPC_PENDING_MESSAGES {
             return Err(Error::session("Follow-up queue is full"));
         }
@@ -506,14 +508,14 @@ impl RpcSharedState {
         Ok(())
     }
 
-    fn pop_steering(&mut self) -> Vec<Message> {
+    fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
         match self.steering_mode {
             QueueMode::All => self.steering.drain(..).collect(),
             QueueMode::OneAtATime => self.steering.pop_front().into_iter().collect(),
         }
     }
 
-    fn pop_follow_up(&mut self) -> Vec<Message> {
+    fn pop_follow_up(&mut self) -> Vec<QueuedAgentMessage> {
         match self.follow_up_mode {
             QueueMode::All => self.follow_up.drain(..).collect(),
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
@@ -633,7 +635,7 @@ pub async fn run(
             options.config.steering_queue_mode(),
             options.config.follow_up_queue_mode(),
         );
-        let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+        let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
             let steering_state = Arc::clone(&steering_state);
             let steering_cx = steering_cx.clone();
             Box::pin(async move {
@@ -643,7 +645,7 @@ pub async fn run(
                     .map_or_else(|_| Vec::new(), |mut state| state.pop_steering())
             })
         };
-        let follow_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+        let follow_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
             let follow_state = Arc::clone(&follow_state);
             let follow_cx = follow_cx.clone();
             Box::pin(async move {
@@ -842,10 +844,16 @@ pub async fn run(
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
                         match streaming_behavior {
                             Some(StreamingBehavior::Steer) => {
-                                state.push_steering(build_user_message(&expanded, &images))
+                                state.push_steering(QueuedAgentMessage::authored(
+                                    build_user_message(&expanded, &images),
+                                    message.clone(),
+                                ))
                             }
                             Some(StreamingBehavior::FollowUp) => {
-                                state.push_follow_up(build_user_message(&expanded, &images))
+                                state.push_follow_up(QueuedAgentMessage::authored(
+                                    build_user_message(&expanded, &images),
+                                    message.clone(),
+                                ))
                             }
                             None => Ok(()), // Unreachable due to check above
                         }
@@ -948,7 +956,10 @@ pub async fn run(
                     let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_steering(build_user_message(&expanded, &[]));
+                        .push_steering(QueuedAgentMessage::authored(
+                            build_user_message(&expanded, &[]),
+                            message.clone(),
+                        ));
 
                     match result {
                         Ok(()) => {
@@ -1021,7 +1032,10 @@ pub async fn run(
                     let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_follow_up(build_user_message(&expanded, &[]));
+                        .push_follow_up(QueuedAgentMessage::authored(
+                            build_user_message(&expanded, &[]),
+                            message.clone(),
+                        ));
 
                     match result {
                         Ok(()) => {
@@ -6387,6 +6401,98 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct CapturedQueuedKeywordCall {
+        thinking_level: Option<ThinkingLevel>,
+        system_prompt: Option<String>,
+        messages: Vec<Message>,
+    }
+
+    struct GatedQueuedKeywordProvider {
+        first_call_entered: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
+        first_call_gate: Mutex<Option<asupersync::channel::oneshot::Receiver<()>>>,
+        calls: Arc<Mutex<Vec<CapturedQueuedKeywordCall>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for GatedQueuedKeywordProvider {
+        fn name(&self) -> &str {
+            "queued-keyword-provider"
+        }
+
+        fn api(&self) -> &str {
+            "queued-keyword-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "queued-keyword-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &crate::provider::Context<'_>,
+            options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            self.calls
+                .lock()
+                .expect("capture queued keyword call")
+                .push(CapturedQueuedKeywordCall {
+                    thinking_level: options.thinking_level,
+                    system_prompt: context.system_prompt.as_deref().map(str::to_string),
+                    messages: context.messages.to_vec(),
+                });
+
+            let cx = AgentCx::for_current_or_request();
+            if let Some(entered) = self
+                .first_call_entered
+                .lock()
+                .expect("lock queued keyword entered signal")
+                .take()
+            {
+                entered
+                    .send(cx.cx(), ())
+                    .expect("signal first queued keyword provider call");
+            }
+            let first_call_gate = self
+                .first_call_gate
+                .lock()
+                .expect("lock queued keyword gate")
+                .take();
+            if let Some(mut gate) = first_call_gate {
+                let _ = gate.recv(cx.cx()).await;
+            }
+
+            let message = AssistantMessage {
+                content: Vec::new(),
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
     #[derive(Default)]
     struct RpcDeadlineProbeState {
         calls: std::sync::atomic::AtomicUsize,
@@ -8327,18 +8433,181 @@ export default function init(pi) {
     }
 
     #[test]
+    fn shared_state_preserves_raw_keyword_source_beside_expanded_payload() {
+        let config = Config::default();
+        let mut shared = RpcSharedState::new(&config);
+        let expanded = "generated ultrathink workflowz bytes";
+
+        shared
+            .push_steering(QueuedAgentMessage::authored(
+                build_user_message(expanded, &[]),
+                "please orchestrate this",
+            ))
+            .expect("enqueue source-aware steering");
+
+        let queued = shared.pop_steering();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].keyword_scan_source(),
+            Some("please orchestrate this")
+        );
+        assert!(matches!(
+            queued[0].message(),
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == expanded
+        ));
+    }
+
+    #[test]
+    fn streaming_rpc_queue_scans_raw_source_not_expanded_template() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (first_call_entered, mut wait_for_first_call) =
+                asupersync::channel::oneshot::channel::<()>();
+            let (release_first_call, first_call_gate) =
+                asupersync::channel::oneshot::channel::<()>();
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let provider: Arc<dyn Provider> = Arc::new(GatedQueuedKeywordProvider {
+                first_call_entered: Mutex::new(Some(first_call_entered)),
+                first_call_gate: Mutex::new(Some(first_call_gate)),
+                calls: Arc::clone(&calls),
+            });
+            let tools = ToolRegistry::new(&[], temp.path(), None);
+            let mut agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    stream_options: crate::provider::StreamOptions {
+                        thinking_level: Some(ThinkingLevel::Low),
+                        ..crate::provider::StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(ThinkingLevel::High);
+            let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(
+                agent,
+                session,
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            options.resources = load_test_prompt_template_resources(
+                temp.path(),
+                "queued",
+                "generated ultrathink workflowz payload; argument=$ARGUMENTS",
+            )
+            .await;
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let initial = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"ordinary first turn"}"#,
+                "initial gated prompt",
+            )
+            .await;
+            assert_ok(&initial, "prompt");
+
+            let entered_cx = AgentCx::for_request();
+            wait_for_first_call
+                .recv(entered_cx.cx())
+                .await
+                .expect("first provider call entered");
+
+            let queued = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"2","type":"prompt","message":"/queued orchestrate","streamingBehavior":"steer"}"#,
+                "streaming source-aware steering prompt",
+            )
+            .await;
+            assert_ok(&queued, "prompt");
+
+            let release_cx = AgentCx::for_request();
+            release_first_call
+                .send(release_cx.cx(), ())
+                .expect("release first provider call");
+
+            loop {
+                let line = recv_line(&out_rx, "source-aware streaming completion")
+                    .await
+                    .expect("receive streaming event");
+                let value = parse_response(&line);
+                if value["type"] == "agent_end" {
+                    assert!(
+                        value.get("error").is_none_or(Value::is_null),
+                        "streaming turn should complete: {value}"
+                    );
+                    break;
+                }
+            }
+
+            drop(in_tx);
+            let server_result = server.await;
+            assert!(
+                server_result.is_ok(),
+                "RPC server error: {server_result:?}"
+            );
+
+            let captured = calls.lock().expect("capture calls");
+            assert_eq!(captured.len(), 2, "steering should trigger a second provider call");
+            assert_eq!(captured[0].thinking_level, Some(ThinkingLevel::Low));
+            assert_eq!(
+                captured[1].thinking_level,
+                Some(ThinkingLevel::Low),
+                "generated ultrathink in the expanded template must stay inert"
+            );
+            let second_prompt = captured[1]
+                .system_prompt
+                .as_deref()
+                .expect("orchestrate directive");
+            assert!(second_prompt.contains("invoked `orchestrate`"));
+            assert!(!second_prompt.contains("invoked `workflowz`"));
+            assert!(captured[1].messages.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text == "generated ultrathink workflowz payload; argument=orchestrate"
+                )
+            }));
+        });
+    }
+
+    #[test]
     fn shared_state_blocks_follow_up_when_steering_queue_reaches_total_cap() {
         let config = Config::default();
         let mut shared = RpcSharedState::new(&config);
 
         for idx in 0..MAX_RPC_PENDING_MESSAGES {
             shared
-                .push_steering(build_user_message(&format!("steer-{idx}"), &[]))
+                .push_steering(QueuedAgentMessage::from_authored_message(
+                    build_user_message(&format!("steer-{idx}"), &[]),
+                ))
                 .expect("steering enqueue within total cap");
         }
 
         let err = shared
-            .push_follow_up(build_user_message("follow-up-overflow", &[]))
+            .push_follow_up(QueuedAgentMessage::from_authored_message(
+                build_user_message("follow-up-overflow", &[]),
+            ))
             .expect_err("follow-up enqueue should respect total pending cap");
         assert!(matches!(err, Error::Session(_)));
         assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);
@@ -8351,12 +8620,16 @@ export default function init(pi) {
 
         for idx in 0..MAX_RPC_PENDING_MESSAGES {
             shared
-                .push_follow_up(build_user_message(&format!("follow-up-{idx}"), &[]))
+                .push_follow_up(QueuedAgentMessage::from_authored_message(
+                    build_user_message(&format!("follow-up-{idx}"), &[]),
+                ))
                 .expect("follow-up enqueue within total cap");
         }
 
         let err = shared
-            .push_steering(build_user_message("steer-overflow", &[]))
+            .push_steering(QueuedAgentMessage::from_authored_message(
+                build_user_message("steer-overflow", &[]),
+            ))
             .expect_err("steering enqueue should respect total pending cap");
         assert!(matches!(err, Error::Session(_)));
         assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);

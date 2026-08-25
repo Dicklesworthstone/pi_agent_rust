@@ -2048,6 +2048,12 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let cmd = match next {
                 PendingInput::Text(text) => self.submit_message(&text),
+                PendingInput::GeneratedText(text) => self
+                    .submit_content_with_display_and_keyword_source(
+                        vec![ContentBlock::Text(TextContent::new(text.clone()))],
+                        &text,
+                        Some(String::new()),
+                    ),
                 PendingInput::Content(content) => self.submit_content(content),
                 PendingInput::ContentWithKeywordSource {
                     content,
@@ -2093,9 +2099,10 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.history.push(trimmed.to_string());
 
         if let Ok(mut queue) = self.message_queue.lock() {
+            let queued = QueuedAgentMessage::authored(build_user_message(expanded), trimmed);
             match kind {
-                QueuedMessageKind::Steering => queue.push_steering(expanded),
-                QueuedMessageKind::FollowUp => queue.push_follow_up(expanded),
+                QueuedMessageKind::Steering => queue.push_steering(queued),
+                QueuedMessageKind::FollowUp => queue.push_follow_up(queued),
             }
         }
 
@@ -2125,7 +2132,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             return 0;
         }
 
-        let queued_text = all.join("\n\n");
+        let queued_text = all
+            .iter()
+            .filter_map(QueuedAgentMessage::text_for_display)
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let current_text = self.input.value();
         let combined = [queued_text, current_text]
             .into_iter()
@@ -2469,6 +2480,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             } else {
                 agent_guard.set_system_prompt(base_system_prompt.clone());
             }
+            let preserve_plain_text_shape = keyword_scan_source.as_deref() == Some("");
             agent_guard.set_magic_keyword_scan_override(keyword_scan_source);
             let previous_len = agent_guard.messages().len();
 
@@ -2484,8 +2496,14 @@ After approving access in the browser, press Enter in Pi to complete login."
                     Arc::clone(&tui_pressure_frame_p99_us),
                 )));
             let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
+            let user_content = match content_for_agent.as_slice() {
+                [ContentBlock::Text(text)] if preserve_plain_text_shape => {
+                    UserContent::Text(text.text.clone())
+                }
+                _ => UserContent::Blocks(content_for_agent),
+            };
             let user_message = ModelMessage::User(UserMessage {
-                content: UserContent::Blocks(content_for_agent),
+                content: user_content,
                 timestamp: Utc::now().timestamp_millis(),
             });
             let mut prompts = Vec::with_capacity(1 + before_messages.len());
@@ -3212,6 +3230,34 @@ mod stream_delta_batcher_tests {
                 .any(|entry| entry.value.contains("tc-plan")),
             "template expansion should record a history entry"
         );
+    }
+
+    #[test]
+    fn queued_tui_template_keeps_raw_keyword_source_and_expanded_payload() {
+        let (mut app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
+        app.resources
+            .push_prompt_for_tests(crate::resources::PromptTemplate {
+                name: "queued".to_string(),
+                description: "Queued provenance fixture".to_string(),
+                content: "generated ultrathink workflowz payload; argument=$ARGUMENTS".to_string(),
+                source: "test".to_string(),
+                file_path: std::path::PathBuf::from("queued.md"),
+            });
+        app.input.set_value("/queued orchestrate");
+
+        app.queue_input(QueuedMessageKind::Steering);
+
+        let mut queue = app.message_queue.lock().expect("message queue");
+        let queued = queue.pop_steering();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].keyword_scan_source(), Some("/queued orchestrate"));
+        assert!(matches!(
+            queued[0].message(),
+            ModelMessage::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "generated ultrathink workflowz payload; argument=orchestrate"
+        ));
     }
 
     #[test]

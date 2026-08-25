@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use bubbles::list::{DefaultDelegate, Item as ListItem, List};
 
-use crate::agent::QueueMode;
+use crate::agent::{QueueMode, QueuedAgentMessage};
 use crate::autocomplete::{
     AutocompleteCatalog, AutocompleteItem, AutocompleteProvider, AutocompleteResponse,
 };
@@ -107,6 +107,7 @@ pub enum InputMode {
 #[derive(Debug, Clone)]
 pub enum PendingInput {
     Text(String),
+    GeneratedText(String),
     Content(Vec<ContentBlock>),
     ContentWithKeywordSource {
         content: Vec<ContentBlock>,
@@ -751,8 +752,8 @@ pub(super) enum QueuedMessageKind {
 
 #[derive(Debug)]
 pub(super) struct InteractiveMessageQueue {
-    pub(super) steering: VecDeque<String>,
-    pub(super) follow_up: VecDeque<String>,
+    pub(super) steering: VecDeque<QueuedAgentMessage>,
+    pub(super) follow_up: VecDeque<QueuedAgentMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
 }
@@ -772,23 +773,23 @@ impl InteractiveMessageQueue {
         self.follow_up_mode = follow_up_mode;
     }
 
-    pub(super) fn push_steering(&mut self, text: String) {
-        self.steering.push_back(text);
+    pub(super) fn push_steering(&mut self, message: QueuedAgentMessage) {
+        self.steering.push_back(message);
     }
 
-    pub(super) fn push_follow_up(&mut self, text: String) {
-        self.follow_up.push_back(text);
+    pub(super) fn push_follow_up(&mut self, message: QueuedAgentMessage) {
+        self.follow_up.push_back(message);
     }
 
-    pub(super) fn pop_steering(&mut self) -> Vec<String> {
+    pub(super) fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
         self.pop_kind(QueuedMessageKind::Steering)
     }
 
-    pub(super) fn pop_follow_up(&mut self) -> Vec<String> {
+    pub(super) fn pop_follow_up(&mut self) -> Vec<QueuedAgentMessage> {
         self.pop_kind(QueuedMessageKind::FollowUp)
     }
 
-    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<String> {
+    fn pop_kind(&mut self, kind: QueuedMessageKind) -> Vec<QueuedAgentMessage> {
         let (queue, mode) = match kind {
             QueuedMessageKind::Steering => (&mut self.steering, self.steering_mode),
             QueuedMessageKind::FollowUp => (&mut self.follow_up, self.follow_up_mode),
@@ -799,7 +800,7 @@ impl InteractiveMessageQueue {
         }
     }
 
-    pub(super) fn clear_all(&mut self) -> (Vec<String>, Vec<String>) {
+    pub(super) fn clear_all(&mut self) -> (Vec<QueuedAgentMessage>, Vec<QueuedAgentMessage>) {
         let steering = self.steering.drain(..).collect();
         let follow_up = self.follow_up.drain(..).collect();
         (steering, follow_up)
@@ -813,12 +814,65 @@ impl InteractiveMessageQueue {
         self.follow_up.len()
     }
 
-    pub(super) fn steering_front(&self) -> Option<&String> {
-        self.steering.front()
+    pub(super) fn steering_front(&self) -> Option<&str> {
+        self.steering
+            .front()
+            .and_then(QueuedAgentMessage::text_for_display)
     }
 
-    pub(super) fn follow_up_front(&self) -> Option<&String> {
-        self.follow_up.front()
+    pub(super) fn follow_up_front(&self) -> Option<&str> {
+        self.follow_up
+            .front()
+            .and_then(QueuedAgentMessage::text_for_display)
+    }
+}
+
+#[cfg(test)]
+mod interactive_message_queue_tests {
+    use super::*;
+    use crate::model::{UserContent, UserMessage};
+
+    fn user_message(text: &str) -> ModelMessage {
+        ModelMessage::User(UserMessage {
+            content: UserContent::Text(text.to_string()),
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn queue_keeps_authored_source_separate_from_provider_payload() {
+        let mut queue = InteractiveMessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_steering(QueuedAgentMessage::authored(
+            user_message("generated ultrathink workflowz bytes"),
+            "please orchestrate this",
+        ));
+
+        assert_eq!(queue.steering_front(), Some("please orchestrate this"));
+        let queued = queue.pop_steering();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].keyword_scan_source(),
+            Some("please orchestrate this")
+        );
+        assert!(matches!(
+            queued[0].message(),
+            ModelMessage::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) if text == "generated ultrathink workflowz bytes"
+        ));
+    }
+
+    #[test]
+    fn generated_queue_entry_is_suppressed_but_still_previewable() {
+        let mut queue = InteractiveMessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_follow_up(QueuedAgentMessage::generated(user_message(
+            "ultrathink from extension",
+        )));
+
+        assert_eq!(queue.follow_up_front(), Some("ultrathink from extension"));
+        let queued = queue.pop_follow_up();
+        assert_eq!(queued[0].keyword_scan_source(), None);
     }
 }
 

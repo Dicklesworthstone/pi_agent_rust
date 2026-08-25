@@ -595,3 +595,169 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
     drop(guard);
     finish_case(&harness, case);
 }
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn rpc_queued_steering_and_follow_up_keyword_provenance_and_suppression() {
+    let case = "rpc_queued_steering_and_follow_up_keyword_provenance_and_suppression";
+    let harness = TestHarness::new(case);
+    let root = harness.temp_path(".");
+    let (agent, capture) = build_agent(&root, None);
+
+    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    {
+        let mut guard = session.try_lock().expect("session header lock");
+        guard.header.provider = Some("capture".to_string());
+        guard.header.model_id = Some("capture-model".to_string());
+        guard.header.thinking_level = Some("off".to_string());
+    }
+    let mut agent_session = AgentSession::new(
+        agent,
+        Arc::clone(&session),
+        false,
+        ResolvedCompactionSettings::default(),
+    );
+    let auth_dir = tempfile::tempdir().expect("auth tempdir");
+    let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth storage");
+    let (registry, expected_max) = capture_model_registry(&auth);
+    agent_session.set_model_registry(registry);
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("RPC test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async {
+        let options = RpcOptions {
+            config: Config::default(),
+            resources: ResourceLoader::empty(false),
+            available_models: Vec::new(),
+            scoped_models: Vec::new(),
+            cli_api_key: None,
+            auth,
+            runtime_handle: handle.clone(),
+            ask_tool: None,
+        };
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+        let out_rx = Arc::new(Mutex::new(out_rx));
+        let server =
+            handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
+        let cx = asupersync::Cx::for_testing();
+
+        // Prompt 1: plain turn -> baseline thinking is Off
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"1","type":"prompt","message":"turn 1 normal"}"#.to_string(),
+            )
+            .await
+            .expect("send RPC prompt 1");
+
+        let _ack1: serde_json::Value = serde_json::from_str(
+            recv_rpc_line(&out_rx, "RPC prompt 1 acknowledgment")
+                .await
+                .expect("receive RPC prompt 1 acknowledgment")
+                .trim(),
+        )
+        .expect("parse ack 1");
+
+        let mut saw_end1 = false;
+        for _ in 0..100 {
+            let event: serde_json::Value = serde_json::from_str(
+                recv_rpc_line(&out_rx, "RPC event 1")
+                    .await
+                    .expect("receive RPC event 1")
+                    .trim(),
+            )
+            .expect("parse event 1");
+            if event["type"] == "agent_end" {
+                saw_end1 = true;
+                break;
+            }
+        }
+        assert!(saw_end1, "Prompt 1 completed");
+
+        // Steer: Queue steering message with ultrathink and workflowz
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"2","type":"steer","message":"please ultrathink and workflowz this steering input"}"#.to_string(),
+            )
+            .await
+            .expect("send RPC steer");
+
+        let _ack2: serde_json::Value = serde_json::from_str(
+            recv_rpc_line(&out_rx, "RPC steer acknowledgment")
+                .await
+                .expect("receive RPC steer acknowledgment")
+                .trim(),
+        )
+        .expect("parse ack 2");
+
+        // Prompt 2: triggers the steering message delivery
+        in_tx
+            .send(
+                &cx,
+                r#"{"id":"3","type":"prompt","message":"turn 2 execute"}"#.to_string(),
+            )
+            .await
+            .expect("send RPC prompt 2");
+
+        let _ack3: serde_json::Value = serde_json::from_str(
+            recv_rpc_line(&out_rx, "RPC prompt 2 acknowledgment")
+                .await
+                .expect("receive RPC prompt 2 acknowledgment")
+                .trim(),
+        )
+        .expect("parse ack 3");
+
+        let mut saw_end2 = false;
+        for _ in 0..100 {
+            let event: serde_json::Value = serde_json::from_str(
+                recv_rpc_line(&out_rx, "RPC event 2")
+                    .await
+                    .expect("receive RPC event 2")
+                    .trim(),
+            )
+            .expect("parse event 2");
+            if event["type"] == "agent_end" {
+                saw_end2 = true;
+                break;
+            }
+        }
+        assert!(saw_end2, "Prompt 2 completed");
+
+        drop(in_tx);
+        server.await.expect("RPC server task join");
+    });
+
+    let captured = capture.lock().expect("capture").clone();
+    assert_eq!(captured.thinking.first(), Some(&Some(ThinkingLevel::Off)));
+    assert_eq!(captured.thinking.get(1), Some(&Some(expected_max)));
+    assert!(
+        captured.system_prompts[1]
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("`workflowz` for this turn")),
+        "RPC turn 2 must observe queued steering workflowz directive"
+    );
+
+    let guard = session.try_lock().expect("session telemetry lock");
+    let has_ultrathink_custom = guard.entries_for_current_path().into_iter().any(|entry| {
+        matches!(
+            entry,
+            SessionEntry::Custom(custom)
+                if custom.custom_type == "magic_keyword"
+                    && custom.data.as_ref().is_some_and(|data| {
+                        data["schema"] == json!("pi.magic_keyword.v1")
+                            && data["word"] == json!("ultrathink")
+                    })
+        )
+    });
+    assert!(
+        has_ultrathink_custom,
+        "Session must contain magic_keyword telemetry for ultrathink"
+    );
+    drop(guard);
+
+    finish_case(&harness, case);
+}

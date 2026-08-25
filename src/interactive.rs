@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
+use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode, QueuedAgentMessage};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
 use crate::config::{Config, ExtensionPolicyConfig, SettingsScope, parse_queue_mode_or_default};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
@@ -2675,30 +2675,40 @@ impl PiApp {
             let follow_up_queue = Arc::clone(&message_queue);
             let injected_steering_queue = Arc::clone(&injected_queue);
             let injected_follow_up_queue = Arc::clone(&injected_queue);
-            let steering_fetcher = move || -> BoxFuture<'static, Vec<ModelMessage>> {
+            let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
                 let steering_queue = Arc::clone(&steering_queue);
                 let injected_steering_queue = Arc::clone(&injected_steering_queue);
                 Box::pin(async move {
                     let mut out = Vec::new();
                     if let Ok(mut queue) = steering_queue.lock() {
-                        out.extend(queue.pop_steering().into_iter().map(build_user_message));
+                        out.extend(queue.pop_steering());
                     }
                     if let Ok(mut queue) = injected_steering_queue.lock() {
-                        out.extend(queue.pop_steering());
+                        out.extend(
+                            queue
+                                .pop_steering()
+                                .into_iter()
+                                .map(QueuedAgentMessage::generated),
+                        );
                     }
                     out
                 })
             };
-            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<ModelMessage>> {
+            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
                 let follow_up_queue = Arc::clone(&follow_up_queue);
                 let injected_follow_up_queue = Arc::clone(&injected_follow_up_queue);
                 Box::pin(async move {
                     let mut out = Vec::new();
                     if let Ok(mut queue) = follow_up_queue.lock() {
-                        out.extend(queue.pop_follow_up().into_iter().map(build_user_message));
+                        out.extend(queue.pop_follow_up());
                     }
                     if let Ok(mut queue) = injected_follow_up_queue.lock() {
-                        out.extend(queue.pop_follow_up());
+                        out.extend(
+                            queue
+                                .pop_follow_up()
+                                .into_iter()
+                                .map(QueuedAgentMessage::generated),
+                        );
                     }
                     out
                 })

@@ -871,8 +871,106 @@ struct SemanticContextPromptStats {
     truncated: bool,
 }
 
+/// Ephemeral queued-message envelope.
+///
+/// `message` is the provider-visible payload. `keyword_scan_source` is present
+/// only when a human-authored source string is known; generated host,
+/// extension, job, and peer messages leave it absent so their payload bytes
+/// can never activate magic keywords accidentally. This provenance is runtime
+/// state only and is deliberately not serialized into [`Message`].
+#[derive(Debug, Clone)]
+pub struct QueuedAgentMessage {
+    message: Message,
+    keyword_scan_source: Option<String>,
+}
+
+impl QueuedAgentMessage {
+    /// Pair a provider-visible message with the exact user-authored source
+    /// that is eligible for magic-keyword scanning.
+    #[must_use]
+    pub fn authored(message: Message, keyword_scan_source: impl Into<String>) -> Self {
+        let keyword_scan_source =
+            matches!(&message, Message::User(_)).then(|| keyword_scan_source.into());
+        Self {
+            message,
+            keyword_scan_source,
+        }
+    }
+
+    /// Treat a user message as its own authored scan source.
+    ///
+    /// Queue boundaries that expand templates or attachments must use
+    /// [`Self::authored`] with the pre-expansion source. This constructor is
+    /// for direct public API callers, where preserving the historical behavior
+    /// means treating every text block they supplied as authored.
+    #[must_use]
+    pub fn from_authored_message(message: Message) -> Self {
+        let keyword_scan_source = match &message {
+            Message::User(UserMessage { content, .. }) => Some(match content {
+                UserContent::Text(text) => text.clone(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            }),
+            _ => None,
+        };
+        Self {
+            message,
+            keyword_scan_source,
+        }
+    }
+
+    /// Wrap a generated/internal message. Its provider-visible text is never
+    /// eligible for magic-keyword activation.
+    #[must_use]
+    pub const fn generated(message: Message) -> Self {
+        Self {
+            message,
+            keyword_scan_source: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn message(&self) -> &Message {
+        &self.message
+    }
+
+    #[must_use]
+    pub fn keyword_scan_source(&self) -> Option<&str> {
+        self.keyword_scan_source.as_deref()
+    }
+
+    /// Text suitable for queue previews/editor restoration. Prefer the raw
+    /// authored source, falling back to provider-visible text for explicitly
+    /// suppressed generated entries.
+    #[must_use]
+    pub fn text_for_display(&self) -> Option<&str> {
+        self.keyword_scan_source().or_else(|| match &self.message {
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => Some(text.as_str()),
+                UserContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                }),
+            },
+            _ => None,
+        })
+    }
+
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        self.message
+    }
+}
+
 /// Async fetcher for queued messages (steering or follow-up).
-pub type MessageFetcher = Arc<dyn Fn() -> BoxFuture<'static, Vec<Message>> + Send + Sync + 'static>;
+pub type MessageFetcher =
+    Arc<dyn Fn() -> BoxFuture<'static, Vec<QueuedAgentMessage>> + Send + Sync + 'static>;
 
 type AgentEventHandler = Arc<dyn Fn(AgentEvent) + Send + Sync + 'static>;
 
@@ -915,16 +1013,16 @@ enum QueueKind {
 }
 
 #[derive(Debug, Clone)]
-struct QueuedMessage {
+struct SequencedQueuedMessage {
     seq: u64,
     enqueued_at: i64,
-    message: Message,
+    delivery: QueuedAgentMessage,
 }
 
 #[derive(Debug)]
 struct MessageQueue {
-    steering: VecDeque<QueuedMessage>,
-    follow_up: VecDeque<QueuedMessage>,
+    steering: VecDeque<SequencedQueuedMessage>,
+    follow_up: VecDeque<SequencedQueuedMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     next_seq: u64,
@@ -950,13 +1048,13 @@ impl MessageQueue {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn push(&mut self, kind: QueueKind, message: Message) -> u64 {
+    fn push(&mut self, kind: QueueKind, delivery: QueuedAgentMessage) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        let entry = QueuedMessage {
+        let entry = SequencedQueuedMessage {
             seq,
             enqueued_at: Utc::now().timestamp_millis(),
-            message,
+            delivery,
         };
         match kind {
             QueueKind::Steering => {
@@ -983,34 +1081,34 @@ impl MessageQueue {
         seq
     }
 
-    fn push_steering(&mut self, message: Message) -> u64 {
-        self.push(QueueKind::Steering, message)
+    fn push_steering(&mut self, delivery: QueuedAgentMessage) -> u64 {
+        self.push(QueueKind::Steering, delivery)
     }
 
-    fn push_follow_up(&mut self, message: Message) -> u64 {
-        self.push(QueueKind::FollowUp, message)
+    fn push_follow_up(&mut self, delivery: QueuedAgentMessage) -> u64 {
+        self.push(QueueKind::FollowUp, delivery)
     }
 
-    fn pop_steering(&mut self) -> Vec<Message> {
+    fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
         self.pop_kind(QueueKind::Steering)
     }
 
-    fn pop_follow_up(&mut self) -> Vec<Message> {
+    fn pop_follow_up(&mut self) -> Vec<QueuedAgentMessage> {
         self.pop_kind(QueueKind::FollowUp)
     }
 
-    fn pop_kind(&mut self, kind: QueueKind) -> Vec<Message> {
+    fn pop_kind(&mut self, kind: QueueKind) -> Vec<QueuedAgentMessage> {
         let (queue, mode) = match kind {
             QueueKind::Steering => (&mut self.steering, self.steering_mode),
             QueueKind::FollowUp => (&mut self.follow_up, self.follow_up_mode),
         };
 
         match mode {
-            QueueMode::All => queue.drain(..).map(|entry| entry.message).collect(),
+            QueueMode::All => queue.drain(..).map(|entry| entry.delivery).collect(),
             QueueMode::OneAtATime => queue
                 .pop_front()
                 .into_iter()
-                .map(|entry| entry.message)
+                .map(|entry| entry.delivery)
                 .collect(),
         }
     }
@@ -1543,10 +1641,11 @@ impl Agent {
                 format = rule.format.label(),
                 "imported scoped rule activated"
             );
-            self.message_queue.push_steering(Message::User(UserMessage {
-                content: UserContent::Text(text),
-                timestamp: Utc::now().timestamp_millis(),
-            }));
+            self.message_queue
+                .push_steering(QueuedAgentMessage::generated(Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    timestamp: Utc::now().timestamp_millis(),
+                })));
         }
     }
 
@@ -1655,12 +1754,19 @@ impl Agent {
 
     /// Queue a steering message (delivered after tool completion).
     pub fn queue_steering(&mut self, message: Message) -> u64 {
-        self.message_queue.push_steering(message)
+        self.message_queue
+            .push_steering(QueuedAgentMessage::from_authored_message(message))
     }
 
     /// Queue a follow-up message (delivered when agent becomes idle).
     pub fn queue_follow_up(&mut self, message: Message) -> u64 {
-        self.message_queue.push_follow_up(message)
+        self.message_queue
+            .push_follow_up(QueuedAgentMessage::from_authored_message(message))
+    }
+
+    fn queue_generated_steering(&mut self, message: Message) -> u64 {
+        self.message_queue
+            .push_steering(QueuedAgentMessage::generated(message))
     }
 
     /// Configure queue delivery modes.
@@ -2157,6 +2263,16 @@ impl Agent {
         self.apply_magic_keywords_for_text(&scan_text, turn_keyword_words);
     }
 
+    fn apply_magic_keywords_for_delivery(
+        &mut self,
+        delivery: &QueuedAgentMessage,
+        turn_keyword_words: &mut std::collections::HashSet<String>,
+    ) {
+        if let Some(source) = delivery.keyword_scan_source() {
+            self.apply_magic_keywords_for_text(source, turn_keyword_words);
+        }
+    }
+
     fn apply_magic_keywords_for_text(
         &mut self,
         scan_text: &str,
@@ -2249,7 +2365,7 @@ impl Agent {
 
         loop {
             let mut has_more_tool_calls = true;
-            let mut steering_after_tools: Option<Vec<Message>> = None;
+            let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
                 if let Some(cap) = max_time
@@ -2289,8 +2405,9 @@ impl Agent {
                     .await;
                 on_event(turn_start_event);
 
-                for message in std::mem::take(&mut pending_messages) {
-                    self.apply_magic_keywords_for_message(&message, &mut turn_keyword_words);
+                for delivery in std::mem::take(&mut pending_messages) {
+                    self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
+                    let message = delivery.into_message();
                     // Advisor notes get a dedicated event on delivery
                     // (bd-cv653.3.3) so RPC/ACP surfaces can render them.
                     if let Message::User(user) = &message
@@ -2367,11 +2484,12 @@ impl Agent {
                     Err(err) => {
                         let err_string = err.to_string();
                         let steering_to_add = self.drain_steering_messages().await;
-                        for message in steering_to_add {
-                            self.apply_magic_keywords_for_message(
-                                &message,
+                        for delivery in steering_to_add {
+                            self.apply_magic_keywords_for_delivery(
+                                &delivery,
                                 &mut turn_keyword_words,
                             );
+                            let message = delivery.into_message();
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -2428,8 +2546,9 @@ impl Agent {
                     StopReason::Error | StopReason::Aborted
                 ) {
                     let steering_to_add = self.drain_steering_messages().await;
-                    for message in steering_to_add {
-                        self.apply_magic_keywords_for_message(&message, &mut turn_keyword_words);
+                    for delivery in steering_to_add {
+                        self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
+                        let message = delivery.into_message();
                         self.messages.push(message.clone());
                         on_event(AgentEvent::MessageStart {
                             message: message.clone(),
@@ -2509,7 +2628,8 @@ impl Agent {
                             )),
                             timestamp: Utc::now().timestamp_millis(),
                         });
-                        self.message_queue.push_steering(warning);
+                        self.message_queue
+                            .push_steering(QueuedAgentMessage::generated(warning));
                         tracing::warn!(
                             iterations,
                             max = self.config.max_tool_iterations,
@@ -2548,11 +2668,12 @@ impl Agent {
                         }
 
                         let steering_to_add = self.drain_steering_messages().await;
-                        for message in steering_to_add {
-                            self.apply_magic_keywords_for_message(
-                                &message,
+                        for delivery in steering_to_add {
+                            self.apply_magic_keywords_for_delivery(
+                                &delivery,
                                 &mut turn_keyword_words,
                             );
+                            let message = delivery.into_message();
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -2599,11 +2720,12 @@ impl Agent {
                         Ok(outcome) => outcome,
                         Err(err) => {
                             let steering_to_add = self.drain_steering_messages().await;
-                            for message in steering_to_add {
-                                self.apply_magic_keywords_for_message(
-                                    &message,
+                            for delivery in steering_to_add {
+                                self.apply_magic_keywords_for_delivery(
+                                    &delivery,
                                     &mut turn_keyword_words,
                                 );
+                                let message = delivery.into_message();
                                 self.messages.push(message.clone());
                                 on_event(AgentEvent::MessageStart {
                                     message: message.clone(),
@@ -2673,10 +2795,11 @@ impl Agent {
                 if pending_messages.is_empty() && !has_more_tool_calls {
                     let text = assistant_text_content(&assistant_arc.content);
                     if let Some(action) = turn_recovery.evaluate(assistant_arc.stop_reason, &text) {
-                        pending_messages = vec![Message::User(UserMessage {
-                            content: UserContent::Text(action.nudge_text),
-                            timestamp: Utc::now().timestamp_millis(),
-                        })];
+                        pending_messages =
+                            vec![QueuedAgentMessage::generated(Message::User(UserMessage {
+                                content: UserContent::Text(action.nudge_text),
+                                timestamp: Utc::now().timestamp_millis(),
+                            }))];
                     }
                 }
             }
@@ -2704,7 +2827,7 @@ impl Agent {
         Ok(Arc::unwrap_or_clone(final_arc))
     }
 
-    async fn fetch_messages(&self, fetcher: Option<&MessageFetcher>) -> Vec<Message> {
+    async fn fetch_messages(&self, fetcher: Option<&MessageFetcher>) -> Vec<QueuedAgentMessage> {
         if let Some(fetcher) = fetcher {
             (fetcher)().await
         } else {
@@ -2826,7 +2949,7 @@ impl Agent {
         }
     }
 
-    async fn drain_steering_messages(&mut self) -> Vec<Message> {
+    async fn drain_steering_messages(&mut self) -> Vec<QueuedAgentMessage> {
         for fetcher in &self.steering_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
@@ -2836,7 +2959,7 @@ impl Agent {
         self.message_queue.pop_steering()
     }
 
-    async fn drain_follow_up_messages(&mut self) -> Vec<Message> {
+    async fn drain_follow_up_messages(&mut self) -> Vec<QueuedAgentMessage> {
         for fetcher in &self.follow_up_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
@@ -3679,7 +3802,7 @@ impl Agent {
         latency: SharedTurnLatencyAccumulator,
     ) -> Result<ToolExecutionOutcome> {
         let mut results = Vec::new();
-        let mut steering_messages: Option<Vec<Message>> = None;
+        let mut steering_messages: Option<Vec<QueuedAgentMessage>> = None;
 
         // Phase 1: Emit start events for ALL tools up front.
         for tool_call in tool_calls {
@@ -4561,7 +4684,7 @@ impl Agent {
 
 struct ToolExecutionOutcome {
     tool_results: Vec<Arc<ToolResultMessage>>,
-    steering_messages: Option<Vec<Message>>,
+    steering_messages: Option<Vec<QueuedAgentMessage>>,
 }
 
 /// Pre-created extension runtime state for overlapping startup I/O.
@@ -5426,16 +5549,40 @@ mod message_queue_tests {
         })
     }
 
+    fn queued_user_message(text: &str) -> QueuedAgentMessage {
+        QueuedAgentMessage::from_authored_message(user_message(text))
+    }
+
+    #[test]
+    fn direct_authored_block_message_preserves_all_text_for_scanning() {
+        let queued = QueuedAgentMessage::from_authored_message(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![
+                ContentBlock::Text(TextContent::new("please orchestrate")),
+                ContentBlock::Image(crate::model::ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Text(TextContent::new("then workflowz")),
+            ]),
+            timestamp: 0,
+        }));
+
+        assert_eq!(
+            queued.keyword_scan_source(),
+            Some("please orchestrate\nthen workflowz")
+        );
+    }
+
     #[test]
     fn message_queue_one_at_a_time() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        queue.push_steering(user_message("a"));
-        queue.push_steering(user_message("b"));
+        queue.push_steering(queued_user_message("a"));
+        queue.push_steering(queued_user_message("b"));
 
         let first = queue.pop_steering();
         assert_eq!(first.len(), 1);
         assert!(matches!(
-            first.first(),
+            first.first().map(QueuedAgentMessage::message),
             Some(Message::User(UserMessage { content, .. }))
                 if matches!(content, UserContent::Text(text) if text == "a")
         ));
@@ -5443,7 +5590,7 @@ mod message_queue_tests {
         let second = queue.pop_steering();
         assert_eq!(second.len(), 1);
         assert!(matches!(
-            second.first(),
+            second.first().map(QueuedAgentMessage::message),
             Some(Message::User(UserMessage { content, .. }))
                 if matches!(content, UserContent::Text(text) if text == "b")
         ));
@@ -5454,8 +5601,8 @@ mod message_queue_tests {
     #[test]
     fn message_queue_all_mode() {
         let mut queue = MessageQueue::new(QueueMode::All, QueueMode::OneAtATime);
-        queue.push_steering(user_message("a"));
-        queue.push_steering(user_message("b"));
+        queue.push_steering(queued_user_message("a"));
+        queue.push_steering(queued_user_message("b"));
 
         let drained = queue.pop_steering();
         assert_eq!(drained.len(), 2);
@@ -5465,8 +5612,8 @@ mod message_queue_tests {
     #[test]
     fn message_queue_separates_kinds() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        queue.push_steering(user_message("steer"));
-        queue.push_follow_up(user_message("follow"));
+        queue.push_steering(queued_user_message("steer"));
+        queue.push_follow_up(queued_user_message("follow"));
 
         let steering = queue.pop_steering();
         assert_eq!(steering.len(), 1);
@@ -5480,8 +5627,8 @@ mod message_queue_tests {
     #[test]
     fn message_queue_seq_increments() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        let first = queue.push_steering(user_message("a"));
-        let second = queue.push_follow_up(user_message("b"));
+        let first = queue.push_steering(queued_user_message("a"));
+        let second = queue.push_follow_up(queued_user_message("b"));
         assert!(second > first);
     }
 
@@ -5490,8 +5637,8 @@ mod message_queue_tests {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
         queue.next_seq = u64::MAX;
 
-        let first = queue.push_steering(user_message("a"));
-        let second = queue.push_follow_up(user_message("b"));
+        let first = queue.push_steering(queued_user_message("a"));
+        let second = queue.push_follow_up(queued_user_message("b"));
 
         assert_eq!(first, u64::MAX);
         assert_eq!(second, u64::MAX);
@@ -5501,18 +5648,18 @@ mod message_queue_tests {
     #[test]
     fn message_queue_follow_up_all_mode_drains_entire_queue_in_order() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::All);
-        queue.push_follow_up(user_message("f1"));
-        queue.push_follow_up(user_message("f2"));
+        queue.push_follow_up(queued_user_message("f1"));
+        queue.push_follow_up(queued_user_message("f2"));
 
         let follow_up = queue.pop_follow_up();
         assert_eq!(follow_up.len(), 2);
         assert!(matches!(
-            follow_up.first(),
+            follow_up.first().map(QueuedAgentMessage::message),
             Some(Message::User(UserMessage { content, .. }))
                 if matches!(content, UserContent::Text(text) if text == "f1")
         ));
         assert!(matches!(
-            follow_up.get(1),
+            follow_up.get(1).map(QueuedAgentMessage::message),
             Some(Message::User(UserMessage { content, .. }))
                 if matches!(content, UserContent::Text(text) if text == "f2")
         ));
@@ -6100,7 +6247,8 @@ mod extensions_integration_tests {
         agent.activate_scoped_rules_for_tool_calls(&[tool_call("src/main.ts")]);
         let delivered = agent.message_queue.pop_steering();
         assert_eq!(delivered.len(), 1, "matching path activates the rule once");
-        let Message::User(user) = &delivered[0] else {
+        assert_eq!(delivered[0].keyword_scan_source(), None);
+        let Message::User(user) = delivered[0].message() else {
             panic!("rule must arrive as a user steering message");
         };
         let UserContent::Text(text) = &user.content else {
@@ -11448,22 +11596,30 @@ impl AgentSession {
         {
             let steering_queue = Arc::clone(&injected);
             let follow_up_queue = Arc::clone(&injected);
-            let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+            let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
                 let steering_queue = Arc::clone(&steering_queue);
                 Box::pin(async move {
                     let Ok(mut queue) = steering_queue.lock() else {
                         return Vec::new();
                     };
-                    queue.pop_steering()
+                    queue
+                        .pop_steering()
+                        .into_iter()
+                        .map(QueuedAgentMessage::generated)
+                        .collect()
                 })
             };
-            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
                 let follow_up_queue = Arc::clone(&follow_up_queue);
                 Box::pin(async move {
                     let Ok(mut queue) = follow_up_queue.lock() else {
                         return Vec::new();
                     };
-                    queue.pop_follow_up()
+                    queue
+                        .pop_follow_up()
+                        .into_iter()
+                        .map(QueuedAgentMessage::generated)
+                        .collect()
                 })
             };
             self.agent.register_message_fetchers(
@@ -11618,7 +11774,7 @@ impl AgentSession {
                         )),
                         timestamp: chrono::Utc::now().timestamp_millis(),
                     });
-                    self.agent.queue_steering(msg);
+                    self.agent.queue_generated_steering(msg);
                 }
                 return;
             }
@@ -11629,7 +11785,7 @@ impl AgentSession {
             content: crate::model::UserContent::Text(injection.clone()),
             timestamp: chrono::Utc::now().timestamp_millis(),
         });
-        self.agent.queue_steering(message);
+        self.agent.queue_generated_steering(message);
         // Session audit entry (replayable advisor trail).
         let cx = pi::agent_cx::AgentCx::for_request();
         if let Ok(mut inner) = self.session.lock(cx.cx()).await {
@@ -12134,6 +12290,11 @@ impl AgentSession {
                     }
                     PendingIdleAction::UserText(text) => {
                         let handler = Arc::clone(&on_event);
+                        // Extension-authored user-shaped text is generated
+                        // input. An explicit empty override suppresses the
+                        // normal fallback scan of its provider-visible text.
+                        self.agent
+                            .set_magic_keyword_scan_override(Some(String::new()));
                         self.run_text_with_abort(text, abort.clone(), move |event| {
                             handler(event);
                         })
@@ -13102,6 +13263,10 @@ mod tests {
         })
     }
 
+    fn queued_user_message(text: &str) -> QueuedAgentMessage {
+        QueuedAgentMessage::from_authored_message(user_message(text))
+    }
+
     fn assert_user_text(message: &Message, expected: &str) {
         assert!(
             matches!(
@@ -13799,6 +13964,156 @@ mod tests {
             assert_eq!(activations.len(), 2);
             assert_eq!(activations[0].word, "ultrathink");
             assert_eq!(activations[1].word, "orchestrate");
+        });
+    }
+
+    #[test]
+    fn fetched_message_scans_only_explicit_authored_source() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+
+            let expanded = "generated ultrathink and workflowz bytes".to_string();
+            let queued = Arc::new(StdTestMutex::new(Some(QueuedAgentMessage::authored(
+                user_message(&expanded),
+                "please orchestrate this queued turn",
+            ))));
+            let fetch_queue = Arc::clone(&queued);
+            let fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let fetch_queue = Arc::clone(&fetch_queue);
+                    Box::pin(async move {
+                        fetch_queue
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .into_iter()
+                            .collect()
+                    })
+                };
+            agent.register_message_fetchers(Some(Arc::new(fetcher)), None);
+
+            agent
+                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
+                .await
+                .expect("source-aware queued message completes");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].thinking_level,
+                Some(crate::model::ThinkingLevel::Low),
+                "generated ultrathink must not raise effort"
+            );
+            let system_prompt = calls[0].system_prompt.as_deref().expect("directive");
+            assert!(system_prompt.contains("invoked `orchestrate`"));
+            assert!(!system_prompt.contains("invoked `workflowz`"));
+            assert!(calls[0].messages.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text == &expanded
+                )
+            }));
+            drop(calls);
+
+            let activations = agent.drain_keyword_ledger();
+            assert_eq!(activations.len(), 1);
+            assert_eq!(activations[0].word, "orchestrate");
+        });
+    }
+
+    #[test]
+    fn fetched_generated_message_reaches_provider_without_keyword_effects() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+
+            let generated_text = "generated ultrathink orchestrate workflowz bytes".to_string();
+            let queued = Arc::new(StdTestMutex::new(Some(QueuedAgentMessage::generated(
+                user_message(&generated_text),
+            ))));
+            let fetch_queue = Arc::clone(&queued);
+            let fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let fetch_queue = Arc::clone(&fetch_queue);
+                    Box::pin(async move {
+                        fetch_queue
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .into_iter()
+                            .collect()
+                    })
+                };
+            agent.register_message_fetchers(Some(Arc::new(fetcher)), None);
+
+            agent
+                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
+                .await
+                .expect("generated queued message completes");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].thinking_level,
+                Some(crate::model::ThinkingLevel::Low)
+            );
+            assert!(calls[0].system_prompt.as_deref().is_none_or(|prompt| {
+                !prompt.contains("invoked `orchestrate`") && !prompt.contains("invoked `workflowz`")
+            }));
+            assert!(calls[0].messages.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage {
+                        content: UserContent::Text(text),
+                        ..
+                    }) if text == &generated_text
+                )
+            }));
+            drop(calls);
+
+            assert!(agent.drain_keyword_ledger().is_empty());
         });
     }
 
@@ -14517,9 +14832,9 @@ mod tests {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
         assert_eq!(queue.pending_count(), 0);
 
-        assert_eq!(queue.push_steering(user_message("s1")), 0);
-        assert_eq!(queue.push_follow_up(user_message("f1")), 1);
-        assert_eq!(queue.push_steering(user_message("s2")), 2);
+        assert_eq!(queue.push_steering(queued_user_message("s1")), 0);
+        assert_eq!(queue.push_follow_up(queued_user_message("f1")), 1);
+        assert_eq!(queue.push_steering(queued_user_message("s2")), 2);
 
         assert_eq!(queue.pending_count(), 3);
     }
@@ -14527,17 +14842,17 @@ mod tests {
     #[test]
     fn message_queue_pop_steering_one_at_a_time_preserves_order() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        queue.push_steering(user_message("s1"));
-        queue.push_steering(user_message("s2"));
+        queue.push_steering(queued_user_message("s1"));
+        queue.push_steering(queued_user_message("s2"));
 
         let first = queue.pop_steering();
         assert_eq!(first.len(), 1);
-        assert_user_text(&first[0], "s1");
+        assert_user_text(first[0].message(), "s1");
         assert_eq!(queue.pending_count(), 1);
 
         let second = queue.pop_steering();
         assert_eq!(second.len(), 1);
-        assert_user_text(&second[0], "s2");
+        assert_user_text(second[0].message(), "s2");
         assert_eq!(queue.pending_count(), 0);
 
         let empty = queue.pop_steering();
@@ -14547,42 +14862,42 @@ mod tests {
     #[test]
     fn message_queue_pop_respects_queue_modes_per_kind() {
         let mut queue = MessageQueue::new(QueueMode::All, QueueMode::OneAtATime);
-        queue.push_steering(user_message("s1"));
-        queue.push_steering(user_message("s2"));
-        queue.push_follow_up(user_message("f1"));
-        queue.push_follow_up(user_message("f2"));
+        queue.push_steering(queued_user_message("s1"));
+        queue.push_steering(queued_user_message("s2"));
+        queue.push_follow_up(queued_user_message("f1"));
+        queue.push_follow_up(queued_user_message("f2"));
 
         let steering = queue.pop_steering();
         assert_eq!(steering.len(), 2);
-        assert_user_text(&steering[0], "s1");
-        assert_user_text(&steering[1], "s2");
+        assert_user_text(steering[0].message(), "s1");
+        assert_user_text(steering[1].message(), "s2");
         assert_eq!(queue.pending_count(), 2);
 
         let follow_up = queue.pop_follow_up();
         assert_eq!(follow_up.len(), 1);
-        assert_user_text(&follow_up[0], "f1");
+        assert_user_text(follow_up[0].message(), "f1");
         assert_eq!(queue.pending_count(), 1);
 
         let follow_up = queue.pop_follow_up();
         assert_eq!(follow_up.len(), 1);
-        assert_user_text(&follow_up[0], "f2");
+        assert_user_text(follow_up[0].message(), "f2");
         assert_eq!(queue.pending_count(), 0);
     }
 
     #[test]
     fn message_queue_set_modes_applies_to_existing_messages() {
         let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
-        queue.push_steering(user_message("s1"));
-        queue.push_steering(user_message("s2"));
+        queue.push_steering(queued_user_message("s1"));
+        queue.push_steering(queued_user_message("s2"));
 
         let first = queue.pop_steering();
         assert_eq!(first.len(), 1);
-        assert_user_text(&first[0], "s1");
+        assert_user_text(first[0].message(), "s1");
 
         queue.set_modes(QueueMode::All, QueueMode::OneAtATime);
         let remaining = queue.pop_steering();
         assert_eq!(remaining.len(), 1);
-        assert_user_text(&remaining[0], "s2");
+        assert_user_text(remaining[0].message(), "s2");
     }
 
     fn build_switch_test_session(auth: &AuthStorage) -> AgentSession {

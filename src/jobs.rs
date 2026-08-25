@@ -595,8 +595,12 @@ pub fn push_completion_notice(text: impl Into<String>) {
 #[must_use]
 pub fn follow_up_fetcher() -> crate::agent::MessageFetcher {
     std::sync::Arc::new(|| {
-        Box::pin(async move { take_completion_notices() })
-            as futures::future::BoxFuture<'static, Vec<Message>>
+        Box::pin(async move {
+            take_completion_notices()
+                .into_iter()
+                .map(crate::agent::QueuedAgentMessage::generated)
+                .collect()
+        }) as futures::future::BoxFuture<'static, Vec<crate::agent::QueuedAgentMessage>>
     })
 }
 

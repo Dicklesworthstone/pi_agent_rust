@@ -3268,6 +3268,8 @@ pub fn run(
     available_models: Vec<String>,
     available_sessions: Vec<(String, String)>,
 ) -> std::io::Result<()> {
+    const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
+
     let (submit_tx, submit_rx) = std::sync::mpsc::channel::<UiCommand>();
     let (agent_tx, agent_rx) = std::sync::mpsc::channel::<PiMsg>();
     let (ask_reply_tx, ask_reply_rx) = std::sync::mpsc::channel::<AskUiReply>();
@@ -3275,7 +3277,6 @@ pub fn run(
     let bash_cwd = driver_bash_cwd(&session_options);
     let resume_template = resume_template_from(&session_options);
 
-    const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
         .stack_size(DRIVER_STACK_BYTES)
