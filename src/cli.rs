@@ -95,6 +95,10 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         // non-ftui builds clap still rejects them with a proper error instead
         // of the pre-parser silently diverting them to extension flags.
         | "ftui"
+        | "classic"
+        | "classic-tui"
+        | "charmed"
+        | "bubbletea"
         | "inline"
         | "hide-cwd-in-prompt" => (false, false),
         "provider"
@@ -420,17 +424,19 @@ pub struct Cli {
     #[arg(long)]
     pub no_session: bool,
 
-    /// Launch the experimental FrankenTUI interactive stack (bd-cv653.9.1
-    /// migration preview). Only present when pi is built with the `ftui`
-    /// feature.
+    /// Launch the FrankenTUI interactive stack (default when built with `ftui`).
     #[cfg(feature = "ftui")]
     #[arg(long)]
     pub ftui: bool,
 
-    /// With --ftui: run inline (UI at the bottom, shell scrollback
+    /// Force the classic charmed_rust TUI stack instead of the default ftui stack.
+    #[arg(long, aliases = ["classic-tui", "charmed", "bubbletea"])]
+    pub classic: bool,
+
+    /// With ftui: run inline (UI at the bottom, shell scrollback
     /// preserved) instead of the alternate screen.
     #[cfg(feature = "ftui")]
-    #[arg(long, requires = "ftui")]
+    #[arg(long)]
     pub inline: bool,
 
     /// Session durability mode: strict, balanced, or throughput

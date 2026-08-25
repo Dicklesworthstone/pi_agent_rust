@@ -186,9 +186,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
                 (None, b']') if !processing_instruction => {
                     declaration_brackets = declaration_brackets.saturating_sub(1);
                 }
-                (None, b'?')
-                    if processing_instruction && bytes.get(index + 1) == Some(&b'>') =>
-                {
+                (None, b'?') if processing_instruction && bytes.get(index + 1) == Some(&b'>') => {
                     return Some((index + 2, HtmlMarkup::Opaque));
                 }
                 (None, b'>') if !processing_instruction && declaration_brackets == 0 => {
@@ -206,14 +204,17 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         index += 1;
     }
     let name_start = index;
-    if !bytes.get(index).copied().is_some_and(is_ascii_markup_name_start) {
+    if !bytes
+        .get(index)
+        .copied()
+        .is_some_and(is_ascii_markup_name_start)
+    {
         return None;
     }
     index += 1;
-    while bytes
-        .get(index)
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'_'))
-    {
+    while bytes.get(index).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
+    }) {
         index += 1;
     }
     match bytes.get(index) {
@@ -274,7 +275,33 @@ fn char_len_at(message: &str, index: usize) -> usize {
     message
         .get(index..)
         .and_then(|tail| tail.chars().next())
-        .map_or_else(|| message.len().saturating_sub(index).max(1), char::len_utf8)
+        .map_or_else(
+            || message.len().saturating_sub(index).max(1),
+            char::len_utf8,
+        )
+}
+
+fn boundary_enters_path_context(token: &str, boundary: char, next: Option<char>) -> bool {
+    match boundary {
+        // URI schemes (including mailto:) and Windows drive prefixes must
+        // suppress the remainder of the same whitespace-delimited lexeme.
+        // A colon followed by whitespace/end is ordinary prose punctuation.
+        ':' => {
+            next.is_some_and(|next| !next.is_whitespace()) && {
+                let mut chars = token.chars();
+                chars
+                    .next()
+                    .is_some_and(|first| first.is_ascii_alphabetic())
+                    && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+            }
+        }
+        // Query/path parameters consume the remainder of their compact
+        // lexeme, including relative references such as `?mode=x` and
+        // `search?mode=x`. The caller flushes the token before suppressing so
+        // ordinary trailing punctuation (`ultrathink?`) still activates.
+        '?' | ';' => true,
+        _ => false,
+    }
 }
 
 /// Detect enabled keywords in a user message. Returns each action at most
@@ -290,6 +317,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
     let mut line_start = true;
     let mut leading_spaces = 0usize;
     let mut line_indented_code = false;
+    let mut suppress_path_lexeme = false;
     let mut index = 0usize;
     let bytes = message.as_bytes();
 
@@ -337,6 +365,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             line_start = true;
             leading_spaces = 0;
             line_indented_code = false;
+            suppress_path_lexeme = false;
             index += 1;
             continue;
         }
@@ -444,30 +473,61 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
+        if ch.is_whitespace() {
+            flush_token(&mut token, &mut activations, &mut seen);
+            suppress_path_lexeme = false;
+            continue;
+        }
+        if suppress_path_lexeme {
+            continue;
+        }
+        let next = message.get(index..).and_then(|tail| tail.chars().next());
+        if boundary_enters_path_context(&token, ch, next) {
+            if matches!(ch, '?' | ';') {
+                flush_token(&mut token, &mut activations, &mut seen);
+            }
+            token.clear();
+            suppress_path_lexeme = true;
+            continue;
+        }
+
         let dot_continues_path = ch == '.'
             && message
                 .get(index..)
                 .and_then(|tail| tail.chars().next())
                 .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '-'));
-        let is_boundary = ch.is_whitespace()
-            || (!dot_continues_path
-                && matches!(
-                    ch,
-                    ',' | '.'
-                        | '!'
-                        | '?'
-                        | ':'
-                        | ';'
-                        | '('
-                        | ')'
-                        | '"'
-                        | '\''
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | '*'
-                ));
+        let is_boundary = !dot_continues_path
+            && matches!(
+                ch,
+                ',' | '.'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | ';'
+                    | '('
+                    | ')'
+                    | '"'
+                    | '\''
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '*'
+                    | '。'
+                    | '！'
+                    | '？'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+            );
         if is_boundary {
             flush_token(&mut token, &mut activations, &mut seen);
             continue;
@@ -624,6 +684,10 @@ mod tests {
             "XML names may begin with an underscore"
         );
         assert!(
+            words("<foo.bar>ultrathink</foo.bar>").is_empty(),
+            "XML names may contain dots"
+        );
+        assert!(
             words("<:guard>ultrathink</:guard>").is_empty(),
             "XML names may begin with a namespace separator"
         );
@@ -648,6 +712,31 @@ mod tests {
         assert!(words("/tmp/ultrathink").is_empty());
         assert!(words("see https://example.com/ultrathink docs").is_empty());
         assert!(
+            words("see https://example.test/?ultrathink docs").is_empty(),
+            "URL query values are part of the URL lexeme, not prose"
+        );
+        assert_eq!(
+            words("https://example.test/?ultrathink then orchestrate"),
+            ["orchestrate"],
+            "path suppression must end at whitespace"
+        );
+        assert!(
+            words("inspect /tmp/file?orchestrate next").is_empty(),
+            "path query values are part of the path lexeme, not prose"
+        );
+        assert!(
+            words("see [docs](?ultrathink) next").is_empty(),
+            "relative query targets are not prose"
+        );
+        assert!(
+            words("open search?orchestrate next").is_empty(),
+            "relative query values stay inside their compact lexeme"
+        );
+        assert!(
+            words("open mailto:ultrathink@example.test").is_empty(),
+            "URI scheme payloads are not prose"
+        );
+        assert!(
             words("edit ultrathink.rs next").is_empty(),
             "a bare filename is still a path, even without a slash"
         );
@@ -658,6 +747,9 @@ mod tests {
         assert_eq!(words("ultrathink,"), ["ultrathink"]);
         assert_eq!(words("(ultrathink)"), ["ultrathink"]);
         assert_eq!(words("ok. ultrathink."), ["ultrathink"]);
+        assert_eq!(words("mode: ultrathink?"), ["ultrathink"]);
+        assert_eq!(words("ultrathink: please"), ["ultrathink"]);
+        assert_eq!(words("ultrathink。"), ["ultrathink"]);
     }
 
     #[test]

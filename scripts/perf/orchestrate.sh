@@ -4251,65 +4251,22 @@ POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
 mkdir -p "$POST_GENERATION_BUDGET_DIR"
 post_generation_budget_exit=0
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
-  post_generation_budget_binary=""
-  post_generation_budget_binary="$(
-    python3 - \
-      "$PERF_BUDGET_BINARY_ATTESTATION_PATH" \
-      "$GIT_COMMIT_FULL" \
-      "$GIT_DIRTY" <<'PY'
-import hashlib
-import json
-import sys
-from pathlib import Path
-
-attestation_path = Path(sys.argv[1])
-expected_commit = sys.argv[2]
-expected_dirty = sys.argv[3] == "true"
-try:
-    payload = json.loads(attestation_path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as error:
-    raise SystemExit(f"invalid perf_budgets binary attestation: {error}")
-if payload.get("schema") != "pi.perf.test_binary_attestation.v1":
-    raise SystemExit("perf_budgets binary attestation schema mismatch")
-if payload.get("source_commit") != expected_commit:
-    raise SystemExit("perf_budgets binary attestation commit mismatch")
-if payload.get("source_dirty") is not expected_dirty:
-    raise SystemExit("perf_budgets binary attestation dirty-state mismatch")
-if payload.get("target_name") != "perf_budgets":
-    raise SystemExit("perf_budgets binary attestation target mismatch")
-binary_path = Path(str(payload.get("binary_path", "")))
-if not binary_path.is_file() or not binary_path.stat().st_mode & 0o111:
-    raise SystemExit("attested perf_budgets test binary is missing or not executable")
-observed_sha256 = hashlib.sha256(binary_path.read_bytes()).hexdigest()
-if observed_sha256 != payload.get("sha256"):
-    raise SystemExit("attested perf_budgets test binary checksum mismatch")
-print(binary_path)
-PY
-  )" || post_generation_budget_binary=""
-  if [[ -z "$post_generation_budget_binary" ]]; then
-    post_generation_budget_exit=127
-    echo "No valid current-build perf_budgets test binary attestation found" \
-      > "$POST_GENERATION_BUDGET_DIR/stderr.log"
-  else
-    PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
-    PI_PERF_POST_GENERATION=1 \
-    CI_CORRELATION_ID="$CORRELATION_ID" \
-    "$post_generation_budget_binary" \
-      ci_enforced_budgets_fail_on_regression_or_missing_data --exact --nocapture \
-      > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
-      2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
-      || post_generation_budget_exit=$?
-  fi
-else
-  PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
-  PI_PERF_POST_GENERATION=1 \
-  CI_CORRELATION_ID="$CORRELATION_ID" \
-  "${CARGO_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \
-    ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact --nocapture \
-    > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
-    2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
-    || post_generation_budget_exit=$?
+  for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION; do
+    case ",${RCH_ENV_ALLOWLIST:-}," in
+      *",$required_env,"*) ;;
+      *) RCH_ENV_ALLOWLIST="${RCH_ENV_ALLOWLIST:+$RCH_ENV_ALLOWLIST,}$required_env" ;;
+    esac
+  done
+  export RCH_ENV_ALLOWLIST
 fi
+PERF_EVIDENCE_DIR="$OUTPUT_DIR/results" \
+PI_PERF_POST_GENERATION=1 \
+CI_CORRELATION_ID="$CORRELATION_ID" \
+"${CARGO_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \
+  ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact --nocapture \
+  > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
+  2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
+  || post_generation_budget_exit=$?
 
 post_generation_budget_status="pass"
 if [[ "$post_generation_budget_exit" -eq 0 ]]; then

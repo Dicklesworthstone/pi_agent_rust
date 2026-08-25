@@ -912,6 +912,7 @@ pub async fn run(
                                 retry_abort,
                                 options,
                                 expanded,
+                                Some(message),
                                 images,
                                 prompt_cx,
                             )
@@ -986,6 +987,7 @@ pub async fn run(
                         retry_abort,
                         options,
                         expanded,
+                        Some(message),
                         Vec::new(),
                         prompt_cx,
                     )
@@ -1058,6 +1060,7 @@ pub async fn run(
                         retry_abort,
                         options,
                         expanded,
+                        Some(message),
                         Vec::new(),
                         prompt_cx,
                     )
@@ -2173,6 +2176,7 @@ pub async fn run(
                             retry_abort,
                             options,
                             text,
+                            Some(String::new()),
                             Vec::new(),
                             prompt_cx,
                         )
@@ -2681,6 +2685,7 @@ async fn run_prompt_with_retry(
     retry_abort: Arc<AtomicBool>,
     options: RpcOptions,
     message: String,
+    keyword_scan_source: Option<String>,
     images: Vec<ImageContent>,
     cx: AgentCx,
 ) {
@@ -2753,6 +2758,9 @@ async fn run_prompt_with_retry(
             } else {
                 // First attempt: add the user message and run the turn.
                 first_attempt_done = true;
+                guard
+                    .agent
+                    .set_magic_keyword_scan_override(keyword_scan_source.clone());
                 if images.is_empty() {
                     guard
                         .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
@@ -4113,6 +4121,7 @@ mod retry_tests {
                 retry_abort,
                 options,
                 "hello".to_string(),
+                None,
                 Vec::new(),
                 AgentCx::for_request(),
             )
@@ -4230,6 +4239,7 @@ mod retry_tests {
                 retry_abort,
                 options,
                 "hello".to_string(),
+                None,
                 Vec::new(),
                 AgentCx::for_request(),
             )
@@ -4355,6 +4365,7 @@ mod retry_tests {
                 retry_abort,
                 options,
                 "hello".to_string(),
+                None,
                 Vec::new(),
                 AgentCx::from_cx(retry_cx),
             )
@@ -5913,7 +5924,7 @@ fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {
         };
         images.push(ImageContent {
             data: data.to_string(),
-            mime_type: media_type.to_string(),
+            mime_type: crate::model::sanitize_image_mime_type(media_type),
         });
     }
     Ok(images)
@@ -8640,6 +8651,22 @@ export default function init(pi) {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/png");
         assert_eq!(images[0].data, "iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn parse_prompt_images_sanitizes_mime_type_at_ingress() {
+        let val = json!([{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "mediaType": " image/jpeg\u{001b}]2;owned\u{0007}",
+                "data": "abc"
+            }
+        }]);
+        let images = parse_prompt_images(Some(&val)).unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/jpeg");
+        assert!(!images[0].mime_type.chars().any(char::is_control));
     }
 
     #[test]

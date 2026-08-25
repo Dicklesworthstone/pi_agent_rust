@@ -11,18 +11,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Network interface binding mode for web-remote server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BindMode {
+    #[default]
     Loopback,
     Tailscale,
     Lan,
-}
-
-impl Default for BindMode {
-    fn default() -> Self {
-        Self::Loopback
-    }
 }
 
 impl std::str::FromStr for BindMode {
@@ -171,6 +166,7 @@ impl WebAuditEvent {
         }
     }
 
+    #[must_use]
     pub fn with_detail(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.details.insert(key.into(), value.into());
         self
@@ -188,6 +184,7 @@ pub struct WebRemoteManager {
     tokens: Arc<Mutex<HashMap<String, AuthTokenRecord>>>,
 }
 
+#[allow(clippy::significant_drop_tightening)]
 impl WebRemoteManager {
     pub fn new(settings: WebRemoteSettings) -> Self {
         Self {
@@ -214,11 +211,13 @@ impl WebRemoteManager {
             revoked: false,
         };
 
-        let mut map = self
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(tok_str.clone(), record.clone());
+        {
+            let mut map = self
+                .tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.insert(tok_str, record.clone());
+        }
 
         self.record_audit(
             WebAuditEvent::new("token_issued", None)
@@ -231,20 +230,25 @@ impl WebRemoteManager {
 
     /// Revoke an existing token.
     pub fn revoke_token(&self, token: &str) -> bool {
-        let mut map = self
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(record) = map.get_mut(token) {
-            record.revoked = true;
+        let kind = {
+            let mut map = self
+                .tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(record) = map.get_mut(token) {
+                record.revoked = true;
+                Some(record.kind)
+            } else {
+                None
+            }
+        };
+        kind.is_some_and(|token_kind| {
             self.record_audit(
                 WebAuditEvent::new("token_revoked", None)
-                    .with_detail("token_kind", format!("{:?}", record.kind)),
+                    .with_detail("token_kind", format!("{token_kind:?}")),
             );
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// Validate and consume a token upon connection.
@@ -254,31 +258,35 @@ impl WebRemoteManager {
         }
 
         let now = current_time_ms();
-        let mut map = self
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let record = map
-            .get_mut(token)
-            .ok_or_else(|| "token not found".to_string())?;
+        let record_kind = {
+            let mut map = self
+                .tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let record = map
+                .get_mut(token)
+                .ok_or_else(|| "token not found".to_string())?;
 
-        if record.revoked {
-            return Err("token has been revoked".to_string());
-        }
-        if record.consumed {
-            return Err("token has already been consumed (single-use)".to_string());
-        }
-        if now > record.expires_at_ms {
-            return Err("token has expired".to_string());
-        }
+            if record.revoked {
+                return Err("token has been revoked".to_string());
+            }
+            if record.consumed {
+                return Err("token has already been consumed (single-use)".to_string());
+            }
+            if now > record.expires_at_ms {
+                return Err("token has expired".to_string());
+            }
 
-        record.consumed = true;
+            record.consumed = true;
+            record.kind
+        };
+
         self.record_audit(
             WebAuditEvent::new("token_consumed", None)
-                .with_detail("token_kind", format!("{:?}", record.kind)),
+                .with_detail("token_kind", format!("{record_kind:?}")),
         );
 
-        Ok(record.kind)
+        Ok(record_kind)
     }
 
     /// Connect a new client viewer.
@@ -289,25 +297,13 @@ impl WebRemoteManager {
         token: Option<&str>,
     ) -> Result<ClientSession, String> {
         let token_kind = if self.settings.require_auth_token {
-            let tok = match token {
-                Some(t) => t,
-                None => return Err("missing authentication token".to_string()),
+            let Some(tok) = token else {
+                return Err("missing authentication token".to_string());
             };
             self.validate_and_consume_token(tok)?
         } else {
             TokenKind::Steer
         };
-
-        let mut clients = self
-            .clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if clients.len() >= self.settings.max_viewers {
-            return Err(format!(
-                "maximum viewer capacity ({}) reached",
-                self.settings.max_viewers
-            ));
-        }
 
         let is_view_only = self.settings.view_only || token_kind == TokenKind::View;
         let session = ClientSession {
@@ -319,7 +315,20 @@ impl WebRemoteManager {
             remote_addr: remote_addr.to_string(),
         };
 
-        clients.insert(client_id.to_string(), session.clone());
+        {
+            let mut clients = self
+                .clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if clients.len() >= self.settings.max_viewers {
+                return Err(format!(
+                    "maximum viewer capacity ({}) reached",
+                    self.settings.max_viewers
+                ));
+            }
+            clients.insert(client_id.to_string(), session.clone());
+        }
+
         self.record_audit(
             WebAuditEvent::new("client_connected", Some(client_id.to_string()))
                 .with_detail("remote_addr", remote_addr)
@@ -331,18 +340,19 @@ impl WebRemoteManager {
 
     /// Disconnect a client viewer.
     pub fn disconnect_client(&self, client_id: &str) {
-        let mut clients = self
-            .clients
+        self.clients
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        clients.remove(client_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(client_id);
 
-        let mut controller = self
-            .active_controller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if controller.as_deref() == Some(client_id) {
-            *controller = None;
+        {
+            let mut controller = self
+                .active_controller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if controller.as_deref() == Some(client_id) {
+                *controller = None;
+            }
         }
 
         self.record_audit(WebAuditEvent::new(
@@ -353,24 +363,35 @@ impl WebRemoteManager {
 
     /// Request steering control by a remote client.
     pub fn request_takeover(&self, client_id: &str) -> Result<ControlMode, String> {
-        let clients = self
-            .clients
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let client = clients
-            .get(client_id)
-            .ok_or_else(|| "unregistered client id".to_string())?;
+        let is_view_only = {
+            let clients = self
+                .clients
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let client = clients
+                .get(client_id)
+                .ok_or_else(|| "unregistered client id".to_string())?;
+            client.is_view_only
+        };
 
-        if client.is_view_only || self.settings.view_only {
+        if is_view_only || self.settings.view_only {
             return Err("client is in view-only mode".to_string());
         }
 
-        let mut controller = self
-            .active_controller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if controller.is_none() {
-            *controller = Some(client_id.to_string());
+        let is_none = {
+            let mut controller = self
+                .active_controller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if controller.is_none() {
+                *controller = Some(client_id.to_string());
+                true
+            } else {
+                false
+            }
+        };
+
+        if is_none {
             self.record_audit(
                 WebAuditEvent::new("takeover_granted", Some(client_id.to_string()))
                     .with_detail("previous_controller", "none"),
@@ -387,12 +408,19 @@ impl WebRemoteManager {
 
     /// Release steering control back to local terminal.
     pub fn release_control(&self, client_id: &str) {
-        let mut controller = self
-            .active_controller
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if controller.as_deref() == Some(client_id) {
-            *controller = None;
+        let was_controller = {
+            let mut controller = self
+                .active_controller
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if controller.as_deref() == Some(client_id) {
+                *controller = None;
+                true
+            } else {
+                false
+            }
+        };
+        if was_controller {
             self.record_audit(WebAuditEvent::new(
                 "control_released_to_local",
                 Some(client_id.to_string()),
@@ -408,12 +436,14 @@ impl WebRemoteManager {
         height: u16,
         data: impl Into<String>,
     ) -> WebFrame {
-        let mut seq_guard = self
-            .frame_seq
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *seq_guard += 1;
-        let seq = *seq_guard;
+        let seq = {
+            let mut seq_guard = self
+                .frame_seq
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *seq_guard += 1;
+            *seq_guard
+        };
 
         WebFrame {
             schema: "pi.web.frame.v1".to_string(),
@@ -446,6 +476,7 @@ impl WebRemoteManager {
 
 /// Render a text/URL string into half-block terminal QR presentation (`▀`, `▄`, `█`, ` `).
 pub fn render_half_block_qr(data: &str) -> String {
+    use std::fmt::Write as _;
     let mut out = String::new();
     out.push_str("┌───────────────────────────┐\n");
     out.push_str("│ █▀▀▀▀▀█ ▄▄█▄▄▄▄ █▀▀▀▀▀█ │\n");
@@ -457,16 +488,18 @@ pub fn render_half_block_qr(data: &str) -> String {
     out.push_str("│ █ ███ █ █▀█▀▄▀█ █▀▀▀▀▀█ │\n");
     out.push_str("│ █▀▀▀▀▀█ ▀▄▀▄▀▄█ █ ███ █ │\n");
     out.push_str("└───────────────────────────┘\n");
-    let truncated_data: String = data.chars().take(36).collect();
-    out.push_str(&format!("Payload: {truncated_data}\n"));
+    let _ = writeln!(out, "Payload: {data}");
     out
 }
 
 fn current_time_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Static HTML/JS/CSS assets for the ftui-web thin client.
@@ -506,7 +539,7 @@ pub const EMBEDDED_WEB_CLIENT_HTML: &str = r#"<!DOCTYPE html>
         <pre id="canvas-grid"></pre>
     </div>
     <script>
-        // Minimal frame receiver and DOM renderer (zero localStorage / persistent caching)
+        // Minimal frame receiver and DOM renderer (zero persistent client-side storage / caching)
         const grid = document.getElementById('canvas-grid');
         const status = document.getElementById('conn-status');
         const token = window.location.hash.replace('#t=', '').replace('#', '');
@@ -552,7 +585,7 @@ mod tests {
         // Client 1 connects with valid steer token
         let c1 = manager.connect_client("client-1", "127.0.0.1:50001", Some("secret-tok-1"));
         assert!(c1.is_ok());
-        assert!(!c1.as_ref().map_or(true, |c| c.is_view_only));
+        assert!(c1.as_ref().is_ok_and(|c| !c.is_view_only));
 
         // Token is consumed, cannot reuse
         let c1_retry =
@@ -562,7 +595,7 @@ mod tests {
         // Client 2 connects with view token
         let c2 = manager.connect_client("client-2", "127.0.0.1:50002", Some("secret-tok-2"));
         assert!(c2.is_ok());
-        assert!(c2.as_ref().map_or(false, |c| c.is_view_only));
+        assert!(c2.as_ref().is_ok_and(|c| c.is_view_only));
 
         // Client 3 hits capacity
         manager.issue_token("secret-tok-3", TokenKind::Steer);
@@ -571,7 +604,7 @@ mod tests {
         assert!(
             c3.as_ref()
                 .err()
-                .map_or(false, |e| e.contains("maximum viewer capacity"))
+                .is_some_and(|e| e.contains("maximum viewer capacity"))
         );
     }
 

@@ -20,6 +20,32 @@ use uuid::Uuid;
 pub const MAX_IMAGE_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 pub const MAX_TTS_TEXT_CHARS: usize = 4096;
 
+// Minimal valid 1x1 PNG bytes for fixture / VCR fallback
+const MIN_VALID_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+// Minimal valid 44-byte standard WAV header + silence
+const MIN_VALID_WAV: &[u8] = &[
+    0x52, 0x49, 0x46, 0x46, // "RIFF"
+    0x24, 0x00, 0x00, 0x00, // ChunkSize (36 + data size)
+    0x57, 0x41, 0x56, 0x45, // "WAVE"
+    0x66, 0x6D, 0x74, 0x20, // "fmt "
+    0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
+    0x01, 0x00, // AudioFormat (1 = PCM)
+    0x01, 0x00, // NumChannels (1 = Mono)
+    0x44, 0xAC, 0x00, 0x00, // SampleRate (44100 Hz)
+    0x88, 0x58, 0x01, 0x00, // ByteRate (44100 * 1 * 2 = 88200)
+    0x02, 0x00, // BlockAlign (1 * 2 = 2)
+    0x10, 0x00, // BitsPerSample (16)
+    0x64, 0x61, 0x74, 0x61, // "data"
+    0x00, 0x00, 0x00, 0x00, // Subchunk2Size (0 bytes data)
+];
+
 // ============================================================================
 // Media Configuration & Settings
 // ============================================================================
@@ -80,11 +106,13 @@ impl InspectImageTool {
         }
     }
 
-    pub fn with_mock(mut self, mock: bool) -> Self {
+    #[must_use]
+    pub const fn with_mock(mut self, mock: bool) -> Self {
         self.mock_mode = Some(mock);
         self
     }
 
+    #[must_use]
     pub fn with_api_key(mut self, key: Option<String>) -> Self {
         self.api_key = key;
         self
@@ -101,7 +129,7 @@ impl InspectImageTool {
 }
 
 #[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for InspectImageTool {
     fn name(&self) -> &str {
         "inspect_image"
@@ -142,6 +170,7 @@ impl Tool for InspectImageTool {
         ToolEffects::read()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -178,9 +207,9 @@ impl Tool for InspectImageTool {
 
         let ext = target_path
             .extension()
-            .and_then(|s| s.to_str())
+            .and_then(|e| e.to_str())
             .unwrap_or("")
-            .to_ascii_lowercase();
+            .to_lowercase();
 
         let mime_type = match ext.as_str() {
             "png" => "image/png",
@@ -192,9 +221,7 @@ impl Tool for InspectImageTool {
             _ => {
                 return Err(Error::tool(
                     "inspect_image",
-                    format!(
-                        "unsupported image extension: .{ext} (expected png, jpg, webp, gif, svg, bmp)"
-                    ),
+                    format!("unsupported image extension: .{ext}"),
                 ));
             }
         };
@@ -205,7 +232,7 @@ impl Tool for InspectImageTool {
 
         let analysis_text = if is_mock {
             format!(
-                "Image Analysis for {path_str} (format: {mime_type}, size: {size} bytes):\n\
+                "Image Analysis for {path_str} ({mime_type}, {size} bytes):\n\
                  Prompt: {prompt}\n\
                  Visual Content: Canned test fixture inspection completed successfully. \
                  Observed diagrams, structured text, and UI layouts intact.",
@@ -220,16 +247,15 @@ impl Tool for InspectImageTool {
                 .or(env_provider.as_deref())
                 .unwrap_or("gemini");
 
-            let has_key = if let Some(ref k) = self.api_key {
-                !k.trim().is_empty()
-            } else {
-                match provider {
+            let has_key = self.api_key.as_deref().map_or_else(
+                || match provider {
                     "openai" => std::env::var("OPENAI_API_KEY").is_ok(),
                     "anthropic" => std::env::var("ANTHROPIC_API_KEY").is_ok(),
                     "gemini" => std::env::var("GEMINI_API_KEY").is_ok(),
                     _ => false,
-                }
-            };
+                },
+                |k| !k.trim().is_empty(),
+            );
 
             if !has_key {
                 return Err(Error::tool(
@@ -243,6 +269,7 @@ impl Tool for InspectImageTool {
 
             format!(
                 "Image Analysis for {path_str} ({mime_type}, {size} bytes):\n\
+                 Prompt: {prompt}\n\
                  Visual analysis performed via {provider} vision model.",
                 size = metadata.len()
             )
@@ -295,11 +322,13 @@ impl GenerateImageTool {
         }
     }
 
-    pub fn with_mock(mut self, mock: bool) -> Self {
+    #[must_use]
+    pub const fn with_mock(mut self, mock: bool) -> Self {
         self.mock_mode = Some(mock);
         self
     }
 
+    #[must_use]
     pub fn with_api_key(mut self, key: Option<String>) -> Self {
         self.api_key = key;
         self
@@ -307,7 +336,7 @@ impl GenerateImageTool {
 }
 
 #[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for GenerateImageTool {
     fn name(&self) -> &str {
         "generate_image"
@@ -357,6 +386,7 @@ impl Tool for GenerateImageTool {
         ToolEffects::write()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -379,11 +409,10 @@ impl Tool for GenerateImageTool {
             .and_then(|v| v.as_str())
             .unwrap_or("1024x1024");
 
-        let output_path_str = args
-            .get("output_path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("images/generated_{}.png", Uuid::new_v4().simple()));
+        let output_path_str = args.get("output_path").and_then(Value::as_str).map_or_else(
+            || format!("images/generated_{}.png", Uuid::new_v4().simple()),
+            ToString::to_string,
+        );
 
         let target_path = if Path::new(&output_path_str).is_absolute() {
             PathBuf::from(&output_path_str)
@@ -396,15 +425,6 @@ impl Tool for GenerateImageTool {
                 Error::tool("generate_image", format!("cannot create output dir: {e}"))
             })?;
         }
-
-        // Minimal valid 1x1 PNG bytes for fixture / VCR fallback
-        const MIN_VALID_PNG: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-            0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00,
-            0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
-        ];
 
         let is_mock = self
             .mock_mode
@@ -430,11 +450,10 @@ impl Tool for GenerateImageTool {
                 }
             };
 
-            let has_key = if let Some(ref k) = self.api_key {
-                !k.trim().is_empty()
-            } else {
-                std::env::var(key_env).is_ok()
-            };
+            let has_key = self
+                .api_key
+                .as_deref()
+                .map_or_else(|| std::env::var(key_env).is_ok(), |k| !k.trim().is_empty());
 
             if !has_key {
                 return Err(Error::tool(
@@ -453,9 +472,8 @@ impl Tool for GenerateImageTool {
             })?;
         }
 
-        let written_bytes = fs::metadata(&target_path)
-            .map(|m| m.len())
-            .unwrap_or(MIN_VALID_PNG.len() as u64);
+        let written_bytes =
+            fs::metadata(&target_path).map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
 
         let result_msg = format!(
             "Successfully generated image and saved to {}\n\
@@ -514,11 +532,13 @@ impl TtsTool {
         }
     }
 
-    pub fn with_mock(mut self, mock: bool) -> Self {
+    #[must_use]
+    pub const fn with_mock(mut self, mock: bool) -> Self {
         self.mock_mode = Some(mock);
         self
     }
 
+    #[must_use]
     pub fn with_api_key(mut self, key: Option<String>) -> Self {
         self.api_key = key;
         self
@@ -526,7 +546,7 @@ impl TtsTool {
 }
 
 #[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for TtsTool {
     fn name(&self) -> &str {
         "tts"
@@ -573,6 +593,7 @@ impl Tool for TtsTool {
         ToolEffects::write()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -607,11 +628,10 @@ impl Tool for TtsTool {
 
         let format = args.get("format").and_then(|v| v.as_str()).unwrap_or("wav");
 
-        let output_path_str = args
-            .get("output_path")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("audio/speech_{}.{}", Uuid::new_v4().simple(), format));
+        let output_path_str = args.get("output_path").and_then(Value::as_str).map_or_else(
+            || format!("audio/speech_{}.{}", Uuid::new_v4().simple(), format),
+            ToString::to_string,
+        );
 
         let target_path = if Path::new(&output_path_str).is_absolute() {
             PathBuf::from(&output_path_str)
@@ -624,23 +644,6 @@ impl Tool for TtsTool {
                 .map_err(|e| Error::tool("tts", format!("cannot create output dir: {e}")))?;
         }
 
-        // Minimal valid 44-byte standard WAV header + silence
-        const MIN_VALID_WAV: &[u8] = &[
-            0x52, 0x49, 0x46, 0x46, // "RIFF"
-            0x24, 0x00, 0x00, 0x00, // ChunkSize (36 + data size)
-            0x57, 0x41, 0x56, 0x45, // "WAVE"
-            0x66, 0x6D, 0x74, 0x20, // "fmt "
-            0x10, 0x00, 0x00, 0x00, // Subchunk1Size (16 for PCM)
-            0x01, 0x00, // AudioFormat (1 = PCM)
-            0x01, 0x00, // NumChannels (1 = Mono)
-            0x44, 0xAC, 0x00, 0x00, // SampleRate (44100 Hz)
-            0x88, 0x58, 0x01, 0x00, // ByteRate (44100 * 1 * 2 = 88200)
-            0x02, 0x00, // BlockAlign (1 * 2 = 2)
-            0x10, 0x00, // BitsPerSample (16)
-            0x64, 0x61, 0x74, 0x61, // "data"
-            0x00, 0x00, 0x00, 0x00, // Subchunk2Size (0 bytes data)
-        ];
-
         let is_mock = self
             .mock_mode
             .unwrap_or_else(|| std::env::var("PI_MEDIA_MOCK").unwrap_or_default() == "1");
@@ -649,11 +652,10 @@ impl Tool for TtsTool {
             fs::write(&target_path, MIN_VALID_WAV)
                 .map_err(|e| Error::tool("tts", format!("failed to write audio file: {e}")))?;
         } else {
-            let has_key = if let Some(ref k) = self.api_key {
-                !k.trim().is_empty()
-            } else {
-                std::env::var("XAI_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok()
-            };
+            let has_key = self.api_key.as_deref().map_or_else(
+                || std::env::var("XAI_API_KEY").is_ok() || std::env::var("OPENAI_API_KEY").is_ok(),
+                |k| !k.trim().is_empty(),
+            );
 
             if !has_key {
                 return Err(Error::tool(
@@ -666,9 +668,8 @@ impl Tool for TtsTool {
                 .map_err(|e| Error::tool("tts", format!("failed to write audio file: {e}")))?;
         }
 
-        let written_bytes = fs::metadata(&target_path)
-            .map(|m| m.len())
-            .unwrap_or(MIN_VALID_WAV.len() as u64);
+        let written_bytes =
+            fs::metadata(&target_path).map_or(MIN_VALID_WAV.len() as u64, |m| m.len());
 
         let result_msg = format!(
             "Successfully synthesized speech audio to {}\n\

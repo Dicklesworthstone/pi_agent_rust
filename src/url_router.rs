@@ -24,7 +24,7 @@
 //! the mount, so prefer the scheme tools for correctness-critical edits.
 //!
 
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -703,7 +703,7 @@ pub fn parse_ssh_target(url: &str) -> Result<SshTarget> {
     }
     Ok(SshTarget {
         host: host.to_string(),
-        path: remote_path.to_string(),
+        path: remote_path,
     })
 }
 
@@ -713,7 +713,7 @@ fn ssh_config_literal_hosts(config_text: &str) -> Vec<String> {
     config_text
         .lines()
         .filter_map(|line| {
-            let mut tokens = line.trim().split_whitespace();
+            let mut tokens = line.split_whitespace();
             if !tokens.next()?.eq_ignore_ascii_case("host") {
                 return None;
             }
@@ -765,9 +765,11 @@ pub fn ssh_host_allowed(host: &str) -> bool {
     ssh_host_allowed_with(host, config.as_deref(), env.as_deref())
 }
 
-/// Shared ssh invocation flags: no interactive auth possible (BatchMode),
-/// bounded connect, and accept-new-then-strict host keys — a *changed* key
-/// still hard-fails and is classified by [`classify_ssh_failure`].
+/// Shared ssh invocation flags.
+///
+/// Disallows interactive auth (BatchMode), bounds connect, and enforces
+/// accept-new-then-strict host keys — a *changed* key still hard-fails and is
+/// classified by [`classify_ssh_failure`].
 ///
 /// `PI_SSH_CLIENT_CONFIG_FILE` (optional) appends `-F <path>` so fixture
 /// and live lanes can pin port/user/identity/known_hosts without touching
@@ -833,9 +835,10 @@ fn sh_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// POSIX sh snippet writing stdin into `remote_path` atomically: mktemp in
-/// the target directory keeps rename(2) on one filesystem, and when the
-/// target already exists it is copied to the staging file with `cp -p`
+/// POSIX sh snippet writing stdin into `remote_path` atomically.
+///
+/// Uses mktemp in the target directory to keep rename(2) on one filesystem, and
+/// when the target already exists it is copied to the staging file with `cp -p`
 /// FIRST — preserving mode/owner/timestamps portably (GNU chmod's
 /// `--reference` does not exist on BSD/macOS remotes). The EXIT trap
 /// removes the staging file if anything aborts before the rename.
@@ -1000,10 +1003,7 @@ pub fn ssh_fetch_document(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     if output.stdout.len() as u64 > max_bytes {
         return Err(Error::tool(
             "edit",
-            format!(
-                "PI_SSH_TOO_LARGE: remote file exceeds the {}-byte edit limit.",
-                max_bytes
-            ),
+            format!("PI_SSH_TOO_LARGE: remote file exceeds the {max_bytes}-byte edit limit."),
         ));
     }
     Ok(output.stdout)
@@ -1034,9 +1034,11 @@ pub fn parse_transfer_endpoint(spec: &str) -> Result<TransferEndpoint> {
     }
 }
 
-/// Resume offset for a partially transferred target: 0 when absent/empty,
-/// the partial size when it is a strict prefix of the source, and a named
-/// conflict when the partial is LARGER than the source (nothing to resume).
+/// Resume offset for a partially transferred target.
+///
+/// Returns 0 when absent/empty, the partial size when it is a strict prefix of
+/// the source, and a named conflict when the partial is LARGER than the source
+/// (nothing to resume).
 ///
 /// # Errors
 /// `PI_SSH_TRANSFER_SIZE_CONFLICT`.
@@ -1096,8 +1098,9 @@ fn remote_size(target: &SshTarget) -> Result<u64> {
     })
 }
 
-/// Transfer a file between a local path and `ssh://host/path`, either
-/// direction, resuming from whatever prefix already exists at the target
+/// Transfer a file between a local path and `ssh://host/path`, either direction.
+///
+/// Resumes from whatever prefix already exists at the target
 /// (partial-upload/upload-interruption semantics). Completion is verified
 /// by comparing final sizes on both sides.
 ///
@@ -1108,10 +1111,10 @@ pub fn ssh_transfer(source: &str, dest: &str) -> Result<serde_json::Value> {
     let dst = parse_transfer_endpoint(dest)?;
     match (src, dst) {
         (TransferEndpoint::Local(local), TransferEndpoint::Remote(remote)) => {
-            transfer_push(local, remote)
+            transfer_push(&local, &remote)
         }
         (TransferEndpoint::Remote(remote), TransferEndpoint::Local(local)) => {
-            transfer_pull(remote, local)
+            transfer_pull(&remote, &local)
         }
         (TransferEndpoint::Local(_), TransferEndpoint::Local(_)) => Err(Error::validation(
             "PI_SSH_TRANSFER_SCHEME: both endpoints are local; copy locally",
@@ -1122,13 +1125,12 @@ pub fn ssh_transfer(source: &str, dest: &str) -> Result<serde_json::Value> {
     }
 }
 
-fn transfer_push(local: PathBuf, remote: SshTarget) -> Result<serde_json::Value> {
-    let total = local_file_size(&local)?;
-    let resumed_from = resume_offset(remote_size(&remote)?, total)?;
+fn transfer_push(local: &Path, remote: &SshTarget) -> Result<serde_json::Value> {
+    let total = local_file_size(local)?;
+    let resumed_from = resume_offset(remote_size(remote)?, total)?;
     if total > resumed_from {
-        let mut src = std::fs::File::open(&local)
+        let mut src = std::fs::File::open(local)
             .map_err(|e| Error::tool("transfer", format!("open {}: {e}", local.display())))?;
-        use std::io::Seek as _;
         src.seek(std::io::SeekFrom::Start(resumed_from))
             .map_err(|e| Error::tool("transfer", format!("seek {resumed_from}: {e}")))?;
         let script = format!("cat >> {}", sh_quote(&remote.path));
@@ -1154,7 +1156,7 @@ fn transfer_push(local: PathBuf, remote: SshTarget) -> Result<serde_json::Value>
             &format!("{host}:{path}", host = remote.host, path = remote.path),
         )?;
     }
-    let final_size = remote_size(&remote)?;
+    let final_size = remote_size(remote)?;
     if final_size != total {
         return Err(Error::tool(
             "transfer",
@@ -1173,9 +1175,9 @@ fn transfer_push(local: PathBuf, remote: SshTarget) -> Result<serde_json::Value>
     }))
 }
 
-fn transfer_pull(remote: SshTarget, local: PathBuf) -> Result<serde_json::Value> {
-    let total = remote_size(&remote)?;
-    let existing = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+fn transfer_pull(remote: &SshTarget, local: &Path) -> Result<serde_json::Value> {
+    let total = remote_size(remote)?;
+    let existing = std::fs::metadata(local).map_or(0, |m| m.len());
     let resumed_from = resume_offset(existing, total)?;
     if total > resumed_from {
         // POSIX `tail -c +N file` emits from byte N (1-based) onward — the
@@ -1202,7 +1204,7 @@ fn transfer_pull(remote: SshTarget, local: PathBuf) -> Result<serde_json::Value>
             let mut dst = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(&local)
+                .open(local)
                 .map_err(|e| Error::tool("transfer", format!("open {}: {e}", local.display())))?;
             std::io::copy(&mut stdout, &mut dst)
                 .map_err(|e| Error::tool("transfer", format!("stream payload: {e}")))?;
@@ -1212,7 +1214,7 @@ fn transfer_pull(remote: SshTarget, local: PathBuf) -> Result<serde_json::Value>
             &format!("{host}:{path}", host = remote.host, path = remote.path),
         )?;
     }
-    let final_size = local_file_size(&local)?;
+    let final_size = local_file_size(local)?;
     if final_size != total {
         return Err(Error::tool(
             "transfer",

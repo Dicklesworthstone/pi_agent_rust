@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::derive_partial_eq_without_eq,
+    clippy::must_use_candidate,
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::redundant_closure_for_method_calls,
+    clippy::unnecessary_wraps,
+    clippy::too_many_lines
+)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

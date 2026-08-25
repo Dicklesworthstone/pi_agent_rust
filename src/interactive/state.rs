@@ -108,6 +108,10 @@ pub enum InputMode {
 pub enum PendingInput {
     Text(String),
     Content(Vec<ContentBlock>),
+    ContentWithKeywordSource {
+        content: Vec<ContentBlock>,
+        keyword_scan_source: String,
+    },
     Continue,
 }
 

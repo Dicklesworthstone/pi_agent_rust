@@ -57,15 +57,17 @@ pub struct VerificationReport {
     pub errors: Vec<String>,
 }
 
+#[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        let _ = write!(s, "{:02x}", b);
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
 
+#[must_use]
 pub fn compute_sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -77,6 +79,8 @@ pub fn compute_sha256_file(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(compute_sha256_bytes(&bytes))
 }
 
+#[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn compute_entry_hash(
     index: usize,
     path: &str,
@@ -130,6 +134,7 @@ impl std::fmt::Display for VerifyIssue<'_> {
     }
 }
 
+#[must_use]
 pub fn verify_ledger(
     ledger: &ReleaseEvidenceLedgerArtifact,
     repo_root: &Path,
@@ -180,9 +185,7 @@ pub fn verify_ledger(
 
         match resolve_safe_path(repo_root, &entry.path) {
             Some(file_path) => {
-                if !file_path.exists() {
-                    raw_issues.push(VerifyIssue::MissingFile(&entry.path));
-                } else {
+                if file_path.exists() {
                     match compute_sha256_file(&file_path) {
                         Ok(actual_sha) => {
                             if actual_sha != entry.sha256 {
@@ -193,6 +196,8 @@ pub fn verify_ledger(
                             raw_issues.push(VerifyIssue::ChecksumError(&entry.path));
                         }
                     }
+                } else {
+                    raw_issues.push(VerifyIssue::MissingFile(&entry.path));
                 }
             }
             None => {

@@ -5089,6 +5089,7 @@ fn path_is_in_allowed_extension_root(
 /// Every record carries runtime identity, active extension id, requested vs
 /// normalized path, workspace root, and the full registered-root lists so
 /// full-suite interference can be reconstructed from tracing captures alone.
+#[allow(clippy::too_many_arguments)]
 fn log_host_fs_decision(
     op: &'static str,
     allowed: bool,
@@ -24998,10 +24999,10 @@ mod tests {
                 sha256_hex(source.as_bytes())
             );
         }
-        assert_eq!(bridge.len(), 200_580);
+        assert_eq!(bridge.len(), 201_242);
         assert_eq!(
             sha256_hex(bridge.as_bytes()),
-            "56fffdd56effbe278a555c9c5d9f276950028f0e59f84e1cb25f4428b77d7236"
+            "2e3cadbe89d8361dfafa9cb9c836ed0a9b1ebc93fd6d8f73a1379f44fcd0590b"
         );
 
         for (name, expected_len, expected_sha256) in [
@@ -25027,8 +25028,8 @@ mod tests {
             ),
             (
                 "@mariozechner/pi-coding-agent",
-                24_278,
-                "5d74143ef1bd12ff6ed02d4fc2cb0c1b7793cbfe6d86cb76a6557dc0b958b408",
+                25_208,
+                "f74b473ecf0df9a826c21be3863c10a28f65b439b08c7dc49da43e2be7c6c4b5",
             ),
             (
                 "@mariozechner/pi-tui",
@@ -30129,6 +30130,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn host_fs_decision_helper_emits_structured_event() {
         // bd-xhl7u: every host-filesystem allow/deny must carry runtime
         // identity, active extension, and normalized path so full-suite

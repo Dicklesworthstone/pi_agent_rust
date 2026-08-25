@@ -79,7 +79,7 @@ impl ToastQueue {
     }
 
     #[must_use]
-    pub fn active_toasts(&self) -> &VecDeque<ToastNotification> {
+    pub const fn active_toasts(&self) -> &VecDeque<ToastNotification> {
         &self.toasts
     }
 
@@ -127,7 +127,7 @@ impl WelcomeScreen {
         }
     }
 
-    pub fn next_tip(&mut self) {
+    pub const fn next_tip(&mut self) {
         if !self.tips.is_empty() {
             self.active_tip_index = (self.active_tip_index + 1) % self.tips.len();
         }
@@ -160,11 +160,9 @@ impl OverlayStack {
     }
 
     pub fn dismiss_top(&mut self) -> bool {
-        if let Some(top) = self.stack.last() {
-            if top.is_dismissible {
-                self.stack.pop();
-                return true;
-            }
+        if self.stack.last().is_some_and(|top| top.is_dismissible) {
+            self.stack.pop();
+            return true;
         }
         false
     }
@@ -175,12 +173,12 @@ impl OverlayStack {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.stack.is_empty()
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.stack.len()
     }
 }

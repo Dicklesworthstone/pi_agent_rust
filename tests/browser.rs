@@ -366,15 +366,17 @@ fn test_browser_default_gated_off() {
 #[test]
 fn test_browser_opt_in_activation() {
     let harness = TestHarness::new("browser_opt_in");
-    let mut config = Config::default();
-    config.browser = Some(BrowserSettings {
-        enable_browser: Some(true),
-        executable_path: None,
-        remote_debugging_port: Some(9222),
-        headless: Some(true),
-        user_agent: None,
-        domain_allowlist: Some(vec!["*".to_string()]),
-    });
+    let config = Config {
+        browser: Some(BrowserSettings {
+            enable_browser: Some(true),
+            executable_path: None,
+            remote_debugging_port: Some(9222),
+            headless: Some(true),
+            user_agent: None,
+            domain_allowlist: Some(vec!["*".to_string()]),
+        }),
+        ..Default::default()
+    };
 
     let enabled_registry =
         ToolRegistry::new(&["read", "browser"], harness.temp_dir(), Some(&config));

@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines
+)]
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;

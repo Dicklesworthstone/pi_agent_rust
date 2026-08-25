@@ -30,6 +30,35 @@ pub(super) fn build_user_message(text: String) -> ModelMessage {
     })
 }
 
+fn append_turn_artifacts(
+    session: &mut Session,
+    mut messages: Vec<ModelMessage>,
+    repairs: &[crate::dialects::RepairEntry],
+    keyword_activations: &[crate::magic_keywords::KeywordActivation],
+) {
+    // Session retry cleanup requires an Error/Aborted assistant to remain the
+    // leaf. Audit entries are durable completed state, so place them before
+    // the incomplete assistant rather than allowing a Custom entry to mask it.
+    let incomplete_assistant = messages
+        .iter()
+        .rposition(|message| {
+            matches!(
+                message,
+                ModelMessage::Assistant(assistant)
+                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
+            )
+        })
+        .map(|index| messages.remove(index));
+    for message in messages {
+        session.append_model_message(message);
+    }
+    crate::agent::append_dialect_repair_telemetry(session, repairs);
+    crate::magic_keywords::append_session_telemetry(session, keyword_activations);
+    if let Some(message) = incomplete_assistant {
+        session.append_model_message(message);
+    }
+}
+
 async fn dispatch_input_event(
     manager: &ExtensionManager,
     text: String,
@@ -597,11 +626,11 @@ fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
 /// derived through the per-tool renderer registry (the bash command line,
 /// file path, operation and target, first question, ...). A registered
 /// renderer may still return `None` for malformed/incomplete arguments.
-/// LOAD-BEARING VISIBILITY: `pub(crate)` is required by the ftui card
-/// framework (interactive_ftui re-exports and calls this from
-/// crate::interactive; bd-cv653.9.2). Sweeps that demote this to
-/// pub(super) break the ftui build — restore pub(crate).
-pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+/// LOAD-BEARING VISIBILITY: `pub(super)` is re-exported as `pub(crate)` by
+/// `src/interactive.rs` when `feature = "ftui"` is active (interactive_ftui
+/// calls `crate::interactive::tool_invocation_summary`; bd-cv653.9.2).
+#[allow(clippy::too_many_lines)]
+pub fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
@@ -676,10 +705,10 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
         },
         ToolInvocationRenderer::Search { pattern, scope } => {
             let pattern = nonblank_str_arg(args, pattern)?.trim();
-            match nonblank_str_arg(args, scope) {
-                Some(scope) => clip(&format!("{pattern} in {}", scope.trim()), MAX),
-                _ => clip(pattern, MAX),
-            }
+            nonblank_str_arg(args, scope).map_or_else(
+                || clip(pattern, MAX),
+                |scope| clip(&format!("{pattern} in {}", scope.trim()), MAX),
+            )
         }
         ToolInvocationRenderer::Action {
             action,
@@ -2020,6 +2049,17 @@ After approving access in the browser, press Enter in Pi to complete login."
             let cmd = match next {
                 PendingInput::Text(text) => self.submit_message(&text),
                 PendingInput::Content(content) => self.submit_content(content),
+                PendingInput::ContentWithKeywordSource {
+                    content,
+                    keyword_scan_source,
+                } => {
+                    let display = content_blocks_to_text(&content);
+                    self.submit_content_with_display_and_keyword_source(
+                        content,
+                        &display,
+                        Some(keyword_scan_source),
+                    )
+                }
                 PendingInput::Continue => self.submit_continue(),
             };
 
@@ -2189,9 +2229,6 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
                 {
@@ -2206,11 +2243,26 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
-            for message in new_messages {
-                session_guard.append_model_message(message);
-            }
-            crate::magic_keywords::append_session_telemetry(
+            let repairs = match agent_guard.drain_repair_ledger() {
+                Ok(repairs) => repairs,
+                Err(err) => {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let keyword_activations = agent_guard.drain_keyword_ledger();
+            drop(agent_guard);
+            append_turn_artifacts(
                 &mut session_guard,
+                new_messages,
+                &repairs,
                 &keyword_activations,
             );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
@@ -2254,6 +2306,16 @@ After approving access in the browser, press Enter in Pi to complete login."
         &mut self,
         content: Vec<ContentBlock>,
         display: &str,
+    ) -> Option<Cmd> {
+        self.submit_content_with_display_and_keyword_source(content, display, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn submit_content_with_display_and_keyword_source(
+        &mut self,
+        content: Vec<ContentBlock>,
+        display: &str,
+        keyword_scan_source: Option<String>,
     ) -> Option<Cmd> {
         if content.is_empty() {
             return None;
@@ -2407,6 +2469,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             } else {
                 agent_guard.set_system_prompt(base_system_prompt.clone());
             }
+            agent_guard.set_magic_keyword_scan_override(keyword_scan_source);
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -2450,9 +2513,6 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
                 {
@@ -2467,11 +2527,26 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
-            for message in new_messages {
-                session_guard.append_model_message(message);
-            }
-            crate::magic_keywords::append_session_telemetry(
+            let repairs = match agent_guard.drain_repair_ledger() {
+                Ok(repairs) => repairs,
+                Err(err) => {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let keyword_activations = agent_guard.drain_keyword_ledger();
+            drop(agent_guard);
+            append_turn_artifacts(
                 &mut session_guard,
+                new_messages,
+                &repairs,
                 &keyword_activations,
             );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
@@ -2590,19 +2665,13 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
 
         if let Err(message) = self.sync_runtime_selection_from_session_header() {
-            if message.starts_with("Agent busy;") || message.starts_with("Session busy;") {
-                tracing::debug!(
-                    message,
-                    "skipping runtime selection sync while submitting input"
-                );
-            } else {
-                self.status_message = Some(message);
-                return None;
-            }
+            self.status_message = Some(message);
+            return None;
         }
 
         let message_owned = message.to_string();
         let (message_without_refs, file_refs) = self.extract_file_references(&message_owned);
+        let keyword_scan_source = message_without_refs.trim().to_string();
         let message_for_agent = if file_refs.is_empty() {
             self.resources.expand_input(&message_owned)
         } else {
@@ -2646,7 +2715,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.history.push(message_owned.clone());
 
             let display = content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display);
+            return self.submit_content_with_display_and_keyword_source(
+                content,
+                &display,
+                Some(keyword_scan_source),
+            );
         }
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
@@ -2681,6 +2754,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.scroll_to_bottom();
 
         let runtime_handle = self.runtime_handle.clone();
+        let keyword_scan_source = message_owned;
 
         // Spawn async task to run the agent
         let runtime_handle_for_agent = runtime_handle.clone();
@@ -2747,6 +2821,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                     }
                 };
             let previous_len = agent_guard.messages().len();
+            agent_guard.set_magic_keyword_scan_override(Some(keyword_scan_source));
 
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
@@ -2803,9 +2878,6 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
                 {
@@ -2820,11 +2892,26 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
-            for message in new_messages {
-                session_guard.append_model_message(message);
-            }
-            crate::magic_keywords::append_session_telemetry(
+            let repairs = match agent_guard.drain_repair_ledger() {
+                Ok(repairs) => repairs,
+                Err(err) => {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let keyword_activations = agent_guard.drain_keyword_ledger();
+            drop(agent_guard);
+            append_turn_artifacts(
                 &mut session_guard,
+                new_messages,
+                &repairs,
                 &keyword_activations,
             );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
@@ -3141,6 +3228,108 @@ mod stream_delta_batcher_tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn interactive_text_turn_persists_keyword_and_repair_ledgers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("fixture.txt"), "hello-fixture").expect("write fixture");
+        let provider = Arc::new(InteractiveRepairProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (mut app, mut event_rx) =
+            build_test_app_with_provider(Arc::clone(&provider) as Arc<dyn Provider>);
+        let mut entry = model_entry(provider.name(), provider.model_id());
+        entry.compat = Some(crate::models::CompatConfig {
+            tool_call_dialect: Some(crate::dialects::Dialect::Xmlish),
+            ..crate::models::CompatConfig::default()
+        });
+        let agent = Agent::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            ToolRegistry::new(&["read"], temp.path(), None),
+            AgentConfig::default(),
+        );
+        let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+            Some(temp.path().join("sessions")),
+        )));
+        app.agent = Arc::new(asupersync::sync::Mutex::new(agent));
+        app.session = Arc::clone(&session);
+        app.cwd = temp.path().to_path_buf();
+        app.model_entry = entry.clone();
+        app.available_models = vec![entry.clone()];
+        if let Ok(mut shared) = app.model_entry_shared.lock() {
+            *shared = entry;
+        }
+        app.save_enabled = true;
+
+        let _ = app.submit_message("ultrathink check the fixture");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline {
+            match event_rx.try_recv() {
+                Ok(PiMsg::AgentDone { error_message, .. }) => {
+                    assert!(error_message.is_none(), "turn error: {error_message:?}");
+                    saw_done = true;
+                    break;
+                }
+                Ok(PiMsg::AgentError(err)) => panic!("interactive turn failed: {err}"),
+                Ok(_) | Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        assert!(
+            saw_done,
+            "interactive turn did not finish before the deadline"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let persisted_path = runtime().block_on(async {
+            let cx = Cx::for_request();
+            let agent_guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                .await
+                .expect("agent completion lock");
+            drop(agent_guard);
+            let session_guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("session completion lock");
+            session_guard
+                .path
+                .clone()
+                .expect("interactive autosave created a session file")
+        });
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen interactive session");
+        let entries = reopened.entries_for_current_path();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "dialect_repair"
+                            && custom.data.as_ref().is_some_and(|data| data["tool"] == json!("read"))
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "magic_keyword"
+                            && custom.data.as_ref().is_some_and(|data| {
+                                data["schema"] == json!("pi.magic_keyword.v1")
+                                    && data["word"] == json!("ultrathink")
+                            })
+                ))
+                .count(),
+            1
+        );
+    }
+
     fn build_test_extension_manager_with_command_output(
         output: &Value,
     ) -> crate::extensions::ExtensionManager {
@@ -3194,6 +3383,57 @@ mod stream_delta_batcher_tests {
 
     struct ContinueProbeProvider {
         state: Arc<ContinueProbeState>,
+    }
+
+    struct InteractiveRepairProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for InteractiveRepairProvider {
+        fn name(&self) -> &'static str {
+            "repair-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "openai-completions"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "qwen3-repair-probe"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let content = if call == 0 {
+                vec![ContentBlock::Text(TextContent::new(
+                    "Checking. <tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"fixture.txt\"}}</tool_call>",
+                ))]
+            } else {
+                vec![ContentBlock::Text(TextContent::new("done"))]
+            };
+            let message = AssistantMessage {
+                content,
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
     }
 
     impl ContinueProbeProvider {

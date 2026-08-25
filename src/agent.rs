@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -89,6 +89,24 @@ const SEMANTIC_CONTEXT_PROVENANCE_SCHEMA_V1: &str = "pi.semantic_context_provena
 const SEMANTIC_CONTEXT_CUSTOM_TYPE: &str = "semantic_context_bundle";
 const DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_BYTES: u64 = 16 * 1024;
 const DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_ITEMS: usize = 16;
+
+/// Append dialect-repair audit entries using one stable shape across SDK,
+/// RPC, retry, extension, and interactive execution surfaces.
+pub(crate) fn append_dialect_repair_telemetry(
+    session: &mut Session,
+    repairs: &[crate::dialects::RepairEntry],
+) {
+    for entry in repairs {
+        session.append_custom_entry(
+            "dialect_repair".to_string(),
+            Some(serde_json::json!({
+                "tool": entry.tool,
+                "strippedBytes": entry.stripped_bytes,
+                "remainingTextBytes": entry.remaining_text_bytes,
+            })),
+        );
+    }
+}
 
 /// Normalize a `before_provider_request` handler response into a proposed
 /// request-body rewrite (gh #167 / bd-1q31s).
@@ -1258,9 +1276,27 @@ pub struct Agent {
     /// session, drained by the session layer into session Custom entries.
     repair_ledger: Arc<StdMutex<crate::dialects::RepairLedger>>,
 
+    /// Session-local sequence used to keep synthesized tool-call IDs unique
+    /// across multiple repaired assistant messages.
+    dialect_repair_sequence: AtomicU64,
+
+    /// Explicit catalog-selected tool-call dialect. Native is the fail-closed
+    /// default; model-name heuristics never enable runtime repair.
+    tool_call_dialect: crate::dialects::Dialect,
+
     /// Magic-keyword activations this run (bd-cv653.3.6), drained by the
     /// session wrapper into session Custom entries for auditability.
     keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
+
+    /// Activations retained only while an incomplete turn is retryable. A
+    /// resume has no new prompt to scan, so these reapply the same turn-local
+    /// effects without duplicating durable telemetry.
+    retry_keyword_activations: Vec<crate::magic_keywords::KeywordActivation>,
+
+    /// One-shot, caller-supplied prose provenance for the next prompt. This
+    /// keeps generated attachment wrappers and file bytes visible to the
+    /// model while excluding them from behavior-changing keyword scans.
+    magic_keyword_scan_override: Option<String>,
 
     /// Highest effort the active model can accept. The session wrapper keeps
     /// this synchronized with the model registry so `ultrathink` cannot send
@@ -1328,7 +1364,11 @@ impl Agent {
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
+            dialect_repair_sequence: AtomicU64::new(0),
+            tool_call_dialect: crate::dialects::Dialect::Native,
             keyword_ledger: Vec::new(),
+            retry_keyword_activations: Vec::new(),
+            magic_keyword_scan_override: None,
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
         }
@@ -1336,13 +1376,11 @@ impl Agent {
 
     /// Dialect repair (bd-cv653.7.8): when a weak model emits its tool call
     /// as text, extract and synthesize it into a real ToolCall block so the
-    /// turn continues. Guards: non-native dialect mapping, Stop reason, no
+    /// turn continues. Guards: explicitly repairable dialect, Stop reason, no
     /// structured calls already present, tools enabled, one repair per
     /// message, candidate names must be registered tools.
     fn maybe_repair_dialect_tool_calls(&self, msg: AssistantMessage) -> AssistantMessage {
-        use crate::dialects::{
-            Dialect, dialect_for_model, extract_text_tool_calls, strip_candidates,
-        };
+        use crate::dialects::{Dialect, extract_text_tool_calls, strip_candidates};
 
         if !extract_tool_calls(&msg.content).is_empty() {
             return msg; // structured calls present — nothing to repair
@@ -1353,41 +1391,49 @@ impl Agent {
         if self.tools.tools().is_empty() {
             return msg;
         }
-        let provider = self.provider();
-        if dialect_for_model(provider.name(), provider.model_id()) == Dialect::Native {
+        if self.tool_call_dialect != Dialect::Xmlish {
             return msg;
         }
 
-        let text = msg
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if text.trim().is_empty() {
+        let candidate_block =
+            msg.content
+                .iter()
+                .enumerate()
+                .find_map(|(index, block)| match block {
+                    ContentBlock::Text(text) => {
+                        let candidates = extract_text_tool_calls(&text.text, &|name| {
+                            self.tools.get(name).is_some()
+                        });
+                        (!candidates.is_empty()).then_some((index, candidates))
+                    }
+                    _ => None,
+                });
+        let Some((block_index, candidates)) = candidate_block else {
             return msg;
-        }
-        let candidates = extract_text_tool_calls(&text, &|name| self.tools.get(name).is_some());
-        if candidates.is_empty() {
-            return msg;
-        }
+        };
 
-        let remaining = strip_candidates(&text, &candidates);
-        let mut content: Vec<ContentBlock> = Vec::new();
+        let ContentBlock::Text(original_text) = &msg.content[block_index] else {
+            unreachable!("candidate search only returns text blocks");
+        };
+        let remaining = strip_candidates(&original_text.text, &candidates);
+        let repair_sequence = self.dialect_repair_sequence.fetch_add(1, Ordering::Relaxed);
+        let mut replacement = Vec::with_capacity(1 + candidates.len());
         if !remaining.is_empty() {
-            content.push(ContentBlock::Text(TextContent::new(remaining.clone())));
+            // The candidate block changed, so its provider signature no longer
+            // authenticates the bytes. Preserve every untouched block and its
+            // metadata, but clear the modified block's now-invalid signature.
+            replacement.push(ContentBlock::Text(TextContent::new(remaining.clone())));
         }
         for (index, candidate) in candidates.iter().enumerate() {
-            content.push(ContentBlock::ToolCall(ToolCall {
-                id: format!("dialect-repair-{index}"),
+            replacement.push(ContentBlock::ToolCall(ToolCall {
+                id: format!("dialect-repair-{repair_sequence}-{index}"),
                 name: candidate.name.clone(),
                 arguments: candidate.arguments.clone(),
                 thought_signature: None,
             }));
         }
+        let mut content = msg.content.clone();
+        content.splice(block_index..=block_index, replacement);
         if let Ok(mut ledger) = self.repair_ledger.lock() {
             for candidate in &candidates {
                 ledger.record(
@@ -1546,11 +1592,30 @@ impl Agent {
         // carry a high thinking cap from the previous model. Registry-aware
         // switch paths immediately install the target model's clamped cap.
         self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
+        self.tool_call_dialect = crate::dialects::Dialect::Native;
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
     pub const fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
         self.keyword_max_thinking_level = level;
+    }
+
+    /// Override the prose scanned for magic keywords on the next non-resume
+    /// run. Attachment-aware callers pass only the user-authored/template
+    /// prose, excluding generated `<file>` wrappers and attached file bytes.
+    pub fn set_magic_keyword_scan_override(&mut self, source: Option<String>) {
+        self.magic_keyword_scan_override = source;
+    }
+
+    /// Install the model-catalog-selected tool-call dialect.
+    pub const fn set_tool_call_dialect(&mut self, dialect: crate::dialects::Dialect) {
+        self.tool_call_dialect = dialect;
+    }
+
+    /// The model-catalog-selected tool-call dialect.
+    #[must_use]
+    pub const fn tool_call_dialect(&self) -> crate::dialects::Dialect {
+        self.tool_call_dialect
     }
 
     /// Register async fetchers for queued steering/follow-up messages.
@@ -2025,12 +2090,90 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
+        if !prompts.is_empty() {
+            self.retry_keyword_activations.clear();
+        }
         let saved_thinking = self.config.stream_options.thinking_level;
         let saved_system_prompt = self.config.system_prompt.clone();
         let result = self.run_loop_inner(prompts, on_event, abort).await;
         self.config.stream_options.thinking_level = saved_thinking;
         self.config.system_prompt = saved_system_prompt;
+        if result.as_ref().is_ok_and(|message| {
+            !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        }) {
+            self.retry_keyword_activations.clear();
+        }
         result
+    }
+
+    fn apply_magic_keyword_effects(&mut self, hits: &[crate::magic_keywords::KeywordActivation]) {
+        let keyword_max_thinking_level = self.keyword_max_thinking_level;
+        for hit in hits {
+            if hit.action == "ultrathink" {
+                self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
+            }
+        }
+        let directives =
+            crate::magic_keywords::directives_for(hits, self.config.keyword_settings.as_ref());
+        if !directives.is_empty() {
+            let block = directives.join("\n");
+            match &mut self.config.system_prompt {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&block);
+                }
+                none_slot => {
+                    *none_slot = Some(block);
+                }
+            }
+        }
+    }
+
+    /// Apply magic-keyword effects for one user-authored message delivered
+    /// during the current run. The caller owns the turn-wide de-duplication
+    /// set so initial prompts, steering, and follow-ups share one activation
+    /// boundary and cannot inject the same directive repeatedly.
+    fn apply_magic_keywords_for_message(
+        &mut self,
+        message: &Message,
+        turn_keyword_words: &mut std::collections::HashSet<String>,
+    ) {
+        let Message::User(user) = message else {
+            return;
+        };
+        let scan_text = match &user.content {
+            UserContent::Text(text) => Cow::Borrowed(text.as_str()),
+            UserContent::Blocks(blocks) => Cow::Owned(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        };
+        self.apply_magic_keywords_for_text(&scan_text, turn_keyword_words);
+    }
+
+    fn apply_magic_keywords_for_text(
+        &mut self,
+        scan_text: &str,
+        turn_keyword_words: &mut std::collections::HashSet<String>,
+    ) {
+        let hits: Vec<_> =
+            crate::magic_keywords::detect(scan_text, self.config.keyword_settings.as_ref())
+                .into_iter()
+                .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
+                .collect();
+        if hits.is_empty() {
+            return;
+        }
+
+        self.apply_magic_keyword_effects(&hits);
+        self.retry_keyword_activations.extend(hits.iter().cloned());
+        self.keyword_ledger.extend(hits);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2056,6 +2199,12 @@ impl Agent {
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
         let mut turn_keyword_words = std::collections::HashSet::new();
 
+        if prompts.is_empty() && !self.retry_keyword_activations.is_empty() {
+            let retry_hits = self.retry_keyword_activations.clone();
+            turn_keyword_words.extend(retry_hits.iter().map(|hit| hit.word.clone()));
+            self.apply_magic_keyword_effects(&retry_hits);
+        }
+
         let agent_start_event = AgentEvent::AgentStart {
             session_id: session_id.clone(),
         };
@@ -2063,60 +2212,19 @@ impl Agent {
             .await;
         on_event(agent_start_event);
 
+        let mut keyword_scan_override = self.magic_keyword_scan_override.take();
         for prompt in prompts {
             // Magic keywords (bd-cv653.3.6): pre-send prose scan of the user
             // message. ultrathink raises the turn's thinking level to the
             // active model's pre-clamped maximum; orchestrate/workflowz/custom words
             // append their directive to the system prompt (appended, never
             // inserted, so provider prompt caches stay valid).
-            if let Message::User(user) = &prompt {
-                let scan_text = match &user.content {
-                    UserContent::Text(text) => Cow::Borrowed(text.as_str()),
-                    UserContent::Blocks(blocks) => Cow::Owned(
-                        blocks
-                            .iter()
-                            .filter_map(|block| match block {
-                                ContentBlock::Text(text) => Some(text.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ),
-                };
-                let hits: Vec<_> = crate::magic_keywords::detect(
-                    &scan_text,
-                    self.config.keyword_settings.as_ref(),
-                )
-                .into_iter()
-                .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
-                .collect();
-                if !hits.is_empty() {
-                    let mut directives = Vec::new();
-                    let keyword_max_thinking_level = self.keyword_max_thinking_level;
-                    for hit in &hits {
-                        if hit.action == "ultrathink" {
-                            self.stream_options_mut().thinking_level =
-                                Some(keyword_max_thinking_level);
-                        }
-                    }
-                    directives.extend(crate::magic_keywords::directives_for(
-                        &hits,
-                        self.config.keyword_settings.as_ref(),
-                    ));
-                    if !directives.is_empty() {
-                        let block = directives.join("\n");
-                        match &mut self.config.system_prompt {
-                            Some(existing) => {
-                                existing.push_str("\n\n");
-                                existing.push_str(&block);
-                            }
-                            none_slot => {
-                                *none_slot = Some(block);
-                            }
-                        }
-                    }
-                    self.keyword_ledger.extend(hits);
-                }
+            if matches!(prompt, Message::User(_))
+                && let Some(source) = keyword_scan_override.take()
+            {
+                self.apply_magic_keywords_for_text(&source, &mut turn_keyword_words);
+            } else {
+                self.apply_magic_keywords_for_message(&prompt, &mut turn_keyword_words);
             }
             self.messages.push(prompt.clone());
             on_event(AgentEvent::MessageStart {
@@ -2182,6 +2290,7 @@ impl Agent {
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
+                    self.apply_magic_keywords_for_message(&message, &mut turn_keyword_words);
                     // Advisor notes get a dedicated event on delivery
                     // (bd-cv653.3.3) so RPC/ACP surfaces can render them.
                     if let Message::User(user) = &message
@@ -2259,6 +2368,10 @@ impl Agent {
                         let err_string = err.to_string();
                         let steering_to_add = self.drain_steering_messages().await;
                         for message in steering_to_add {
+                            self.apply_magic_keywords_for_message(
+                                &message,
+                                &mut turn_keyword_words,
+                            );
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -2316,6 +2429,7 @@ impl Agent {
                 ) {
                     let steering_to_add = self.drain_steering_messages().await;
                     for message in steering_to_add {
+                        self.apply_magic_keywords_for_message(&message, &mut turn_keyword_words);
                         self.messages.push(message.clone());
                         on_event(AgentEvent::MessageStart {
                             message: message.clone(),
@@ -2435,6 +2549,10 @@ impl Agent {
 
                         let steering_to_add = self.drain_steering_messages().await;
                         for message in steering_to_add {
+                            self.apply_magic_keywords_for_message(
+                                &message,
+                                &mut turn_keyword_words,
+                            );
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -2482,6 +2600,10 @@ impl Agent {
                         Err(err) => {
                             let steering_to_add = self.drain_steering_messages().await;
                             for message in steering_to_add {
+                                self.apply_magic_keywords_for_message(
+                                    &message,
+                                    &mut turn_keyword_words,
+                                );
                                 self.messages.push(message.clone());
                                 on_event(AgentEvent::MessageStart {
                                     message: message.clone(),
@@ -10151,12 +10273,17 @@ impl AgentSession {
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
         let provider = self.agent.provider();
-        let keyword_max = registry
-            .find(provider.name(), provider.model_id())
+        let entry = registry.find(provider.name(), provider.model_id());
+        let keyword_max = entry
+            .as_ref()
             .map_or(self.agent.keyword_max_thinking_level, |entry| {
                 entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
             });
         self.agent.set_keyword_max_thinking_level(keyword_max);
+        self.agent.set_tool_call_dialect(entry.as_ref().map_or_else(
+            || self.agent.tool_call_dialect(),
+            ModelEntry::tool_call_dialect,
+        ));
         self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
         // Keep the extension ctx catalog in sync when the registry is
         // replaced after extension boot (e.g. after merging extension
@@ -10278,6 +10405,8 @@ impl AgentSession {
         self.agent.stream_options_mut().thinking_level = Some(next_thinking);
         let keyword_max = self.keyword_max_thinking_level_for_model(provider_id, model_id);
         self.agent.set_keyword_max_thinking_level(keyword_max);
+        let dialect = self.tool_call_dialect_for_model(provider_id, model_id);
+        self.agent.set_tool_call_dialect(dialect);
         self.refresh_extension_completion_host_state();
 
         {
@@ -10378,6 +10507,20 @@ impl AgentSession {
             })
     }
 
+    fn tool_call_dialect_for_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> crate::dialects::Dialect {
+        self.model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider_id, model_id))
+            .map_or_else(
+                || self.agent.tool_call_dialect(),
+                |entry| entry.tool_call_dialect(),
+            )
+    }
+
     fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
         let normalize = |key_opt: Option<String>| {
             key_opt.and_then(|key| {
@@ -10439,9 +10582,11 @@ impl AgentSession {
             self.clamp_thinking_level_for_model(&active_provider_id, &active_model_id, requested);
         let keyword_max =
             self.keyword_max_thinking_level_for_model(&active_provider_id, &active_model_id);
+        let dialect = self.tool_call_dialect_for_model(&active_provider_id, &active_model_id);
 
         self.agent.stream_options_mut().thinking_level = Some(effective);
         self.agent.set_keyword_max_thinking_level(keyword_max);
+        self.agent.set_tool_call_dialect(dialect);
         self.refresh_extension_completion_host_state();
 
         let thinking_changed = !effective.eq(&current_thinking);
@@ -11430,57 +11575,6 @@ impl AgentSession {
         self.run_text_with_abort(input, None, on_event).await
     }
 
-    /// Drain the magic-keyword activation ledger into session Custom
-    /// entries (bd-cv653.3.6) so activations are auditable ("why did
-    /// thinking jump to max?").
-    async fn persist_keyword_ledger(&mut self) -> Result<()> {
-        if self.agent.keyword_ledger.is_empty() {
-            return Ok(());
-        }
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-            .await
-            .map_err(|err| Error::session(err.to_string()))?;
-        let activations = self.agent.drain_keyword_ledger();
-        crate::magic_keywords::append_session_telemetry(&mut inner, &activations);
-        if self.save_enabled {
-            inner.flush_autosave(AutosaveFlushTrigger::Periodic).await?;
-        }
-        Ok(())
-    }
-
-    async fn finish_turn_ledgers(&mut self) -> Result<()> {
-        self.persist_repair_ledger().await?;
-        self.persist_keyword_ledger().await
-    }
-
-    /// Drain the dialect-repair ledger into session Custom entries
-    /// (bd-cv653.7.8) so repairs are replayable/auditable.
-    async fn persist_repair_ledger(&self) -> Result<()> {
-        if self.agent.repair_ledger_is_empty()? {
-            return Ok(());
-        }
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-            .await
-            .map_err(|err| Error::session(err.to_string()))?;
-        let repairs = self.agent.drain_repair_ledger()?;
-        for entry in &repairs {
-            inner.append_custom_entry(
-                "dialect_repair".to_string(),
-                Some(serde_json::json!({
-                    "tool": entry.tool,
-                    "strippedBytes": entry.stripped_bytes,
-                    "remainingTextBytes": entry.remaining_text_bytes,
-                })),
-            );
-        }
-        if self.save_enabled {
-            inner.flush_autosave(AutosaveFlushTrigger::Periodic).await?;
-        }
-        Ok(())
-    }
-
     /// Advisor hook (bd-cv653.3.3): after a completed turn, if the advisor
     /// role resolved a model, review a compact digest and inject the verdict
     /// into the next turn via the steering queue. Zero-overhead gate: no
@@ -11557,6 +11651,9 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
+            // Consume the one-shot provenance before extension dispatch so a
+            // blocked/failed input cannot leak it into the next user turn.
+            let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
             let outcome = self.dispatch_input_event(input, Vec::new()).await?;
             let (text, images) = match outcome {
                 InputEventOutcome::Continue { text, images } => (text, images),
@@ -11582,6 +11679,7 @@ impl AgentSession {
             } else {
                 self.agent.set_system_prompt(base_system_prompt.clone());
             }
+            self.agent.magic_keyword_scan_override = keyword_scan_override;
 
             let result = if images.is_empty() {
                 self.run_agent_with_text(text, abort, on_event, custom_messages)
@@ -11591,13 +11689,16 @@ impl AgentSession {
                 self.run_agent_with_content(content, abort, on_event, custom_messages)
                     .await
             };
+            // `run_loop_inner` normally consumes this. Clear it here as the
+            // fail-closed fallback when setup/synchronization returns early.
+            let _ = self.agent.magic_keyword_scan_override.take();
 
             self.agent.set_system_prompt(base_system_prompt);
-            let ledger_result = self.finish_turn_ledgers().await;
-            self.maybe_advise_turn().await;
             match result {
                 Ok(message) => {
-                    ledger_result?;
+                    if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        self.maybe_advise_turn().await;
+                    }
                     Ok(message)
                 }
                 Err(err) => Err(err),
@@ -11625,6 +11726,9 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
+            // See the text path above: provenance is one-shot even when an
+            // input extension blocks before the Agent loop starts.
+            let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
             let (text, images) = Self::split_content_blocks_for_input(&content);
             let outcome = self.dispatch_input_event(text, images).await?;
             let (text, images) = match outcome {
@@ -11651,18 +11755,20 @@ impl AgentSession {
             } else {
                 self.agent.set_system_prompt(base_system_prompt.clone());
             }
+            self.agent.magic_keyword_scan_override = keyword_scan_override;
 
             let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
             let result = self
                 .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
                 .await;
+            let _ = self.agent.magic_keyword_scan_override.take();
 
             self.agent.set_system_prompt(base_system_prompt);
-            let ledger_result = self.finish_turn_ledgers().await;
-            self.maybe_advise_turn().await;
             match result {
                 Ok(message) => {
-                    ledger_result?;
+                    if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        self.maybe_advise_turn().await;
+                    }
                     Ok(message)
                 }
                 Err(err) => Err(err),
@@ -12138,8 +12244,11 @@ impl AgentSession {
         drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
 
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         let persist_result = self
-            .persist_new_messages(start_len + 1, result.is_err())
+            .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
         let result = result?;
@@ -12221,8 +12330,11 @@ impl AgentSession {
 
         // Persist any NEW messages (assistant/tools) generated before the agent stopped,
         // even if it stopped due to an error, skipping the user message we already saved.
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         let persist_result = self
-            .persist_new_messages(start_len + 1, result.is_err())
+            .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
         let result = result?;
@@ -12304,8 +12416,11 @@ impl AgentSession {
 
         // Persist any NEW messages (assistant/tools) generated before the agent stopped,
         // even if it stopped due to an error, skipping the user message we already saved.
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         let persist_result = self
-            .persist_new_messages(start_len + 1, result.is_err())
+            .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
         let result = result?;
@@ -12358,24 +12473,56 @@ impl AgentSession {
 
         // Persist any NEW messages generated by the resume, even on error.
         // No user message was added, so nothing to skip: persist from start_len.
-        let persist_result = self.persist_new_messages(start_len, result.is_err()).await;
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
+        let persist_result = self
+            .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
+            .await;
 
         let result = result?;
         persist_result?;
         Ok(result)
     }
 
-    async fn persist_new_messages(&self, start_len: usize, run_failed: bool) -> Result<()> {
-        let new_messages = self.agent.messages()[start_len..].to_vec();
+    /// Persist the turn transcript and both audit ledgers under one session
+    /// lock. On a failed/aborted turn the incomplete assistant is deliberately
+    /// appended last, after audit and queued-steering entries, so
+    /// `revert_incomplete_response` can remove it without discarding the
+    /// durable audit trail or replaying completed tool effects.
+    async fn persist_turn_artifacts(
+        &mut self,
+        start_len: usize,
+        run_failed: bool,
+        run_incomplete: bool,
+    ) -> Result<()> {
+        let mut new_messages = self.agent.messages()[start_len..].to_vec();
+        let incomplete_assistant = if run_incomplete {
+            new_messages
+                .iter()
+                .rposition(is_incomplete_assistant_message)
+                .map(|index| new_messages.remove(index))
+        } else {
+            None
+        };
         {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            let repairs = self.agent.drain_repair_ledger()?;
+            let activations = self.agent.drain_keyword_ledger();
             for message in new_messages {
                 if run_failed && is_synthetic_empty_error_assistant(&message) {
                     continue;
                 }
+                session.append_model_message(message);
+            }
+            append_dialect_repair_telemetry(&mut session, &repairs);
+            crate::magic_keywords::append_session_telemetry(&mut session, &activations);
+            if let Some(message) = incomplete_assistant
+                && !(run_failed && is_synthetic_empty_error_assistant(&message))
+            {
                 session.append_model_message(message);
             }
             if self.save_enabled {
@@ -12386,6 +12533,14 @@ impl AgentSession {
         }
         Ok(())
     }
+}
+
+fn is_incomplete_assistant_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Assistant(assistant)
+            if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
+    )
 }
 
 fn is_synthetic_empty_error_assistant(message: &Message) -> bool {
@@ -13083,6 +13238,7 @@ mod tests {
     struct CapturedProviderContext {
         system_prompt: Option<String>,
         messages: Vec<Message>,
+        thinking_level: Option<crate::model::ThinkingLevel>,
     }
 
     #[derive(Debug)]
@@ -13122,7 +13278,7 @@ mod tests {
         async fn stream(
             &self,
             context: &Context<'_>,
-            _options: &StreamOptions,
+            options: &StreamOptions,
         ) -> crate::error::Result<
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
         > {
@@ -13132,6 +13288,7 @@ mod tests {
                 .push(CapturedProviderContext {
                     system_prompt: context.system_prompt.as_ref().map(ToString::to_string),
                     messages: context.messages.iter().cloned().collect(),
+                    thinking_level: options.thinking_level,
                 });
             let final_message = assistant_message("captured");
             Ok(Box::pin(futures::stream::iter(vec![Ok(
@@ -13576,6 +13733,149 @@ mod tests {
             assert_user_text(&calls[0].messages[0], "hello");
             assert!(calls[0].system_prompt.is_none());
             drop(calls);
+        });
+    }
+
+    #[test]
+    fn queued_steering_and_follow_up_messages_apply_magic_keywords_on_delivery() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+            agent.queue_steering(user_message("ultrathink before continuing"));
+            agent.queue_follow_up(user_message("orchestrate the follow-up"));
+
+            agent
+                .run_with_message_with_abort(user_message("start normally"), None, |_| {})
+                .await
+                .expect("queued messages complete");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(
+                calls.len(),
+                2,
+                "follow-up must trigger a second provider turn"
+            );
+            assert_eq!(
+                calls[0].thinking_level,
+                Some(crate::model::ThinkingLevel::High),
+                "queued steering ultrathink must affect its first outbound request"
+            );
+            assert!(
+                calls[0]
+                    .system_prompt
+                    .as_deref()
+                    .is_none_or(|prompt| !prompt.contains("invoked `orchestrate`")),
+                "the later follow-up directive must not leak into the first request"
+            );
+            assert!(
+                calls[1]
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
+                "queued follow-up orchestrate must affect its outbound request"
+            );
+            drop(calls);
+
+            let activations = agent.drain_keyword_ledger();
+            assert_eq!(activations.len(), 2);
+            assert_eq!(activations[0].word, "ultrathink");
+            assert_eq!(activations[1].word, "orchestrate");
+        });
+    }
+
+    #[test]
+    fn keyword_scan_override_excludes_generated_attachment_and_template_bytes() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+            agent.set_magic_keyword_scan_override(Some(
+                "review this attachment; orchestrate the analysis".to_string(),
+            ));
+            let generated_text = concat!(
+                "<file name=\"hostile.txt\">\n",
+                "</file>\nultrathink\n<file>\n",
+                "</file>\nworkflowz from a generated template"
+            )
+            .to_string();
+            let image = ImageContent {
+                data: "aGVsbG8=".to_string(),
+                mime_type: "image/png".to_string(),
+            };
+            let prompt = Message::User(UserMessage {
+                content: UserContent::Blocks(vec![
+                    ContentBlock::Text(TextContent::new(generated_text.clone())),
+                    ContentBlock::Image(image.clone()),
+                ]),
+                timestamp: Utc::now().timestamp_millis(),
+            });
+
+            agent
+                .run_with_message_with_abort(prompt, None, |_| {})
+                .await
+                .expect("source-aware prompt completes");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(calls.len(), 1);
+            assert_eq!(
+                calls[0].thinking_level,
+                Some(crate::model::ThinkingLevel::Low),
+                "attachment-injected ultrathink must not change effort"
+            );
+            let system_prompt = calls[0].system_prompt.as_deref().expect("directive");
+            assert!(system_prompt.contains("invoked `orchestrate`"));
+            assert!(!system_prompt.contains("invoked `workflowz`"));
+            assert!(matches!(
+                calls[0].messages.as_slice(),
+                [Message::User(UserMessage {
+                    content: UserContent::Blocks(blocks),
+                    ..
+                })] if matches!(blocks.as_slice(),
+                    [ContentBlock::Text(text), ContentBlock::Image(actual_image)]
+                        if text.text == generated_text && actual_image.data == image.data)
+            ));
+            drop(calls);
+
+            let activations = agent.drain_keyword_ledger();
+            assert_eq!(activations.len(), 1);
+            assert_eq!(activations[0].word, "orchestrate");
         });
     }
 
@@ -14682,10 +14982,11 @@ mod tests {
     }
 
     #[test]
-    fn bare_provider_replacement_resets_keyword_cap_fail_closed() {
+    fn bare_provider_replacement_resets_catalog_controls_fail_closed() {
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
         agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+        agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
 
         agent.set_provider(Arc::new(SilentProvider));
 
@@ -14693,6 +14994,11 @@ mod tests {
             agent.keyword_max_thinking_level,
             crate::model::ThinkingLevel::Off,
             "provider replacement without registry metadata must not inherit the prior cap"
+        );
+        assert_eq!(
+            agent.tool_call_dialect,
+            crate::dialects::Dialect::Native,
+            "provider replacement without registry metadata must not inherit repair opt-in"
         );
     }
 
@@ -15739,8 +16045,12 @@ mod tests {
     /// Emits a text-embedded tool call on stream 1, plain text on stream 2.
     struct TextCallProvider {
         calls: std::sync::atomic::AtomicUsize,
-        /// When true, report a Native-mapped model id (no repair path).
-        native: bool,
+        model_id: &'static str,
+        /// When true, the request after the repaired tool result drops
+        /// mid-stream once so retry cleanup can be exercised.
+        fail_after_tool_once: bool,
+        /// Optional mutation-sensitive assertion for the resumed request.
+        expected_retry_thinking: Option<crate::model::ThinkingLevel>,
     }
 
     #[async_trait]
@@ -15753,15 +16063,24 @@ mod tests {
             "test-api"
         }
         fn model_id(&self) -> &str {
-            if self.native { "gpt-4o" } else { "qwen3-mock" }
+            self.model_id
         }
 
         async fn stream(
             &self,
-            _context: &Context<'_>,
-            _options: &StreamOptions,
+            context: &Context<'_>,
+            options: &StreamOptions,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
             let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_number >= 2
+                && let Some(expected) = self.expected_retry_thinking
+            {
+                assert_eq!(
+                    options.thinking_level,
+                    Some(expected),
+                    "retry must preserve the original turn's magic-keyword effort"
+                );
+            }
             let make = |content: Vec<ContentBlock>, reason: StopReason| AssistantMessage {
                 content,
                 api: "test-api".to_string(),
@@ -15789,7 +16108,29 @@ mod tests {
                         ),
                     }),
                 ]
+            } else if self.fail_after_tool_once && call_number == 1 {
+                vec![
+                    Ok(StreamEvent::Start {
+                        partial: make(Vec::new(), StopReason::Stop),
+                    }),
+                    Err(Error::api(
+                        "SSE error: connection reset by peer (transient connection drop)",
+                    )),
+                ]
             } else {
+                assert!(
+                    !context.messages.iter().any(|message| {
+                        matches!(
+                            message,
+                            Message::Assistant(assistant)
+                                if matches!(
+                                    assistant.stop_reason,
+                                    StopReason::Error | StopReason::Aborted
+                                )
+                        )
+                    }),
+                    "retry context must not retain the incomplete assistant"
+                );
                 vec![
                     Ok(StreamEvent::TextDelta {
                         content_index: 0,
@@ -15811,6 +16152,79 @@ mod tests {
     }
 
     #[test]
+    fn dialect_repair_preserves_other_blocks_and_uses_unique_ids() {
+        let provider = Arc::new(TextCallProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model_id: "qwen3-mock",
+            fail_after_tool_once: false,
+            expected_retry_thinking: None,
+        });
+        let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+        agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
+        let original = AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "reasoning".to_string(),
+                    thinking_signature: Some("thinking-sig".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "preface".to_string(),
+                    text_signature: Some("preface-sig".to_string()),
+                }),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: r#"<tool_call>{"name":"read","arguments":{"path":"fixture.txt"}}</tool_call>"#
+                        .to_string(),
+                    text_signature: Some("candidate-sig".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "tail".to_string(),
+                    text_signature: Some("tail-sig".to_string()),
+                }),
+            ],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "qwen3-mock".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_details: None,
+            error_message: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let first = agent.maybe_repair_dialect_tool_calls(original.clone());
+        let second = agent.maybe_repair_dialect_tool_calls(original);
+        assert!(matches!(
+            &first.content[0],
+            ContentBlock::Thinking(thinking)
+                if thinking.thinking_signature.as_deref() == Some("thinking-sig")
+        ));
+        assert!(matches!(
+            &first.content[1],
+            ContentBlock::Text(text)
+                if text.text == "preface"
+                    && text.text_signature.as_deref() == Some("preface-sig")
+        ));
+        assert!(matches!(&first.content[2], ContentBlock::Image(_)));
+        assert!(matches!(
+            &first.content[4],
+            ContentBlock::Text(text)
+                if text.text == "tail" && text.text_signature.as_deref() == Some("tail-sig")
+        ));
+        let first_id = extract_tool_calls(&first.content)[0].id.clone();
+        let second_id = extract_tool_calls(&second.content)[0].id.clone();
+        assert_ne!(
+            first_id, second_id,
+            "repaired call IDs must be session-unique"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn dialect_repair_continues_turn_and_executes_tool() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -15819,27 +16233,52 @@ mod tests {
             // CONTROL: Native dialect (no repair path) — a plain-text turn
             // must complete without hitting the iteration cap. If this
             // loops, the test provider is the artifact, not the repair.
-            let control = Arc::new(TextCallProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                native: true,
-            });
-            let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-            let mut control_agent = Agent::new(control, control_tools, AgentConfig::default());
-            control_agent.config.max_tool_iterations = 5;
-            let control_session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut control_session = AgentSession::new(
-                control_agent,
-                control_session,
-                false,
-                ResolvedCompactionSettings::default(),
-            );
-            let control_result = control_session
-                .run_text_with_abort("hello".to_string(), None, |_| {})
-                .await;
-            if let Err(err) = &control_result {
+            for model_id in ["gpt-4o", "gpt-5.5"] {
+                let control = Arc::new(TextCallProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    model_id,
+                    fail_after_tool_once: false,
+                    expected_retry_thinking: None,
+                });
+                let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+                let mut control_agent = Agent::new(
+                    Arc::clone(&control) as Arc<dyn Provider>,
+                    control_tools,
+                    AgentConfig::default(),
+                );
+                control_agent.config.max_tool_iterations = 5;
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let mut control_session = AgentSession::new(
+                    control_agent,
+                    Arc::clone(&session),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let tool_starts_for_events = Arc::clone(&tool_starts);
+                let control_result = control_session
+                    .run_text_with_abort("hello".to_string(), None, move |event| {
+                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                    .await
+                    .expect("non-repairable control completes");
+                assert_eq!(control_result.stop_reason, StopReason::Stop);
+                assert_eq!(control.calls.load(Ordering::SeqCst), 1, "{model_id}");
+                assert_eq!(tool_starts.load(Ordering::SeqCst), 0, "{model_id}");
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("control session lock");
                 assert!(
-                    !err.to_string().contains("Maximum tool iterations"),
-                    "control provider looped: {err}"
+                    inner
+                        .entries_for_current_path()
+                        .iter()
+                        .all(|entry| !matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "dialect_repair"
+                        )),
+                    "{model_id} must not persist repair telemetry"
                 );
             }
         });
@@ -15849,10 +16288,13 @@ mod tests {
                 .expect("write fixture");
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                native: false,
+                model_id: "qwen3-mock",
+                fail_after_tool_once: false,
+                expected_retry_thinking: None,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
-            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
             let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
                 temp.path().join("sessions"),
             ))));
@@ -15941,6 +16383,239 @@ mod tests {
                 })
                 .count();
             assert_eq!(persisted_repairs, 1, "repair audit entry survives reopen");
+        });
+    }
+
+    #[test]
+    fn dialect_repair_on_resume_persists_before_exit() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
+                .expect("write fixture");
+            let provider = Arc::new(TextCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                model_id: "qwen3-mock",
+                fail_after_tool_once: false,
+                expected_retry_thinking: None,
+            });
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
+            let mut durable_session =
+                Session::create_with_dir(Some(temp.path().join("resume-sessions")));
+            durable_session.append_model_message(Message::User(UserMessage {
+                content: UserContent::Text("check the fixture".to_string()),
+                timestamp: Utc::now().timestamp_millis(),
+            }));
+            let session = Arc::new(Mutex::new(durable_session));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let final_message = agent_session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("resume completes");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+
+            let persisted_path = {
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("session lock");
+                inner.path.clone().expect("autosave created session file")
+            };
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen autosaved resume session");
+            let persisted_repairs = reopened
+                .entries_for_current_path()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "dialect_repair"
+                                && custom.data.as_ref().is_some_and(|data| {
+                                    data["tool"] == json!("read")
+                                })
+                    )
+                })
+                .count();
+            assert_eq!(
+                persisted_repairs, 1,
+                "resume repair audit entry survives an immediate reopen"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failed_keyword_repair_turn_keeps_audits_and_reverts_incomplete_tail() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
+                .expect("write fixture");
+            let provider = Arc::new(TextCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                model_id: "qwen3-mock",
+                fail_after_tool_once: true,
+                expected_retry_thinking: Some(crate::model::ThinkingLevel::High),
+            });
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let mut agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                tools,
+                AgentConfig::default(),
+            );
+            agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("retry-sessions"),
+            ))));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool_starts_for_events = Arc::clone(&tool_starts);
+
+            let failed = agent_session
+                .run_text_with_abort(
+                    "ultrathink check the fixture".to_string(),
+                    None,
+                    move |event| {
+                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                )
+                .await
+                .expect("mid-stream failure is represented by an assistant message");
+            assert_eq!(failed.stop_reason, StopReason::Error);
+
+            {
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("failed session lock");
+                let entries = inner.entries_for_current_path();
+                assert!(matches!(
+                    entries.last(),
+                    Some(crate::session::SessionEntry::Message(message))
+                        if matches!(
+                            &message.message,
+                            crate::session::SessionMessage::Assistant { message }
+                                if message.stop_reason == StopReason::Error
+                        )
+                ));
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "dialect_repair"
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "magic_keyword"
+                        ))
+                        .count(),
+                    1
+                );
+            }
+
+            assert!(
+                agent_session
+                    .revert_incomplete_response()
+                    .await
+                    .expect("revert succeeds"),
+                "the failed assistant must remain the removable session tail"
+            );
+            let resumed = agent_session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("retry resumes after the completed tool cycle");
+            assert_eq!(resumed.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(tool_starts.load(Ordering::SeqCst), 1);
+
+            let persisted_path = {
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("resumed session lock");
+                inner.path.clone().expect("autosave created session file")
+            };
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen autosaved retry session");
+            let entries = reopened.entries_for_current_path();
+            assert!(entries.iter().all(|entry| !matches!(
+                entry,
+                crate::session::SessionEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        crate::session::SessionMessage::Assistant { message }
+                            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                    )
+            )));
+            let repair_data = entries.iter().find_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == "dialect_repair" =>
+                {
+                    custom.data.as_ref()
+                }
+                _ => None,
+            });
+            assert_eq!(
+                repair_data
+                    .and_then(|data| data.get("tool"))
+                    .and_then(Value::as_str),
+                Some("read")
+            );
+            assert!(
+                repair_data
+                    .and_then(|data| data.get("strippedBytes"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|bytes| bytes > 0),
+                "repair telemetry must prove that text was actually stripped"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "dialect_repair"
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "magic_keyword"
+                    ))
+                    .count(),
+                1
+            );
         });
     }
 

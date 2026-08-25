@@ -162,6 +162,11 @@ pub struct VerificationReport {
 }
 
 /// Computes the split-conformal calibration quantile threshold with finite-sample coverage guarantee.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 pub fn compute_conformal_threshold(
     raw_samples: &[f64],
     comparison: &str,
@@ -269,6 +274,7 @@ impl std::fmt::Display for CalibIssue<'_> {
     }
 }
 
+#[must_use]
 pub fn verify_conformal_artifact(
     artifact: &ConformalCalibrationArtifact,
     contract_path: &Path,

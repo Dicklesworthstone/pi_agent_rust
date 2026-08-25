@@ -47,9 +47,6 @@ fn test_inspect_image_schema_and_metadata() {
 
 #[test]
 fn test_inspect_image_fixture_analysis() {
-    let harness = TestHarness::new("inspect_image_fixture");
-    let img_path = harness.temp_path("fixture.png");
-
     // Minimal valid 1x1 PNG
     const PNG_BYTES: &[u8] = &[
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
@@ -58,6 +55,9 @@ fn test_inspect_image_fixture_analysis() {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
+
+    let harness = TestHarness::new("inspect_image_fixture");
+    let img_path = harness.temp_path("fixture.png");
     fs::write(&img_path, PNG_BYTES).expect("write png fixture");
 
     asupersync::test_utils::run_test(|| async {
@@ -131,9 +131,9 @@ fn test_inspect_image_unsupported_format_error() {
 
 #[test]
 fn test_inspect_image_auth_error_when_unconfigured() {
+    const PNG_BYTES: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     let harness = TestHarness::new("inspect_image_auth_error");
     let img_path = harness.temp_path("fixture.png");
-    const PNG_BYTES: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     fs::write(&img_path, PNG_BYTES).expect("write png");
 
     asupersync::test_utils::run_test(|| async {
@@ -371,18 +371,20 @@ fn test_media_tools_default_gated_off() {
 #[test]
 fn test_media_tools_opt_in_activation() {
     let harness = TestHarness::new("media_tools_opt_in");
-    let mut config = Config::default();
-    config.media = Some(MediaSettings {
-        enable_inspect_image: Some(true),
-        enable_generate_image: Some(true),
-        enable_tts: Some(true),
-        vision_model: Some("gemini-1.5-pro".to_string()),
-        vision_provider: Some("gemini".to_string()),
-        image_gen_provider: Some("openai".to_string()),
-        image_gen_model: Some("dall-e-3".to_string()),
-        tts_voice: Some("eve".to_string()),
-        tts_provider: Some("xai".to_string()),
-    });
+    let config = Config {
+        media: Some(MediaSettings {
+            enable_inspect_image: Some(true),
+            enable_generate_image: Some(true),
+            enable_tts: Some(true),
+            vision_model: Some("gemini-1.5-pro".to_string()),
+            vision_provider: Some("gemini".to_string()),
+            image_gen_provider: Some("openai".to_string()),
+            image_gen_model: Some("dall-e-3".to_string()),
+            tts_voice: Some("eve".to_string()),
+            tts_provider: Some("xai".to_string()),
+        }),
+        ..Default::default()
+    };
 
     let enabled_registry = ToolRegistry::new(
         &["read", "inspect_image", "generate_image", "tts"],

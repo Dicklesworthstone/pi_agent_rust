@@ -9,7 +9,13 @@
 #![allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::unreadable_literal
+    clippy::unreadable_literal,
+    clippy::collapsible_if,
+    clippy::redundant_clone,
+    clippy::manual_range_contains,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::too_many_lines,
+    clippy::suboptimal_flops
 )]
 
 use pi::perf_build::{

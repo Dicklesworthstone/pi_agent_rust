@@ -1215,6 +1215,7 @@ impl PiApp {
         agent_guard.set_keyword_max_thinking_level(
             target_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
         );
+        agent_guard.set_tool_call_dialect(target_entry.tool_call_dialect());
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
         drop(agent_guard);
 
@@ -4356,6 +4357,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 }
             };
 
+            let keyword_scan_source = raw_input;
             let mut text = processed.text;
             if !message_for_agent.trim().is_empty() {
                 text.push_str(&message_for_agent);
@@ -4377,7 +4379,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
             self.history.push(history_entry);
             let display = super::conversation::content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display);
+            return self.submit_content_with_display_and_keyword_source(
+                content,
+                &display,
+                Some(keyword_scan_source),
+            );
         }
 
         if message_for_agent.is_empty() {
@@ -4388,7 +4394,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         self.history.push(history_entry);
         let content = vec![ContentBlock::Text(TextContent::new(message_for_agent))];
         let display = super::conversation::content_blocks_to_text(&content);
-        self.submit_content_with_display(content, &display)
+        self.submit_content_with_display_and_keyword_source(content, &display, Some(raw_input))
     }
 }
 

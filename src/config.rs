@@ -854,7 +854,7 @@ impl Config {
             computer: merge_computer(base.computer, other.computer),
             browser: merge_browser(base.browser, other.browser),
             secrets: other.secrets.or(base.secrets),
-            keywords: other.keywords.or(base.keywords),
+            keywords: merge_keywords(base.keywords, other.keywords),
             advisor: merge_advisor(base.advisor, other.advisor),
             lsp: merge_lsp(base.lsp, other.lsp),
             approval: merge_approval(base.approval, other.approval),
@@ -1686,6 +1686,26 @@ fn merge_advisor(
     }
 }
 
+/// Merge magic-keyword settings field-wise. Scalar toggles inherit from the
+/// lower-precedence layer when omitted; an explicitly supplied custom-word
+/// list replaces the lower layer's list (including an explicit empty list).
+fn merge_keywords(
+    base: Option<crate::magic_keywords::KeywordSettings>,
+    other: Option<crate::magic_keywords::KeywordSettings>,
+) -> Option<crate::magic_keywords::KeywordSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(crate::magic_keywords::KeywordSettings {
+            ultrathink: other.ultrathink.or(base.ultrathink),
+            orchestrate: other.orchestrate.or(base.orchestrate),
+            workflowz: other.workflowz.or(base.workflowz),
+            extra: other.extra.or(base.extra),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
 /// Merge bash mediation settings field-wise (bd-cv653.1.7).
 fn merge_bash(base: Option<BashSettings>, other: Option<BashSettings>) -> Option<BashSettings> {
     match (base, other) {
@@ -2408,6 +2428,57 @@ mod tests {
         assert!(!config.compaction_enabled());
         assert_eq!(config.compaction_reserve_tokens(), 1234);
         assert_eq!(config.compaction_keep_recent_tokens(), 5678);
+    }
+
+    #[test]
+    fn load_merges_keyword_settings_fieldwise() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+        write_file(
+            &global_dir.join("settings.json"),
+            r#"{
+                "keywords": {
+                    "ultrathink": true,
+                    "orchestrate": false,
+                    "workflowz": false,
+                    "extra": [{"word": "deepdive", "directive": "go deep"}]
+                }
+            }"#,
+        );
+        write_file(
+            &cwd.join(".pi/settings.json"),
+            r#"{"keywords":{"ultrathink":false}}"#,
+        );
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        let keywords = config.keywords.expect("merged keyword settings");
+        assert_eq!(keywords.ultrathink, Some(false));
+        assert_eq!(keywords.orchestrate, Some(false));
+        assert_eq!(keywords.workflowz, Some(false));
+        let extra = keywords.extra.expect("inherited custom keywords");
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].word, "deepdive");
+        assert_eq!(extra[0].directive, "go deep");
+    }
+
+    #[test]
+    fn keyword_custom_list_is_explicitly_replaceable() {
+        let base: Config = serde_json::from_str(
+            r#"{"keywords":{"extra":[{"word":"deepdive","directive":"go deep"}]}}"#,
+        )
+        .expect("base config");
+        let other: Config =
+            serde_json::from_str(r#"{"keywords":{"extra":[]}}"#).expect("other config");
+
+        let merged = Config::merge(base, other);
+        assert!(
+            merged
+                .keywords
+                .and_then(|keywords| keywords.extra)
+                .is_some_and(|extra| extra.is_empty()),
+            "an explicit higher-precedence empty list must clear inherited custom words"
+        );
     }
 
     #[test]

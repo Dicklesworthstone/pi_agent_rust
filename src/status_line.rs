@@ -56,10 +56,10 @@ pub enum StatusLinePreset {
 pub enum SeparatorStyle {
     #[default]
     Powerline, //  / 
-    Thin,      //  / 
-    Slash,     // /
-    Dot,       // •
-    Pipe,      // |
+    Thin,  //  / 
+    Slash, // /
+    Dot,   // •
+    Pipe,  // |
 }
 
 impl SeparatorStyle {

@@ -214,12 +214,8 @@ fn ultrathink_uses_model_clamped_max() {
     let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth storage");
     let (registry, expected_max) = capture_model_registry(&auth);
     let session = Arc::new(AsyncMutex::new(Session::in_memory()));
-    let mut agent_session = AgentSession::new(
-        agent,
-        session,
-        false,
-        ResolvedCompactionSettings::default(),
-    );
+    let mut agent_session =
+        AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
     agent_session.set_model_registry(registry);
 
     let response =
@@ -364,8 +360,9 @@ fn settings_disable_keywords() {
         ..Default::default()
     };
     let (mut agent, capture) = build_agent(&root, Some(settings));
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
 
-    block_on_local(agent.run("ultrathink and orchestrate this", |_| {})).expect("run");
+    block_on_local(agent.run("ultrathink, orchestrate, and workflowz this", |_| {})).expect("run");
     let capture = capture.lock().expect("capture").clone();
     harness.log().info(
         "verify",
@@ -377,9 +374,10 @@ fn settings_disable_keywords() {
                 .is_some_and(|p| p.contains("for this turn"))
         ),
     );
-    assert!(
-        !matches!(capture.thinking.first(), Some(&Some(ThinkingLevel::Max))),
-        "disabled ultrathink must not raise thinking: {:?}",
+    assert_eq!(
+        capture.thinking.first(),
+        Some(&None),
+        "disabled ultrathink must preserve the unset baseline: {:?}",
         capture.thinking
     );
     let prompt = capture.system_prompts[0].clone().expect("prompt");
@@ -396,16 +394,18 @@ fn code_and_paths_leave_request_untouched() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
 
     block_on_local(agent.run(
-        "see `ultrathink` and /tmp/orchestrate plus <think>workflowz</think>",
+        "see `ultrathink`, /tmp/orchestrate, <think>workflowz</think>, and https://example.test/?ultrathink",
         |_| {},
     ))
     .expect("run");
     let capture = capture.lock().expect("capture").clone();
-    assert!(
-        !matches!(capture.thinking.first(), Some(&Some(ThinkingLevel::Max))),
-        "code-span ultrathink must not raise: {:?}",
+    assert_eq!(
+        capture.thinking.first(),
+        Some(&None),
+        "excluded ultrathink occurrences must preserve the unset baseline: {:?}",
         capture.thinking
     );
     let prompt = capture.system_prompts[0].clone().expect("prompt");
@@ -462,18 +462,23 @@ fn block_keyword_activation_persists_in_session_custom_entry() {
 
     let reopened = block_on_local(Session::open(persisted_path.to_string_lossy().as_ref()))
         .expect("reopen autosaved session");
-    assert!(reopened.entries_for_current_path().into_iter().any(|entry| {
-        matches!(
-            entry,
-            SessionEntry::Custom(custom)
-                if custom.custom_type == "magic_keyword"
-                    && custom.data.as_ref().is_some_and(|data| {
-                        data["schema"] == json!("pi.magic_keyword.v1")
-                            && data["word"] == json!("ultrathink")
-                            && data["action"] == json!("ultrathink")
-                    })
-        )
-    }));
+    assert!(
+        reopened
+            .entries_for_current_path()
+            .into_iter()
+            .any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "magic_keyword"
+                            && custom.data.as_ref().is_some_and(|data| {
+                                data["schema"] == json!("pi.magic_keyword.v1")
+                                    && data["word"] == json!("ultrathink")
+                                    && data["action"] == json!("ultrathink")
+                            })
+                )
+            })
+    );
     finish_case(&harness, case);
 }
 
@@ -564,10 +569,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         }
         assert!(saw_agent_end, "RPC prompt never reached agent_end");
         drop(in_tx);
-        server
-            .await
-            .expect("RPC server task join")
-            .expect("RPC server result");
+        server.await.expect("RPC server task join");
     });
 
     let captured = capture.lock().expect("capture").clone();

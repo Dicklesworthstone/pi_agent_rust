@@ -2807,6 +2807,7 @@ fn perf_proof_field<'a>(fields: &'a [&str], index: usize, key: &str) -> Result<&
         .ok_or_else(|| format!("measurement negative-control proof requires {key}<value>"))
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn validate_perf_measurement_control_source(
     budget_name: &str,
     source: &str,

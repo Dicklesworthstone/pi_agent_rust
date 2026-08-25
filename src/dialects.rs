@@ -7,20 +7,23 @@
 //! ending on prose.
 //!
 //! Guards against false positives (the whole point of the layer):
-//! - Extraction only runs for models mapped to a non-native dialect
-//!   (`dialect_for_model`) — strong models never see the repair path.
+//! - Extraction only runs when the model catalog explicitly selects the
+//!   repairable Xmlish dialect; Native and Harmony never see it.
 //! - A candidate's `name` must be a currently-registered tool.
 //! - `arguments` must be a JSON object.
 //! - Bare-JSON extraction only fires when the ENTIRE trimmed content is the
 //!   candidate object (prose can never half-match).
 //! - At most one repair per assistant message (callers bound the turn).
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Tool-call dialect families (v1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Dialect {
     /// Provider-native structured tool calls (no repair).
+    #[default]
     Native,
     /// XML-ish / fenced-JSON text emissions (qwen3, kimi-k2, glm-4.5,
     /// minimax, deepseek-reasoner families on OpenAI-compatible transports).
@@ -40,9 +43,10 @@ impl Dialect {
     }
 }
 
-/// Map a model to its dialect family (bd-cv653.7.8). Conservative: everything
-/// not known-weak stays Native. User overrides come from models.json
-/// `dialect` on the provider entry (read by the caller).
+/// Heuristically classify a model for offline benchmarking and migration suggestions (bd-cv653.7.8).
+///
+/// Runtime response repair does not call this: only an explicit model-catalog `dialect` opt-in
+/// can enable Xmlish repair. Callers must never treat Harmony as a text-repair dialect.
 #[must_use]
 pub fn dialect_for_model(provider: &str, model_id: &str) -> Dialect {
     const XMLISH_MARKERS: &[&str] = &[

@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::derive_partial_eq_without_eq,
+    clippy::must_use_candidate,
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::redundant_closure_for_method_calls,
+    clippy::unnecessary_wraps,
+    clippy::too_many_lines
+)]
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -70,6 +81,12 @@ pub struct VerificationReport {
     pub errors: Vec<String>,
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+#[must_use]
 pub fn compute_percentile(sorted_samples: &[f64], p: f64) -> f64 {
     if sorted_samples.is_empty() {
         return 0.0;
@@ -81,6 +98,12 @@ pub fn compute_percentile(sorted_samples: &[f64], p: f64) -> f64 {
         .unwrap_or(0.0)
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+#[must_use]
 pub fn compute_bootstrap_ci(samples: &[f64], resamples: usize) -> (f64, f64) {
     if samples.is_empty() {
         return (0.0, 0.0);
@@ -127,6 +150,7 @@ impl std::fmt::Display for StartupIssue<'_> {
     }
 }
 
+#[must_use]
 pub fn verify_startup_artifact(
     artifact: &StartupBenchmarkReportArtifact,
     contract_path: &Path,
@@ -154,20 +178,17 @@ pub fn verify_startup_artifact(
         ));
     }
 
-    let mut issues = Vec::new();
     for cmd in &artifact.commands {
         if cmd.repetitions < 10 {
-            issues.push(StartupIssue::LowRepetitions(&cmd.command, cmd.repetitions));
+            errors.push(StartupIssue::LowRepetitions(&cmd.command, cmd.repetitions).to_string());
         }
         if cmd.p95_ms > cmd.threshold_ms {
-            issues.push(StartupIssue::ExceedsThreshold(
-                &cmd.command,
-                cmd.p95_ms,
-                cmd.threshold_ms,
-            ));
+            errors.push(
+                StartupIssue::ExceedsThreshold(&cmd.command, cmd.p95_ms, cmd.threshold_ms)
+                    .to_string(),
+            );
         }
     }
-    errors.extend(issues.into_iter().map(|i| i.to_string()));
 
     let status = if errors.is_empty() {
         "pass".to_string()
@@ -176,7 +197,7 @@ pub fn verify_startup_artifact(
     };
 
     VerificationReport {
-        schema: "pi.perf.startup_benchmark.verification_report.v1".to_string(),
+        schema: STARTUP_ARTIFACT_SCHEMA.to_string(),
         status,
         evaluated_commands: artifact.commands.len(),
         binary_size_status: artifact.binary_size.status.clone(),
@@ -205,29 +226,27 @@ fn contract_file_matches_schema_and_policy() -> Result<()> {
 }
 
 #[test]
-fn percentile_and_bootstrap_ci_math() -> Result<()> {
-    let sorted_samples: Vec<f64> = (1..=100).map(|x| x as f64).collect();
+fn percentile_and_bootstrap_ci_math() {
+    let sorted_samples: Vec<f64> = (1..=100).map(f64::from).collect();
     let p95 = compute_percentile(&sorted_samples, 0.95);
-    assert_eq!(p95, 95.0);
+    assert!((p95 - 95.0).abs() < f64::EPSILON);
 
     let p50 = compute_percentile(&sorted_samples, 0.50);
-    assert_eq!(p50, 50.0);
+    assert!((p50 - 50.0).abs() < f64::EPSILON);
 
     let (lower, upper) = compute_bootstrap_ci(&sorted_samples, 500);
     assert!(
-        lower >= 40.0 && lower <= 55.0,
+        (40.0..=55.0).contains(&lower),
         "lower {lower} in plausible range"
     );
     assert!(
-        upper >= 45.0 && upper <= 60.0,
+        (45.0..=60.0).contains(&upper),
         "upper {upper} in plausible range"
     );
-
-    Ok(())
 }
 
 #[test]
-fn mock_artifact_passes_verification() -> Result<()> {
+fn mock_artifact_passes_verification() {
     let contract_path = Path::new("docs/contracts/startup-benchmark-contract.json");
 
     let artifact = StartupBenchmarkReportArtifact {
@@ -297,12 +316,10 @@ fn mock_artifact_passes_verification() -> Result<()> {
     assert_eq!(report.evaluated_commands, 3);
     assert_eq!(report.binary_size_status, "PASS");
     assert!(report.errors.is_empty());
-
-    Ok(())
 }
 
 #[test]
-fn tamper_detection_in_startup_artifact() -> Result<()> {
+fn tamper_detection_in_startup_artifact() {
     let contract_path = Path::new("docs/contracts/startup-benchmark-contract.json");
 
     let artifact = StartupBenchmarkReportArtifact {
@@ -330,9 +347,9 @@ fn tamper_detection_in_startup_artifact() -> Result<()> {
             command: "--version".to_string(),
             metric_name: "startup_version_p95".to_string(),
             threshold_ms: 100.0,
-            repetitions: 5, // under minimum 10
+            repetitions: 5,
             mean_ms: 10.5,
-            p95_ms: 112.1, // exceeds 100.0
+            p95_ms: 112.1,
             ci95_lower_ms: 10.1,
             ci95_upper_ms: 11.0,
             status: "FAIL".to_string(),
@@ -344,6 +361,4 @@ fn tamper_detection_in_startup_artifact() -> Result<()> {
     let report = verify_startup_artifact(&artifact, contract_path);
     assert_eq!(report.status, "fail");
     assert!(report.errors.len() >= 3);
-
-    Ok(())
 }

@@ -441,7 +441,7 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 win32job = "2.0.3"
 
 [features]
-default = ["sqlite-sessions", "tui", "bpe-tokens"]
+default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui"]
 full = [
     "image-resize",
     "jemalloc",
@@ -527,11 +527,12 @@ debug = true
 debug = "line-tables-only"
 incremental = false
 
-# Performance benchmarking profile: opt-level=3, with debug info.
+# Performance benchmarking profile: optimized with bounded remote-build latency.
 [profile.perf]
 inherits = "release"
 opt-level = 3
 lto = "thin"
+codegen-units = 8
 debug = 1
 strip = false
 

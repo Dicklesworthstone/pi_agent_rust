@@ -3,6 +3,7 @@
 // Allow some clippy lints that are acceptable in benchmarks
 #![allow(clippy::cast_precision_loss)] // u64 -> f64 for size calculations is fine
 #![allow(clippy::cmp_owned)] // PathBuf comparison with "pi" requires owned
+#![allow(clippy::too_many_lines)]
 //!
 //! Run with:
 //! - `cargo bench --bench system`

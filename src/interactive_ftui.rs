@@ -36,6 +36,7 @@
 //! - Core session slash commands (/new, /clear, /session, /tree summary, /thinking, /name), bash context-inclusion, extension UIs, and the PTY/e2e acceptance lanes.
 
 use std::cell::Cell;
+use std::fmt::Write as _;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -567,6 +568,7 @@ fn word_diff_parts(removed: &str, added: &str) -> Option<(String, String, String
 /// glyph is the SHARED spinner frame while pending), then the folded
 /// result detail. Diff cards pair consecutive -/+ lines and emphasize the
 /// changed words; everything else renders dim indented lines.
+#[allow(clippy::too_many_arguments)]
 fn push_card_block(
     lines: &mut Vec<ftui::text::Line<'static>>,
     state: CardState,
@@ -1059,7 +1061,7 @@ impl PiFtuiModel {
     /// suspend path mirrors only the features actually enabled; the launch
     /// path calls this with `!inline`.
     #[must_use]
-    pub fn with_alt_screen(mut self, alt_screen: bool) -> Self {
+    pub const fn with_alt_screen(mut self, alt_screen: bool) -> Self {
         self.alt_screen = alt_screen;
         self
     }
@@ -1216,7 +1218,7 @@ impl PiFtuiModel {
             .collect::<Vec<_>>()
             .join("\n");
         if total > MAX_DETAIL_LINES {
-            collected.push_str(&format!("\n… +{} more lines", total - MAX_DETAIL_LINES));
+            let _ = write!(collected, "\n… +{} more lines", total - MAX_DETAIL_LINES);
         }
         entry.detail = Some(collected);
         true
@@ -1239,6 +1241,7 @@ impl PiFtuiModel {
         self.scroll_from_tail = self.scroll_from_tail.saturating_sub(lines);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_agent(&mut self, msg: PiMsg) -> Cmd<PiFtuiMsg> {
         match msg {
             PiMsg::AgentStart => {
@@ -1571,6 +1574,7 @@ impl PiFtuiModel {
     }
 
     /// Remaining slash routing after `/model`.
+    #[allow(clippy::too_many_lines)]
     fn route_slash_command_tail(&mut self, clean: &str) -> bool {
         // Case-insensitive tokens (SlashCommand::parse parity): compare on
         // an ASCII-lowercased copy; args keep their original case.
@@ -1813,6 +1817,7 @@ impl PiFtuiModel {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_term(&mut self, event: &Event) -> Cmd<PiFtuiMsg> {
         match event {
             Event::Tick => {
@@ -2180,6 +2185,7 @@ impl PiFtuiModel {
 
     /// The real render pass. Split out of [`Model::view`] so the watchdog can
     /// time it without an extra guard type.
+    #[allow(clippy::too_many_lines)]
     fn render_frame(&self, frame: &mut Frame) {
         let area = Rect::new(0, 0, frame.width(), frame.height());
         let regions = layout_regions(
@@ -2314,6 +2320,8 @@ impl PiFtuiModel {
 /// detail, with an elision counter. `None` when the result has no text.
 fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
     const MAX_DETAIL_LINES: usize = 8;
+    const MAX_LINE_CHARS: usize = 300;
+
     let mut text = String::new();
     for block in &result.content {
         if let crate::model::ContentBlock::Text(t) = block {
@@ -2330,7 +2338,6 @@ fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
     // Byte-cap each kept line too: a multi-megabyte single-line result
     // (minified JSON, long grep hit) must not land whole in the transcript
     // and be re-laid-out every frame.
-    const MAX_LINE_CHARS: usize = 300;
     let mut preview = text
         .lines()
         .take(MAX_DETAIL_LINES)
@@ -2341,7 +2348,7 @@ fn tool_output_preview(result: &crate::tools::ToolOutput) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n");
     if total > MAX_DETAIL_LINES {
-        preview.push_str(&format!("\n… +{} more lines", total - MAX_DETAIL_LINES));
+        let _ = write!(preview, "\n… +{} more lines", total - MAX_DETAIL_LINES);
     }
     Some(preview)
 }
@@ -3030,10 +3037,10 @@ fn run_crash_command(action: &str, agent_tx: &Sender<PiMsg>) {
                 )
             }
         }
-        "show" => match pi::crash::show_latest(&agent_dir) {
-            Some(report) => PiMsg::System(report),
-            None => PiMsg::System(String::from("No crash bundles recorded.")),
-        },
+        "show" => pi::crash::show_latest(&agent_dir).map_or_else(
+            || PiMsg::System(String::from("No crash bundles recorded.")),
+            PiMsg::System,
+        ),
         "delete" => {
             let removed = pi::crash::delete_all(&agent_dir);
             PiMsg::System(format!("Deleted {removed} crash bundle(s)"))
@@ -3253,6 +3260,7 @@ fn driver_bash_cwd(session_options: &crate::sdk::SessionOptions) -> std::path::P
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn run(
     session_options: crate::sdk::SessionOptions,
     theme: &crate::theme::Theme,
@@ -3267,8 +3275,10 @@ pub fn run(
     let bash_cwd = driver_bash_cwd(&session_options);
     let resume_template = resume_template_from(&session_options);
 
+    const DRIVER_STACK_BYTES: usize = 16 * 1024 * 1024;
     let driver = std::thread::Builder::new()
         .name("pi-ftui-agent-driver".into())
+        .stack_size(DRIVER_STACK_BYTES)
         .spawn(move || {
             let runtime = match asupersync::runtime::RuntimeBuilder::new().build() {
                 Ok(runtime) => runtime,

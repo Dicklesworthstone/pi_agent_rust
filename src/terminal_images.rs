@@ -10,8 +10,6 @@ use std::sync::OnceLock;
 
 /// Maximum decoded image size accepted by terminal rendering helpers.
 const MAX_INLINE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-/// Maximum number of visible ASCII characters retained in a MIME placeholder.
-const MAX_PLACEHOLDER_MIME_LEN: usize = 80;
 
 // ---------------------------------------------------------------------------
 // Protocol detection
@@ -165,24 +163,12 @@ pub fn encode_iterm2(image_bytes: &[u8], cols: usize) -> String {
 
 /// Generate a text placeholder for terminals that don't support inline images.
 pub fn placeholder(mime_type: &str, width: Option<u32>, height: Option<u32>) -> String {
-    let mime_type = sanitized_mime_type(mime_type);
+    // Normalize again at the terminal boundary as defense in depth for image
+    // values built directly in Rust rather than through a deserializer.
+    let mime_type = crate::model::sanitize_image_mime_type(mime_type);
     match (width, height) {
         (Some(w), Some(h)) if w > 0 && h > 0 => format!("[image: {mime_type}, {w}x{h}]"),
         _ => format!("[image: {mime_type}]"),
-    }
-}
-
-fn sanitized_mime_type(mime_type: &str) -> String {
-    let sanitized: String = mime_type
-        .trim()
-        .chars()
-        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-'))
-        .take(MAX_PLACEHOLDER_MIME_LEN)
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
     }
 }
 
@@ -481,7 +467,7 @@ mod tests {
     #[test]
     fn placeholder_bounds_mime_length() {
         let mime = format!("image/{}", "a".repeat(100));
-        let expected_mime = &mime[..MAX_PLACEHOLDER_MIME_LEN];
+        let expected_mime = &mime[..crate::model::MAX_IMAGE_MIME_TYPE_LEN];
         assert_eq!(
             placeholder(&mime, None, None),
             format!("[image: {expected_mime}]")

@@ -19,7 +19,7 @@ mod common;
 use common::tmux::TuiSession;
 use std::fs::OpenOptions;
 use std::sync::{Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -154,6 +154,7 @@ fn e2e_ftui_launch_help_bash_quit() {
 /// (no fake provider streams in this lane yet); raw mode + mouse capture +
 /// alt-screen are all active at signal time, which is the terminal state
 /// that matters.
+#[allow(clippy::too_many_lines)]
 fn run_signal_teardown(name: &str, signal: &str, blind_stty_sane: bool, mid_activity: bool) {
     use std::fmt::Write as _;
 
@@ -393,6 +394,7 @@ fn e2e_ftui_sigkill_recoverable_with_stty_sane() {
 /// SNl+). Re-enable once key delivery is deterministic under tmux+rch.
 #[test]
 #[ignore = "ctrl+z pane delivery is worker-dependent; see bd-cv653.9.1 notes"]
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
 fn e2e_ftui_ctrl_z_suspend_fg_resumes() {
     use std::fmt::Write as _;
 
@@ -719,6 +721,7 @@ fn e2e_ftui_resize_storm_survives() {
 /// export PI_FTUI_FLICKER_SCAN_BIN="$CARGO_TARGET_DIR/debug/flicker_scan"
 /// ```
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_ftui_resize_storm_stream_is_flicker_free() {
     let analyzer = std::env::var("PI_FTUI_FLICKER_SCAN_BIN")
         .ok()
@@ -1058,7 +1061,7 @@ fn write_ftui_vcr_cassette(
 /// the full assistant reply (progressive streaming render + finalization).
 #[test]
 fn e2e_ftui_vcr_streamed_turn() {
-    let Some((_lock, mut session)) = new_locked_session(FTUI_VCR_TEST_NAME) else {
+    let Some((_lock, session)) = new_locked_session(FTUI_VCR_TEST_NAME) else {
         eprintln!("Skipping: tmux not available");
         return;
     };
@@ -1159,6 +1162,7 @@ const FTUI_VCR_KILL_TEST_NAME: &str = "e2e_ftui_vcr_midstream_kill";
 /// window), and the RAII restore must still leave the wrapper shell's
 /// terminal echoing.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_ftui_sigterm_mid_stream_restores_terminal() {
     use std::fmt::Write as _;
 

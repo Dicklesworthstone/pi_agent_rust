@@ -30,6 +30,9 @@ use crate::tools::process_file_arguments;
 pub struct InitialMessage {
     pub text: String,
     pub images: Vec<ImageContent>,
+    /// Prose eligible for behavior-changing magic-keyword scans. Generated
+    /// attachment wrappers and file bytes are deliberately excluded.
+    pub keyword_scan_source: String,
 }
 
 #[derive(Debug, Clone)]
@@ -125,9 +128,12 @@ pub fn prepare_initial_message(
     let processed = process_file_arguments(file_args, cwd, auto_resize_images, workspace)?;
     let mut initial_message = processed.text;
     let has_message = !messages.is_empty();
-    if has_message {
-        initial_message.push_str(&messages.remove(0));
-    }
+    let keyword_scan_source = if has_message {
+        messages.remove(0)
+    } else {
+        String::new()
+    };
+    initial_message.push_str(&keyword_scan_source);
 
     if initial_message.is_empty() && processed.images.is_empty() && !has_message {
         return Ok(None);
@@ -136,6 +142,7 @@ pub fn prepare_initial_message(
     Ok(Some(InitialMessage {
         text: initial_message,
         images: processed.images,
+        keyword_scan_source,
     }))
 }
 

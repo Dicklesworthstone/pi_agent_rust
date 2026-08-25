@@ -1911,9 +1911,8 @@ async fn run(
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
-        let auth = match pi::auth::AuthStorage::load(pi::config::Config::auth_path()) {
-            Ok(auth) => auth,
-            Err(_) => return None,
+        let Ok(auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
+            return None;
         };
         pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
     });
@@ -2196,7 +2195,7 @@ async fn run(
     let session_handle = Arc::clone(&agent_session.session);
 
     #[cfg(feature = "ftui")]
-    let ftui_requested = is_interactive && cli.ftui;
+    let ftui_requested = is_interactive && !cli.classic;
     #[cfg(not(feature = "ftui"))]
     let ftui_requested = false;
 
@@ -2647,10 +2646,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 pi::web_remote::TokenKind::Steer,
             );
             println!(
-                "Pi Agent Web Remote server listening on {}:{} (view_only={})",
-                bind, port, view_only
+                "Pi Agent Web Remote server listening on {bind}:{port} (view_only={view_only})"
             );
-            println!("Web client interface: http://127.0.0.1:{}", port);
+            println!("Web client interface: http://127.0.0.1:{port}");
             println!("Pairing token: {}", token.token);
         }
         cli::Commands::Gallery { format } => {
@@ -8322,13 +8320,22 @@ async fn run_print_mode(
 
     let mut initial = initial;
     if let Some(ref mut initial) = initial {
-        initial.text = resources.expand_input(&initial.text);
+        let generated_prefix = initial
+            .text
+            .strip_suffix(&initial.keyword_scan_source)
+            .unwrap_or(&initial.text)
+            .to_string();
+        let expanded_source = resources.expand_input(&initial.keyword_scan_source);
+        initial.text = generated_prefix + &expanded_source;
     }
 
     let messages = messages
         .into_iter()
-        .map(|message| resources.expand_input(&message))
-        .filter(|message| !message.trim().is_empty())
+        .map(|keyword_scan_source| {
+            let text = resources.expand_input(&keyword_scan_source);
+            (text, keyword_scan_source)
+        })
+        .filter(|(message, _)| !message.trim().is_empty())
         .collect::<Vec<_>>();
 
     if initial.is_none() && messages.is_empty() {
@@ -8356,7 +8363,10 @@ async fn run_print_mode(
             max_retries,
             is_json,
             &text_stream_state,
-            PromptInput::Content(content),
+            PromptInput::Content {
+                content,
+                keyword_scan_source: Some(initial.keyword_scan_source),
+            },
             failover_ctx,
         )
         .await?;
@@ -8370,7 +8380,7 @@ async fn run_print_mode(
         }
     }
 
-    for message in messages {
+    for (message, keyword_scan_source) in messages {
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -8381,7 +8391,10 @@ async fn run_print_mode(
             max_retries,
             is_json,
             &text_stream_state,
-            PromptInput::Text(message),
+            PromptInput::Text {
+                text: message,
+                keyword_scan_source: Some(keyword_scan_source),
+            },
             failover_ctx,
         )
         .await?;
@@ -8522,8 +8535,14 @@ fn finish_print_text_response(
 
 /// Discriminated prompt input for retry helper.
 enum PromptInput {
-    Text(String),
-    Content(Vec<ContentBlock>),
+    Text {
+        text: String,
+        keyword_scan_source: Option<String>,
+    },
+    Content {
+        content: Vec<ContentBlock>,
+        keyword_scan_source: Option<String>,
+    },
 }
 
 /// Compute retry delay with exponential backoff (mirrors RPC mode logic).
@@ -8680,7 +8699,13 @@ where
 {
     // First attempt.
     let first_result = match &input {
-        PromptInput::Text(text) => {
+        PromptInput::Text {
+            text,
+            keyword_scan_source,
+        } => {
+            session
+                .agent
+                .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
                 .run_text_with_abort(
                     text.clone(),
@@ -8689,7 +8714,13 @@ where
                 )
                 .await
         }
-        PromptInput::Content(content) => {
+        PromptInput::Content {
+            content,
+            keyword_scan_source,
+        } => {
+            session
+                .agent
+                .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
                 .run_with_content_with_abort(
                     content.clone(),
@@ -8910,10 +8941,18 @@ async fn run_interactive_mode(
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();
-    if let Some(initial) = initial {
-        pending.push(pi::interactive::PendingInput::Content(
-            pi::app::build_initial_content(&initial),
-        ));
+    if let Some(mut initial) = initial {
+        let generated_prefix = initial
+            .text
+            .strip_suffix(&initial.keyword_scan_source)
+            .unwrap_or(&initial.text)
+            .to_string();
+        let expanded_source = resources.expand_input(&initial.keyword_scan_source);
+        initial.text = generated_prefix + &expanded_source;
+        pending.push(pi::interactive::PendingInput::ContentWithKeywordSource {
+            content: pi::app::build_initial_content(&initial),
+            keyword_scan_source: initial.keyword_scan_source,
+        });
     }
     for message in messages {
         pending.push(pi::interactive::PendingInput::Text(message));

@@ -1,4 +1,12 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::must_use_candidate,
+    clippy::too_many_arguments,
+    clippy::uninlined_format_args,
+    clippy::if_not_else,
+    clippy::map_unwrap_or,
+    clippy::too_many_lines
+)]
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -108,15 +116,17 @@ pub struct ReplayReport<'a> {
     pub trace: Vec<ReplayStep<'a>>,
 }
 
+#[must_use]
 pub fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        let _ = write!(s, "{:02x}", b);
+        let _ = write!(s, "{b:02x}");
     }
     s
 }
 
+#[must_use]
 pub fn compute_sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -129,6 +139,8 @@ pub fn compute_sha256_file(path: &Path) -> Result<String> {
     Ok(compute_sha256_bytes(&bytes))
 }
 
+#[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn compute_entry_hash(
     index: usize,
     path: &str,
@@ -182,6 +194,7 @@ impl std::fmt::Display for VerifyIssue<'_> {
     }
 }
 
+#[must_use]
 pub fn verify_ledger(
     ledger: &ReleaseEvidenceLedgerArtifact,
     repo_root: &Path,
@@ -232,9 +245,7 @@ pub fn verify_ledger(
 
         match resolve_safe_path(repo_root, &entry.path) {
             Some(file_path) => {
-                if !file_path.exists() {
-                    raw_issues.push(VerifyIssue::MissingFile(&entry.path));
-                } else {
+                if file_path.exists() {
                     match compute_sha256_file(&file_path) {
                         Ok(actual_sha) => {
                             if actual_sha != entry.sha256 {
@@ -245,6 +256,8 @@ pub fn verify_ledger(
                             raw_issues.push(VerifyIssue::ChecksumError(&entry.path));
                         }
                     }
+                } else {
+                    raw_issues.push(VerifyIssue::MissingFile(&entry.path));
                 }
             }
             None => {
@@ -329,8 +342,7 @@ pub fn replay_ledger(ledger: &ReleaseEvidenceLedgerArtifact) -> Result<ReplayRep
     let final_last_hash = ledger
         .entries
         .last()
-        .map(|e| e.entry_hash.as_str())
-        .unwrap_or(GENESIS_PREV_HASH);
+        .map_or(GENESIS_PREV_HASH, |e| e.entry_hash.as_str());
     let head_hash_matched = final_last_hash == ledger.head_hash;
 
     Ok(ReplayReport {
@@ -442,16 +454,16 @@ fn main() -> Result<()> {
             for (index, file_path) in files.iter().enumerate() {
                 let prev_ref = entries
                     .last()
-                    .map(|e: &ReleaseEvidenceLedgerEntry| e.entry_hash.as_str())
-                    .unwrap_or(GENESIS_PREV_HASH);
+                    .map_or(GENESIS_PREV_HASH, |e: &ReleaseEvidenceLedgerEntry| {
+                        e.entry_hash.as_str()
+                    });
                 let entry = build_single_entry(index, file_path, root, prev_ref)?;
                 entries.push(entry);
             }
 
             let head_hash = entries
                 .last()
-                .map(|e| e.entry_hash.clone())
-                .unwrap_or_else(|| GENESIS_PREV_HASH.to_string());
+                .map_or_else(|| GENESIS_PREV_HASH.to_string(), |e| e.entry_hash.clone());
             let summary = ReleaseEvidenceLedgerSummary {
                 total_artifacts: entries.len(),
                 verified_intact: entries.len(),

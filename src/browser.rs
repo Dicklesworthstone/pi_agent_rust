@@ -22,6 +22,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use uuid::Uuid;
 
+// Minimal valid 1x1 PNG bytes
+const MIN_VALID_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
 // ============================================================================
 // Data Types & Structures
 // ============================================================================
@@ -101,11 +110,13 @@ impl BrowserTool {
         }
     }
 
-    pub fn with_mock(mut self, mock: bool) -> Self {
+    #[must_use]
+    pub const fn with_mock(mut self, mock: bool) -> Self {
         self.mock_mode = Some(mock);
         self
     }
 
+    #[must_use]
     pub fn with_domain_allowlist(mut self, allowlist: Option<Vec<String>>) -> Self {
         self.domain_allowlist = allowlist;
         self
@@ -141,7 +152,7 @@ impl BrowserTool {
 }
 
 #[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
         "browser"
@@ -223,6 +234,7 @@ impl Tool for BrowserTool {
         ToolEffects::write()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -252,20 +264,20 @@ impl Tool for BrowserTool {
                     Error::tool("browser", format!("{action} requires url parameter"))
                 })?;
 
+                let title = args.get("title").and_then(Value::as_str).map_or_else(
+                    || {
+                        if self.mock_mode.unwrap_or(false)
+                            && (url == "https://example.com" || url == "http://example.com")
+                        {
+                            "Example Domain".to_string()
+                        } else {
+                            format!("Page ({url})")
+                        }
+                    },
+                    ToString::to_string,
+                );
+
                 self.check_domain(url)?;
-
-                let mut tabs = self
-                    .tabs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-                let title = if url.contains("example.com") {
-                    "Example Domain".to_string()
-                } else if url.contains("github.com") {
-                    "GitHub: Where the world builds software".to_string()
-                } else {
-                    format!("Page: {url}")
-                };
 
                 let tab_info = BrowserTabInfo {
                     name: tab_name.clone(),
@@ -274,12 +286,16 @@ impl Tool for BrowserTool {
                     is_active: true,
                 };
 
-                tabs.insert(tab_name.clone(), tab_info);
+                self.tabs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(tab_name.clone(), tab_info);
                 let mut cur = self
                     .active_tab
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *cur = tab_name.clone();
+                (*cur).clone_from(&tab_name);
+                drop(cur);
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
@@ -297,25 +313,28 @@ impl Tool for BrowserTool {
             }
 
             "close" => {
-                let mut tabs = self
-                    .tabs
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let remaining: Vec<String> = {
+                    let mut tabs = self
+                        .tabs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-                if tabs.remove(&tab_name).is_none() {
-                    return Err(Error::tool(
-                        "browser",
-                        format!("cannot close nonexistent tab {tab_name}"),
-                    ));
-                }
+                    if tabs.remove(&tab_name).is_none() {
+                        return Err(Error::tool(
+                            "browser",
+                            format!("cannot close nonexistent tab {tab_name}"),
+                        ));
+                    }
+                    tabs.keys().cloned().collect()
+                };
 
-                let remaining: Vec<String> = tabs.keys().cloned().collect();
                 if let Some(next_tab) = remaining.first() {
                     let mut cur = self
                         .active_tab
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    *cur = next_tab.clone();
+                    (*cur).clone_from(next_tab);
+                    drop(cur);
                 }
 
                 Ok(ToolOutput {
@@ -331,12 +350,14 @@ impl Tool for BrowserTool {
             }
 
             "list_tabs" => {
-                let tabs = self
+                let list: Vec<BrowserTabInfo> = self
                     .tabs
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .values()
+                    .cloned()
+                    .collect();
 
-                let list: Vec<BrowserTabInfo> = tabs.values().cloned().collect();
                 let text = format!(
                     "Active browser tabs ({}):\n{}",
                     list.len(),
@@ -357,12 +378,10 @@ impl Tool for BrowserTool {
             }
 
             "snapshot" | "ax_tree" => {
-                let tabs = self
+                let current_info = self
                     .tabs
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-                let current_info = tabs
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(&tab_name)
                     .cloned()
                     .unwrap_or_else(|| BrowserTabInfo {
@@ -530,7 +549,7 @@ impl Tool for BrowserTool {
                     })?;
                 let timeout_ms = args
                     .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
+                    .and_then(serde_json::Value::as_u64)
                     .unwrap_or(5000);
 
                 Ok(ToolOutput {
@@ -550,15 +569,16 @@ impl Tool for BrowserTool {
             "screenshot" => {
                 let output_path_str = args
                     .get("output_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        format!(
-                            "screenshots/browser_tab_{}_{}.png",
-                            tab_name,
-                            Uuid::new_v4().simple()
-                        )
-                    });
+                    .and_then(serde_json::Value::as_str)
+                    .map_or_else(
+                        || {
+                            format!(
+                                "screenshots/browser_tab_{tab_name}_{}.png",
+                                Uuid::new_v4().simple()
+                            )
+                        },
+                        ToString::to_string,
+                    );
 
                 let target_path = if Path::new(&output_path_str).is_absolute() {
                     PathBuf::from(&output_path_str)
@@ -572,16 +592,6 @@ impl Tool for BrowserTool {
                     })?;
                 }
 
-                // Minimal valid 1x1 PNG bytes
-                const MIN_VALID_PNG: &[u8] = &[
-                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
-                    0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
-                    0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
-                    0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D,
-                    0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
-                    0x60, 0x82,
-                ];
-
                 fs::write(&target_path, MIN_VALID_PNG).map_err(|e| {
                     Error::tool(
                         "browser",
@@ -589,9 +599,8 @@ impl Tool for BrowserTool {
                     )
                 })?;
 
-                let written_bytes = fs::metadata(&target_path)
-                    .map(|m| m.len())
-                    .unwrap_or(MIN_VALID_PNG.len() as u64);
+                let written_bytes =
+                    fs::metadata(&target_path).map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
