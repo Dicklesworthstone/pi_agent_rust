@@ -1048,14 +1048,19 @@ impl MessageQueue {
         self.steering.len() + self.follow_up.len()
     }
 
-    fn push(&mut self, kind: QueueKind, delivery: QueuedAgentMessage) -> u64 {
+    fn next_entry(&mut self, delivery: QueuedAgentMessage) -> SequencedQueuedMessage {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        let entry = SequencedQueuedMessage {
+        SequencedQueuedMessage {
             seq,
             enqueued_at: Utc::now().timestamp_millis(),
             delivery,
-        };
+        }
+    }
+
+    fn push(&mut self, kind: QueueKind, delivery: QueuedAgentMessage) -> u64 {
+        let entry = self.next_entry(delivery);
+        let seq = entry.seq;
         match kind {
             QueueKind::Steering => {
                 if self.steering.len() >= MAX_STEERING_QUEUE_SIZE {
@@ -1087,6 +1092,13 @@ impl MessageQueue {
 
     fn push_follow_up(&mut self, delivery: QueuedAgentMessage) -> u64 {
         self.push(QueueKind::FollowUp, delivery)
+    }
+
+    fn push_follow_up_lossless(&mut self, delivery: QueuedAgentMessage) -> u64 {
+        let entry = self.next_entry(delivery);
+        let seq = entry.seq;
+        self.follow_up.push_back(entry);
+        seq
     }
 
     fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
@@ -2413,7 +2425,7 @@ impl Agent {
         // RPC late-follow-up repair explicitly starts with follow-ups instead.
         let mut initial_follow_up_staged = false;
         let mut pending_messages = if initial_follow_up {
-            self.fetch_follow_up_messages().await;
+            self.fetch_initial_follow_up_messages().await;
             initial_follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
             Vec::new()
         } else {
@@ -3055,6 +3067,18 @@ impl Agent {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
                 self.message_queue.push_follow_up(message);
+            }
+        }
+    }
+
+    async fn fetch_initial_follow_up_messages(&mut self) {
+        for fetcher in &self.follow_up_fetchers {
+            let fetched = self.fetch_messages(Some(fetcher)).await;
+            for message in fetched {
+                // This batch has already passed its source queue's admission
+                // limit. Preserve it across the handoff even when that source
+                // permits a larger batch than the ordinary internal queue.
+                self.message_queue.push_follow_up_lossless(message);
             }
         }
     }
@@ -14191,6 +14215,64 @@ mod tests {
                     .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
                 "the exact authored source must activate its directive"
             );
+        });
+    }
+
+    #[test]
+    fn continuation_follow_up_first_preserves_full_admitted_batch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+
+            let expected = (0..128)
+                .map(|index| format!("admitted follow-up {index}"))
+                .collect::<Vec<_>>();
+            let queued_follow_up = Arc::new(StdTestMutex::new(Some(
+                expected
+                    .iter()
+                    .map(|text| {
+                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
+                    Box::pin(async move {
+                        follow_up_fetcher_state
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_message_fetchers(None, Some(Arc::new(follow_up_fetcher)));
+
+            agent
+                .run_continue_with_follow_up_with_abort(None, |_| {})
+                .await
+                .expect("full admitted follow-up batch");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].messages.len(), expected.len());
+            for (message, expected_text) in calls[0].messages.iter().zip(&expected) {
+                assert_user_text(message, expected_text);
+            }
         });
     }
 
