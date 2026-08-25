@@ -91,6 +91,8 @@ struct Capture {
 
 struct CaptureProvider {
     capture: Arc<Mutex<Capture>>,
+    first_call_entered: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
+    first_call_gate: Mutex<Option<asupersync::channel::oneshot::Receiver<()>>>,
 }
 
 #[async_trait::async_trait]
@@ -121,6 +123,26 @@ impl pi::provider::Provider for CaptureProvider {
             capture
                 .system_prompts
                 .push(context.system_prompt.as_ref().map(ToString::to_string));
+        }
+        let first_call_entered = self
+            .first_call_entered
+            .lock()
+            .expect("first call entered signal")
+            .take();
+        let first_call_gate = self
+            .first_call_gate
+            .lock()
+            .expect("first call gate")
+            .take();
+        if let Some(entered) = first_call_entered {
+            let cx = asupersync::Cx::for_testing();
+            entered.send(&cx, ()).expect("signal first provider call");
+        }
+        if let Some(mut gate) = first_call_gate {
+            let cx = asupersync::Cx::for_testing();
+            gate.recv(&cx)
+                .await
+                .expect("release first provider call");
         }
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(StreamEvent::TextDelta {
@@ -153,11 +175,32 @@ fn build_agent(
     let capture = Arc::new(Mutex::new(Capture::default()));
     let provider = Arc::new(CaptureProvider {
         capture: Arc::clone(&capture),
+        first_call_entered: Mutex::new(None),
+        first_call_gate: Mutex::new(None),
     });
     let tools = ToolRegistry::new(&[], root, None::<&pi::config::Config>);
     let config = AgentConfig {
         system_prompt: Some("base prompt".to_string()),
         keyword_settings: keywords,
+        ..AgentConfig::default()
+    };
+    (Agent::new(provider, tools, config), capture)
+}
+
+fn build_gated_agent(
+    root: &Path,
+    first_call_entered: asupersync::channel::oneshot::Sender<()>,
+    first_call_gate: asupersync::channel::oneshot::Receiver<()>,
+) -> (Agent, Arc<Mutex<Capture>>) {
+    let capture = Arc::new(Mutex::new(Capture::default()));
+    let provider = Arc::new(CaptureProvider {
+        capture: Arc::clone(&capture),
+        first_call_entered: Mutex::new(Some(first_call_entered)),
+        first_call_gate: Mutex::new(Some(first_call_gate)),
+    });
+    let tools = ToolRegistry::new(&[], root, None::<&pi::config::Config>);
+    let config = AgentConfig {
+        system_prompt: Some("base prompt".to_string()),
         ..AgentConfig::default()
     };
     (Agent::new(provider, tools, config), capture)
@@ -598,11 +641,15 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn rpc_queued_steering_and_follow_up_keyword_provenance_and_suppression() {
-    let case = "rpc_queued_steering_and_follow_up_keyword_provenance_and_suppression";
+fn rpc_queued_steering_and_follow_up_keyword_provenance() {
+    let case = "rpc_queued_steering_and_follow_up_keyword_provenance";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let (agent, capture) = build_agent(&root, None);
+    let (first_call_entered, mut wait_for_first_call) =
+        asupersync::channel::oneshot::channel::<()>();
+    let (release_first_call, first_call_gate) =
+        asupersync::channel::oneshot::channel::<()>();
+    let (agent, capture) = build_gated_agent(&root, first_call_entered, first_call_gate);
 
     let session = Arc::new(AsyncMutex::new(Session::in_memory()));
     {
@@ -644,7 +691,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance_and_suppression() {
             handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
         let cx = asupersync::Cx::for_testing();
 
-        // Prompt 1: plain turn -> baseline thinking is Off
+        // Keep prompt 1 inside the provider while both queued messages arrive.
         in_tx
             .send(
                 &cx,
@@ -653,110 +700,132 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance_and_suppression() {
             .await
             .expect("send RPC prompt 1");
 
-        let _ack1: serde_json::Value = serde_json::from_str(
+        let ack1: serde_json::Value = serde_json::from_str(
             recv_rpc_line(&out_rx, "RPC prompt 1 acknowledgment")
                 .await
                 .expect("receive RPC prompt 1 acknowledgment")
                 .trim(),
         )
         .expect("parse ack 1");
+        assert_eq!(ack1["type"], "response");
+        assert_eq!(ack1["command"], "prompt");
+        assert_eq!(ack1["success"], true);
 
-        let mut saw_end1 = false;
-        for _ in 0..100 {
-            let event: serde_json::Value = serde_json::from_str(
-                recv_rpc_line(&out_rx, "RPC event 1")
-                    .await
-                    .expect("receive RPC event 1")
-                    .trim(),
-            )
-            .expect("parse event 1");
-            if event["type"] == "agent_end" {
-                saw_end1 = true;
-                break;
-            }
-        }
-        assert!(saw_end1, "Prompt 1 completed");
+        let entered_cx = asupersync::Cx::for_testing();
+        wait_for_first_call
+            .recv(&entered_cx)
+            .await
+            .expect("first provider call entered");
 
-        // Steer: Queue steering message with ultrathink and workflowz
+        // Queue steering while prompt 1 is provably still streaming.
         in_tx
             .send(
                 &cx,
-                r#"{"id":"2","type":"steer","message":"please ultrathink and workflowz this steering input"}"#.to_string(),
+                r#"{"id":"2","type":"prompt","message":"please ultrathink and workflowz this steering input","streamingBehavior":"steer"}"#.to_string(),
             )
             .await
             .expect("send RPC steer");
 
-        let _ack2: serde_json::Value = serde_json::from_str(
+        let ack2: serde_json::Value = serde_json::from_str(
             recv_rpc_line(&out_rx, "RPC steer acknowledgment")
                 .await
                 .expect("receive RPC steer acknowledgment")
                 .trim(),
         )
         .expect("parse ack 2");
+        assert_eq!(ack2["type"], "response");
+        assert_eq!(ack2["command"], "prompt");
+        assert_eq!(ack2["success"], true);
 
-        // Prompt 2: triggers the steering message delivery
+        // Queue a distinct follow-up before releasing the first provider call.
         in_tx
             .send(
                 &cx,
-                r#"{"id":"3","type":"prompt","message":"turn 2 execute"}"#.to_string(),
+                r#"{"id":"3","type":"follow_up","message":"please orchestrate this follow-up"}"#.to_string(),
             )
             .await
-            .expect("send RPC prompt 2");
+            .expect("send RPC follow-up");
 
-        let _ack3: serde_json::Value = serde_json::from_str(
-            recv_rpc_line(&out_rx, "RPC prompt 2 acknowledgment")
+        let ack3: serde_json::Value = serde_json::from_str(
+            recv_rpc_line(&out_rx, "RPC follow-up acknowledgment")
                 .await
-                .expect("receive RPC prompt 2 acknowledgment")
+                .expect("receive RPC follow-up acknowledgment")
                 .trim(),
         )
         .expect("parse ack 3");
+        assert_eq!(ack3["type"], "response");
+        assert_eq!(ack3["command"], "follow_up");
+        assert_eq!(ack3["success"], true);
 
-        let mut saw_end2 = false;
+        let release_cx = asupersync::Cx::for_testing();
+        release_first_call
+            .send(&release_cx, ())
+            .expect("release first provider call");
+
+        let mut saw_agent_end = false;
         for _ in 0..100 {
             let event: serde_json::Value = serde_json::from_str(
-                recv_rpc_line(&out_rx, "RPC event 2")
+                recv_rpc_line(&out_rx, "RPC queued turn event")
                     .await
-                    .expect("receive RPC event 2")
+                    .expect("receive RPC queued turn event")
                     .trim(),
             )
-            .expect("parse event 2");
+            .expect("parse queued turn event");
             if event["type"] == "agent_end" {
-                saw_end2 = true;
+                assert!(
+                    event["error"].is_null(),
+                    "RPC queued turn ended with an error: {event}"
+                );
+                saw_agent_end = true;
                 break;
             }
         }
-        assert!(saw_end2, "Prompt 2 completed");
+        assert!(saw_agent_end, "queued steering/follow-up turn completed");
 
         drop(in_tx);
         server.await.expect("RPC server task join");
     });
 
     let captured = capture.lock().expect("capture").clone();
-    assert_eq!(captured.thinking.first(), Some(&Some(ThinkingLevel::Off)));
+    assert_eq!(captured.thinking.len(), 3);
+    assert_eq!(captured.thinking[0], Some(ThinkingLevel::Off));
     assert_eq!(captured.thinking.get(1), Some(&Some(expected_max)));
+    assert_eq!(captured.thinking[2], Some(ThinkingLevel::Off));
     assert!(
         captured.system_prompts[1]
             .as_deref()
             .is_some_and(|prompt| prompt.contains("`workflowz` for this turn")),
         "RPC turn 2 must observe queued steering workflowz directive"
     );
+    assert!(
+        captured.system_prompts[2]
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("`orchestrate` for this turn")),
+        "RPC turn 3 must observe the queued follow-up orchestrate directive"
+    );
+    assert!(
+        captured.system_prompts[1]
+            .as_deref()
+            .is_none_or(|prompt| !prompt.contains("`orchestrate` for this turn")),
+        "follow-up directives must not leak into the steering request"
+    );
 
     let guard = session.try_lock().expect("session telemetry lock");
-    let has_ultrathink_custom = guard.entries_for_current_path().into_iter().any(|entry| {
-        matches!(
-            entry,
-            SessionEntry::Custom(custom)
-                if custom.custom_type == "magic_keyword"
-                    && custom.data.as_ref().is_some_and(|data| {
-                        data["schema"] == json!("pi.magic_keyword.v1")
-                            && data["word"] == json!("ultrathink")
-                    })
-        )
-    });
-    assert!(
-        has_ultrathink_custom,
-        "Session must contain magic_keyword telemetry for ultrathink"
-    );
+    let activation_words = guard
+        .entries_for_current_path()
+        .into_iter()
+        .filter_map(|entry| match entry {
+            SessionEntry::Custom(custom) if custom.custom_type == "magic_keyword" => custom
+                .data
+                .as_ref()
+                .and_then(|data| data["word"].as_str())
+                .map(ToString::to_string),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(activation_words.iter().any(|word| word == "ultrathink"));
+    assert!(activation_words.iter().any(|word| word == "workflowz"));
+    assert!(activation_words.iter().any(|word| word == "orchestrate"));
     drop(guard);
 
     finish_case(&harness, case);
