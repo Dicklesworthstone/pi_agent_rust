@@ -541,9 +541,25 @@ async fn send_parts(
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
     let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
-    let mut transport = connect_transport(&parsed, client).await?;
+    let conn = connect_transport(&parsed, client).await?;
+    let mut transport = conn.transport;
 
-    let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
+    // Merge proxy extra headers (Proxy-Authorization for absolute-form only).
+    let effective_headers: Vec<(String, String)> = if conn.extra_headers.is_empty() {
+        headers.to_vec()
+    } else {
+        let mut h = headers.to_vec();
+        h.extend(conn.extra_headers.iter().cloned());
+        h
+    };
+    let request_bytes = build_request_bytes(
+        method,
+        &parsed,
+        &client.user_agent,
+        &effective_headers,
+        body,
+        conn.absolute_form,
+    );
     write_all_with_retry(&mut transport, &request_bytes).await?;
     if !body.is_empty() {
         write_all_with_retry(&mut transport, body).await?;
@@ -827,6 +843,35 @@ fn is_retryable_not_connected_tls(err: &TlsError) -> bool {
 struct ConnectAttemptError {
     error: Error,
     retryable_not_connected: bool,
+    /// Proxy-path failures never participate in the WSAENOTCONN retry loop —
+    /// a rejected CONNECT or SOCKS5 handshake is deterministic, and silently
+    /// falling back to a direct connection would defeat the user's proxy
+    /// (privacy leak).
+    from_proxy: bool,
+}
+
+impl ConnectAttemptError {
+    fn proxy(message: String) -> Self {
+        Self { error: Error::api(message), retryable_not_connected: false, from_proxy: true }
+    }
+}
+
+/// Result of establishing a connection: the transport plus request-form hints
+/// that only apply when routed through an HTTP proxy for a plain-HTTP target.
+struct EstablishedConnection {
+    transport: Transport,
+    /// true only for (HTTP proxy, HTTP target): the request line must be
+    /// absolute-form (`GET http://host:port/path HTTP/1.1`).
+    absolute_form: bool,
+    /// Extra headers to attach to each request (Proxy-Authorization for the
+    /// absolute-form path; CONNECT and SOCKS5 authenticate during setup).
+    extra_headers: Vec<(String, String)>,
+}
+
+impl EstablishedConnection {
+    fn direct(transport: Transport) -> Self {
+        Self { transport, absolute_form: false, extra_headers: Vec::new() }
+    }
 }
 
 /// One full connect attempt: fresh TCP connection plus (for HTTPS) a fresh
@@ -835,20 +880,63 @@ struct ConnectAttemptError {
 async fn connect_transport_once(
     parsed: &ParsedUrl,
     client: &Client,
-) -> std::result::Result<Transport, ConnectAttemptError> {
+) -> std::result::Result<EstablishedConnection, ConnectAttemptError> {
+    // ── Proxy branch: if a proxy is configured for this target's scheme and
+    // the host is not bypassed, establish the tunnel through the proxy. On
+    // failure this returns an error (never a silent direct-connection
+    // fallback — the user configured a proxy on purpose).
+    if let Some(proxy) = super::proxy::get_proxy(parsed.scheme == Scheme::Https) {
+        if !super::proxy::should_bypass_proxy(&parsed.host) {
+            let tunnel = super::proxy::connect_via_proxy(parsed, &proxy)
+                .await
+                .map_err(ConnectAttemptError::proxy)?;
+            return match parsed.scheme {
+                Scheme::Http => Ok(EstablishedConnection {
+                    transport: Transport::Tcp(tunnel.tcp),
+                    absolute_form: tunnel.absolute_form,
+                    extra_headers: tunnel.proxy_auth_header.into_iter().collect(),
+                }),
+                Scheme::Https => {
+                    let tls = client.tls.as_ref().map_err(|e| ConnectAttemptError {
+                        error: Error::api(format!("TLS configuration error: {e}")),
+                        retryable_not_connected: false,
+                        from_proxy: false,
+                    })?;
+                    let tls_stream = tls
+                        .clone()
+                        .connect(&parsed.host, tunnel.tcp)
+                        .await
+                        .map_err(|e| ConnectAttemptError {
+                            retryable_not_connected: is_retryable_not_connected_tls(&e),
+                            error: Error::api(format!("TLS connect failed (via proxy): {e}")),
+                            from_proxy: false,
+                        })?;
+                    Ok(EstablishedConnection {
+                        transport: Transport::Tls(Box::new(tls_stream)),
+                        absolute_form: false,
+                        extra_headers: Vec::new(),
+                    })
+                }
+            };
+        }
+    }
+
+    // ── Direct connection (existing path) ──
     let addr = (parsed.host.clone(), parsed.port);
     let tcp = TcpStream::connect(addr)
         .await
         .map_err(|e| ConnectAttemptError {
             retryable_not_connected: is_retryable_not_connected(&e),
             error: Error::from(e),
+            from_proxy: false,
         })?;
     match parsed.scheme {
-        Scheme::Http => Ok(Transport::Tcp(tcp)),
+        Scheme::Http => Ok(EstablishedConnection::direct(Transport::Tcp(tcp))),
         Scheme::Https => {
             let tls = client.tls.as_ref().map_err(|e| ConnectAttemptError {
                 error: Error::api(format!("TLS configuration error: {e}")),
                 retryable_not_connected: false,
+                from_proxy: false,
             })?;
             let tls_stream =
                 tls.clone()
@@ -857,21 +945,29 @@ async fn connect_transport_once(
                     .map_err(|e| ConnectAttemptError {
                         retryable_not_connected: is_retryable_not_connected_tls(&e),
                         error: Error::api(format!("TLS connect failed: {e}")),
+                        from_proxy: false,
                     })?;
-            Ok(Transport::Tls(Box::new(tls_stream)))
+            Ok(EstablishedConnection::direct(Transport::Tls(Box::new(tls_stream))))
         }
     }
 }
 
-async fn connect_transport(parsed: &ParsedUrl, client: &Client) -> Result<Transport> {
+async fn connect_transport(
+    parsed: &ParsedUrl,
+    client: &Client,
+) -> Result<EstablishedConnection> {
     use asupersync::time::{sleep, wall_now};
 
     let mut backoffs = NOT_CONNECTED_RETRY_BACKOFFS.iter();
     loop {
         let failure = match connect_transport_once(parsed, client).await {
-            Ok(transport) => return Ok(transport),
+            Ok(conn) => return Ok(conn),
             Err(failure) => failure,
         };
+        // Proxy-path failures are terminal: no WSAENOTCONN retry, no fallback.
+        if failure.from_proxy {
+            return Err(failure.error);
+        }
         if !failure.retryable_not_connected {
             return Err(failure.error);
         }
@@ -956,14 +1052,26 @@ fn build_request_bytes(
     user_agent: &str,
     headers: &[(String, String)],
     body: &[u8],
+    absolute_form: bool,
 ) -> Vec<u8> {
     let mut out = String::new();
     let effective_user_agent =
         sanitize_header_value(header_value(headers, "user-agent").unwrap_or(user_agent));
     let host_header = host_header_value(parsed);
+    // Absolute-form (HTTP target through an HTTP proxy): the request target is
+    // the full URL; Host stays the target's host (never the proxy's).
+    let request_target = if absolute_form {
+        let scheme_str = match parsed.scheme {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        };
+        format!("{scheme_str}://{}{}", parsed.connect_authority(), parsed.path)
+    } else {
+        parsed.path.to_string()
+    };
     let _ = std::fmt::Write::write_fmt(
         &mut out,
-        format_args!("{} {} HTTP/1.1\r\n", method.as_str(), parsed.path),
+        format_args!("{} {} HTTP/1.1\r\n", method.as_str(), request_target),
     );
     let _ = std::fmt::Write::write_fmt(&mut out, format_args!("Host: {host_header}\r\n"));
     let _ = std::fmt::Write::write_fmt(
@@ -1853,7 +1961,7 @@ mod tests {
     #[test]
     fn build_request_bytes_get() {
         let parsed = ParsedUrl::parse("http://example.com/api/test").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, "test-agent", &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "test-agent", &[], &[], false);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("GET /api/test HTTP/1.1\r\n"));
         assert!(text.contains("Host: example.com\r\n"));
@@ -1867,7 +1975,7 @@ mod tests {
         let parsed = ParsedUrl::parse("https://api.example.com/v1/messages").unwrap();
         let body = b"hello world";
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        let bytes = build_request_bytes(Method::Post, &parsed, "pi/0.1", &headers, body);
+        let bytes = build_request_bytes(Method::Post, &parsed, "pi/0.1", &headers, body, false);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("POST /v1/messages HTTP/1.1\r\n"));
         assert!(text.contains("Host: api.example.com\r\n"));
@@ -1882,7 +1990,7 @@ mod tests {
             ("Authorization".to_string(), "Bearer sk-test".to_string()),
             ("X-Custom".to_string(), "value".to_string()),
         ];
-        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, &[], false);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains("Authorization: Bearer sk-test\r\n"));
         assert!(text.contains("X-Custom: value\r\n"));
@@ -1898,7 +2006,7 @@ mod tests {
             ("X-Test".to_string(), "1".to_string()),
         ];
         let body = b"hello";
-        let bytes = build_request_bytes(Method::Post, &parsed, "default-agent", &headers, body);
+        let bytes = build_request_bytes(Method::Post, &parsed, "default-agent", &headers, body, false);
         let text = String::from_utf8(bytes).unwrap();
 
         assert_eq!(text.matches("Host: ").count(), 1);
@@ -1919,7 +2027,7 @@ mod tests {
     #[test]
     fn build_request_bytes_non_default_port_includes_port_in_host_header() {
         let parsed = ParsedUrl::parse("http://example.com:8080/api/test").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[], false);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("Host: example.com:8080\r\n"));
@@ -1932,7 +2040,7 @@ mod tests {
             "User-Agent".to_string(),
             "custom-agent\r\nX-Injected: nope".to_string(),
         )];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], false);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("User-Agent: custom-agentX-Injected: nope\r\n"));
@@ -2553,7 +2661,7 @@ mod tests {
     #[test]
     fn build_request_bytes_empty_path() {
         let parsed = ParsedUrl::parse("http://example.com").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[], false);
         let text = String::from_utf8(bytes).unwrap();
         // Should have "/" as path
         assert!(text.starts_with("GET /"));
@@ -2588,7 +2696,7 @@ mod tests {
             "X-Injected\r\nEvil".to_string(),
             "value\r\nX-Bad: smuggled".to_string(),
         )];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], false);
         let text = String::from_utf8(bytes).unwrap();
         // CRLF should be stripped — no injected header line
         assert!(text.contains("X-InjectedEvil: valueX-Bad: smuggled\r\n"));
@@ -2600,7 +2708,7 @@ mod tests {
     fn build_request_bytes_strips_invalid_chars_from_header_names() {
         let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
         let headers = vec![("X:Injected Header".to_string(), "value".to_string())];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], false);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("XInjectedHeader: value\r\n"));
@@ -2615,7 +2723,7 @@ mod tests {
             ("Content-Length ".to_string(), "999".to_string()),
             ("User-Agent:".to_string(), "spoofed".to_string()),
         ];
-        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[], false);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("Host: example.com\r\n"));
@@ -2631,7 +2739,7 @@ mod tests {
         let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
         let headers = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
         let body = b"hello";
-        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, body);
+        let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, body, false);
         let text = String::from_utf8(bytes).unwrap();
 
         assert!(text.contains("Content-Length: 5\r\n"));
@@ -2716,7 +2824,7 @@ mod tests {
         // Simulate the antigravity user agent being used in request building.
         let ua = format!("{DEFAULT_USER_AGENT} Antigravity/42.0");
         let parsed = ParsedUrl::parse("http://example.com/api").unwrap();
-        let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[]);
+        let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[], false);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));
     }
