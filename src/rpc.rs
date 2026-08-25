@@ -6608,15 +6608,15 @@ mod tests {
                 timestamp: 0,
             };
             Ok(Box::pin(futures::stream::iter(vec![
-                Ok(StreamEvent::TextDelta {
+                Ok(crate::model::StreamEvent::TextDelta {
                     content_index: 0,
                     delta: summary.clone(),
                 }),
-                Ok(StreamEvent::TextEnd {
+                Ok(crate::model::StreamEvent::TextEnd {
                     content_index: 0,
                     content: summary,
                 }),
-                Ok(StreamEvent::Done {
+                Ok(crate::model::StreamEvent::Done {
                     reason: StopReason::Stop,
                     message,
                 }),
@@ -9187,7 +9187,7 @@ export default function init(pi) {
                 session
                     .entries_for_current_path()
                     .iter()
-                    .any(|entry| matches!(entry, SessionEntry::Compaction(_))),
+                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
                 "the reported in-memory result must correspond to a real compaction mutation"
             );
             assert!(
@@ -9233,7 +9233,7 @@ export default function init(pi) {
                 session
                     .entries_for_current_path()
                     .iter()
-                    .any(|entry| matches!(entry, SessionEntry::Compaction(_))),
+                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
                 "the persistence error must occur after the in-memory compaction mutation"
             );
             assert!(
