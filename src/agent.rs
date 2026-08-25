@@ -1090,6 +1090,13 @@ impl MessageQueue {
         self.push(QueueKind::Steering, delivery)
     }
 
+    fn push_steering_lossless(&mut self, delivery: QueuedAgentMessage) -> u64 {
+        let entry = self.next_entry(delivery);
+        let seq = entry.seq;
+        self.steering.push_back(entry);
+        seq
+    }
+
     fn push_follow_up(&mut self, delivery: QueuedAgentMessage) -> u64 {
         self.push(QueueKind::FollowUp, delivery)
     }
@@ -2314,9 +2321,9 @@ impl Agent {
     }
 
     /// Apply magic-keyword effects for one user-authored message delivered
-    /// during the current run. The caller owns the turn-wide de-duplication
-    /// set so initial prompts, steering, and follow-ups share one activation
-    /// boundary and cannot inject the same directive repeatedly.
+    /// during the current logical turn. The caller owns the turn-wide
+    /// de-duplication set so the initial prompt and steering messages cannot
+    /// inject the same directive repeatedly. Follow-ups begin a fresh scope.
     fn apply_magic_keywords_for_message(
         &mut self,
         message: &Message,
@@ -2394,6 +2401,8 @@ impl Agent {
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
         let mut turn_keyword_words = std::collections::HashSet::new();
+        let turn_baseline_thinking = self.config.stream_options.thinking_level;
+        let turn_baseline_system_prompt = self.config.system_prompt.clone();
 
         if prompts.is_empty() && !self.retry_keyword_activations.is_empty() {
             let retry_hits = self.retry_keyword_activations.clone();
@@ -2457,7 +2466,7 @@ impl Agent {
         let run_started = std::time::Instant::now();
         let max_time = self.config.max_time;
 
-        loop {
+        'agent: loop {
             let mut has_more_tool_calls = true;
             let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
@@ -2471,22 +2480,24 @@ impl Agent {
                         cap.as_secs()
                     );
                     tracing::info!("{marker}");
-                    let marker_message = Message::User(UserMessage {
-                        content: UserContent::Text(format!("[TIME CAP] {marker}")),
+                    let assistant = Arc::new(AssistantMessage {
+                        content: vec![crate::model::ContentBlock::Text(TextContent::new(format!(
+                            "[time cap reached] {marker}"
+                        )))],
                         timestamp: Utc::now().timestamp_millis(),
+                        ..AssistantMessage::default()
                     });
+                    let marker_message = Message::Assistant(Arc::clone(&assistant));
+                    self.messages.push(marker_message.clone());
+                    new_messages.push(marker_message.clone());
                     on_event(AgentEvent::MessageStart {
                         message: marker_message.clone(),
                     });
                     on_event(AgentEvent::MessageEnd {
                         message: marker_message,
                     });
-                    return Ok(AssistantMessage {
-                        content: vec![crate::model::ContentBlock::Text(TextContent::new(format!(
-                            "[time cap reached] {marker}"
-                        )))],
-                        ..AssistantMessage::default()
-                    });
+                    last_assistant = Some(assistant);
+                    break 'agent;
                 }
 
                 let current_turn_index = turn_index;
@@ -2504,6 +2515,13 @@ impl Agent {
                 let delivering_required_initial_follow_up =
                     delivering_follow_up && required_initial_follow_up_pending;
                 if delivering_follow_up {
+                    // Follow-ups are new logical user turns. Restore the
+                    // caller's baseline before scanning their keywords so
+                    // steering-only effort and directives cannot leak across
+                    // the boundary.
+                    self.config.stream_options.thinking_level = turn_baseline_thinking;
+                    self.config.system_prompt = turn_baseline_system_prompt.clone();
+                    turn_keyword_words.clear();
                     pending_messages = self.message_queue.pop_follow_up();
                     follow_up_staged = false;
                     required_initial_follow_up_pending = false;
@@ -2918,6 +2936,37 @@ impl Agent {
             }
 
             // Delivery boundary: agent idle (after all tool calls + steering).
+            // Check the wall-clock cap before fetching the owning surface's
+            // follow-up queue. Accepted RPC messages then remain visible to
+            // that surface and can be resumed follow-up-first by its normal
+            // late-queue handoff instead of becoming private staged state.
+            if let Some(cap) = max_time
+                && run_started.elapsed() >= cap
+            {
+                let marker = format!(
+                    "time cap reached after {}s (--max-time); stopping at the turn boundary",
+                    cap.as_secs()
+                );
+                tracing::info!("{marker}");
+                let assistant = Arc::new(AssistantMessage {
+                    content: vec![crate::model::ContentBlock::Text(TextContent::new(format!(
+                        "[time cap reached] {marker}"
+                    )))],
+                    timestamp: Utc::now().timestamp_millis(),
+                    ..AssistantMessage::default()
+                });
+                let marker_message = Message::Assistant(Arc::clone(&assistant));
+                self.messages.push(marker_message.clone());
+                new_messages.push(marker_message.clone());
+                on_event(AgentEvent::MessageStart {
+                    message: marker_message.clone(),
+                });
+                on_event(AgentEvent::MessageEnd {
+                    message: marker_message,
+                });
+                last_assistant = Some(assistant);
+                break;
+            }
             follow_up_staged = self.stage_follow_up_messages().await;
             if !follow_up_staged {
                 break;
@@ -3065,7 +3114,11 @@ impl Agent {
         for fetcher in &self.steering_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
-                self.message_queue.push_steering(message);
+                // Fetchers own their admission and queue bounds. Preserve the
+                // complete accepted batch at the synchronous handoff instead
+                // of applying the smaller direct-input queue limit a second
+                // time (RPC legally admits up to MAX_RPC_PENDING_MESSAGES).
+                self.message_queue.push_steering_lossless(message);
             }
         }
         self.message_queue.pop_steering()
