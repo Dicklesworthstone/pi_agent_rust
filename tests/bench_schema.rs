@@ -1384,6 +1384,9 @@ esac
 set -euo pipefail
 case "${1:-}" in
   rev-parse)
+    if [[ "${PI_FAKE_GIT_IDENTITY_UNAVAILABLE:-0}" == "1" ]]; then
+      exit 64
+    fi
     if [[ "${2:-}" == "--short" && "${3:-}" == "HEAD" ]]; then
       printf '%s\n' '01234567'
     elif [[ "${2:-}" == "HEAD" ]]; then
@@ -1393,6 +1396,9 @@ case "${1:-}" in
     fi
     ;;
   status)
+    if [[ "${PI_FAKE_GIT_DIRTY:-0}" == "1" ]]; then
+      printf '%s\n' ' M scripts/perf/orchestrate.sh'
+    fi
     ;;
   *)
     exit 64
@@ -7885,6 +7891,48 @@ fn orchestrate_rch_perf_harness_rejects_wrong_source_commit() {
             .join("run/results/perf_bench_harness/extension_bench.jsonl")
             .exists(),
         "a wrong-commit extension benchmark must not enter the accepted result directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_unknown_source_commit() {
+    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_GIT_IDENTITY_UNAVAILABLE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must reject an unavailable Git commit identity"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("without a full Git commit identity: unknown"),
+        "unknown source identity must fail before the remote benchmark starts: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_dirty_source_tree() {
+    let (output, _temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_GIT_DIRTY", "1")]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must reject a dirty source tree"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("from a dirty source tree"),
+        "dirty source identity must fail before the remote benchmark starts: {combined}"
     );
 }
 

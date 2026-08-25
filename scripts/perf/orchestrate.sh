@@ -1152,7 +1152,13 @@ run_test_suite() {
     # arrive in the matching local target directory before crediting the suite.
     rch_target_subdir="nextest/pi-perf/$CORRELATION_ID/$suite_name"
     local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
-    if [[ -e "$retrieved_result_dir/extension_bench.jsonl" \
+    if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
+      log_fail "Refusing RCH extension benchmark without a full Git commit identity: $GIT_COMMIT_FULL"
+      exit_code=89
+    elif [[ "$GIT_DIRTY" != false ]]; then
+      log_fail "Refusing RCH extension benchmark from a dirty source tree"
+      exit_code=90
+    elif [[ -e "$retrieved_result_dir/extension_bench.jsonl" \
       || -L "$retrieved_result_dir/extension_bench.jsonl" \
       || -e "$retrieved_result_dir/extension_bench_summary.md" \
       || -L "$retrieved_result_dir/extension_bench_summary.md" ]]; then
