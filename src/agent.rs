@@ -1419,7 +1419,6 @@ impl Agent {
     }
 
     /// Report whether the dialect-repair audit ledger has pending entries.
-    #[must_use = "ledger inspection can fail if its mutex is poisoned"]
     pub fn repair_ledger_is_empty(&self) -> Result<bool> {
         self.repair_ledger
             .lock()
@@ -1428,7 +1427,6 @@ impl Agent {
     }
 
     /// Take all pending dialect-repair audit entries.
-    #[must_use = "draining the repair ledger can fail if its mutex is poisoned"]
     pub fn drain_repair_ledger(&self) -> Result<Vec<crate::dialects::RepairEntry>> {
         self.repair_ledger
             .lock()
