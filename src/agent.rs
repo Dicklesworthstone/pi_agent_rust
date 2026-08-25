@@ -1288,6 +1288,11 @@ pub struct Agent {
     /// session wrapper into session Custom entries for auditability.
     keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
 
+    /// Activations retained only while an incomplete turn is retryable. A
+    /// resume has no new prompt to scan, so these reapply the same turn-local
+    /// effects without duplicating durable telemetry.
+    retry_keyword_activations: Vec<crate::magic_keywords::KeywordActivation>,
+
     /// Highest effort the active model can accept. The session wrapper keeps
     /// this synchronized with the model registry so `ultrathink` cannot send
     /// a raw unsupported `Max` request.
@@ -1357,6 +1362,7 @@ impl Agent {
             dialect_repair_sequence: AtomicU64::new(0),
             tool_call_dialect: crate::dialects::Dialect::Native,
             keyword_ledger: Vec::new(),
+            retry_keyword_activations: Vec::new(),
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
         }
@@ -2065,12 +2071,46 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
+        if !prompts.is_empty() {
+            self.retry_keyword_activations.clear();
+        }
         let saved_thinking = self.config.stream_options.thinking_level;
         let saved_system_prompt = self.config.system_prompt.clone();
         let result = self.run_loop_inner(prompts, on_event, abort).await;
         self.config.stream_options.thinking_level = saved_thinking;
         self.config.system_prompt = saved_system_prompt;
+        if result.as_ref().is_ok_and(|message| {
+            !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        }) {
+            self.retry_keyword_activations.clear();
+        }
         result
+    }
+
+    fn apply_magic_keyword_effects(
+        &mut self,
+        hits: &[crate::magic_keywords::KeywordActivation],
+    ) {
+        let keyword_max_thinking_level = self.keyword_max_thinking_level;
+        for hit in hits {
+            if hit.action == "ultrathink" {
+                self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
+            }
+        }
+        let directives =
+            crate::magic_keywords::directives_for(hits, self.config.keyword_settings.as_ref());
+        if !directives.is_empty() {
+            let block = directives.join("\n");
+            match &mut self.config.system_prompt {
+                Some(existing) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(&block);
+                }
+                none_slot => {
+                    *none_slot = Some(block);
+                }
+            }
+        }
     }
 
     /// Apply magic-keyword effects for one user-authored message delivered
@@ -2107,26 +2147,8 @@ impl Agent {
             return;
         }
 
-        let keyword_max_thinking_level = self.keyword_max_thinking_level;
-        for hit in &hits {
-            if hit.action == "ultrathink" {
-                self.stream_options_mut().thinking_level = Some(keyword_max_thinking_level);
-            }
-        }
-        let directives =
-            crate::magic_keywords::directives_for(&hits, self.config.keyword_settings.as_ref());
-        if !directives.is_empty() {
-            let block = directives.join("\n");
-            match &mut self.config.system_prompt {
-                Some(existing) => {
-                    existing.push_str("\n\n");
-                    existing.push_str(&block);
-                }
-                none_slot => {
-                    *none_slot = Some(block);
-                }
-            }
-        }
+        self.apply_magic_keyword_effects(&hits);
+        self.retry_keyword_activations.extend(hits.iter().cloned());
         self.keyword_ledger.extend(hits);
     }
 
@@ -2152,6 +2174,12 @@ impl Agent {
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
         let mut turn_keyword_words = std::collections::HashSet::new();
+
+        if prompts.is_empty() && !self.retry_keyword_activations.is_empty() {
+            let retry_hits = self.retry_keyword_activations.clone();
+            turn_keyword_words.extend(retry_hits.iter().map(|hit| hit.word.clone()));
+            self.apply_magic_keyword_effects(&retry_hits);
+        }
 
         let agent_start_event = AgentEvent::AgentStart {
             session_id: session_id.clone(),
@@ -2309,6 +2337,10 @@ impl Agent {
                         let err_string = err.to_string();
                         let steering_to_add = self.drain_steering_messages().await;
                         for message in steering_to_add {
+                            self.apply_magic_keywords_for_message(
+                                &message,
+                                &mut turn_keyword_words,
+                            );
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -2366,6 +2398,7 @@ impl Agent {
                 ) {
                     let steering_to_add = self.drain_steering_messages().await;
                     for message in steering_to_add {
+                        self.apply_magic_keywords_for_message(&message, &mut turn_keyword_words);
                         self.messages.push(message.clone());
                         on_event(AgentEvent::MessageStart {
                             message: message.clone(),
@@ -2485,6 +2518,10 @@ impl Agent {
 
                         let steering_to_add = self.drain_steering_messages().await;
                         for message in steering_to_add {
+                            self.apply_magic_keywords_for_message(
+                                &message,
+                                &mut turn_keyword_words,
+                            );
                             self.messages.push(message.clone());
                             on_event(AgentEvent::MessageStart {
                                 message: message.clone(),
@@ -2532,6 +2569,10 @@ impl Agent {
                         Err(err) => {
                             let steering_to_add = self.drain_steering_messages().await;
                             for message in steering_to_add {
+                                self.apply_magic_keywords_for_message(
+                                    &message,
+                                    &mut turn_keyword_words,
+                                );
                                 self.messages.push(message.clone());
                                 on_event(AgentEvent::MessageStart {
                                     message: message.clone(),
