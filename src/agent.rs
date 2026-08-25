@@ -14299,13 +14299,16 @@ mod tests {
                 .await
                 .expect("full admitted follow-up batch");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].messages.len(), expected.len());
-            for (message, expected_text) in calls[0].messages.iter().zip(&expected) {
+            assert_eq!(recorded_calls.len(), 1);
+            assert_eq!(recorded_calls[0].messages.len(), expected.len());
+            for (message, expected_text) in recorded_calls[0].messages.iter().zip(&expected) {
                 assert_user_text(message, expected_text);
             }
         });
@@ -14357,12 +14360,15 @@ mod tests {
                 .await
                 .expect("ordinary follow-up delivery");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
-            assert_eq!(calls.len(), 2);
-            let second_call = &calls[1].messages;
+            assert_eq!(recorded_calls.len(), 2);
+            let second_call = &recorded_calls[1].messages;
             assert!(second_call.len() >= expected.len());
             let delivered = &second_call[second_call.len() - expected.len()..];
             for (message, expected_text) in delivered.iter().zip(&expected) {
@@ -14419,13 +14425,12 @@ mod tests {
                 .await
                 .expect("max-time stop");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let calls_len = match calls.lock() {
+                Ok(calls) => calls.len(),
+                Err(poisoned) => poisoned.into_inner().len(),
             };
             assert_eq!(
-                calls.len(),
-                1,
+                calls_len, 1,
                 "the expired time cap must prevent a follow-up provider turn"
             );
             assert_eq!(
@@ -14483,20 +14488,26 @@ mod tests {
                 .await
                 .expect("source-aware queued message completes");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
-            assert_eq!(calls.len(), 1);
+            assert_eq!(recorded_calls.len(), 1);
             assert_eq!(
-                calls[0].thinking_level,
+                recorded_calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::Low),
                 "generated ultrathink must not raise effort"
             );
-            let system_prompt = calls[0].system_prompt.as_deref().expect("directive");
+            let system_prompt = recorded_calls[0]
+                .system_prompt
+                .as_deref()
+                .expect("directive");
             assert!(system_prompt.contains("invoked `orchestrate`"));
             assert!(!system_prompt.contains("invoked `workflowz`"));
-            assert!(calls[0].messages.iter().any(|message| {
+            assert!(recorded_calls[0].messages.iter().any(|message| {
                 matches!(
                     message,
                     Message::User(UserMessage {
@@ -14505,7 +14516,6 @@ mod tests {
                     }) if text == &expanded
                 )
             }));
-            drop(calls);
 
             let activations = agent.drain_keyword_ledger();
             assert_eq!(activations.len(), 1);
@@ -14559,19 +14569,28 @@ mod tests {
                 .await
                 .expect("generated queued message completes");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
-            assert_eq!(calls.len(), 1);
+            assert_eq!(recorded_calls.len(), 1);
             assert_eq!(
-                calls[0].thinking_level,
+                recorded_calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::Low)
             );
-            assert!(calls[0].system_prompt.as_deref().is_none_or(|prompt| {
-                !prompt.contains("invoked `orchestrate`") && !prompt.contains("invoked `workflowz`")
-            }));
-            assert!(calls[0].messages.iter().any(|message| {
+            assert!(
+                recorded_calls[0]
+                    .system_prompt
+                    .as_deref()
+                    .is_none_or(|prompt| {
+                        !prompt.contains("invoked `orchestrate`")
+                            && !prompt.contains("invoked `workflowz`")
+                    })
+            );
+            assert!(recorded_calls[0].messages.iter().any(|message| {
                 matches!(
                     message,
                     Message::User(UserMessage {
@@ -14580,7 +14599,6 @@ mod tests {
                     }) if text == &generated_text
                 )
             }));
-            drop(calls);
 
             assert!(agent.drain_keyword_ledger().is_empty());
         });
@@ -14633,21 +14651,27 @@ mod tests {
                 .await
                 .expect("source-aware prompt completes");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
-            assert_eq!(calls.len(), 1);
+            assert_eq!(recorded_calls.len(), 1);
             assert_eq!(
-                calls[0].thinking_level,
+                recorded_calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::Low),
                 "attachment-injected ultrathink must not change effort"
             );
-            let system_prompt = calls[0].system_prompt.as_deref().expect("directive");
+            let system_prompt = recorded_calls[0]
+                .system_prompt
+                .as_deref()
+                .expect("directive");
             assert!(system_prompt.contains("invoked `orchestrate`"));
             assert!(!system_prompt.contains("invoked `workflowz`"));
             assert!(matches!(
-                calls[0].messages.as_slice(),
+                recorded_calls[0].messages.as_slice(),
                 [Message::User(UserMessage {
                     content: UserContent::Blocks(blocks),
                     ..
@@ -14655,7 +14679,6 @@ mod tests {
                     [ContentBlock::Text(text), ContentBlock::Image(actual_image)]
                         if text.text == generated_text && actual_image.data == image.data)
             ));
-            drop(calls);
 
             let activations = agent.drain_keyword_ledger();
             assert_eq!(activations.len(), 1);
