@@ -5197,13 +5197,9 @@ mod retry_tests {
                 assert_eq!(ack["command"], "prompt");
                 assert_eq!(ack["success"], true, "prompt should be accepted: {ack}");
 
-                let cancel_thread = std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(100));
-                    cancel_cx.set_cancel_requested(true);
-                });
-
                 let retry_abort_wait = async {
                     let mut timeline = Vec::new();
+                    let mut cancellation_requested = false;
                     loop {
                         let recv_result = {
                             let rx = client_out_rx.lock().expect("lock rpc output receiver");
@@ -5218,6 +5214,10 @@ mod retry_tests {
                                     continue;
                                 };
                                 timeline.push(kind.to_string());
+                                if kind == "auto_retry_start" && !cancellation_requested {
+                                    cancel_cx.set_cancel_requested(true);
+                                    cancellation_requested = true;
+                                }
                                 if kind == "agent_end" {
                                     let agent_end_error = value
                                         .get("error")
@@ -5253,7 +5253,6 @@ mod retry_tests {
                 .await
                 .expect("cancelled prompt should finish before timeout");
 
-                cancel_thread.join().expect("cancel thread join");
                 let retry_start_idx = timeline
                     .iter()
                     .position(|kind| kind == "auto_retry_start")

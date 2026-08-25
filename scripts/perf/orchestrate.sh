@@ -4755,7 +4755,6 @@ POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
 post_generation_budget_exit=0
 declare -a POST_GENERATION_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
-  && suite_selected "perf_bench_harness" \
   && ! verify_current_clean_source_identity "RCH post-generation staging precondition"; then
   die "RCH post-generation staging source identity is not stable"
 fi
@@ -4975,10 +4974,7 @@ if pijs_artifact.is_file():
             or len(claimed_sha256) != 64
         ):
             raise SystemExit("eligible PiJS records have invalid binary provenance")
-        binary_candidates = [
-            Path(claimed_path),
-            target_dir / "perf" / "examples" / "pijs_workload",
-        ]
+        binary_candidates = [target_dir / "perf" / "examples" / "pijs_workload"]
         pijs_binary = None
         for candidate in binary_candidates:
             try:
@@ -5047,6 +5043,7 @@ fi
 mkdir -p "$POST_GENERATION_BUDGET_DIR"
 PERF_EVIDENCE_DIR="$POST_GENERATION_EVIDENCE_DIR" \
 PI_PERF_POST_GENERATION=1 \
+PI_PERF_STRICT=1 \
 PI_PERF_EXPECTED_SOURCE_COMMIT="$GIT_COMMIT_FULL" \
 CI_CORRELATION_ID="$CORRELATION_ID" \
 RCH_REQUIRE_REMOTE=1 \
@@ -5079,7 +5076,6 @@ if [[ "$post_generation_budget_exit" -eq 0 && "$CARGO_RUNNER_MODE" == "rch" ]]; 
 fi
 if [[ "$post_generation_budget_exit" -eq 0 \
   && "$CARGO_RUNNER_MODE" == "rch" ]] \
-  && suite_selected "perf_bench_harness" \
   && ! verify_current_clean_source_identity "RCH post-generation budget postcondition"; then
   post_generation_budget_exit=96
 fi
@@ -5088,14 +5084,10 @@ post_generation_budget_status="pass"
 if [[ "$post_generation_budget_exit" -eq 0 ]]; then
   suite_pass=$((suite_pass + 1))
   log_ok "Post-generation perf budget data-contract evaluation passed"
-elif [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
+else
   post_generation_budget_status="fail"
   suite_fail=$((suite_fail + 1))
   log_warn "Post-generation perf budget data-contract evaluation failed (exit=$post_generation_budget_exit)"
-else
-  post_generation_budget_status="skip"
-  suite_skip=$((suite_skip + 1))
-  log_warn "Post-generation perf budget data-contract evaluation skipped after failure (exit=$post_generation_budget_exit)"
 fi
 
 staging_exit=0
@@ -5169,13 +5161,8 @@ if [[ "$post_generation_exit" -ne 0 \
   else
     post_generation_result_exit="$staging_exit"
   fi
-  if [[ "${PI_PERF_STRICT:-0}" == "1" ]]; then
-    post_generation_status="fail"
-    suite_fail=$((suite_fail + 1))
-  else
-    post_generation_status="skip"
-    suite_skip=$((suite_skip + 1))
-  fi
+  post_generation_status="fail"
+  suite_fail=$((suite_fail + 1))
 else
   suite_pass=$((suite_pass + 1))
 fi
@@ -5246,7 +5233,6 @@ log_ok "Total artifacts collected and finalized: $artifact_count"
 # ─── Phase 6: Generate checksums ────────────────────────────────────────────
 
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
-  && suite_selected "perf_bench_harness" \
   && ! verify_current_clean_source_identity "RCH checksum precondition"; then
   die "RCH checksum source identity is not stable"
 fi
@@ -5304,7 +5290,6 @@ fi
 # ─── Summary ─────────────────────────────────────────────────────────────────
 
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
-  && suite_selected "perf_bench_harness" \
   && ! verify_current_clean_source_identity "RCH final-success precondition"; then
   die "RCH final-success source identity is not stable"
 fi

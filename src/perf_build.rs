@@ -560,10 +560,6 @@ fn validate_control_lineage(
     Ok(())
 }
 
-fn canonical_regular_file(path: &str, field: &str) -> Result<PathBuf, MeasurementControlError> {
-    canonical_regular_path(Path::new(path), field)
-}
-
 fn canonical_regular_path(
     path: &Path,
     field: &str,

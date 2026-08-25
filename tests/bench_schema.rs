@@ -1366,11 +1366,6 @@ marker = {
     "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
     "exact": True,
 }
-(evidence_dir / "perf_budgets_post_generation_invocation.json").write_text(
-    json.dumps(marker, sort_keys=True)
-    + "\n",
-    encoding="utf-8",
-)
 print(json.dumps(marker, sort_keys=True))
 PY
     fi
@@ -1515,6 +1510,17 @@ case "${1:-}" in
     else
       echo "unexpected fake RCH exec arguments: $*" >&2
       exit 68
+    fi
+    if [[ "$has_overlay" == "1" ]]; then
+      for key in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do
+        case ",${RCH_ENV_ALLOWLIST:-}," in
+          *",$key,"*) ;;
+          *)
+            echo "RCH_ENV_ALLOWLIST omitted $key" >&2
+            exit 66
+            ;;
+        esac
+      done
     fi
     if PI_FAKE_RCH_EXECUTED=1 \
       PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" \
@@ -1665,7 +1671,7 @@ for name in (
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("correlation_id") != expected_correlation_id:
         raise SystemExit(f"{name}: correlation_id mismatch")
-(evidence_dir / "perf_budgets_post_generation_invocation.json").write_text(
+print(
     json.dumps(
         {
             "schema": "pi.perf.fake_post_generation_invocation.v1",
@@ -1675,8 +1681,6 @@ for name in (
         },
         sort_keys=True,
     )
-    + "\n",
-    encoding="utf-8",
 )
 PY
 "#;

@@ -1920,6 +1920,11 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             "atomic rename must publish the complete new JSONL snapshot exactly once"
         );
         assert_no_duplicate_user_texts(&mid_texts, "jsonl mid-flush window");
+        assert_eq!(
+            reopened_mid.header.provider.as_deref(),
+            Some("failpoint-jsonl"),
+            "atomic rename must publish the complete rewritten JSONL header"
+        );
 
         // Post-flush crash window: persisted mutation survives exactly once.
         let mut post = reopened_mid;
@@ -2028,8 +2033,8 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         );
         assert_eq!(
             std::fs::read_to_string(&marker_path).expect("read SQLite checkpoint marker"),
-            format!("{failpoint}\n"),
-            "SQLite hard exit must occur only after the exact backend checkpoint"
+            format!("{failpoint}\nentries_before=1;entries_after=2;message_count=2\n"),
+            "SQLite hard exit must carry same-transaction evidence from after the mutation"
         );
         harness
             .log()
@@ -2043,6 +2048,13 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
         assert_eq!(mid_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&mid_texts, "sqlite mid-flush window");
+        let mid_meta = pi::session_sqlite::load_session_meta(&stable_path)
+            .await
+            .expect("load SQLite metadata after rollback recovery");
+        assert_eq!(
+            mid_meta.message_count, 1,
+            "SQLite recovery must roll back transactional metadata with the entry"
+        );
 
         // Post-flush crash window.
         let mut post = reopened_mid;
@@ -2068,6 +2080,13 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             "sqlite post-crash ordering mismatch"
         );
         assert_no_duplicate_user_texts(&post_texts, "sqlite post-flush window");
+        let post_meta = pi::session_sqlite::load_session_meta(&stable_path)
+            .await
+            .expect("load SQLite metadata after committed post-flush save");
+        assert_eq!(
+            post_meta.message_count, 2,
+            "SQLite committed metadata must match the two persisted messages"
+        );
 
         record_inline_json_artifact(
             &harness,

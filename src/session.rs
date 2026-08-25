@@ -1300,7 +1300,10 @@ fn validate_unterminated_jsonl_rewrite_scope(
 }
 
 #[cfg(feature = "internal-persistence-fault-injection")]
-pub(crate) fn persistence_test_failpoint(point: &str) -> Result<()> {
+pub(crate) fn persistence_test_failpoint(
+    point: &str,
+    mutation_witness: Option<&str>,
+) -> Result<()> {
     if std::env::var("PI_SESSION_PERSISTENCE_TEST_FAILPOINT")
         .is_ok_and(|configured| configured == point)
     {
@@ -1319,7 +1322,15 @@ pub(crate) fn persistence_test_failpoint(point: &str) -> Result<()> {
                 .open(marker_path)?;
             marker.write_all(point.as_bytes())?;
             marker.write_all(b"\n")?;
-            marker.sync_all()?;
+            if let Some(witness) = mutation_witness {
+                marker.write_all(witness.as_bytes())?;
+                marker.write_all(b"\n")?;
+            }
+            // File writes are visible to the parent after the child exits. Do
+            // not fsync this diagnostic marker: on a shared filesystem that
+            // could also commit the JSONL rename's journal transaction and
+            // perturb the durability window under test.
+            drop(marker);
             // Terminate without unwinding or dropping backend connections.
             // The parent process reopens the store to exercise real crash
             // recovery rather than the ordinary error/rollback path.
@@ -1338,7 +1349,10 @@ pub(crate) fn persistence_test_failpoint(point: &str) -> Result<()> {
     clippy::unnecessary_wraps,
     reason = "the non-default fault-injection feature shares this Result-returning call site"
 )]
-pub(crate) const fn persistence_test_failpoint(_point: &str) -> Result<()> {
+pub(crate) const fn persistence_test_failpoint(
+    _point: &str,
+    _mutation_witness: Option<&str>,
+) -> Result<()> {
     Ok(())
 }
 
@@ -1379,7 +1393,7 @@ fn persist_jsonl_snapshot_locked(
     temp_file
         .persist(path)
         .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
-    persistence_test_failpoint("jsonl_after_rename_before_parent_sync")?;
+    persistence_test_failpoint("jsonl_after_rename_before_parent_sync", None)?;
     sync_parent_dir(path).map_err(|e| crate::Error::Io(Box::new(e)))
 }
 

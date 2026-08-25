@@ -2214,7 +2214,34 @@ pub async fn append_entries(
 
             insert_entry_jsons(&conn, &reconciled.appended_json, existing_entry_count)?;
             write_session_meta(&conn, &reconciled.entries)?;
-            crate::session::persistence_test_failpoint("sqlite_after_mutation_before_commit")?;
+            #[cfg(feature = "internal-persistence-fault-injection")]
+            {
+                let mutated_entry_count = read_stored_entries(&conn)?.len();
+                let mut mutated_message_count = None;
+                for row in query_session_meta_rows(&conn)? {
+                    if row_get_string(&row, 0, "key")? == "message_count" {
+                        let raw_count = row_get_string(&row, 1, "value")?;
+                        mutated_message_count = Some(raw_count.parse::<u64>().map_err(|err| {
+                            Error::session(format!(
+                                "SQLite session message_count is not a valid u64: {err}"
+                            ))
+                        })?);
+                        break;
+                    }
+                }
+                let mutated_message_count = mutated_message_count.ok_or_else(|| {
+                    Error::session(
+                        "SQLite session missing message_count after transactional mutation",
+                    )
+                })?;
+                let mutation_witness = format!(
+                    "entries_before={existing_entry_count};entries_after={mutated_entry_count};message_count={mutated_message_count}"
+                );
+                crate::session::persistence_test_failpoint(
+                    "sqlite_after_mutation_before_commit",
+                    Some(&mutation_witness),
+                )?;
+            }
 
             Ok((stored_header, reconciled.entries))
         })();
