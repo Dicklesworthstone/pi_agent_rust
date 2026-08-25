@@ -9152,6 +9152,97 @@ export default function init(pi) {
         });
     }
 
+    #[test]
+    fn auto_compaction_save_disabled_reports_in_memory_result() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let (events, session) = run_auto_compaction_persistence_case(
+                Session::in_memory(),
+                false,
+                runtime_handle,
+            )
+            .await;
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "auto_compaction_end")
+                .expect("auto_compaction_end");
+            assert_eq!(end["result"]["persisted"], false);
+            assert_eq!(
+                end["result"]["persistenceStatus"]["event"],
+                "session.persistence.disabled"
+            );
+            assert!(
+                end.get("errorMessage").is_none(),
+                "in-memory compaction is successful but explicitly non-durable: {end}"
+            );
+
+            let cx = asupersync::Cx::for_testing();
+            let session = session.lock(&cx).await.expect("lock compacted session");
+            assert!(
+                session
+                    .entries_for_current_path()
+                    .iter()
+                    .any(|entry| matches!(entry, SessionEntry::Compaction(_))),
+                "the reported in-memory result must correspond to a real compaction mutation"
+            );
+            assert!(
+                session.autosave_metrics().pending_mutations > 0,
+                "disabled persistence must leave the in-memory mutation observable"
+            );
+        });
+    }
+
+    #[test]
+    fn auto_compaction_persistence_failure_emits_terminal_error_after_mutation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let blocked_root = tempfile::tempdir().expect("tempdir");
+            let blocked_session_dir = blocked_root.path().join("not-a-directory");
+            std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
+            let session = Session::create_with_dir(Some(blocked_session_dir));
+            let (events, session) =
+                run_auto_compaction_persistence_case(session, true, runtime_handle).await;
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "auto_compaction_end")
+                .expect("auto_compaction_end");
+            assert!(
+                end.get("result").is_none(),
+                "a failed durable write must not expose a successful result: {end}"
+            );
+            assert!(
+                end["errorMessage"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Failed to persist compaction")),
+                "persistence failure must be explicit and terminal: {end}"
+            );
+
+            let cx = asupersync::Cx::for_testing();
+            let session = session.lock(&cx).await.expect("lock failed-save session");
+            assert!(
+                session
+                    .entries_for_current_path()
+                    .iter()
+                    .any(|entry| matches!(entry, SessionEntry::Compaction(_))),
+                "the persistence error must occur after the in-memory compaction mutation"
+            );
+            assert!(
+                session.autosave_metrics().pending_mutations > 0,
+                "failed persistence must retain retryable pending mutations"
+            );
+        });
+    }
+
     // -----------------------------------------------------------------------
     // rpc_flatten_content_blocks
     // -----------------------------------------------------------------------
