@@ -7,6 +7,13 @@
 use base64::Engine as _;
 use std::sync::OnceLock;
 
+/// Maximum decoded image size accepted by terminal rendering helpers.
+const MAX_INLINE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// Maximum base64 length for an image at the decoded size limit.
+const MAX_INLINE_IMAGE_BASE64_BYTES: usize = MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4;
+/// Maximum number of visible ASCII characters retained in a MIME placeholder.
+const MAX_PLACEHOLDER_MIME_LEN: usize = 80;
+
 // ---------------------------------------------------------------------------
 // Protocol detection
 // ---------------------------------------------------------------------------
@@ -31,6 +38,12 @@ pub fn detect_protocol() -> ImageProtocol {
 }
 
 fn detect_protocol_uncached() -> ImageProtocol {
+    // Direct protocol sequences are not safe through multiplexers unless their
+    // explicit passthrough protocol is implemented. Fail closed for now.
+    if std::env::var_os("TMUX").is_some() || std::env::var_os("STY").is_some() {
+        return ImageProtocol::Unsupported;
+    }
+
     // iTerm2 detection (very reliable).
     if let Ok(prog) = std::env::var("TERM_PROGRAM") {
         let lower = prog.to_ascii_lowercase();
@@ -52,9 +65,6 @@ fn detect_protocol_uncached() -> ImageProtocol {
     if let Ok(term) = std::env::var("TERM") {
         let lower = term.to_ascii_lowercase();
         if lower.contains("kitty") {
-            return ImageProtocol::Kitty;
-        }
-        if lower.contains("xterm-kitty") {
             return ImageProtocol::Kitty;
         }
     }
@@ -79,24 +89,31 @@ const KITTY_CHUNK_SIZE: usize = 4096;
 /// Returns the complete escape sequence string that, when written to stdout,
 /// displays the image inline.
 ///
+/// Only structurally recognizable PNG data within the inline size limit is
+/// accepted because Kitty format `100` specifically denotes PNG. Invalid,
+/// empty, or oversized input returns an empty string.
+///
 /// `cols` constrains the display width in terminal columns.
 pub fn encode_kitty(image_bytes: &[u8], cols: usize) -> String {
+    // Kitty format 100 means PNG, not auto-detection. Never label arbitrary
+    // bytes as PNG or allocate an unbounded base64 copy.
+    if image_bytes.len() > MAX_INLINE_IMAGE_BYTES || !is_png(image_bytes) {
+        return String::new();
+    }
+
     let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
     let mut out = String::with_capacity(b64.len() + 256);
+    let chunk_count = b64.len().div_ceil(KITTY_CHUNK_SIZE);
+    let cols = cols.max(1);
 
-    let chunks: Vec<&str> = b64
-        .as_bytes()
-        .chunks(KITTY_CHUNK_SIZE)
-        .map(|c| std::str::from_utf8(c).unwrap_or(""))
-        .collect();
-
-    for (i, chunk) in chunks.iter().enumerate() {
+    for (i, chunk_bytes) in b64.as_bytes().chunks(KITTY_CHUNK_SIZE).enumerate() {
+        let chunk = std::str::from_utf8(chunk_bytes).unwrap_or("");
         let is_first = i == 0;
-        let is_last = i == chunks.len() - 1;
+        let is_last = i == chunk_count - 1;
         let more = u8::from(!is_last);
 
         if is_first {
-            // First chunk: include action=transmit+display, format=100 (auto-detect).
+            // First chunk: include action=transmit+display and PNG format=100.
             // c=<cols> constrains display width.
             write_kitty_chunk(&mut out, &format!("a=T,f=100,c={cols},m={more}"), chunk);
         } else {
@@ -125,10 +142,20 @@ fn write_kitty_chunk(out: &mut String, control: &str, payload: &str) {
 ///
 /// Returns the complete escape sequence string.
 ///
+/// Input must be a recognizable PNG, JPEG, or GIF within the inline size
+/// limit. Empty, unrecognized, or oversized input returns an empty string.
+///
 /// `cols` is used to set `width` in character cells.
 pub fn encode_iterm2(image_bytes: &[u8], cols: usize) -> String {
+    if image_bytes.is_empty()
+        || image_bytes.len() > MAX_INLINE_IMAGE_BYTES
+        || image_dimensions(image_bytes).is_none()
+    {
+        return String::new();
+    }
     let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
     let size = image_bytes.len();
+    let cols = cols.max(1);
     // OSC 1337 ; File=<params> : <base64> BEL
     format!("\x1b]1337;File=size={size};width={cols};inline=1:{b64}\x07")
 }
@@ -139,9 +166,24 @@ pub fn encode_iterm2(image_bytes: &[u8], cols: usize) -> String {
 
 /// Generate a text placeholder for terminals that don't support inline images.
 pub fn placeholder(mime_type: &str, width: Option<u32>, height: Option<u32>) -> String {
+    let mime_type = sanitized_mime_type(mime_type);
     match (width, height) {
-        (Some(w), Some(h)) => format!("[image: {mime_type}, {w}x{h}]"),
+        (Some(w), Some(h)) if w > 0 && h > 0 => format!("[image: {mime_type}, {w}x{h}]"),
         _ => format!("[image: {mime_type}]"),
+    }
+}
+
+fn sanitized_mime_type(mime_type: &str) -> String {
+    let sanitized: String = mime_type
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '+' | '-'))
+        .take(MAX_PLACEHOLDER_MIME_LEN)
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
     }
 }
 
@@ -155,7 +197,7 @@ pub fn placeholder(mime_type: &str, width: Option<u32>, height: Option<u32>) -> 
 pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     // PNG: width at bytes 16..20, height at 20..24 (big-endian).
     // Valid PNGs must have the IHDR chunk immediately following the signature.
-    if data.len() >= 24 && data.starts_with(b"\x89PNG\r\n\x1A\n") && &data[12..16] == b"IHDR" {
+    if is_png(data) {
         let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
         let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
         return Some((w, h));
@@ -170,10 +212,38 @@ pub fn image_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     if data.len() >= 10 && (data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
         let w = u32::from(u16::from_le_bytes([data[6], data[7]]));
         let h = u32::from(u16::from_le_bytes([data[8], data[9]]));
-        return Some((w, h));
+        return (w > 0 && h > 0).then_some((w, h));
     }
 
     None
+}
+
+fn is_png(data: &[u8]) -> bool {
+    if data.len() < 33
+        || !data.starts_with(b"\x89PNG\r\n\x1A\n")
+        || data[8..12] != 13_u32.to_be_bytes()
+        || &data[12..16] != b"IHDR"
+    {
+        return false;
+    }
+    let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
+    let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
+    width > 0 && height > 0
+}
+
+fn image_bytes_match_mime(data: &[u8], mime_type: &str) -> bool {
+    if mime_type.eq_ignore_ascii_case("image/png") {
+        return is_png(data);
+    }
+    if mime_type.eq_ignore_ascii_case("image/jpeg") || mime_type.eq_ignore_ascii_case("image/jpg") {
+        return data.starts_with(&[0xFF, 0xD8]) && jpeg_dimensions(data).is_some();
+    }
+    if mime_type.eq_ignore_ascii_case("image/gif") {
+        return data.len() >= 10
+            && (data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a"))
+            && image_dimensions(data).is_some();
+    }
+    false
 }
 
 fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
@@ -223,7 +293,7 @@ fn jpeg_dimensions(data: &[u8]) -> Option<(u32, u32)> {
             }
             let h = u32::from(u16::from_be_bytes([data[i + 3], data[i + 4]]));
             let w = u32::from(u16::from_be_bytes([data[i + 5], data[i + 6]]));
-            return Some((w, h));
+            return (w > 0 && h > 0).then_some((w, h));
         }
 
         i += seg_len;
@@ -251,11 +321,20 @@ const fn is_jpeg_sof_marker(marker: u8) -> bool {
 /// Returns the string to write to the terminal.
 ///
 pub fn render_inline(image_b64: &str, mime_type: &str, max_cols: usize) -> String {
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(image_b64) else {
-        return placeholder(mime_type, None, None);
-    };
+    let fallback = placeholder(mime_type, None, None);
+    let protocol = detect_protocol();
+    if protocol == ImageProtocol::Unsupported || image_b64.len() > MAX_INLINE_IMAGE_BASE64_BYTES {
+        return fallback;
+    }
 
-    render_inline_bytes(&bytes, mime_type, max_cols, detect_protocol())
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(image_b64) else {
+        return fallback;
+    };
+    if bytes.len() > MAX_INLINE_IMAGE_BYTES {
+        return fallback;
+    }
+
+    render_inline_bytes(&bytes, mime_type, max_cols, protocol)
 }
 
 fn render_inline_bytes(
@@ -264,24 +343,39 @@ fn render_inline_bytes(
     max_cols: usize,
     protocol: ImageProtocol,
 ) -> String {
+    let fallback = placeholder(mime_type, None, None);
+    if bytes.is_empty() || bytes.len() > MAX_INLINE_IMAGE_BYTES {
+        return fallback;
+    }
     let dims = image_dimensions(bytes);
     let placeholder = placeholder(mime_type, dims.map(|(w, _)| w), dims.map(|(_, h)| h));
-
-    if bytes.is_empty() {
-        return placeholder;
-    }
 
     let cols = max_cols.max(1);
     match protocol {
         ImageProtocol::Kitty => {
-            let encoded = encode_kitty(bytes, cols);
+            let encoded = if image_bytes_match_mime(bytes, mime_type) {
+                encode_kitty(bytes, cols)
+            } else {
+                String::new()
+            };
             if encoded.is_empty() {
                 placeholder
             } else {
                 encoded
             }
         }
-        ImageProtocol::Iterm2 => encode_iterm2(bytes, cols),
+        ImageProtocol::Iterm2 => {
+            let encoded = if image_bytes_match_mime(bytes, mime_type) {
+                encode_iterm2(bytes, cols)
+            } else {
+                String::new()
+            };
+            if encoded.is_empty() {
+                placeholder
+            } else {
+                encoded
+            }
+        }
         ImageProtocol::Unsupported => placeholder,
     }
 }
@@ -294,14 +388,24 @@ fn render_inline_bytes(
 mod tests {
     use super::*;
 
+    fn png_with_payload(payload_len: usize) -> Vec<u8> {
+        let mut data = vec![0_u8; payload_len.max(33)];
+        data[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
+        data[8..12].copy_from_slice(&13_u32.to_be_bytes());
+        data[12..16].copy_from_slice(b"IHDR");
+        data[16..20].copy_from_slice(&100_u32.to_be_bytes());
+        data[20..24].copy_from_slice(&50_u32.to_be_bytes());
+        data
+    }
+
     #[test]
     fn kitty_single_chunk_small_image() {
         // Small payload that fits in one chunk.
-        let data = b"hello";
-        let result = encode_kitty(data, 40);
+        let data = png_with_payload(32);
+        let result = encode_kitty(&data, 40);
         assert!(result.starts_with("\x1b_G"), "Should start with APC");
         assert!(result.contains("a=T"), "First chunk should have a=T");
-        assert!(result.contains("f=100"), "Should auto-detect format");
+        assert!(result.contains("f=100"), "Should identify PNG format");
         assert!(result.contains("c=40"), "Should set column constraint");
         assert!(result.contains("m=0"), "Single chunk should have m=0");
         assert!(result.ends_with("\x1b\\"), "Should end with ST");
@@ -310,14 +414,11 @@ mod tests {
     #[test]
     fn kitty_multi_chunk_large_payload() {
         // Create payload larger than KITTY_CHUNK_SIZE.
-        let data = vec![0u8; 4096];
+        let data = png_with_payload(4096);
         let result = encode_kitty(&data, 80);
         // Base64 of 4096 bytes = ~5462 chars, needs 2 chunks.
         let chunk_count = result.matches("\x1b_G").count();
-        assert!(
-            chunk_count >= 2,
-            "Should have at least 2 chunks, got {chunk_count}"
-        );
+        assert_eq!(chunk_count, 2, "Should have exactly 2 chunks");
         // First chunk should have m=1 (more to come).
         assert!(result.contains("m=1"), "First chunk should signal more");
         // Last chunk should have m=0.
@@ -328,8 +429,8 @@ mod tests {
 
     #[test]
     fn iterm2_format() {
-        let data = b"test image";
-        let result = encode_iterm2(data, 60);
+        let data = png_with_payload(33);
+        let result = encode_iterm2(&data, 60);
         assert!(
             result.starts_with("\x1b]1337;File="),
             "Should start with OSC 1337"
@@ -356,9 +457,29 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_removes_terminal_controls_and_bidi_text() {
+        let result = placeholder("image/png\x1b[2J\u{202e}evil", None, None);
+        assert_eq!(result, "[image: image/png]");
+        assert!(!result.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn placeholder_uses_unknown_for_empty_or_invalid_mime() {
+        assert_eq!(placeholder("\x1b\n", None, None), "[image: unknown]");
+    }
+
+    #[test]
+    fn placeholder_omits_zero_dimensions() {
+        assert_eq!(
+            placeholder("image/png", Some(0), Some(100)),
+            "[image: image/png]"
+        );
+    }
+
+    #[test]
     fn png_dimensions() {
         // Minimal valid PNG header with 100x50 dimensions.
-        let mut data = vec![0u8; 32];
+        let mut data = vec![0u8; 33];
         data[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
         // IHDR chunk: length=13, type=IHDR, width=100, height=50
         data[8..12].copy_from_slice(&13u32.to_be_bytes());
@@ -459,8 +580,8 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"not-an-image");
         let result = render_inline(&b64, "image/webp", 80);
         match detect_protocol() {
-            ImageProtocol::Kitty => assert!(result.starts_with("\x1b_G")),
-            ImageProtocol::Iterm2 => assert!(result.starts_with("\x1b]1337;File=")),
+            ImageProtocol::Kitty => assert_eq!(result, "[image: image/webp]"),
+            ImageProtocol::Iterm2 => assert_eq!(result, "[image: image/webp]"),
             ImageProtocol::Unsupported => assert_eq!(result, "[image: image/webp]"),
         }
     }
@@ -480,16 +601,28 @@ mod tests {
     }
 
     #[test]
-    fn render_inline_kitty_with_decodable_image_uses_escape_sequence() {
-        let result = render_inline_bytes(b"hello", "image/png", 40, ImageProtocol::Kitty);
+    fn render_inline_kitty_with_png_uses_escape_sequence() {
+        let data = png_with_payload(33);
+        let result = render_inline_bytes(&data, "image/png", 40, ImageProtocol::Kitty);
         assert!(result.starts_with("\x1b_G"));
         assert!(result.contains("a=T"));
         assert!(result.ends_with("\x1b\\"));
     }
 
     #[test]
+    fn render_inline_kitty_rejects_non_png_or_mismatched_mime() {
+        let arbitrary = render_inline_bytes(b"hello", "image/png", 40, ImageProtocol::Kitty);
+        assert_eq!(arbitrary, "[image: image/png]");
+
+        let png = png_with_payload(33);
+        let mismatched = render_inline_bytes(&png, "image/jpeg", 40, ImageProtocol::Kitty);
+        assert_eq!(mismatched, "[image: image/jpeg, 100x50]");
+    }
+
+    #[test]
     fn render_inline_iterm2_with_decodable_image_uses_escape_sequence() {
-        let result = render_inline_bytes(b"hello", "image/png", 40, ImageProtocol::Iterm2);
+        let data = png_with_payload(33);
+        let result = render_inline_bytes(&data, "image/png", 40, ImageProtocol::Iterm2);
         assert!(result.starts_with("\x1b]1337;File="));
         assert!(result.contains("inline=1"));
         assert!(result.ends_with('\x07'));
@@ -583,15 +716,19 @@ mod tests {
     #[test]
     fn iterm2_empty_data() {
         let result = encode_iterm2(&[], 40);
-        assert!(result.contains("size=0"));
-        assert!(result.contains("width=40"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn iterm2_rejects_unrecognized_image_bytes() {
+        assert!(encode_iterm2(b"not-an-image", 40).is_empty());
     }
 
     // ── render_inline with valid PNG ─────────────────────────────────
 
     #[test]
     fn render_inline_with_valid_png_includes_dimensions() {
-        let mut png_data = vec![0u8; 32];
+        let mut png_data = vec![0u8; 33];
         png_data[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
         png_data[8..12].copy_from_slice(&13u32.to_be_bytes());
         png_data[12..16].copy_from_slice(b"IHDR");
@@ -618,7 +755,9 @@ mod tests {
         proptest! {
             /// Kitty encoding always starts with APC and ends with ST for non-empty data.
             #[test]
-            fn kitty_bookends(data in proptest::collection::vec(any::<u8>(), 1..512), cols in 1..200usize) {
+            fn kitty_bookends(payload in proptest::collection::vec(any::<u8>(), 1..512), cols in 1..200usize) {
+                let mut data = png_with_payload(33);
+                data.extend_from_slice(&payload);
                 let result = encode_kitty(&data, cols);
                 assert!(result.starts_with("\x1b_G"), "must start with APC");
                 assert!(result.ends_with("\x1b\\"), "must end with ST");
@@ -626,17 +765,21 @@ mod tests {
 
             /// Kitty chunk count grows with payload size.
             #[test]
-            fn kitty_chunk_count_lower_bound(data in proptest::collection::vec(any::<u8>(), 1..8192)) {
+            fn kitty_chunk_count_is_exact(payload in proptest::collection::vec(any::<u8>(), 1..8192)) {
+                let mut data = png_with_payload(33);
+                data.extend_from_slice(&payload);
                 let result = encode_kitty(&data, 80);
-                let b64_len = (data.len() * 4).div_ceil(3); // ceil(n * 4/3)
+                let b64_len = data.len().div_ceil(3) * 4;
                 let expected_chunks = b64_len.div_ceil(4096);
                 let actual_chunks = result.matches("\x1b_G").count();
-                assert!(actual_chunks >= expected_chunks.min(1));
+                assert_eq!(actual_chunks, expected_chunks);
             }
 
             /// Kitty first chunk always includes `a=T` (transmit+display).
             #[test]
-            fn kitty_first_chunk_has_action(data in proptest::collection::vec(any::<u8>(), 1..100)) {
+            fn kitty_first_chunk_has_action(payload in proptest::collection::vec(any::<u8>(), 1..100)) {
+                let mut data = png_with_payload(33);
+                data.extend_from_slice(&payload);
                 let result = encode_kitty(&data, 40);
                 // First chunk starts at position 0
                 let first_st = result.find("\x1b\\").unwrap();
@@ -647,7 +790,9 @@ mod tests {
 
             /// iTerm2 encoding includes size, width, and inline=1.
             #[test]
-            fn iterm2_format_invariants(data in proptest::collection::vec(any::<u8>(), 0..512), cols in 1..200usize) {
+            fn iterm2_format_invariants(payload in proptest::collection::vec(any::<u8>(), 1..512), cols in 1..200usize) {
+                let mut data = png_with_payload(33);
+                data.extend_from_slice(&payload);
                 let result = encode_iterm2(&data, cols);
                 assert!(result.starts_with("\x1b]1337;File="));
                 assert!(result.contains(&format!("size={}", data.len())));
@@ -681,7 +826,7 @@ mod tests {
             /// PNG dimension extraction is correct for arbitrary width/height.
             #[test]
             fn png_dimensions_roundtrip(w in 1..10000u32, h in 1..10000u32) {
-                let mut data = vec![0u8; 32];
+                let mut data = vec![0u8; 33];
                 data[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
                 data[8..12].copy_from_slice(&13u32.to_be_bytes());
                 data[12..16].copy_from_slice(b"IHDR");
@@ -725,7 +870,7 @@ mod tests {
             /// Unsupported terminals preserve dimensions in placeholders.
             #[test]
             fn render_inline_png_has_dims(w in 1..5000u32, h in 1..5000u32) {
-                let mut png = vec![0u8; 32];
+                let mut png = vec![0u8; 33];
                 png[..8].copy_from_slice(b"\x89PNG\r\n\x1A\n");
                 png[8..12].copy_from_slice(&13u32.to_be_bytes());
                 png[12..16].copy_from_slice(b"IHDR");

@@ -42,9 +42,13 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
         match block {
             ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
             ContentBlock::Image(image) => {
-                let rendered =
-                    crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
-                push_line(&mut output, &rendered);
+                // Conversation content is wrapped and sanitized as ordinary
+                // text later. Keep terminal control sequences out of that path;
+                // structured image blocks remain available to model input.
+                push_line(
+                    &mut output,
+                    &crate::terminal_images::placeholder(&image.mime_type, None, None),
+                );
             }
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
@@ -97,9 +101,10 @@ pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: 
             ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
             ContentBlock::Image(image) => {
                 if show_images {
-                    let rendered =
-                        crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
-                    push_line(&mut output, &rendered);
+                    push_line(
+                        &mut output,
+                        &crate::terminal_images::placeholder(&image.mime_type, None, None),
+                    );
                 } else {
                     hidden_images = hidden_images.saturating_add(1);
                 }
@@ -280,6 +285,17 @@ mod tests {
         assert!(result.contains("second"));
     }
 
+    #[test]
+    fn user_content_image_is_a_control_free_placeholder() {
+        let content = UserContent::Blocks(vec![ContentBlock::Image(ImageContent {
+            data: "ignored-invalid-base64".to_string(),
+            mime_type: "image/png\x1b[2J\u{202e}evil".to_string(),
+        })]);
+        let result = user_content_to_text(&content);
+        assert_eq!(result, "[image: image/png]");
+        assert!(!result.chars().any(char::is_control));
+    }
+
     // ── assistant_content_to_text ───────────────────────────────────────
 
     #[test]
@@ -418,6 +434,17 @@ mod tests {
         ];
         let result = tool_content_blocks_to_text(&blocks, false);
         assert!(result.contains("[2 image(s) hidden]"));
+    }
+
+    #[test]
+    fn tool_content_shown_image_is_a_control_free_placeholder() {
+        let blocks = vec![ContentBlock::Image(ImageContent {
+            data: "ignored-invalid-base64".to_string(),
+            mime_type: "image/jpeg\x07\x1b[2J".to_string(),
+        })];
+        let result = tool_content_blocks_to_text(&blocks, true);
+        assert_eq!(result, "[image: image/jpeg]");
+        assert!(!result.chars().any(char::is_control));
     }
 
     #[test]
