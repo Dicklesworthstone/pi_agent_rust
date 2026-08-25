@@ -11448,48 +11448,6 @@ impl AgentSession {
         self.run_text_with_abort(input, None, on_event).await
     }
 
-    /// Drain the magic-keyword activation ledger into session Custom
-    /// entries (bd-cv653.3.6) so activations are auditable ("why did
-    /// thinking jump to max?").
-    async fn persist_keyword_ledger(&mut self) -> Result<()> {
-        if self.agent.keyword_ledger.is_empty() {
-            return Ok(());
-        }
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-            .await
-            .map_err(|err| Error::session(err.to_string()))?;
-        let activations = self.agent.drain_keyword_ledger();
-        crate::magic_keywords::append_session_telemetry(&mut inner, &activations);
-        if self.save_enabled {
-            inner.flush_autosave(AutosaveFlushTrigger::Periodic).await?;
-        }
-        Ok(())
-    }
-
-    async fn finish_turn_ledgers(&mut self) -> Result<()> {
-        self.persist_repair_ledger().await?;
-        self.persist_keyword_ledger().await
-    }
-
-    /// Drain the dialect-repair ledger into session Custom entries
-    /// (bd-cv653.7.8) so repairs are replayable/auditable.
-    async fn persist_repair_ledger(&self) -> Result<()> {
-        if self.agent.repair_ledger_is_empty()? {
-            return Ok(());
-        }
-        let cx = pi::agent_cx::AgentCx::for_request();
-        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
-            .await
-            .map_err(|err| Error::session(err.to_string()))?;
-        let repairs = self.agent.drain_repair_ledger()?;
-        append_dialect_repair_telemetry(&mut inner, &repairs);
-        if self.save_enabled {
-            inner.flush_autosave(AutosaveFlushTrigger::Periodic).await?;
-        }
-        Ok(())
-    }
-
     /// Advisor hook (bd-cv653.3.3): after a completed turn, if the advisor
     /// role resolved a model, review a compact digest and inject the verdict
     /// into the next turn via the steering queue. Zero-overhead gate: no
@@ -11602,11 +11560,11 @@ impl AgentSession {
             };
 
             self.agent.set_system_prompt(base_system_prompt);
-            let ledger_result = self.finish_turn_ledgers().await;
-            self.maybe_advise_turn().await;
             match result {
                 Ok(message) => {
-                    ledger_result?;
+                    if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        self.maybe_advise_turn().await;
+                    }
                     Ok(message)
                 }
                 Err(err) => Err(err),
@@ -11667,11 +11625,11 @@ impl AgentSession {
                 .await;
 
             self.agent.set_system_prompt(base_system_prompt);
-            let ledger_result = self.finish_turn_ledgers().await;
-            self.maybe_advise_turn().await;
             match result {
                 Ok(message) => {
-                    ledger_result?;
+                    if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted) {
+                        self.maybe_advise_turn().await;
+                    }
                     Ok(message)
                 }
                 Err(err) => Err(err),
@@ -12077,12 +12035,8 @@ impl AgentSession {
                 .await;
 
             self.agent.set_system_prompt(base_system_prompt);
-            let ledger_result = self.finish_turn_ledgers().await;
             match result {
-                Ok(message) => {
-                    ledger_result?;
-                    Ok(message)
-                }
+                Ok(message) => Ok(message),
                 Err(err) => Err(err),
             }
         }
@@ -12154,8 +12108,11 @@ impl AgentSession {
         drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
 
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         let persist_result = self
-            .persist_new_messages(start_len + 1, result.is_err())
+            .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
         let result = result?;
@@ -12237,8 +12194,11 @@ impl AgentSession {
 
         // Persist any NEW messages (assistant/tools) generated before the agent stopped,
         // even if it stopped due to an error, skipping the user message we already saved.
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         let persist_result = self
-            .persist_new_messages(start_len + 1, result.is_err())
+            .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
         let result = result?;
@@ -12320,8 +12280,11 @@ impl AgentSession {
 
         // Persist any NEW messages (assistant/tools) generated before the agent stopped,
         // even if it stopped due to an error, skipping the user message we already saved.
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
         let persist_result = self
-            .persist_new_messages(start_len + 1, result.is_err())
+            .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
         let result = result?;
@@ -12374,26 +12337,56 @@ impl AgentSession {
 
         // Persist any NEW messages generated by the resume, even on error.
         // No user message was added, so nothing to skip: persist from start_len.
-        let persist_result = self.persist_new_messages(start_len, result.is_err()).await;
-        let ledger_result = self.finish_turn_ledgers().await;
+        let run_incomplete = result.as_ref().map_or(true, |message| {
+            matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        });
+        let persist_result = self
+            .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
+            .await;
 
         let result = result?;
         persist_result?;
-        ledger_result?;
         Ok(result)
     }
 
-    async fn persist_new_messages(&self, start_len: usize, run_failed: bool) -> Result<()> {
-        let new_messages = self.agent.messages()[start_len..].to_vec();
+    /// Persist the turn transcript and both audit ledgers under one session
+    /// lock. On a failed/aborted turn the incomplete assistant is deliberately
+    /// appended last, after audit and queued-steering entries, so
+    /// `revert_incomplete_response` can remove it without discarding the
+    /// durable audit trail or replaying completed tool effects.
+    async fn persist_turn_artifacts(
+        &mut self,
+        start_len: usize,
+        run_failed: bool,
+        run_incomplete: bool,
+    ) -> Result<()> {
+        let mut new_messages = self.agent.messages()[start_len..].to_vec();
+        let incomplete_assistant = if run_incomplete {
+            new_messages
+                .iter()
+                .rposition(is_incomplete_assistant_message)
+                .map(|index| new_messages.remove(index))
+        } else {
+            None
+        };
         {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
+            let repairs = self.agent.drain_repair_ledger()?;
+            let activations = self.agent.drain_keyword_ledger();
             for message in new_messages {
                 if run_failed && is_synthetic_empty_error_assistant(&message) {
                     continue;
                 }
+                session.append_model_message(message);
+            }
+            append_dialect_repair_telemetry(&mut session, &repairs);
+            crate::magic_keywords::append_session_telemetry(&mut session, &activations);
+            if let Some(message) = incomplete_assistant
+                && !(run_failed && is_synthetic_empty_error_assistant(&message))
+            {
                 session.append_model_message(message);
             }
             if self.save_enabled {
@@ -12404,6 +12397,14 @@ impl AgentSession {
         }
         Ok(())
     }
+}
+
+fn is_incomplete_assistant_message(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Assistant(assistant)
+            if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
+    )
 }
 
 fn is_synthetic_empty_error_assistant(message: &Message) -> bool {
@@ -15759,6 +15760,9 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         /// When true, report a Native-mapped model id (no repair path).
         native: bool,
+        /// When true, the request after the repaired tool result drops
+        /// mid-stream once so retry cleanup can be exercised.
+        fail_after_tool_once: bool,
     }
 
     #[async_trait]
@@ -15776,7 +15780,7 @@ mod tests {
 
         async fn stream(
             &self,
-            _context: &Context<'_>,
+            context: &Context<'_>,
             _options: &StreamOptions,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
             let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -15807,7 +15811,29 @@ mod tests {
                         ),
                     }),
                 ]
+            } else if self.fail_after_tool_once && call_number == 1 {
+                vec![
+                    Ok(StreamEvent::Start {
+                        partial: make(Vec::new(), StopReason::Stop),
+                    }),
+                    Err(Error::api(
+                        "SSE error: connection reset by peer (transient connection drop)",
+                    )),
+                ]
             } else {
+                assert!(
+                    !context.messages.iter().any(|message| {
+                        matches!(
+                            message,
+                            Message::Assistant(assistant)
+                                if matches!(
+                                    assistant.stop_reason,
+                                    StopReason::Error | StopReason::Aborted
+                                )
+                        )
+                    }),
+                    "retry context must not retain the incomplete assistant"
+                );
                 vec![
                     Ok(StreamEvent::TextDelta {
                         content_index: 0,
@@ -15829,6 +15855,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn dialect_repair_continues_turn_and_executes_tool() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -15840,26 +15867,45 @@ mod tests {
             let control = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 native: true,
+                fail_after_tool_once: false,
             });
             let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-            let mut control_agent = Agent::new(control, control_tools, AgentConfig::default());
+            let mut control_agent = Agent::new(
+                Arc::clone(&control) as Arc<dyn Provider>,
+                control_tools,
+                AgentConfig::default(),
+            );
             control_agent.config.max_tool_iterations = 5;
-            let control_session = Arc::new(Mutex::new(Session::in_memory()));
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut control_session = AgentSession::new(
                 control_agent,
-                control_session,
+                Arc::clone(&session),
                 false,
                 ResolvedCompactionSettings::default(),
             );
+            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool_starts_for_events = Arc::clone(&tool_starts);
             let control_result = control_session
-                .run_text_with_abort("hello".to_string(), None, |_| {})
-                .await;
-            if let Err(err) = &control_result {
-                assert!(
-                    !err.to_string().contains("Maximum tool iterations"),
-                    "control provider looped: {err}"
-                );
-            }
+                .run_text_with_abort("hello".to_string(), None, move |event| {
+                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                        tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+                .await
+                .expect("native control completes");
+            assert_eq!(control_result.stop_reason, StopReason::Stop);
+            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(tool_starts.load(Ordering::SeqCst), 0);
+            let cx = asupersync::Cx::for_request();
+            let inner = session.lock(&cx).await.expect("control session lock");
+            assert!(
+                inner.entries_for_current_path().iter().all(|entry| !matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "dialect_repair"
+                )),
+                "native control must not persist repair telemetry"
+            );
         });
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -15868,6 +15914,7 @@ mod tests {
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 native: false,
+                fail_after_tool_once: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
@@ -15974,6 +16021,7 @@ mod tests {
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 native: false,
+                fail_after_tool_once: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
@@ -16022,6 +16070,169 @@ mod tests {
             assert_eq!(
                 persisted_repairs, 1,
                 "resume repair audit entry survives an immediate reopen"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn failed_keyword_repair_turn_keeps_audits_and_reverts_incomplete_tail() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
+                .expect("write fixture");
+            let provider = Arc::new(TextCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                native: false,
+                fail_after_tool_once: true,
+            });
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let agent = Agent::new(
+                Arc::clone(&provider) as Arc<dyn Provider>,
+                tools,
+                AgentConfig::default(),
+            );
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("retry-sessions"),
+            ))));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let tool_starts_for_events = Arc::clone(&tool_starts);
+
+            let failed = agent_session
+                .run_text_with_abort(
+                    "ultrathink check the fixture".to_string(),
+                    None,
+                    move |event| {
+                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                )
+                .await
+                .expect("mid-stream failure is represented by an assistant message");
+            assert_eq!(failed.stop_reason, StopReason::Error);
+
+            {
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("failed session lock");
+                let entries = inner.entries_for_current_path();
+                assert!(matches!(
+                    entries.last(),
+                    Some(crate::session::SessionEntry::Message(message))
+                        if matches!(
+                            &message.message,
+                            crate::session::SessionMessage::Assistant { message }
+                                if message.stop_reason == StopReason::Error
+                        )
+                ));
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "dialect_repair"
+                        ))
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    entries
+                        .iter()
+                        .filter(|entry| matches!(
+                            entry,
+                            crate::session::SessionEntry::Custom(custom)
+                                if custom.custom_type == "magic_keyword"
+                        ))
+                        .count(),
+                    1
+                );
+            }
+
+            assert!(
+                agent_session
+                    .revert_incomplete_response()
+                    .await
+                    .expect("revert succeeds"),
+                "the failed assistant must remain the removable session tail"
+            );
+            let resumed = agent_session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("retry resumes after the completed tool cycle");
+            assert_eq!(resumed.stop_reason, StopReason::Stop);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(tool_starts.load(Ordering::SeqCst), 1);
+
+            let persisted_path = {
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("resumed session lock");
+                inner.path.clone().expect("autosave created session file")
+            };
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen autosaved retry session");
+            let entries = reopened.entries_for_current_path();
+            assert!(entries.iter().all(|entry| !matches!(
+                entry,
+                crate::session::SessionEntry::Message(message)
+                    if matches!(
+                        &message.message,
+                        crate::session::SessionMessage::Assistant { message }
+                            if matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+                    )
+            )));
+            let repair_data = entries.iter().find_map(|entry| match entry {
+                crate::session::SessionEntry::Custom(custom)
+                    if custom.custom_type == "dialect_repair" =>
+                {
+                    custom.data.as_ref()
+                }
+                _ => None,
+            });
+            assert_eq!(
+                repair_data
+                    .and_then(|data| data.get("tool"))
+                    .and_then(Value::as_str),
+                Some("read")
+            );
+            assert!(
+                repair_data
+                    .and_then(|data| data.get("strippedBytes"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|bytes| bytes > 0),
+                "repair telemetry must prove that text was actually stripped"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "dialect_repair"
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "magic_keyword"
+                    ))
+                    .count(),
+                1
             );
         });
     }

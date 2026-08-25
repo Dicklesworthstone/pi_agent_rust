@@ -2439,6 +2439,7 @@ mod tests {
             &global_dir.join("settings.json"),
             r#"{
                 "keywords": {
+                    "ultrathink": true,
                     "orchestrate": false,
                     "workflowz": false,
                     "extra": [{"word": "deepdive", "directive": "go deep"}]

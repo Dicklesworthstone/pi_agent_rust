@@ -184,6 +184,7 @@ pub struct WebRemoteManager {
     tokens: Arc<Mutex<HashMap<String, AuthTokenRecord>>>,
 }
 
+#[allow(clippy::significant_drop_tightening)]
 impl WebRemoteManager {
     pub fn new(settings: WebRemoteSettings) -> Self {
         Self {
@@ -241,15 +242,13 @@ impl WebRemoteManager {
                 None
             }
         };
-        if let Some(token_kind) = kind {
+        kind.is_some_and(|token_kind| {
             self.record_audit(
                 WebAuditEvent::new("token_revoked", None)
                     .with_detail("token_kind", format!("{token_kind:?}")),
             );
             true
-        } else {
-            false
-        }
+        })
     }
 
     /// Validate and consume a token upon connection.
