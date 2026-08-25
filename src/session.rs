@@ -1304,6 +1304,27 @@ pub(crate) fn persistence_test_failpoint(point: &str) -> Result<()> {
     if std::env::var("PI_SESSION_PERSISTENCE_TEST_FAILPOINT")
         .is_ok_and(|configured| configured == point)
     {
+        if std::env::var("PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION")
+            .is_ok_and(|action| action == "hard_exit")
+        {
+            let marker_path = std::env::var_os("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH")
+                .ok_or_else(|| {
+                    Error::session(
+                        "hard-exit persistence failpoint requires a checkpoint marker path",
+                    )
+                })?;
+            let mut marker = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(marker_path)?;
+            marker.write_all(point.as_bytes())?;
+            marker.write_all(b"\n")?;
+            marker.sync_all()?;
+            // Terminate without unwinding or dropping backend connections.
+            // The parent process reopens the store to exercise real crash
+            // recovery rather than the ordinary error/rollback path.
+            std::process::exit(86);
+        }
         return Err(Error::session(format!(
             "injected persistence failpoint: {point}"
         )));

@@ -1086,6 +1086,48 @@ suite_fail=0
 suite_skip=0
 declare -a SUITE_RESULTS=()
 
+validate_retrieved_extension_bench_jsonl() {
+  local artifact_path="$1"
+  local expected_profile="$2"
+  python3 - "$artifact_path" "$expected_profile" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+artifact_path = Path(sys.argv[1])
+expected_profile = sys.argv[2]
+records = []
+for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").splitlines(), 1):
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"line {line_number}: invalid JSON: {exc}") from exc
+    if not isinstance(record, dict):
+        raise SystemExit(f"line {line_number}: record must be an object")
+    if record.get("schema") != "pi.ext.rust_bench.v1":
+        raise SystemExit(f"line {line_number}: unexpected schema")
+    if record.get("runtime") != "pi_agent_rust":
+        raise SystemExit(f"line {line_number}: unexpected runtime")
+    environment = record.get("env")
+    if not isinstance(environment, dict) or environment.get("build_profile") != expected_profile:
+        raise SystemExit(f"line {line_number}: build profile does not match {expected_profile}")
+    records.append(record)
+
+if not records:
+    raise SystemExit("extension benchmark JSONL contains no records")
+if not any(
+    record.get("scenario") == "cold_start"
+    and isinstance(record.get("summary"), dict)
+    and isinstance(record["summary"].get("count"), int)
+    and record["summary"]["count"] > 0
+    for record in records
+):
+    raise SystemExit("extension benchmark JSONL has no successful cold_start record")
+PY
+}
+
 run_test_suite() {
   local suite_name="$1"
   local target_name="$2"
@@ -1107,8 +1149,10 @@ run_test_suite() {
     rch_target_subdir="nextest/pi-perf/$CORRELATION_ID/$suite_name"
     local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
     if [[ -e "$retrieved_result_dir/extension_bench.jsonl" \
-      || -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
-      log_fail "Refusing stale RCH extension benchmark artifact at $rch_target_subdir"
+      || -L "$retrieved_result_dir/extension_bench.jsonl" \
+      || -e "$retrieved_result_dir/extension_bench_summary.md" \
+      || -L "$retrieved_result_dir/extension_bench_summary.md" ]]; then
+      log_fail "Refusing stale RCH extension benchmark artifacts at $rch_target_subdir"
       exit_code=87
     else
       BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
@@ -1118,11 +1162,12 @@ run_test_suite() {
       VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
       VERGEN_GIT_DIRTY="$GIT_DIRTY" \
       RUST_TEST_THREADS="$PARALLELISM" \
+      PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
         "${CARGO_RUNNER_ARGS[@]}" nextest run \
           --build-jobs "$PARALLELISM" \
           --test "$target_name" \
           --cargo-profile "$CARGO_PROFILE" \
-          --test-threads "$PARALLELISM" \
+          --test-threads 1 \
         >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
         || exit_code=$?
     fi
@@ -1130,8 +1175,16 @@ run_test_suite() {
     if [[ "$exit_code" -eq 0 \
       && -s "$retrieved_result_dir/extension_bench.jsonl" \
       && ! -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
-      cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
-      if [[ -f "$retrieved_result_dir/extension_bench_summary.md" ]]; then
+      if validate_retrieved_extension_bench_jsonl \
+        "$retrieved_result_dir/extension_bench.jsonl" "$CARGO_PROFILE"; then
+        cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
+      else
+        log_fail "RCH retrieved an invalid extension_bench.jsonl from $rch_target_subdir"
+        exit_code=88
+      fi
+      if [[ "$exit_code" -eq 0 \
+        && -s "$retrieved_result_dir/extension_bench_summary.md" \
+        && ! -L "$retrieved_result_dir/extension_bench_summary.md" ]]; then
         cp "$retrieved_result_dir/extension_bench_summary.md" "$result_dir/extension_bench_summary.md"
       fi
     elif [[ "$exit_code" -eq 0 ]]; then

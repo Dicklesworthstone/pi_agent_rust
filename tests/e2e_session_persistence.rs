@@ -731,8 +731,12 @@ fn required_chaos_env(name: &str) -> String {
 }
 
 #[cfg(feature = "internal-persistence-fault-injection")]
+const PERSISTENCE_FAILPOINT_HARD_EXIT_CODE: i32 = 86;
+
+#[cfg(feature = "internal-persistence-fault-injection")]
 fn run_persistence_failpoint_child(
     session_path: &Path,
+    marker_path: &Path,
     backend: &str,
     failpoint: &str,
     message: &str,
@@ -746,6 +750,8 @@ fn run_persistence_failpoint_child(
         .env("PI_SESSION_PERSISTENCE_TEST_PATH", session_path)
         .env("PI_SESSION_PERSISTENCE_TEST_BACKEND", backend)
         .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT", failpoint)
+        .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT_ACTION", "hard_exit")
+        .env("PI_SESSION_PERSISTENCE_TEST_MARKER_PATH", marker_path)
         .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
         .stdin(Stdio::null())
         .output()
@@ -774,15 +780,8 @@ fn persistence_failpoint_worker_process_entrypoint() {
         if backend == "jsonl" {
             session.set_model_header(Some("failpoint-jsonl".to_string()), None, None);
         }
-        let error = session
-            .save()
-            .await
-            .expect_err("persistence failpoint must interrupt save");
-        assert_eq!(
-            error.to_string(),
-            format!("Session error: injected persistence failpoint: {failpoint}")
-        );
-        println!("PERSISTENCE_FAILPOINT_REACHED:{failpoint}");
+        let result = session.save().await;
+        panic!("hard-exit persistence failpoint returned unexpectedly: {result:?}");
     });
 }
 
@@ -1870,26 +1869,29 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         assert_eq!(pre_texts, vec!["jsonl-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "jsonl pre-flush window");
 
-        // Mid-flush crash window: the child fails after atomic rename but before
-        // parent-directory sync, proving the backend checkpoint was reached.
+        // Mid-flush crash window: the child hard-exits after atomic rename but
+        // before parent-directory sync, proving the backend checkpoint was reached.
         drop(reopened_pre);
         let failpoint = "jsonl_after_rename_before_parent_sync";
+        let marker_path = harness.temp_path("jsonl-midflush-hard-exit.marker");
         let child = run_persistence_failpoint_child(
             &stable_path,
+            &marker_path,
             "jsonl",
             failpoint,
             "jsonl-midflush-pending",
         );
-        assert!(
-            child.status.success(),
-            "JSONL failpoint child failed\nstdout:\n{}\nstderr:\n{}",
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "JSONL failpoint child must terminate at the backend checkpoint\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
-        assert_contains(
-            &harness,
-            &String::from_utf8_lossy(&child.stdout),
-            &format!("PERSISTENCE_FAILPOINT_REACHED:{failpoint}"),
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).expect("read JSONL checkpoint marker"),
+            format!("{failpoint}\n"),
+            "JSONL hard exit must occur only after the exact backend checkpoint"
         );
         harness.log().info_ctx("fault", "jsonl mid-flush failure", |ctx| {
             ctx.push(("checkpoint".into(), failpoint.to_string()));
@@ -1986,26 +1988,29 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         assert_eq!(pre_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "sqlite pre-flush window");
 
-        // Mid-flush crash window: the child fails after transactional mutation
-        // but before COMMIT, so SQLite must roll the appended row back.
+        // Mid-flush crash window: the child hard-exits after transactional
+        // mutation but before COMMIT, so SQLite recovery must roll the row back.
         drop(reopened_pre);
         let failpoint = "sqlite_after_mutation_before_commit";
+        let marker_path = harness.temp_path("sqlite-midflush-hard-exit.marker");
         let child = run_persistence_failpoint_child(
             &stable_path,
+            &marker_path,
             "sqlite",
             failpoint,
             "sqlite-midflush-pending",
         );
-        assert!(
-            child.status.success(),
-            "SQLite failpoint child failed\nstdout:\n{}\nstderr:\n{}",
+        assert_eq!(
+            child.status.code(),
+            Some(PERSISTENCE_FAILPOINT_HARD_EXIT_CODE),
+            "SQLite failpoint child must terminate at the backend checkpoint\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
-        assert_contains(
-            &harness,
-            &String::from_utf8_lossy(&child.stdout),
-            &format!("PERSISTENCE_FAILPOINT_REACHED:{failpoint}"),
+        assert_eq!(
+            std::fs::read_to_string(&marker_path).expect("read SQLite checkpoint marker"),
+            format!("{failpoint}\n"),
+            "SQLite hard exit must occur only after the exact backend checkpoint"
         );
         harness.log().info_ctx("fault", "sqlite mid-flush failure", |ctx| {
             ctx.push(("checkpoint".into(), failpoint.to_string()));
