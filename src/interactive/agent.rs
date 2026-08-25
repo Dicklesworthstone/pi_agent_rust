@@ -2189,9 +2189,6 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
                 {
@@ -2206,9 +2203,26 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+            let repairs = match agent_guard.drain_repair_ledger() {
+                Ok(repairs) => repairs,
+                Err(err) => {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let keyword_activations = agent_guard.drain_keyword_ledger();
+            drop(agent_guard);
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
+            crate::agent::append_dialect_repair_telemetry(&mut session_guard, &repairs);
             crate::magic_keywords::append_session_telemetry(
                 &mut session_guard,
                 &keyword_activations,
@@ -2450,9 +2464,6 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
                 {
@@ -2467,9 +2478,26 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+            let repairs = match agent_guard.drain_repair_ledger() {
+                Ok(repairs) => repairs,
+                Err(err) => {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let keyword_activations = agent_guard.drain_keyword_ledger();
+            drop(agent_guard);
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
+            crate::agent::append_dialect_repair_telemetry(&mut session_guard, &repairs);
             crate::magic_keywords::append_session_telemetry(
                 &mut session_guard,
                 &keyword_activations,
@@ -2803,9 +2831,6 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
-            let keyword_activations = agent_guard.drain_keyword_ledger();
-            drop(agent_guard);
-
             let mut session_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
                 {
@@ -2820,9 +2845,26 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+            let repairs = match agent_guard.drain_repair_ledger() {
+                Ok(repairs) => repairs,
+                Err(err) => {
+                    drop(session_guard);
+                    drop(agent_guard);
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to drain turn audit ledger: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            let keyword_activations = agent_guard.drain_keyword_ledger();
+            drop(agent_guard);
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
+            crate::agent::append_dialect_repair_telemetry(&mut session_guard, &repairs);
             crate::magic_keywords::append_session_telemetry(
                 &mut session_guard,
                 &keyword_activations,

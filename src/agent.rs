@@ -15962,6 +15962,70 @@ mod tests {
         });
     }
 
+    #[test]
+    fn dialect_repair_on_resume_persists_before_exit() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
+                .expect("write fixture");
+            let provider = Arc::new(TextCallProvider {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                native: false,
+            });
+            let tools = ToolRegistry::new(&["read"], temp.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let mut durable_session =
+                Session::create_with_dir(Some(temp.path().join("resume-sessions")));
+            durable_session.append_model_message(Message::User(UserMessage {
+                content: UserContent::Text("check the fixture".to_string()),
+                timestamp: Utc::now().timestamp_millis(),
+            }));
+            let session = Arc::new(Mutex::new(durable_session));
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                true,
+                ResolvedCompactionSettings::default(),
+            );
+
+            let final_message = agent_session
+                .run_continue_with_abort(None, |_| {})
+                .await
+                .expect("resume completes");
+            assert_eq!(final_message.stop_reason, StopReason::Stop);
+
+            let persisted_path = {
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("session lock");
+                inner.path.clone().expect("autosave created session file")
+            };
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen autosaved resume session");
+            let persisted_repairs = reopened
+                .entries_for_current_path()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "dialect_repair"
+                                && custom.data.as_ref().is_some_and(|data| {
+                                    data["tool"] == json!("read")
+                                })
+                    )
+                })
+                .count();
+            assert_eq!(
+                persisted_repairs, 1,
+                "resume repair audit entry survives an immediate reopen"
+            );
+        });
+    }
+
     // === Advisor turn review (bd-cv653.3.3) ===
 
     /// Doer: issues one structured read call, then finishes with text.
