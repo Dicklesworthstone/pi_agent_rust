@@ -25,12 +25,14 @@ use pi::model::{
     AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingLevel,
     UserContent, UserMessage,
 };
-use pi::provider::{Context, StreamOptions};
+use pi::models::{ModelEntry, ModelRegistry};
+use pi::provider::{Context, InputType, Model, ModelCost, StreamOptions};
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, run as run_rpc};
 use pi::session::{Session, SessionEntry};
 use pi::tools::ToolRegistry;
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -161,15 +163,67 @@ fn build_agent(
     (Agent::new(provider, tools, config), capture)
 }
 
+fn capture_model_entry() -> ModelEntry {
+    ModelEntry {
+        model: Model {
+            id: "capture-model".to_string(),
+            name: "Capture Model".to_string(),
+            api: "capture-api".to_string(),
+            provider: "capture".to_string(),
+            base_url: "https://example.invalid/v1".to_string(),
+            reasoning: true,
+            input: vec![InputType::Text],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 128_000,
+            max_tokens: 8_192,
+            headers: HashMap::new(),
+        },
+        api_key: None,
+        headers: HashMap::new(),
+        auth_header: false,
+        compat: None,
+        oauth_config: None,
+    }
+}
+
+fn capture_model_registry(auth: &AuthStorage) -> (ModelRegistry, ThinkingLevel) {
+    let entry = capture_model_entry();
+    let expected_max = entry.clamp_thinking_level(ThinkingLevel::Max);
+    assert_eq!(
+        expected_max,
+        ThinkingLevel::High,
+        "capture fixture must exercise a real Max-to-High clamp"
+    );
+    let mut registry = ModelRegistry::load(auth, None);
+    registry.merge_entries(vec![entry]);
+    (registry, expected_max)
+}
+
 #[test]
 fn ultrathink_uses_model_clamped_max() {
     let case = "ultrathink_uses_model_clamped_max";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let (mut agent, capture) = build_agent(&root, None);
-    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
+    let (agent, capture) = build_agent(&root, None);
+    let auth_dir = tempfile::tempdir().expect("auth tempdir");
+    let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth storage");
+    let (registry, expected_max) = capture_model_registry(&auth);
+    let session = Arc::new(AsyncMutex::new(Session::in_memory()));
+    let mut agent_session = AgentSession::new(
+        agent,
+        session,
+        false,
+        ResolvedCompactionSettings::default(),
+    );
+    agent_session.set_model_registry(registry);
 
-    block_on_local(agent.run("please ultrathink this design", |_| {})).expect("run");
+    block_on_local(agent_session.run_text("please ultrathink this design".to_string(), |_| {}))
+        .expect("run");
     let capture = capture.lock().expect("capture").clone();
     harness.log().info(
         "verify",
@@ -177,7 +231,7 @@ fn ultrathink_uses_model_clamped_max() {
     );
     assert_eq!(
         capture.thinking.first(),
-        Some(&Some(ThinkingLevel::High)),
+        Some(&Some(expected_max)),
         "ultrathink must use the active model's clamped max: {:?}",
         capture.thinking
     );
@@ -409,8 +463,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
     let case = "rpc_prompt_observes_clamped_thinking_directive_and_telemetry";
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
-    let (mut agent, capture) = build_agent(&root, None);
-    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
+    let (agent, capture) = build_agent(&root, None);
 
     let session = Arc::new(AsyncMutex::new(Session::in_memory()));
     {
@@ -419,7 +472,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         guard.header.model_id = Some("capture-model".to_string());
         guard.header.thinking_level = Some("medium".to_string());
     }
-    let agent_session = AgentSession::new(
+    let mut agent_session = AgentSession::new(
         agent,
         Arc::clone(&session),
         false,
@@ -427,6 +480,8 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
     );
     let auth_dir = tempfile::tempdir().expect("auth tempdir");
     let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth storage");
+    let (registry, expected_max) = capture_model_registry(&auth);
+    agent_session.set_model_registry(registry);
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("RPC test runtime");
@@ -496,7 +551,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
     });
 
     let captured = capture.lock().expect("capture").clone();
-    assert_eq!(captured.thinking.first(), Some(&Some(ThinkingLevel::High)));
+    assert_eq!(captured.thinking.first(), Some(&Some(expected_max)));
     assert!(
         captured.system_prompts[0]
             .as_deref()
