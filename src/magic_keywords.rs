@@ -444,24 +444,30 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
+        let dot_continues_path = ch == '.'
+            && message
+                .get(index..)
+                .and_then(|tail| tail.chars().next())
+                .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '-'));
         let is_boundary = ch.is_whitespace()
-            || matches!(
-                ch,
-                ',' | '.'
-                    | '!'
-                    | '?'
-                    | ':'
-                    | ';'
-                    | '('
-                    | ')'
-                    | '"'
-                    | '\''
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '*'
-            );
+            || (!dot_continues_path
+                && matches!(
+                    ch,
+                    ',' | '.'
+                        | '!'
+                        | '?'
+                        | ':'
+                        | ';'
+                        | '('
+                        | ')'
+                        | '"'
+                        | '\''
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '*'
+                ));
         if is_boundary {
             flush_token(&mut token, &mut activations, &mut seen);
             continue;
@@ -476,8 +482,9 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
 
 /// Map activations to their injected directives.
 ///
-/// Path safety is structural: `/` is not a boundary, so a path like
-/// /tmp/ultrathink reads as one token and never equals a keyword.
+/// Path safety is structural: `/` is not a boundary, and a `.` followed by a
+/// filename character is retained, so neither `/tmp/ultrathink` nor
+/// `ultrathink.rs` equals a keyword token.
 #[must_use]
 pub fn directives_for(
     activations: &[KeywordActivation],
@@ -640,6 +647,10 @@ mod tests {
         assert!(words("preultrathink").is_empty());
         assert!(words("/tmp/ultrathink").is_empty());
         assert!(words("see https://example.com/ultrathink docs").is_empty());
+        assert!(
+            words("edit ultrathink.rs next").is_empty(),
+            "a bare filename is still a path, even without a slash"
+        );
     }
 
     #[test]
