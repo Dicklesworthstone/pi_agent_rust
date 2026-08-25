@@ -1543,6 +1543,11 @@ impl Agent {
     /// Replace the provider implementation (used for model/provider switching).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
+        // A bare provider object does not carry registry capability metadata.
+        // Reset fail-closed so a new or external call site cannot accidentally
+        // carry a high thinking cap from the previous model. Registry-aware
+        // switch paths immediately install the target model's clamped cap.
+        self.keyword_max_thinking_level = crate::model::ThinkingLevel::Off;
     }
 
     /// Set the model-clamped target used when a turn contains `ultrathink`.
@@ -14676,6 +14681,21 @@ mod tests {
             assert_eq!(session.header.model_id.as_deref(), Some("plain-model"));
             assert_eq!(session.header.thinking_level.as_deref(), Some("off"));
         });
+    }
+
+    #[test]
+    fn bare_provider_replacement_resets_keyword_cap_fail_closed() {
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
+        agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+
+        agent.set_provider(Arc::new(SilentProvider));
+
+        assert_eq!(
+            agent.keyword_max_thinking_level,
+            crate::model::ThinkingLevel::Off,
+            "provider replacement without registry metadata must not inherit the prior cap"
+        );
     }
 
     #[test]
