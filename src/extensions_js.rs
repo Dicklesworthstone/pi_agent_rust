@@ -8764,7 +8764,141 @@ export async function refreshOpenAICodexToken(_refreshToken) {
   failClosedUnsupported("refreshOpenAICodexToken");
 }
 
-export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken };
+const __piOverflowPatterns = [
+  /prompt is too long/i,
+  /request_too_large/i,
+  /input is too long for requested model/i,
+  /exceeds the context window/i,
+  /exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))/i,
+  /input token count.*exceeds the maximum/i,
+  /maximum prompt length is \d+/i,
+  /reduce the length of the messages/i,
+  /maximum context length is \d+ tokens/i,
+  /exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?/i,
+  /input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)/i,
+  /exceeds the limit of \d+/i,
+  /exceeds the available context size/i,
+  /greater than the context length/i,
+  /context window exceeds limit/i,
+  /exceeded model token limit/i,
+  /too large for model with \d+ maximum context length/i,
+  /prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?/i,
+  /model_context_window_exceeded/i,
+  /prompt too long; exceeded (?:max )?context length/i,
+  /range of input length should be/i,
+  /context[_ ]length[_ ]exceeded/i,
+  /too many tokens/i,
+  /token limit exceeded/i,
+  /^4(?:00|13)\s*(?:status code)?\s*\(no body\)/i,
+];
+
+const __piNonOverflowPatterns = [
+  /^(Throttling error|Service unavailable):/i,
+  /rate limit/i,
+  /too many requests/i,
+];
+
+export function getOverflowPatterns() {
+  return [...__piOverflowPatterns];
+}
+
+export function isContextOverflow(message, contextWindow) {
+  if (message && message.stopReason === "error" && message.errorMessage) {
+    const isNonOverflow = __piNonOverflowPatterns.some((p) => p.test(message.errorMessage));
+    if (!isNonOverflow && __piOverflowPatterns.some((p) => p.test(message.errorMessage))) {
+      return true;
+    }
+  }
+  const usage = message && typeof message.usage === "object" ? message.usage : {};
+  const inputTokens = Number(usage.input ?? 0) + Number(usage.cacheRead ?? 0);
+  if (contextWindow && message && message.stopReason === "stop") {
+    if (inputTokens > contextWindow) {
+      return true;
+    }
+  }
+  if (contextWindow && message && message.stopReason === "length" && Number(usage.output ?? 0) === 0) {
+    if (inputTokens >= contextWindow * 0.99) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function isRecoverableLength(message, desiredMaxOutput) {
+  return Boolean(
+    message
+      && message.stopReason === "length"
+      && Number(desiredMaxOutput ?? 0) > 0
+      && message.usage
+      && Number(message.usage.output ?? 0) < Number(desiredMaxOutput),
+  );
+}
+
+const __piRetryableProviderErrorPattern = new RegExp([
+  "overloaded",
+  "rate.?limit",
+  "too many requests",
+  "429",
+  "500",
+  "502",
+  "503",
+  "504",
+  "524",
+  "service.?unavailable",
+  "server.?error",
+  "internal.?error",
+  "provider.?returned.?error",
+  "exceeded request buffer limit while retrying upstream",
+  "network.?error",
+  "connection.?error",
+  "connection.?refused",
+  "connection.?lost",
+  "other side closed",
+  "fetch failed",
+  "getaddrinfo",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "upstream.?connect",
+  "reset before headers",
+  "socket hang up",
+  "socket connection was closed",
+  "timed? out",
+  "timeout",
+  "terminated",
+  "websocket.?closed",
+  "websocket.?error",
+  "ended without",
+  "stream ended before message_stop",
+  "stream ended before a terminal response event",
+  "http2 request did not get a response",
+  "retry delay",
+  "you can retry your request",
+  "try your request again",
+  "please retry your request",
+  "ResourceExhausted",
+].join("|"), "i");
+
+const __piNonRetryableProviderLimitErrorPattern = new RegExp([
+  "GoUsageLimitError",
+  "FreeUsageLimitError",
+  "Monthly usage limit reached",
+  "available balance",
+  "insufficient_quota",
+  "out of budget",
+  "quota exceeded",
+  "billing",
+].join("|"), "i");
+
+export function isRetryableAssistantError(message) {
+  if (!message || message.stopReason !== "error" || !message.errorMessage)
+    return false;
+  const errorMessage = String(message.errorMessage);
+  if (__piNonRetryableProviderLimitErrorPattern.test(errorMessage))
+    return false;
+  return __piRetryableProviderErrorPattern.test(errorMessage);
+}
+
+export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken, isContextOverflow, isRecoverableLength, getOverflowPatterns, isRetryableAssistantError };
 "#)
         .trim()
         .to_string(),

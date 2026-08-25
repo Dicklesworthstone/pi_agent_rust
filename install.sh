@@ -254,6 +254,29 @@ capture_version_line() {
   printf '%s\n' "$out"
 }
 
+# Runs a freshly downloaded release artifact once (--version) BEFORE it is
+# installed. Release binaries link against the builder's glibc; hosts running
+# older distributions (e.g. Ubuntu 22.04 glibc 2.35 receiving a binary built on
+# Ubuntu 24.04 glibc 2.39) fail at launch with:
+#   /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.39' not found (required by pi)
+# Prints nothing. Returns 0 iff the binary executed successfully.
+artifact_runs_on_host() {
+  local bin_path="$1"
+  local err_file="$TMP/smoke.err"
+  chmod +x "$bin_path" 2>/dev/null || true
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 15 "$bin_path" --version >/dev/null 2>"$err_file"
+  else
+    "$bin_path" --version >/dev/null 2>"$err_file"
+  fi
+}
+
+# True iff the smoke-test stderr shows the specific dynamic-loader
+# "version `GLIBC_x.yy' not found" failure shape.
+artifact_missing_glibc() {
+  grep -Eq "version \`GLIBC_[0-9.]+' not found" "$TMP/smoke.err" 2>/dev/null
+}
+
 is_managed_alias() {
   local path="$1"
   [ -f "$path" ] || return 1
@@ -3495,6 +3518,25 @@ main() {
     local download_rc=0
     if run_with_spinner "Downloading release binary" download_release_binary > "$TMP/source_bin_path"; then
       source_bin=$(cat "$TMP/source_bin_path")
+      # Pre-install smoke test: never install a binary this host cannot load.
+      # Scoped to the exact glibc-mismatch failure shape so unrelated nonzero
+      # exits (or non-standard artifacts) keep the previous behavior.
+      if ! artifact_runs_on_host "$source_bin" && artifact_missing_glibc; then
+        warn "Downloaded release binary requires a newer glibc than this system provides"
+        warn "Host: $(ldd --version 2>/dev/null | head -1)"
+        if [ "$OFFLINE" -eq 1 ] || [ -n "$ARTIFACT_URL" ]; then
+          err "Cannot auto-fallback; re-run with --from-source, or upgrade the base system"
+          exit 1
+        fi
+        warn "Falling back to building from source against the local toolchain"
+        FROM_SOURCE=1
+        INSTALL_SOURCE="source (glibc fallback)"
+        CHECKSUM_STATUS="not applicable (source fallback)"
+        SIGSTORE_STATUS="not applicable (source fallback)"
+        check_dependencies
+        run_with_spinner "Building pi from source" build_from_source > "$TMP/source_bin_path"
+        source_bin=$(cat "$TMP/source_bin_path")
+      fi
     else
       download_rc=$?
       if [ "$download_rc" -eq 2 ] || [ "$download_rc" -eq 3 ] || [ "$download_rc" -eq 4 ]; then

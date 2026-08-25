@@ -489,10 +489,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Pinned to ubuntu-22.04 (glibc 2.35), NOT ubuntu-latest (=24.04,
+          # glibc 2.39). Release binaries must link against the oldest glibc
+          # we intend to support; building on ubuntu-latest silently raises
+          # the runtime requirement and breaks every older distribution with
+          # "version `GLIBC_2.xx' not found" at launch.
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: pi-linux-amd64
+          # No ubuntu-22.04 hosted ARM runner exists, so pin the glibc
+          # baseline via a container instead. rust:bullseye is multi-arch
+          # (works on the ARM runner), ships glibc 2.31, and already contains
+          # git/curl/gcc so checkout and rustup work out of the box.
           - os: ubuntu-24.04-arm
+            container: rust:bullseye
             target: aarch64-unknown-linux-gnu
             asset: pi-linux-arm64
           - os: macos-15-intel
@@ -505,6 +515,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             asset: pi-windows-amd64
     runs-on: ${{ matrix.os }}
+    # Optional per-matrix container (used to pin the glibc baseline for
+    # architectures without an old-glibc hosted runner). When the key is
+    # absent this evaluates to null, i.e. no container.
+    container: ${{ matrix.container }}
     timeout-minutes: 60
     env:
       CI: "true"
@@ -623,8 +637,22 @@ jobs:
             exit 1
           fi
 
+      - name: Install system deps (xcb + build tools) [linux container]
+        if: runner.os == 'Linux' && matrix.container != ''
+        run: |
+          set -euxo pipefail
+          # Running as root inside the container: no sudo. rust:bullseye already
+          # provides git, curl, ca-certificates, and a C toolchain.
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
       - name: Install system deps (xcb + build tools) [linux]
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.container == ''
         run: |
           set -euxo pipefail
           sudo apt-get update
