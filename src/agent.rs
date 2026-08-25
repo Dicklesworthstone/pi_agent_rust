@@ -2381,7 +2381,9 @@ impl Agent {
 
         // Delivery boundary: start of turn (steering messages queued while idle).
         let mut pending_messages = initial_pending;
-        pending_messages.extend(self.drain_steering_messages().await);
+        if pending_messages.is_empty() {
+            pending_messages = self.drain_steering_messages().await;
+        }
         let mut turn_recovery =
             crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
@@ -14033,6 +14035,24 @@ mod tests {
             );
             agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
 
+            let queued_steering = Arc::new(StdTestMutex::new(Some(
+                QueuedAgentMessage::from_authored_message(user_message("steer after handoff")),
+            )));
+            let steering_fetcher_state = Arc::clone(&queued_steering);
+            let steering_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let steering_fetcher_state = Arc::clone(&steering_fetcher_state);
+                    Box::pin(async move {
+                        steering_fetcher_state
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .into_iter()
+                            .collect()
+                    })
+                };
+            agent.register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
+
             let first_visible = "expanded payload without a magic word";
             let second_visible = "generated ultrathink payload";
             agent
@@ -14056,12 +14076,29 @@ mod tests {
             };
             assert_eq!(
                 calls.len(),
-                1,
-                "the initial pending batch must not be preceded by an empty provider request"
+                2,
+                "initial follow-up and later steering must each drive one provider request"
             );
             assert_eq!(calls[0].messages.len(), 2);
             assert_user_text(&calls[0].messages[0], first_visible);
             assert_user_text(&calls[0].messages[1], second_visible);
+            assert!(
+                calls[0].messages.iter().all(|message| {
+                    !matches!(
+                        message,
+                        Message::User(UserMessage { content: UserContent::Text(text), .. })
+                            if text == "steer after handoff"
+                    )
+                }),
+                "steering admitted for the resumed turn must not precede its initial follow-up"
+            );
+            assert!(calls[1].messages.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::User(UserMessage { content: UserContent::Text(text), .. })
+                        if text == "steer after handoff"
+                )
+            }));
             assert_eq!(
                 calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::Low),
