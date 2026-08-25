@@ -1207,6 +1207,10 @@ JSON
     if [[ -n "${PI_FAKE_PERF_BENCH_INVOCATION_MARKER:-}" ]]; then
       printf '%s\n' invoked >"$PI_FAKE_PERF_BENCH_INVOCATION_MARKER"
     fi
+    if [[ "${PI_FAKE_RCH_STRICT_PINNED:-0}" != "1" ]]; then
+      echo "perf_bench_harness did not use the clean committed-source pin" >&2
+      exit 73
+    fi
     args=("$@")
     arg_count="${#args[@]}"
     if (( arg_count < 2 )) \
@@ -1371,18 +1375,26 @@ case "${1:-}" in
         ;;
     esac
     shift
-    if (( $# < 6 )) \
-      || [[ "${1:-}" != "--base" ]] \
-      || [[ "${2:-}" != "$(git rev-parse HEAD)" ]] \
-      || [[ "${3:-}" != "--clean-overlay" ]] \
-      || [[ "${4:-}" != "--no-overlay" ]] \
-      || [[ "${5:-}" != "--" ]] \
-      || [[ "${6:-}" != "cargo" ]]; then
-      echo "strict RCH execution omitted the clean committed-source pin" >&2
-      exit 67
+    strict_pinned=0
+    if [[ "${1:-}" == "--base" ]]; then
+      if (( $# < 6 )) \
+        || [[ "${2:-}" != "$(git rev-parse HEAD)" ]] \
+        || [[ "${3:-}" != "--clean-overlay" ]] \
+        || [[ "${4:-}" != "--no-overlay" ]] \
+        || [[ "${5:-}" != "--" ]] \
+        || [[ "${6:-}" != "cargo" ]]; then
+        echo "strict RCH execution used an invalid clean committed-source pin" >&2
+        exit 67
+      fi
+      strict_pinned=1
+      shift 5
+    elif [[ "${1:-}" == "--" ]]; then
+      shift
+    else
+      echo "unexpected fake RCH exec arguments: $*" >&2
+      exit 68
     fi
-    shift 5
-    PI_FAKE_RCH_EXECUTED=1 exec "$@"
+    PI_FAKE_RCH_EXECUTED=1 PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" exec "$@"
     ;;
   *)
     exit 64
@@ -1397,10 +1409,23 @@ case "${1:-}" in
     if [[ "${PI_FAKE_GIT_IDENTITY_UNAVAILABLE:-0}" == "1" ]]; then
       exit 64
     fi
+    call_number=1
+    if [[ -n "${PI_FAKE_GIT_REV_PARSE_STATE_FILE:-}" ]]; then
+      if [[ -f "$PI_FAKE_GIT_REV_PARSE_STATE_FILE" ]]; then
+        read -r call_number <"$PI_FAKE_GIT_REV_PARSE_STATE_FILE"
+        call_number=$((call_number + 1))
+      fi
+      printf '%s\n' "$call_number" >"$PI_FAKE_GIT_REV_PARSE_STATE_FILE"
+    fi
+    full_commit='0123456789abcdef0123456789abcdef01234567'
+    if [[ "${PI_FAKE_GIT_DRIFT_FROM_REV_PARSE_CALL:-0}" -gt 0 \
+      && "$call_number" -ge "${PI_FAKE_GIT_DRIFT_FROM_REV_PARSE_CALL}" ]]; then
+      full_commit='ffffffffffffffffffffffffffffffffffffffff'
+    fi
     if [[ "${2:-}" == "--short" && "${3:-}" == "HEAD" ]]; then
-      printf '%s\n' '01234567'
+      printf '%s\n' "${full_commit:0:8}"
     elif [[ "${2:-}" == "HEAD" ]]; then
-      printf '%s\n' '0123456789abcdef0123456789abcdef01234567'
+      printf '%s\n' "$full_commit"
     else
       exit 64
     fi
@@ -7704,10 +7729,20 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             "PI_FAKE_PERF_BENCH_INVOCATION_MARKER",
             target_dir.join("perf-bench-invoked"),
         )
+        .env(
+            "PI_FAKE_GIT_REV_PARSE_STATE_FILE",
+            target_dir.join("git-rev-parse-count"),
+        )
         .env("CI_CORRELATION_ID", FAKE_ORCHESTRATE_CORRELATION_ID)
         .env("PERF_SKIP_CRITERION", "1");
     for (key, value) in extra_env {
         command.env(key, value);
+    }
+    if extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_PERF_ONLY" && *value == "1")
+    {
+        command.arg("--suite").arg("perf_bench_harness");
     }
 
     let output = command.output().expect("run orchestrate.sh");
@@ -7979,6 +8014,64 @@ fn orchestrate_rch_perf_harness_rejects_unavailable_git_status() {
     assert!(
         !temp_root.join("target/perf-bench-invoked").exists(),
         "unavailable Git status must not invoke the remote benchmark"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_head_drift_before_invocation() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_GIT_DRIFT_FROM_REV_PARSE_CALL", "4"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must reject HEAD drift before benchmark invocation"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH extension benchmark precondition: Git HEAD drifted"),
+        "pre-invocation HEAD drift must trip the immediate source fence: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "pre-invocation HEAD drift must not invoke the remote benchmark"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_head_drift_after_invocation() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_GIT_DRIFT_FROM_REV_PARSE_CALL", "6"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must reject HEAD drift after benchmark invocation"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH extension benchmark postcondition: Git HEAD drifted"),
+        "post-invocation HEAD drift must trip the immediate source fence: {combined}"
+    );
+    assert!(
+        temp_root.join("target/perf-bench-invoked").is_file(),
+        "post-invocation control must prove the remote benchmark actually ran"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "post-invocation HEAD drift must prevent the JSONL from entering accepted results"
     );
 }
 

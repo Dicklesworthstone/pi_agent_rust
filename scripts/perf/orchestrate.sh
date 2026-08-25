@@ -102,6 +102,7 @@ fi
 CARGO_RUNNER_REQUEST="${PERF_CARGO_RUNNER:-rch}" # rch | auto | local
 CARGO_RUNNER_MODE="local"
 declare -a CARGO_RUNNER_ARGS=("cargo")
+declare -a PERF_BENCH_RUNNER_ARGS=("cargo")
 SEEN_NO_RCH=false
 SEEN_REQUIRE_RCH=false
 ARTIFACT_STAGING_STATUS="not_generated"
@@ -490,13 +491,18 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" && "$SEEN_REQUIRE_RCH" == true ]] \
   if ! verify_current_clean_source_identity "Strict RCH performance proof admission"; then
     die "Strict RCH performance proof source identity is not stable"
   fi
-  CARGO_RUNNER_ARGS=(
+  # Pin only the extension benchmark producer. Later strict-RCH Cargo steps
+  # consume evidence generated in this run, which is intentionally outside
+  # the committed source archive and needs the ordinary RCH transfer path.
+  PERF_BENCH_RUNNER_ARGS=(
     "rch" "exec"
     "--base" "$GIT_COMMIT_FULL"
     "--clean-overlay"
     "--no-overlay"
     "--" "cargo"
   )
+else
+  PERF_BENCH_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
 fi
 
 write_binary_size_measurement_control() {
@@ -1223,7 +1229,7 @@ run_test_suite() {
       VERGEN_GIT_DIRTY="$GIT_DIRTY" \
       RUST_TEST_THREADS="$PARALLELISM" \
       PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
-        "${CARGO_RUNNER_ARGS[@]}" nextest run \
+        "${PERF_BENCH_RUNNER_ARGS[@]}" nextest run \
           --build-jobs "$PARALLELISM" \
           --test "$target_name" \
           --cargo-profile "$CARGO_PROFILE" \

@@ -492,6 +492,11 @@ fn rpc_turn_phase(is_streaming: &AtomicBool, is_compacting: &AtomicBool) -> RpcT
     }
 }
 
+fn lock_rpc_turn_phase(lock: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 impl RpcSharedState {
     fn new(config: &Config) -> Self {
         Self {
@@ -643,6 +648,7 @@ pub async fn run(
     let shared_state = Arc::new(Mutex::new(RpcSharedState::new(&options.config)));
     let is_streaming = Arc::new(AtomicBool::new(false));
     let is_compacting = Arc::new(AtomicBool::new(false));
+    let turn_phase_linearizer = Arc::new(std::sync::Mutex::new(()));
     let abort_handle: Arc<Mutex<Option<AbortHandle>>> = Arc::new(Mutex::new(None));
     let bash_state: Arc<Mutex<Option<RunningBash>>> = Arc::new(Mutex::new(None));
     let retry_abort = Arc::new(AtomicBool::new(false));
@@ -882,6 +888,7 @@ pub async fn run(
                                 .map_err(|err| {
                                     Error::session(format!("state lock failed: {err}"))
                                 })?;
+                            let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                             match rpc_turn_phase(&is_streaming, &is_compacting) {
                                 RpcTurnPhase::Streaming => match streaming_behavior {
                                     Some(StreamingBehavior::Steer) => {
@@ -930,6 +937,7 @@ pub async fn run(
                 let shared_state = Arc::clone(&shared_state);
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
+                let turn_phase_linearizer = Arc::clone(&turn_phase_linearizer);
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let runtime_handle = options.runtime_handle.clone();
                 if let Some((command_name, args)) = extension_command {
@@ -964,6 +972,7 @@ pub async fn run(
                                 shared_state,
                                 is_streaming,
                                 is_compacting,
+                                turn_phase_linearizer,
                                 abort_handle_slot,
                                 out_tx,
                                 retry_abort,
@@ -1016,6 +1025,7 @@ pub async fn run(
                         let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                        let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                         let result = match rpc_turn_phase(&is_streaming, &is_compacting) {
                             RpcTurnPhase::Streaming => {
                                 state.push_steering(QueuedAgentMessage::authored(
@@ -1052,6 +1062,7 @@ pub async fn run(
                 let shared_state = Arc::clone(&shared_state);
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
+                let turn_phase_linearizer = Arc::clone(&turn_phase_linearizer);
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
@@ -1064,6 +1075,7 @@ pub async fn run(
                         shared_state,
                         is_streaming,
                         is_compacting,
+                        turn_phase_linearizer,
                         abort_handle_slot,
                         out_tx,
                         retry_abort,
@@ -1115,6 +1127,7 @@ pub async fn run(
                         let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                        let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                         let result = match rpc_turn_phase(&is_streaming, &is_compacting) {
                             RpcTurnPhase::Streaming => {
                                 state.push_follow_up(QueuedAgentMessage::authored(
@@ -1152,6 +1165,7 @@ pub async fn run(
                 let shared_state = Arc::clone(&shared_state);
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
+                let turn_phase_linearizer = Arc::clone(&turn_phase_linearizer);
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
@@ -1164,6 +1178,7 @@ pub async fn run(
                         shared_state,
                         is_streaming,
                         is_compacting,
+                        turn_phase_linearizer,
                         abort_handle_slot,
                         out_tx,
                         retry_abort,
@@ -2402,6 +2417,7 @@ pub async fn run(
                 let shared_state = Arc::clone(&shared_state);
                 let is_streaming = Arc::clone(&is_streaming);
                 let is_compacting = Arc::clone(&is_compacting);
+                let turn_phase_linearizer = Arc::clone(&turn_phase_linearizer);
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let retry_abort = retry_abort.clone();
                 let options = options.clone();
@@ -2414,6 +2430,7 @@ pub async fn run(
                             shared_state,
                             is_streaming,
                             is_compacting,
+                            turn_phase_linearizer,
                             abort_handle_slot,
                             out_tx,
                             retry_abort,
@@ -2923,6 +2940,7 @@ async fn run_prompt_with_retry(
     shared_state: Arc<Mutex<RpcSharedState>>,
     is_streaming: Arc<AtomicBool>,
     is_compacting: Arc<AtomicBool>,
+    turn_phase_linearizer: Arc<std::sync::Mutex<()>>,
     abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
     out_tx: std::sync::mpsc::SyncSender<String>,
     retry_abort: Arc<AtomicBool>,
@@ -3065,6 +3083,7 @@ async fn run_prompt_with_retry(
                     // Close new-turn admission before leaving the successful
                     // provider result. The flag covers both the compaction
                     // decision and any provider-backed compaction that follows.
+                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                     is_compacting.store(true, Ordering::SeqCst);
                     success = true;
                     break;
@@ -4361,6 +4380,7 @@ mod retry_tests {
                 shared_state,
                 is_streaming,
                 is_compacting,
+                Arc::new(std::sync::Mutex::new(())),
                 abort_handle_slot,
                 out_tx,
                 retry_abort,
@@ -4479,6 +4499,7 @@ mod retry_tests {
                 shared_state,
                 is_streaming,
                 is_compacting,
+                Arc::new(std::sync::Mutex::new(())),
                 abort_handle_slot,
                 out_tx,
                 retry_abort,
@@ -4605,6 +4626,7 @@ mod retry_tests {
                 shared_state,
                 is_streaming,
                 is_compacting,
+                Arc::new(std::sync::Mutex::new(())),
                 abort_handle_slot,
                 out_tx,
                 retry_abort,
@@ -6818,10 +6840,10 @@ mod tests {
                 error_message: None,
                 timestamp: 0,
             };
+            let mut partial = message.clone();
+            partial.content.clear();
             Ok(Box::pin(stream::iter(vec![
-                Ok(crate::model::StreamEvent::Start {
-                    partial: message.clone(),
-                }),
+                Ok(crate::model::StreamEvent::Start { partial }),
                 Ok(crate::model::StreamEvent::TextDelta {
                     content_index: 0,
                     delta: text.to_string(),
