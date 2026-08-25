@@ -237,7 +237,9 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         }
         index += 1;
     }
-    let end = end?;
+    let Some(end) = end else {
+        return Some((bytes.len(), HtmlMarkup::Opaque));
+    };
     if closing {
         return Some((end, HtmlMarkup::Closing { name }));
     }
@@ -625,6 +627,10 @@ mod tests {
         assert!(
             words("<?guard mode='?> ultrathink'?>").is_empty(),
             "a quoted processing-instruction terminator must not expose markup"
+        );
+        assert!(
+            words("<guard mode='unfinished ultrathink").is_empty(),
+            "an unterminated tag consumes the remaining input fail-closed"
         );
     }
 
