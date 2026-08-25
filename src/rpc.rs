@@ -6451,12 +6451,12 @@ mod tests {
                 });
 
             let cx = AgentCx::for_current_or_request();
-            if let Some(entered) = self
+            let first_call_entered = self
                 .first_call_entered
                 .lock()
                 .expect("lock queued keyword entered signal")
-                .take()
-            {
+                .take();
+            if let Some(entered) = first_call_entered {
                 entered
                     .send(cx.cx(), ())
                     .expect("signal first queued keyword provider call");

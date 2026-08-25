@@ -3247,8 +3247,11 @@ mod stream_delta_batcher_tests {
 
         app.queue_input(QueuedMessageKind::Steering);
 
-        let mut queue = app.message_queue.lock().expect("message queue");
-        let queued = queue.pop_steering();
+        let queued = app
+            .message_queue
+            .lock()
+            .expect("message queue")
+            .pop_steering();
         assert_eq!(queued.len(), 1);
         assert_eq!(queued[0].keyword_scan_source(), Some("/queued orchestrate"));
         assert!(matches!(
