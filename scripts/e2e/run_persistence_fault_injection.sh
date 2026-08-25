@@ -320,6 +320,7 @@ run_case() {
             "$test_name" \
             -- \
             --nocapture \
+            --exact \
             --test-threads=1 \
             2>&1 | tee "$log_file"
     else
@@ -328,6 +329,7 @@ run_case() {
             "$test_name" \
             -- \
             --nocapture \
+            --exact \
             --test-threads=1 \
             2>&1 | tee "$log_file"
     fi
@@ -615,9 +617,51 @@ def inline_summary_bytes_are_valid(
         },
     }:
         return False
-    local_summary_path = case_dir / expected_summary_artifact
+    case_root = case_dir.resolve()
+    local_summary_path = (case_dir / expected_summary_artifact).resolve()
+    try:
+        relative_summary_path = local_summary_path.relative_to(case_root)
+    except ValueError:
+        return False
+    if relative_summary_path.parts != (expected_summary_artifact,):
+        return False
     local_summary_path.write_bytes(payload)
-    return local_summary_path.is_file()
+    if (
+        not local_summary_path.is_file()
+        or local_summary_path.stat().st_size != len(payload)
+        or hashlib.sha256(local_summary_path.read_bytes()).hexdigest() != digest
+    ):
+        return False
+    artifact_record["remote_path"] = artifact_record["path"]
+    artifact_record["path"] = str(local_summary_path)
+    return True
+
+
+def canonical_summary_artifact_is_valid(
+    artifact_record: dict,
+    case_dir: Path,
+    expected_summary_artifact: str,
+) -> bool:
+    raw_path = artifact_record.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return False
+    try:
+        case_root = case_dir.resolve(strict=True)
+        summary_path = Path(raw_path).resolve(strict=True)
+        relative_summary_path = summary_path.relative_to(case_root)
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    if relative_summary_path.parts != (expected_summary_artifact,):
+        return False
+    try:
+        payload = summary_path.read_bytes()
+    except OSError:
+        return False
+    return (
+        summary_path.is_file()
+        and len(payload) == artifact_record.get("size_bytes")
+        and hashlib.sha256(payload).hexdigest() == artifact_record.get("sha256")
+    )
 
 
 def case_checks(
@@ -660,6 +704,20 @@ def case_checks(
         expected_test_name,
         expected_summary_artifact,
     )
+    has_confined_summary_artifact = (
+        has_verified_summary_bytes
+        and canonical_summary_artifact_is_valid(
+            summary_artifacts[0], case_dir, expected_summary_artifact
+        )
+    )
+    if has_confined_summary_artifact:
+        (case_dir / "artifact-index.jsonl").write_text(
+            "".join(
+                f"{json.dumps(record, sort_keys=True, separators=(',', ':'))}\n"
+                for record in artifacts
+            ),
+            encoding="utf-8",
+        )
     has_current_correlation = bool(logs) and all(
         record.get("ci_correlation_id") == correlation_id for record in logs
     )
@@ -696,6 +754,7 @@ def case_checks(
         "summary_artifact_indexed": has_summary_artifact,
         "summary_artifact_schema_valid": has_valid_summary_artifact,
         "summary_artifact_bytes_verified": has_verified_summary_bytes,
+        "summary_artifact_path_confined": has_confined_summary_artifact,
         "diagnostic_log_schema_valid": diagnostic_log_schema_valid,
         "artifact_index_schema_valid": artifact_index_schema_valid,
         "correlation_id_current": has_current_correlation,
