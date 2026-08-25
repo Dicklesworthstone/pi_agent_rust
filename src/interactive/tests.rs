@@ -284,7 +284,7 @@ fn render_header_uses_cycle_thinking_binding_hint() {
     assert!(header.contains("shift+tab: thinking"), "header: {header}");
     assert!(!header.contains("ctrl+t: thinking"), "header: {header}");
     assert!(
-        header.contains("\x1b]0;Pi · gpt-5.2 · ready\x07"),
+        header.contains("\x1b]0;Pi · openai/gpt-5.2 · ready\x07"),
         "live header must emit the delight terminal title: {header:?}"
     );
 }

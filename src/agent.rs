@@ -1612,6 +1612,12 @@ impl Agent {
         self.tool_call_dialect = dialect;
     }
 
+    /// The model-catalog-selected tool-call dialect.
+    #[must_use]
+    pub const fn tool_call_dialect(&self) -> crate::dialects::Dialect {
+        self.tool_call_dialect
+    }
+
     /// Register async fetchers for queued steering/follow-up messages.
     ///
     /// This is additive: multiple sources (e.g. RPC, extensions) can register
@@ -10274,8 +10280,8 @@ impl AgentSession {
                 entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
             });
         self.agent.set_keyword_max_thinking_level(keyword_max);
-        self.agent.set_tool_call_dialect(entry.as_ref().map_or(
-            crate::dialects::Dialect::Native,
+        self.agent.set_tool_call_dialect(entry.as_ref().map_or_else(
+            || self.agent.tool_call_dialect(),
             ModelEntry::tool_call_dialect,
         ));
         self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
@@ -10509,9 +10515,10 @@ impl AgentSession {
         self.model_registry
             .as_ref()
             .and_then(|registry| registry.find(provider_id, model_id))
-            .map_or(crate::dialects::Dialect::Native, |entry| {
-                entry.tool_call_dialect()
-            })
+            .map_or_else(
+                || self.agent.tool_call_dialect(),
+                |entry| entry.tool_call_dialect(),
+            )
     }
 
     fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
