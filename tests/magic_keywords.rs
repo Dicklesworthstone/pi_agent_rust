@@ -115,6 +115,7 @@ async fn recv_rpc_command_response(
 struct Capture {
     thinking: Vec<Option<ThinkingLevel>>,
     system_prompts: Vec<Option<String>>,
+    messages: Vec<Vec<Message>>,
 }
 
 struct CaptureProvider {
@@ -151,6 +152,7 @@ impl pi::provider::Provider for CaptureProvider {
             capture
                 .system_prompts
                 .push(context.system_prompt.as_ref().map(ToString::to_string));
+            capture.messages.push(context.messages.to_vec());
         }
         let first_call_entered = self
             .first_call_entered
@@ -578,6 +580,7 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
     let handle = runtime.handle();
 
     runtime.block_on(async {
+        let scenario = async {
         let options = RpcOptions {
             config: Config::default(),
             resources: ResourceLoader::empty(false),
@@ -729,6 +732,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
         )
         .expect("parse ack 1");
         assert_eq!(ack1["type"], "response");
+        assert_eq!(ack1["id"], "1");
         assert_eq!(ack1["command"], "prompt");
         assert_eq!(ack1["success"], true);
 
@@ -777,9 +781,10 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             .expect("release first provider call");
 
         let mut saw_agent_end = false;
+        let event_deadline = Instant::now() + Duration::from_secs(10);
         for _ in 0..100 {
             let event: serde_json::Value = serde_json::from_str(
-                recv_rpc_line(&out_rx, "RPC queued turn event")
+                recv_rpc_line_before(&out_rx, "RPC queued turn event", event_deadline)
                     .await
                     .expect("receive RPC queued turn event")
                     .trim(),
@@ -798,6 +803,14 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
 
         drop(in_tx);
         server.await.expect("RPC server task join");
+        };
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            scenario,
+        )
+        .await
+        .expect("queued steering/follow-up RPC scenario exceeded 15 seconds");
     });
 
     let captured = capture.lock().expect("capture").clone();
@@ -805,6 +818,22 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
     assert_eq!(captured.thinking[0], Some(ThinkingLevel::Off));
     assert_eq!(captured.thinking.get(1), Some(&Some(expected_max)));
     assert_eq!(captured.thinking[2], Some(ThinkingLevel::Off));
+    let last_user_text = |call: usize| match captured.messages[call].last() {
+        Some(Message::User(UserMessage {
+            content: UserContent::Text(text),
+            ..
+        })) => text.as_str(),
+        other => panic!("RPC provider call {call} did not end with a text user message: {other:?}"),
+    };
+    assert_eq!(last_user_text(0), "turn 1 normal");
+    assert_eq!(
+        last_user_text(1),
+        "please ultrathink and workflowz this steering input"
+    );
+    assert_eq!(
+        last_user_text(2),
+        "please orchestrate this follow-up"
+    );
     assert!(
         captured.system_prompts[1]
             .as_deref()
@@ -823,23 +852,51 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             .is_none_or(|prompt| !prompt.contains("`orchestrate` for this turn")),
         "follow-up directives must not leak into the steering request"
     );
+    assert!(
+        captured.system_prompts[2]
+            .as_deref()
+            .is_none_or(|prompt| !prompt.contains("`workflowz` for this turn")),
+        "steering directives must not leak into the follow-up request"
+    );
 
     let guard = session.try_lock().expect("session telemetry lock");
-    let activation_words = guard
+    let activations = guard
         .entries_for_current_path()
         .into_iter()
         .filter_map(|entry| match entry {
-            SessionEntry::Custom(custom) if custom.custom_type == "magic_keyword" => custom
-                .data
-                .as_ref()
-                .and_then(|data| data["word"].as_str())
-                .map(ToString::to_string),
+            SessionEntry::Custom(custom) if custom.custom_type == "magic_keyword" => {
+                custom.data.as_ref().map(|data| {
+                    (
+                        data["schema"].as_str().map(ToString::to_string),
+                        data["word"].as_str().map(ToString::to_string),
+                        data["action"].as_str().map(ToString::to_string),
+                    )
+                })
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(activation_words.iter().any(|word| word == "ultrathink"));
-    assert!(activation_words.iter().any(|word| word == "workflowz"));
-    assert!(activation_words.iter().any(|word| word == "orchestrate"));
+    assert_eq!(
+        activations,
+        vec![
+            (
+                Some("pi.magic_keyword.v1".to_string()),
+                Some("ultrathink".to_string()),
+                Some("ultrathink".to_string()),
+            ),
+            (
+                Some("pi.magic_keyword.v1".to_string()),
+                Some("workflowz".to_string()),
+                Some("workflowz".to_string()),
+            ),
+            (
+                Some("pi.magic_keyword.v1".to_string()),
+                Some("orchestrate".to_string()),
+                Some("orchestrate".to_string()),
+            ),
+        ],
+        "telemetry must contain exactly one ordered activation per authored keyword"
+    );
     drop(guard);
 
     finish_case(&harness, case);

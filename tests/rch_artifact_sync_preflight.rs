@@ -377,3 +377,99 @@ fn postcondition_passes_when_local_generated_artifact_changes() -> Result<(), Bo
     require_u64_field(summary, "violation_count", 0)?;
     Ok(())
 }
+
+#[test]
+fn postcondition_preserves_absolute_artifact_paths_outside_repo() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let artifact = temp.path().join("external-target/extension_bench.jsonl");
+    fs::create_dir_all(&repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+
+    let generated_path = artifact
+        .to_str()
+        .ok_or_else(|| test_error("absolute generated artifact path must be UTF-8"))?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output =
+        run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "absolute-path baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("absolute artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current_run\":true}\n")?;
+
+    let output = run_postcondition(&repo, generated_path, &before_manifest)?;
+    if !output.status.success() {
+        return Err(test_error(format!(
+            "new absolute artifact outside repo should pass the postcondition\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let first_postcondition = array_field(&report, "postconditions")?
+        .first()
+        .ok_or_else(|| test_error("expected one absolute-path postcondition"))?;
+    require_string_field(first_postcondition, "path", generated_path)?;
+    if !bool_field(first_postcondition, "updated")? {
+        return Err(test_error("new absolute artifact should be marked updated"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn postcondition_rejects_symlinked_generated_artifact() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "symlink negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    let target = repo.join("actual-artifact.json");
+    fs::write(&target, "{\"current_run\":true}\n")?;
+    let link = repo.join(GENERATED_ARTIFACT);
+    fs::create_dir_all(
+        link.parent()
+            .ok_or_else(|| test_error("generated artifact should have a parent"))?,
+    )?;
+    symlink(&target, &link)?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "symlinked generated artifact must fail the postcondition\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let has_symlink_diagnostic = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "generated_artifact_not_regular_file")
+    });
+    if !has_symlink_diagnostic {
+        return Err(test_error(format!(
+            "symlink rejection must report a regular-file violation\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}

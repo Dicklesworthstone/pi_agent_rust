@@ -128,7 +128,7 @@ def resolve_required_path(repo_root: Path, raw_path: str) -> tuple[str, Path]:
         try:
             rel_path = full_path.resolve().relative_to(repo_root.resolve()).as_posix()
         except ValueError:
-            rel_path = normalize_posix_path(raw_path)
+            rel_path = full_path.absolute().as_posix()
     else:
         rel_path = normalize_posix_path(raw_path)
         full_path = repo_root / rel_path
@@ -166,7 +166,7 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
         "sha256": None,
     }
     try:
-        stat = full_path.stat()
+        stat = full_path.lstat()
     except FileNotFoundError:
         return snapshot
     except OSError as exc:
@@ -174,10 +174,17 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
         return snapshot
 
     snapshot["exists"] = True
-    snapshot["kind"] = "directory" if full_path.is_dir() else "file" if full_path.is_file() else "other"
+    if full_path.is_symlink():
+        snapshot["kind"] = "symlink"
+    elif full_path.is_dir():
+        snapshot["kind"] = "directory"
+    elif full_path.is_file():
+        snapshot["kind"] = "file"
+    else:
+        snapshot["kind"] = "other"
     snapshot["size_bytes"] = stat.st_size
     snapshot["mtime_ns"] = stat.st_mtime_ns
-    if full_path.is_file():
+    if snapshot["kind"] == "file":
         try:
             snapshot["sha256"] = file_sha256(full_path)
         except OSError as exc:
@@ -208,7 +215,9 @@ def load_json_file(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def before_snapshots_by_path(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def before_snapshots_by_path(
+    repo_root: Path, manifest: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
     items = manifest.get("generated_artifacts")
     if not isinstance(items, list):
         items = manifest.get("postconditions")
@@ -226,7 +235,8 @@ def before_snapshots_by_path(manifest: dict[str, Any]) -> dict[str, dict[str, An
             snapshot = item
         path = snapshot.get("path") or item.get("path")
         if isinstance(path, str):
-            snapshots[normalize_posix_path(path)] = snapshot
+            normalized_path, _ = resolve_required_path(repo_root, path)
+            snapshots[normalized_path] = snapshot
     return snapshots
 
 
@@ -244,7 +254,7 @@ def snapshot_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
 def build_missing_before_manifest_report(repo_root: Path, generated_artifacts: list[str]) -> dict[str, Any]:
     violations = [
         {
-            "path": normalize_posix_path(path),
+            "path": resolve_required_path(repo_root, path)[0],
             "source": "postcondition",
             "line": None,
             "pattern": None,
@@ -274,7 +284,7 @@ def build_postcondition_report(
     repo_root: Path, generated_artifacts: list[str], before_manifest: Path
 ) -> dict[str, Any]:
     before_manifest_payload = load_json_file(before_manifest)
-    before_by_path = before_snapshots_by_path(before_manifest_payload)
+    before_by_path = before_snapshots_by_path(repo_root, before_manifest_payload)
     if not generated_artifacts:
         generated_artifacts = list(before_by_path)
 
@@ -286,8 +296,12 @@ def build_postcondition_report(
     for raw_path in generated_artifacts:
         rel_path, _ = resolve_required_path(repo_root, raw_path)
         before = before_by_path.get(rel_path)
-        after = artifact_snapshot(repo_root, rel_path)
-        updated = before is not None and snapshot_changed(before, after)
+        after = artifact_snapshot(repo_root, raw_path)
+        updated = (
+            before is not None
+            and after.get("kind") == "file"
+            and snapshot_changed(before, after)
+        )
         if updated:
             updated_count += 1
         else:
@@ -322,6 +336,21 @@ def build_postcondition_report(
                     "pattern": None,
                     "reason": "generated_artifact_missing_after_run",
                     "message": f"generated artifact is missing after remote run: {rel_path}",
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        elif after.get("kind") != "file":
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "generated_artifact_not_regular_file",
+                    "message": (
+                        "generated artifact is not a regular file after remote run: "
+                        f"{rel_path} ({after.get('kind', 'unknown')})"
+                    ),
                     "recommended_action": POSTCONDITION_ACTION,
                 }
             )
@@ -538,7 +567,7 @@ def main(argv: list[str]) -> int:
     required_paths = args.required_paths or list(DEFAULT_REQUIRED_PATHS)
 
     if args.mode == "postcondition":
-        generated_artifacts = [normalize_posix_path(path) for path in args.generated_artifacts]
+        generated_artifacts = list(args.generated_artifacts)
         if args.write_before_manifest is not None:
             if generated_artifacts:
                 report = build_postcondition_baseline(repo_root, generated_artifacts)
