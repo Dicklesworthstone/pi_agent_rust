@@ -552,11 +552,6 @@ impl RpcSharedState {
         }
     }
 
-    fn restore_follow_up_front(&mut self, messages: Vec<QueuedAgentMessage>) {
-        for message in messages.into_iter().rev() {
-            self.follow_up.push_front(message);
-        }
-    }
 }
 
 /// Tracks a running bash command so it can be aborted.
@@ -2977,7 +2972,7 @@ async fn run_prompt_with_retry(
     // never replay the first attempt (which would re-add the user message and
     // re-execute completed tool cycles — pi_agent_rust#125 semantics).
     let mut first_attempt_done = false;
-    let mut initial_pending = Vec::new();
+    let mut follow_up_first = false;
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
@@ -2993,8 +2988,9 @@ async fn run_prompt_with_retry(
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             *guard = Some(abort_handle);
         } else {
-            is_streaming.store(false, Ordering::SeqCst);
-            return;
+            final_error = Some("abort handle lock failed".to_string());
+            final_error_hints = None;
+            break;
         }
 
         let runtime_for_events = options.runtime_handle.clone();
@@ -3019,24 +3015,31 @@ async fn run_prompt_with_retry(
                 // below; every completed tool cycle stays on the path, so the
                 // retry re-issues only the failed provider request — no tool
                 // re-execution, no re-billing of prior work (pi_agent_rust#125).
-                if initial_pending.is_empty() {
+                if !follow_up_first {
                     guard
                         .run_continue_with_abort(Some(abort_signal), event_handler)
                         .await
                 } else {
                     let ready_linearizer = Arc::clone(&turn_phase_linearizer);
                     let ready_compacting = Arc::clone(&is_compacting);
-                    guard
-                        .run_continue_with_pending_with_abort(
-                            &mut initial_pending,
+                    let ready = Arc::new(AtomicBool::new(false));
+                    let ready_for_callback = Arc::clone(&ready);
+                    let result = guard
+                        .run_continue_with_follow_up_with_abort(
+                            true,
                             Some(abort_signal),
                             move || {
                                 let _phase_guard = lock_rpc_turn_phase(&ready_linearizer);
                                 ready_compacting.store(false, Ordering::SeqCst);
+                                ready_for_callback.store(true, Ordering::SeqCst);
                             },
                             event_handler,
                         )
-                        .await
+                        .await;
+                    if ready.load(Ordering::SeqCst) {
+                        follow_up_first = false;
+                    }
+                    result
                 }
             } else {
                 // First attempt: add the user message and run the turn.
@@ -3119,14 +3122,9 @@ async fn run_prompt_with_retry(
                     )
                     .await
                     {
-                        Ok(mut state) => {
-                            if state.steering.is_empty() {
-                                let follow_up = state.pop_follow_up();
-                                (!follow_up.is_empty(), follow_up)
-                            } else {
-                                (true, Vec::new())
-                            }
-                        }
+                        Ok(state) if !state.steering.is_empty() => Some(false),
+                        Ok(state) if !state.follow_up.is_empty() => Some(true),
+                        Ok(_) => None,
                         Err(err) => {
                             final_error = Some(format!(
                                 "state lock failed while finalizing turn: {err}"
@@ -3135,14 +3133,13 @@ async fn run_prompt_with_retry(
                             break;
                         }
                     };
-                    if late_queued_input.0 {
+                    if let Some(needs_follow_up_first) = late_queued_input {
                         // A queue insertion that linearized immediately before
                         // our phase claim must not be stranded for a future
-                        // unrelated turn. A follow-up-only batch must be the
-                        // continuation's initial input; otherwise an empty
-                        // provider request would run before the follow-up drain.
-                        initial_pending = late_queued_input.1;
-                        if initial_pending.is_empty() {
+                        // unrelated turn. Follow-ups stay in the shared queue
+                        // until `Agent` drains them after successful preflight.
+                        follow_up_first = needs_follow_up_first;
+                        if !follow_up_first {
                             let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                             is_compacting.store(false, Ordering::SeqCst);
                         }
@@ -3265,23 +3262,6 @@ async fn run_prompt_with_retry(
                 if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
                     guard.agent.stream_options_mut().api_key = Some(fresh);
                 }
-            }
-        }
-    }
-
-    if !initial_pending.is_empty() {
-        // Pending remains non-empty only when continuation preflight never
-        // handed the acknowledged batch to `Agent`. Admission stayed closed,
-        // so restoring it at the front cannot race newer accepted follow-ups.
-        let pending = std::mem::take(&mut initial_pending);
-        match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await {
-            Ok(mut state) => state.restore_follow_up_front(pending),
-            Err(err) => {
-                final_error = Some(format!(
-                    "state lock failed while restoring accepted follow-up: {err}"
-                ));
-                final_error_hints = None;
-                success = false;
             }
         }
     }
@@ -9117,42 +9097,6 @@ export default function init(pi) {
                 ..
             }) if text == expanded
         ));
-    }
-
-    #[test]
-    fn shared_state_restores_transferred_follow_up_batch_at_front_in_order() {
-        let config = Config {
-            follow_up_mode: Some("all".to_string()),
-            ..Config::default()
-        };
-        let mut shared = RpcSharedState::new(&config);
-        for text in ["accepted-first", "accepted-second"] {
-            shared
-                .push_follow_up(QueuedAgentMessage::from_authored_message(
-                    build_user_message(text, &[]),
-                ))
-                .expect("enqueue accepted follow-up");
-        }
-        let transferred = shared.pop_follow_up();
-        shared
-            .push_follow_up(QueuedAgentMessage::from_authored_message(
-                build_user_message("newer", &[]),
-            ))
-            .expect("enqueue newer follow-up");
-
-        shared.restore_follow_up_front(transferred);
-        let restored = shared.pop_follow_up();
-        let texts = restored
-            .iter()
-            .map(|delivery| match delivery.message() {
-                Message::User(UserMessage {
-                    content: UserContent::Text(text),
-                    ..
-                }) => text.as_str(),
-                other => panic!("expected text user message, got {other:?}"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(texts, ["accepted-first", "accepted-second", "newer"]);
     }
 
     #[test]

@@ -1992,16 +1992,15 @@ impl Agent {
         self.run_loop(Vec::new(), Arc::new(on_event), abort).await
     }
 
-    /// Continue without a new top-level prompt, but deliver an already accepted
-    /// batch before the first provider request. RPC uses this for follow-ups
-    /// accepted in the narrow interval after the prior run's final queue drain.
-    pub async fn run_continue_with_pending_with_abort(
+    /// Continue without a new top-level prompt, draining follow-ups before the
+    /// first provider request. RPC uses this when a follow-up was accepted in
+    /// the narrow interval after the prior run's final queue drain.
+    pub async fn run_continue_with_follow_up_with_abort(
         &mut self,
-        pending: Vec<QueuedAgentMessage>,
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_loop_with_initial_pending(Vec::new(), pending, Arc::new(on_event), abort)
+        self.run_loop_with_initial_follow_up(Vec::new(), true, Arc::new(on_event), abort)
             .await
     }
 
@@ -2209,24 +2208,24 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        self.run_loop_with_initial_pending(prompts, Vec::new(), on_event, abort)
+        self.run_loop_with_initial_follow_up(prompts, false, on_event, abort)
             .await
     }
 
-    async fn run_loop_with_initial_pending(
+    async fn run_loop_with_initial_follow_up(
         &mut self,
         prompts: Vec<Message>,
-        initial_pending: Vec<QueuedAgentMessage>,
+        initial_follow_up: bool,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        if !prompts.is_empty() || !initial_pending.is_empty() {
+        if !prompts.is_empty() || initial_follow_up {
             self.retry_keyword_activations.clear();
         }
         let saved_thinking = self.config.stream_options.thinking_level;
         let saved_system_prompt = self.config.system_prompt.clone();
         let result = self
-            .run_loop_inner(prompts, initial_pending, on_event, abort)
+            .run_loop_inner(prompts, initial_follow_up, on_event, abort)
             .await;
         self.config.stream_options.thinking_level = saved_thinking;
         self.config.system_prompt = saved_system_prompt;
@@ -2322,7 +2321,7 @@ impl Agent {
     async fn run_loop_inner(
         &mut self,
         prompts: Vec<Message>,
-        initial_pending: Vec<QueuedAgentMessage>,
+        initial_follow_up: bool,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2380,10 +2379,11 @@ impl Agent {
         }
 
         // Delivery boundary: start of turn (steering messages queued while idle).
-        let mut pending_messages = initial_pending;
-        if pending_messages.is_empty() {
-            pending_messages = self.drain_steering_messages().await;
-        }
+        let mut pending_messages = if initial_follow_up {
+            self.drain_follow_up_messages().await
+        } else {
+            self.drain_steering_messages().await
+        };
         let mut turn_recovery =
             crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
@@ -12635,16 +12635,15 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        let mut pending = Vec::new();
-        self.run_continue_with_pending_with_abort(&mut pending, abort, || {}, on_event)
+        self.run_continue_with_follow_up_with_abort(false, abort, || {}, on_event)
             .await
     }
 
-    /// Resume from persisted history and deliver an already accepted batch
-    /// before issuing the first provider request.
-    pub(crate) async fn run_continue_with_pending_with_abort(
+    /// Resume from persisted history and optionally drain the registered
+    /// follow-up fetchers before issuing the first provider request.
+    pub(crate) async fn run_continue_with_follow_up_with_abort(
         &mut self,
-        pending: &mut Vec<QueuedAgentMessage>,
+        follow_up_first: bool,
         abort: Option<AbortSignal>,
         on_ready: impl FnOnce() + Send,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
@@ -12666,16 +12665,22 @@ impl AgentSession {
         self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
         on_ready();
-        let pending = std::mem::take(pending);
 
         let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
         let on_event_for_run = Arc::clone(&on_event);
-        let result = self
-            .agent
-            .run_continue_with_pending_with_abort(pending, abort, move |event| {
-                on_event_for_run(event);
-            })
-            .await;
+        let result = if follow_up_first {
+            self.agent
+                .run_continue_with_follow_up_with_abort(abort, move |event| {
+                    on_event_for_run(event);
+                })
+                .await
+        } else {
+            self.agent
+                .run_continue_with_abort(abort, move |event| {
+                    on_event_for_run(event);
+                })
+                .await
+        };
         drop(streaming_guard);
 
         // Persist any NEW messages generated by the resume, even on error.
@@ -14034,6 +14039,7 @@ mod tests {
                 },
             );
             agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
 
             let queued_steering = Arc::new(StdTestMutex::new(Some(
                 QueuedAgentMessage::from_authored_message(user_message("steer after handoff")),
@@ -14051,22 +14057,34 @@ mod tests {
                             .collect()
                     })
                 };
-            agent.register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
 
             let first_visible = "expanded payload without a magic word";
             let second_visible = "generated ultrathink payload";
+            let queued_follow_up = Arc::new(StdTestMutex::new(Some(vec![
+                QueuedAgentMessage::authored(
+                    user_message(first_visible),
+                    "please orchestrate this follow-up",
+                ),
+                QueuedAgentMessage::generated(user_message(second_visible)),
+            ])));
+            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
+                    Box::pin(async move {
+                        follow_up_fetcher_state
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_message_fetchers(
+                Some(Arc::new(steering_fetcher)),
+                Some(Arc::new(follow_up_fetcher)),
+            );
             agent
-                .run_continue_with_pending_with_abort(
-                    vec![
-                        QueuedAgentMessage::authored(
-                            user_message(first_visible),
-                            "please orchestrate this follow-up",
-                        ),
-                        QueuedAgentMessage::generated(user_message(second_visible)),
-                    ],
-                    None,
-                    |_| {},
-                )
+                .run_continue_with_follow_up_with_abort(None, |_| {})
                 .await
                 .expect("initial pending continuation");
 
