@@ -277,6 +277,23 @@ fn char_len_at(message: &str, index: usize) -> usize {
         .map_or_else(|| message.len().saturating_sub(index).max(1), char::len_utf8)
 }
 
+fn boundary_enters_path_context(token: &str, boundary: char) -> bool {
+    match boundary {
+        // URI schemes (including mailto:) and Windows drive prefixes must
+        // suppress the remainder of the same whitespace-delimited lexeme.
+        ':' => {
+            let mut chars = token.chars();
+            chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+        }
+        // Query/path parameters split on prose punctuation only after the
+        // surrounding lexeme has been classified. Otherwise
+        // https://host/?ultrathink would expose the query value as prose.
+        '?' | ';' => token.contains('/') || token.contains('\\') || token.contains('.'),
+        _ => false,
+    }
+}
+
 /// Detect enabled keywords in a user message. Returns each action at most
 /// once (first hit wins), in message order.
 #[allow(clippy::too_many_lines)]
@@ -290,6 +307,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
     let mut line_start = true;
     let mut leading_spaces = 0usize;
     let mut line_indented_code = false;
+    let mut suppress_path_lexeme = false;
     let mut index = 0usize;
     let bytes = message.as_bytes();
 
@@ -337,6 +355,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             line_start = true;
             leading_spaces = 0;
             line_indented_code = false;
+            suppress_path_lexeme = false;
             index += 1;
             continue;
         }
@@ -444,30 +463,43 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
+        if ch.is_whitespace() {
+            flush_token(&mut token, &mut activations, &mut seen);
+            suppress_path_lexeme = false;
+            continue;
+        }
+        if suppress_path_lexeme {
+            continue;
+        }
+        if boundary_enters_path_context(&token, ch) {
+            token.clear();
+            suppress_path_lexeme = true;
+            continue;
+        }
+
         let dot_continues_path = ch == '.'
             && message
                 .get(index..)
                 .and_then(|tail| tail.chars().next())
                 .is_some_and(|next| next.is_alphanumeric() || matches!(next, '_' | '-'));
-        let is_boundary = ch.is_whitespace()
-            || (!dot_continues_path
-                && matches!(
-                    ch,
-                    ',' | '.'
-                        | '!'
-                        | '?'
-                        | ':'
-                        | ';'
-                        | '('
-                        | ')'
-                        | '"'
-                        | '\''
-                        | '['
-                        | ']'
-                        | '{'
-                        | '}'
-                        | '*'
-                ));
+        let is_boundary = !dot_continues_path
+            && matches!(
+                ch,
+                ',' | '.'
+                    | '!'
+                    | '?'
+                    | ':'
+                    | ';'
+                    | '('
+                    | ')'
+                    | '"'
+                    | '\''
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '*'
+            );
         if is_boundary {
             flush_token(&mut token, &mut activations, &mut seen);
             continue;
@@ -647,6 +679,18 @@ mod tests {
         assert!(words("preultrathink").is_empty());
         assert!(words("/tmp/ultrathink").is_empty());
         assert!(words("see https://example.com/ultrathink docs").is_empty());
+        assert!(
+            words("see https://example.test/?ultrathink docs").is_empty(),
+            "URL query values are part of the URL lexeme, not prose"
+        );
+        assert!(
+            words("inspect /tmp/file?orchestrate next").is_empty(),
+            "path query values are part of the path lexeme, not prose"
+        );
+        assert!(
+            words("open mailto:ultrathink@example.test").is_empty(),
+            "URI scheme payloads are not prose"
+        );
         assert!(
             words("edit ultrathink.rs next").is_empty(),
             "a bare filename is still a path, even without a slash"

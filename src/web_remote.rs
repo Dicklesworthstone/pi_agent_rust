@@ -581,7 +581,7 @@ mod tests {
         // Client 1 connects with valid steer token
         let c1 = manager.connect_client("client-1", "127.0.0.1:50001", Some("secret-tok-1"));
         assert!(c1.is_ok());
-        assert!(!c1.as_ref().map_or(true, |c| c.is_view_only));
+        assert!(c1.as_ref().is_ok_and(|c| !c.is_view_only));
 
         // Token is consumed, cannot reuse
         let c1_retry =

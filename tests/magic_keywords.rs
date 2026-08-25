@@ -364,8 +364,9 @@ fn settings_disable_keywords() {
         ..Default::default()
     };
     let (mut agent, capture) = build_agent(&root, Some(settings));
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
 
-    block_on_local(agent.run("ultrathink and orchestrate this", |_| {})).expect("run");
+    block_on_local(agent.run("ultrathink, orchestrate, and workflowz this", |_| {})).expect("run");
     let capture = capture.lock().expect("capture").clone();
     harness.log().info(
         "verify",
@@ -377,9 +378,10 @@ fn settings_disable_keywords() {
                 .is_some_and(|p| p.contains("for this turn"))
         ),
     );
-    assert!(
-        !matches!(capture.thinking.first(), Some(&Some(ThinkingLevel::Max))),
-        "disabled ultrathink must not raise thinking: {:?}",
+    assert_eq!(
+        capture.thinking.first(),
+        Some(&None),
+        "disabled ultrathink must preserve the unset baseline: {:?}",
         capture.thinking
     );
     let prompt = capture.system_prompts[0].clone().expect("prompt");
@@ -396,16 +398,18 @@ fn code_and_paths_leave_request_untouched() {
     let harness = TestHarness::new(case);
     let root = harness.temp_path(".");
     let (mut agent, capture) = build_agent(&root, None);
+    agent.set_keyword_max_thinking_level(ThinkingLevel::High);
 
     block_on_local(agent.run(
-        "see `ultrathink` and /tmp/orchestrate plus <think>workflowz</think>",
+        "see `ultrathink`, /tmp/orchestrate, <think>workflowz</think>, and https://example.test/?ultrathink",
         |_| {},
     ))
     .expect("run");
     let capture = capture.lock().expect("capture").clone();
-    assert!(
-        !matches!(capture.thinking.first(), Some(&Some(ThinkingLevel::Max))),
-        "code-span ultrathink must not raise: {:?}",
+    assert_eq!(
+        capture.thinking.first(),
+        Some(&None),
+        "excluded ultrathink occurrences must preserve the unset baseline: {:?}",
         capture.thinking
     );
     let prompt = capture.system_prompts[0].clone().expect("prompt");
