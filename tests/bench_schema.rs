@@ -1205,6 +1205,9 @@ JSON
 JSON
     ;;
   perf_bench_harness)
+    if [[ -n "${PI_FAKE_PERF_BENCH_INVOCATION_MARKER:-}" ]]; then
+      printf '%s\n' invoked >"$PI_FAKE_PERF_BENCH_INVOCATION_MARKER"
+    fi
     args=("$@")
     arg_count="${#args[@]}"
     if (( arg_count < 2 )) \
@@ -1369,9 +1372,17 @@ case "${1:-}" in
         ;;
     esac
     shift
-    if [[ "${1:-}" == "--" ]]; then
-      shift
+    if (( $# < 6 )) \
+      || [[ "${1:-}" != "--base" ]] \
+      || [[ "${2:-}" != "$(git rev-parse HEAD)" ]] \
+      || [[ "${3:-}" != "--clean-overlay" ]] \
+      || [[ "${4:-}" != "--no-overlay" ]] \
+      || [[ "${5:-}" != "--" ]] \
+      || [[ "${6:-}" != "cargo" ]]; then
+      echo "strict RCH execution omitted the clean committed-source pin" >&2
+      exit 67
     fi
+    shift 5
     PI_FAKE_RCH_EXECUTED=1 exec "$@"
     ;;
   *)
@@ -1396,6 +1407,9 @@ case "${1:-}" in
     fi
     ;;
   status)
+    if [[ "${PI_FAKE_GIT_STATUS_UNAVAILABLE:-0}" == "1" ]]; then
+      exit 64
+    fi
     if [[ "${PI_FAKE_GIT_DIRTY:-0}" == "1" ]]; then
       printf '%s\n' ' M scripts/perf/orchestrate.sh'
     fi
@@ -7684,6 +7698,10 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("PERF_OUTPUT_DIR", &output_dir)
         .env("PERF_FAULT_INJECTION_ROOT", &fault_injection_root)
+        .env(
+            "PI_FAKE_PERF_BENCH_INVOCATION_MARKER",
+            target_dir.join("perf-bench-invoked"),
+        )
         .env("CI_CORRELATION_ID", FAKE_ORCHESTRATE_CORRELATION_ID)
         .env("PERF_SKIP_CRITERION", "1");
     for (key, value) in extra_env {
@@ -7897,7 +7915,7 @@ fn orchestrate_rch_perf_harness_rejects_wrong_source_commit() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rch_perf_harness_rejects_unknown_source_commit() {
-    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
         "PI_FAKE_GIT_IDENTITY_UNAVAILABLE",
         "1",
     )]);
@@ -7911,15 +7929,19 @@ fn orchestrate_rch_perf_harness_rejects_unknown_source_commit() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("without a full Git commit identity: unknown"),
+        combined.contains("requires a full Git commit identity, got: unknown"),
         "unknown source identity must fail before the remote benchmark starts: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "unknown source identity must not invoke the remote benchmark"
     );
 }
 
 #[cfg(unix)]
 #[test]
 fn orchestrate_rch_perf_harness_rejects_dirty_source_tree() {
-    let (output, _temp_root) =
+    let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_GIT_DIRTY", "1")]);
     assert!(
         !output.status.success(),
@@ -7931,8 +7953,38 @@ fn orchestrate_rch_perf_harness_rejects_dirty_source_tree() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("from a dirty source tree"),
+        combined.contains("requires a clean source tree"),
         "dirty source identity must fail before the remote benchmark starts: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "dirty source identity must not invoke the remote benchmark"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_unavailable_git_status() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_GIT_STATUS_UNAVAILABLE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must reject an unavailable Git status"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("requires an available Git status"),
+        "unavailable Git status must fail before the remote benchmark starts: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "unavailable Git status must not invoke the remote benchmark"
     );
 }
 

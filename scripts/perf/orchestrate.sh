@@ -90,9 +90,14 @@ CREATE_BUNDLE=0
 VALIDATE_ONLY=""
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
 GIT_COMMIT_FULL="$(git rev-parse HEAD 2>/dev/null || echo "unknown")"
-GIT_DIRTY=false
-if [[ -n "$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)" ]]; then
-  GIT_DIRTY=true
+GIT_STATUS_AVAILABLE=false
+GIT_STATUS_PORCELAIN=""
+GIT_DIRTY=true
+if GIT_STATUS_PORCELAIN="$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)"; then
+  GIT_STATUS_AVAILABLE=true
+  if [[ -z "$GIT_STATUS_PORCELAIN" ]]; then
+    GIT_DIRTY=false
+  fi
 fi
 CARGO_RUNNER_REQUEST="${PERF_CARGO_RUNNER:-rch}" # rch | auto | local
 CARGO_RUNNER_MODE="local"
@@ -444,6 +449,55 @@ suite_selected() {
   done
   return 1
 }
+
+verify_current_clean_source_identity() {
+  local label="$1"
+  local observed_commit observed_status
+  if ! observed_commit="$(git rev-parse HEAD 2>/dev/null)"; then
+    log_fail "$label: Git commit identity is unavailable"
+    return 1
+  fi
+  if [[ ! "$observed_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    log_fail "$label: Git commit identity is not a full SHA-1: $observed_commit"
+    return 1
+  fi
+  if [[ "$observed_commit" != "$GIT_COMMIT_FULL" ]]; then
+    log_fail "$label: Git HEAD drifted from $GIT_COMMIT_FULL to $observed_commit"
+    return 1
+  fi
+  if ! observed_status="$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)"; then
+    log_fail "$label: Git status is unavailable"
+    return 1
+  fi
+  if [[ -n "$observed_status" ]]; then
+    log_fail "$label: source tree is dirty"
+    return 1
+  fi
+  return 0
+}
+
+if [[ "$CARGO_RUNNER_MODE" == "rch" && "$SEEN_REQUIRE_RCH" == true ]] \
+  && suite_selected "perf_bench_harness"; then
+  if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
+    die "Strict RCH performance proof requires a full Git commit identity, got: $GIT_COMMIT_FULL"
+  fi
+  if [[ "$GIT_STATUS_AVAILABLE" != true ]]; then
+    die "Strict RCH performance proof requires an available Git status"
+  fi
+  if [[ "$GIT_DIRTY" != false ]]; then
+    die "Strict RCH performance proof requires a clean source tree"
+  fi
+  if ! verify_current_clean_source_identity "Strict RCH performance proof admission"; then
+    die "Strict RCH performance proof source identity is not stable"
+  fi
+  CARGO_RUNNER_ARGS=(
+    "rch" "exec"
+    "--base" "$GIT_COMMIT_FULL"
+    "--clean-overlay"
+    "--no-overlay"
+    "--" "cargo"
+  )
+fi
 
 write_binary_size_measurement_control() {
   local binary_path="$1"
@@ -1152,12 +1206,8 @@ run_test_suite() {
     # arrive in the matching local target directory before crediting the suite.
     rch_target_subdir="nextest/pi-perf/$CORRELATION_ID/$suite_name"
     local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
-    if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
-      log_fail "Refusing RCH extension benchmark without a full Git commit identity: $GIT_COMMIT_FULL"
+    if ! verify_current_clean_source_identity "RCH extension benchmark precondition"; then
       exit_code=89
-    elif [[ "$GIT_DIRTY" != false ]]; then
-      log_fail "Refusing RCH extension benchmark from a dirty source tree"
-      exit_code=90
     elif [[ -e "$retrieved_result_dir/extension_bench.jsonl" \
       || -L "$retrieved_result_dir/extension_bench.jsonl" \
       || -e "$retrieved_result_dir/extension_bench_summary.md" \
@@ -1181,6 +1231,11 @@ run_test_suite() {
           -- bench_extension_scenarios --exact \
         >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
         || exit_code=$?
+    fi
+
+    if [[ "$exit_code" -eq 0 ]] \
+      && ! verify_current_clean_source_identity "RCH extension benchmark postcondition"; then
+      exit_code=91
     fi
 
     if [[ "$exit_code" -eq 0 \

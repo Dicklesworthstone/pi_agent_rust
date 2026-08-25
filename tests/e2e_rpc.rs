@@ -2943,8 +2943,8 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
         );
         assert_eq!(
             metrics_after.coalesced_mutations,
-            metrics_before.coalesced_mutations + 1,
-            "the BashExecution append must enqueue exactly one autosave mutation"
+            metrics_before.coalesced_mutations,
+            "the first pending BashExecution mutation must not be reported as coalesced"
         );
         assert_eq!(
             metrics_after.pending_mutations,

@@ -467,6 +467,31 @@ impl Drop for ClearFlagOnDrop {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RpcTurnPhase {
+    Idle,
+    Streaming,
+    Compacting,
+}
+
+/// Snapshot the two-flag turn handoff without accepting the torn state where
+/// compaction became active between the first compaction read and the streaming
+/// read. `SeqCst` plus the second compaction read makes `Idle` observable only
+/// before the handoff begins or after compaction has actually finished.
+fn rpc_turn_phase(is_streaming: &AtomicBool, is_compacting: &AtomicBool) -> RpcTurnPhase {
+    if is_compacting.load(Ordering::SeqCst) {
+        return RpcTurnPhase::Compacting;
+    }
+    let streaming = is_streaming.load(Ordering::SeqCst);
+    if is_compacting.load(Ordering::SeqCst) {
+        RpcTurnPhase::Compacting
+    } else if streaming {
+        RpcTurnPhase::Streaming
+    } else {
+        RpcTurnPhase::Idle
+    }
+}
+
 impl RpcSharedState {
     fn new(config: &Config) -> Self {
         Self {
@@ -812,74 +837,80 @@ pub async fn run(
                         }
                     };
 
-                if is_compacting.load(Ordering::SeqCst) {
-                    let resp = response_error(
-                        id,
-                        "prompt",
-                        "Agent is currently compacting; wait before sending another prompt"
-                            .to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
-
                 let extension_command =
                     resolve_extension_command(&message, rpc_extension_manager.as_ref());
 
-                if is_streaming.load(Ordering::SeqCst) {
-                    if extension_command.is_some() {
+                match rpc_turn_phase(&is_streaming, &is_compacting) {
+                    RpcTurnPhase::Compacting => {
                         let resp = response_error(
                             id,
                             "prompt",
-                            "Extension commands are not allowed while agent is streaming"
+                            "Agent is currently compacting; wait before sending another prompt"
                                 .to_string(),
                         );
                         let _ = out_tx.send(resp);
                         continue;
                     }
+                    RpcTurnPhase::Idle => {}
+                    RpcTurnPhase::Streaming => {
+                        if extension_command.is_some() {
+                            let resp = response_error(
+                                id,
+                                "prompt",
+                                "Extension commands are not allowed while agent is streaming"
+                                    .to_string(),
+                            );
+                            let _ = out_tx.send(resp);
+                            continue;
+                        }
 
-                    if streaming_behavior.is_none() {
-                        let resp = response_error(
-                            id,
-                            "prompt",
-                            "Agent is currently streaming; specify streamingBehavior".to_string(),
-                        );
-                        let _ = out_tx.send(resp);
+                        if streaming_behavior.is_none() {
+                            let resp = response_error(
+                                id,
+                                "prompt",
+                                "Agent is currently streaming; specify streamingBehavior"
+                                    .to_string(),
+                            );
+                            let _ = out_tx.send(resp);
+                            continue;
+                        }
+
+                        let expanded = options.resources.expand_input(&message);
+                        let queued_result = {
+                            let mut state =
+                                OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                                    .await
+                                    .map_err(|err| {
+                                        Error::session(format!("state lock failed: {err}"))
+                                    })?;
+                            match streaming_behavior {
+                                Some(StreamingBehavior::Steer) => {
+                                    state.push_steering(QueuedAgentMessage::authored(
+                                        build_user_message(&expanded, &images),
+                                        message.clone(),
+                                    ))
+                                }
+                                Some(StreamingBehavior::FollowUp) => {
+                                    state.push_follow_up(QueuedAgentMessage::authored(
+                                        build_user_message(&expanded, &images),
+                                        message.clone(),
+                                    ))
+                                }
+                                None => Ok(()), // Unreachable due to check above
+                            }
+                        };
+
+                        match queued_result {
+                            Ok(()) => {
+                                let _ = out_tx.send(response_ok(id, "prompt", None));
+                            }
+                            Err(err) => {
+                                let resp = response_error_with_hints(id, "prompt", &err);
+                                let _ = out_tx.send(resp);
+                            }
+                        }
                         continue;
                     }
-
-                    let expanded = options.resources.expand_input(&message);
-                    let queued_result = {
-                        let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                            .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        match streaming_behavior {
-                            Some(StreamingBehavior::Steer) => {
-                                state.push_steering(QueuedAgentMessage::authored(
-                                    build_user_message(&expanded, &images),
-                                    message.clone(),
-                                ))
-                            }
-                            Some(StreamingBehavior::FollowUp) => {
-                                state.push_follow_up(QueuedAgentMessage::authored(
-                                    build_user_message(&expanded, &images),
-                                    message.clone(),
-                                ))
-                            }
-                            None => Ok(()), // Unreachable due to check above
-                        }
-                    };
-
-                    match queued_result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response_ok(id, "prompt", None));
-                        }
-                        Err(err) => {
-                            let resp = response_error_with_hints(id, "prompt", &err);
-                            let _ = out_tx.send(resp);
-                        }
-                    }
-                    continue;
                 }
 
                 // Ack immediately.
@@ -962,35 +993,38 @@ pub async fn run(
                     continue;
                 }
 
-                if is_compacting.load(Ordering::SeqCst) {
-                    let resp = response_error(
-                        id,
-                        "steer",
-                        "Agent is currently compacting; wait before steering".to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
-
                 let expanded = options.resources.expand_input(&message);
-                if is_streaming.load(Ordering::SeqCst) {
-                    let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_steering(QueuedAgentMessage::authored(
-                            build_user_message(&expanded, &[]),
-                            message.clone(),
-                        ));
-
-                    match result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response_ok(id, "steer", None));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(id, "steer", &err));
-                        }
+                match rpc_turn_phase(&is_streaming, &is_compacting) {
+                    RpcTurnPhase::Compacting => {
+                        let resp = response_error(
+                            id,
+                            "steer",
+                            "Agent is currently compacting; wait before steering".to_string(),
+                        );
+                        let _ = out_tx.send(resp);
+                        continue;
                     }
-                    continue;
+                    RpcTurnPhase::Idle => {}
+                    RpcTurnPhase::Streaming => {
+                        let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?
+                            .push_steering(QueuedAgentMessage::authored(
+                                build_user_message(&expanded, &[]),
+                                message.clone(),
+                            ));
+
+                        match result {
+                            Ok(()) => {
+                                let _ = out_tx.send(response_ok(id, "steer", None));
+                            }
+                            Err(err) => {
+                                let _ =
+                                    out_tx.send(response_error_with_hints(id, "steer", &err));
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 let _ = out_tx.send(response_ok(id, "steer", None));
@@ -1048,35 +1082,42 @@ pub async fn run(
                     continue;
                 }
 
-                if is_compacting.load(Ordering::SeqCst) {
-                    let resp = response_error(
-                        id,
-                        "follow_up",
-                        "Agent is currently compacting; wait before sending a follow-up".to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
-
                 let expanded = options.resources.expand_input(&message);
-                if is_streaming.load(Ordering::SeqCst) {
-                    let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                        .await
-                        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                        .push_follow_up(QueuedAgentMessage::authored(
-                            build_user_message(&expanded, &[]),
-                            message.clone(),
-                        ));
-
-                    match result {
-                        Ok(()) => {
-                            let _ = out_tx.send(response_ok(id, "follow_up", None));
-                        }
-                        Err(err) => {
-                            let _ = out_tx.send(response_error_with_hints(id, "follow_up", &err));
-                        }
+                match rpc_turn_phase(&is_streaming, &is_compacting) {
+                    RpcTurnPhase::Compacting => {
+                        let resp = response_error(
+                            id,
+                            "follow_up",
+                            "Agent is currently compacting; wait before sending a follow-up"
+                                .to_string(),
+                        );
+                        let _ = out_tx.send(resp);
+                        continue;
                     }
-                    continue;
+                    RpcTurnPhase::Idle => {}
+                    RpcTurnPhase::Streaming => {
+                        let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                            .await
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?
+                            .push_follow_up(QueuedAgentMessage::authored(
+                                build_user_message(&expanded, &[]),
+                                message.clone(),
+                            ));
+
+                        match result {
+                            Ok(()) => {
+                                let _ = out_tx.send(response_ok(id, "follow_up", None));
+                            }
+                            Err(err) => {
+                                let _ = out_tx.send(response_error_with_hints(
+                                    id,
+                                    "follow_up",
+                                    &err,
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 let _ = out_tx.send(response_ok(id, "follow_up", None));
@@ -1977,9 +2018,7 @@ pub async fn run(
             }
 
             "compact" => {
-                if is_streaming.load(Ordering::SeqCst)
-                    || is_compacting.load(Ordering::SeqCst)
-                {
+                if rpc_turn_phase(&is_streaming, &is_compacting) != RpcTurnPhase::Idle {
                     let _ = out_tx.send(response_error(
                         id,
                         "compact",
@@ -2287,21 +2326,25 @@ pub async fn run(
                 // Retry re-EXECUTES the recovered turn immediately: queueing
                 // it as steering would silently wait for (and then pollute)
                 // the next unrelated prompt.
-                if is_compacting.load(Ordering::SeqCst) {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "retry",
-                        "Agent is currently compacting; wait before retrying".to_string(),
-                    ));
-                    continue;
-                }
-                if is_streaming.load(Ordering::SeqCst) {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "retry",
-                        "Agent is currently streaming; abort or wait before retrying".to_string(),
-                    ));
-                    continue;
+                match rpc_turn_phase(&is_streaming, &is_compacting) {
+                    RpcTurnPhase::Compacting => {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "retry",
+                            "Agent is currently compacting; wait before retrying".to_string(),
+                        ));
+                        continue;
+                    }
+                    RpcTurnPhase::Streaming => {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "retry",
+                            "Agent is currently streaming; abort or wait before retrying"
+                                .to_string(),
+                        ));
+                        continue;
+                    }
+                    RpcTurnPhase::Idle => {}
                 }
                 let text = {
                     let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
