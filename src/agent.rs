@@ -10137,7 +10137,7 @@ impl AgentSession {
         let provider = self.agent.provider();
         let keyword_max = registry
             .find(provider.name(), provider.model_id())
-            .map_or(crate::model::ThinkingLevel::Max, |entry| {
+            .map_or(self.agent.keyword_max_thinking_level, |entry| {
                 entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
             });
         self.agent.set_keyword_max_thinking_level(keyword_max);
