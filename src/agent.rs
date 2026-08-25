@@ -1363,6 +1363,9 @@ pub struct Agent {
     /// Fetchers for queued steering messages (interrupts).
     steering_fetchers: Vec<MessageFetcher>,
 
+    /// Owning surface's bounded follow-up source used for resumed handoffs.
+    initial_follow_up_fetcher: Option<MessageFetcher>,
+
     /// Fetchers for queued follow-up messages (idle).
     follow_up_fetchers: Vec<MessageFetcher>,
 
@@ -1473,6 +1476,7 @@ impl Agent {
             extensions: None,
             messages: Vec::new(),
             steering_fetchers: Vec::new(),
+            initial_follow_up_fetcher: None,
             follow_up_fetchers: Vec::new(),
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
@@ -1751,6 +1755,13 @@ impl Agent {
         if let Some(fetcher) = follow_up {
             self.follow_up_fetchers.push(fetcher);
         }
+    }
+
+    /// Register the owning surface's bounded follow-up source for a resumed
+    /// handoff. Unlike additive follow-up sources, this source is fetched on
+    /// its own before the first provider request.
+    pub(crate) fn register_initial_follow_up_fetcher(&mut self, fetcher: MessageFetcher) {
+        self.initial_follow_up_fetcher = Some(fetcher);
     }
 
     /// Extend the tool registry with additional tools (e.g. extension-registered tools).
@@ -3058,11 +3069,26 @@ impl Agent {
     }
 
     async fn drain_follow_up_messages(&mut self) -> Vec<QueuedAgentMessage> {
-        self.fetch_follow_up_messages().await;
+        let queued = self.message_queue.pop_follow_up();
+        if !queued.is_empty() {
+            return queued;
+        }
+
+        let owning_surface = self
+            .fetch_messages(self.initial_follow_up_fetcher.as_ref())
+            .await;
+        if !owning_surface.is_empty() {
+            // The owning surface already applied its queue mode and admission
+            // bound, so deliver its batch directly instead of truncating it to
+            // the smaller internal producer-queue limit.
+            return owning_surface;
+        }
+
+        self.fetch_additive_follow_up_messages().await;
         self.message_queue.pop_follow_up()
     }
 
-    async fn fetch_follow_up_messages(&mut self) {
+    async fn fetch_additive_follow_up_messages(&mut self) {
         for fetcher in &self.follow_up_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
@@ -3072,14 +3098,14 @@ impl Agent {
     }
 
     async fn fetch_initial_follow_up_messages(&mut self) {
-        for fetcher in &self.follow_up_fetchers {
-            let fetched = self.fetch_messages(Some(fetcher)).await;
-            for message in fetched {
-                // This batch has already passed its source queue's admission
-                // limit. Preserve it across the handoff even when that source
-                // permits a larger batch than the ordinary internal queue.
-                self.message_queue.push_follow_up_lossless(message);
-            }
+        let fetched = self
+            .fetch_messages(self.initial_follow_up_fetcher.as_ref())
+            .await;
+        for message in fetched {
+            // The owning surface has already admitted and bounded this batch.
+            // Preserve it across the handoff even when that source permits a
+            // larger batch than the ordinary internal queue.
+            self.message_queue.push_follow_up_lossless(message);
         }
     }
 
@@ -14024,15 +14050,17 @@ mod tests {
                 .await
                 .expect("run with default context settings");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
-            assert_eq!(calls.len(), 1);
-            assert_eq!(calls[0].messages.len(), 1);
-            assert_user_text(&calls[0].messages[0], "hello");
-            assert!(calls[0].system_prompt.is_none());
-            drop(calls);
+            assert_eq!(recorded_calls.len(), 1);
+            assert_eq!(recorded_calls[0].messages.len(), 1);
+            assert_user_text(&recorded_calls[0].messages[0], "hello");
+            assert!(recorded_calls[0].system_prompt.is_none());
         });
     }
 
@@ -14165,10 +14193,8 @@ mod tests {
                             .unwrap_or_default()
                     })
                 };
-            agent.register_message_fetchers(
-                Some(Arc::new(steering_fetcher)),
-                Some(Arc::new(follow_up_fetcher)),
-            );
+            agent.register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
             agent
                 .run_continue_with_follow_up_with_abort(None, |_| {})
                 .await
@@ -14257,7 +14283,7 @@ mod tests {
                             .unwrap_or_default()
                     })
                 };
-            agent.register_message_fetchers(None, Some(Arc::new(follow_up_fetcher)));
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
 
             agent
                 .run_continue_with_follow_up_with_abort(None, |_| {})

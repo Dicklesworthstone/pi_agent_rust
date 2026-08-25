@@ -657,6 +657,7 @@ fn write_jsonl_artifacts(harness: &TestHarness, test_name: &str) {
     );
 }
 
+#[allow(dead_code)]
 fn record_inline_json_artifact(harness: &TestHarness, name: &str, value: &Value) {
     let bytes = serde_json::to_vec(value).expect("serialize inline JSON artifact");
     let path = harness.temp_path(name);

@@ -697,10 +697,12 @@ pub async fn run(
                     .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up_for_fetch())
             })
         };
-        guard.agent.register_message_fetchers(
-            Some(Arc::new(steering_fetcher)),
-            Some(Arc::new(follow_fetcher)),
-        );
+        guard
+            .agent
+            .register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
+        guard
+            .agent
+            .register_initial_follow_up_fetcher(Arc::new(follow_fetcher));
         // Background job completion notices (bd-cv653.3.10).
         guard
             .agent
