@@ -13,6 +13,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import stat as stat_mode
 import sys
 import tomllib
 from dataclasses import dataclass
@@ -281,6 +282,20 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def first_symlink_ancestor(path: Path) -> Path | None:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:-1]:
+        current /= component
+        try:
+            metadata = current.lstat()
+        except FileNotFoundError:
+            return None
+        if stat_mode.S_ISLNK(metadata.st_mode):
+            return current
+    return None
+
+
 def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
     rel_path, full_path = resolve_required_path(repo_root, raw_path)
     snapshot: dict[str, Any] = {
@@ -291,8 +306,14 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
         "mtime_ns": None,
         "sha256": None,
     }
+    symlink_ancestor = first_symlink_ancestor(full_path)
+    if symlink_ancestor is not None:
+        snapshot["exists"] = True
+        snapshot["kind"] = "symlink_ancestor"
+        snapshot["symlink_ancestor"] = str(symlink_ancestor)
+        return snapshot
     try:
-        stat = full_path.lstat()
+        metadata = full_path.lstat()
     except FileNotFoundError:
         return snapshot
     except OSError as exc:
@@ -300,16 +321,16 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
         return snapshot
 
     snapshot["exists"] = True
-    if full_path.is_symlink():
+    if stat_mode.S_ISLNK(metadata.st_mode):
         snapshot["kind"] = "symlink"
-    elif full_path.is_dir():
+    elif stat_mode.S_ISDIR(metadata.st_mode):
         snapshot["kind"] = "directory"
-    elif full_path.is_file():
+    elif stat_mode.S_ISREG(metadata.st_mode):
         snapshot["kind"] = "file"
     else:
         snapshot["kind"] = "other"
-    snapshot["size_bytes"] = stat.st_size
-    snapshot["mtime_ns"] = stat.st_mtime_ns
+    snapshot["size_bytes"] = metadata.st_size
+    snapshot["mtime_ns"] = metadata.st_mtime_ns
     if snapshot["kind"] == "file":
         try:
             snapshot["sha256"] = file_sha256(full_path)
@@ -321,9 +342,27 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
 def build_postcondition_baseline(repo_root: Path, generated_artifacts: list[str]) -> dict[str, Any]:
     snapshots = []
     violations: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
     for raw_path in generated_artifacts:
         snapshot = artifact_snapshot(repo_root, raw_path)
         snapshots.append({"path": snapshot["path"], "snapshot": snapshot})
+        if snapshot["path"] in seen_paths:
+            violations.append(
+                {
+                    "path": snapshot["path"],
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "duplicate_generated_artifact_request",
+                    "message": (
+                        "postcondition baseline request contains duplicate generated artifact: "
+                        f"{snapshot['path']}"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        else:
+            seen_paths.add(snapshot["path"])
         if snapshot.get("error"):
             violations.append(
                 {
@@ -408,16 +447,38 @@ def build_before_manifest_error_report(
 
 def before_snapshots_by_path(
     repo_root: Path, manifest: dict[str, Any]
-) -> dict[str, dict[str, Any]]:
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     items = manifest.get("generated_artifacts")
     if not isinstance(items, list):
         items = manifest.get("postconditions")
     if not isinstance(items, list):
-        return {}
+        return {}, [
+            {
+                "path": None,
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_artifact_set_invalid",
+                "message": "before manifest does not contain a generated-artifact array",
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        ]
 
     snapshots: dict[str, dict[str, Any]] = {}
-    for item in items:
+    violations: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
         if not isinstance(item, dict):
+            violations.append(
+                {
+                    "path": None,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_manifest_snapshot_invalid",
+                    "message": f"before manifest artifact entry {index} is not an object",
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
             continue
         snapshot = item.get("snapshot")
         if not isinstance(snapshot, dict):
@@ -425,10 +486,38 @@ def before_snapshots_by_path(
         if not isinstance(snapshot, dict):
             snapshot = item
         path = snapshot.get("path") or item.get("path")
-        if isinstance(path, str):
-            normalized_path, _ = resolve_required_path(repo_root, path)
-            snapshots[normalized_path] = snapshot
-    return snapshots
+        if not isinstance(path, str) or not path.strip():
+            violations.append(
+                {
+                    "path": None,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_manifest_snapshot_invalid",
+                    "message": f"before manifest artifact entry {index} has no valid path",
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+            continue
+        normalized_path, _ = resolve_required_path(repo_root, path)
+        if normalized_path in snapshots:
+            violations.append(
+                {
+                    "path": normalized_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_manifest_duplicate_artifact",
+                    "message": (
+                        "before manifest contains duplicate generated-artifact identity: "
+                        f"{normalized_path}"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+            continue
+        snapshots[normalized_path] = snapshot
+    return snapshots, violations
 
 
 def snapshot_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
@@ -549,13 +638,57 @@ def build_postcondition_report(
                 "recommended_action": POSTCONDITION_ACTION,
             }
         )
-    before_by_path = (
-        {}
-        if manifest_violations
-        else before_snapshots_by_path(repo_root, before_manifest_payload)
+    before_by_path, artifact_set_violations = before_snapshots_by_path(
+        repo_root, before_manifest_payload
     )
+    manifest_violations.extend(artifact_set_violations)
     if not generated_artifacts:
         generated_artifacts = list(before_by_path)
+    else:
+        requested_paths = [
+            resolve_required_path(repo_root, raw_path)[0]
+            for raw_path in generated_artifacts
+        ]
+        duplicate_requested_paths = sorted(
+            {
+                path
+                for path in requested_paths
+                if requested_paths.count(path) > 1
+            }
+        )
+        if duplicate_requested_paths:
+            manifest_violations.append(
+                {
+                    "path": str(before_manifest),
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "duplicate_generated_artifact_request",
+                    "message": (
+                        "postcondition request contains duplicate generated artifacts: "
+                        f"{duplicate_requested_paths}"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        before_paths = set(before_by_path)
+        requested_path_set = set(requested_paths)
+        if requested_path_set != before_paths:
+            manifest_violations.append(
+                {
+                    "path": str(before_manifest),
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_manifest_artifact_set_mismatch",
+                    "message": (
+                        "postcondition artifact set does not exactly match the before manifest; "
+                        f"missing_from_request={sorted(before_paths - requested_path_set)}, "
+                        f"missing_from_manifest={sorted(requested_path_set - before_paths)}"
+                    ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
 
     postconditions: list[dict[str, Any]] = []
     violations: list[dict[str, Any]] = list(manifest_violations)
@@ -598,6 +731,30 @@ def build_postcondition_report(
                     "recommended_action": POSTCONDITION_ACTION,
                 }
             )
+        elif before.get("error"):
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_snapshot_error",
+                    "message": f"before snapshot failed for generated artifact: {rel_path}",
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        elif after.get("error"):
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "after_snapshot_error",
+                    "message": f"after snapshot failed for generated artifact: {rel_path}",
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
         elif not after.get("exists"):
             violations.append(
                 {
@@ -622,30 +779,6 @@ def build_postcondition_report(
                         "generated artifact is not a regular file after remote run: "
                         f"{rel_path} ({after.get('kind', 'unknown')})"
                     ),
-                    "recommended_action": POSTCONDITION_ACTION,
-                }
-            )
-        elif before.get("error"):
-            violations.append(
-                {
-                    "path": rel_path,
-                    "source": "postcondition",
-                    "line": None,
-                    "pattern": None,
-                    "reason": "before_snapshot_error",
-                    "message": f"before snapshot failed for generated artifact: {rel_path}",
-                    "recommended_action": POSTCONDITION_ACTION,
-                }
-            )
-        elif after.get("error"):
-            violations.append(
-                {
-                    "path": rel_path,
-                    "source": "postcondition",
-                    "line": None,
-                    "pattern": None,
-                    "reason": "after_snapshot_error",
-                    "message": f"after snapshot failed for generated artifact: {rel_path}",
                     "recommended_action": POSTCONDITION_ACTION,
                 }
             )
@@ -742,7 +875,6 @@ def evaluate_required_paths(
         except FileNotFoundError:
             metadata = None
         except OSError as exc:
-            metadata = None
             violations.append(
                 {
                     "path": rel_path,
@@ -753,12 +885,26 @@ def evaluate_required_paths(
                     "message": f"failed to inspect required path {rel_path}: {exc}",
                 }
             )
+            required_results.append(
+                {
+                    "path": rel_path,
+                    "exists": False,
+                    "kind": "inspection_error",
+                    "matched_rules": matched_rules,
+                    "included": False,
+                }
+            )
+            continue
         exists = metadata is not None
-        if full_path.is_symlink():
+        symlink_ancestor = first_symlink_ancestor(full_path)
+        if symlink_ancestor is not None:
+            exists = True
+            kind = "symlink_ancestor"
+        elif metadata is not None and stat_mode.S_ISLNK(metadata.st_mode):
             kind = "symlink"
-        elif full_path.is_dir():
+        elif metadata is not None and stat_mode.S_ISDIR(metadata.st_mode):
             kind = "directory"
-        elif full_path.is_file():
+        elif metadata is not None and stat_mode.S_ISREG(metadata.st_mode):
             kind = "file"
         elif exists:
             kind = "other"

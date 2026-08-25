@@ -10095,7 +10095,6 @@ export default function init(pi) {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
-        let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
             let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
