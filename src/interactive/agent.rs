@@ -30,6 +30,35 @@ pub(super) fn build_user_message(text: String) -> ModelMessage {
     })
 }
 
+fn append_turn_artifacts(
+    session: &mut Session,
+    mut messages: Vec<ModelMessage>,
+    repairs: &[crate::dialects::RepairEntry],
+    keyword_activations: &[crate::magic_keywords::KeywordActivation],
+) {
+    // Session retry cleanup requires an Error/Aborted assistant to remain the
+    // leaf. Audit entries are durable completed state, so place them before
+    // the incomplete assistant rather than allowing a Custom entry to mask it.
+    let incomplete_assistant = messages
+        .iter()
+        .rposition(|message| {
+            matches!(
+                message,
+                ModelMessage::Assistant(assistant)
+                    if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted)
+            )
+        })
+        .map(|index| messages.remove(index));
+    for message in messages {
+        session.append_model_message(message);
+    }
+    crate::agent::append_dialect_repair_telemetry(session, repairs);
+    crate::magic_keywords::append_session_telemetry(session, keyword_activations);
+    if let Some(message) = incomplete_assistant {
+        session.append_model_message(message);
+    }
+}
+
 async fn dispatch_input_event(
     manager: &ExtensionManager,
     text: String,
@@ -2219,12 +2248,10 @@ After approving access in the browser, press Enter in Pi to complete login."
             };
             let keyword_activations = agent_guard.drain_keyword_ledger();
             drop(agent_guard);
-            for message in new_messages {
-                session_guard.append_model_message(message);
-            }
-            crate::agent::append_dialect_repair_telemetry(&mut session_guard, &repairs);
-            crate::magic_keywords::append_session_telemetry(
+            append_turn_artifacts(
                 &mut session_guard,
+                new_messages,
+                &repairs,
                 &keyword_activations,
             );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
@@ -2494,12 +2521,10 @@ After approving access in the browser, press Enter in Pi to complete login."
             };
             let keyword_activations = agent_guard.drain_keyword_ledger();
             drop(agent_guard);
-            for message in new_messages {
-                session_guard.append_model_message(message);
-            }
-            crate::agent::append_dialect_repair_telemetry(&mut session_guard, &repairs);
-            crate::magic_keywords::append_session_telemetry(
+            append_turn_artifacts(
                 &mut session_guard,
+                new_messages,
+                &repairs,
                 &keyword_activations,
             );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
@@ -2854,12 +2879,10 @@ After approving access in the browser, press Enter in Pi to complete login."
             };
             let keyword_activations = agent_guard.drain_keyword_ledger();
             drop(agent_guard);
-            for message in new_messages {
-                session_guard.append_model_message(message);
-            }
-            crate::agent::append_dialect_repair_telemetry(&mut session_guard, &repairs);
-            crate::magic_keywords::append_session_telemetry(
+            append_turn_artifacts(
                 &mut session_guard,
+                new_messages,
+                &repairs,
                 &keyword_activations,
             );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
@@ -3256,7 +3279,7 @@ mod stream_delta_batcher_tests {
                     entry,
                     crate::session::SessionEntry::Custom(custom)
                         if custom.custom_type == "dialect_repair"
-                            && custom.data.as_ref().is_some_and(|data| data["tool"] == "read")
+                            && custom.data.as_ref().is_some_and(|data| data["tool"] == json!("read"))
                 ))
                 .count(),
             1
@@ -3269,8 +3292,8 @@ mod stream_delta_batcher_tests {
                     crate::session::SessionEntry::Custom(custom)
                         if custom.custom_type == "magic_keyword"
                             && custom.data.as_ref().is_some_and(|data| {
-                                data["schema"] == "pi.magic_keyword.v1"
-                                    && data["word"] == "ultrathink"
+                                data["schema"] == json!("pi.magic_keyword.v1")
+                                    && data["word"] == json!("ultrathink")
                             })
                 ))
                 .count(),
