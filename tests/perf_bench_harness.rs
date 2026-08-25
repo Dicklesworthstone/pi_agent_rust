@@ -24,8 +24,10 @@
 
 mod common;
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -159,6 +161,11 @@ fn output_dir() -> PathBuf {
     std::env::var("BENCH_OUTPUT_DIR")
         .ok()
         .map_or_else(|| cargo_target_dir().join("perf"), PathBuf::from)
+}
+
+fn write_new_artifact(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(contents)
 }
 
 #[test]
@@ -422,9 +429,26 @@ fn emit_jsonl_line(record: &BenchRecord) -> String {
     serde_json::to_string(record).expect("serialize extension benchmark record")
 }
 
-fn validate_bench_jsonl(content: &str) -> Result<usize, String> {
+fn expected_bench_coverage(expected_extensions: &[String]) -> BTreeSet<(String, String)> {
+    let mut expected = BTreeSet::new();
+    for extension in expected_extensions {
+        expected.insert((extension.clone(), "cold_start".to_string()));
+        expected.insert((extension.clone(), "warm_start".to_string()));
+    }
+    if expected_extensions.iter().any(|extension| extension == "hello") {
+        expected.insert(("hello".to_string(), "tool_call".to_string()));
+    }
+    if expected_extensions.iter().any(|extension| extension == "pirate") {
+        expected.insert(("pirate".to_string(), "event_hook".to_string()));
+    }
+    expected
+}
+
+fn validate_bench_jsonl(content: &str, expected_extensions: &[String]) -> Result<usize, String> {
     let mut record_count = 0usize;
     let mut has_positive_cold_start = false;
+    let expected_coverage = expected_bench_coverage(expected_extensions);
+    let mut observed_coverage = BTreeSet::new();
     for (line_index, line) in content.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -484,6 +508,19 @@ fn validate_bench_jsonl(content: &str) -> Result<usize, String> {
                 line_index + 1
             ));
         }
+        let coverage_key = (record.extension.clone(), record.scenario.clone());
+        if !expected_coverage.contains(&coverage_key) {
+            return Err(format!(
+                "line {}: unexpected benchmark coverage {coverage_key:?}",
+                line_index + 1
+            ));
+        }
+        if !observed_coverage.insert(coverage_key.clone()) {
+            return Err(format!(
+                "line {}: duplicate benchmark coverage {coverage_key:?}",
+                line_index + 1
+            ));
+        }
         if record.env.config_hash != env_config_hash(&record.env) {
             return Err(format!(
                 "line {}: environment config_hash does not bind its provenance fields",
@@ -500,6 +537,17 @@ fn validate_bench_jsonl(content: &str) -> Result<usize, String> {
         return Err(
             "extension benchmark JSONL contains no successful cold_start record".to_string(),
         );
+    }
+    if observed_coverage != expected_coverage {
+        return Err(format!(
+            "extension benchmark coverage mismatch: missing={:?}, unexpected={:?}",
+            expected_coverage
+                .difference(&observed_coverage)
+                .collect::<Vec<_>>(),
+            observed_coverage
+                .difference(&expected_coverage)
+                .collect::<Vec<_>>()
+        ));
     }
     Ok(record_count)
 }
@@ -585,8 +633,48 @@ fn shutdown_manager(manager: &ExtensionManager) {
 
 // ─── Scenario Runners ────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone)]
+struct ScenarioSamples {
+    attempted: usize,
+    samples_us: Vec<f64>,
+}
+
+fn validate_complete_samples<'a>(
+    scenario: &str,
+    extension: &str,
+    samples: &'a ScenarioSamples,
+) -> Result<&'a [f64], String> {
+    if samples.attempted == 0 {
+        return Err(format!(
+            "{scenario}/{extension}: benchmark attempted zero iterations"
+        ));
+    }
+    if samples.samples_us.len() != samples.attempted {
+        return Err(format!(
+            "{scenario}/{extension}: only {} of {} benchmark iterations succeeded",
+            samples.samples_us.len(),
+            samples.attempted
+        ));
+    }
+    if samples
+        .samples_us
+        .iter()
+        .any(|sample| !sample.is_finite() || *sample < 0.0)
+    {
+        return Err(format!(
+            "{scenario}/{extension}: benchmark emitted a non-finite or negative sample"
+        ));
+    }
+    Ok(&samples.samples_us)
+}
+
 /// Cold start: create fresh runtime + manager, load extension, measure total.
-fn run_cold_start(_ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usize) -> Vec<f64> {
+fn run_cold_start(
+    _ext_name: &str,
+    entry_path: &Path,
+    cwd: &Path,
+    iterations: usize,
+) -> ScenarioSamples {
     let mut samples_us = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
@@ -631,7 +719,10 @@ fn run_cold_start(_ext_name: &str, entry_path: &Path, cwd: &Path, iterations: us
         shutdown_manager(&manager);
     }
 
-    samples_us
+    ScenarioSamples {
+        attempted: iterations,
+        samples_us,
+    }
 }
 
 /// Warm start: reuse existing runtime, reload extension.
@@ -640,9 +731,12 @@ fn run_warm_start(
     entry_path: &Path,
     cwd: &Path,
     iterations: usize,
-) -> Vec<f64> {
+) -> ScenarioSamples {
     let Ok(spec) = JsExtensionLoadSpec::from_entry_path(entry_path) else {
-        return Vec::new();
+        return ScenarioSamples {
+            attempted: iterations,
+            samples_us: Vec::new(),
+        };
     };
 
     let manager = ExtensionManager::new();
@@ -663,7 +757,10 @@ fn run_warm_start(
     });
 
     let Some(runtime) = runtime_ok else {
-        return Vec::new();
+        return ScenarioSamples {
+            attempted: iterations,
+            samples_us: Vec::new(),
+        };
     };
     manager.set_js_runtime(runtime);
 
@@ -675,7 +772,10 @@ fn run_warm_start(
     });
     if !warmup_ok {
         shutdown_manager(&manager);
-        return Vec::new();
+        return ScenarioSamples {
+            attempted: iterations,
+            samples_us: Vec::new(),
+        };
     }
 
     // Measure subsequent loads.
@@ -693,18 +793,32 @@ fn run_warm_start(
     }
 
     shutdown_manager(&manager);
-    samples_us
+    ScenarioSamples {
+        attempted: iterations,
+        samples_us,
+    }
 }
 
 /// Tool call overhead: load extension, then call its tool N times.
-fn run_tool_call(ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usize) -> Vec<f64> {
+fn run_tool_call(
+    ext_name: &str,
+    entry_path: &Path,
+    cwd: &Path,
+    iterations: usize,
+) -> ScenarioSamples {
     let Some((manager, _spec)) = create_runtime_and_load(ext_name, entry_path, cwd) else {
-        return Vec::new();
+        return ScenarioSamples {
+            attempted: iterations,
+            samples_us: Vec::new(),
+        };
     };
 
     let Some(runtime) = manager.js_runtime() else {
         shutdown_manager(&manager);
-        return Vec::new();
+        return ScenarioSamples {
+            attempted: iterations,
+            samples_us: Vec::new(),
+        };
     };
 
     // Determine tool name: use the extension name as a best guess.
@@ -733,7 +847,10 @@ fn run_tool_call(ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usiz
     }
 
     shutdown_manager(&manager);
-    samples_us
+    ScenarioSamples {
+        attempted: iterations,
+        samples_us,
+    }
 }
 
 /// Event hook dispatch: load extension, dispatch events N times.
@@ -742,9 +859,12 @@ fn run_event_dispatch(
     entry_path: &Path,
     cwd: &Path,
     iterations: usize,
-) -> Vec<f64> {
+) -> ScenarioSamples {
     let Some((manager, _spec)) = create_runtime_and_load(ext_name, entry_path, cwd) else {
-        return Vec::new();
+        return ScenarioSamples {
+            attempted: iterations,
+            samples_us: Vec::new(),
+        };
     };
 
     let event_payload = json!({"systemPrompt": "You are Pi."});
@@ -773,7 +893,10 @@ fn run_event_dispatch(
     }
 
     shutdown_manager(&manager);
-    samples_us
+    ScenarioSamples {
+        attempted: iterations,
+        samples_us,
+    }
 }
 
 // ─── Main Harness ────────────────────────────────────────────────────────────
