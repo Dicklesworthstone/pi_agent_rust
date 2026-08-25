@@ -336,7 +336,12 @@ def case_checks(
 ) -> dict:
     case_dir = artifact_dir / case_id
     result = load_json(case_dir / "result.json")
-    logs = load_jsonl(case_dir / "test-log.jsonl")
+    diagnostic_records = load_jsonl(case_dir / "test-log.jsonl")
+    logs = [
+        record
+        for record in diagnostic_records
+        if record.get("schema") == "pi.test.log.v2" and record.get("type") == "log"
+    ]
     artifacts = load_jsonl(case_dir / "artifact-index.jsonl")
 
     has_fault_log = any(

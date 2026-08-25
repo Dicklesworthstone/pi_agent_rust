@@ -648,7 +648,8 @@ esac
 
 printf '%s\n' "$case_id" >>"${PI_FAKE_INVOCATION_LOG:?}"
 cat >"$TEST_LOG_JSONL_PATH" <<JSON
-{"schema":"pi.test.log.v2","test":"$test_name","ci_correlation_id":"${CI_CORRELATION_ID:?}","category":"fault","message":"$fault_message"}
+{"schema":"pi.test.log.v2","type":"log","test":"$test_name","ci_correlation_id":"${CI_CORRELATION_ID:?}","category":"fault","message":"$fault_message"}
+{"schema":"pi.test.artifact.v1","type":"artifact","test":"$test_name","name":"$summary_name"}
 JSON
 cat >"$TEST_ARTIFACT_INDEX_PATH" <<JSON
 {"schema":"pi.test.artifact.v1","test":"$test_name","name":"$summary_name"}
@@ -726,6 +727,8 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     {
         assert_eq!(case["checks"]["correlation_id_current"], true);
         assert_eq!(case["checks"]["test_identity_current"], true);
+        assert_eq!(case["test_log_records"], 1);
+        assert_eq!(case["artifact_records"], 1);
     }
     let manifest: Value = serde_json::from_slice(
         &fs::read(success_root.join("artifacts/run-manifest.json"))
