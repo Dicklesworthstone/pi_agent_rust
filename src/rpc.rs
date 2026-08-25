@@ -551,7 +551,6 @@ impl RpcSharedState {
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
         }
     }
-
 }
 
 /// Tracks a running bash command so it can be aborted.
@@ -3116,23 +3115,18 @@ async fn run_prompt_with_retry(
                         }
                     }
                 } else {
-                    let late_queued_input = match OwnedMutexGuard::lock(
-                        Arc::clone(&shared_state),
-                        &cx,
-                    )
-                    .await
-                    {
-                        Ok(state) if !state.steering.is_empty() => Some(false),
-                        Ok(state) if !state.follow_up.is_empty() => Some(true),
-                        Ok(_) => None,
-                        Err(err) => {
-                            final_error = Some(format!(
-                                "state lock failed while finalizing turn: {err}"
-                            ));
-                            final_error_hints = None;
-                            break;
-                        }
-                    };
+                    let late_queued_input =
+                        match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await {
+                            Ok(state) if !state.steering.is_empty() => Some(false),
+                            Ok(state) if !state.follow_up.is_empty() => Some(true),
+                            Ok(_) => None,
+                            Err(err) => {
+                                final_error =
+                                    Some(format!("state lock failed while finalizing turn: {err}"));
+                                final_error_hints = None;
+                                break;
+                            }
+                        };
                     if let Some(needs_follow_up_first) = late_queued_input {
                         // A queue insertion that linearized immediately before
                         // our phase claim must not be stranded for a future

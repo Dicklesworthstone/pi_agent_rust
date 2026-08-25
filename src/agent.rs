@@ -2239,7 +2239,7 @@ impl Agent {
         &mut self,
         prompts: Vec<Message>,
         initial_follow_up: bool,
-        initial_queue_ready: Option<Box<dyn FnOnce() + Send>>,
+        mut initial_queue_ready: Option<Box<dyn FnOnce() + Send>>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2424,9 +2424,6 @@ impl Agent {
                 "accepted follow-up was unavailable at continuation boundary",
             ));
         }
-        if let Some(on_ready) = initial_queue_ready {
-            on_ready();
-        }
         let mut turn_recovery =
             crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
@@ -2441,7 +2438,8 @@ impl Agent {
             let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if let Some(cap) = max_time
+                if !initial_follow_up_staged
+                    && let Some(cap) = max_time
                     && run_started.elapsed() >= cap
                 {
                     let marker = format!(
@@ -2478,7 +2476,8 @@ impl Agent {
                     .await;
                 on_event(turn_start_event);
 
-                if initial_follow_up_staged {
+                let delivering_initial_follow_up = initial_follow_up_staged;
+                if delivering_initial_follow_up {
                     pending_messages = self.message_queue.pop_follow_up();
                     initial_follow_up_staged = false;
                 }
@@ -2507,6 +2506,12 @@ impl Agent {
                         message: message.clone(),
                     });
                     new_messages.push(message);
+                }
+
+                if delivering_initial_follow_up
+                    && let Some(on_ready) = initial_queue_ready.take()
+                {
+                    on_ready();
                 }
 
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -12721,13 +12726,9 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = if follow_up_first {
             self.agent
-                .run_continue_with_follow_up_on_ready_with_abort(
-                    abort,
-                    on_ready,
-                    move |event| {
-                        on_event_for_run(event);
-                    },
-                )
+                .run_continue_with_follow_up_on_ready_with_abort(abort, on_ready, move |event| {
+                    on_event_for_run(event);
+                })
                 .await
         } else {
             on_ready();
@@ -14037,35 +14038,37 @@ mod tests {
                 .await
                 .expect("queued messages complete");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
             assert_eq!(
-                calls.len(),
+                recorded_calls.len(),
                 2,
                 "follow-up must trigger a second provider turn"
             );
             assert_eq!(
-                calls[0].thinking_level,
+                recorded_calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::High),
                 "queued steering ultrathink must affect its first outbound request"
             );
             assert!(
-                calls[0]
+                recorded_calls[0]
                     .system_prompt
                     .as_deref()
                     .is_none_or(|prompt| !prompt.contains("invoked `orchestrate`")),
                 "the later follow-up directive must not leak into the first request"
             );
             assert!(
-                calls[1]
+                recorded_calls[1]
                     .system_prompt
                     .as_deref()
                     .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
                 "queued follow-up orchestrate must affect its outbound request"
             );
-            drop(calls);
 
             let activations = agent.drain_keyword_ledger();
             assert_eq!(activations.len(), 2);
