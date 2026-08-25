@@ -1873,7 +1873,8 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         // before parent-directory sync, proving the backend checkpoint was reached.
         drop(reopened_pre);
         let failpoint = "jsonl_after_rename_before_parent_sync";
-        let marker_path = harness.temp_path("jsonl-midflush-hard-exit.marker");
+        let marker_root = tempfile::tempdir().expect("JSONL checkpoint marker tempdir");
+        let marker_path = marker_root.path().join("jsonl-midflush-hard-exit.marker");
         let child = run_persistence_failpoint_child(
             &stable_path,
             &marker_path,
@@ -1992,7 +1993,8 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         // mutation but before COMMIT, so SQLite recovery must roll the row back.
         drop(reopened_pre);
         let failpoint = "sqlite_after_mutation_before_commit";
-        let marker_path = harness.temp_path("sqlite-midflush-hard-exit.marker");
+        let marker_root = tempfile::tempdir().expect("SQLite checkpoint marker tempdir");
+        let marker_path = marker_root.path().join("sqlite-midflush-hard-exit.marker");
         let child = run_persistence_failpoint_child(
             &stable_path,
             &marker_path,
