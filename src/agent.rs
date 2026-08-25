@@ -1992,6 +1992,19 @@ impl Agent {
         self.run_loop(Vec::new(), Arc::new(on_event), abort).await
     }
 
+    /// Continue without a new top-level prompt, but deliver an already accepted
+    /// batch before the first provider request. RPC uses this for follow-ups
+    /// accepted in the narrow interval after the prior run's final queue drain.
+    pub async fn run_continue_with_pending_with_abort(
+        &mut self,
+        pending: Vec<QueuedAgentMessage>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_loop_with_initial_pending(Vec::new(), pending, Arc::new(on_event), abort)
+            .await
+    }
+
     /// Outbound secrets transform (bd-cv653.7.9): obfuscate credential
     /// shapes in the context before the provider sees it (or refuse the
     /// send in block mode). Off mode is byte-identical.
@@ -2196,12 +2209,25 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        if !prompts.is_empty() {
+        self.run_loop_with_initial_pending(prompts, Vec::new(), on_event, abort)
+            .await
+    }
+
+    async fn run_loop_with_initial_pending(
+        &mut self,
+        prompts: Vec<Message>,
+        initial_pending: Vec<QueuedAgentMessage>,
+        on_event: AgentEventHandler,
+        abort: Option<AbortSignal>,
+    ) -> Result<AssistantMessage> {
+        if !prompts.is_empty() || !initial_pending.is_empty() {
             self.retry_keyword_activations.clear();
         }
         let saved_thinking = self.config.stream_options.thinking_level;
         let saved_system_prompt = self.config.system_prompt.clone();
-        let result = self.run_loop_inner(prompts, on_event, abort).await;
+        let result = self
+            .run_loop_inner(prompts, initial_pending, on_event, abort)
+            .await;
         self.config.stream_options.thinking_level = saved_thinking;
         self.config.system_prompt = saved_system_prompt;
         if result.as_ref().is_ok_and(|message| {
@@ -2296,6 +2322,7 @@ impl Agent {
     async fn run_loop_inner(
         &mut self,
         prompts: Vec<Message>,
+        initial_pending: Vec<QueuedAgentMessage>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2353,7 +2380,8 @@ impl Agent {
         }
 
         // Delivery boundary: start of turn (steering messages queued while idle).
-        let mut pending_messages = self.drain_steering_messages().await;
+        let mut pending_messages = initial_pending;
+        pending_messages.extend(self.drain_steering_messages().await);
         let mut turn_recovery =
             crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
@@ -12605,6 +12633,18 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.run_continue_with_pending_with_abort(Vec::new(), abort, on_event)
+            .await
+    }
+
+    /// Resume from persisted history and deliver an already accepted batch
+    /// before issuing the first provider request.
+    pub(crate) async fn run_continue_with_pending_with_abort(
+        &mut self,
+        pending: Vec<QueuedAgentMessage>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
         let on_event: AgentEventHandler = Arc::new(on_event);
         self.sync_runtime_selection_from_session_header().await?;
 
@@ -12626,7 +12666,7 @@ impl AgentSession {
         let on_event_for_run = Arc::clone(&on_event);
         let result = self
             .agent
-            .run_continue_with_abort(abort, move |event| {
+            .run_continue_with_pending_with_abort(pending, abort, move |event| {
                 on_event_for_run(event);
             })
             .await;

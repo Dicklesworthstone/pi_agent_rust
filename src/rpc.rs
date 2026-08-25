@@ -2971,6 +2971,7 @@ async fn run_prompt_with_retry(
     // never replay the first attempt (which would re-add the user message and
     // re-execute completed tool cycles — pi_agent_rust#125 semantics).
     let mut first_attempt_done = false;
+    let mut initial_pending = Vec::new();
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
@@ -3012,9 +3013,19 @@ async fn run_prompt_with_retry(
                 // below; every completed tool cycle stays on the path, so the
                 // retry re-issues only the failed provider request — no tool
                 // re-execution, no re-billing of prior work (pi_agent_rust#125).
-                guard
-                    .run_continue_with_abort(Some(abort_signal), event_handler)
-                    .await
+                if initial_pending.is_empty() {
+                    guard
+                        .run_continue_with_abort(Some(abort_signal), event_handler)
+                        .await
+                } else {
+                    guard
+                        .run_continue_with_pending_with_abort(
+                            std::mem::take(&mut initial_pending),
+                            Some(abort_signal),
+                            event_handler,
+                        )
+                        .await
+                }
             } else {
                 // First attempt: add the user message and run the turn.
                 first_attempt_done = true;
@@ -3090,13 +3101,20 @@ async fn run_prompt_with_retry(
                         }
                     }
                 } else {
-                    let has_late_queued_input = match OwnedMutexGuard::lock(
+                    let late_queued_input = match OwnedMutexGuard::lock(
                         Arc::clone(&shared_state),
                         &cx,
                     )
                     .await
                     {
-                        Ok(state) => state.pending_count() > 0,
+                        Ok(mut state) => {
+                            if state.steering.is_empty() {
+                                let follow_up = state.pop_follow_up();
+                                (!follow_up.is_empty(), follow_up)
+                            } else {
+                                (true, Vec::new())
+                            }
+                        }
                         Err(err) => {
                             final_error = Some(format!(
                                 "state lock failed while finalizing turn: {err}"
@@ -3105,11 +3123,13 @@ async fn run_prompt_with_retry(
                             break;
                         }
                     };
-                    if has_late_queued_input {
+                    if late_queued_input.0 {
                         // A queue insertion that linearized immediately before
                         // our phase claim must not be stranded for a future
-                        // unrelated turn. Re-open streaming admission and let
-                        // run_continue_with_abort consume it in this turn.
+                        // unrelated turn. A follow-up-only batch must be the
+                        // continuation's initial input; otherwise an empty
+                        // provider request would run before the follow-up drain.
+                        initial_pending = late_queued_input.1;
                         let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                         is_compacting.store(false, Ordering::SeqCst);
                         continue;
