@@ -6565,6 +6565,161 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct CompactionSummaryProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for CompactionSummaryProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let summary = "causal auto-compaction summary".to_string();
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(summary.clone()))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: summary.clone(),
+                }),
+                Ok(StreamEvent::TextEnd {
+                    content_index: 0,
+                    content: summary,
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
+    fn seed_auto_compaction_session(mut session: Session) -> Session {
+        session.header.provider = Some("test-provider".to_string());
+        session.header.model_id = Some("test-model".to_string());
+        for (index, tokens) in [200_000, 250_000].into_iter().enumerate() {
+            session.append_message(crate::session::SessionMessage::User {
+                content: UserContent::Text(format!("user turn {index}")),
+                timestamp: Some(0),
+            });
+            session.append_message(crate::session::SessionMessage::Assistant {
+                message: AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "assistant turn {index}"
+                    )))],
+                    api: "test-api".to_string(),
+                    provider: "test-provider".to_string(),
+                    model: "test-model".to_string(),
+                    usage: Usage {
+                        total_tokens: tokens,
+                        ..Usage::default()
+                    },
+                    stop_reason: StopReason::Stop,
+                    stop_details: None,
+                    error_message: None,
+                    timestamp: 0,
+                },
+            });
+        }
+        session.append_message(crate::session::SessionMessage::User {
+            content: UserContent::Text("recent turn".to_string()),
+            timestamp: Some(0),
+        });
+        session
+    }
+
+    async fn run_auto_compaction_persistence_case(
+        session: Session,
+        save_enabled: bool,
+        runtime_handle: RuntimeHandle,
+    ) -> (Vec<Value>, Arc<asupersync::sync::Mutex<Session>>) {
+        let mut model = dummy_entry("test-model", false);
+        model.model.provider = "test-provider".to_string();
+        let provider: Arc<dyn Provider> = Arc::new(CompactionSummaryProvider);
+        let agent = Agent::new(
+            provider,
+            ToolRegistry::new(&[], Path::new("."), None),
+            AgentConfig {
+                stream_options: StreamOptions {
+                    api_key: Some("test-key".to_string()),
+                    ..StreamOptions::default()
+                },
+                ..AgentConfig::default()
+            },
+        );
+        let inner_session = Arc::new(asupersync::sync::Mutex::new(
+            seed_auto_compaction_session(session),
+        ));
+        let agent_session = AgentSession::new(
+            agent,
+            Arc::clone(&inner_session),
+            save_enabled,
+            crate::compaction::ResolvedCompactionSettings::default(),
+        );
+        let mut config = Config::default();
+        config.compaction = Some(crate::config::CompactionSettings {
+            enabled: Some(true),
+            reserve_tokens: Some(2),
+            keep_recent_tokens: Some(1),
+            mode: None,
+        });
+        let auth_dir = tempfile::tempdir().expect("tempdir");
+        let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth load");
+        let options = RpcOptions {
+            config,
+            resources: ResourceLoader::empty(false),
+            available_models: vec![model],
+            scoped_models: Vec::new(),
+            cli_api_key: None,
+            auth,
+            runtime_handle,
+            ask_tool: None,
+        };
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+        maybe_auto_compact(
+            Arc::new(asupersync::sync::Mutex::new(agent_session)),
+            options,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            out_tx,
+        )
+        .await;
+        let events = out_rx
+            .try_iter()
+            .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+            .collect();
+        (events, inner_session)
+    }
+
     #[derive(Debug, Clone)]
     struct CapturedQueuedKeywordCall {
         thinking_level: Option<ThinkingLevel>,
