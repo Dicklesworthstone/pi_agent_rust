@@ -1250,6 +1250,10 @@ JSON
     ;;
   perf_budgets)
     if [[ "${PI_PERF_POST_GENERATION:-0}" == "1" ]]; then
+      if [[ "${PI_FAKE_RCH_STRICT_PINNED:-0}" != "0" ]]; then
+        echo "post-generation perf_budgets must use the ordinary evidence-transfer runner" >&2
+        exit 74
+      fi
       case " $* " in
         *" ci_enforced_budgets_fail_on_regression_or_missing_data "*" --exact "*) ;;
         *)
