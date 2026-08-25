@@ -551,6 +551,12 @@ impl RpcSharedState {
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
         }
     }
+
+    fn restore_follow_up_front(&mut self, messages: Vec<QueuedAgentMessage>) {
+        for message in messages.into_iter().rev() {
+            self.follow_up.push_front(message);
+        }
+    }
 }
 
 /// Tracks a running bash command so it can be aborted.
@@ -3018,10 +3024,16 @@ async fn run_prompt_with_retry(
                         .run_continue_with_abort(Some(abort_signal), event_handler)
                         .await
                 } else {
+                    let ready_linearizer = Arc::clone(&turn_phase_linearizer);
+                    let ready_compacting = Arc::clone(&is_compacting);
                     guard
                         .run_continue_with_pending_with_abort(
-                            std::mem::take(&mut initial_pending),
+                            &mut initial_pending,
                             Some(abort_signal),
+                            move || {
+                                let _phase_guard = lock_rpc_turn_phase(&ready_linearizer);
+                                ready_compacting.store(false, Ordering::SeqCst);
+                            },
                             event_handler,
                         )
                         .await
@@ -3130,8 +3142,10 @@ async fn run_prompt_with_retry(
                         // continuation's initial input; otherwise an empty
                         // provider request would run before the follow-up drain.
                         initial_pending = late_queued_input.1;
-                        let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
-                        is_compacting.store(false, Ordering::SeqCst);
+                        if initial_pending.is_empty() {
+                            let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                            is_compacting.store(false, Ordering::SeqCst);
+                        }
                         continue;
                     }
                     success = true;
@@ -3251,6 +3265,23 @@ async fn run_prompt_with_retry(
                 if let Some(fresh) = options.auth.resolve_api_key(&provider_name, None) {
                     guard.agent.stream_options_mut().api_key = Some(fresh);
                 }
+            }
+        }
+    }
+
+    if !initial_pending.is_empty() {
+        // Pending remains non-empty only when continuation preflight never
+        // handed the acknowledged batch to `Agent`. Admission stayed closed,
+        // so restoring it at the front cannot race newer accepted follow-ups.
+        let pending = std::mem::take(&mut initial_pending);
+        match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await {
+            Ok(mut state) => state.restore_follow_up_front(pending),
+            Err(err) => {
+                final_error = Some(format!(
+                    "state lock failed while restoring accepted follow-up: {err}"
+                ));
+                final_error_hints = None;
+                success = false;
             }
         }
     }
@@ -6847,12 +6878,12 @@ mod tests {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 1 {
                 let cx = AgentCx::for_current_or_request();
-                if let Some(entered) = self
+                let entered_signal = self
                     .compaction_entered
                     .lock()
                     .expect("lock compaction entered signal")
-                    .take()
-                {
+                    .take();
+                if let Some(entered) = entered_signal {
                     entered
                         .send(cx.cx(), ())
                         .expect("signal auto-compaction provider entry");
@@ -9086,6 +9117,42 @@ export default function init(pi) {
                 ..
             }) if text == expanded
         ));
+    }
+
+    #[test]
+    fn shared_state_restores_transferred_follow_up_batch_at_front_in_order() {
+        let config = Config {
+            follow_up_mode: Some("all".to_string()),
+            ..Config::default()
+        };
+        let mut shared = RpcSharedState::new(&config);
+        for text in ["accepted-first", "accepted-second"] {
+            shared
+                .push_follow_up(QueuedAgentMessage::from_authored_message(
+                    build_user_message(text, &[]),
+                ))
+                .expect("enqueue accepted follow-up");
+        }
+        let transferred = shared.pop_follow_up();
+        shared
+            .push_follow_up(QueuedAgentMessage::from_authored_message(
+                build_user_message("newer", &[]),
+            ))
+            .expect("enqueue newer follow-up");
+
+        shared.restore_follow_up_front(transferred);
+        let restored = shared.pop_follow_up();
+        let texts = restored
+            .iter()
+            .map(|delivery| match delivery.message() {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => text.as_str(),
+                other => panic!("expected text user message, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["accepted-first", "accepted-second", "newer"]);
     }
 
     #[test]

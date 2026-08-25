@@ -12633,7 +12633,8 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_continue_with_pending_with_abort(Vec::new(), abort, on_event)
+        let mut pending = Vec::new();
+        self.run_continue_with_pending_with_abort(&mut pending, abort, || {}, on_event)
             .await
     }
 
@@ -12641,8 +12642,9 @@ impl AgentSession {
     /// before issuing the first provider request.
     pub(crate) async fn run_continue_with_pending_with_abort(
         &mut self,
-        pending: Vec<QueuedAgentMessage>,
+        pending: &mut Vec<QueuedAgentMessage>,
         abort: Option<AbortSignal>,
+        on_ready: impl FnOnce() + Send,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         let on_event: AgentEventHandler = Arc::new(on_event);
@@ -12661,6 +12663,8 @@ impl AgentSession {
         };
         self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
+        on_ready();
+        let pending = std::mem::take(pending);
 
         let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
         let on_event_for_run = Arc::clone(&on_event);

@@ -661,7 +661,7 @@ fn record_inline_json_artifact(harness: &TestHarness, name: &str, value: &Value)
     let bytes = serde_json::to_vec(value).expect("serialize inline JSON artifact");
     let path = harness.temp_path(name);
     std::fs::write(&path, &bytes).expect("write inline JSON artifact");
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let sha256 = pi::package_manager::hex_encode(&Sha256::digest(&bytes));
     let content_base64 = BASE64_STANDARD.encode(&bytes);
     harness
         .log()
