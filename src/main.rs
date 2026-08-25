@@ -8327,8 +8327,8 @@ async fn run_print_mode(
             .strip_suffix(&initial.keyword_scan_source)
             .unwrap_or(&initial.text)
             .to_string();
-        initial.keyword_scan_source = resources.expand_input(&initial.keyword_scan_source);
-        initial.text = generated_prefix + &initial.keyword_scan_source;
+        let expanded_source = resources.expand_input(&initial.keyword_scan_source);
+        initial.text = generated_prefix + &expanded_source;
     }
 
     let messages = messages
@@ -8934,8 +8934,8 @@ async fn run_interactive_mode(
             .strip_suffix(&initial.keyword_scan_source)
             .unwrap_or(&initial.text)
             .to_string();
-        initial.keyword_scan_source = resources.expand_input(&initial.keyword_scan_source);
-        initial.text = generated_prefix + &initial.keyword_scan_source;
+        let expanded_source = resources.expand_input(&initial.keyword_scan_source);
+        initial.text = generated_prefix + &expanded_source;
         pending.push(pi::interactive::PendingInput::ContentWithKeywordSource {
             content: pi::app::build_initial_content(&initial),
             keyword_scan_source: initial.keyword_scan_source,
