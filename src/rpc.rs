@@ -3093,8 +3093,8 @@ async fn preserve_terminal_rpc_input(
 
     let queued_count = state.steering.len() + state.follow_up.len();
     let rollback_session = inner.clone();
-    let steering = state.steering.drain(..).collect::<VecDeque<_>>();
-    let follow_up = state.follow_up.drain(..).collect::<VecDeque<_>>();
+    let steering = std::mem::take(&mut state.steering);
+    let follow_up = std::mem::take(&mut state.follow_up);
     for delivery in steering.iter().chain(&follow_up) {
         inner.append_model_message(delivery.clone().into_message());
     }
@@ -3103,9 +3103,7 @@ async fn preserve_terminal_rpc_input(
         .replace_messages(inner.to_messages_for_current_path());
 
     if save_enabled
-        && let Err(persist_err) = inner
-            .flush_autosave(AutosaveFlushTrigger::Periodic)
-            .await
+        && let Err(persist_err) = inner.flush_autosave(AutosaveFlushTrigger::Periodic).await
     {
         *inner = rollback_session;
         guard
@@ -7554,7 +7552,8 @@ mod tests {
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let cx = AgentCx::for_current_or_request();
-            if let Some(entered) = self.entered.lock().expect("entered signal lock").take() {
+            let entered = self.entered.lock().expect("entered signal lock").take();
+            if let Some(entered) = entered {
                 entered
                     .send(cx.cx(), ())
                     .expect("signal terminal provider entry");
@@ -10147,19 +10146,16 @@ export default function init(pi) {
             );
             cancel_cx.set_cancel_requested(true);
 
-            let result = match asupersync::time::timeout(
-                wall_now(),
-                Duration::from_secs(5),
-                preserve_task,
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(timeout_err) => {
-                    drop(held_session);
-                    panic!("cancelled session-lock waiter did not finish: {timeout_err}");
-                }
-            };
+            let result =
+                match asupersync::time::timeout(wall_now(), Duration::from_secs(5), preserve_task)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(timeout_err) => {
+                        drop(held_session);
+                        panic!("cancelled session-lock waiter did not finish: {timeout_err}");
+                    }
+                };
             drop(held_session);
             assert!(
                 result

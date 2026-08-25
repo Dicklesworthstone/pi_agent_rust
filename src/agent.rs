@@ -2551,7 +2551,9 @@ impl Agent {
                     // steering-only effort and directives cannot leak across
                     // the boundary.
                     self.config.stream_options.thinking_level = turn_baseline_thinking;
-                    self.config.system_prompt = turn_baseline_system_prompt.clone();
+                    self.config
+                        .system_prompt
+                        .clone_from(&turn_baseline_system_prompt);
                     turn_keyword_words.clear();
                     pending_messages = self.message_queue.pop_follow_up();
                     follow_up_staged = false;
@@ -14457,7 +14459,7 @@ mod tests {
                 &agent.message_queue.steering[2].delivery.message,
                 "accepted steering three",
             );
-            let captured_events = events.lock().expect("event capture");
+            let captured_events = { events.lock().expect("event capture").clone() };
             assert_eq!(
                 captured_events
                     .iter()
@@ -14476,7 +14478,6 @@ mod tests {
                 event,
                 AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. }
             )));
-            drop(captured_events);
 
             agent.config.max_time = None;
             agent.set_queue_modes(QueueMode::All, QueueMode::All);
@@ -14695,6 +14696,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn ordinary_follow_up_batch_remains_staged_and_resumes_after_max_time() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -14769,7 +14771,7 @@ mod tests {
                 assert_user_text(&entry.delivery.message, expected_text);
             }
 
-            let captured_events = events.lock().expect("event capture");
+            let captured_events = { events.lock().expect("event capture").clone() };
             assert_eq!(
                 captured_events
                     .iter()
@@ -14799,7 +14801,6 @@ mod tests {
                         if assistant_text_content(&assistant.content).contains("time cap reached")
                 )
             }));
-            drop(captured_events);
 
             agent
                 .run_continue_with_follow_up_with_abort(None, |_| {})
