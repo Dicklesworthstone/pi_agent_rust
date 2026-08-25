@@ -98,6 +98,16 @@ pub struct ModelEntry {
 }
 
 impl ModelEntry {
+    /// Explicit tool-call dialect selected by the catalog. Absence is
+    /// fail-closed Native behavior; model-name heuristics are informational
+    /// only and never enable response repair at runtime.
+    pub fn tool_call_dialect(&self) -> crate::dialects::Dialect {
+        self.compat
+            .as_ref()
+            .and_then(|compat| compat.tool_call_dialect)
+            .unwrap_or_default()
+    }
+
     /// Whether this model supports xhigh thinking level.
     pub fn supports_xhigh(&self) -> bool {
         matches!(
@@ -766,6 +776,8 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
     pub headers: Option<HashMap<String, String>>,
     pub compat: Option<CompatConfig>,
+    /// Opt-in tool-call repair dialect. Omitted models remain Native.
+    pub dialect: Option<crate::dialects::Dialect>,
     /// Model-level `thinkingLevelMap` (gh #165). Equivalent to — and
     /// authoritative over — `compat.thinkingLevelMap` for this model: it is
     /// folded into the entry's merged [`CompatConfig`] at registry build time.
@@ -785,6 +797,11 @@ pub struct CompatConfig {
     pub supports_tools: Option<bool>,
     pub supports_streaming: Option<bool>,
     pub supports_parallel_tool_calls: Option<bool>,
+
+    /// Explicit opt-in tool-call repair dialect, folded from a model-level
+    /// `dialect` declaration. Absence means Native/fail-closed.
+    #[serde(rename = "dialect")]
+    pub tool_call_dialect: Option<crate::dialects::Dialect>,
 
     // ── Request field overrides ─────────────────────────────────────────
     /// Override the JSON field name for `max_tokens` (e.g., `"max_completion_tokens"` for o1).
@@ -3021,6 +3038,11 @@ fn apply_custom_models_with_provider_headers(
                     .get_or_insert_with(CompatConfig::default)
                     .thinking_level_map = Some(map);
             }
+            if let Some(dialect) = model_cfg.dialect {
+                compat
+                    .get_or_insert_with(CompatConfig::default)
+                    .tool_call_dialect = Some(dialect);
+            }
 
             models.push(ModelEntry {
                 model,
@@ -3071,6 +3093,7 @@ fn merge_compat(
                 supports_parallel_tool_calls: model
                     .supports_parallel_tool_calls
                     .or(provider.supports_parallel_tool_calls),
+                tool_call_dialect: model.tool_call_dialect.or(provider.tool_call_dialect),
                 max_tokens_field: model
                     .max_tokens_field
                     .clone()

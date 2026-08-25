@@ -15,12 +15,15 @@
 //!   candidate object (prose can never half-match).
 //! - At most one repair per assistant message (callers bound the turn).
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Tool-call dialect families (v1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Dialect {
     /// Provider-native structured tool calls (no repair).
+    #[default]
     Native,
     /// XML-ish / fenced-JSON text emissions (qwen3, kimi-k2, glm-4.5,
     /// minimax, deepseek-reasoner families on OpenAI-compatible transports).
