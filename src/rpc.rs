@@ -1903,45 +1903,19 @@ pub async fn run(
                                     if let Ok(mut guard) =
                                         OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
                                     {
-                                        if !guard.save_enabled() {
-                                            let pending_message_count = match guard
-                                                .session
-                                                .lock(&bash_cx)
-                                                .await
-                                            {
-                                                Ok(inner_session) => json!(
-                                                    inner_session
-                                                        .autosave_metrics()
-                                                        .pending_mutations
-                                                ),
-                                                Err(_) => Value::Null,
-                                            };
-                                            (
-                                                false,
-                                                None,
-                                                json!({
-                                                    "event": "session.persistence.disabled",
-                                                    "severity": "info",
-                                                    "summary": "Session persistence is disabled; bash history is retained in memory only.",
-                                                    "action": "Enable session saving to make command history durable.",
-                                                    "sliIds": [],
-                                                    "pendingMessageCount": pending_message_count,
-                                                }),
-                                            )
-                                        } else {
+                                        if guard.save_enabled() {
                                             let persist_result = guard.persist_session().await;
-                                            let pending_message_count = match guard
+                                            let pending_message_count = guard
                                                 .session
                                                 .lock(&bash_cx)
                                                 .await
-                                            {
-                                                Ok(inner_session) => json!(
-                                                    inner_session
-                                                        .autosave_metrics()
-                                                        .pending_mutations
-                                                ),
-                                                Err(_) => Value::Null,
-                                            };
+                                                .map_or(Value::Null, |inner_session| {
+                                                    json!(
+                                                        inner_session
+                                                            .autosave_metrics()
+                                                            .pending_mutations
+                                                    )
+                                                });
                                             match persist_result {
                                                 Ok(()) => (
                                                     true,
@@ -1975,6 +1949,30 @@ pub async fn run(
                                                     )
                                                 }
                                             }
+                                        } else {
+                                            let pending_message_count = guard
+                                                .session
+                                                .lock(&bash_cx)
+                                                .await
+                                                .map_or(Value::Null, |inner_session| {
+                                                    json!(
+                                                        inner_session
+                                                            .autosave_metrics()
+                                                            .pending_mutations
+                                                    )
+                                                });
+                                            (
+                                                false,
+                                                None,
+                                                json!({
+                                                    "event": "session.persistence.disabled",
+                                                    "severity": "info",
+                                                    "summary": "Session persistence is disabled; bash history is retained in memory only.",
+                                                    "action": "Enable session saving to make command history durable.",
+                                                    "sliIds": [],
+                                                    "pendingMessageCount": pending_message_count,
+                                                }),
+                                            )
                                         }
                                     } else {
                                         (
@@ -3092,6 +3090,30 @@ async fn run_prompt_with_retry(
                         }
                     }
                 } else {
+                    let has_late_queued_input = match OwnedMutexGuard::lock(
+                        Arc::clone(&shared_state),
+                        &cx,
+                    )
+                    .await
+                    {
+                        Ok(state) => state.pending_count() > 0,
+                        Err(err) => {
+                            final_error = Some(format!(
+                                "state lock failed while finalizing turn: {err}"
+                            ));
+                            final_error_hints = None;
+                            break;
+                        }
+                    };
+                    if has_late_queued_input {
+                        // A queue insertion that linearized immediately before
+                        // our phase claim must not be stranded for a future
+                        // unrelated turn. Re-open streaming admission and let
+                        // run_continue_with_abort consume it in this turn.
+                        let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                        is_compacting.store(false, Ordering::SeqCst);
+                        continue;
+                    }
                     success = true;
                     break;
                 }
@@ -5285,12 +5307,13 @@ async fn maybe_auto_compact(
             };
             let save_enabled = guard.save_enabled();
             let persist_res = guard.persist_session().await;
-            let pending_message_count = match guard.session.lock(cx.cx()).await {
-                Ok(inner_session) => {
+            let pending_message_count = guard
+                .session
+                .lock(cx.cx())
+                .await
+                .map_or(Value::Null, |inner_session| {
                     json!(inner_session.autosave_metrics().pending_mutations)
-                }
-                Err(_) => Value::Null,
-            };
+                });
             guard.agent.replace_messages(messages);
             drop(guard);
 
