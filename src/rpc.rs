@@ -3036,6 +3036,18 @@ async fn run_prompt_with_retry(
             }
         };
 
+        if matches!(
+            &result,
+            Ok(message)
+                if !matches!(message.stop_reason, StopReason::Error | StopReason::Aborted)
+        ) {
+            // The provider turn has stopped consuming steering/follow-up input.
+            // Claim finalization before any further await so no message can be
+            // acknowledged into a queue with no active consumer.
+            let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+            is_compacting.store(true, Ordering::SeqCst);
+        }
+
         if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
             *guard = None;
         }
@@ -3080,11 +3092,6 @@ async fn run_prompt_with_retry(
                         }
                     }
                 } else {
-                    // Close new-turn admission before leaving the successful
-                    // provider result. The flag covers both the compaction
-                    // decision and any provider-backed compaction that follows.
-                    let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
-                    is_compacting.store(true, Ordering::SeqCst);
                     success = true;
                     break;
                 }
