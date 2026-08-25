@@ -214,12 +214,8 @@ fn ultrathink_uses_model_clamped_max() {
     let auth = AuthStorage::load(auth_dir.path().join("auth.json")).expect("auth storage");
     let (registry, expected_max) = capture_model_registry(&auth);
     let session = Arc::new(AsyncMutex::new(Session::in_memory()));
-    let mut agent_session = AgentSession::new(
-        agent,
-        session,
-        false,
-        ResolvedCompactionSettings::default(),
-    );
+    let mut agent_session =
+        AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
     agent_session.set_model_registry(registry);
 
     let response =
@@ -466,18 +462,23 @@ fn block_keyword_activation_persists_in_session_custom_entry() {
 
     let reopened = block_on_local(Session::open(persisted_path.to_string_lossy().as_ref()))
         .expect("reopen autosaved session");
-    assert!(reopened.entries_for_current_path().into_iter().any(|entry| {
-        matches!(
-            entry,
-            SessionEntry::Custom(custom)
-                if custom.custom_type == "magic_keyword"
-                    && custom.data.as_ref().is_some_and(|data| {
-                        data["schema"] == json!("pi.magic_keyword.v1")
-                            && data["word"] == json!("ultrathink")
-                            && data["action"] == json!("ultrathink")
-                    })
-        )
-    }));
+    assert!(
+        reopened
+            .entries_for_current_path()
+            .into_iter()
+            .any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Custom(custom)
+                        if custom.custom_type == "magic_keyword"
+                            && custom.data.as_ref().is_some_and(|data| {
+                                data["schema"] == json!("pi.magic_keyword.v1")
+                                    && data["word"] == json!("ultrathink")
+                                    && data["action"] == json!("ultrathink")
+                            })
+                )
+            })
+    );
     finish_case(&harness, case);
 }
 

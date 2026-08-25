@@ -2618,15 +2618,8 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
 
         if let Err(message) = self.sync_runtime_selection_from_session_header() {
-            if message.starts_with("Agent busy;") || message.starts_with("Session busy;") {
-                tracing::debug!(
-                    message,
-                    "skipping runtime selection sync while submitting input"
-                );
-            } else {
-                self.status_message = Some(message);
-                return None;
-            }
+            self.status_message = Some(message);
+            return None;
         }
 
         let message_owned = message.to_string();

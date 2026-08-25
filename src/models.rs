@@ -7397,6 +7397,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_level_dialect_is_explicit_and_defaults_native() {
+        let (_dir, auth) = test_auth_storage();
+        let mut models = Vec::new();
+        let config: ModelsConfig = serde_json::from_str(
+            r#"{
+                "providers": {
+                    "local": {
+                        "baseUrl": "http://localhost:11434/v1",
+                        "api": "openai-completions",
+                        "models": [
+                            {"id": "qwen-opt-in", "dialect": "xmlish"},
+                            {"id": "qwen-default"}
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .expect("parse model dialect config");
+
+        apply_custom_models(&auth, &mut models, &config, None);
+        let opt_in = models
+            .iter()
+            .find(|entry| entry.model.id == "qwen-opt-in")
+            .expect("opt-in model");
+        let defaulted = models
+            .iter()
+            .find(|entry| entry.model.id == "qwen-default")
+            .expect("default model");
+        assert_eq!(
+            opt_in.tool_call_dialect(),
+            crate::dialects::Dialect::Xmlish
+        );
+        assert_eq!(
+            defaulted.tool_call_dialect(),
+            crate::dialects::Dialect::Native
+        );
+        assert!(
+            serde_json::from_str::<ModelsConfig>(
+                r#"{"providers":{"local":{"models":[{"id":"bad","dialect":"guess"}]}}}"#,
+            )
+            .is_err(),
+            "unknown dialect names must fail instead of silently enabling heuristics"
+        );
+    }
+
     // ─── ad_hoc_provider_defaults ────────────────────────────────────
 
     #[test]

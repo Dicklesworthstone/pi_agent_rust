@@ -7,8 +7,8 @@
 //! ending on prose.
 //!
 //! Guards against false positives (the whole point of the layer):
-//! - Extraction only runs for models mapped to the explicitly repairable
-//!   Xmlish dialect (`dialect_for_model`); Native and Harmony never see it.
+//! - Extraction only runs when the model catalog explicitly selects the
+//!   repairable Xmlish dialect; Native and Harmony never see it.
 //! - A candidate's `name` must be a currently-registered tool.
 //! - `arguments` must be a JSON object.
 //! - Bare-JSON extraction only fires when the ENTIRE trimmed content is the
@@ -43,10 +43,10 @@ impl Dialect {
     }
 }
 
-/// Heuristically map a model to its dialect family (bd-cv653.7.8).
-/// Conservative: everything not known-weak stays Native. Explicit catalog
-/// overrides are still required before this can be described as an opt-in
-/// rollout; callers must not treat Harmony as a text-repair dialect.
+/// Heuristically classify a model for offline benchmarking and migration
+/// suggestions (bd-cv653.7.8). Runtime response repair does not call this:
+/// only an explicit model-catalog `dialect` opt-in can enable Xmlish repair.
+/// Callers must never treat Harmony as a text-repair dialect.
 #[must_use]
 pub fn dialect_for_model(provider: &str, model_id: &str) -> Dialect {
     const XMLISH_MARKERS: &[&str] = &[
