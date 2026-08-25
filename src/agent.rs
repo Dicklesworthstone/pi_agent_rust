@@ -14426,17 +14426,25 @@ mod tests {
                     ..AgentConfig::default()
                 },
             );
-            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+            agent.set_queue_modes(QueueMode::OneAtATime, QueueMode::All);
             agent.queue_steering(user_message("accepted steering one"));
             agent.queue_steering(user_message("accepted steering two"));
+            agent.queue_steering(user_message("accepted steering three"));
 
+            let events = StdArc::new(StdTestMutex::new(Vec::new()));
+            let events_for_capped_run = StdArc::clone(&events);
             let capped = agent
-                .run_with_message_with_abort(user_message("initial prompt"), None, |_| {})
+                .run_with_message_with_abort(user_message("initial prompt"), None, move |event| {
+                    events_for_capped_run
+                        .lock()
+                        .expect("event capture")
+                        .push(event);
+                })
                 .await
                 .expect("time-capped run");
             assert!(assistant_text_content(&capped.content).contains("time cap reached"));
             assert!(calls.lock().expect("provider calls").is_empty());
-            assert_eq!(agent.message_queue.steering.len(), 2);
+            assert_eq!(agent.message_queue.steering.len(), 3);
             assert_user_text(
                 &agent.message_queue.steering[0].delivery.message,
                 "accepted steering one",
@@ -14445,8 +14453,33 @@ mod tests {
                 &agent.message_queue.steering[1].delivery.message,
                 "accepted steering two",
             );
+            assert_user_text(
+                &agent.message_queue.steering[2].delivery.message,
+                "accepted steering three",
+            );
+            let captured_events = events.lock().expect("event capture");
+            assert_eq!(
+                captured_events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentStart { .. }))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                captured_events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                    .count(),
+                1
+            );
+            assert!(captured_events.iter().all(|event| !matches!(
+                event,
+                AgentEvent::TurnStart { .. } | AgentEvent::TurnEnd { .. }
+            )));
+            drop(captured_events);
 
             agent.config.max_time = None;
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
             agent
                 .run_with_message_with_abort(user_message("resume prompt"), None, |_| {})
                 .await
@@ -14471,7 +14504,8 @@ mod tests {
                     "initial prompt",
                     "resume prompt",
                     "accepted steering one",
-                    "accepted steering two"
+                    "accepted steering two",
+                    "accepted steering three"
                 ]
             );
         });

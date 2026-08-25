@@ -8051,6 +8051,32 @@ fn orchestrate_rejects_non_positive_build_jobs_before_remote_invocation() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_rejects_non_perf_rch_extension_profile_before_invocation() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PERF_PROFILE", "release"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "the exact RCH extension proof must reject a non-perf Cargo profile"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("requires PERF_PROFILE=perf"),
+        "profile mismatch must fail with an actionable diagnostic: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "profile mismatch must fail before benchmark invocation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_rejects_rch_local_fallback_marker() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_RCH_LOCAL_FALLBACK", "1")]);

@@ -517,6 +517,9 @@ verify_current_clean_source_identity() {
 
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
   && suite_selected "perf_bench_harness"; then
+  if [[ "$CARGO_PROFILE" != "perf" ]]; then
+    die "RCH extension benchmark proof requires PERF_PROFILE=perf, got: $CARGO_PROFILE"
+  fi
   if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
     die "RCH performance proof requires a full Git commit identity, got: $GIT_COMMIT_FULL"
   fi
