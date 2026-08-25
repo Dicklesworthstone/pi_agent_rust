@@ -8039,6 +8039,64 @@ fn orchestrate_env_only_remote_requirement_selects_clean_runner() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_env_only_remote_requirement_rejects_local_runner() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_OMIT_REQUIRE_RCH_CLI", "1"),
+        ("RCH_REQUIRE_REMOTE", "1"),
+        ("PERF_CARGO_RUNNER", "local"),
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "environment-only remote proof must reject an explicitly local runner"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH proof mode requires PERF_CARGO_RUNNER=rch"),
+        "local proof-mode rejection must name the required runner: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "local proof-mode rejection must happen before benchmark invocation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_env_only_remote_requirement_rejects_auto_runner() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_OMIT_REQUIRE_RCH_CLI", "1"),
+        ("RCH_REQUIRE_REMOTE", "1"),
+        ("PERF_CARGO_RUNNER", "auto"),
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "environment-only remote proof must reject an auto runner that could fall back locally"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH proof mode requires PERF_CARGO_RUNNER=rch"),
+        "auto proof-mode rejection must name the required runner: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "auto proof-mode rejection must happen before benchmark invocation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_explicit_quick_suite_forwards_benchmark_controls() {
     let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
         ("PI_FAKE_PERF_ONLY", "1"),
@@ -8257,6 +8315,35 @@ fn orchestrate_rch_perf_harness_fails_when_nextest_artifact_is_missing() {
     assert!(
         combined.contains("without retrieving extension_bench.jsonl"),
         "missing-artifact failure must name the failed RCH writeback postcondition: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_incomplete_scenario_coverage() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_DROP_RCH_EXTENSION_COVERAGE", "1"),
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "a benchmark artifact missing required event-hook coverage must fail admission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("extension benchmark coverage mismatch"),
+        "incomplete coverage rejection must identify the exact matrix mismatch: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "incomplete benchmark coverage must not enter accepted results"
     );
 }
 

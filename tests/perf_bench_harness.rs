@@ -471,6 +471,7 @@ fn expected_bench_coverage(expected_extensions: &[String]) -> BTreeSet<(String, 
     expected
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_bench_jsonl(content: &str, expected_extensions: &[String]) -> Result<usize, String> {
     let mut record_count = 0usize;
     let mut has_positive_cold_start = false;
@@ -553,7 +554,9 @@ fn validate_bench_jsonl(content: &str, expected_extensions: &[String]) -> Result
                 line_index + 1
             ));
         }
-        if !ordered_summary.windows(2).all(|window| window[0] <= window[1])
+        if !ordered_summary
+            .windows(2)
+            .all(|window| window[0] <= window[1])
             || record.summary.mean_ms < record.summary.min_ms
             || record.summary.mean_ms > record.summary.max_ms
         {
@@ -1066,7 +1069,7 @@ fn bench_extension_scenarios() {
             let sample_batch = run_cold_start(ext_name, &entry_path, &cwd, config.cold_iterations);
             let samples = validate_complete_samples("cold_start", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
-            let summary = compute_summary(&samples);
+            let summary = compute_summary(samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
             eprintln!(
@@ -1107,7 +1110,7 @@ fn bench_extension_scenarios() {
             let sample_batch = run_warm_start(ext_name, &entry_path, &cwd, config.warm_iterations);
             let samples = validate_complete_samples("warm_start", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
-            let summary = compute_summary(&samples);
+            let summary = compute_summary(samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
             eprintln!(
@@ -1151,7 +1154,7 @@ fn bench_extension_scenarios() {
             let sample_batch = run_tool_call(ext_name, &entry_path, &cwd, config.tool_iterations);
             let samples = validate_complete_samples("tool_call", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
-            let summary = compute_summary(&samples);
+            let summary = compute_summary(samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
             eprintln!(
@@ -1194,7 +1197,7 @@ fn bench_extension_scenarios() {
                 run_event_dispatch(ext_name, &entry_path, &cwd, config.event_iterations);
             let samples = validate_complete_samples("event_hook", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
-            let summary = compute_summary(&samples);
+            let summary = compute_summary(samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
             eprintln!(
@@ -1386,7 +1389,7 @@ fn bench_jsonl_schema_validation_is_non_vacuous() {
     let mut tool_record = record.clone();
     tool_record.scenario = "tool_call".to_string();
     let expected_extensions = vec!["hello".to_string()];
-    let valid_records = vec![record.clone(), warm_record, tool_record];
+    let valid_records = vec![record, warm_record, tool_record];
     let records_to_jsonl = |records: &[BenchRecord]| {
         format!(
             "{}\n",
