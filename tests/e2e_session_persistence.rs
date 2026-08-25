@@ -1899,9 +1899,11 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             format!("{failpoint}\n"),
             "JSONL hard exit must occur only after the exact backend checkpoint"
         );
-        harness.log().info_ctx("fault", "jsonl mid-flush failure", |ctx| {
-            ctx.push(("checkpoint".into(), failpoint.to_string()));
-        });
+        harness
+            .log()
+            .info_ctx("fault", "jsonl mid-flush failure", |ctx| {
+                ctx.push(("checkpoint".into(), failpoint.to_string()));
+            });
 
         // Simulate process crash/restart after failed flush.
         let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
@@ -2028,9 +2030,11 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
             format!("{failpoint}\n"),
             "SQLite hard exit must occur only after the exact backend checkpoint"
         );
-        harness.log().info_ctx("fault", "sqlite mid-flush failure", |ctx| {
-            ctx.push(("checkpoint".into(), failpoint.to_string()));
-        });
+        harness
+            .log()
+            .info_ctx("fault", "sqlite mid-flush failure", |ctx| {
+                ctx.push(("checkpoint".into(), failpoint.to_string()));
+            });
 
         let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
             .await

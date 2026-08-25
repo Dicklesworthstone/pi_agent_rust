@@ -877,12 +877,11 @@ pub async fn run(
 
                         let expanded = options.resources.expand_input(&message);
                         let queued_result = {
-                            let mut state =
-                                OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
-                                    .await
-                                    .map_err(|err| {
-                                        Error::session(format!("state lock failed: {err}"))
-                                    })?;
+                            let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                                .await
+                                .map_err(|err| {
+                                    Error::session(format!("state lock failed: {err}"))
+                                })?;
                             match streaming_behavior {
                                 Some(StreamingBehavior::Steer) => {
                                     state.push_steering(QueuedAgentMessage::authored(
@@ -1019,8 +1018,7 @@ pub async fn run(
                                 let _ = out_tx.send(response_ok(id, "steer", None));
                             }
                             Err(err) => {
-                                let _ =
-                                    out_tx.send(response_error_with_hints(id, "steer", &err));
+                                let _ = out_tx.send(response_error_with_hints(id, "steer", &err));
                             }
                         }
                         continue;
@@ -1109,11 +1107,8 @@ pub async fn run(
                                 let _ = out_tx.send(response_ok(id, "follow_up", None));
                             }
                             Err(err) => {
-                                let _ = out_tx.send(response_error_with_hints(
-                                    id,
-                                    "follow_up",
-                                    &err,
-                                ));
+                                let _ =
+                                    out_tx.send(response_error_with_hints(id, "follow_up", &err));
                             }
                         }
                         continue;
@@ -1288,9 +1283,7 @@ pub async fn run(
                 let data = {
                     let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
-                        .map_err(|err| {
-                            Error::session(format!("session lock failed: {err}"))
-                        })?;
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                     let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                         Error::session(format!("inner session lock failed: {err}"))
                     })?;
@@ -6718,6 +6711,105 @@ mod tests {
         }
     }
 
+    struct GatedAutoCompactionProvider {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        compaction_entered: Mutex<Option<asupersync::channel::oneshot::Sender<()>>>,
+        compaction_gate: Mutex<Option<asupersync::channel::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for GatedAutoCompactionProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &crate::provider::Context<'_>,
+            _options: &crate::provider::StreamOptions,
+        ) -> crate::error::Result<
+            Pin<
+                Box<
+                    dyn futures::Stream<Item = crate::error::Result<crate::model::StreamEvent>>
+                        + Send,
+                >,
+            >,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                let cx = AgentCx::for_current_or_request();
+                if let Some(entered) = self
+                    .compaction_entered
+                    .lock()
+                    .expect("lock compaction entered signal")
+                    .take()
+                {
+                    entered
+                        .send(cx.cx(), ())
+                        .expect("signal auto-compaction provider entry");
+                }
+                let gate = self
+                    .compaction_gate
+                    .lock()
+                    .expect("lock auto-compaction gate")
+                    .take();
+                if let Some(mut gate) = gate {
+                    let _ = gate.recv(cx.cx()).await;
+                }
+            }
+
+            let text = if call == 0 {
+                "primary turn response"
+            } else {
+                "gated auto-compaction summary"
+            };
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new(text))],
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: if call == 0 {
+                    Usage {
+                        total_tokens: 230_000,
+                        ..Usage::default()
+                    }
+                } else {
+                    Usage::default()
+                },
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(crate::model::StreamEvent::Start {
+                    partial: message.clone(),
+                }),
+                Ok(crate::model::StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.to_string(),
+                }),
+                Ok(crate::model::StreamEvent::TextEnd {
+                    content_index: 0,
+                    content: text.to_string(),
+                }),
+                Ok(crate::model::StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message,
+                }),
+            ])))
+        }
+    }
+
     fn seed_auto_compaction_session(mut session: Session) -> Session {
         session.header.provider = Some("test-provider".to_string());
         session.header.model_id = Some("test-model".to_string());
@@ -9278,21 +9370,15 @@ export default function init(pi) {
         let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
-            let (events, session, metrics_before) = run_auto_compaction_persistence_case(
-                Session::in_memory(),
-                false,
-                runtime_handle,
-            )
-            .await;
+            let (events, session, metrics_before) =
+                run_auto_compaction_persistence_case(Session::in_memory(), false, runtime_handle)
+                    .await;
             let end = events
                 .iter()
                 .find(|event| event["type"] == "auto_compaction_end")
                 .expect("auto_compaction_end");
             assert_eq!(end["result"]["persisted"], false);
-            assert_eq!(
-                end["result"]["summary"],
-                "causal auto-compaction summary"
-            );
+            assert_eq!(end["result"]["summary"], "causal auto-compaction summary");
             assert_eq!(
                 end["result"]["persistenceStatus"]["event"],
                 "session.persistence.disabled"
@@ -9352,10 +9438,7 @@ export default function init(pi) {
                 end["result"]["persistenceStatus"]["event"],
                 "session.persistence.healthy"
             );
-            assert_eq!(
-                end["result"]["persistenceStatus"]["pendingMessageCount"],
-                0
-            );
+            assert_eq!(end["result"]["persistenceStatus"]["pendingMessageCount"], 0);
 
             let cx = asupersync::Cx::for_testing();
             let session = session.lock(&cx).await.expect("lock persisted session");
@@ -9444,13 +9527,154 @@ export default function init(pi) {
                 metrics_after.flush_started,
                 metrics_before.flush_started + 1
             );
-            assert_eq!(
-                metrics_after.flush_failed,
-                metrics_before.flush_failed + 1
-            );
+            assert_eq!(metrics_after.flush_failed, metrics_before.flush_failed + 1);
             assert_eq!(
                 metrics_after.flush_succeeded, metrics_before.flush_succeeded,
                 "failed persistence must not claim a successful flush"
+            );
+        });
+    }
+
+    #[test]
+    fn auto_compaction_excludes_overlapping_rpc_turn_entry() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (compaction_entered, mut wait_for_compaction) =
+                asupersync::channel::oneshot::channel::<()>();
+            let (release_compaction, compaction_gate) =
+                asupersync::channel::oneshot::channel::<()>();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let provider: Arc<dyn Provider> = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::clone(&calls),
+                compaction_entered: Mutex::new(Some(compaction_entered)),
+                compaction_gate: Mutex::new(Some(compaction_gate)),
+            });
+            let tools = ToolRegistry::new(&[], temp.path(), None);
+            let agent = Agent::new(
+                provider,
+                tools,
+                AgentConfig {
+                    stream_options: crate::provider::StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..crate::provider::StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            let session = Arc::new(asupersync::sync::Mutex::new(
+                seed_auto_compaction_session(Session::in_memory()),
+            ));
+            let agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let mut model = dummy_entry("test-model", false);
+            model.model.provider = "test-provider".to_string();
+            options.available_models = vec![model];
+            options.config.compaction = Some(crate::config::CompactionSettings {
+                enabled: Some(true),
+                reserve_tokens: Some(2),
+                keep_recent_tokens: Some(1),
+                mode: None,
+            });
+
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server = runtime_handle
+                .spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let first = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"trigger compaction"}"#,
+                "compaction trigger",
+            )
+            .await;
+            assert_ok(&first, "prompt");
+
+            let entered_cx = AgentCx::for_request();
+            wait_for_compaction
+                .recv(entered_cx.cx())
+                .await
+                .expect("auto-compaction provider entered");
+
+            for (id, command, expected_command) in [
+                (
+                    "2",
+                    r#"{"id":"2","type":"prompt","message":"overlap"}"#,
+                    "prompt",
+                ),
+                (
+                    "3",
+                    r#"{"id":"3","type":"steer","message":"overlap"}"#,
+                    "steer",
+                ),
+                (
+                    "4",
+                    r#"{"id":"4","type":"follow_up","message":"overlap"}"#,
+                    "follow_up",
+                ),
+                ("5", r#"{"id":"5","type":"retry"}"#, "retry"),
+                ("6", r#"{"id":"6","type":"compact"}"#, "compact"),
+            ] {
+                let response = send_recv(&in_tx, &out_rx, command, "compaction overlap").await;
+                assert_err(&response, expected_command);
+                assert_eq!(response["id"], id);
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .is_some_and(|error| error.contains("compacting") || error.contains("busy")),
+                    "turn entry must fail specifically because compaction owns the phase: {response}"
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "rejected turns must not dispatch another provider request"
+            );
+
+            let release_cx = AgentCx::for_request();
+            release_compaction
+                .send(release_cx.cx(), ())
+                .expect("release auto-compaction provider");
+            loop {
+                let line = recv_line(&out_rx, "auto-compaction completion")
+                    .await
+                    .expect("receive auto-compaction event");
+                if parse_response(&line)["type"] == "auto_compaction_end" {
+                    break;
+                }
+            }
+
+            drop(in_tx);
+            let server_result = server.await;
+            assert!(server_result.is_ok(), "RPC server error: {server_result:?}");
+            let cx = asupersync::Cx::for_testing();
+            let session = session.lock(&cx).await.expect("lock compacted session");
+            let gated_compactions = session
+                .entries_for_current_path()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        crate::session::SessionEntry::Compaction(compaction)
+                            if compaction.summary == "gated auto-compaction summary"
+                    )
+                })
+                .count();
+            assert_eq!(
+                gated_compactions, 1,
+                "exactly one compaction mutation may survive the exclusion window"
             );
         });
     }
@@ -10645,8 +10869,11 @@ export default function init(pi) {
                 "pendingMessageCount": 1,
             }
         });
-        let disabled_resp =
-            response_ok(Some("cmd-disabled".to_string()), "bash", Some(disabled_payload));
+        let disabled_resp = response_ok(
+            Some("cmd-disabled".to_string()),
+            "bash",
+            Some(disabled_payload),
+        );
         assert!(disabled_resp.contains("\"success\":true"));
         assert!(disabled_resp.contains("\"persisted\":false"));
         assert!(disabled_resp.contains("\"event\":\"session.persistence.disabled\""));

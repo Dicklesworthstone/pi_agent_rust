@@ -764,10 +764,9 @@ fn run_persistence_fault_runner_with_fake_rch(
 #[cfg(unix)]
 #[test]
 fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed() {
-    let runner = fs::read_to_string(
-        project_root().join("scripts/e2e/run_persistence_fault_injection.sh"),
-    )
-    .expect("read persistence fault runner");
+    let runner =
+        fs::read_to_string(project_root().join("scripts/e2e/run_persistence_fault_injection.sh"))
+            .expect("read persistence fault runner");
     assert!(
         runner.contains("time.monotonic_ns() // 1_000_000"),
         "duration measurement must use a portable monotonic clock"
@@ -855,7 +854,10 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
                 .expect("canonical summary path"),
         );
         assert_eq!(indexed_path.parent(), Some(case_dir.as_path()));
-        assert!(indexed_path.is_file(), "canonical summary artifact must exist");
+        assert!(
+            indexed_path.is_file(),
+            "canonical summary artifact must exist"
+        );
         assert_eq!(
             indexed_path.file_name().and_then(|name| name.to_str()),
             Some(summary_name)
@@ -924,8 +926,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         .expect("malformed-evidence summary cases")
     {
         assert_eq!(
-            case["checks"]["summary_artifact_schema_valid"],
-            false,
+            case["checks"]["summary_artifact_schema_valid"], false,
             "schema-incomplete artifact rows must be rejected"
         );
     }
@@ -950,8 +951,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         .expect("malformed-log summary cases")
     {
         assert_eq!(
-            case["checks"]["diagnostic_log_schema_valid"],
-            false,
+            case["checks"]["diagnostic_log_schema_valid"], false,
             "missing trace/sequence/time/level fields must be rejected"
         );
     }
@@ -976,8 +976,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         .expect("tampered-payload summary cases")
     {
         assert_eq!(
-            case["checks"]["summary_artifact_bytes_verified"],
-            false,
+            case["checks"]["summary_artifact_bytes_verified"], false,
             "retrieved inline bytes must match the remote artifact digest"
         );
     }
@@ -7627,9 +7626,10 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     install_fake_orchestrate_toolchain(&bin_dir);
     install_fake_orchestrate_staging_artifacts(&target_dir);
     install_fake_orchestrate_rch_attestation(&target_dir, &output_dir);
-    if extra_env.iter().any(|(key, value)| {
-        *key == "PI_FAKE_PRECREATE_RCH_EXTENSION_ARTIFACT" && *value == "1"
-    }) {
+    if extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_PRECREATE_RCH_EXTENSION_ARTIFACT" && *value == "1")
+    {
         let stale_artifact = target_dir
             .join("nextest")
             .join("pi-perf")
@@ -7648,17 +7648,19 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             .expect("fault-injection summary parent"),
     )
     .expect("create fake fault-injection evidence directory");
-    let fault_injection_passed = !extra_env.iter().any(|(key, value)| {
-        *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1"
-    });
-    let fault_injection_source_commit = if extra_env.iter().any(|(key, value)| {
-        *key == "PI_FAKE_FOREIGN_PERSISTENCE_SOURCE" && *value == "1"
-    }) {
+    let fault_injection_passed = !extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1");
+    let fault_injection_source_commit = if extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_FOREIGN_PERSISTENCE_SOURCE" && *value == "1")
+    {
         "ffffffffffffffffffffffffffffffffffffffff"
     } else {
         FAKE_ORCHESTRATE_SOURCE_COMMIT
     };
-    let fault_injection_source_tree = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let fault_injection_source_tree =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     fs::write(
         &fault_injection_summary,
         serde_json::to_vec(&json!({
@@ -7791,8 +7793,7 @@ fn orchestrate_rejects_foreign_persistence_summary_source() {
         "foreign-source persistence evidence must block Phase 5 readiness"
     );
     assert!(
-        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
-            ["fault_injection_summary_path"]
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]["fault_injection_summary_path"]
             .is_null(),
         "a rejected persistence summary must not be linked as consumed evidence"
     );
@@ -7828,10 +7829,7 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
             .expect("retrieved extension benchmark artifact must be non-empty"),
     )
     .expect("retrieved extension benchmark artifact must contain JSONL");
-    assert_eq!(
-        first_row["schema"].as_str(),
-        Some("pi.ext.rust_bench.v1")
-    );
+    assert_eq!(first_row["schema"].as_str(), Some("pi.ext.rust_bench.v1"));
     assert_eq!(
         first_row["env"]["git_commit"].as_str(),
         Some(FAKE_ORCHESTRATE_SOURCE_COMMIT),
@@ -7915,10 +7913,8 @@ fn orchestrate_rch_perf_harness_rejects_wrong_source_commit() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rch_perf_harness_rejects_unknown_source_commit() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_GIT_IDENTITY_UNAVAILABLE",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_GIT_IDENTITY_UNAVAILABLE", "1")]);
     assert!(
         !output.status.success(),
         "strict RCH orchestration must reject an unavailable Git commit identity"
@@ -7965,10 +7961,8 @@ fn orchestrate_rch_perf_harness_rejects_dirty_source_tree() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rch_perf_harness_rejects_unavailable_git_status() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_GIT_STATUS_UNAVAILABLE",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_GIT_STATUS_UNAVAILABLE", "1")]);
     assert!(
         !output.status.success(),
         "strict RCH orchestration must reject an unavailable Git status"

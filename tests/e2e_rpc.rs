@@ -2933,8 +2933,7 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
             "the failed flush must retain the appended BashExecution mutation"
         );
         assert_eq!(
-            resp["data"]["persistenceStatus"]["pendingMessageCount"],
-            live_pending_mutations,
+            resp["data"]["persistenceStatus"]["pendingMessageCount"], live_pending_mutations,
             "the response must expose the retained autosave backlog: {resp}"
         );
         assert!(
@@ -2942,8 +2941,7 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
             "the successful command response must carry a non-retryable save warning: {resp}"
         );
         assert_eq!(
-            metrics_after.coalesced_mutations,
-            metrics_before.coalesced_mutations,
+            metrics_after.coalesced_mutations, metrics_before.coalesced_mutations,
             "the first pending BashExecution mutation must not be reported as coalesced"
         );
         assert_eq!(
@@ -3362,8 +3360,7 @@ fn rpc_get_state_reflects_session_stats() {
             "session.persistence.disabled"
         );
         assert_eq!(
-            resp["data"]["persistenceStatus"]["pendingMessageCount"],
-            2,
+            resp["data"]["persistenceStatus"]["pendingMessageCount"], 2,
             "in-memory mutations remain observable without being mislabeled as a durable backlog"
         );
 
