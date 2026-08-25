@@ -237,6 +237,13 @@ fn rpc_agent_event_handler(
         if matches!(event, AgentEvent::AgentEnd { .. })
             && let Some(deferred) = &deferred_agent_end
         {
+            output_pressure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .flush_pending(&out_tx);
+            if let Some(coalescer) = &coalescer {
+                coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
+            }
             *deferred
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
@@ -3223,6 +3230,9 @@ async fn run_prompt_with_retry(
         }
 
         let runtime_for_events = options.runtime_handle.clone();
+        *deferred_agent_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
         let result = {
             let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
@@ -4943,10 +4953,17 @@ mod retry_tests {
                 .iter()
                 .position(|kind| kind == "auto_retry_end")
                 .expect("missing auto_retry_end");
-            let agent_end_idx = timeline
+            let agent_end_positions = timeline
                 .iter()
-                .rposition(|kind| kind == "agent_end")
-                .expect("missing agent_end");
+                .enumerate()
+                .filter_map(|(index, kind)| (kind == "agent_end").then_some(index))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                agent_end_positions.len(),
+                1,
+                "retry timeline must have exactly one terminal agent_end: {timeline:?}"
+            );
+            let agent_end_idx = agent_end_positions[0];
 
             assert!(
                 retry_start_idx < retry_end_idx && retry_end_idx < agent_end_idx,
