@@ -264,6 +264,11 @@ impl Tool for BrowserTool {
                     Error::tool("browser", format!("{action} requires url parameter"))
                 })?;
 
+                let title = args
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| format!("Page ({url})"), ToString::to_string);
+
                 self.check_domain(url)?;
 
                 let tab_info = BrowserTabInfo {

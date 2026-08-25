@@ -229,16 +229,22 @@ impl WebRemoteManager {
 
     /// Revoke an existing token.
     pub fn revoke_token(&self, token: &str) -> bool {
-        let mut map = self
-            .tokens
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(record) = map.get_mut(token) {
-            record.revoked = true;
-            drop(map);
+        let kind = {
+            let mut map = self
+                .tokens
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(record) = map.get_mut(token) {
+                record.revoked = true;
+                Some(record.kind)
+            } else {
+                None
+            }
+        };
+        if let Some(token_kind) = kind {
             self.record_audit(
                 WebAuditEvent::new("token_revoked", None)
-                    .with_detail("token_kind", format!("{record:?}")),
+                    .with_detail("token_kind", format!("{token_kind:?}")),
             );
             true
         } else {

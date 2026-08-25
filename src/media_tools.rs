@@ -228,6 +228,7 @@ impl Tool for InspectImageTool {
         let analysis_text = if is_mock {
             format!(
                 "Image Analysis for {path_str} ({mime_type}, {size} bytes):\n\
+                 Prompt: {prompt}\n\
                  Visual Content: Canned test fixture inspection completed successfully. \
                  Observed diagrams, structured text, and UI layouts intact.",
                 size = metadata.len()
@@ -263,6 +264,7 @@ impl Tool for InspectImageTool {
 
             format!(
                 "Image Analysis for {path_str} ({mime_type}, {size} bytes):\n\
+                 Prompt: {prompt}\n\
                  Visual analysis performed via {provider} vision model.",
                 size = metadata.len()
             )

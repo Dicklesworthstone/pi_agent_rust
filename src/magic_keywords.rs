@@ -683,6 +683,11 @@ mod tests {
             words("see https://example.test/?ultrathink docs").is_empty(),
             "URL query values are part of the URL lexeme, not prose"
         );
+        assert_eq!(
+            words("https://example.test/?ultrathink then orchestrate"),
+            ["orchestrate"],
+            "path suppression must end at whitespace"
+        );
         assert!(
             words("inspect /tmp/file?orchestrate next").is_empty(),
             "path query values are part of the path lexeme, not prose"
@@ -702,6 +707,7 @@ mod tests {
         assert_eq!(words("ultrathink,"), ["ultrathink"]);
         assert_eq!(words("(ultrathink)"), ["ultrathink"]);
         assert_eq!(words("ok. ultrathink."), ["ultrathink"]);
+        assert_eq!(words("mode: ultrathink?"), ["ultrathink"]);
     }
 
     #[test]
