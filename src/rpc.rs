@@ -4862,7 +4862,7 @@ mod retry_tests {
                     .expect("shared state lock")
                     .pending_count(),
                 0,
-                "terminal finalization must consume acknowledged queued input"
+                "terminal finalization must consume preexisting queued input"
             );
             let terminal_cx = AgentCx::for_request();
             let guard = session
@@ -4891,7 +4891,7 @@ mod retry_tests {
                     ))
                     .count(),
                 1,
-                "acknowledged terminal follow-up must be retained exactly once"
+                "preexisting terminal follow-up must be retained exactly once"
             );
         });
     }
@@ -6957,6 +6957,7 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc::{Receiver, TryRecvError};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};

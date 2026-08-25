@@ -725,111 +725,111 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             let cx = asupersync::Cx::for_testing();
             let mut observed_events = Vec::new();
 
-        // Keep prompt 1 inside the provider while both queued messages arrive.
-        in_tx
-            .send(
-                &cx,
-                r#"{"id":"1","type":"prompt","message":"turn 1 normal"}"#.to_string(),
+            // Keep prompt 1 inside the provider while both queued messages arrive.
+            in_tx
+                .send(
+                    &cx,
+                    r#"{"id":"1","type":"prompt","message":"turn 1 normal"}"#.to_string(),
+                )
+                .await
+                .expect("send RPC prompt 1");
+
+            let ack1 = recv_rpc_command_response(
+                &out_rx,
+                "1",
+                "RPC prompt 1 acknowledgment",
+                &mut observed_events,
             )
             .await
-            .expect("send RPC prompt 1");
+            .expect("receive RPC prompt 1 acknowledgment");
+            assert_eq!(ack1["type"], "response");
+            assert_eq!(ack1["id"], "1");
+            assert_eq!(ack1["command"], "prompt");
+            assert_eq!(ack1["success"], true);
 
-        let ack1 = recv_rpc_command_response(
-            &out_rx,
-            "1",
-            "RPC prompt 1 acknowledgment",
-            &mut observed_events,
-        )
-        .await
-        .expect("receive RPC prompt 1 acknowledgment");
-        assert_eq!(ack1["type"], "response");
-        assert_eq!(ack1["id"], "1");
-        assert_eq!(ack1["command"], "prompt");
-        assert_eq!(ack1["success"], true);
+            let entered_cx = asupersync::Cx::for_testing();
+            wait_for_first_call
+                .recv(&entered_cx)
+                .await
+                .expect("first provider call entered");
 
-        let entered_cx = asupersync::Cx::for_testing();
-        wait_for_first_call
-            .recv(&entered_cx)
-            .await
-            .expect("first provider call entered");
+            // Queue steering while prompt 1 is provably still streaming.
+            in_tx
+                .send(
+                    &cx,
+                    r#"{"id":"2","type":"prompt","message":"please ultrathink and workflowz this steering input","streamingBehavior":"steer"}"#.to_string(),
+                )
+                .await
+                .expect("send RPC steer");
 
-        // Queue steering while prompt 1 is provably still streaming.
-        in_tx
-            .send(
-                &cx,
-                r#"{"id":"2","type":"prompt","message":"please ultrathink and workflowz this steering input","streamingBehavior":"steer"}"#.to_string(),
+            let ack2 = recv_rpc_command_response(
+                &out_rx,
+                "2",
+                "RPC steer acknowledgment",
+                &mut observed_events,
             )
             .await
-            .expect("send RPC steer");
+            .expect("receive RPC steer acknowledgment");
+            assert_eq!(ack2["type"], "response");
+            assert_eq!(ack2["command"], "prompt");
+            assert_eq!(ack2["success"], true);
 
-        let ack2 = recv_rpc_command_response(
-            &out_rx,
-            "2",
-            "RPC steer acknowledgment",
-            &mut observed_events,
-        )
-        .await
-        .expect("receive RPC steer acknowledgment");
-        assert_eq!(ack2["type"], "response");
-        assert_eq!(ack2["command"], "prompt");
-        assert_eq!(ack2["success"], true);
+            // Queue a distinct follow-up before releasing the first provider call.
+            in_tx
+                .send(
+                    &cx,
+                    r#"{"id":"3","type":"follow_up","message":"please workflowz and orchestrate this follow-up"}"#.to_string(),
+                )
+                .await
+                .expect("send RPC follow-up");
 
-        // Queue a distinct follow-up before releasing the first provider call.
-        in_tx
-            .send(
-                &cx,
-                r#"{"id":"3","type":"follow_up","message":"please workflowz and orchestrate this follow-up"}"#.to_string(),
+            let ack3 = recv_rpc_command_response(
+                &out_rx,
+                "3",
+                "RPC follow-up acknowledgment",
+                &mut observed_events,
             )
             .await
-            .expect("send RPC follow-up");
+            .expect("receive RPC follow-up acknowledgment");
+            assert_eq!(ack3["type"], "response");
+            assert_eq!(ack3["command"], "follow_up");
+            assert_eq!(ack3["success"], true);
 
-        let ack3 = recv_rpc_command_response(
-            &out_rx,
-            "3",
-            "RPC follow-up acknowledgment",
-            &mut observed_events,
-        )
-        .await
-        .expect("receive RPC follow-up acknowledgment");
-        assert_eq!(ack3["type"], "response");
-        assert_eq!(ack3["command"], "follow_up");
-        assert_eq!(ack3["success"], true);
+            let release_cx = asupersync::Cx::for_testing();
+            release_first_call
+                .send(&release_cx, ())
+                .expect("release first provider call");
 
-        let release_cx = asupersync::Cx::for_testing();
-        release_first_call
-            .send(&release_cx, ())
-            .expect("release first provider call");
-
-        let mut saw_agent_end = false;
-        let event_deadline = Instant::now() + Duration::from_secs(10);
-        for _ in 0..100 {
-            let event: serde_json::Value = serde_json::from_str(
-                recv_rpc_line_before(&out_rx, "RPC queued turn event", event_deadline)
-                    .await
-                    .expect("receive RPC queued turn event")
-                    .trim(),
-            )
-            .expect("parse queued turn event");
-            observed_events.push(event.clone());
-            if event["type"] == "agent_end" {
-                assert!(
-                    event["error"].is_null(),
-                    "RPC queued turn ended with an error: {event}"
-                );
-                saw_agent_end = true;
-                break;
+            let mut saw_agent_end = false;
+            let event_deadline = Instant::now() + Duration::from_secs(10);
+            for _ in 0..100 {
+                let event: serde_json::Value = serde_json::from_str(
+                    recv_rpc_line_before(&out_rx, "RPC queued turn event", event_deadline)
+                        .await
+                        .expect("receive RPC queued turn event")
+                        .trim(),
+                )
+                .expect("parse queued turn event");
+                observed_events.push(event.clone());
+                if event["type"] == "agent_end" {
+                    assert!(
+                        event["error"].is_null(),
+                        "RPC queued turn ended with an error: {event}"
+                    );
+                    saw_agent_end = true;
+                    break;
+                }
             }
-        }
-        assert!(saw_agent_end, "queued steering/follow-up turn completed");
-        let agent_end_events = observed_events
-            .iter()
-            .filter(|event| event["type"] == "agent_end")
-            .collect::<Vec<_>>();
-        assert_eq!(agent_end_events.len(), 1, "unexpected lifecycle events");
-        assert!(agent_end_events[0]["error"].is_null());
+            assert!(saw_agent_end, "queued steering/follow-up turn completed");
+            let agent_end_events = observed_events
+                .iter()
+                .filter(|event| event["type"] == "agent_end")
+                .collect::<Vec<_>>();
+            assert_eq!(agent_end_events.len(), 1, "unexpected lifecycle events");
+            assert!(agent_end_events[0]["error"].is_null());
 
-        drop(in_tx);
-        server.await.expect("RPC server task join");
+            drop(in_tx);
+            server.await.expect("RPC server task join");
         };
         asupersync::time::timeout(
             asupersync::time::wall_now(),

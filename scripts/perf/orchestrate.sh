@@ -144,6 +144,14 @@ dim()    { printf '\033[2m%s\033[0m\n' "$*"; }
 
 die() { red "ERROR: $*" >&2; exit 1; }
 
+require_positive_integer() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[1-9][0-9]*$ ]]; then
+    die "$name must be a positive integer, got: $value"
+  fi
+}
+
 log_phase() {
   echo ""
   bold "═══ $1 ═══"
@@ -365,6 +373,9 @@ if [[ -n "$VALIDATE_ONLY" ]]; then
   exit 0
 fi
 
+require_positive_integer "PERF_PARALLELISM" "$PARALLELISM"
+require_positive_integer "PERF_BUILD_JOBS" "$BUILD_JOBS"
+
 # ─── Cargo Runner Resolution ────────────────────────────────────────────────
 
 if [[ "$CARGO_RUNNER_REQUEST" != "rch" && "$CARGO_RUNNER_REQUEST" != "auto" && "$CARGO_RUNNER_REQUEST" != "local" ]]; then
@@ -504,23 +515,23 @@ verify_current_clean_source_identity() {
   return 0
 }
 
-if [[ "$CARGO_RUNNER_MODE" == "rch" && "$RCH_PROOF_REQUIRED" == true ]] \
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
   && suite_selected "perf_bench_harness"; then
   if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
-    die "Strict RCH performance proof requires a full Git commit identity, got: $GIT_COMMIT_FULL"
+    die "RCH performance proof requires a full Git commit identity, got: $GIT_COMMIT_FULL"
   fi
   if [[ "$GIT_STATUS_AVAILABLE" != true ]]; then
-    die "Strict RCH performance proof requires an available Git status"
+    die "RCH performance proof requires an available Git status"
   fi
   if [[ "$GIT_DIRTY" != false ]]; then
-    die "Strict RCH performance proof requires a clean source tree"
+    die "RCH performance proof requires a clean source tree"
   fi
-  if ! verify_current_clean_source_identity "Strict RCH performance proof admission"; then
-    die "Strict RCH performance proof source identity is not stable"
+  if ! verify_current_clean_source_identity "RCH performance proof admission"; then
+    die "RCH performance proof source identity is not stable"
   fi
-  # Pin only the extension benchmark producer. Later strict-RCH Cargo steps
-  # consume evidence generated in this run, which is intentionally outside
-  # the committed source archive and needs the ordinary RCH transfer path.
+  # The accepted extension benchmark always uses a clean committed-source pin.
+  # The runner's receipt and the retrieved record's exact run/commit identity
+  # jointly distinguish real remote evidence from fallback or stale output.
   PERF_BENCH_RUNNER_ARGS=(
     "rch" "exec"
     "--no-color"
@@ -902,6 +913,8 @@ log_step "Output:         $OUTPUT_DIR"
 log_step "Correlation ID: $CORRELATION_ID"
 log_step "Git commit:     $GIT_COMMIT (dirty=$GIT_DIRTY)"
 log_step "Cargo profile:  $CARGO_PROFILE"
+log_step "Test threads:   $PARALLELISM"
+log_step "Build jobs:     $BUILD_JOBS"
 log_step "Evidence cache: $EVIDENCE_CACHE_DIR (ttl=${EVIDENCE_CACHE_TTL_HOURS}h)"
 log_step "PGO mode:       $PGO_MODE"
 log_step "PGO profile:    $PGO_PROFILE_DATA"
@@ -1301,6 +1314,7 @@ run_test_suite() {
       RUST_TEST_THREADS="$PARALLELISM" \
       CARGO_BUILD_JOBS="$BUILD_JOBS" \
       PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
+      RCH_REQUIRE_REMOTE=1 \
       RCH_QUIET=0 \
       RCH_VISIBILITY=summary \
         "${PERF_BENCH_RUNNER_ARGS[@]}" nextest run \
@@ -1351,7 +1365,7 @@ run_test_suite() {
           log_fail "Refusing preexisting accepted extension benchmark destination"
           exit_code=95
         else
-        cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
+          cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
           if ! validate_retrieved_extension_bench_jsonl \
             "$result_dir/extension_bench.jsonl" \
             "$CARGO_PROFILE" \
@@ -1603,6 +1617,7 @@ cat > "$OUTPUT_DIR/manifest.json" <<EOF
   "profile": "$PROFILE",
   "cargo_profile": "$CARGO_PROFILE",
   "parallelism": $PARALLELISM,
+  "build_jobs": $BUILD_JOBS,
   "run_summary": {
     "total_suites": $((suite_pass + suite_fail + suite_skip)),
     "passed": $suite_pass,
@@ -4595,7 +4610,6 @@ fi
 artifact_count=$((artifact_count + 1))
 
 POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
-mkdir -p "$POST_GENERATION_BUDGET_DIR"
 post_generation_budget_exit=0
 POST_GENERATION_EVIDENCE_DIR="$OUTPUT_DIR/results"
 declare -a POST_GENERATION_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
@@ -4616,7 +4630,35 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     die "Refusing preexisting post-generation RCH evidence stage: $POST_GENERATION_STAGE_RELATIVE"
   fi
   mkdir -p "$POST_GENERATION_STAGE_ABSOLUTE"
-  cp -R "$OUTPUT_DIR/results/." "$POST_GENERATION_STAGE_ABSOLUTE/"
+  unsafe_stage_entry=""
+  while IFS= read -r -d '' candidate; do
+    unsafe_stage_entry="$candidate"
+    break
+  done < <(find "$OUTPUT_DIR/results" -type l -print0 2>/dev/null)
+  if [[ -n "$unsafe_stage_entry" ]]; then
+    die "Refusing symlink in post-generation RCH evidence: $unsafe_stage_entry"
+  fi
+  while IFS= read -r -d '' candidate; do
+    unsafe_stage_entry="$candidate"
+    break
+  done < <(find "$OUTPUT_DIR/results" ! -type d ! -type f -print0 2>/dev/null)
+  if [[ -n "$unsafe_stage_entry" ]]; then
+    die "Refusing non-regular post-generation RCH evidence: $unsafe_stage_entry"
+  fi
+  staged_file_count=0
+  while IFS= read -r -d '' evidence_file; do
+    evidence_relative="${evidence_file#"$OUTPUT_DIR/results/"}"
+    if [[ "$evidence_relative" == "$evidence_file" || -z "$evidence_relative" ]]; then
+      die "Could not derive post-generation evidence-relative path: $evidence_file"
+    fi
+    evidence_destination="$POST_GENERATION_STAGE_ABSOLUTE/$evidence_relative"
+    mkdir -p "$(dirname "$evidence_destination")"
+    cp "$evidence_file" "$evidence_destination"
+    staged_file_count=$((staged_file_count + 1))
+  done < <(find "$OUTPUT_DIR/results" -type f -print0 2>/dev/null)
+  if [[ "$staged_file_count" -eq 0 ]]; then
+    die "Post-generation RCH evidence stage contains no regular files"
+  fi
   POST_GENERATION_EVIDENCE_DIR="$POST_GENERATION_STAGE_RELATIVE"
   POST_GENERATION_RUNNER_ARGS=(
     "rch" "exec"
@@ -4627,6 +4669,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     "--" "cargo"
   )
 fi
+mkdir -p "$POST_GENERATION_BUDGET_DIR"
 PERF_EVIDENCE_DIR="$POST_GENERATION_EVIDENCE_DIR" \
 PI_PERF_POST_GENERATION=1 \
 CI_CORRELATION_ID="$CORRELATION_ID" \

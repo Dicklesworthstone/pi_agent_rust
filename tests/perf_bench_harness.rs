@@ -48,9 +48,13 @@ fn is_quick_mode() -> bool {
 }
 
 fn iterations_override() -> Option<usize> {
-    std::env::var("BENCH_ITERATIONS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let Ok(raw) = std::env::var("BENCH_ITERATIONS") else {
+        return None;
+    };
+    match raw.parse::<usize>() {
+        Ok(value) if value > 0 => Some(value),
+        _ => panic!("BENCH_ITERATIONS must be a positive integer, got {raw:?}"),
+    }
 }
 
 fn cargo_target_dir() -> PathBuf {
@@ -230,6 +234,7 @@ struct EnvFingerprint {
     compiled_profile_family: String,
     compiled_opt_level: String,
     compiled_debug: String,
+    debug_assertions: bool,
     git_commit: String,
     source_dirty: bool,
     #[serde(default)]
@@ -237,6 +242,29 @@ struct EnvFingerprint {
     binary_path: String,
     binary_sha256: String,
     config_hash: String,
+}
+
+fn env_config_hash(env: &EnvFingerprint) -> String {
+    let compiled_features = env.features.iter().map(String::as_str).collect::<Vec<_>>();
+    perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
+        source_commit: &env.git_commit,
+        source_dirty: env.source_dirty,
+        build_profile: &env.build_profile,
+        executable_build_profile: &env.executable_build_profile,
+        verification: perf_build::BenchmarkBuildVerification {
+            executable_profile: env.executable_profile_verified,
+            build_fingerprint: env.build_fingerprint_verified,
+            build_profile: env.build_profile_verified,
+        },
+        build_fingerprint_contract: &env.build_fingerprint_contract,
+        compiled_profile_family: &env.compiled_profile_family,
+        compiled_opt_level: &env.compiled_opt_level,
+        compiled_debug: &env.compiled_debug,
+        compiled_features: &compiled_features,
+        binary_path: &env.binary_path,
+        binary_sha256: &env.binary_sha256,
+        debug_assertions: env.debug_assertions,
+    })
 }
 
 fn collect_env_fingerprint() -> EnvFingerprint {
@@ -253,10 +281,19 @@ fn collect_env_fingerprint() -> EnvFingerprint {
     let os = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
     let arch = std::env::consts::ARCH.to_string();
     let build_profile = perf_build::detect_build_profile();
-    let git_commit = option_env!("VERGEN_GIT_SHA")
-        .unwrap_or("unknown")
-        .to_string();
-    let source_dirty = option_env!("VERGEN_GIT_DIRTY") != Some("false");
+    // Clean-overlay workers intentionally compile without a .git directory.
+    // The controller-provided identity is therefore authoritative at runtime
+    // and is independently bound to RCH's clean-overlay receipt by the
+    // orchestrator. Fall back to vergen only for ordinary direct Cargo runs.
+    let git_commit = std::env::var("VERGEN_GIT_SHA")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| option_env!("VERGEN_GIT_SHA").map(ToString::to_string))
+        .unwrap_or_else(|| "unknown".to_string());
+    let source_dirty = std::env::var("VERGEN_GIT_DIRTY").map_or_else(
+        |_| option_env!("VERGEN_GIT_DIRTY") != Some("false"),
+        |value| !value.eq_ignore_ascii_case("false"),
+    );
     let current_exe = std::env::current_exe().ok();
     let executable_build_profile = current_exe
         .as_deref()
@@ -278,28 +315,7 @@ fn collect_env_fingerprint() -> EnvFingerprint {
         .iter()
         .map(|feature| (*feature).to_string())
         .collect::<Vec<_>>();
-    let config_hash =
-        perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
-            source_commit: &git_commit,
-            source_dirty,
-            build_profile: &build_profile,
-            executable_build_profile: &executable_build_profile,
-            verification: perf_build::BenchmarkBuildVerification {
-                executable_profile: executable_profile_verified,
-                build_fingerprint: build_fingerprint_verified,
-                build_profile: build_profile_verified,
-            },
-            build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
-            compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY,
-            compiled_opt_level: perf_build::COMPILED_OPT_LEVEL,
-            compiled_debug: perf_build::COMPILED_DEBUG,
-            compiled_features: &compiled_features,
-            binary_path: &binary_path,
-            binary_sha256: &binary_sha256,
-            debug_assertions: cfg!(debug_assertions),
-        });
-
-    EnvFingerprint {
+    let mut fingerprint = EnvFingerprint {
         os,
         arch,
         cpu_model,
@@ -314,13 +330,16 @@ fn collect_env_fingerprint() -> EnvFingerprint {
         compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY.to_string(),
         compiled_opt_level: perf_build::COMPILED_OPT_LEVEL.to_string(),
         compiled_debug: perf_build::COMPILED_DEBUG.to_string(),
+        debug_assertions: cfg!(debug_assertions),
         git_commit,
         source_dirty,
         features,
         binary_path,
         binary_sha256,
-        config_hash,
-    }
+        config_hash: String::new(),
+    };
+    fingerprint.config_hash = env_config_hash(&fingerprint);
+    fingerprint
 }
 
 // ─── Statistics ──────────────────────────────────────────────────────────────
@@ -419,12 +438,34 @@ fn validate_bench_jsonl(content: &str) -> Result<usize, String> {
         if record.runtime != "pi_agent_rust" {
             return Err(format!("line {}: unexpected runtime", line_index + 1));
         }
+        if record.run_id != record.correlation_id {
+            return Err(format!(
+                "line {}: run_id and correlation_id differ",
+                line_index + 1
+            ));
+        }
+        if record.source_commit != record.env.git_commit
+            || record.source_dirty != record.env.source_dirty
+        {
+            return Err(format!(
+                "line {}: top-level and environment source identity differ",
+                line_index + 1
+            ));
+        }
+        if record.runs != record.summary.count {
+            return Err(format!(
+                "line {}: runs and summary.count differ",
+                line_index + 1
+            ));
+        }
         for (field, value) in [
             ("run_id", record.run_id.as_str()),
             ("correlation_id", record.correlation_id.as_str()),
             ("benchmark_run_id", record.benchmark_run_id.as_str()),
             ("source_commit", record.source_commit.as_str()),
             ("timestamp", record.timestamp.as_str()),
+            ("scenario", record.scenario.as_str()),
+            ("extension", record.extension.as_str()),
             ("env.build_profile", record.env.build_profile.as_str()),
             (
                 "env.executable_build_profile",
@@ -436,6 +477,18 @@ fn validate_bench_jsonl(content: &str) -> Result<usize, String> {
             if value.trim().is_empty() {
                 return Err(format!("line {}: {field} is empty", line_index + 1));
             }
+        }
+        if record.summary.count == 0 {
+            return Err(format!(
+                "line {}: benchmark record has no successful samples",
+                line_index + 1
+            ));
+        }
+        if record.env.config_hash != env_config_hash(&record.env) {
+            return Err(format!(
+                "line {}: environment config_hash does not bind its provenance fields",
+                line_index + 1
+            ));
         }
         has_positive_cold_start |= record.scenario == "cold_start" && record.summary.count > 0;
         record_count += 1;
@@ -673,7 +726,7 @@ fn run_tool_call(ext_name: &str, entry_path: &Path, cwd: &Path, iterations: usiz
         ));
 
         let elapsed_us = start.elapsed().as_micros() as f64;
-        // Record even if the tool returns an error — we measure dispatch overhead.
+        // Only successful dispatches are evidence-bearing measurements.
         if result.is_ok() {
             samples_us.push(elapsed_us);
         }
@@ -776,6 +829,14 @@ fn bench_extension_scenarios() {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("{correlation_id}:{now}"));
+    let cwd_nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    let cwd_root = std::env::temp_dir().join(format!(
+        "pi-bench-harness-{}-{cwd_nonce}",
+        std::process::id()
+    ));
 
     eprintln!("\n══════════════════════════════════════════════════════════");
     eprintln!("  Extension Benchmark Harness (bd-20s9)");
@@ -808,8 +869,8 @@ fn bench_extension_scenarios() {
             continue;
         };
 
-        let cwd = std::env::temp_dir().join(format!("pi-bench-harness-{ext_name}"));
-        let _ = std::fs::create_dir_all(&cwd);
+        let cwd = cwd_root.join(ext_name);
+        std::fs::create_dir_all(&cwd).expect("create isolated extension benchmark cwd");
 
         // ── Cold Start ──
         {
@@ -1069,6 +1130,31 @@ fn bench_extension_scenarios() {
 
 #[test]
 fn bench_jsonl_schema_validation_is_non_vacuous() {
+    let mut fixture_env = EnvFingerprint {
+        os: "linux".to_string(),
+        arch: "x86_64".to_string(),
+        cpu_model: "fixture".to_string(),
+        cpu_cores: 8,
+        mem_total_mb: 1_024,
+        build_profile: "perf".to_string(),
+        executable_build_profile: "perf".to_string(),
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT.to_string(),
+        compiled_profile_family: "release".to_string(),
+        compiled_opt_level: "3".to_string(),
+        compiled_debug: "true".to_string(),
+        debug_assertions: false,
+        git_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        source_dirty: false,
+        features: vec!["sqlite-sessions".to_string()],
+        binary_path: "/target/perf/deps/perf_bench_harness-fixture".to_string(),
+        binary_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+        config_hash: String::new(),
+    };
+    fixture_env.config_hash = env_config_hash(&fixture_env);
     let record = BenchRecord {
         schema: "pi.ext.rust_bench.v1".to_string(),
         runtime: "pi_agent_rust".to_string(),
@@ -1093,28 +1179,7 @@ fn bench_jsonl_schema_validation_is_non_vacuous() {
         elapsed_ms: 1.0,
         per_call_us: 1_000.0,
         calls_per_sec: 1_000.0,
-        env: EnvFingerprint {
-            os: "linux".to_string(),
-            arch: "x86_64".to_string(),
-            cpu_model: "fixture".to_string(),
-            cpu_cores: 8,
-            mem_total_mb: 1_024,
-            build_profile: "perf".to_string(),
-            executable_build_profile: "perf".to_string(),
-            executable_profile_verified: true,
-            build_fingerprint_verified: true,
-            build_profile_verified: true,
-            build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT.to_string(),
-            compiled_profile_family: "release".to_string(),
-            compiled_opt_level: "3".to_string(),
-            compiled_debug: "true".to_string(),
-            git_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
-            source_dirty: false,
-            features: vec!["sqlite-sessions".to_string()],
-            binary_path: "/target/perf/deps/perf_bench_harness-fixture".to_string(),
-            binary_sha256: "fixture-sha256".to_string(),
-            config_hash: "fixture-config-hash".to_string(),
-        },
+        env: fixture_env,
         timestamp: "2026-08-25T00:00:00Z".to_string(),
     };
     let valid_jsonl = format!("{}\n", emit_jsonl_line(&record));
