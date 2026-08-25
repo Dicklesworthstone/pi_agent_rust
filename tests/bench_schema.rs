@@ -1212,14 +1212,29 @@ JSON
         exit 68
         ;;
     esac
+    args=("$@")
+    arg_count="${#args[@]}"
+    if (( arg_count < 5 )) \
+      || [[ "${args[arg_count - 5]}" != "--test-threads" ]] \
+      || [[ "${args[arg_count - 4]}" != "1" ]] \
+      || [[ "${args[arg_count - 3]}" != "--" ]] \
+      || [[ "${args[arg_count - 2]}" != "bench_extension_scenarios" ]] \
+      || [[ "${args[arg_count - 1]}" != "--exact" ]]; then
+      echo "perf_bench_harness omitted the exact serialized benchmark test filter" >&2
+      exit 72
+    fi
     if [[ -z "${BENCH_OUTPUT_TARGET_SUBDIR:-}" ]]; then
       echo "perf_bench_harness omitted BENCH_OUTPUT_TARGET_SUBDIR" >&2
       exit 69
     fi
     if [[ "${PI_FAKE_DROP_RCH_EXTENSION_ARTIFACT:-0}" != "1" ]]; then
       mkdir -p "$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR"
-      cat >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl" <<'JSON'
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","git_commit":"01234567","features":[],"config_hash":"stub"},"timestamp":"2026-08-25T00:00:00Z"}
+      extension_commit="${VERGEN_GIT_SHA:?}"
+      if [[ "${PI_FAKE_WRONG_RCH_EXTENSION_COMMIT:-0}" == "1" ]]; then
+        extension_commit="ffffffffffffffffffffffffffffffffffffffff"
+      fi
+      cat >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl" <<JSON
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","git_commit":"$extension_commit","features":[],"config_hash":"stub"},"timestamp":"2026-08-25T00:00:00Z"}
 JSON
       printf '%s\n' '# fake extension benchmark summary' \
         >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench_summary.md"
@@ -7794,6 +7809,11 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
         first_row["schema"].as_str(),
         Some("pi.ext.rust_bench.v1")
     );
+    assert_eq!(
+        first_row["env"]["git_commit"].as_str(),
+        Some(FAKE_ORCHESTRATE_SOURCE_COMMIT),
+        "retrieved extension benchmark must retain the full source commit"
+    );
 }
 
 #[cfg(unix)]
@@ -7837,6 +7857,35 @@ fn orchestrate_rch_perf_harness_refuses_preexisting_nextest_artifact() {
     assert!(
         combined.contains("Refusing stale RCH extension benchmark artifact"),
         "stale-artifact failure must identify the freshness postcondition: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_rejects_wrong_source_commit() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_WRONG_RCH_EXTENSION_COMMIT",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must reject an extension benchmark from another commit"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("git commit does not match")
+            && combined.contains("RCH retrieved an invalid extension_bench.jsonl"),
+        "wrong-commit failure must identify both the lineage mismatch and rejected artifact: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "a wrong-commit extension benchmark must not enter the accepted result directory"
     );
 }
 
