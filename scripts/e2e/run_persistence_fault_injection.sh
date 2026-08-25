@@ -472,11 +472,13 @@ def timestamp_is_valid(value: object) -> bool:
     return parsed.tzinfo is not None
 
 
-def log_record_is_valid(record: dict) -> bool:
+def log_record_is_valid(record: dict, expected_test_name: str) -> bool:
     required_fields = {
         "schema",
         "type",
+        "test",
         "trace_id",
+        "ci_correlation_id",
         "seq",
         "ts",
         "t_ms",
@@ -488,7 +490,14 @@ def log_record_is_valid(record: dict) -> bool:
         return False
     if record.get("schema") != "pi.test.log.v2" or record.get("type") != "log":
         return False
+    if record.get("test") != expected_test_name:
+        return False
     if not isinstance(record.get("trace_id"), str) or not record["trace_id"].strip():
+        return False
+    if (
+        not isinstance(record.get("ci_correlation_id"), str)
+        or not record["ci_correlation_id"].strip()
+    ):
         return False
     seq = record.get("seq")
     elapsed_ms = record.get("t_ms")
@@ -554,6 +563,7 @@ def inline_summary_bytes_are_valid(
     artifact_record: dict,
     case_dir: Path,
     case_id: str,
+    expected_test_name: str,
     expected_summary_artifact: str,
 ) -> bool:
     payload_records = [
@@ -561,6 +571,7 @@ def inline_summary_bytes_are_valid(
         for record in diagnostic_records
         if record.get("schema") == "pi.test.log.v2"
         and record.get("type") == "log"
+        and record.get("test") == expected_test_name
         and record.get("category") == "artifact_payload"
         and isinstance(record.get("context"), dict)
         and record["context"].get("artifact_name") == expected_summary_artifact
@@ -612,6 +623,7 @@ def inline_summary_bytes_are_valid(
 def case_checks(
     case_id: str,
     expected_test_name: str,
+    expected_feature: str,
     expected_fault_message: str,
     expected_summary_artifact: str,
 ) -> dict:
@@ -626,7 +638,8 @@ def case_checks(
     artifacts = load_jsonl(case_dir / "artifact-index.jsonl")
 
     has_fault_log = any(
-        record.get("category") == "fault"
+        record.get("test") == expected_test_name
+        and record.get("category") == "fault"
         and expected_fault_message in str(record.get("message", ""))
         for record in logs
     )
@@ -644,19 +657,23 @@ def case_checks(
         summary_artifacts[0],
         case_dir,
         case_id,
+        expected_test_name,
         expected_summary_artifact,
     )
     has_current_correlation = bool(logs) and all(
         record.get("ci_correlation_id") == correlation_id for record in logs
     )
     diagnostic_log_schema_valid = bool(logs) and all(
-        log_record_is_valid(record)
+        log_record_is_valid(record, expected_test_name)
         if record.get("schema") == "pi.test.log.v2"
         else artifact_envelope_is_valid(record, expected_test_name)
         for record in diagnostic_records
     )
-    has_expected_test_identity = bool(artifacts) and all(
-        record.get("test") == expected_test_name for record in artifacts
+    has_expected_test_identity = (
+        bool(logs)
+        and all(record.get("test") == expected_test_name for record in logs)
+        and bool(artifacts)
+        and all(record.get("test") == expected_test_name for record in artifacts)
     )
     artifact_index_schema_valid = bool(artifacts) and all(
         artifact_envelope_is_valid(record, expected_test_name) for record in artifacts
@@ -670,6 +687,10 @@ def case_checks(
             and result.get("source_commit") == source_commit
             and result.get("source_dirty") == source_dirty
             and result.get("source_tree_sha256") == source_tree_digest
+            and result.get("case_id") == case_id
+            and result.get("suite") == "e2e_session_persistence"
+            and result.get("test_name") == expected_test_name
+            and result.get("feature") == expected_feature
         ),
         "fault_log_emitted": has_fault_log,
         "summary_artifact_indexed": has_summary_artifact,
@@ -694,12 +715,14 @@ def case_checks(
 jsonl_case = case_checks(
     "jsonl",
     "e2e_jsonl_fault_injection_flush_windows",
+    "internal-persistence-fault-injection",
     "jsonl mid-flush failure",
     "jsonl-fault-window-summary.json",
 )
 sqlite_case = case_checks(
     "sqlite",
     "e2e_sqlite_fault_injection_flush_windows",
+    "sqlite-sessions,internal-persistence-fault-injection",
     "sqlite mid-flush failure",
     "sqlite-fault-window-summary.json",
 )
