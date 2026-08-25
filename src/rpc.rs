@@ -6627,7 +6627,10 @@ mod tests {
     fn seed_auto_compaction_session(mut session: Session) -> Session {
         session.header.provider = Some("test-provider".to_string());
         session.header.model_id = Some("test-model".to_string());
-        for (index, tokens) in [200_000, 250_000].into_iter().enumerate() {
+        // Stay above the 200k model window so auto-compaction triggers, but
+        // below the 400k forced-local threshold so a broken summary provider
+        // cannot make these persistence tests pass through the fallback path.
+        for (index, tokens) in [110_000, 120_000].into_iter().enumerate() {
             session.append_message(crate::session::SessionMessage::User {
                 content: UserContent::Text(format!("user turn {index}")),
                 timestamp: Some(0),
@@ -9173,6 +9176,10 @@ export default function init(pi) {
                 .expect("auto_compaction_end");
             assert_eq!(end["result"]["persisted"], false);
             assert_eq!(
+                end["result"]["summary"],
+                "causal auto-compaction summary"
+            );
+            assert_eq!(
                 end["result"]["persistenceStatus"]["event"],
                 "session.persistence.disabled"
             );
@@ -9187,8 +9194,12 @@ export default function init(pi) {
                 session
                     .entries_for_current_path()
                     .iter()
-                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
-                "the reported in-memory result must correspond to a real compaction mutation"
+                    .any(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Compaction(compaction)
+                            if compaction.summary == "causal auto-compaction summary"
+                    )),
+                "the reported result must correspond to the provider-backed compaction mutation"
             );
             assert!(
                 session.autosave_metrics().pending_mutations > 0,
@@ -9233,8 +9244,12 @@ export default function init(pi) {
                 session
                     .entries_for_current_path()
                     .iter()
-                    .any(|entry| matches!(entry, crate::session::SessionEntry::Compaction(_))),
-                "the persistence error must occur after the in-memory compaction mutation"
+                    .any(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Compaction(compaction)
+                            if compaction.summary == "causal auto-compaction summary"
+                    )),
+                "the persistence error must occur after the provider-backed compaction mutation"
             );
             assert!(
                 session.autosave_metrics().pending_mutations > 0,
