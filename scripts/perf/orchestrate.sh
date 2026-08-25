@@ -4753,10 +4753,207 @@ artifact_count=$((artifact_count + 1))
 
 POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
 post_generation_budget_exit=0
-POST_GENERATION_EVIDENCE_DIR="$OUTPUT_DIR/results"
 declare -a POST_GENERATION_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
+  && suite_selected "perf_bench_harness" \
+  && ! verify_current_clean_source_identity "RCH post-generation staging precondition"; then
+  die "RCH post-generation staging source identity is not stable"
+fi
+
+post_generation_stage_key="$({ printf '%s\0' "$CORRELATION_ID" "$TIMESTAMP" "$$"; } | sha256sum | cut -d' ' -f1)"
+POST_GENERATION_STAGE_RELATIVE=".rch-tmp/pi-perf-evidence/$post_generation_stage_key"
+POST_GENERATION_STAGE_ABSOLUTE="$PROJECT_ROOT/$POST_GENERATION_STAGE_RELATIVE"
+if ! PROJECT_ROOT="$PROJECT_ROOT" \
+  OUTPUT_DIR="$OUTPUT_DIR" \
+  TARGET_DIR="$TARGET_DIR" \
+  POST_GENERATION_STAGE_RELATIVE="$POST_GENERATION_STAGE_RELATIVE" \
+  GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+  CORRELATION_ID="$CORRELATION_ID" \
+  python3 - <<'PY'
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path, PurePosixPath
+
+project_root = Path(os.environ["PROJECT_ROOT"]).resolve(strict=True)
+output_dir = Path(os.environ["OUTPUT_DIR"]).resolve(strict=True)
+target_dir = Path(os.environ["TARGET_DIR"]).resolve(strict=True)
+stage_relative = PurePosixPath(os.environ["POST_GENERATION_STAGE_RELATIVE"])
+if stage_relative.is_absolute() or not stage_relative.parts or any(
+    part in {"", ".", ".."} for part in stage_relative.parts
+):
+    raise SystemExit("invalid post-generation evidence stage path")
+stage = project_root.joinpath(*stage_relative.parts)
+
+cursor = project_root
+for index, part in enumerate(stage_relative.parts):
+    cursor = cursor / part
+    final = index == len(stage_relative.parts) - 1
+    try:
+        metadata = cursor.lstat()
+    except FileNotFoundError:
+        cursor.mkdir()
+        metadata = cursor.lstat()
+    elif final:
+        raise SystemExit(f"refusing preexisting post-generation evidence stage: {cursor}")
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"post-generation evidence stage has unsafe ancestor: {cursor}")
+
+sources = [
+    (output_dir / "results", PurePosixPath("."), True),
+    (target_dir / "criterion", PurePosixPath("criterion"), False),
+    (target_dir / "perf" / "release_evidence", PurePosixPath("release_evidence"), False),
+]
+optional_files = [
+    (target_dir / "release" / "pi", PurePosixPath("release/pi")),
+    (
+        target_dir / "perf" / "examples" / "pijs_workload",
+        PurePosixPath("perf/examples/pijs_workload"),
+    ),
+    (
+        target_dir / "perf" / "context_intelligence_planner_budget.json",
+        PurePosixPath("context_intelligence_planner_budget.json"),
+    ),
+    (
+        target_dir / "perf" / "results" / "context_intelligence_planner_budget.json",
+        PurePosixPath("results/context_intelligence_planner_budget.json"),
+    ),
+    (
+        target_dir / "perf" / "context_intelligence" / "perf_budget.json",
+        PurePosixPath("context_intelligence/perf_budget.json"),
+    ),
+]
+
+entries = []
+destinations = set()
+
+
+def copy_regular_file(source: Path, relative: PurePosixPath):
+    relative_text = relative.as_posix()
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise SystemExit(f"invalid staged evidence path: {relative_text}")
+    if relative_text in destinations:
+        raise SystemExit(f"duplicate staged evidence path: {relative_text}")
+    destinations.add(relative_text)
+    source_metadata = source.lstat()
+    if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISREG(source_metadata.st_mode):
+        raise SystemExit(f"post-generation evidence source is not a regular file: {source}")
+
+    destination = stage.joinpath(*relative.parts)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    destination_flags = (
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    )
+    digest = hashlib.sha256()
+    source_fd = os.open(source, source_flags)
+    try:
+        opened_metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise SystemExit(f"post-generation evidence source changed type: {source}")
+        destination_fd = os.open(destination, destination_flags, 0o600)
+        try:
+            copied = 0
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_fd, view)
+                    if written <= 0:
+                        raise SystemExit(f"short write while staging evidence: {destination}")
+                    copied += written
+                    view = view[written:]
+        finally:
+            os.close(destination_fd)
+        final_metadata = source.lstat()
+        if (
+            source_metadata.st_dev,
+            source_metadata.st_ino,
+            source_metadata.st_size,
+            source_metadata.st_mtime_ns,
+        ) != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_size,
+            final_metadata.st_mtime_ns,
+        ) or copied != opened_metadata.st_size:
+            raise SystemExit(f"post-generation evidence source changed while copied: {source}")
+    finally:
+        os.close(source_fd)
+    entries.append(
+        {
+            "logical_input_id": f"file:{relative_text}",
+            "path": relative_text,
+            "sha256": digest.hexdigest(),
+            "size_bytes": copied,
+        }
+    )
+
+
+def copy_tree(source_root: Path, destination_root: PurePosixPath, required: bool):
+    if not source_root.exists():
+        if required:
+            raise SystemExit(f"required post-generation evidence root is missing: {source_root}")
+        return
+    root_metadata = source_root.lstat()
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise SystemExit(f"post-generation evidence root is unsafe: {source_root}")
+    pending = [(source_root, PurePosixPath("."))]
+    while pending:
+        directory, relative_directory = pending.pop()
+        with os.scandir(directory) as iterator:
+            children = sorted(iterator, key=lambda entry: entry.name)
+        for child in children:
+            child_relative = relative_directory / child.name
+            child_path = Path(child.path)
+            if child.is_symlink():
+                raise SystemExit(f"post-generation evidence contains symlink: {child_path}")
+            if child.is_dir(follow_symlinks=False):
+                pending.append((child_path, child_relative))
+            elif child.is_file(follow_symlinks=False):
+                relative = (
+                    child_relative
+                    if destination_root == PurePosixPath(".")
+                    else destination_root / child_relative
+                )
+                copy_regular_file(child_path, relative)
+            else:
+                raise SystemExit(
+                    f"post-generation evidence contains non-regular entry: {child_path}"
+                )
+
+
+for source_root, destination_root, required in sources:
+    copy_tree(source_root, destination_root, required)
+for source, destination in optional_files:
+    if source.exists() or source.is_symlink():
+        copy_regular_file(source, destination)
+if not entries:
+    raise SystemExit("post-generation evidence stage contains no regular files")
+
+entries.sort(key=lambda entry: entry["path"])
+inventory = {
+    "schema": "pi.perf.post_generation_evidence_inventory.v1",
+    "source_commit": os.environ["GIT_COMMIT_FULL"],
+    "correlation_id": os.environ["CORRELATION_ID"],
+    "entries": entries,
+}
+inventory_path = stage / "post_generation_evidence_inventory.json"
+with inventory_path.open("x", encoding="utf-8") as handle:
+    json.dump(inventory, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PY
+then
+  die "Failed to create the post-generation evidence package"
+fi
+POST_GENERATION_EVIDENCE_DIR="$POST_GENERATION_STAGE_RELATIVE"
+
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
-  for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION; do
+  for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do
     case ",${RCH_ENV_ALLOWLIST:-}," in
       *",$required_env,"*) ;;
       *) RCH_ENV_ALLOWLIST="${RCH_ENV_ALLOWLIST:+$RCH_ENV_ALLOWLIST,}$required_env" ;;
@@ -4764,44 +4961,6 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   done
   export RCH_ENV_ALLOWLIST
 
-  post_generation_stage_key="$({ printf '%s\0' "$CORRELATION_ID" "$TIMESTAMP" "$$"; } | sha256sum | cut -d' ' -f1)"
-  POST_GENERATION_STAGE_RELATIVE=".rch-tmp/pi-perf-evidence/$post_generation_stage_key"
-  POST_GENERATION_STAGE_ABSOLUTE="$PROJECT_ROOT/$POST_GENERATION_STAGE_RELATIVE"
-  if [[ -e "$POST_GENERATION_STAGE_ABSOLUTE" \
-    || -L "$POST_GENERATION_STAGE_ABSOLUTE" ]]; then
-    die "Refusing preexisting post-generation RCH evidence stage: $POST_GENERATION_STAGE_RELATIVE"
-  fi
-  mkdir -p "$POST_GENERATION_STAGE_ABSOLUTE"
-  unsafe_stage_entry=""
-  while IFS= read -r -d '' candidate; do
-    unsafe_stage_entry="$candidate"
-    break
-  done < <(find "$OUTPUT_DIR/results" -type l -print0 2>/dev/null)
-  if [[ -n "$unsafe_stage_entry" ]]; then
-    die "Refusing symlink in post-generation RCH evidence: $unsafe_stage_entry"
-  fi
-  while IFS= read -r -d '' candidate; do
-    unsafe_stage_entry="$candidate"
-    break
-  done < <(find "$OUTPUT_DIR/results" ! -type d ! -type f -print0 2>/dev/null)
-  if [[ -n "$unsafe_stage_entry" ]]; then
-    die "Refusing non-regular post-generation RCH evidence: $unsafe_stage_entry"
-  fi
-  staged_file_count=0
-  while IFS= read -r -d '' evidence_file; do
-    evidence_relative="${evidence_file#"$OUTPUT_DIR/results/"}"
-    if [[ "$evidence_relative" == "$evidence_file" || -z "$evidence_relative" ]]; then
-      die "Could not derive post-generation evidence-relative path: $evidence_file"
-    fi
-    evidence_destination="$POST_GENERATION_STAGE_ABSOLUTE/$evidence_relative"
-    mkdir -p "$(dirname "$evidence_destination")"
-    cp "$evidence_file" "$evidence_destination"
-    staged_file_count=$((staged_file_count + 1))
-  done < <(find "$OUTPUT_DIR/results" -type f -print0 2>/dev/null)
-  if [[ "$staged_file_count" -eq 0 ]]; then
-    die "Post-generation RCH evidence stage contains no regular files"
-  fi
-  POST_GENERATION_EVIDENCE_DIR="$POST_GENERATION_STAGE_RELATIVE"
   POST_GENERATION_RUNNER_ARGS=(
     "rch" "exec"
     "--no-color"
@@ -4814,6 +4973,7 @@ fi
 mkdir -p "$POST_GENERATION_BUDGET_DIR"
 PERF_EVIDENCE_DIR="$POST_GENERATION_EVIDENCE_DIR" \
 PI_PERF_POST_GENERATION=1 \
+PI_PERF_EXPECTED_SOURCE_COMMIT="$GIT_COMMIT_FULL" \
 CI_CORRELATION_ID="$CORRELATION_ID" \
 RCH_REQUIRE_REMOTE=1 \
 RCH_QUIET=0 \
@@ -4842,6 +5002,12 @@ if [[ "$post_generation_budget_exit" -eq 0 && "$CARGO_RUNNER_MODE" == "rch" ]]; 
     log_fail "Post-generation perf budget gate has no current-commit clean-overlay receipt"
     post_generation_budget_exit=99
   fi
+fi
+if [[ "$post_generation_budget_exit" -eq 0 \
+  && "$CARGO_RUNNER_MODE" == "rch" ]] \
+  && suite_selected "perf_bench_harness" \
+  && ! verify_current_clean_source_identity "RCH post-generation budget postcondition"; then
+  post_generation_budget_exit=96
 fi
 
 post_generation_budget_status="pass"
@@ -5005,6 +5171,12 @@ log_ok "Total artifacts collected and finalized: $artifact_count"
 
 # ─── Phase 6: Generate checksums ────────────────────────────────────────────
 
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
+  && suite_selected "perf_bench_harness" \
+  && ! verify_current_clean_source_identity "RCH checksum precondition"; then
+  die "RCH checksum source identity is not stable"
+fi
+
 log_phase "Phase 6: Integrity Checksums"
 
 pushd "$OUTPUT_DIR" >/dev/null
@@ -5056,6 +5228,12 @@ EOF
 fi
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
+
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
+  && suite_selected "perf_bench_harness" \
+  && ! verify_current_clean_source_identity "RCH final-success precondition"; then
+  die "RCH final-success source identity is not stable"
+fi
 
 log_phase "Summary"
 

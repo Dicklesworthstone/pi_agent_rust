@@ -91,6 +91,8 @@ impl fmt::Display for MeasurementControlError {
 pub struct VerifiedBinarySizeMeasurement {
     pub control_path: PathBuf,
     pub control_sha256: String,
+    pub source_commit: String,
+    pub correlation_id: String,
     pub binary_path: PathBuf,
     pub binary_sha256: String,
     pub size_bytes: u64,
@@ -101,6 +103,8 @@ pub struct VerifiedBinarySizeMeasurement {
 pub struct VerifiedColdLoadMeasurement {
     pub control_path: PathBuf,
     pub control_sha256: String,
+    pub source_commit: String,
+    pub correlation_id: String,
     pub artifact_path: PathBuf,
     pub artifact_sha256: String,
     pub bench_env_sha256: String,
@@ -115,6 +119,8 @@ pub struct VerifiedColdLoadMeasurement {
 pub struct VerifiedIdleRssMeasurement {
     pub control_path: PathBuf,
     pub control_sha256: String,
+    pub source_commit: String,
+    pub correlation_id: String,
     pub pid: u32,
     pub process_name: String,
     pub allocator: String,
@@ -580,6 +586,29 @@ fn canonical_regular_file(path: &str, field: &str) -> Result<PathBuf, Measuremen
     Ok(canonical)
 }
 
+fn measurement_artifact_path(
+    claimed_path: &str,
+    relocated_path: Option<&Path>,
+    field: &str,
+) -> Result<PathBuf, MeasurementControlError> {
+    let claimed_path = PathBuf::from(claimed_path);
+    if !claimed_path.is_absolute()
+        || claimed_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir))
+    {
+        return Err(MeasurementControlError::Invalid(format!(
+            "{field} must claim an absolute normalized producer path"
+        )));
+    }
+    relocated_path.map_or_else(
+        || canonical_regular_file(claimed_path.to_string_lossy().as_ref(), field),
+        |relocated_path| {
+            canonical_regular_file(relocated_path.to_string_lossy().as_ref(), field)
+        },
+    )
+}
+
 fn validate_sha256(value: &str, field: &str) -> Result<(), MeasurementControlError> {
     if value.len() == 64
         && value
@@ -597,6 +626,16 @@ fn validate_sha256(value: &str, field: &str) -> Result<(), MeasurementControlErr
 /// proves the shipping profile's size-oriented Cargo settings.
 pub fn verify_binary_size_measurement_control(
     control_path: &Path,
+) -> Result<VerifiedBinarySizeMeasurement, MeasurementControlError> {
+    verify_binary_size_measurement_control_with_relocated_artifact(control_path, None)
+}
+
+/// Verify a release-binary control while reading the measured bytes from a
+/// digest-identical relocated evidence package. The control's producer path is
+/// preserved as provenance and must remain an absolute normalized path.
+pub fn verify_binary_size_measurement_control_with_relocated_artifact(
+    control_path: &Path,
+    relocated_binary_path: Option<&Path>,
 ) -> Result<VerifiedBinarySizeMeasurement, MeasurementControlError> {
     let (control_path, control_sha256, control): (_, _, BinarySizeMeasurementControl) =
         read_measurement_control(control_path)?;
@@ -625,7 +664,11 @@ pub fn verify_binary_size_measurement_control(
         ));
     }
     validate_sha256(&control.binary_sha256, "binary_sha256")?;
-    let binary_path = canonical_regular_file(&control.binary_path, "binary_path")?;
+    let binary_path = measurement_artifact_path(
+        &control.binary_path,
+        relocated_binary_path,
+        "binary_path",
+    )?;
     let metadata = std::fs::metadata(&binary_path).map_err(|error| {
         MeasurementControlError::Invalid(format!("cannot inspect binary_path: {error}"))
     })?;
@@ -648,6 +691,8 @@ pub fn verify_binary_size_measurement_control(
     Ok(VerifiedBinarySizeMeasurement {
         control_path,
         control_sha256,
+        source_commit: control.source_commit,
+        correlation_id: control.correlation_id,
         binary_path,
         binary_sha256: control.binary_sha256,
         size_bytes: control.size_bytes,
@@ -659,6 +704,17 @@ pub fn verify_binary_size_measurement_control(
 pub fn verify_cold_load_measurement_control(
     control_path: &Path,
     extension: &str,
+) -> Result<VerifiedColdLoadMeasurement, MeasurementControlError> {
+    verify_cold_load_measurement_control_with_relocated_artifact(control_path, extension, None)
+}
+
+/// Verify a cold-load control against an inventory-bound relocated Criterion
+/// estimate while retaining the producer's absolute artifact path in the
+/// control document.
+pub fn verify_cold_load_measurement_control_with_relocated_artifact(
+    control_path: &Path,
+    extension: &str,
+    relocated_artifact_path: Option<&Path>,
 ) -> Result<VerifiedColdLoadMeasurement, MeasurementControlError> {
     let (control_path, control_sha256, control): (_, _, ColdLoadMeasurementControl) =
         read_measurement_control(control_path)?;
@@ -703,7 +759,11 @@ pub fn verify_cold_load_measurement_control(
         ))
     })?;
     validate_sha256(&measurement.sha256, "artifact_sha256")?;
-    let artifact_path = canonical_regular_file(&measurement.path, "artifact_path")?;
+    let artifact_path = measurement_artifact_path(
+        &measurement.path,
+        relocated_artifact_path,
+        "artifact_path",
+    )?;
     let artifact_metadata = std::fs::metadata(&artifact_path).map_err(|error| {
         MeasurementControlError::Invalid(format!("cannot inspect artifact_path: {error}"))
     })?;
@@ -726,6 +786,8 @@ pub fn verify_cold_load_measurement_control(
     Ok(VerifiedColdLoadMeasurement {
         control_path,
         control_sha256,
+        source_commit: control.source_commit,
+        correlation_id: control.correlation_id,
         artifact_path,
         artifact_sha256: measurement.sha256.clone(),
         bench_env_sha256: claimed_bench_env_sha256,
@@ -828,6 +890,15 @@ fn verify_idle_rss_samples(
 pub fn verify_idle_rss_measurement_control(
     control_path: &Path,
 ) -> Result<VerifiedIdleRssMeasurement, MeasurementControlError> {
+    verify_idle_rss_measurement_control_with_relocated_artifact(control_path, None)
+}
+
+/// Verify an idle-RSS control while resolving its measured executable from an
+/// inventory-bound relocated evidence package.
+pub fn verify_idle_rss_measurement_control_with_relocated_artifact(
+    control_path: &Path,
+    relocated_binary_path: Option<&Path>,
+) -> Result<VerifiedIdleRssMeasurement, MeasurementControlError> {
     let (control_path, control_sha256, control): (_, _, IdleRssMeasurementControl) =
         read_measurement_control(control_path)?;
     if control.schema != IDLE_RSS_MEASUREMENT_SCHEMA {
@@ -864,7 +935,11 @@ pub fn verify_idle_rss_measurement_control(
     validate_sha256(&control.bench_env_sha256, "bench_env_sha256")?;
     let bench_env = verify_bench_env_measurement(control.bench_env, &control.bench_env_sha256, 7)?;
     validate_sha256(&control.binary_sha256, "binary_sha256")?;
-    let binary_path = canonical_regular_file(&control.binary_path, "binary_path")?;
+    let binary_path = measurement_artifact_path(
+        &control.binary_path,
+        relocated_binary_path,
+        "binary_path",
+    )?;
     if binary_path.file_name().and_then(|name| name.to_str()) != Some("pi") {
         return Err(MeasurementControlError::Invalid(
             "idle RSS binary_path must identify the pi executable".to_string(),
@@ -882,6 +957,8 @@ pub fn verify_idle_rss_measurement_control(
     Ok(VerifiedIdleRssMeasurement {
         control_path,
         control_sha256,
+        source_commit: control.source_commit,
+        correlation_id: control.correlation_id,
         pid: control.pid,
         process_name: control.process_name,
         allocator: control.allocator,

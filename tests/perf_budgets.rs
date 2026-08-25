@@ -24,15 +24,17 @@ use pi::perf_build::{
     VerifiedBinarySizeMeasurement, VerifiedColdLoadMeasurement, VerifiedIdleRssMeasurement,
     benchmark_provenance_config_hash, matches_canonical_perf_build_fingerprint,
     matches_canonical_pijs_perf_features, profile_from_target_path, sha256_file,
-    verify_binary_size_measurement_control, verify_cold_load_measurement_control,
-    verify_idle_rss_measurement_control,
+    verify_binary_size_measurement_control_with_relocated_artifact,
+    verify_cold_load_measurement_control_with_relocated_artifact,
+    verify_idle_rss_measurement_control_with_relocated_artifact,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
 
@@ -359,11 +361,378 @@ const PIJS_REGRESSION_GATE_ITERATIONS: u64 = 2_000;
 const BINARY_SIZE_CONTROL_FILE: &str = "binary_size_measurement.json";
 const COLD_LOAD_CONTROL_FILE: &str = "cold_load_measurement.json";
 const IDLE_RSS_CONTROL_FILE: &str = "idle_memory_rss.json";
+const POST_GENERATION_MODE_ENV: &str = "PI_PERF_POST_GENERATION";
+const POST_GENERATION_EXPECTED_COMMIT_ENV: &str = "PI_PERF_EXPECTED_SOURCE_COMMIT";
+const POST_GENERATION_INVENTORY_FILE: &str = "post_generation_evidence_inventory.json";
+const POST_GENERATION_ARTIFACT_OVERRIDE_ENVS: &[&str] = &[
+    "PERF_RELEASE_BINARY_PATH",
+    "PERF_BINARY_SIZE_CONTROL_PATH",
+    "PERF_COLD_LOAD_CONTROL_PATH",
+    "PERF_IDLE_RSS_CONTROL_PATH",
+    "PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON",
+    "PERF_EXTENSION_STRATIFICATION_JSON",
+    "PERF_PHASE1_MATRIX_VALIDATION_JSON",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostGenerationEvidencePolicy {
+    root: PathBuf,
+    expected_source_commit: String,
+    correlation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostGenerationEvidenceInventory {
+    schema: String,
+    source_commit: String,
+    correlation_id: String,
+    entries: Vec<PostGenerationEvidenceInventoryEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PostGenerationEvidenceInventoryEntry {
+    logical_input_id: String,
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
 
 // ─── Data Readers ────────────────────────────────────────────────────────────
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn post_generation_mode_is_active_from(raw: Option<&OsStr>) -> bool {
+    raw.is_some_and(|value| !value.is_empty() && value != OsStr::new("0"))
+}
+
+fn post_generation_mode_is_active() -> bool {
+    post_generation_mode_is_active_from(std::env::var_os(POST_GENERATION_MODE_ENV).as_deref())
+}
+
+fn validate_post_generation_source_commit(raw: Option<&OsStr>) -> Result<String, String> {
+    let source_commit = raw
+        .and_then(OsStr::to_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("{POST_GENERATION_EXPECTED_COMMIT_ENV} must be set"))?;
+    if source_commit.len() != 40
+        || !source_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || source_commit.bytes().all(|byte| byte == b'0')
+    {
+        return Err(format!(
+            "{POST_GENERATION_EXPECTED_COMMIT_ENV} must be a full lowercase nonzero Git SHA-1"
+        ));
+    }
+    Ok(source_commit.to_string())
+}
+
+fn validate_post_generation_correlation_id(raw: Option<&OsStr>) -> Result<String, String> {
+    raw.and_then(OsStr::to_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "CI_CORRELATION_ID must be a non-empty UTF-8 value".to_string())
+}
+
+fn resolve_post_generation_evidence_root(
+    project_root: &Path,
+    raw_evidence_root: Option<&OsStr>,
+) -> Result<PathBuf, String> {
+    let canonical_project_root = std::fs::canonicalize(project_root).map_err(|error| {
+        format!(
+            "cannot canonicalize project root {}: {error}",
+            project_root.display()
+        )
+    })?;
+    let raw_evidence_root = raw_evidence_root
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "PERF_EVIDENCE_DIR must name exactly one evidence root".to_string())?;
+    let raw_path = PathBuf::from(raw_evidence_root);
+    if raw_path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err("PERF_EVIDENCE_DIR must not contain '.' or '..' components".to_string());
+    }
+    let candidate = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        canonical_project_root.join(raw_path)
+    };
+    let relative = candidate
+        .strip_prefix(&canonical_project_root)
+        .map_err(|_| "PERF_EVIDENCE_DIR must be confined beneath the project root".to_string())?;
+    if relative.as_os_str().is_empty() {
+        return Err("PERF_EVIDENCE_DIR must not equal the project root".to_string());
+    }
+
+    let mut cursor = canonical_project_root.clone();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err("PERF_EVIDENCE_DIR has an unsupported path component".to_string());
+        };
+        cursor.push(component);
+        let metadata = std::fs::symlink_metadata(&cursor)
+            .map_err(|error| format!("cannot inspect evidence-root component: {error}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "PERF_EVIDENCE_DIR contains a symlink component: {}",
+                cursor.display()
+            ));
+        }
+    }
+    if !cursor.is_dir() {
+        return Err("PERF_EVIDENCE_DIR must identify an existing directory".to_string());
+    }
+    let canonical_evidence_root = std::fs::canonicalize(&cursor).map_err(|error| {
+        format!(
+            "cannot canonicalize evidence root {}: {error}",
+            cursor.display()
+        )
+    })?;
+    if canonical_evidence_root != cursor {
+        return Err("PERF_EVIDENCE_DIR must not resolve through a symlink".to_string());
+    }
+    Ok(canonical_evidence_root)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn post_generation_evidence_policy_from_inputs(
+    project_root: &Path,
+    raw_mode: Option<&OsStr>,
+    raw_evidence_root: Option<&OsStr>,
+    raw_alternate_roots: Option<&OsStr>,
+    raw_expected_source_commit: Option<&OsStr>,
+    raw_correlation_id: Option<&OsStr>,
+    present_artifact_overrides: &[&str],
+) -> Result<Option<PostGenerationEvidencePolicy>, String> {
+    match raw_mode {
+        None => return Ok(None),
+        Some(value) if value.is_empty() || value == OsStr::new("0") => return Ok(None),
+        Some(value) if value == OsStr::new("1") => {}
+        Some(value) => {
+            return Err(format!(
+                "{POST_GENERATION_MODE_ENV} must be exactly 0 or 1, got {:?}",
+                value.to_string_lossy()
+            ));
+        }
+    }
+    if raw_alternate_roots.is_some() {
+        return Err("PERF_EVIDENCE_DIRS is forbidden in post-generation mode".to_string());
+    }
+    if !present_artifact_overrides.is_empty() {
+        return Err(format!(
+            "per-artifact evidence overrides are forbidden in post-generation mode: {}",
+            present_artifact_overrides.join(", ")
+        ));
+    }
+    Ok(Some(PostGenerationEvidencePolicy {
+        root: resolve_post_generation_evidence_root(project_root, raw_evidence_root)?,
+        expected_source_commit: validate_post_generation_source_commit(
+            raw_expected_source_commit,
+        )?,
+        correlation_id: validate_post_generation_correlation_id(raw_correlation_id)?,
+    }))
+}
+
+fn post_generation_evidence_policy(
+    project_root: &Path,
+) -> Result<Option<PostGenerationEvidencePolicy>, String> {
+    let present_artifact_overrides = POST_GENERATION_ARTIFACT_OVERRIDE_ENVS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var_os(name).is_some())
+        .collect::<Vec<_>>();
+    post_generation_evidence_policy_from_inputs(
+        project_root,
+        std::env::var_os(POST_GENERATION_MODE_ENV).as_deref(),
+        std::env::var_os("PERF_EVIDENCE_DIR").as_deref(),
+        std::env::var_os("PERF_EVIDENCE_DIRS").as_deref(),
+        std::env::var_os(POST_GENERATION_EXPECTED_COMMIT_ENV).as_deref(),
+        std::env::var_os("CI_CORRELATION_ID").as_deref(),
+        &present_artifact_overrides,
+    )
+}
+
+fn validate_inventory_relative_path(raw: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    if raw.is_empty()
+        || raw.contains('\\')
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || portable_relative_path(&path) != raw
+    {
+        return Err(format!("invalid inventory-relative path {raw:?}"));
+    }
+    Ok(path)
+}
+
+fn collect_post_generation_evidence_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<String, (u64, String)>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot read evidence directory {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read evidence entry: {error}"))?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("cannot inspect evidence entry {}: {error}", path.display()))?;
+        if file_type.is_symlink() {
+            return Err(format!("evidence package contains symlink: {}", path.display()));
+        }
+        if file_type.is_dir() {
+            collect_post_generation_evidence_files(root, &path, files)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(format!(
+                "evidence package contains non-regular entry: {}",
+                path.display()
+            ));
+        }
+        let relative = path
+            .strip_prefix(root)
+            .map(portable_relative_path)
+            .map_err(|_| format!("evidence entry escaped root: {}", path.display()))?;
+        if relative == POST_GENERATION_INVENTORY_FILE {
+            continue;
+        }
+        let metadata = std::fs::metadata(&path)
+            .map_err(|error| format!("cannot inspect evidence file {}: {error}", path.display()))?;
+        let digest = sha256_file(&path)
+            .map_err(|error| format!("cannot hash evidence file {}: {error}", path.display()))?;
+        if files.insert(relative.clone(), (metadata.len(), digest)).is_some() {
+            return Err(format!("duplicate evidence path {relative:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_post_generation_evidence_inventory(
+    policy: &PostGenerationEvidencePolicy,
+) -> Result<(), String> {
+    let inventory_path = policy.root.join(POST_GENERATION_INVENTORY_FILE);
+    let metadata = std::fs::symlink_metadata(&inventory_path).map_err(|error| {
+        format!(
+            "post-generation evidence inventory is missing or unreadable: {error}"
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("post-generation evidence inventory must be a regular file".to_string());
+    }
+    let bytes = std::fs::read(&inventory_path)
+        .map_err(|error| format!("cannot read post-generation evidence inventory: {error}"))?;
+    let inventory: PostGenerationEvidenceInventory = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid post-generation evidence inventory: {error}"))?;
+    if inventory.schema != "pi.perf.post_generation_evidence_inventory.v1" {
+        return Err("post-generation evidence inventory has the wrong schema".to_string());
+    }
+    if inventory.source_commit != policy.expected_source_commit {
+        return Err("post-generation evidence inventory source_commit mismatch".to_string());
+    }
+    if inventory.correlation_id != policy.correlation_id {
+        return Err("post-generation evidence inventory correlation_id mismatch".to_string());
+    }
+    if inventory.entries.is_empty() {
+        return Err("post-generation evidence inventory contains no inputs".to_string());
+    }
+
+    let mut expected_files = BTreeMap::new();
+    let mut logical_input_ids = BTreeSet::new();
+    for entry in inventory.entries {
+        let relative_path = validate_inventory_relative_path(&entry.path)?;
+        if relative_path == Path::new(POST_GENERATION_INVENTORY_FILE) {
+            return Err("the evidence inventory must not list itself".to_string());
+        }
+        if entry.logical_input_id.trim().is_empty()
+            || !logical_input_ids.insert(entry.logical_input_id.clone())
+        {
+            return Err(format!(
+                "duplicate or empty logical_input_id {:?}",
+                entry.logical_input_id
+            ));
+        }
+        if entry.sha256.len() != 64
+            || !entry
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(format!("invalid inventory metadata for {:?}", entry.path));
+        }
+        if expected_files
+            .insert(entry.path.clone(), (entry.size_bytes, entry.sha256))
+            .is_some()
+        {
+            return Err(format!("duplicate inventory path {:?}", entry.path));
+        }
+    }
+
+    let mut observed_files = BTreeMap::new();
+    collect_post_generation_evidence_files(&policy.root, &policy.root, &mut observed_files)?;
+    if observed_files != expected_files {
+        let expected = expected_files.keys().cloned().collect::<BTreeSet<_>>();
+        let observed = observed_files.keys().cloned().collect::<BTreeSet<_>>();
+        return Err(format!(
+            "post-generation evidence inventory mismatch: missing={:?}, unlisted={:?}, metadata_mismatch={:?}",
+            expected.difference(&observed).collect::<Vec<_>>(),
+            observed.difference(&expected).collect::<Vec<_>>(),
+            expected
+                .intersection(&observed)
+                .filter(|path| expected_files.get(*path) != observed_files.get(*path))
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_post_generation_record_lineage(
+    root: &Path,
+    record: &Value,
+    require_source_commit: bool,
+) -> Result<(), String> {
+    let Some(policy) = post_generation_evidence_policy(root)? else {
+        return Ok(());
+    };
+    let observed_correlation_id = record
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "post-generation evidence is missing correlation_id".to_string())?;
+    if observed_correlation_id != policy.correlation_id {
+        return Err(format!(
+            "post-generation correlation_id mismatch (expected={}, observed={observed_correlation_id})",
+            policy.correlation_id
+        ));
+    }
+    match record.get("source_commit").and_then(Value::as_str) {
+        Some(observed_source_commit)
+            if observed_source_commit != policy.expected_source_commit =>
+        {
+            return Err(format!(
+                "post-generation source_commit mismatch (expected={}, observed={observed_source_commit})",
+                policy.expected_source_commit
+            ));
+        }
+        None if require_source_commit => {
+            return Err("post-generation evidence is missing source_commit".to_string());
+        }
+        Some(_) | None => {}
+    }
+    if record.get("source_dirty").and_then(Value::as_bool) == Some(true) {
+        return Err("post-generation evidence must have source_dirty=false".to_string());
+    }
+    Ok(())
 }
 
 fn resolve_target_dir(root: &Path, raw_target_dir: Option<&std::ffi::OsStr>) -> PathBuf {
@@ -395,6 +764,9 @@ fn target_dir_candidates_for(
 }
 
 fn target_dir_candidates(root: &Path) -> Vec<PathBuf> {
+    if post_generation_mode_is_active() && root == project_root().as_path() {
+        return Vec::new();
+    }
     target_dir_candidates_for(
         root,
         &project_root(),
@@ -425,6 +797,9 @@ fn perf_evidence_dirs(root: &Path) -> Vec<PathBuf> {
         && let Some(path) = resolve_env_path(root, PathBuf::from(raw))
     {
         dirs.push(path);
+    }
+    if post_generation_mode_is_active() {
+        return dedup_paths(dirs);
     }
     if let Some(raw) = std::env::var_os("PERF_EVIDENCE_DIRS") {
         for path in std::env::split_paths(&raw) {
@@ -1066,7 +1441,11 @@ fn build_binary_size_candidate_paths(
 
 fn binary_size_candidate_paths(root: &Path) -> Vec<PathBuf> {
     let detected_profile = pi::perf_build::detect_build_profile();
-    let release_binary_override = binary_size_release_override();
+    let release_binary_override = if post_generation_mode_is_active() {
+        None
+    } else {
+        binary_size_release_override()
+    };
     let mut paths = Vec::new();
     for dir in perf_evidence_dirs(root) {
         paths.extend(build_binary_size_candidate_paths(
@@ -1092,10 +1471,12 @@ fn measurement_control_candidate_paths(
 ) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if root == project_root().as_path() {
-        if let Some(raw) = std::env::var_os(env_override)
-            && let Some(path) = resolve_env_path(root, PathBuf::from(raw))
-        {
-            paths.push(path);
+        if !post_generation_mode_is_active() {
+            if let Some(raw) = std::env::var_os(env_override)
+                && let Some(path) = resolve_env_path(root, PathBuf::from(raw))
+            {
+                paths.push(path);
+            }
         }
         paths.extend(
             perf_evidence_dirs(root)
@@ -1138,6 +1519,32 @@ fn cold_load_control_candidates(root: &Path) -> Vec<PathBuf> {
     measurement_control_candidate_paths(root, "PERF_COLD_LOAD_CONTROL_PATH", COLD_LOAD_CONTROL_FILE)
 }
 
+fn post_generation_measurement_policy(
+    root: &Path,
+) -> Result<Option<PostGenerationEvidencePolicy>, MeasurementControlError> {
+    post_generation_evidence_policy(root).map_err(|detail| {
+        MeasurementControlError::Invalid(format!(
+            "invalid post-generation evidence configuration: {detail}"
+        ))
+    })
+}
+
+fn validate_post_generation_measurement_lineage(
+    policy: Option<&PostGenerationEvidencePolicy>,
+    source_commit: &str,
+    correlation_id: &str,
+) -> Result<(), MeasurementControlError> {
+    if let Some(policy) = policy
+        && (source_commit != policy.expected_source_commit
+            || correlation_id != policy.correlation_id)
+    {
+        return Err(MeasurementControlError::Invalid(format!(
+            "measurement lineage does not match the post-generation package (source_commit={source_commit}, correlation_id={correlation_id})"
+        )));
+    }
+    Ok(())
+}
+
 fn idle_rss_control_candidates(root: &Path) -> Vec<PathBuf> {
     measurement_control_candidate_paths(root, "PERF_IDLE_RSS_CONTROL_PATH", IDLE_RSS_CONTROL_FILE)
 }
@@ -1145,9 +1552,18 @@ fn idle_rss_control_candidates(root: &Path) -> Vec<PathBuf> {
 fn verify_binary_size_control_for_root(
     root: &Path,
 ) -> Result<VerifiedBinarySizeMeasurement, MeasurementControlError> {
+    let policy = post_generation_measurement_policy(root)?;
     let candidates = binary_size_control_candidates(root);
-    let verified =
-        verify_binary_size_measurement_control(first_existing_control_path(&candidates)?)?;
+    let relocated_binary_path = policy.as_ref().map(|policy| policy.root.join("release/pi"));
+    let verified = verify_binary_size_measurement_control_with_relocated_artifact(
+        first_existing_control_path(&candidates)?,
+        relocated_binary_path.as_deref(),
+    )?;
+    validate_post_generation_measurement_lineage(
+        policy.as_ref(),
+        &verified.source_commit,
+        &verified.correlation_id,
+    )?;
     let admissible_binary = binary_size_candidate_paths(root)
         .into_iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
@@ -1164,10 +1580,22 @@ fn verify_cold_load_control_for_root(
     root: &Path,
     extension: &str,
 ) -> Result<VerifiedColdLoadMeasurement, MeasurementControlError> {
+    let policy = post_generation_measurement_policy(root)?;
     let candidates = cold_load_control_candidates(root);
-    let verified =
-        verify_cold_load_measurement_control(first_existing_control_path(&candidates)?, extension)?;
     let relative = format!("criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json");
+    let relocated_artifact_path = policy
+        .as_ref()
+        .map(|policy| policy.root.join(&relative));
+    let verified = verify_cold_load_measurement_control_with_relocated_artifact(
+        first_existing_control_path(&candidates)?,
+        extension,
+        relocated_artifact_path.as_deref(),
+    )?;
+    validate_post_generation_measurement_lineage(
+        policy.as_ref(),
+        &verified.source_commit,
+        &verified.correlation_id,
+    )?;
     let admissible_artifact = criterion_estimate_candidate_paths(root, &relative)
         .into_iter()
         .filter_map(|path| std::fs::canonicalize(path).ok())
@@ -1183,8 +1611,19 @@ fn verify_cold_load_control_for_root(
 fn verify_idle_rss_control_for_root(
     root: &Path,
 ) -> Result<VerifiedIdleRssMeasurement, MeasurementControlError> {
+    let policy = post_generation_measurement_policy(root)?;
     let candidates = idle_rss_control_candidates(root);
-    verify_idle_rss_measurement_control(first_existing_control_path(&candidates)?)
+    let relocated_binary_path = policy.as_ref().map(|policy| policy.root.join("release/pi"));
+    let verified = verify_idle_rss_measurement_control_with_relocated_artifact(
+        first_existing_control_path(&candidates)?,
+        relocated_binary_path.as_deref(),
+    )?;
+    validate_post_generation_measurement_lineage(
+        policy.as_ref(),
+        &verified.source_commit,
+        &verified.correlation_id,
+    )?;
+    Ok(verified)
 }
 
 fn collect_estimate_json_files(base: &Path) -> Vec<PathBuf> {
@@ -1240,7 +1679,9 @@ fn context_intelligence_budget_metric_key(budget_name: &str) -> Option<&'static 
 
 fn context_intelligence_budget_candidate_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON") {
+    if !post_generation_mode_is_active()
+        && let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON")
+    {
         let trimmed = path.trim();
         if !trimmed.is_empty()
             && let Some(path) = resolve_env_path(root, PathBuf::from(trimmed))
@@ -1258,7 +1699,9 @@ fn context_intelligence_budget_candidate_paths(root: &Path) -> Vec<PathBuf> {
             &dir,
         ));
     }
-    paths.push(root.join("tests/perf/reports/context_intelligence_planner_budget.json"));
+    if !post_generation_mode_is_active() {
+        paths.push(root.join("tests/perf/reports/context_intelligence_planner_budget.json"));
+    }
     dedup_paths(paths)
 }
 
@@ -1293,7 +1736,9 @@ fn context_intelligence_budget_candidate_paths_in_evidence_dir(
 
 fn extension_stratification_candidates(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var("PERF_EXTENSION_STRATIFICATION_JSON") {
+    if !post_generation_mode_is_active()
+        && let Ok(path) = std::env::var("PERF_EXTENSION_STRATIFICATION_JSON")
+    {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             paths.push(PathBuf::from(trimmed));
@@ -1312,13 +1757,17 @@ fn extension_stratification_candidates(root: &Path) -> Vec<PathBuf> {
             "perf/results/extension_benchmark_stratification.json",
         ],
     ));
-    paths.push(root.join("tests/perf/reports/extension_benchmark_stratification.json"));
+    if !post_generation_mode_is_active() {
+        paths.push(root.join("tests/perf/reports/extension_benchmark_stratification.json"));
+    }
     dedup_paths(paths)
 }
 
 fn phase1_matrix_validation_candidates(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(path) = std::env::var("PERF_PHASE1_MATRIX_VALIDATION_JSON") {
+    if !post_generation_mode_is_active()
+        && let Ok(path) = std::env::var("PERF_PHASE1_MATRIX_VALIDATION_JSON")
+    {
         let trimmed = path.trim();
         if !trimmed.is_empty() {
             paths.push(PathBuf::from(trimmed));
@@ -1333,7 +1782,9 @@ fn phase1_matrix_validation_candidates(root: &Path) -> Vec<PathBuf> {
         ],
         &["perf/results/phase1_matrix_validation.json"],
     ));
-    paths.push(root.join("tests/perf/reports/phase1_matrix_validation.json"));
+    if !post_generation_mode_is_active() {
+        paths.push(root.join("tests/perf/reports/phase1_matrix_validation.json"));
+    }
     dedup_paths(paths)
 }
 
@@ -1552,6 +2003,16 @@ fn evaluate_phase1_weighted_attribution_contract(
         });
         return failures;
     };
+    if let Err(detail) = validate_post_generation_record_lineage(root, &payload, true) {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_post_generation_evidence_lineage".to_string(),
+            budget_name: None,
+            detail: format!("{detail} in {}", path.display()),
+            remediation:
+                "Regenerate the phase-1 matrix inside the current orchestrator run."
+                    .to_string(),
+        });
+    }
 
     let matrix_schema = payload.get("schema").and_then(Value::as_str);
     if matrix_schema != Some("pi.perf.phase1_matrix_validation.v1") {
@@ -1792,6 +2253,16 @@ fn evaluate_required_e2e_ratio_contract(
         });
         return failures;
     };
+    if let Err(detail) = validate_post_generation_record_lineage(root, &payload, true) {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_post_generation_evidence_lineage".to_string(),
+            budget_name: None,
+            detail: format!("{detail} in {}", path.display()),
+            remediation:
+                "Regenerate extension stratification inside the current orchestrator run."
+                    .to_string(),
+        });
+    }
 
     let full_e2e_rows = collect_full_e2e_rows(&payload);
     if let Some(failure) = duplicate_full_e2e_failure(&path, full_e2e_rows.len()) {
@@ -2004,6 +2475,14 @@ fn evaluate_context_intelligence_budget_contract(
         Ok(payload) => payload,
         Err(failure) => return vec![failure],
     };
+    if let Err(detail) = validate_post_generation_record_lineage(root, &payload, false) {
+        failures.push(context_intelligence_failure(
+            "invalid_post_generation_evidence_lineage",
+            None,
+            format!("{detail} in {}", path.display()),
+            "Regenerate context-intelligence evidence inside the current orchestrator run.",
+        ));
+    }
 
     validate_context_intelligence_schema(&mut failures, &path, &payload);
     validate_context_intelligence_environment(&mut failures, &path, &payload);
@@ -2234,6 +2713,12 @@ fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("binary_path must be absolute".to_string());
     }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err("binary_path must be normalized".to_string());
+    }
     if path.file_stem().and_then(|name| name.to_str()) != Some("pijs_workload") {
         return Err(format!(
             "binary_path must identify the pijs_workload executable (observed={binary_path:?})"
@@ -2246,11 +2731,22 @@ fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
         ));
     }
     require_pijs_string(record, "executable_build_profile", "perf")?;
-    let canonical_path = std::fs::canonicalize(path)
+    let policy = post_generation_evidence_policy(&project_root())?;
+    let observed_path = policy.as_ref().map_or_else(
+        || path.to_path_buf(),
+        |policy| policy.root.join("perf/examples/pijs_workload"),
+    );
+    let observed_metadata = std::fs::symlink_metadata(&observed_path)
+        .map_err(|err| format!("binary_path must resolve to staged executable bytes: {err}"))?;
+    if observed_metadata.file_type().is_symlink() || !observed_metadata.is_file() {
+        return Err("binary_path must resolve to a regular non-symlink file".to_string());
+    }
+    let canonical_path = std::fs::canonicalize(&observed_path)
         .map_err(|err| format!("binary_path must resolve to an existing executable: {err}"))?;
-    if canonical_path != path {
+    if canonical_path != observed_path {
         return Err(format!(
-            "binary_path must be canonical (observed={binary_path:?}, canonical={:?})",
+            "resolved binary_path must be canonical (observed={:?}, canonical={:?})",
+            observed_path.display().to_string(),
             canonical_path.display().to_string()
         ));
     }
@@ -2259,8 +2755,8 @@ fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
         .and_then(Value::as_str)
         .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
         .ok_or_else(|| "binary_sha256 must be a 64-character hexadecimal string".to_string())?;
-    let observed_sha256 = sha256_file(path)
-        .map_err(|err| format!("failed to hash binary_path {binary_path:?}: {err}"))?;
+    let observed_sha256 = sha256_file(&observed_path)
+        .map_err(|err| format!("failed to hash resolved binary_path {binary_path:?}: {err}"))?;
     if claimed_sha256 != observed_sha256 {
         return Err(format!(
             "binary_sha256 does not match binary_path (claimed={claimed_sha256}, observed={observed_sha256})"
@@ -2431,6 +2927,7 @@ fn validate_pijs_gate_lineage(record: &Value, compiled_features: &[&str]) -> Res
             "config_hash does not match asserted provenance (claimed={claimed_config_hash}, expected={expected_config_hash})"
         ));
     }
+    validate_post_generation_record_lineage(&project_root(), record, true)?;
     Ok(())
 }
 
@@ -2946,7 +3443,9 @@ fn read_stress_rss_growth(root: &Path) -> (Option<f64>, String) {
         ],
         &["perf/stress_triage.json", "perf/results/stress_triage.json"],
     );
-    candidate_paths.push(root.join("tests/perf/reports/stress_triage.json"));
+    if !post_generation_mode_is_active() {
+        candidate_paths.push(root.join("tests/perf/reports/stress_triage.json"));
+    }
     let candidate_paths = dedup_paths(candidate_paths);
 
     for path in candidate_paths {
@@ -3381,6 +3880,19 @@ fn ci_enforced_budgets_have_data_sources() {
 fn ci_enforced_budgets_fail_on_regression_or_missing_data() {
     let strict = perf_strict_mode();
     let root = project_root();
+    if post_generation_mode_is_active() {
+        let policy = post_generation_evidence_policy(&root).unwrap_or_else(|detail| {
+            panic!("invalid_post_generation_evidence_configuration: {detail}")
+        });
+        let policy = policy.unwrap_or_else(|| {
+            panic!(
+                "invalid_post_generation_evidence_configuration: post-generation mode resolved to discovery mode"
+            )
+        });
+        validate_post_generation_evidence_inventory(&policy).unwrap_or_else(|detail| {
+            panic!("invalid_post_generation_evidence_inventory: {detail}")
+        });
+    }
 
     let mut checked_with_data = 0usize;
     let mut checked_without_data = 0usize;

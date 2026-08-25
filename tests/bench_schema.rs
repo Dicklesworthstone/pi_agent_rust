@@ -1331,13 +1331,27 @@ JSON
           exit 64
           ;;
       esac
-      python3 - "${PERF_EVIDENCE_DIR:?}" "${CI_CORRELATION_ID:?}" <<'PY'
+      python3 - \
+        "${PERF_EVIDENCE_DIR:?}" \
+        "${CI_CORRELATION_ID:?}" \
+        "${PI_PERF_EXPECTED_SOURCE_COMMIT:?}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 evidence_dir = Path(sys.argv[1])
 expected_correlation_id = sys.argv[2]
+expected_source_commit = sys.argv[3]
+inventory_path = evidence_dir / "post_generation_evidence_inventory.json"
+inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+if inventory.get("schema") != "pi.perf.post_generation_evidence_inventory.v1":
+    raise SystemExit("post-generation evidence inventory schema mismatch")
+if inventory.get("source_commit") != expected_source_commit:
+    raise SystemExit("post-generation evidence inventory source_commit mismatch")
+if inventory.get("correlation_id") != expected_correlation_id:
+    raise SystemExit("post-generation evidence inventory correlation_id mismatch")
+if not inventory.get("entries"):
+    raise SystemExit("post-generation evidence inventory is empty")
 for name in (
     "extension_benchmark_stratification.json",
     "phase1_matrix_validation.json",
@@ -7679,13 +7693,18 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
         "pi.perf.test_binary_attestation.v1",
         "perf_budgets binary attestation commit mismatch",
         "perf_budgets test binary checksum mismatch",
-        "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION; do",
+        "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do",
         "POST_GENERATION_STAGE_RELATIVE=\".rch-tmp/pi-perf-evidence/$post_generation_stage_key\"",
+        "pi.perf.post_generation_evidence_inventory.v1",
         "--overlay-path\" \"$POST_GENERATION_STAGE_RELATIVE",
         "\"${POST_GENERATION_RUNNER_ARGS[@]}\" test --test perf_budgets --profile \"$CARGO_PROFILE\"",
         "clean-overlay receipt: base=$GIT_COMMIT_FULL",
         "source_dataset_checksum_mismatch",
         "timestamp_before_run_start",
+        "RCH post-generation staging precondition",
+        "RCH post-generation budget postcondition",
+        "RCH checksum precondition",
+        "RCH final-success precondition",
     ] {
         assert!(
             content.contains(token),
