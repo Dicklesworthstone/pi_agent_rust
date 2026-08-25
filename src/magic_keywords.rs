@@ -317,7 +317,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
-        if line_indented_code {
+        if line_indented_code && html_stack.is_empty() {
             line_start = false;
             index += message[index..].chars().next().map_or(1, char::len_utf8);
             continue;
@@ -357,7 +357,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
-        if line_start && matches!(byte, b'`' | b'~') {
+        if line_start && html_stack.is_empty() && matches!(byte, b'`' | b'~') {
             let count = run_len(bytes, index, byte);
             if count >= 3 {
                 flush_token(&mut token, &mut activations, &mut seen);
@@ -372,7 +372,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
         }
         line_start = false;
 
-        if byte == b'`' {
+        if byte == b'`' && html_stack.is_empty() {
             let count = run_len(bytes, index, b'`');
             flush_token(&mut token, &mut activations, &mut seen);
             state = ScanState::InlineCode {
@@ -564,6 +564,11 @@ mod tests {
         assert_eq!(
             words("<div><span>ultrathink</span></div> then workflowz"),
             ["workflowz"]
+        );
+        assert_eq!(
+            words("<div>\n    ultrathink\n    </div>\nworkflowz"),
+            ["workflowz"],
+            "indentation inside an HTML section must not hide its closing tag"
         );
         assert_eq!(
             words("before <br data-mode='ultrathink'> orchestrate"),
