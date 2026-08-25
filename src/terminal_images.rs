@@ -1,16 +1,15 @@
 //! Terminal image helpers.
 //!
-//! Pi renders image blocks inline when the terminal advertises a supported
-//! protocol (Kitty or iTerm2). Unsupported terminals fall back to stable text
-//! placeholders like `[image: image/png]`.
+//! Direct terminal surfaces can encode recognized image bytes using Kitty or
+//! iTerm2 protocols. Conversation transcript text deliberately uses the stable,
+//! control-free placeholders from this module until it has a structured image
+//! rendering path.
 
 use base64::Engine as _;
 use std::sync::OnceLock;
 
 /// Maximum decoded image size accepted by terminal rendering helpers.
 const MAX_INLINE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
-/// Maximum base64 length for an image at the decoded size limit.
-const MAX_INLINE_IMAGE_BASE64_BYTES: usize = MAX_INLINE_IMAGE_BYTES.div_ceil(3) * 4;
 /// Maximum number of visible ASCII characters retained in a MIME placeholder.
 const MAX_PLACEHOLDER_MIME_LEN: usize = 80;
 
@@ -323,18 +322,26 @@ const fn is_jpeg_sof_marker(marker: u8) -> bool {
 pub fn render_inline(image_b64: &str, mime_type: &str, max_cols: usize) -> String {
     let fallback = placeholder(mime_type, None, None);
     let protocol = detect_protocol();
-    if protocol == ImageProtocol::Unsupported || image_b64.len() > MAX_INLINE_IMAGE_BASE64_BYTES {
+    if protocol == ImageProtocol::Unsupported {
         return fallback;
     }
 
-    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(image_b64) else {
+    let Some(bytes) = decode_base64_bounded(image_b64, MAX_INLINE_IMAGE_BYTES) else {
         return fallback;
     };
-    if bytes.len() > MAX_INLINE_IMAGE_BYTES {
-        return fallback;
-    }
 
     render_inline_bytes(&bytes, mime_type, max_cols, protocol)
+}
+
+fn decode_base64_bounded(image_b64: &str, max_decoded_bytes: usize) -> Option<Vec<u8>> {
+    let max_encoded_bytes = max_decoded_bytes.div_ceil(3).checked_mul(4)?;
+    if image_b64.len() > max_encoded_bytes {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image_b64)
+        .ok()?;
+    (bytes.len() <= max_decoded_bytes).then_some(bytes)
 }
 
 fn render_inline_bytes(
@@ -469,6 +476,16 @@ mod tests {
     }
 
     #[test]
+    fn placeholder_bounds_mime_length() {
+        let mime = format!("image/{}", "a".repeat(100));
+        let expected_mime = &mime[..MAX_PLACEHOLDER_MIME_LEN];
+        assert_eq!(
+            placeholder(&mime, None, None),
+            format!("[image: {expected_mime}]")
+        );
+    }
+
+    #[test]
     fn placeholder_omits_zero_dimensions() {
         assert_eq!(
             placeholder("image/png", Some(0), Some(100)),
@@ -576,6 +593,25 @@ mod tests {
     }
 
     #[test]
+    fn bounded_base64_decode_enforces_both_encoded_and_decoded_limits() {
+        let at_limit = base64::engine::general_purpose::STANDARD.encode(b"four");
+        assert_eq!(
+            decode_base64_bounded(&at_limit, 4).as_deref(),
+            Some(&b"four"[..])
+        );
+
+        // Five decoded bytes share the same padded base64 length as four, so
+        // this specifically exercises the post-decode size check.
+        let decoded_too_large = base64::engine::general_purpose::STANDARD.encode(b"12345");
+        assert!(decode_base64_bounded(&decoded_too_large, 4).is_none());
+
+        // This input is rejected by the pre-decode encoded-length check.
+        let encoded_too_large = base64::engine::general_purpose::STANDARD.encode(b"1234567");
+        assert!(decode_base64_bounded(&encoded_too_large, 4).is_none());
+        assert!(decode_base64_bounded("%%%", 4).is_none());
+    }
+
+    #[test]
     fn render_inline_with_unknown_image_bytes_omits_dimensions() {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"not-an-image");
         let result = render_inline(&b64, "image/webp", 80);
@@ -617,6 +653,9 @@ mod tests {
         let png = png_with_payload(33);
         let mismatched = render_inline_bytes(&png, "image/jpeg", 40, ImageProtocol::Kitty);
         assert_eq!(mismatched, "[image: image/jpeg, 100x50]");
+
+        let iterm_mismatched = render_inline_bytes(&png, "image/jpeg", 40, ImageProtocol::Iterm2);
+        assert_eq!(iterm_mismatched, "[image: image/jpeg, 100x50]");
     }
 
     #[test]
@@ -688,6 +727,23 @@ mod tests {
         assert_eq!(image_dimensions(&data), Some((128, 64)));
     }
 
+    #[test]
+    fn image_dimensions_reject_zero_sized_images() {
+        let mut png = png_with_payload(33);
+        png[16..20].copy_from_slice(&0_u32.to_be_bytes());
+        assert_eq!(image_dimensions(&png), None);
+
+        let mut gif = vec![0_u8; 16];
+        gif[..6].copy_from_slice(b"GIF89a");
+        gif[6..8].copy_from_slice(&10_u16.to_le_bytes());
+        assert_eq!(image_dimensions(&gif), None);
+
+        let jpeg = vec![
+            0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x08, 0x08, 0x00, 0x00, 0x00, 0x0A, 0x00,
+        ];
+        assert_eq!(image_dimensions(&jpeg), None);
+    }
+
     // ── placeholder edge cases ───────────────────────────────────────
 
     #[test]
@@ -722,6 +778,13 @@ mod tests {
     #[test]
     fn iterm2_rejects_unrecognized_image_bytes() {
         assert!(encode_iterm2(b"not-an-image", 40).is_empty());
+    }
+
+    #[test]
+    fn protocol_encoders_normalize_zero_columns() {
+        let png = png_with_payload(33);
+        assert!(encode_kitty(&png, 0).contains("c=1"));
+        assert!(encode_iterm2(&png, 0).contains("width=1"));
     }
 
     // ── render_inline with valid PNG ─────────────────────────────────
