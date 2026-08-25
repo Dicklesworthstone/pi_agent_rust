@@ -1870,7 +1870,8 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         assert_eq!(pre_texts, vec!["jsonl-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "jsonl pre-flush window");
 
-        // Mid-flush crash window: force a flush error by pointing path at a directory.
+        // Mid-flush crash window: the child fails after atomic rename but before
+        // parent-directory sync, proving the backend checkpoint was reached.
         drop(reopened_pre);
         let failpoint = "jsonl_after_rename_before_parent_sync";
         let child = run_persistence_failpoint_child(
@@ -1985,7 +1986,8 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         assert_eq!(pre_texts, vec!["sqlite-base".to_string()]);
         assert_no_duplicate_user_texts(&pre_texts, "sqlite pre-flush window");
 
-        // Mid-flush crash window.
+        // Mid-flush crash window: the child fails after transactional mutation
+        // but before COMMIT, so SQLite must roll the appended row back.
         drop(reopened_pre);
         let failpoint = "sqlite_after_mutation_before_commit";
         let child = run_persistence_failpoint_child(
