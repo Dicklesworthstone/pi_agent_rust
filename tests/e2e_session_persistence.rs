@@ -730,6 +730,62 @@ fn required_chaos_env(name: &str) -> String {
     value
 }
 
+#[cfg(feature = "internal-persistence-fault-injection")]
+fn run_persistence_failpoint_child(
+    session_path: &Path,
+    backend: &str,
+    failpoint: &str,
+    message: &str,
+) -> std::process::Output {
+    Command::new(std::env::current_exe().expect("current persistence test binary"))
+        .arg("--exact")
+        .arg("persistence_failpoint_worker_process_entrypoint")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env("PI_SESSION_PERSISTENCE_TEST_WORKER", "1")
+        .env("PI_SESSION_PERSISTENCE_TEST_PATH", session_path)
+        .env("PI_SESSION_PERSISTENCE_TEST_BACKEND", backend)
+        .env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT", failpoint)
+        .env("PI_SESSION_PERSISTENCE_TEST_MESSAGE", message)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run persistence failpoint child")
+}
+
+#[cfg(feature = "internal-persistence-fault-injection")]
+#[test]
+fn persistence_failpoint_worker_process_entrypoint() {
+    if std::env::var_os("PI_SESSION_PERSISTENCE_TEST_WORKER").is_none() {
+        return;
+    }
+    let session_path = PathBuf::from(required_chaos_env("PI_SESSION_PERSISTENCE_TEST_PATH"));
+    let backend = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_BACKEND");
+    let failpoint = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_FAILPOINT");
+    let message = required_chaos_env("PI_SESSION_PERSISTENCE_TEST_MESSAGE");
+
+    run_async_test(async {
+        let mut session = Session::open(session_path.to_string_lossy().as_ref())
+            .await
+            .expect("open failpoint worker session");
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text(message),
+            timestamp: Some(0),
+        });
+        if backend == "jsonl" {
+            session.set_model_header(Some("failpoint-jsonl".to_string()), None, None);
+        }
+        let error = session
+            .save()
+            .await
+            .expect_err("persistence failpoint must interrupt save");
+        assert_eq!(
+            error.to_string(),
+            format!("Session error: injected persistence failpoint: {failpoint}")
+        );
+        println!("PERSISTENCE_FAILPOINT_REACHED:{failpoint}");
+    });
+}
+
 #[test]
 fn session_store_chaos_worker_process_entrypoint() {
     if std::env::var_os("PI_SESSION_STORE_CHAOS_WORKER").is_none() {
@@ -1782,6 +1838,7 @@ fn multi_turn_persistence() {
     write_jsonl_artifacts(&harness, test_name);
 }
 
+#[cfg(feature = "internal-persistence-fault-injection")]
 #[test]
 fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_jsonl_fault_injection_flush_windows";
@@ -1814,28 +1871,42 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         assert_no_duplicate_user_texts(&pre_texts, "jsonl pre-flush window");
 
         // Mid-flush crash window: force a flush error by pointing path at a directory.
-        let mut mid = reopened_pre;
-        mid.append_message(SessionMessage::User {
-            content: UserContent::Text("jsonl-midflush-pending".to_string()),
-            timestamp: Some(0),
+        drop(reopened_pre);
+        let failpoint = "jsonl_after_rename_before_parent_sync";
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            "jsonl",
+            failpoint,
+            "jsonl-midflush-pending",
+        );
+        assert!(
+            child.status.success(),
+            "JSONL failpoint child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_contains(
+            &harness,
+            &String::from_utf8_lossy(&child.stdout),
+            &format!("PERSISTENCE_FAILPOINT_REACHED:{failpoint}"),
+        );
+        harness.log().info_ctx("fault", "jsonl mid-flush failure", |ctx| {
+            ctx.push(("checkpoint".into(), failpoint.to_string()));
         });
-        let fault_path = harness.create_dir("jsonl-midflush-fault-path");
-        mid.path = Some(fault_path.clone());
-        let flush_err = mid.save().await.expect_err("mid-flush save should fail");
-        harness
-            .log()
-            .info_ctx("fault", "jsonl mid-flush failure", |ctx| {
-                ctx.push(("fault_path".into(), fault_path.display().to_string()));
-                ctx.push(("error".into(), flush_err.to_string()));
-            });
 
         // Simulate process crash/restart after failed flush.
-        drop(mid);
         let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
             .await
             .expect("reopen after mid-flush crash simulation");
         let mid_texts = user_texts_in_order(&reopened_mid.to_messages_for_current_path());
-        assert_eq!(mid_texts, vec!["jsonl-base".to_string()]);
+        assert_eq!(
+            mid_texts,
+            vec![
+                "jsonl-base".to_string(),
+                "jsonl-midflush-pending".to_string()
+            ],
+            "atomic rename must publish the complete new JSONL snapshot exactly once"
+        );
         assert_no_duplicate_user_texts(&mid_texts, "jsonl mid-flush window");
 
         // Post-flush crash window: persisted mutation survives exactly once.
@@ -1855,6 +1926,7 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
             post_texts,
             vec![
                 "jsonl-base".to_string(),
+                "jsonl-midflush-pending".to_string(),
                 "jsonl-postflush-persisted".to_string()
             ],
             "jsonl post-crash ordering mismatch"
@@ -1878,7 +1950,10 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
     write_jsonl_artifacts(&harness, test_name);
 }
 
-#[cfg(feature = "sqlite-sessions")]
+#[cfg(all(
+    feature = "sqlite-sessions",
+    feature = "internal-persistence-fault-injection"
+))]
 #[test]
 fn sqlite_fault_injection_flush_windows_preserve_integrity() {
     let test_name = "e2e_sqlite_fault_injection_flush_windows";
@@ -1911,25 +1986,29 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         assert_no_duplicate_user_texts(&pre_texts, "sqlite pre-flush window");
 
         // Mid-flush crash window.
-        let mut mid = reopened_pre;
-        mid.append_message(SessionMessage::User {
-            content: UserContent::Text("sqlite-midflush-pending".to_string()),
-            timestamp: Some(0),
+        drop(reopened_pre);
+        let failpoint = "sqlite_after_mutation_before_commit";
+        let child = run_persistence_failpoint_child(
+            &stable_path,
+            "sqlite",
+            failpoint,
+            "sqlite-midflush-pending",
+        );
+        assert!(
+            child.status.success(),
+            "SQLite failpoint child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert_contains(
+            &harness,
+            &String::from_utf8_lossy(&child.stdout),
+            &format!("PERSISTENCE_FAILPOINT_REACHED:{failpoint}"),
+        );
+        harness.log().info_ctx("fault", "sqlite mid-flush failure", |ctx| {
+            ctx.push(("checkpoint".into(), failpoint.to_string()));
         });
-        let fault_path = harness.create_dir("sqlite-midflush-fault-path");
-        mid.path = Some(fault_path.clone());
-        let flush_err = mid
-            .save()
-            .await
-            .expect_err("sqlite mid-flush save should fail");
-        harness
-            .log()
-            .info_ctx("fault", "sqlite mid-flush failure", |ctx| {
-                ctx.push(("fault_path".into(), fault_path.display().to_string()));
-                ctx.push(("error".into(), flush_err.to_string()));
-            });
 
-        drop(mid);
         let reopened_mid = Session::open(stable_path.to_string_lossy().as_ref())
             .await
             .expect("reopen sqlite after mid-flush crash simulation");

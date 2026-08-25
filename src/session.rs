@@ -1313,6 +1313,10 @@ pub(crate) fn persistence_test_failpoint(point: &str) -> Result<()> {
 
 #[cfg(not(feature = "internal-persistence-fault-injection"))]
 #[inline]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the non-default fault-injection feature shares this Result-returning call site"
+)]
 pub(crate) const fn persistence_test_failpoint(_point: &str) -> Result<()> {
     Ok(())
 }

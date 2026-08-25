@@ -630,7 +630,7 @@ case " $* " in
     test_name="e2e_jsonl_fault_injection_flush_windows"
     fault_message="jsonl mid-flush failure"
     summary_name="jsonl-fault-window-summary.json"
-    summary_payload='{"scenario":"jsonl_fault_windows","windows":{"pre_flush":["jsonl-base"],"mid_flush":["jsonl-base"],"post_flush":["jsonl-base","jsonl-postflush-persisted"]}}'
+    summary_payload='{"scenario":"jsonl_fault_windows","windows":{"pre_flush":["jsonl-base"],"mid_flush":["jsonl-base","jsonl-midflush-pending"],"post_flush":["jsonl-base","jsonl-midflush-pending","jsonl-postflush-persisted"]}}'
     ;;
   *" sqlite_fault_injection_flush_windows_preserve_integrity "*)
     case_id="sqlite"

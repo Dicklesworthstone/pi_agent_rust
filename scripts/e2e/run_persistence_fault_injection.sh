@@ -406,8 +406,8 @@ jsonl_exit=0
 sqlite_exit=0
 summary_exit=0
 
-run_case "jsonl" "jsonl_fault_injection_flush_windows_preserve_integrity" || jsonl_exit=$?
-run_case "sqlite" "sqlite_fault_injection_flush_windows_preserve_integrity" "sqlite-sessions" || sqlite_exit=$?
+run_case "jsonl" "jsonl_fault_injection_flush_windows_preserve_integrity" "internal-persistence-fault-injection" || jsonl_exit=$?
+run_case "sqlite" "sqlite_fault_injection_flush_windows_preserve_integrity" "sqlite-sessions,internal-persistence-fault-injection" || sqlite_exit=$?
 
 set +e
 SOURCE_COMMIT_FINAL="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -587,13 +587,20 @@ def inline_summary_bytes_are_valid(
     except (UnicodeDecodeError, json.JSONDecodeError):
         return False
     base_message = f"{case_id}-base"
+    mid_message = f"{case_id}-midflush-pending"
     post_message = f"{case_id}-postflush-persisted"
+    if case_id == "jsonl":
+        expected_mid_flush = [base_message, mid_message]
+        expected_post_flush = [base_message, mid_message, post_message]
+    else:
+        expected_mid_flush = [base_message]
+        expected_post_flush = [base_message, post_message]
     if summary != {
         "scenario": f"{case_id}_fault_windows",
         "windows": {
             "pre_flush": [base_message],
-            "mid_flush": [base_message],
-            "post_flush": [base_message, post_message],
+            "mid_flush": expected_mid_flush,
+            "post_flush": expected_post_flush,
         },
     }:
         return False
