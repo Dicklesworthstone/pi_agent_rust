@@ -212,7 +212,9 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
     index += 1;
     while bytes
         .get(index)
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b':' | b'_'))
+        .is_some_and(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':' | b'_')
+        })
     {
         index += 1;
     }
@@ -277,19 +279,23 @@ fn char_len_at(message: &str, index: usize) -> usize {
         .map_or_else(|| message.len().saturating_sub(index).max(1), char::len_utf8)
 }
 
-fn boundary_enters_path_context(token: &str, boundary: char) -> bool {
+fn boundary_enters_path_context(token: &str, boundary: char, next: Option<char>) -> bool {
     match boundary {
         // URI schemes (including mailto:) and Windows drive prefixes must
         // suppress the remainder of the same whitespace-delimited lexeme.
+        // A colon followed by whitespace/end is ordinary prose punctuation.
         ':' => {
-            let mut chars = token.chars();
-            chars.next().is_some_and(|first| first.is_ascii_alphabetic())
-                && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+            next.is_some_and(|next| !next.is_whitespace()) && {
+                let mut chars = token.chars();
+                chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+                    && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+            }
         }
-        // Query/path parameters split on prose punctuation only after the
-        // surrounding lexeme has been classified. Otherwise
-        // https://host/?ultrathink would expose the query value as prose.
-        '?' | ';' => token.contains('/') || token.contains('\\') || token.contains('.'),
+        // Query/path parameters consume the remainder of their compact
+        // lexeme, including relative references such as `?mode=x` and
+        // `search?mode=x`. The caller flushes the token before suppressing so
+        // ordinary trailing punctuation (`ultrathink?`) still activates.
+        '?' | ';' => true,
         _ => false,
     }
 }
@@ -471,7 +477,11 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
         if suppress_path_lexeme {
             continue;
         }
-        if boundary_enters_path_context(&token, ch) {
+        let next = message.get(index..).and_then(|tail| tail.chars().next());
+        if boundary_enters_path_context(&token, ch, next) {
+            if matches!(ch, '?' | ';') {
+                flush_token(&mut token, &mut activations, &mut seen);
+            }
             token.clear();
             suppress_path_lexeme = true;
             continue;
@@ -499,6 +509,20 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                     | '{'
                     | '}'
                     | '*'
+                    | '。'
+                    | '！'
+                    | '？'
+                    | '，'
+                    | '；'
+                    | '：'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
             );
         if is_boundary {
             flush_token(&mut token, &mut activations, &mut seen);
@@ -656,6 +680,10 @@ mod tests {
             "XML names may begin with an underscore"
         );
         assert!(
+            words("<foo.bar>ultrathink</foo.bar>").is_empty(),
+            "XML names may contain dots"
+        );
+        assert!(
             words("<:guard>ultrathink</:guard>").is_empty(),
             "XML names may begin with a namespace separator"
         );
@@ -693,6 +721,14 @@ mod tests {
             "path query values are part of the path lexeme, not prose"
         );
         assert!(
+            words("see [docs](?ultrathink) next").is_empty(),
+            "relative query targets are not prose"
+        );
+        assert!(
+            words("open search?orchestrate next").is_empty(),
+            "relative query values stay inside their compact lexeme"
+        );
+        assert!(
             words("open mailto:ultrathink@example.test").is_empty(),
             "URI scheme payloads are not prose"
         );
@@ -708,6 +744,8 @@ mod tests {
         assert_eq!(words("(ultrathink)"), ["ultrathink"]);
         assert_eq!(words("ok. ultrathink."), ["ultrathink"]);
         assert_eq!(words("mode: ultrathink?"), ["ultrathink"]);
+        assert_eq!(words("ultrathink: please"), ["ultrathink"]);
+        assert_eq!(words("ultrathink。"), ["ultrathink"]);
     }
 
     #[test]
