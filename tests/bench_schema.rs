@@ -1205,15 +1205,14 @@ JSON
 JSON
     ;;
   perf_bench_harness)
-    case " $* " in
-      *" nextest run "*) ;;
-      *)
-        echo "perf_bench_harness did not use the RCH nextest artifact path" >&2
-        exit 68
-        ;;
-    esac
     args=("$@")
     arg_count="${#args[@]}"
+    if (( arg_count < 2 )) \
+      || [[ "${args[0]}" != "nextest" ]] \
+      || [[ "${args[1]}" != "run" ]]; then
+      echo "perf_bench_harness did not use the RCH nextest artifact path" >&2
+      exit 68
+    fi
     if (( arg_count < 5 )) \
       || [[ "${args[arg_count - 5]}" != "--test-threads" ]] \
       || [[ "${args[arg_count - 4]}" != "1" ]] \
