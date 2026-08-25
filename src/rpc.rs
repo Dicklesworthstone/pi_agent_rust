@@ -3114,7 +3114,7 @@ async fn preserve_terminal_rpc_input(
         state.steering = steering;
         state.follow_up = follow_up;
         return Err(persist_err);
-    };
+    }
 
     Ok(queued_count)
 }
@@ -5100,7 +5100,6 @@ mod retry_tests {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
-        let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
             let provider = Arc::new(AlwaysErrorProvider);
@@ -10129,14 +10128,15 @@ export default function init(pi) {
                 .expect("hold outer session lock");
             let operation_cx = AgentCx::for_testing();
             let cancel_cx = operation_cx.clone();
-            let session_for_task = Arc::clone(&session);
-            let shared_for_task = Arc::clone(&shared_state);
-            let preserve_task = runtime_handle.spawn(async move {
-                preserve_terminal_rpc_input(&session_for_task, &shared_for_task, &operation_cx)
-                    .await
-            });
-
-            sleep(wall_now(), Duration::from_millis(20)).await;
+            let mut preserve_task = Box::pin(preserve_terminal_rpc_input(
+                &session,
+                &shared_state,
+                &operation_cx,
+            ));
+            assert!(matches!(
+                futures::poll!(preserve_task.as_mut()),
+                std::task::Poll::Pending
+            ));
             assert_eq!(
                 shared_state
                     .lock(&setup_cx)
@@ -10148,8 +10148,6 @@ export default function init(pi) {
             );
             cancel_cx.set_cancel_requested(true);
 
-            let preserve_task = async { preserve_task.await };
-            futures::pin_mut!(preserve_task);
             let result = match asupersync::time::timeout(
                 wall_now(),
                 Duration::from_secs(5),

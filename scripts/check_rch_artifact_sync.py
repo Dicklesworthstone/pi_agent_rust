@@ -181,26 +181,55 @@ def mandatory_rch_rules() -> list[IgnoreRule]:
     ]
 
 
+def component_glob_matches(
+    pattern_components: tuple[str, ...],
+    path_components: tuple[str, ...],
+    *,
+    allow_descendants: bool,
+) -> bool:
+    """Match rsync-style path components without allowing ``*`` across ``/``."""
+    if not pattern_components:
+        return allow_descendants or not path_components
+
+    pattern_head = pattern_components[0]
+    pattern_tail = pattern_components[1:]
+    if pattern_head == "**":
+        return component_glob_matches(
+            pattern_tail,
+            path_components,
+            allow_descendants=allow_descendants,
+        ) or bool(path_components) and component_glob_matches(
+            pattern_components,
+            path_components[1:],
+            allow_descendants=allow_descendants,
+        )
+
+    return bool(path_components) and fnmatch.fnmatchcase(path_components[0], pattern_head) and (
+        component_glob_matches(
+            pattern_tail,
+            path_components[1:],
+            allow_descendants=allow_descendants,
+        )
+    )
+
+
 def core_rule_matches(pattern: str, rel_path: str) -> bool:
     body = pattern.lstrip("/")
     if not body:
         return False
 
-    if body.endswith("/**"):
-        base = body[:-3].rstrip("/")
-        return rel_path == base or rel_path.startswith(f"{base}/")
+    directory_rule = body.endswith("/")
+    body = body.rstrip("/")
+    if not body:
+        return False
 
-    if body.endswith("/"):
-        base = body.rstrip("/")
-        return rel_path == base or rel_path.startswith(f"{base}/")
-
-    if fnmatch.fnmatchcase(rel_path, body):
-        return True
-
-    if "/" not in body:
-        return any(fnmatch.fnmatchcase(component, body) for component in rel_path.split("/"))
-
-    return False
+    pattern_components = tuple(component for component in body.split("/") if component)
+    path_components = tuple(component for component in rel_path.split("/") if component)
+    return component_glob_matches(
+        pattern_components,
+        path_components,
+        allow_descendants=directory_rule,
+    )
 
 
 def rule_matches(rule: IgnoreRule, rel_path: str) -> bool:
