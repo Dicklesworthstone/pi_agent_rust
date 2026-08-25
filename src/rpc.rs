@@ -570,6 +570,40 @@ struct RunningBash {
     abort_tx: oneshot::Sender<()>,
 }
 
+async fn rpc_session_transition_blocker(
+    is_streaming: &AtomicBool,
+    is_compacting: &AtomicBool,
+    turn_phase_linearizer: &std::sync::Mutex<()>,
+    bash_state: &Arc<Mutex<Option<RunningBash>>>,
+    cx: &AgentCx,
+) -> Result<Option<&'static str>> {
+    let phase = {
+        let _phase_guard = lock_rpc_turn_phase(turn_phase_linearizer);
+        rpc_turn_phase(is_streaming, is_compacting)
+    };
+    match phase {
+        RpcTurnPhase::Streaming => {
+            return Ok(Some(
+                "Agent is currently streaming; abort or wait before changing sessions",
+            ));
+        }
+        RpcTurnPhase::Compacting => {
+            return Ok(Some(
+                "Agent is currently compacting; wait before changing sessions",
+            ));
+        }
+        RpcTurnPhase::Idle => {}
+    }
+
+    let bash_running = OwnedMutexGuard::lock(Arc::clone(bash_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
+        .is_some();
+    Ok(bash_running.then_some(
+        "A background bash command is still running; wait before changing sessions",
+    ))
+}
+
 #[derive(Debug, Default)]
 struct RpcUiBridgeState {
     active: Option<ExtensionUiRequest>,
@@ -1861,6 +1895,15 @@ pub async fn run(
 
                 let run_id = uuid::Uuid::new_v4().to_string();
                 let (abort_tx, abort_rx) = oneshot::channel();
+                let origin_session_id = {
+                    let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                        .await
+                        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let inner = guard.session.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("inner session lock failed: {err}"))
+                    })?;
+                    inner.header.id.clone()
+                };
                 *running = Some(RunningBash {
                     id: run_id.clone(),
                     abort_tx,
@@ -1893,17 +1936,31 @@ pub async fn run(
                                 OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
                             {
                                 if let Ok(mut inner_session) = guard.session.lock(&bash_cx).await {
-                                    inner_session.append_message(SessionMessage::BashExecution {
-                                        command: command.clone(),
-                                        output: result.output.clone(),
-                                        exit_code: result.exit_code,
-                                        cancelled: Some(result.cancelled),
-                                        truncated: Some(result.truncated),
-                                        full_output_path: result.full_output_path.clone(),
-                                        timestamp: Some(chrono::Utc::now().timestamp_millis()),
-                                        extra: std::collections::HashMap::default(),
-                                    });
-                                    (true, None)
+                                    if inner_session.header.id == origin_session_id {
+                                        inner_session.append_message(
+                                            SessionMessage::BashExecution {
+                                                command: command.clone(),
+                                                output: result.output.clone(),
+                                                exit_code: result.exit_code,
+                                                cancelled: Some(result.cancelled),
+                                                truncated: Some(result.truncated),
+                                                full_output_path: result.full_output_path.clone(),
+                                                timestamp: Some(
+                                                    chrono::Utc::now().timestamp_millis(),
+                                                ),
+                                                extra: std::collections::HashMap::default(),
+                                            },
+                                        );
+                                        (true, None)
+                                    } else {
+                                        (
+                                            false,
+                                            Some(
+                                                "active session changed while bash was running"
+                                                    .to_string(),
+                                            ),
+                                        )
+                                    }
                                 } else {
                                     (false, Some("inner session lock poisoned".to_string()))
                                 }
@@ -2457,6 +2514,18 @@ pub async fn run(
             }
 
             "new_session" => {
+                if let Some(reason) = rpc_session_transition_blocker(
+                    &is_streaming,
+                    &is_compacting,
+                    &turn_phase_linearizer,
+                    &bash_state,
+                    &cx,
+                )
+                .await?
+                {
+                    let _ = out_tx.send(response_error(id, "new_session", reason.to_string()));
+                    continue;
+                }
                 if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
                     .await
                 {
@@ -2538,6 +2607,18 @@ pub async fn run(
             }
 
             "switch_session" => {
+                if let Some(reason) = rpc_session_transition_blocker(
+                    &is_streaming,
+                    &is_compacting,
+                    &turn_phase_linearizer,
+                    &bash_state,
+                    &cx,
+                )
+                .await?
+                {
+                    let _ = out_tx.send(response_error(id, "switch_session", reason.to_string()));
+                    continue;
+                }
                 let Some(session_path) = parsed.get("sessionPath").and_then(Value::as_str) else {
                     let _ = out_tx.send(response_error(
                         id,
@@ -2641,6 +2722,18 @@ pub async fn run(
             }
 
             "fork" => {
+                if let Some(reason) = rpc_session_transition_blocker(
+                    &is_streaming,
+                    &is_compacting,
+                    &turn_phase_linearizer,
+                    &bash_state,
+                    &cx,
+                )
+                .await?
+                {
+                    let _ = out_tx.send(response_error(id, "fork", reason.to_string()));
+                    continue;
+                }
                 let Some(entry_id) = parsed.get("entryId").and_then(Value::as_str) else {
                     let _ = out_tx.send(response_error(id, "fork", "Missing entryId".to_string()));
                     continue;
