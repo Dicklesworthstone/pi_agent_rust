@@ -1,0 +1,12 @@
+{
+  "id": 421,
+  "project": "/Users/jemanuel/projects/asimposium.org",
+  "agent": "GoldenDove",
+  "path_pattern": "packages/contracts/test/unit/sessions.test.ts",
+  "exclusive": true,
+  "reason": "asimposiumorg-e7j.2 sponsor workshop byte-bounded pagination",
+  "created_ts": "2026-08-23T20:12:46.145324Z",
+  "expires_ts": "2026-08-23T23:12:46.145324Z",
+  "released_ts": "2026-08-24T00:42:05.505441Z",
+  "db_generation": "826aba49fd3bca29ec8a99b103b668a479b1317bf52e1e8665aa3b6c10e8c53f"
+}

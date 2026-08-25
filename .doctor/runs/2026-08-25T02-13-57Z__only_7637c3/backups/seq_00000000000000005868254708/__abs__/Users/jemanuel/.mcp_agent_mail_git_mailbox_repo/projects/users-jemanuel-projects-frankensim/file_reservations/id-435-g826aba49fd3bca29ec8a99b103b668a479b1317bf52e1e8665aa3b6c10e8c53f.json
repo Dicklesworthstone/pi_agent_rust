@@ -1,0 +1,12 @@
+{
+  "id": 435,
+  "project": "/Users/jemanuel/projects/frankensim",
+  "agent": "CobaltBrook",
+  "path_pattern": "crates/fs-la/**",
+  "exclusive": true,
+  "reason": "frankensim-epic-bedrock-6ys.5.1.2 CanonicalQrPolicy typed surface",
+  "created_ts": "2026-08-23T23:01:26.128628Z",
+  "expires_ts": "2026-08-24T03:01:26.128628Z",
+  "released_ts": "2026-08-24T00:42:03.450525Z",
+  "db_generation": "826aba49fd3bca29ec8a99b103b668a479b1317bf52e1e8665aa3b6c10e8c53f"
+}

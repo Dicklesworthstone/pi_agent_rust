@@ -1,0 +1,12 @@
+{
+  "id": 404,
+  "project": "/Users/jemanuel/projects/asimposium.org",
+  "agent": "StormyMountain",
+  "path_pattern": "apps/web/test/unit/enrollment-recovery.test.ts",
+  "exclusive": true,
+  "reason": "asimposiumorg-auxf cross-owner causal plant authoring",
+  "created_ts": "2026-08-23T18:26:53.589845Z",
+  "expires_ts": "2026-08-23T19:26:53.589845Z",
+  "released_ts": "2026-08-24T00:42:09.171459Z",
+  "db_generation": "826aba49fd3bca29ec8a99b103b668a479b1317bf52e1e8665aa3b6c10e8c53f"
+}

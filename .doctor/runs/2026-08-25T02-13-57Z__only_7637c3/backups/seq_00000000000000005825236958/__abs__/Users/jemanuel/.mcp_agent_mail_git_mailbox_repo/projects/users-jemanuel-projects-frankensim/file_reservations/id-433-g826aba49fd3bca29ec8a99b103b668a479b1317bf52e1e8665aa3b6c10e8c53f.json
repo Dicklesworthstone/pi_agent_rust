@@ -1,0 +1,12 @@
+{
+  "id": 433,
+  "project": "/Users/jemanuel/projects/frankensim",
+  "agent": "BluePrairie",
+  "path_pattern": "apps/wright-flyer/test/e2eLib.test.mjs",
+  "exclusive": true,
+  "reason": "frankensim-y473e",
+  "created_ts": "2026-08-23T20:55:24.032100Z",
+  "expires_ts": "2026-08-23T22:55:24.032100Z",
+  "released_ts": "2026-08-24T00:44:27.266745Z",
+  "db_generation": "826aba49fd3bca29ec8a99b103b668a479b1317bf52e1e8665aa3b6c10e8c53f"
+}
