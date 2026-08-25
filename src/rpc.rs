@@ -10166,9 +10166,9 @@ export default function init(pi) {
                     ..AgentConfig::default()
                 },
             );
-            let session = Arc::new(asupersync::sync::Mutex::new(
-                seed_auto_compaction_session(Session::in_memory()),
-            ));
+            let session = Arc::new(asupersync::sync::Mutex::new(seed_auto_compaction_session(
+                Session::in_memory(),
+            )));
             let agent_session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
                 agent,
                 Arc::clone(&session),
@@ -10206,11 +10206,7 @@ export default function init(pi) {
                     .lock(&entered_cx)
                     .await
                     .expect("agent session lock");
-                let mut inner = guard
-                    .session
-                    .lock(&entered_cx)
-                    .await
-                    .expect("session lock");
+                let mut inner = guard.session.lock(&entered_cx).await.expect("session lock");
                 let replacement = Session::in_memory();
                 let replacement_id = replacement.header.id.clone();
                 *inner = replacement;
@@ -10236,7 +10232,11 @@ export default function init(pi) {
                 .iter()
                 .filter(|event| event["type"] == "auto_compaction_end")
                 .collect::<Vec<_>>();
-            assert_eq!(ends.len(), 1, "start must have exactly one terminal end: {events:?}");
+            assert_eq!(
+                ends.len(),
+                1,
+                "start must have exactly one terminal end: {events:?}"
+            );
             assert!(
                 ends[0]["errorMessage"]
                     .as_str()
@@ -10246,7 +10246,10 @@ export default function init(pi) {
             assert!(ends[0].get("result").is_none());
             assert!(!compacting.load(Ordering::SeqCst));
 
-            let inner = session.lock(&entered_cx).await.expect("replacement session lock");
+            let inner = session
+                .lock(&entered_cx)
+                .await
+                .expect("replacement session lock");
             assert_eq!(inner.header.id, replacement_id);
             assert_eq!(provider_compaction_count(&inner), 0);
         });

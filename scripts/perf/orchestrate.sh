@@ -1178,7 +1178,14 @@ validate_retrieved_extension_bench_jsonl() {
   local artifact_path="$1"
   local expected_profile="$2"
   local expected_commit="$3"
-  python3 - "$artifact_path" "$expected_profile" "$expected_commit" <<'PY'
+  local expected_correlation_id="$4"
+  local expected_benchmark_run_id="$5"
+  python3 - \
+    "$artifact_path" \
+    "$expected_profile" \
+    "$expected_commit" \
+    "$expected_correlation_id" \
+    "$expected_benchmark_run_id" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1186,6 +1193,8 @@ from pathlib import Path
 artifact_path = Path(sys.argv[1])
 expected_profile = sys.argv[2]
 expected_commit = sys.argv[3]
+expected_correlation_id = sys.argv[4]
+expected_benchmark_run_id = sys.argv[5]
 records = []
 for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").splitlines(), 1):
     if not line.strip():
@@ -1200,11 +1209,42 @@ for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").spl
         raise SystemExit(f"line {line_number}: unexpected schema")
     if record.get("runtime") != "pi_agent_rust":
         raise SystemExit(f"line {line_number}: unexpected runtime")
+    if record.get("run_id") != expected_correlation_id:
+        raise SystemExit(f"line {line_number}: run_id does not match current run")
+    if record.get("correlation_id") != expected_correlation_id:
+        raise SystemExit(f"line {line_number}: correlation_id does not match current run")
+    if record.get("benchmark_run_id") != expected_benchmark_run_id:
+        raise SystemExit(f"line {line_number}: benchmark_run_id does not match current invocation")
+    if record.get("source_commit") != expected_commit:
+        raise SystemExit(f"line {line_number}: source_commit does not match {expected_commit}")
+    if record.get("source_dirty") is not False:
+        raise SystemExit(f"line {line_number}: source_dirty must equal false")
     environment = record.get("env")
     if not isinstance(environment, dict) or environment.get("build_profile") != expected_profile:
         raise SystemExit(f"line {line_number}: build profile does not match {expected_profile}")
     if environment.get("git_commit") != expected_commit:
         raise SystemExit(f"line {line_number}: git commit does not match {expected_commit}")
+    if environment.get("source_dirty") is not False:
+        raise SystemExit(f"line {line_number}: env.source_dirty must equal false")
+    if environment.get("executable_build_profile") != expected_profile:
+        raise SystemExit(
+            f"line {line_number}: executable build profile does not match {expected_profile}"
+        )
+    for field in (
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+    ):
+        if environment.get(field) is not True:
+            raise SystemExit(f"line {line_number}: env.{field} must equal true")
+    if environment.get("build_fingerprint_contract") != "cargo_build_fingerprint.v1":
+        raise SystemExit(f"line {line_number}: unexpected build fingerprint contract")
+    if (
+        environment.get("compiled_profile_family") != "release"
+        or environment.get("compiled_opt_level") != "3"
+        or environment.get("compiled_debug") != "true"
+    ):
+        raise SystemExit(f"line {line_number}: compiled perf fingerprint is invalid")
     records.append(record)
 
 if not records:
@@ -1225,6 +1265,7 @@ run_test_suite() {
   local target_name="$2"
   local suite_start suite_end suite_elapsed exit_code
   local rch_target_subdir=""
+  local benchmark_run_id=""
 
   log_step "Running suite: $suite_name (target=$target_name)"
   suite_start=$(epoch_ms)
@@ -1239,6 +1280,7 @@ run_test_suite() {
     # artifact beneath the worker's active CARGO_TARGET_DIR and require it to
     # arrive in the matching local target directory before crediting the suite.
     rch_target_subdir="nextest/pi-perf/$CORRELATION_ID/$suite_name"
+    benchmark_run_id="${CORRELATION_ID}:${suite_start}:$$"
     local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
     if ! verify_current_clean_source_identity "RCH extension benchmark precondition"; then
       exit_code=89
@@ -1250,18 +1292,23 @@ run_test_suite() {
       exit_code=87
     else
       BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
+      PI_BENCH_RUN_ID="$benchmark_run_id" \
       PERF_REGRESSION_OUTPUT="$result_dir" \
       PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
       CI_CORRELATION_ID="$CORRELATION_ID" \
       VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
       VERGEN_GIT_DIRTY="$GIT_DIRTY" \
       RUST_TEST_THREADS="$PARALLELISM" \
+      CARGO_BUILD_JOBS="$BUILD_JOBS" \
       PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
+      RCH_QUIET=0 \
+      RCH_VISIBILITY=summary \
         "${PERF_BENCH_RUNNER_ARGS[@]}" nextest run \
-          --build-jobs "$PARALLELISM" \
+          --build-jobs "$BUILD_JOBS" \
           --test "$target_name" \
           --cargo-profile "$CARGO_PROFILE" \
           --test-threads 1 \
+          --no-tests fail \
           -- bench_extension_scenarios --exact \
         >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
         || exit_code=$?
@@ -1272,12 +1319,49 @@ run_test_suite() {
       exit_code=91
     fi
 
+    if [[ "$exit_code" -eq 0 ]]; then
+      if ! grep -Eqs \
+        '^\[RCH\] remote [^[:space:]]+ \([^)]+\)$' \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "RCH extension benchmark has no remote-success marker"
+        exit_code=92
+      elif grep -Eqs '^\[RCH\] local( |$)' \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "RCH extension benchmark reported local execution"
+        exit_code=93
+      elif ! grep -Eqs \
+        "^\\[RCH\\] clean-overlay receipt: base=$GIT_COMMIT_FULL overlay-fingerprint=[0-9a-f]{64}$" \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "RCH extension benchmark has no current-commit clean-overlay receipt"
+        exit_code=94
+      fi
+    fi
+
     if [[ "$exit_code" -eq 0 \
       && -s "$retrieved_result_dir/extension_bench.jsonl" \
       && ! -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
       if validate_retrieved_extension_bench_jsonl \
-        "$retrieved_result_dir/extension_bench.jsonl" "$CARGO_PROFILE" "$GIT_COMMIT_FULL"; then
+        "$retrieved_result_dir/extension_bench.jsonl" \
+        "$CARGO_PROFILE" \
+        "$GIT_COMMIT_FULL" \
+        "$CORRELATION_ID" \
+        "$benchmark_run_id"; then
+        if [[ -e "$result_dir/extension_bench.jsonl" \
+          || -L "$result_dir/extension_bench.jsonl" ]]; then
+          log_fail "Refusing preexisting accepted extension benchmark destination"
+          exit_code=95
+        else
         cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
+          if ! validate_retrieved_extension_bench_jsonl \
+            "$result_dir/extension_bench.jsonl" \
+            "$CARGO_PROFILE" \
+            "$GIT_COMMIT_FULL" \
+            "$CORRELATION_ID" \
+            "$benchmark_run_id"; then
+            log_fail "Accepted extension benchmark copy failed post-copy validation"
+            exit_code=96
+          fi
+        fi
       else
         log_fail "RCH retrieved an invalid extension_bench.jsonl from $rch_target_subdir"
         exit_code=88

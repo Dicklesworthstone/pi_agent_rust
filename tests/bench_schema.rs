@@ -1212,21 +1212,29 @@ JSON
       exit 73
     fi
     args=("$@")
-    arg_count="${#args[@]}"
-    if (( arg_count < 2 )) \
-      || [[ "${args[0]}" != "nextest" ]] \
-      || [[ "${args[1]}" != "run" ]]; then
-      echo "perf_bench_harness did not use the RCH nextest artifact path" >&2
+    expected_args=(
+      nextest run
+      --build-jobs "${CARGO_BUILD_JOBS:?}"
+      --test perf_bench_harness
+      --cargo-profile perf
+      --test-threads 1
+      --no-tests fail
+      -- bench_extension_scenarios --exact
+    )
+    if (( ${#args[@]} != ${#expected_args[@]} )); then
+      echo "perf_bench_harness used the wrong RCH nextest argv length: $*" >&2
       exit 68
     fi
-    if (( arg_count < 5 )) \
-      || [[ "${args[arg_count - 5]}" != "--test-threads" ]] \
-      || [[ "${args[arg_count - 4]}" != "1" ]] \
-      || [[ "${args[arg_count - 3]}" != "--" ]] \
-      || [[ "${args[arg_count - 2]}" != "bench_extension_scenarios" ]] \
-      || [[ "${args[arg_count - 1]}" != "--exact" ]]; then
-      echo "perf_bench_harness omitted the exact serialized benchmark test filter" >&2
-      exit 72
+    for ((i=0; i<${#expected_args[@]}; i++)); do
+      if [[ "${args[i]}" != "${expected_args[i]}" ]]; then
+        echo "perf_bench_harness used unexpected RCH nextest argv at $i: $*" >&2
+        exit 72
+      fi
+    done
+    if [[ "${PI_FAKE_REQUIRE_BENCH_CONTROLS:-0}" == "1" ]] \
+      && { [[ "${BENCH_QUICK:-}" != "1" ]] || [[ "${BENCH_ITERATIONS:-}" != "1" ]]; }; then
+      echo "perf_bench_harness did not receive benchmark quick/iteration controls" >&2
+      exit 75
     fi
     if [[ -z "${BENCH_OUTPUT_TARGET_SUBDIR:-}" ]]; then
       echo "perf_bench_harness omitted BENCH_OUTPUT_TARGET_SUBDIR" >&2
@@ -1238,8 +1246,12 @@ JSON
       if [[ "${PI_FAKE_WRONG_RCH_EXTENSION_COMMIT:-0}" == "1" ]]; then
         extension_commit="ffffffffffffffffffffffffffffffffffffffff"
       fi
+      benchmark_run_id="${PI_BENCH_RUN_ID:?}"
+      if [[ "${PI_FAKE_STALE_RCH_EXTENSION_ARTIFACT:-0}" == "1" ]]; then
+        benchmark_run_id="stale-benchmark-run"
+      fi
       cat >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl" <<JSON
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","git_commit":"$extension_commit","features":[],"config_hash":"stub"},"timestamp":"2026-08-25T00:00:00Z"}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"/target/perf/deps/perf_bench_harness-stub","binary_sha256":"stub","config_hash":"stub"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
       printf '%s\n' '# fake extension benchmark summary' \
         >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench_summary.md"
@@ -1371,14 +1383,19 @@ case "${1:-}" in
       echo "rch exec was not placed in fail-closed proof mode" >&2
       exit 65
     fi
-    case ",${RCH_ENV_ALLOWLIST:-}," in
-      *",BENCH_OUTPUT_TARGET_SUBDIR,"*) ;;
-      *)
-        echo "RCH_ENV_ALLOWLIST omitted BENCH_OUTPUT_TARGET_SUBDIR" >&2
-        exit 66
-        ;;
-    esac
+    for key in BENCH_OUTPUT_TARGET_SUBDIR BENCH_QUICK BENCH_ITERATIONS PI_BENCH_RUN_ID CARGO_BUILD_JOBS; do
+      case ",${RCH_ENV_ALLOWLIST:-}," in
+        *",$key,"*) ;;
+        *)
+          echo "RCH_ENV_ALLOWLIST omitted $key" >&2
+          exit 66
+          ;;
+      esac
+    done
     shift
+    if [[ "${1:-}" == "--no-color" ]]; then
+      shift
+    fi
     strict_pinned=0
     if [[ "${1:-}" == "--base" ]]; then
       if (( $# < 6 )) \
@@ -1398,7 +1415,20 @@ case "${1:-}" in
       echo "unexpected fake RCH exec arguments: $*" >&2
       exit 68
     fi
-    PI_FAKE_RCH_EXECUTED=1 PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" exec "$@"
+    if PI_FAKE_RCH_EXECUTED=1 PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" "$@"; then
+      if [[ "${PI_FAKE_RCH_LOCAL_FALLBACK:-0}" == "1" ]]; then
+        echo "[RCH] local (fixture fallback)" >&2
+      else
+        echo "[RCH] remote fixture-worker (1.00s)" >&2
+        if [[ "$strict_pinned" == "1" ]]; then
+          echo "[RCH] clean-overlay receipt: base=$(git rev-parse HEAD) overlay-fingerprint=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" >&2
+        fi
+      fi
+      exit 0
+    else
+      exit_code=$?
+      exit "$exit_code"
+    fi
     ;;
   *)
     exit 64
