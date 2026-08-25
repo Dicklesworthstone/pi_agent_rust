@@ -61,8 +61,18 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
 }
 
 async fn recv_rpc_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<String, String> {
-    let started = Instant::now();
+    recv_rpc_line_before(rx, label, Instant::now() + Duration::from_secs(10)).await
+}
+
+async fn recv_rpc_line_before(
+    rx: &Arc<Mutex<Receiver<String>>>,
+    label: &str,
+    deadline: Instant,
+) -> Result<String, String> {
     loop {
+        if Instant::now() >= deadline {
+            return Err(format!("{label}: timed out waiting for RPC output"));
+        }
         let recv_result = match rx.lock() {
             Ok(receiver) => receiver.try_recv(),
             Err(poisoned) => poisoned.into_inner().try_recv(),
@@ -74,9 +84,6 @@ async fn recv_rpc_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result
             }
             Err(TryRecvError::Empty) => {}
         }
-        if started.elapsed() >= Duration::from_secs(10) {
-            return Err(format!("{label}: timed out waiting for RPC output"));
-        }
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
     }
 }
@@ -86,20 +93,18 @@ async fn recv_rpc_command_response(
     expected_id: &str,
     label: &str,
 ) -> Result<serde_json::Value, String> {
-    let started = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let line = recv_rpc_line(rx, label).await?;
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("response")
-                && value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id)
-            {
-                return Ok(value);
-            }
-        }
-        if started.elapsed() >= Duration::from_secs(10) {
-            return Err(format!(
-                "{label}: timed out waiting for response id {expected_id}"
-            ));
+        let line = recv_rpc_line_before(rx, label, deadline).await?;
+        let value = serde_json::from_str::<serde_json::Value>(line.trim()).map_err(|err| {
+            format!(
+                "{label}: invalid RPC JSON while waiting for response id {expected_id}: {err}"
+            )
+        })?;
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("response")
+            && value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id)
+        {
+            return Ok(value);
         }
     }
 }
