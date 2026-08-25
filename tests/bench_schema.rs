@@ -7201,6 +7201,8 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
         "pi.perf.test_binary_attestation.v1",
         "perf_budgets binary attestation commit mismatch",
         "perf_budgets test binary checksum mismatch",
+        "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION; do",
+        "\"${CARGO_RUNNER_ARGS[@]}\" test --test perf_budgets --profile \"$CARGO_PROFILE\"",
         "source_dataset_checksum_mismatch",
         "timestamp_before_run_start",
     ] {
@@ -7209,6 +7211,10 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
             "post-generation evidence gate must include token: {token}"
         );
     }
+    assert!(
+        !content.contains("post_generation_budget_binary"),
+        "the controller must not execute a downloaded RCH test binary directly"
+    );
 
     assert!(
         phase1_generation < post_generation_budget

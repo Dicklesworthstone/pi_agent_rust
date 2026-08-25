@@ -912,6 +912,7 @@ pub async fn run(
                                 retry_abort,
                                 options,
                                 expanded,
+                                Some(message),
                                 images,
                                 prompt_cx,
                             )
@@ -986,6 +987,7 @@ pub async fn run(
                         retry_abort,
                         options,
                         expanded,
+                        Some(message),
                         Vec::new(),
                         prompt_cx,
                     )
@@ -1058,6 +1060,7 @@ pub async fn run(
                         retry_abort,
                         options,
                         expanded,
+                        Some(message),
                         Vec::new(),
                         prompt_cx,
                     )
@@ -2173,6 +2176,7 @@ pub async fn run(
                             retry_abort,
                             options,
                             text,
+                            Some(String::new()),
                             Vec::new(),
                             prompt_cx,
                         )
@@ -2681,6 +2685,7 @@ async fn run_prompt_with_retry(
     retry_abort: Arc<AtomicBool>,
     options: RpcOptions,
     message: String,
+    keyword_scan_source: Option<String>,
     images: Vec<ImageContent>,
     cx: AgentCx,
 ) {
@@ -2753,6 +2758,9 @@ async fn run_prompt_with_retry(
             } else {
                 // First attempt: add the user message and run the turn.
                 first_attempt_done = true;
+                guard
+                    .agent
+                    .set_magic_keyword_scan_override(keyword_scan_source.clone());
                 if images.is_empty() {
                     guard
                         .run_text_with_abort(message.clone(), Some(abort_signal), event_handler)
@@ -4113,6 +4121,7 @@ mod retry_tests {
                 retry_abort,
                 options,
                 "hello".to_string(),
+                None,
                 Vec::new(),
                 AgentCx::for_request(),
             )
@@ -4230,6 +4239,7 @@ mod retry_tests {
                 retry_abort,
                 options,
                 "hello".to_string(),
+                None,
                 Vec::new(),
                 AgentCx::for_request(),
             )
@@ -4355,6 +4365,7 @@ mod retry_tests {
                 retry_abort,
                 options,
                 "hello".to_string(),
+                None,
                 Vec::new(),
                 AgentCx::from_cx(retry_cx),
             )

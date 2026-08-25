@@ -8333,8 +8333,11 @@ async fn run_print_mode(
 
     let messages = messages
         .into_iter()
-        .map(|message| resources.expand_input(&message))
-        .filter(|message| !message.trim().is_empty())
+        .map(|keyword_scan_source| {
+            let text = resources.expand_input(&keyword_scan_source);
+            (text, keyword_scan_source)
+        })
+        .filter(|(message, _)| !message.trim().is_empty())
         .collect::<Vec<_>>();
 
     if initial.is_none() && messages.is_empty() {
@@ -8379,7 +8382,7 @@ async fn run_print_mode(
         }
     }
 
-    for message in messages {
+    for (message, keyword_scan_source) in messages {
         reset_print_text_stream_state(&text_stream_state);
         let response = run_print_prompt_with_retry(
             session,
@@ -8390,7 +8393,10 @@ async fn run_print_mode(
             max_retries,
             is_json,
             &text_stream_state,
-            PromptInput::Text(message),
+            PromptInput::Text {
+                text: message,
+                keyword_scan_source: Some(keyword_scan_source),
+            },
             failover_ctx,
         )
         .await?;
@@ -8531,7 +8537,10 @@ fn finish_print_text_response(
 
 /// Discriminated prompt input for retry helper.
 enum PromptInput {
-    Text(String),
+    Text {
+        text: String,
+        keyword_scan_source: Option<String>,
+    },
     Content {
         content: Vec<ContentBlock>,
         keyword_scan_source: Option<String>,
@@ -8692,7 +8701,13 @@ where
 {
     // First attempt.
     let first_result = match &input {
-        PromptInput::Text(text) => {
+        PromptInput::Text {
+            text,
+            keyword_scan_source,
+        } => {
+            session
+                .agent
+                .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
                 .run_text_with_abort(
                     text.clone(),
