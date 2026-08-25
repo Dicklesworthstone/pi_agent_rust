@@ -199,7 +199,7 @@ impl SubagentTool {
     /// process-global agent directory or current executable.
     #[doc(hidden)]
     #[must_use]
-    pub fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
+    pub const fn with_paths(cwd: PathBuf, global_dir: PathBuf, child_binary: PathBuf) -> Self {
         Self {
             cwd,
             global_dir,

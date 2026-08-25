@@ -75,10 +75,12 @@ pub enum AutoCompactionMode {
     Aggressive,
 }
 
-/// Render mode for compaction output (bd-cv653.7.6): plain text summary
-/// (default) or text summary plus deterministic PNG frames rasterized from
-/// the compacted transcript span (snapcompact). Frames are attached to the
-/// compaction entry and only emitted to models that accept image inputs.
+/// Render mode for compaction output (bd-cv653.7.6).
+///
+/// Supports plain text summary (default) or text summary plus deterministic
+/// PNG frames rasterized from the compacted transcript span (snapcompact).
+/// Frames are attached to the compaction entry and only emitted to models that
+/// accept image inputs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CompactionRenderMode {
     #[default]

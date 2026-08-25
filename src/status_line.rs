@@ -38,9 +38,10 @@ fn truncate_display_width(text: &str, maximum_width: usize) -> String {
 }
 
 /// Predefined status line presets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StatusLinePreset {
+    #[default]
     Default,
     Minimal,
     Compact,
@@ -49,27 +50,16 @@ pub enum StatusLinePreset {
     Ascii,
 }
 
-impl Default for StatusLinePreset {
-    fn default() -> Self {
-        Self::Default
-    }
-}
-
 /// Powerline separator style.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SeparatorStyle {
+    #[default]
     Powerline, //  / 
     Thin,      //  / 
     Slash,     // /
     Dot,       // •
     Pipe,      // |
-}
-
-impl Default for SeparatorStyle {
-    fn default() -> Self {
-        Self::Powerline
-    }
 }
 
 impl SeparatorStyle {
@@ -129,7 +119,7 @@ pub struct StatusSegment {
 
 impl StatusSegment {
     #[must_use]
-    pub fn new(id: SegmentId, priority: u8, min_width: usize) -> Self {
+    pub const fn new(id: SegmentId, priority: u8, min_width: usize) -> Self {
         Self {
             id,
             priority,
