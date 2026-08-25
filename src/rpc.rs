@@ -83,7 +83,6 @@ struct RpcStateSnapshot {
     follow_up_count: usize,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
-    follow_up_fetch_generation: Arc<AtomicU64>,
     auto_compaction_enabled: bool,
     auto_retry_enabled: bool,
 }
@@ -437,6 +436,7 @@ struct RpcSharedState {
     follow_up: VecDeque<QueuedAgentMessage>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
+    follow_up_fetch_generation: Arc<AtomicU64>,
     auto_compaction_enabled: bool,
     auto_retry_enabled: bool,
     /// Cross-turn failover state (bd-cv653.3.2): cooldown tracker and the

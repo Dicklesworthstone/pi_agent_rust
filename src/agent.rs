@@ -13510,7 +13510,7 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Default)]
+    #[derive(Debug, Clone, Default)]
     struct CapturedProviderContext {
         system_prompt: Option<String>,
         messages: Vec<Message>,
