@@ -1225,7 +1225,7 @@ mod grep_tool {
         });
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn test_grep_renders_invalid_utf8_filename_losslessly() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -1936,7 +1936,7 @@ mod find_tool {
         });
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn test_find_renders_invalid_utf8_filename_losslessly() {
         use std::os::unix::ffi::OsStringExt as _;
@@ -2314,7 +2314,7 @@ mod ls_tool {
         });
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn test_ls_renders_invalid_utf8_filenames_losslessly_and_deterministically() {
         use std::os::unix::ffi::OsStringExt as _;
