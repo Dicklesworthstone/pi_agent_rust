@@ -557,7 +557,9 @@ write_binary_size_measurement_control() {
     "$GIT_DIRTY" \
     "$CORRELATION_ID" <<'PY'
 import hashlib
+import hashlib
 import json
+import re
 import os
 import sys
 import tomllib
@@ -1258,6 +1260,46 @@ for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").spl
         or environment.get("compiled_debug") != "true"
     ):
         raise SystemExit(f"line {line_number}: compiled perf fingerprint is invalid")
+    if environment.get("debug_assertions") is not False:
+        raise SystemExit(f"line {line_number}: perf build must disable debug assertions")
+    features = environment.get("features")
+    if (
+        not isinstance(features, list)
+        or not all(isinstance(feature, str) and feature for feature in features)
+        or features != sorted(set(features))
+    ):
+        raise SystemExit(f"line {line_number}: compiled feature set is invalid")
+    binary_path = environment.get("binary_path")
+    binary_sha256 = environment.get("binary_sha256")
+    if not isinstance(binary_path, str) or not binary_path.strip():
+        raise SystemExit(f"line {line_number}: binary_path is missing")
+    if not isinstance(binary_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", binary_sha256) is None:
+        raise SystemExit(f"line {line_number}: binary_sha256 is invalid")
+    canonical_provenance = {
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "build_fingerprint_contract": environment.get("build_fingerprint_contract"),
+        "build_fingerprint_verified": environment.get("build_fingerprint_verified"),
+        "build_profile": environment.get("build_profile"),
+        "build_profile_verified": environment.get("build_profile_verified"),
+        "compiled_debug": environment.get("compiled_debug"),
+        "compiled_features": features,
+        "compiled_opt_level": environment.get("compiled_opt_level"),
+        "compiled_profile_family": environment.get("compiled_profile_family"),
+        "debug_assertions": environment.get("debug_assertions"),
+        "executable_build_profile": environment.get("executable_build_profile"),
+        "executable_profile_verified": environment.get("executable_profile_verified"),
+        "source_commit": environment.get("git_commit"),
+        "source_dirty": environment.get("source_dirty"),
+    }
+    expected_config_hash = hashlib.sha256(
+        json.dumps(canonical_provenance, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    if environment.get("config_hash") != expected_config_hash:
+        raise SystemExit(f"line {line_number}: config_hash does not bind provenance fields")
+    summary = record.get("summary")
+    if not isinstance(summary, dict) or summary.get("count") != record.get("runs"):
+        raise SystemExit(f"line {line_number}: runs and summary.count differ")
     records.append(record)
 
 if not records:
@@ -4673,6 +4715,7 @@ mkdir -p "$POST_GENERATION_BUDGET_DIR"
 PERF_EVIDENCE_DIR="$POST_GENERATION_EVIDENCE_DIR" \
 PI_PERF_POST_GENERATION=1 \
 CI_CORRELATION_ID="$CORRELATION_ID" \
+RCH_REQUIRE_REMOTE=1 \
 RCH_QUIET=0 \
 RCH_VISIBILITY=summary \
 "${POST_GENERATION_RUNNER_ARGS[@]}" test --test perf_budgets --profile "$CARGO_PROFILE" \

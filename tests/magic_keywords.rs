@@ -821,15 +821,28 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
                 }
             }
             assert!(saw_agent_end, "queued steering/follow-up turn completed");
+
+            drop(in_tx);
+            server
+                .await
+                .expect("RPC server task join")
+                .expect("RPC server run");
+            let remaining = out_rx
+                .lock()
+                .expect("RPC output lock")
+                .try_iter()
+                .collect::<Vec<_>>();
+            for line in remaining {
+                observed_events.push(
+                    serde_json::from_str(line.trim()).expect("remaining RPC event JSON"),
+                );
+            }
             let agent_end_events = observed_events
                 .iter()
                 .filter(|event| event["type"] == "agent_end")
                 .collect::<Vec<_>>();
             assert_eq!(agent_end_events.len(), 1, "unexpected lifecycle events");
             assert!(agent_end_events[0]["error"].is_null());
-
-            drop(in_tx);
-            server.await.expect("RPC server task join");
         };
         asupersync::time::timeout(
             asupersync::time::wall_now(),

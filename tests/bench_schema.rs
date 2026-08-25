@@ -1408,6 +1408,9 @@ exit 0
 set -euo pipefail
 case "${1:-}" in
   check)
+    if [[ "${PI_FAKE_RCH_CHECK_OK:-0}" == "1" ]]; then
+      exit 0
+    fi
     exit 2
     ;;
   exec)
@@ -1430,6 +1433,7 @@ case "${1:-}" in
     fi
     strict_pinned=0
     has_overlay=0
+    overlay_path=""
     if [[ "${1:-}" == "--base" ]]; then
       if (( $# < 6 )) \
         || [[ "${2:-}" != "$(git rev-parse HEAD)" ]] \
@@ -1447,6 +1451,21 @@ case "${1:-}" in
         && "${6:-}" == "--" \
         && "${7:-}" == "cargo" ]]; then
         has_overlay=1
+        overlay_path="${5}"
+        case "$overlay_path" in
+          /*|../*|*/../*|*/..)
+            echo "RCH overlay path must be normalized and repo-relative" >&2
+            exit 76
+            ;;
+        esac
+        if [[ ! -d "$overlay_path" ]]; then
+          echo "RCH overlay path is missing: $overlay_path" >&2
+          exit 76
+        fi
+        if find "$overlay_path" -type d -empty -print -quit | grep -q .; then
+          echo "RCH clean-overlay fixture rejects empty directories" >&2
+          exit 76
+        fi
         shift 6
       else
         echo "strict RCH execution used an invalid overlay contract" >&2
@@ -1461,6 +1480,7 @@ case "${1:-}" in
     if PI_FAKE_RCH_EXECUTED=1 \
       PI_FAKE_RCH_STRICT_PINNED="$strict_pinned" \
       PI_FAKE_RCH_HAS_OVERLAY="$has_overlay" \
+      PI_FAKE_RCH_OVERLAY_PATH="$overlay_path" \
       "$@"; then
       if [[ "${PI_FAKE_RCH_LOCAL_FALLBACK:-0}" == "1" ]]; then
         echo "[RCH] local (fixture fallback)" >&2
@@ -7635,7 +7655,10 @@ fn orchestrate_final_evidence_gates_run_after_derived_artifact_generation() {
         "perf_budgets binary attestation commit mismatch",
         "perf_budgets test binary checksum mismatch",
         "for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION; do",
-        "\"${CARGO_RUNNER_ARGS[@]}\" test --test perf_budgets --profile \"$CARGO_PROFILE\"",
+        "POST_GENERATION_STAGE_RELATIVE=\".rch-tmp/pi-perf-evidence/$post_generation_stage_key\"",
+        "--overlay-path\" \"$POST_GENERATION_STAGE_RELATIVE",
+        "\"${POST_GENERATION_RUNNER_ARGS[@]}\" test --test perf_budgets --profile \"$CARGO_PROFILE\"",
+        "clean-overlay receipt: base=$GIT_COMMIT_FULL",
         "source_dataset_checksum_mismatch",
         "timestamp_before_run_start",
     ] {
@@ -7791,15 +7814,25 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         bin_dir.display(),
         std::env::var("PATH").unwrap_or_default()
     );
+    let profile = if extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_PROFILE_QUICK" && *value == "1")
+    {
+        "quick"
+    } else {
+        "full"
+    };
+    let omit_require_rch_cli = extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_OMIT_REQUIRE_RCH_CLI" && *value == "1");
 
     let mut command = Command::new("bash");
     command
         .arg("scripts/perf/orchestrate.sh")
         .arg("--profile")
-        .arg("full")
+        .arg(profile)
         .arg("--skip-build")
         .arg("--skip-env-check")
-        .arg("--require-rch")
         .current_dir(project_root())
         .env("PATH", path)
         .env("CARGO_TARGET_DIR", &target_dir)
@@ -7815,6 +7848,9 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         )
         .env("CI_CORRELATION_ID", FAKE_ORCHESTRATE_CORRELATION_ID)
         .env("PERF_SKIP_CRITERION", "1");
+    if !omit_require_rch_cli {
+        command.arg("--require-rch");
+    }
     for (key, value) in extra_env {
         command.env(key, value);
     }
