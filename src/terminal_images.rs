@@ -429,9 +429,12 @@ mod tests {
         // First chunk should have m=1 (more to come).
         assert!(result.contains("m=1"), "First chunk should signal more");
         // Last chunk should have m=0.
-        let last_chunk_start = result.rfind("\x1b_G").unwrap();
-        let last_chunk = &result[last_chunk_start..];
-        assert!(last_chunk.contains("m=0"), "Last chunk should signal done");
+        assert!(
+            result
+                .rsplit_once("\x1b_G")
+                .is_some_and(|(_, last_chunk)| last_chunk.contains("m=0")),
+            "Last chunk should signal done"
+        );
     }
 
     #[test]
@@ -845,8 +848,9 @@ mod tests {
                 data.extend_from_slice(&payload);
                 let result = encode_kitty(&data, 40);
                 // First chunk starts at position 0
-                let first_st = result.find("\x1b\\").unwrap();
-                let first_chunk = &result[..first_st];
+                let first_chunk = result
+                    .split_once("\x1b\\")
+                    .map_or("", |(first_chunk, _)| first_chunk);
                 assert!(first_chunk.contains("a=T"));
                 assert!(first_chunk.contains("f=100"));
             }
