@@ -25,6 +25,15 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+// Minimal valid 1x1 PNG bytes
+const MIN_VALID_PNG: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+    0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+    0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+    0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+    0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
 // ============================================================================
 // Data Types & Structures
 // ============================================================================
@@ -59,7 +68,7 @@ pub struct AxNode {
     pub value: Option<String>,
     pub enabled: bool,
     pub focused: bool,
-    pub children: Vec<AxNode>,
+    pub children: Vec<Self>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,12 +113,14 @@ impl ComputerTool {
         }
     }
 
-    pub fn with_mock(mut self, mock: bool) -> Self {
+    #[must_use]
+    pub const fn with_mock(mut self, mock: bool) -> Self {
         self.mock_mode = Some(mock);
         self
     }
 
-    pub fn with_require_approval(mut self, require: bool) -> Self {
+    #[must_use]
+    pub const fn with_require_approval(mut self, require: bool) -> Self {
         self.require_approval = require;
         self
     }
@@ -122,10 +133,13 @@ impl ComputerTool {
     }
 
     fn record_audit(&self, action: &str, details: Value, allowed: bool) {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        let now_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         let entry = ComputerAuditEntry {
             timestamp_ms: now_ms,
@@ -148,7 +162,7 @@ impl ComputerTool {
 }
 
 #[async_trait]
-#[allow(clippy::unnecessary_literal_bound)]
+#[allow(clippy::unnecessary_literal_bound, clippy::too_many_lines)]
 impl Tool for ComputerTool {
     fn name(&self) -> &str {
         "computer"
@@ -228,6 +242,7 @@ impl Tool for ComputerTool {
         ToolEffects::write()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -367,11 +382,11 @@ impl Tool for ComputerTool {
             "screenshot" => {
                 let output_path_str = args
                     .get("output_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| {
-                        format!("screenshots/screenshot_{}.png", Uuid::new_v4().simple())
-                    });
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || format!("screenshots/screenshot_{}.png", Uuid::new_v4().simple()),
+                        ToString::to_string,
+                    );
 
                 let target_path = if Path::new(&output_path_str).is_absolute() {
                     PathBuf::from(&output_path_str)
@@ -385,34 +400,20 @@ impl Tool for ComputerTool {
                     })?;
                 }
 
-                // Minimal valid 1x1 PNG bytes
-                const MIN_VALID_PNG: &[u8] = &[
-                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49,
-                    0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06,
-                    0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
-                    0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D,
-                    0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42,
-                    0x60, 0x82,
-                ];
-
                 fs::write(&target_path, MIN_VALID_PNG).map_err(|e| {
                     Error::tool("computer", format!("failed to write screenshot PNG: {e}"))
                 })?;
 
                 let written_bytes = fs::metadata(&target_path)
-                    .map(|m| m.len())
-                    .unwrap_or(MIN_VALID_PNG.len() as u64);
+                    .map_or(MIN_VALID_PNG.len() as u64, |m| m.len());
 
-                let display_target = args.get("display_id").and_then(|v| v.as_u64());
-                let window_target = args.get("window_id").and_then(|v| v.as_u64());
+                let display_target = args.get("display_id").and_then(Value::as_u64);
+                let window_target = args.get("window_id").and_then(Value::as_u64);
 
                 let result_text = format!(
                     "Screenshot captured successfully to {}\n\
-                     Target: display={:?}, window={:?} | Size: {} bytes",
-                    target_path.display(),
-                    display_target,
-                    window_target,
-                    written_bytes
+                     Target: display={display_target:?}, window={window_target:?} | Size: {written_bytes} bytes",
+                    target_path.display()
                 );
 
                 Ok(ToolOutput {
@@ -431,8 +432,8 @@ impl Tool for ComputerTool {
             }
 
             "mouse_move" => {
-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                let x = args.get("x").and_then(Value::as_i64).unwrap_or(0);
+                let y = args.get("y").and_then(Value::as_i64).unwrap_or(0);
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {
@@ -445,8 +446,8 @@ impl Tool for ComputerTool {
             }
 
             "mouse_click" => {
-                let x = args.get("x").and_then(|v| v.as_i64());
-                let y = args.get("y").and_then(|v| v.as_i64());
+                let x = args.get("x").and_then(Value::as_i64);
+                let y = args.get("y").and_then(Value::as_i64);
                 let button = args
                     .get("button")
                     .and_then(|v| v.as_str())
@@ -472,11 +473,11 @@ impl Tool for ComputerTool {
             "mouse_drag" => {
                 let x = args
                     .get("x")
-                    .and_then(|v| v.as_i64())
+                    .and_then(Value::as_i64)
                     .ok_or_else(|| Error::tool("computer", "mouse_drag requires x parameter"))?;
                 let y = args
                     .get("y")
-                    .and_then(|v| v.as_i64())
+                    .and_then(Value::as_i64)
                     .ok_or_else(|| Error::tool("computer", "mouse_drag requires y parameter"))?;
 
                 Ok(ToolOutput {
@@ -526,7 +527,7 @@ impl Tool for ComputerTool {
             "ax_tree" => {
                 let window_id = args
                     .get("window_id")
-                    .and_then(|v| v.as_u64())
+                    .and_then(Value::as_u64)
                     .unwrap_or(101);
 
                 let root_node = AxNode {
@@ -599,11 +600,13 @@ impl Tool for ComputerTool {
                     Error::tool("computer", "clipboard_write requires text parameter")
                 })?;
 
-                let mut buf = self
-                    .clipboard_buffer
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *buf = text.to_string();
+                {
+                    let mut buf = self
+                        .clipboard_buffer
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *buf = text.to_string();
+                }
 
                 Ok(ToolOutput {
                     content: vec![ContentBlock::Text(TextContent {

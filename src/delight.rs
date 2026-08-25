@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
 /// Shimmer wave type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,6 +18,7 @@ pub enum ShimmerMode {
 }
 
 /// Compute shimmer brightness (0.0 .. 1.0) for a given character index and tick.
+#[allow(clippy::cast_precision_loss)]
 #[must_use]
 pub fn compute_shimmer_intensity(char_idx: usize, tick: u64, mode: ShimmerMode) -> f32 {
     let speed = 0.25;
@@ -26,7 +29,7 @@ pub fn compute_shimmer_intensity(char_idx: usize, tick: u64, mode: ShimmerMode) 
         ShimmerMode::Cosine => {
             let dist = ((char_idx as f32) - (phase % 40.0)).abs();
             if dist < width {
-                0.15 + 0.85 * (1.0 + (dist / width * std::f32::consts::PI).cos()) * 0.5
+                (0.85 * (1.0 + (dist / width * std::f32::consts::PI).cos())).mul_add(0.5, 0.15)
             } else {
                 0.15
             }
@@ -45,13 +48,12 @@ pub fn compute_shimmer_intensity(char_idx: usize, tick: u64, mode: ShimmerMode) 
 }
 
 /// Render a series of numbers into an ASCII/Unicode sparkline string.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 #[must_use]
 pub fn render_sparkline(values: &[f64]) -> String {
     if values.is_empty() {
         return String::new();
     }
-
-    const BARS: [char; 8] = [' ', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
 
     let first = values
         .iter()
@@ -100,31 +102,22 @@ pub struct Particle {
 }
 
 /// Fireworks animation state.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct FireworksState {
     pub particles: Vec<Particle>,
     pub frame_count: u32,
     pub is_active: bool,
 }
 
-impl Default for FireworksState {
-    fn default() -> Self {
-        Self {
-            particles: Vec::new(),
-            frame_count: 0,
-            is_active: false,
-        }
-    }
-}
-
 impl FireworksState {
+    #[allow(clippy::cast_precision_loss)]
     pub fn trigger_burst(&mut self, origin_x: f32, origin_y: f32, count: usize) {
         self.is_active = true;
         let glyphs = ['*', '✦', '✧', '•', '·', 'x'];
 
         for i in 0..count {
             let angle = (i as f32) / (count as f32) * 2.0 * std::f32::consts::PI;
-            let speed = 1.2 + (i % 3) as f32 * 0.4;
+            let speed = ((i % 3) as f32).mul_add(0.4, 1.2);
             let glyph = glyphs.get(i % glyphs.len()).copied().unwrap_or('*');
 
             self.particles.push(Particle {

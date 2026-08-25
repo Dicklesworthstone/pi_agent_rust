@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 pub const PMU_TELEMETRY_SCHEMA: &str = "pi.pmu.telemetry.v1";
 
 /// Hardware PMU counter measurements for an execution interval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct PmuSample {
     /// Total elapsed CPU cycles.
     pub cycles: u64,
@@ -32,21 +32,7 @@ pub struct PmuSample {
     pub backend_stall_cycles: u64,
 }
 
-impl Default for PmuSample {
-    fn default() -> Self {
-        Self {
-            cycles: 0,
-            instructions: 0,
-            llc_references: 0,
-            llc_misses: 0,
-            branch_instructions: 0,
-            branch_misses: 0,
-            frontend_stall_cycles: 0,
-            backend_stall_cycles: 0,
-        }
-    }
-}
-
+#[allow(clippy::cast_precision_loss)]
 impl PmuSample {
     /// Instructions retired per clock cycle (IPC). Higher is better.
     #[must_use]
@@ -137,7 +123,7 @@ impl Default for PmuRegressionBudget {
 }
 
 /// Evaluation outcome from checking a [`PmuSample`] against a [`PmuRegressionBudget`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PmuBudgetVerdict {
     /// True if all microarchitectural thresholds were satisfied.
     pub passed: bool,
@@ -152,6 +138,14 @@ impl PmuRegressionBudget {
     #[must_use]
     pub fn evaluate(&self, sample: &PmuSample) -> PmuBudgetVerdict {
         let mut violations = Vec::new();
+
+        let ipc = sample.ipc();
+        if sample.cycles > 1000 && ipc < self.min_ipc {
+            violations.push(format!(
+                "IPC {:.2} falls below budget minimum {:.2}",
+                ipc, self.min_ipc
+            ));
+        }
 
         let llc_rate = sample.llc_miss_rate();
         if llc_rate > self.max_llc_miss_rate {
@@ -177,14 +171,6 @@ impl PmuRegressionBudget {
                 "Total stall ratio {:.2}% exceeds budget max {:.2}%",
                 stall_ratio * 100.0,
                 self.max_stall_ratio * 100.0
-            ));
-        }
-
-        let ipc = sample.ipc();
-        if ipc < self.min_ipc && sample.cycles > 1000 {
-            violations.push(format!(
-                "IPC {:.2} falls below budget minimum {:.2}",
-                ipc, self.min_ipc
             ));
         }
 
@@ -227,6 +213,7 @@ pub struct PmuOptimizationOpportunity {
 #[derive(Debug, Default, Clone)]
 pub struct PmuOpportunityRanker;
 
+#[allow(clippy::cast_precision_loss)]
 impl PmuOpportunityRanker {
     /// Analyze a named component's [`PmuSample`] and evaluate optimization potential.
     #[must_use]
