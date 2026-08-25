@@ -14303,6 +14303,66 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_idle_boundary_preserves_full_primary_follow_up_batch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+
+            let expected = (0..128)
+                .map(|index| format!("ordinary follow-up {index}"))
+                .collect::<Vec<_>>();
+            let queued_follow_up = Arc::new(StdTestMutex::new(Some(
+                expected
+                    .iter()
+                    .map(|text| {
+                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
+                    Box::pin(async move {
+                        follow_up_fetcher_state
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
+
+            agent
+                .run_with_message_with_abort(user_message("initial turn"), None, |_| {})
+                .await
+                .expect("ordinary follow-up delivery");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(calls.len(), 2);
+            let second_call = &calls[1].messages;
+            assert!(second_call.len() >= expected.len());
+            let delivered = &second_call[second_call.len() - expected.len()..];
+            for (message, expected_text) in delivered.iter().zip(&expected) {
+                assert_user_text(message, expected_text);
+            }
+        });
+    }
+
+    #[test]
     fn fetched_message_scans_only_explicit_authored_source() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
