@@ -81,6 +81,29 @@ async fn recv_rpc_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result
     }
 }
 
+async fn recv_rpc_command_response(
+    rx: &Arc<Mutex<Receiver<String>>>,
+    expected_id: &str,
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    let started = Instant::now();
+    loop {
+        let line = recv_rpc_line(rx, label).await?;
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+            if value.get("type").and_then(serde_json::Value::as_str) == Some("response")
+                && value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id)
+            {
+                return Ok(value);
+            }
+        }
+        if started.elapsed() >= Duration::from_secs(10) {
+            return Err(format!(
+                "{label}: timed out waiting for response id {expected_id}"
+            ));
+        }
+    }
+}
+
 /// Records the options + system prompt of every request, then streams a
 /// one-line assistant reply.
 #[derive(Default, Clone)]
@@ -719,13 +742,9 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             .await
             .expect("send RPC steer");
 
-        let ack2: serde_json::Value = serde_json::from_str(
-            recv_rpc_line(&out_rx, "RPC steer acknowledgment")
-                .await
-                .expect("receive RPC steer acknowledgment")
-                .trim(),
-        )
-        .expect("parse ack 2");
+        let ack2 = recv_rpc_command_response(&out_rx, "2", "RPC steer acknowledgment")
+            .await
+            .expect("receive RPC steer acknowledgment");
         assert_eq!(ack2["type"], "response");
         assert_eq!(ack2["command"], "prompt");
         assert_eq!(ack2["success"], true);
@@ -739,13 +758,10 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             .await
             .expect("send RPC follow-up");
 
-        let ack3: serde_json::Value = serde_json::from_str(
-            recv_rpc_line(&out_rx, "RPC follow-up acknowledgment")
+        let ack3 =
+            recv_rpc_command_response(&out_rx, "3", "RPC follow-up acknowledgment")
                 .await
-                .expect("receive RPC follow-up acknowledgment")
-                .trim(),
-        )
-        .expect("parse ack 3");
+                .expect("receive RPC follow-up acknowledgment");
         assert_eq!(ack3["type"], "response");
         assert_eq!(ack3["command"], "follow_up");
         assert_eq!(ack3["success"], true);
