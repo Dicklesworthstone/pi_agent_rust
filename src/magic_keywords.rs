@@ -159,7 +159,8 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         return None;
     }
     if bytes.get(start..start + 4) == Some(b"<!--") {
-        let end = message[start + 4..]
+        let tail = message.get(start + 4..)?;
+        let end = tail
             .find("-->")
             .map_or(bytes.len(), |relative| start + 4 + relative + 3);
         return Some((end, HtmlMarkup::Opaque));
@@ -172,11 +173,10 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         } else {
             ">"
         };
-        let end = message[index + 1..]
-            .find(terminator)
-            .map_or(bytes.len(), |relative| {
-                index + 1 + relative + terminator.len()
-            });
+        let tail = message.get(index + 1..)?;
+        let end = tail.find(terminator).map_or(bytes.len(), |relative| {
+            index + 1 + relative + terminator.len()
+        });
         return Some((end, HtmlMarkup::Opaque));
     }
 
@@ -200,7 +200,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
         Some(b'/') if bytes.get(index + 1) == Some(&b'>') => {}
         _ => return None,
     }
-    let name = message[name_start..index].to_ascii_lowercase();
+    let name = message.get(name_start..index)?.to_ascii_lowercase();
 
     let mut quote = None;
     let mut end = None;
@@ -220,7 +220,7 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
     if closing {
         return Some((end, HtmlMarkup::Closing { name }));
     }
-    let before_close = message[start..end - 1].trim_end();
+    let before_close = message.get(start..end - 1)?.trim_end();
     Some((
         end,
         HtmlMarkup::Opening {
@@ -231,18 +231,27 @@ fn parse_html_markup(message: &str, start: usize) -> Option<(usize, HtmlMarkup)>
 }
 
 fn run_len(bytes: &[u8], start: usize, marker: u8) -> usize {
-    bytes[start..]
+    bytes
+        .get(start..)
+        .unwrap_or_default()
         .iter()
         .take_while(|byte| **byte == marker)
         .count()
 }
 
 fn fence_close_has_only_indent_after(message: &str, after_run: usize) -> bool {
-    message[after_run..]
-        .split_once('\n')
-        .map_or(&message[after_run..], |(line_tail, _)| line_tail)
+    let tail = message.get(after_run..).unwrap_or_default();
+    tail.split_once('\n')
+        .map_or(tail, |(line_tail, _)| line_tail)
         .bytes()
         .all(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+}
+
+fn char_len_at(message: &str, index: usize) -> usize {
+    message
+        .get(index..)
+        .and_then(|tail| tail.chars().next())
+        .map_or(message.len().saturating_sub(index).max(1), char::len_utf8)
 }
 
 /// Detect enabled keywords in a user message. Returns each action at most
@@ -319,7 +328,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
 
         if line_indented_code && html_stack.is_empty() {
             line_start = false;
-            index += message[index..].chars().next().map_or(1, char::len_utf8);
+            index += char_len_at(message, index);
             continue;
         }
 
@@ -339,7 +348,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                 }
             }
             line_start = false;
-            index += message[index..].chars().next().map_or(1, char::len_utf8);
+            index += char_len_at(message, index);
             continue;
         }
 
@@ -351,7 +360,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
                 }
                 index += count;
             } else {
-                index += message[index..].chars().next().map_or(1, char::len_utf8);
+                index += char_len_at(message, index);
             }
             line_start = false;
             continue;
@@ -403,7 +412,7 @@ pub fn detect(message: &str, settings: Option<&KeywordSettings>) -> Vec<KeywordA
             continue;
         }
 
-        let Some(ch) = message[index..].chars().next() else {
+        let Some(ch) = message.get(index..).and_then(|tail| tail.chars().next()) else {
             break;
         };
         index += ch.len_utf8();

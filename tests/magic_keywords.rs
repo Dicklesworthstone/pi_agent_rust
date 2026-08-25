@@ -57,18 +57,23 @@ fn block_on_local<F: std::future::Future>(future: F) -> F::Output {
     runtime.block_on(future)
 }
 
-async fn recv_rpc_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> String {
+async fn recv_rpc_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<String, String> {
     let started = Instant::now();
     loop {
-        match rx.lock().expect("RPC output lock").try_recv() {
-            Ok(line) => return line,
-            Err(TryRecvError::Disconnected) => panic!("{label}: RPC output disconnected"),
+        let recv_result = match rx.lock() {
+            Ok(receiver) => receiver.try_recv(),
+            Err(poisoned) => poisoned.into_inner().try_recv(),
+        };
+        match recv_result {
+            Ok(line) => return Ok(line),
+            Err(TryRecvError::Disconnected) => {
+                return Err(format!("{label}: RPC output disconnected"));
+            }
             Err(TryRecvError::Empty) => {}
         }
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "{label}: timed out waiting for RPC output"
-        );
+        if started.elapsed() >= Duration::from_secs(10) {
+            return Err(format!("{label}: timed out waiting for RPC output"));
+        }
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
     }
 }
@@ -382,10 +387,12 @@ fn block_keyword_activation_lands_in_session_custom_entry() {
     assert_eq!(telemetry["schema"], json!("pi.magic_keyword.v1"));
     assert_eq!(telemetry["word"], json!("ultrathink"));
     assert_eq!(telemetry["action"], json!("ultrathink"));
+    drop(guard);
     finish_case(&harness, case);
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
     let case = "rpc_prompt_observes_clamped_thinking_directive_and_telemetry";
     let harness = TestHarness::new(case);
@@ -442,18 +449,20 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         let ack: serde_json::Value = serde_json::from_str(
             recv_rpc_line(&out_rx, "RPC prompt acknowledgment")
                 .await
+                .expect("receive RPC prompt acknowledgment")
                 .trim(),
         )
         .expect("parse RPC prompt acknowledgment");
         assert_eq!(ack["type"], "response");
         assert_eq!(ack["command"], "prompt");
-        assert_eq!(ack["success"], true);
+        assert!(ack["success"].as_bool().unwrap_or(false));
 
         let mut saw_agent_end = false;
         for _ in 0..100 {
             let event: serde_json::Value = serde_json::from_str(
                 recv_rpc_line(&out_rx, "RPC magic-keyword event")
                     .await
+                    .expect("receive RPC magic-keyword event")
                     .trim(),
             )
             .expect("parse RPC event");
@@ -464,7 +473,10 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         }
         assert!(saw_agent_end, "RPC prompt never reached agent_end");
         drop(in_tx);
-        assert!(server.await.is_ok(), "RPC server did not stop cleanly");
+        server
+            .await
+            .expect("RPC server task join")
+            .expect("RPC server result");
     });
 
     let captured = capture.lock().expect("capture").clone();
@@ -487,5 +499,6 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
                     })
         )
     }));
+    drop(guard);
     finish_case(&harness, case);
 }
