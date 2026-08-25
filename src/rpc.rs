@@ -3088,6 +3088,7 @@ async fn preserve_terminal_rpc_input(
             Ok(inner) => inner,
             Err(err) => {
                 let lock_error = format!("inner session lock failed: {err}");
+                drop(guard);
                 restore_terminal_rpc_input(shared_state, steering, follow_up, cx)
                     .await
                     .map_err(|restore_err| Error::session(format!("{lock_error}; {restore_err}")))?;
@@ -3198,7 +3199,7 @@ async fn run_prompt_with_retry(
                             true,
                             Some(abort_signal),
                             move || {
-                                let source_ready = expected_fetch.as_ref().is_some_and(
+                                let source_ready = expected_fetch.as_ref().is_none_or(
                                     |(generation, expected)| {
                                         generation.load(Ordering::SeqCst) == *expected
                                     },
@@ -3299,6 +3300,17 @@ async fn run_prompt_with_retry(
                         }
                     }
                 } else {
+                    let internally_staged_follow_up =
+                        match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
+                            Ok(guard) => guard.agent.has_staged_follow_up(),
+                            Err(err) => {
+                                final_error = Some(format!(
+                                    "session lock failed while checking staged input: {err}"
+                                ));
+                                final_error_hints = None;
+                                break;
+                            }
+                        };
                     let late_queued_input =
                         match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await {
                             Ok(state) if !state.steering.is_empty() => Some((false, None)),
@@ -3307,6 +3319,7 @@ async fn run_prompt_with_retry(
                                 let expected = generation.load(Ordering::SeqCst).wrapping_add(1);
                                 Some((true, Some((generation, expected))))
                             }
+                            Ok(_) if internally_staged_follow_up => Some((true, None)),
                             Ok(_) => None,
                             Err(err) => {
                                 final_error =

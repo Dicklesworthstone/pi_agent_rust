@@ -92,6 +92,7 @@ async fn recv_rpc_command_response(
     rx: &Arc<Mutex<Receiver<String>>>,
     expected_id: &str,
     label: &str,
+    observed_events: &mut Vec<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -104,6 +105,7 @@ async fn recv_rpc_command_response(
         {
             return Ok(value);
         }
+        observed_events.push(value);
     }
 }
 
@@ -706,21 +708,22 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
     runtime.block_on(async {
         let scenario = async {
             let options = RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
-            available_models: Vec::new(),
-            scoped_models: Vec::new(),
-            cli_api_key: None,
-            auth,
-            runtime_handle: handle.clone(),
-            ask_tool: None,
-        };
-        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
-        let out_rx = Arc::new(Mutex::new(out_rx));
-        let server =
-            handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
-        let cx = asupersync::Cx::for_testing();
+                config: Config::default(),
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth,
+                runtime_handle: handle.clone(),
+                ask_tool: None,
+            };
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server =
+                handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
+            let cx = asupersync::Cx::for_testing();
+            let mut observed_events = Vec::new();
 
         // Keep prompt 1 inside the provider while both queued messages arrive.
         in_tx
@@ -731,13 +734,14 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             .await
             .expect("send RPC prompt 1");
 
-        let ack1: serde_json::Value = serde_json::from_str(
-            recv_rpc_line(&out_rx, "RPC prompt 1 acknowledgment")
-                .await
-                .expect("receive RPC prompt 1 acknowledgment")
-                .trim(),
+        let ack1 = recv_rpc_command_response(
+            &out_rx,
+            "1",
+            "RPC prompt 1 acknowledgment",
+            &mut observed_events,
         )
-        .expect("parse ack 1");
+        .await
+        .expect("receive RPC prompt 1 acknowledgment");
         assert_eq!(ack1["type"], "response");
         assert_eq!(ack1["id"], "1");
         assert_eq!(ack1["command"], "prompt");
@@ -758,9 +762,14 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             .await
             .expect("send RPC steer");
 
-        let ack2 = recv_rpc_command_response(&out_rx, "2", "RPC steer acknowledgment")
-            .await
-            .expect("receive RPC steer acknowledgment");
+        let ack2 = recv_rpc_command_response(
+            &out_rx,
+            "2",
+            "RPC steer acknowledgment",
+            &mut observed_events,
+        )
+        .await
+        .expect("receive RPC steer acknowledgment");
         assert_eq!(ack2["type"], "response");
         assert_eq!(ack2["command"], "prompt");
         assert_eq!(ack2["success"], true);
@@ -769,15 +778,19 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
         in_tx
             .send(
                 &cx,
-                r#"{"id":"3","type":"follow_up","message":"please orchestrate this follow-up"}"#.to_string(),
+                r#"{"id":"3","type":"follow_up","message":"please workflowz and orchestrate this follow-up"}"#.to_string(),
             )
             .await
             .expect("send RPC follow-up");
 
-        let ack3 =
-            recv_rpc_command_response(&out_rx, "3", "RPC follow-up acknowledgment")
-                .await
-                .expect("receive RPC follow-up acknowledgment");
+        let ack3 = recv_rpc_command_response(
+            &out_rx,
+            "3",
+            "RPC follow-up acknowledgment",
+            &mut observed_events,
+        )
+        .await
+        .expect("receive RPC follow-up acknowledgment");
         assert_eq!(ack3["type"], "response");
         assert_eq!(ack3["command"], "follow_up");
         assert_eq!(ack3["success"], true);
@@ -797,6 +810,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
                     .trim(),
             )
             .expect("parse queued turn event");
+            observed_events.push(event.clone());
             if event["type"] == "agent_end" {
                 assert!(
                     event["error"].is_null(),
@@ -807,6 +821,12 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
             }
         }
         assert!(saw_agent_end, "queued steering/follow-up turn completed");
+        let agent_end_events = observed_events
+            .iter()
+            .filter(|event| event["type"] == "agent_end")
+            .collect::<Vec<_>>();
+        assert_eq!(agent_end_events.len(), 1, "unexpected lifecycle events");
+        assert!(agent_end_events[0]["error"].is_null());
 
         drop(in_tx);
         server.await.expect("RPC server task join");
@@ -825,42 +845,67 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
     assert_eq!(captured.thinking[0], Some(ThinkingLevel::Off));
     assert_eq!(captured.thinking.get(1), Some(&Some(expected_max)));
     assert_eq!(captured.thinking[2], Some(ThinkingLevel::Off));
-    let last_user_text = |call: usize| match captured.messages[call].last() {
-        Some(Message::User(UserMessage {
-            content: UserContent::Text(text),
-            ..
-        })) => text.as_str(),
-        other => panic!("RPC provider call {call} did not end with a text user message: {other:?}"),
+    let user_texts = |call: usize| {
+        captured.messages[call]
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
     };
-    assert_eq!(last_user_text(0), "turn 1 normal");
     assert_eq!(
-        last_user_text(1),
-        "please ultrathink and workflowz this steering input"
+        user_texts(0),
+        vec!["turn 1 normal"],
+        "the initial request must contain exactly its authored prompt"
     );
-    assert_eq!(last_user_text(2), "please orchestrate this follow-up");
-    assert!(
+    assert_eq!(
+        user_texts(1),
+        vec![
+            "turn 1 normal",
+            "please ultrathink and workflowz this steering input"
+        ],
+        "the steering request must append its message exactly once"
+    );
+    assert_eq!(
+        user_texts(2),
+        vec![
+            "turn 1 normal",
+            "please ultrathink and workflowz this steering input",
+            "please workflowz and orchestrate this follow-up"
+        ],
+        "the follow-up request must preserve exact order without duplicates"
+    );
+    assert_eq!(
         captured.system_prompts[1]
             .as_deref()
-            .is_some_and(|prompt| prompt.contains("`workflowz` for this turn")),
-        "RPC turn 2 must observe queued steering workflowz directive"
+            .map_or(0, |prompt| prompt.matches("`workflowz` for this turn").count()),
+        1,
+        "RPC turn 2 must inject the steering workflowz directive exactly once"
     );
-    assert!(
+    assert_eq!(
         captured.system_prompts[2]
             .as_deref()
-            .is_some_and(|prompt| prompt.contains("`orchestrate` for this turn")),
-        "RPC turn 3 must observe the queued follow-up orchestrate directive"
+            .map_or(0, |prompt| prompt.matches("`workflowz` for this turn").count()),
+        1,
+        "the repeated keyword must activate once in the new logical turn"
     );
-    assert!(
+    assert_eq!(
+        captured.system_prompts[2]
+            .as_deref()
+            .map_or(0, |prompt| prompt.matches("`orchestrate` for this turn").count()),
+        1,
+        "RPC turn 3 must inject its orchestrate directive exactly once"
+    );
+    assert_eq!(
         captured.system_prompts[1]
             .as_deref()
-            .is_none_or(|prompt| !prompt.contains("`orchestrate` for this turn")),
+            .map_or(0, |prompt| prompt.matches("`orchestrate` for this turn").count()),
+        0,
         "follow-up directives must not leak into the steering request"
-    );
-    assert!(
-        captured.system_prompts[2]
-            .as_deref()
-            .is_none_or(|prompt| !prompt.contains("`workflowz` for this turn")),
-        "steering directives must not leak into the follow-up request"
     );
 
     let guard = session.try_lock().expect("session telemetry lock");
@@ -887,6 +932,11 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
                 Some("pi.magic_keyword.v1".to_string()),
                 Some("ultrathink".to_string()),
                 Some("ultrathink".to_string()),
+            ),
+            (
+                Some("pi.magic_keyword.v1".to_string()),
+                Some("workflowz".to_string()),
+                Some("workflowz".to_string()),
             ),
             (
                 Some("pi.magic_keyword.v1".to_string()),
