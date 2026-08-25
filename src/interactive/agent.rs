@@ -3203,8 +3203,7 @@ mod stream_delta_batcher_tests {
     #[allow(clippy::too_many_lines)]
     fn interactive_text_turn_persists_keyword_and_repair_ledgers() {
         let temp = tempfile::tempdir().expect("tempdir");
-        std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
-            .expect("write fixture");
+        std::fs::write(temp.path().join("fixture.txt"), "hello-fixture").expect("write fixture");
         let provider = Arc::new(InteractiveRepairProvider {
             calls: AtomicUsize::new(0),
         });
@@ -3249,20 +3248,21 @@ mod stream_delta_batcher_tests {
                 }
             }
         }
-        assert!(saw_done, "interactive turn did not finish before the deadline");
+        assert!(
+            saw_done,
+            "interactive turn did not finish before the deadline"
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 
         let persisted_path = runtime().block_on(async {
             let cx = Cx::for_request();
-            let agent_guard =
-                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
-                    .await
-                    .expect("agent completion lock");
+            let agent_guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                .await
+                .expect("agent completion lock");
             drop(agent_guard);
-            let session_guard =
-                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
-                    .await
-                    .expect("session completion lock");
+            let session_guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("session completion lock");
             session_guard
                 .path
                 .clone()
