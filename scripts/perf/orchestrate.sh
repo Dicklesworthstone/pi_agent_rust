@@ -1524,7 +1524,7 @@ collect_jsonl() {
 }
 
 # Standard JSONL output paths
-collect_jsonl "$TARGET_DIR/perf/extension_bench.jsonl" "extension_bench.jsonl"
+collect_jsonl "$OUTPUT_DIR/results/perf_bench_harness/extension_bench.jsonl" "extension_bench.jsonl"
 collect_jsonl "$TARGET_DIR/perf/ext_bench_harness.jsonl" "ext_bench_harness.jsonl"
 collect_jsonl "$TARGET_DIR/perf/scenario_runner.jsonl" "scenario_runner.jsonl"
 collect_jsonl "$TARGET_DIR/perf/pijs_workload.jsonl" "pijs_workload.jsonl"
@@ -2095,6 +2095,7 @@ manifest_path = output_dir / "manifest.json"
 baseline_path = output_dir / "results" / "baseline_variance_confidence.json"
 scenario_runner_path = output_dir / "results" / "scenario_runner.jsonl"
 workload_path = output_dir / "results" / "pijs_workload.jsonl"
+extension_bench_path = output_dir / "results" / "extension_bench.jsonl"
 ext_bench_path = output_dir / "results" / "ext_bench_harness.jsonl"
 ext_bench_report_path = output_dir / "results" / "ext_bench_harness_report.json"
 legacy_path = output_dir / "results" / "legacy_extension_workloads.jsonl"
@@ -2255,6 +2256,12 @@ scenario_runner_records, scenario_dataset = admit_dataset(
 workload_records, workload_dataset = admit_dataset(
     workload_path, load_jsonl(workload_path), "correlation_id", True
 )
+extension_bench_records, extension_bench_dataset = admit_dataset(
+    extension_bench_path,
+    load_jsonl(extension_bench_path),
+    "correlation_id",
+    "perf_bench_harness" in suite_result_by_name,
+)
 ext_bench_records, ext_bench_dataset = admit_dataset(
     ext_bench_path, load_jsonl(ext_bench_path), "correlation_id", False
 )
@@ -2264,6 +2271,7 @@ legacy_records, legacy_dataset = admit_dataset(
 source_datasets = [
     scenario_dataset,
     workload_dataset,
+    extension_bench_dataset,
     ext_bench_dataset,
     legacy_dataset,
 ]
@@ -2301,6 +2309,17 @@ if not cold_samples_ms:
         if p95_ms is not None:
             cold_samples_ms.append(p95_ms)
 
+if not cold_samples_ms:
+    for record in extension_bench_records:
+        if str(record.get("scenario", "")).strip() != "cold_start":
+            continue
+        summary = record.get("summary", {})
+        if not isinstance(summary, dict):
+            continue
+        p95_ms = parse_float(summary.get("p95_ms"))
+        if p95_ms is not None:
+            cold_samples_ms.append(p95_ms)
+
 per_call_samples_us: list[float] = []
 for record in scenario_runner_records:
     scenario = str(record.get("scenario", "")).strip()
@@ -2309,6 +2328,15 @@ for record in scenario_runner_records:
     per_call_us = parse_float(record.get("per_call_us"))
     if per_call_us is not None:
         per_call_samples_us.append(per_call_us)
+
+if not per_call_samples_us:
+    for record in extension_bench_records:
+        scenario = str(record.get("scenario", "")).strip()
+        if scenario not in {"tool_call", "event_hook"}:
+            continue
+        per_call_us = parse_float(record.get("per_call_us"))
+        if per_call_us is not None:
+            per_call_samples_us.append(per_call_us)
 
 if not per_call_samples_us:
     for record in workload_records:
@@ -2524,7 +2552,12 @@ layers = [
         ratio_basis(cold_node_ratio, "node_legacy_extension_workloads"),
         cold_bun_ratio,
         ratio_basis(cold_bun_ratio, "bun_legacy_extension_workloads"),
-        [ext_bench_path, ext_bench_report_path, scenario_runner_path],
+        [
+            ext_bench_path,
+            ext_bench_report_path,
+            scenario_runner_path,
+            extension_bench_path,
+        ],
         "Cold-load wins are attribution-only and must not be promoted as global UX claims.",
     ),
     build_layer(
@@ -2539,7 +2572,7 @@ layers = [
         ratio_basis(per_call_node_ratio, "node_legacy_extension_workloads"),
         per_call_bun_ratio,
         ratio_basis(per_call_bun_ratio, "bun_legacy_extension_workloads"),
-        [scenario_runner_path, workload_path],
+        [scenario_runner_path, extension_bench_path, workload_path],
         "Per-call improvements are diagnostic and cannot substitute for full-session outcomes.",
     ),
     build_layer(
