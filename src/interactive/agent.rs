@@ -2296,6 +2296,16 @@ After approving access in the browser, press Enter in Pi to complete login."
         content: Vec<ContentBlock>,
         display: &str,
     ) -> Option<Cmd> {
+        self.submit_content_with_display_and_keyword_source(content, display, None)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn submit_content_with_display_and_keyword_source(
+        &mut self,
+        content: Vec<ContentBlock>,
+        display: &str,
+        keyword_scan_source: Option<String>,
+    ) -> Option<Cmd> {
         if content.is_empty() {
             return None;
         }
@@ -2448,6 +2458,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             } else {
                 agent_guard.set_system_prompt(base_system_prompt.clone());
             }
+            agent_guard.set_magic_keyword_scan_override(keyword_scan_source);
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -2676,6 +2687,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
             };
 
+            let keyword_scan_source = message_for_agent.clone();
             let mut text = processed.text;
             if !message_for_agent.trim().is_empty() {
                 text.push_str(&message_for_agent);
@@ -2692,7 +2704,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.history.push(message_owned.clone());
 
             let display = content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display);
+            return self.submit_content_with_display_and_keyword_source(
+                content,
+                &display,
+                Some(keyword_scan_source),
+            );
         }
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);

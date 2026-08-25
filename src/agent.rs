@@ -1293,6 +1293,11 @@ pub struct Agent {
     /// effects without duplicating durable telemetry.
     retry_keyword_activations: Vec<crate::magic_keywords::KeywordActivation>,
 
+    /// One-shot, caller-supplied prose provenance for the next prompt. This
+    /// keeps generated attachment wrappers and file bytes visible to the
+    /// model while excluding them from behavior-changing keyword scans.
+    magic_keyword_scan_override: Option<String>,
+
     /// Highest effort the active model can accept. The session wrapper keeps
     /// this synchronized with the model registry so `ultrathink` cannot send
     /// a raw unsupported `Max` request.
@@ -1363,6 +1368,7 @@ impl Agent {
             tool_call_dialect: crate::dialects::Dialect::Native,
             keyword_ledger: Vec::new(),
             retry_keyword_activations: Vec::new(),
+            magic_keyword_scan_override: None,
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
         }
@@ -1592,6 +1598,13 @@ impl Agent {
     /// Set the model-clamped target used when a turn contains `ultrathink`.
     pub const fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
         self.keyword_max_thinking_level = level;
+    }
+
+    /// Override the prose scanned for magic keywords on the next non-resume
+    /// run. Attachment-aware callers pass only the user-authored/template
+    /// prose, excluding generated `<file>` wrappers and attached file bytes.
+    pub fn set_magic_keyword_scan_override(&mut self, source: Option<String>) {
+        self.magic_keyword_scan_override = source;
     }
 
     /// Install the model-catalog-selected tool-call dialect.
@@ -2138,8 +2151,16 @@ impl Agent {
                     .join("\n"),
             ),
         };
+        self.apply_magic_keywords_for_text(&scan_text, turn_keyword_words);
+    }
+
+    fn apply_magic_keywords_for_text(
+        &mut self,
+        scan_text: &str,
+        turn_keyword_words: &mut std::collections::HashSet<String>,
+    ) {
         let hits: Vec<_> =
-            crate::magic_keywords::detect(&scan_text, self.config.keyword_settings.as_ref())
+            crate::magic_keywords::detect(scan_text, self.config.keyword_settings.as_ref())
                 .into_iter()
                 .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
                 .collect();
@@ -2188,13 +2209,20 @@ impl Agent {
             .await;
         on_event(agent_start_event);
 
+        let mut keyword_scan_override = self.magic_keyword_scan_override.take();
         for prompt in prompts {
             // Magic keywords (bd-cv653.3.6): pre-send prose scan of the user
             // message. ultrathink raises the turn's thinking level to the
             // active model's pre-clamped maximum; orchestrate/workflowz/custom words
             // append their directive to the system prompt (appended, never
             // inserted, so provider prompt caches stay valid).
-            self.apply_magic_keywords_for_message(&prompt, &mut turn_keyword_words);
+            if matches!(prompt, Message::User(_))
+                && let Some(source) = keyword_scan_override.take()
+            {
+                self.apply_magic_keywords_for_text(&source, &mut turn_keyword_words);
+            } else {
+                self.apply_magic_keywords_for_message(&prompt, &mut turn_keyword_words);
+            }
             self.messages.push(prompt.clone());
             on_event(AgentEvent::MessageStart {
                 message: prompt.clone(),

@@ -4357,6 +4357,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 }
             };
 
+            let keyword_scan_source = message_for_agent.clone();
             let mut text = processed.text;
             if !message_for_agent.trim().is_empty() {
                 text.push_str(&message_for_agent);
@@ -4378,7 +4379,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
             self.history.push(history_entry);
             let display = super::conversation::content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display);
+            return self.submit_content_with_display_and_keyword_source(
+                content,
+                &display,
+                Some(keyword_scan_source),
+            );
         }
 
         if message_for_agent.is_empty() {
