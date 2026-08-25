@@ -1105,6 +1105,25 @@ JSON
 JSON
     ;;
   perf_bench_harness)
+    case " $* " in
+      *" nextest run "*) ;;
+      *)
+        echo "perf_bench_harness did not use the RCH nextest artifact path" >&2
+        exit 68
+        ;;
+    esac
+    if [[ -z "${BENCH_OUTPUT_TARGET_SUBDIR:-}" ]]; then
+      echo "perf_bench_harness omitted BENCH_OUTPUT_TARGET_SUBDIR" >&2
+      exit 69
+    fi
+    if [[ "${PI_FAKE_DROP_RCH_EXTENSION_ARTIFACT:-0}" != "1" ]]; then
+      mkdir -p "$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR"
+      cat >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl" <<'JSON'
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","git_commit":"01234567","features":[],"config_hash":"stub"},"timestamp":"2026-08-25T00:00:00Z"}
+JSON
+      printf '%s\n' '# fake extension benchmark summary' \
+        >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench_summary.md"
+    fi
     cat >"$target_dir/perf/pijs_workload.jsonl" <<'JSON'
 {"schema":"pi.perf.workload.v1","scenario":"200x10","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":1200,"per_call_us":45,"calls_per_sec":1666}
 JSON
@@ -1228,6 +1247,13 @@ case "${1:-}" in
       echo "rch exec was not placed in fail-closed proof mode" >&2
       exit 65
     fi
+    case ",${RCH_ENV_ALLOWLIST:-}," in
+      *",BENCH_OUTPUT_TARGET_SUBDIR,"*) ;;
+      *)
+        echo "RCH_ENV_ALLOWLIST omitted BENCH_OUTPUT_TARGET_SUBDIR" >&2
+        exit 66
+        ;;
+    esac
     shift
     if [[ "${1:-}" == "--" ]]; then
       shift
@@ -7627,6 +7653,54 @@ fn assert_orchestrate_success(output: &std::process::Output) {
         "orchestrate.sh should succeed with stub toolchain. stdout={}\nstderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain();
+    assert_orchestrate_success(&output);
+
+    let artifact_path = temp_root
+        .join("run")
+        .join("results")
+        .join("perf_bench_harness")
+        .join("extension_bench.jsonl");
+    let artifact = fs::read_to_string(&artifact_path)
+        .expect("RCH perf harness artifact must be copied from target/nextest");
+    let first_row: Value = serde_json::from_str(
+        artifact
+            .lines()
+            .next()
+            .expect("retrieved extension benchmark artifact must be non-empty"),
+    )
+    .expect("retrieved extension benchmark artifact must contain JSONL");
+    assert_eq!(
+        first_row["schema"].as_str(),
+        Some("pi.ext.rust_bench.v1")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_fails_when_nextest_artifact_is_missing() {
+    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_DROP_RCH_EXTENSION_ARTIFACT",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must fail when nextest returns without the JSONL artifact"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("without retrieving extension_bench.jsonl"),
+        "missing-artifact failure must name the failed RCH writeback postcondition: {combined}"
     );
 }
 

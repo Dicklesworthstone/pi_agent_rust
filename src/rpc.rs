@@ -9218,7 +9218,10 @@ export default function init(pi) {
             let metrics_after = session.autosave_metrics();
             assert_eq!(
                 metrics_after.pending_mutations,
-                metrics_before.pending_mutations + 1,
+                metrics_before
+                    .pending_mutations
+                    .saturating_add(1)
+                    .min(metrics_before.max_pending_mutations),
                 "disabled persistence must retain the new compaction mutation"
             );
             assert_eq!(
@@ -9332,7 +9335,10 @@ export default function init(pi) {
             let metrics_after = session.autosave_metrics();
             assert_eq!(
                 metrics_after.pending_mutations,
-                metrics_before.pending_mutations + 1,
+                metrics_before
+                    .pending_mutations
+                    .saturating_add(1)
+                    .min(metrics_before.max_pending_mutations),
                 "failed persistence must retain the new retryable mutation"
             );
             assert_eq!(

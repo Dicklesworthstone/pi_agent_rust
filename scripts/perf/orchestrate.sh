@@ -380,6 +380,7 @@ fi
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   for required_env in \
     BENCH_OUTPUT_DIR \
+    BENCH_OUTPUT_TARGET_SUBDIR \
     PERF_REGRESSION_OUTPUT \
     PERF_RELEASE_BINARY_PATH \
     CI_CORRELATION_ID \
@@ -1089,6 +1090,7 @@ run_test_suite() {
   local suite_name="$1"
   local target_name="$2"
   local suite_start suite_end suite_elapsed exit_code
+  local rch_target_subdir=""
 
   log_step "Running suite: $suite_name (target=$target_name)"
   suite_start=$(epoch_ms)
@@ -1097,16 +1099,50 @@ run_test_suite() {
   mkdir -p "$result_dir"
 
   exit_code=0
-  BENCH_OUTPUT_DIR="$result_dir" \
-  PERF_REGRESSION_OUTPUT="$result_dir" \
-  PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
-  CI_CORRELATION_ID="$CORRELATION_ID" \
-  VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
-  VERGEN_GIT_DIRTY="$GIT_DIRTY" \
-  RUST_TEST_THREADS="$PARALLELISM" \
-    "${CARGO_RUNNER_ARGS[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
-    >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
-    || exit_code=$?
+  if [[ "$CARGO_RUNNER_MODE" == "rch" && "$suite_name" == "perf_bench_harness" ]]; then
+    # RCH 1.0.58 does not retrieve arbitrary CargoTest output. CargoNextest has
+    # an explicit nextest/** target-dir sync contract, so write the benchmark
+    # artifact beneath the worker's active CARGO_TARGET_DIR and require it to
+    # arrive in the matching local target directory before crediting the suite.
+    rch_target_subdir="nextest/pi-perf/$CORRELATION_ID/$suite_name"
+    BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
+    PERF_REGRESSION_OUTPUT="$result_dir" \
+    PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
+    CI_CORRELATION_ID="$CORRELATION_ID" \
+    VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+    RUST_TEST_THREADS="$PARALLELISM" \
+      "${CARGO_RUNNER_ARGS[@]}" nextest run \
+        --build-jobs "$PARALLELISM" \
+        --test "$target_name" \
+        --cargo-profile "$CARGO_PROFILE" \
+        --test-threads "$PARALLELISM" \
+        --no-capture \
+      >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
+      || exit_code=$?
+
+    local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
+    if [[ "$exit_code" -eq 0 && -f "$retrieved_result_dir/extension_bench.jsonl" ]]; then
+      cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
+      if [[ -f "$retrieved_result_dir/extension_bench_summary.md" ]]; then
+        cp "$retrieved_result_dir/extension_bench_summary.md" "$result_dir/extension_bench_summary.md"
+      fi
+    elif [[ "$exit_code" -eq 0 ]]; then
+      log_fail "RCH completed $suite_name without retrieving extension_bench.jsonl from $rch_target_subdir"
+      exit_code=86
+    fi
+  else
+    BENCH_OUTPUT_DIR="$result_dir" \
+    PERF_REGRESSION_OUTPUT="$result_dir" \
+    PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
+    CI_CORRELATION_ID="$CORRELATION_ID" \
+    VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+    RUST_TEST_THREADS="$PARALLELISM" \
+      "${CARGO_RUNNER_ARGS[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
+      >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
+      || exit_code=$?
+  fi
 
   suite_end=$(epoch_ms)
   suite_elapsed=$((suite_end - suite_start))
