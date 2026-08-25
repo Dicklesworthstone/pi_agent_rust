@@ -1,0 +1,12 @@
+{
+  "id": 392,
+  "project": "/Users/jemanuel/projects/frankensim",
+  "agent": "RusticSpire",
+  "path_pattern": "crates/fs-evidence/**",
+  "exclusive": true,
+  "reason": "clear nightly clippy drift unblocking neural-cone strict lane (cf4fv/rsxgz)",
+  "created_ts": "2026-08-23T18:10:10.139374Z",
+  "expires_ts": "2026-08-23T21:10:10.139374Z",
+  "released_ts": "2026-08-24T00:42:08.520710Z",
+  "db_generation": "826aba49fd3bca29ec8a99b103b668a479b1317bf52e1e8665aa3b6c10e8c53f"
+}

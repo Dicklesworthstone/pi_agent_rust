@@ -1,0 +1,1074 @@
+{
+  "schema_version": "1.0",
+  "doctor_version": "1.0.0",
+  "doctor_contract_version": "1.0",
+  "tool": "am",
+  "tool_version": "0.3.30",
+  "ok": false,
+  "exit_code": 1,
+  "fm_id": "fm-db-state-files-reservation-db-archive-parity",
+  "severity": "P1",
+  "subsystem": "db_state_files",
+  "op_pattern": "Op::DbExec + Op::WriteFile + Op::Rename",
+  "mode": "fix",
+  "dry_run": false,
+  "run_id": "2026-08-25T02-13-57Z__only_7637c3",
+  "run_dir": "/Users/jemanuel/projects/pi_agent_rust/.doctor/runs/2026-08-25T02-13-57Z__only_7637c3",
+  "duration_ms": 6199,
+  "actions_taken": 15,
+  "actions_planned": 15,
+  "summary": {
+    "total_findings": 1,
+    "initial_findings": 1,
+    "actions_taken": 15,
+    "actions_skipped": 0
+  },
+  "post_fix": {
+    "fm_id": "fm-db-state-files-reservation-db-archive-parity",
+    "findings_count": 1,
+    "actions_planned": 14,
+    "findings": [
+      {
+        "id": "fm-db-state-files-reservation-db-archive-parity",
+        "severity": "P1",
+        "subsystem": "db_state_files",
+        "title": "file reservation DB/archive parity drift: 56 mismatch signal(s) in /Users/jemanuel/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 (14 reconcilable, 0 global-id collision(s) auto-quarantinable)",
+        "confidence": 1.0,
+        "evidence": {
+          "db_path": "/Users/jemanuel/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3",
+          "storage_root": "/Users/jemanuel/.mcp_agent_mail_git_mailbox_repo",
+          "health_line": "reservation_parity: drift total=56 db=1326 archive=1298 fields=[missing_archive=28,released_ts=14,active_status=14] examples=[users-jemanuel-projects-asimposium-org:404:released_ts,users-jemanuel-projects-asimposium-org:404:active_status,users-jemanuel-projects-asimposium-org:419:released_ts]",
+          "archive_id_collisions": 0,
+          "reconcilable_mismatches": 14,
+          "report": {
+            "schema_version": "reservation_db_archive_parity.v1",
+            "ok": false,
+            "db_reservations": 1326,
+            "archive_reservations": 1298,
+            "drift": {
+              "missing_archive_artifacts": 28,
+              "archive_without_db_rows": 0,
+              "reconstructed_prior_generation_rows": 0,
+              "released_rows_without_artifacts": 0,
+              "pruned_released_archived": 0,
+              "released_missing_archive": 0,
+              "archive_id_collisions": 0,
+              "foreign_generation_artifacts": 0,
+              "agent_id_mismatches": 0,
+              "released_ts_mismatches": 14,
+              "active_status_mismatches": 14,
+              "path_pattern_mismatches": 0,
+              "exclusive_mismatches": 0,
+              "thread_provenance_mismatches": 0,
+              "parse_errors": 0
+            },
+            "examples": [
+              {
+                "reservation_id": 404,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532129171459",
+                "archive_value": "NULL",
+                "detail": "reservation_id=404 db_released_ts=1787532129171459 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 404,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=404 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 419,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532129171463",
+                "archive_value": "NULL",
+                "detail": "reservation_id=419 db_released_ts=1787532129171463 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 419,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=419 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 421,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505441",
+                "archive_value": "NULL",
+                "detail": "reservation_id=421 db_released_ts=1787532125505441 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 421,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=421 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 423,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505443",
+                "archive_value": "NULL",
+                "detail": "reservation_id=423 db_released_ts=1787532125505443 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 423,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=423 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 425,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505445",
+                "archive_value": "NULL",
+                "detail": "reservation_id=425 db_released_ts=1787532125505445 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 425,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=425 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 427,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505447",
+                "archive_value": "NULL",
+                "detail": "reservation_id=427 db_released_ts=1787532125505447 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 427,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=427 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1299,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1299 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1300,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1300 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1301,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1301 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1302,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1302 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1303,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1303 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1304,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1304 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1305,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1305 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1306,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1306 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1307,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1307 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1308,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1308 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1309,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1309 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1310,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1310 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1311,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1311 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1312,
+                "project_slug": "users-jemanuel-projects-franken-whisper",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1312 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 392,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532128520710",
+                "archive_value": "NULL",
+                "detail": "reservation_id=392 db_released_ts=1787532128520710 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 392,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=392 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 431,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532267266744",
+                "archive_value": "NULL",
+                "detail": "reservation_id=431 db_released_ts=1787532267266744 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 431,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=431 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 433,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532267266745",
+                "archive_value": "NULL",
+                "detail": "reservation_id=433 db_released_ts=1787532267266745 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 433,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=433 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 435,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532123450525",
+                "archive_value": "NULL",
+                "detail": "reservation_id=435 db_released_ts=1787532123450525 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 435,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=435 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1313,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1313 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1314,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1314 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1315,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1315 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1316,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1316 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1317,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1317 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1318,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1318 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 399,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "released_ts",
+                "db_value": "1787532128857632",
+                "archive_value": "NULL",
+                "detail": "reservation_id=399 db_released_ts=1787532128857632 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 399,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=399 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 400,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "released_ts",
+                "db_value": "1787532128857633",
+                "archive_value": "NULL",
+                "detail": "reservation_id=400 db_released_ts=1787532128857633 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 400,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=400 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 402,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "released_ts",
+                "db_value": "1787532128857635",
+                "archive_value": "NULL",
+                "detail": "reservation_id=402 db_released_ts=1787532128857635 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 402,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=402 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1319,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1319 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1320,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1320 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1321,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1321 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1322,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1322 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1323,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1323 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 437,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "released_ts",
+                "db_value": "1787532144892935",
+                "archive_value": "NULL",
+                "detail": "reservation_id=437 db_released_ts=1787532144892935 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 437,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=437 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1324,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1324 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1325,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1325 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1326,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1326 active reservation missing stable id artifact"
+              }
+            ]
+          },
+          "reconcile_policy": {
+            "release": "monotonic/irreversible — if either store records a release the reservation is released; the lagging store is synced to the earliest known released_ts (DB hot row + ledger via Op::DbExec, or the archive artifact's released_ts via Op::WriteFile).",
+            "holder": "the immutable acquire-time archive wins for a still-active reservation, but only when the archive holder resolves to a registered agent; otherwise the row is left for manual reconciliation rather than guessed.",
+            "detect_only": "path_pattern, exclusive, thread_provenance, missing_archive, archive_without_db, and unresolved-holder rows need operator-supplied truth and are never auto-reconciled."
+          },
+          "manual_remediation": {
+            "warning": "Holder and release drift are auto-reconciled through the reversible mutate() chokepoint (`--yes`). The remaining classes (path_pattern, exclusive, thread_provenance, missing_archive, archive_without_db, unresolved holder) stay detect-only — do not reconcile those by guessing.",
+            "steps": [
+              "Run `am doctor fix --only fm-db-state-files-reservation-db-archive-parity --list --json` for structured drift examples.",
+              "Run `am doctor fix --only fm-db-state-files-reservation-db-archive-parity --yes` to reconcile holder/release drift and quarantine global-id collisions (reversible via `am doctor undo`).",
+              "For remaining detect-only drift where the archive is authoritative, run `am doctor reconstruct --dry-run --json` to preview a DB rebuild before applying it.",
+              "For remaining detect-only drift where SQLite/release-ledger evidence is authoritative, regenerate the affected archive artifacts through a dedicated repair path; do not hand-edit production state without preserving the original bytes.",
+              "Re-run `am doctor health` and this detector until reservation_parity reports drift=0."
+            ]
+          }
+        },
+        "remediation": {
+          "command": "am doctor fix --only fm-db-state-files-reservation-db-archive-parity --yes",
+          "explain_command": "am doctor explain fm-db-state-files-reservation-db-archive-parity",
+          "auto_fixable": true,
+          "estimated_actions": 14
+        }
+      }
+    ]
+  },
+  "outcome": {
+    "fm_id": "fm-db-state-files-reservation-db-archive-parity",
+    "findings_count": 1,
+    "actions_taken": 15,
+    "actions_skipped": 0,
+    "quarantined_paths": [],
+    "findings": [
+      {
+        "id": "fm-db-state-files-reservation-db-archive-parity",
+        "severity": "P1",
+        "subsystem": "db_state_files",
+        "title": "file reservation DB/archive parity drift: 58 mismatch signal(s) in /Users/jemanuel/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3 (15 reconcilable, 0 global-id collision(s) auto-quarantinable)",
+        "confidence": 1.0,
+        "evidence": {
+          "db_path": "/Users/jemanuel/.mcp_agent_mail_git_mailbox_repo/storage.sqlite3",
+          "storage_root": "/Users/jemanuel/.mcp_agent_mail_git_mailbox_repo",
+          "health_line": "reservation_parity: drift total=58 db=1326 archive=1298 fields=[missing_archive=28,released_ts=15,active_status=15] examples=[users-jemanuel-projects-asimposium-org:404:released_ts,users-jemanuel-projects-asimposium-org:404:active_status,users-jemanuel-projects-asimposium-org:419:released_ts]",
+          "archive_id_collisions": 0,
+          "reconcilable_mismatches": 15,
+          "report": {
+            "schema_version": "reservation_db_archive_parity.v1",
+            "ok": false,
+            "db_reservations": 1326,
+            "archive_reservations": 1298,
+            "drift": {
+              "missing_archive_artifacts": 28,
+              "archive_without_db_rows": 0,
+              "reconstructed_prior_generation_rows": 0,
+              "released_rows_without_artifacts": 0,
+              "pruned_released_archived": 0,
+              "released_missing_archive": 0,
+              "archive_id_collisions": 0,
+              "foreign_generation_artifacts": 0,
+              "agent_id_mismatches": 0,
+              "released_ts_mismatches": 15,
+              "active_status_mismatches": 15,
+              "path_pattern_mismatches": 0,
+              "exclusive_mismatches": 0,
+              "thread_provenance_mismatches": 0,
+              "parse_errors": 0
+            },
+            "examples": [
+              {
+                "reservation_id": 404,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532129171459",
+                "archive_value": "NULL",
+                "detail": "reservation_id=404 db_released_ts=1787532129171459 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 404,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=404 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 419,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532129171463",
+                "archive_value": "NULL",
+                "detail": "reservation_id=419 db_released_ts=1787532129171463 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 419,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=419 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 421,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505441",
+                "archive_value": "NULL",
+                "detail": "reservation_id=421 db_released_ts=1787532125505441 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 421,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=421 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 423,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505443",
+                "archive_value": "NULL",
+                "detail": "reservation_id=423 db_released_ts=1787532125505443 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 423,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=423 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 425,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505445",
+                "archive_value": "NULL",
+                "detail": "reservation_id=425 db_released_ts=1787532125505445 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 425,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=425 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 427,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "released_ts",
+                "db_value": "1787532125505447",
+                "archive_value": "NULL",
+                "detail": "reservation_id=427 db_released_ts=1787532125505447 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 427,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=427 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1299,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1299 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1300,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1300 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1301,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1301 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1302,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1302 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1303,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1303 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1304,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1304 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1305,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1305 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1306,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1306 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1307,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1307 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1308,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1308 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1309,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1309 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1310,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1310 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1311,
+                "project_slug": "users-jemanuel-projects-asimposium-org",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1311 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1312,
+                "project_slug": "users-jemanuel-projects-franken-whisper",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1312 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 392,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532128520710",
+                "archive_value": "NULL",
+                "detail": "reservation_id=392 db_released_ts=1787532128520710 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 392,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=392 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 431,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532267266744",
+                "archive_value": "NULL",
+                "detail": "reservation_id=431 db_released_ts=1787532267266744 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 431,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=431 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 433,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532267266745",
+                "archive_value": "NULL",
+                "detail": "reservation_id=433 db_released_ts=1787532267266745 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 433,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=433 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 435,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "released_ts",
+                "db_value": "1787532123450525",
+                "archive_value": "NULL",
+                "detail": "reservation_id=435 db_released_ts=1787532123450525 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 435,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=435 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1313,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1313 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1314,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1314 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1315,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1315 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1316,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1316 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1317,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1317 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1318,
+                "project_slug": "users-jemanuel-projects-frankensim",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1318 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 399,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "released_ts",
+                "db_value": "1787532128857632",
+                "archive_value": "NULL",
+                "detail": "reservation_id=399 db_released_ts=1787532128857632 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 399,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=399 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 400,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "released_ts",
+                "db_value": "1787532128857633",
+                "archive_value": "NULL",
+                "detail": "reservation_id=400 db_released_ts=1787532128857633 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 400,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=400 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 402,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "released_ts",
+                "db_value": "1787532128857635",
+                "archive_value": "NULL",
+                "detail": "reservation_id=402 db_released_ts=1787532128857635 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 402,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=402 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1319,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1319 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1320,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1320 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1321,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1321 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1322,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1322 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1323,
+                "project_slug": "users-jemanuel-projects-frankentts",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1323 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 437,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "released_ts",
+                "db_value": "1787532144892935",
+                "archive_value": "NULL",
+                "detail": "reservation_id=437 db_released_ts=1787532144892935 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 437,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=437 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1189,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "released_ts",
+                "db_value": "1787610971122546",
+                "archive_value": "NULL",
+                "detail": "reservation_id=1189 db_released_ts=1787610971122546 archive_released_ts=NULL"
+              },
+              {
+                "reservation_id": 1189,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "active_status",
+                "db_value": "released",
+                "archive_value": "active",
+                "detail": "reservation_id=1189 db_status=released archive_status=active"
+              },
+              {
+                "reservation_id": 1324,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1324 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1325,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1325 active reservation missing stable id artifact"
+              },
+              {
+                "reservation_id": 1326,
+                "project_slug": "users-jemanuel-projects-pi-agent-rust",
+                "field": "archive_artifact",
+                "db_value": "present",
+                "archive_value": "missing",
+                "detail": "reservation_id=1326 active reservation missing stable id artifact"
+              }
+            ]
+          },
+          "reconcile_policy": {
+            "release": "monotonic/irreversible — if either store records a release the reservation is released; the lagging store is synced to the earliest known released_ts (DB hot row + ledger via Op::DbExec, or the archive artifact's released_ts via Op::WriteFile).",
+            "holder": "the immutable acquire-time archive wins for a still-active reservation, but only when the archive holder resolves to a registered agent; otherwise the row is left for manual reconciliation rather than guessed.",
+            "detect_only": "path_pattern, exclusive, thread_provenance, missing_archive, archive_without_db, and unresolved-holder rows need operator-supplied truth and are never auto-reconciled."
+          },
+          "manual_remediation": {
+            "warning": "Holder and release drift are auto-reconciled through the reversible mutate() chokepoint (`--yes`). The remaining classes (path_pattern, exclusive, thread_provenance, missing_archive, archive_without_db, unresolved holder) stay detect-only — do not reconcile those by guessing.",
+            "steps": [
+              "Run `am doctor fix --only fm-db-state-files-reservation-db-archive-parity --list --json` for structured drift examples.",
+              "Run `am doctor fix --only fm-db-state-files-reservation-db-archive-parity --yes` to reconcile holder/release drift and quarantine global-id collisions (reversible via `am doctor undo`).",
+              "For remaining detect-only drift where the archive is authoritative, run `am doctor reconstruct --dry-run --json` to preview a DB rebuild before applying it.",
+              "For remaining detect-only drift where SQLite/release-ledger evidence is authoritative, regenerate the affected archive artifacts through a dedicated repair path; do not hand-edit production state without preserving the original bytes.",
+              "Re-run `am doctor health` and this detector until reservation_parity reports drift=0."
+            ]
+          }
+        },
+        "remediation": {
+          "command": "am doctor fix --only fm-db-state-files-reservation-db-archive-parity --yes",
+          "explain_command": "am doctor explain fm-db-state-files-reservation-db-archive-parity",
+          "auto_fixable": true,
+          "estimated_actions": 15
+        }
+      }
+    ]
+  }
+}
