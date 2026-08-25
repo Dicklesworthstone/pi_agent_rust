@@ -821,6 +821,7 @@ fn build_initial_content_text_only() {
     let initial = app::InitialMessage {
         text: "hello world".to_string(),
         images: vec![],
+        keyword_scan_source: "hello world".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
     assert_eq!(blocks.len(), 1);
@@ -838,6 +839,7 @@ fn build_initial_content_with_images() {
             data: "base64data".to_string(),
             mime_type: "image/png".to_string(),
         }],
+        keyword_scan_source: "describe this".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
     assert_eq!(blocks.len(), 2);
@@ -859,6 +861,7 @@ fn build_initial_content_multiple_images() {
                 mime_type: "image/jpeg".to_string(),
             },
         ],
+        keyword_scan_source: "compare".to_string(),
     };
     let blocks = app::build_initial_content(&initial);
     assert_eq!(blocks.len(), 3); // 1 text + 2 images

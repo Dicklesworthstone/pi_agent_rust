@@ -2049,6 +2049,17 @@ After approving access in the browser, press Enter in Pi to complete login."
             let cmd = match next {
                 PendingInput::Text(text) => self.submit_message(&text),
                 PendingInput::Content(content) => self.submit_content(content),
+                PendingInput::ContentWithKeywordSource {
+                    content,
+                    keyword_scan_source,
+                } => {
+                    let display = content_blocks_to_text(&content);
+                    self.submit_content_with_display_and_keyword_source(
+                        content,
+                        &display,
+                        Some(keyword_scan_source),
+                    )
+                }
                 PendingInput::Continue => self.submit_continue(),
             };
 

@@ -8322,7 +8322,13 @@ async fn run_print_mode(
 
     let mut initial = initial;
     if let Some(ref mut initial) = initial {
-        initial.text = resources.expand_input(&initial.text);
+        let generated_prefix = initial
+            .text
+            .strip_suffix(&initial.keyword_scan_source)
+            .unwrap_or(&initial.text)
+            .to_string();
+        initial.keyword_scan_source = resources.expand_input(&initial.keyword_scan_source);
+        initial.text = generated_prefix + &initial.keyword_scan_source;
     }
 
     let messages = messages
@@ -8356,7 +8362,10 @@ async fn run_print_mode(
             max_retries,
             is_json,
             &text_stream_state,
-            PromptInput::Content(content),
+            PromptInput::Content {
+                content,
+                keyword_scan_source: Some(initial.keyword_scan_source),
+            },
             failover_ctx,
         )
         .await?;
@@ -8523,7 +8532,10 @@ fn finish_print_text_response(
 /// Discriminated prompt input for retry helper.
 enum PromptInput {
     Text(String),
-    Content(Vec<ContentBlock>),
+    Content {
+        content: Vec<ContentBlock>,
+        keyword_scan_source: Option<String>,
+    },
 }
 
 /// Compute retry delay with exponential backoff (mirrors RPC mode logic).
@@ -8689,7 +8701,13 @@ where
                 )
                 .await
         }
-        PromptInput::Content(content) => {
+        PromptInput::Content {
+            content,
+            keyword_scan_source,
+        } => {
+            session
+                .agent
+                .set_magic_keyword_scan_override(keyword_scan_source.clone());
             session
                 .run_with_content_with_abort(
                     content.clone(),
@@ -8910,10 +8928,18 @@ async fn run_interactive_mode(
     mcp_manager: Option<std::sync::Arc<pi::mcp::McpManager>>,
 ) -> Result<()> {
     let mut pending = Vec::new();
-    if let Some(initial) = initial {
-        pending.push(pi::interactive::PendingInput::Content(
-            pi::app::build_initial_content(&initial),
-        ));
+    if let Some(mut initial) = initial {
+        let generated_prefix = initial
+            .text
+            .strip_suffix(&initial.keyword_scan_source)
+            .unwrap_or(&initial.text)
+            .to_string();
+        initial.keyword_scan_source = resources.expand_input(&initial.keyword_scan_source);
+        initial.text = generated_prefix + &initial.keyword_scan_source;
+        pending.push(pi::interactive::PendingInput::ContentWithKeywordSource {
+            content: pi::app::build_initial_content(&initial),
+            keyword_scan_source: initial.keyword_scan_source,
+        });
     }
     for message in messages {
         pending.push(pi::interactive::PendingInput::Text(message));
