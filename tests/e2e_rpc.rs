@@ -2847,6 +2847,99 @@ fn rpc_bash_echo() {
             output.contains("hello_rpc"),
             "bash output should contain hello_rpc, got: {output}"
         );
+        assert_eq!(resp["data"]["persisted"], false);
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["event"],
+            "session.persistence.disabled"
+        );
+        assert!(
+            resp["data"]["persistenceStatus"]["pendingMessageCount"]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "the in-memory BashExecution mutation must remain observable: {resp}"
+        );
+        assert!(
+            resp["data"]["persistenceWarning"].is_null(),
+            "disabled persistence is an expected mode, not a save failure"
+        );
+
+        drop(in_tx);
+        let result = server.await;
+        assert!(result.is_ok(), "rpc server error: {result:?}");
+    });
+}
+
+#[test]
+fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
+    let harness = TestHarness::new("rpc_bash_persistence_failure_reports_real_backlog");
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test runtime");
+    let handle = runtime.handle();
+
+    runtime.block_on(async move {
+        let blocked_session_dir = harness.create_file("not-a-session-directory", b"blocked");
+        let session = Session::create_with_dir(Some(blocked_session_dir));
+        let provider: Arc<dyn Provider> = Arc::new(KeylessReplayProvider::new(
+            "keyless-rpc-replay",
+            KEYLESS_REPLAY_ABORT_WINDOW,
+        ));
+        let tools = ToolRegistry::new(&[], &harness.temp_path("worktree"), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
+        let agent_session = AgentSession::new(
+            agent,
+            Arc::clone(&session),
+            true,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
+        let options = build_options(&handle, harness.temp_path("auth.json"), vec![], vec![]);
+        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+        let (out_tx, out_rx) = rpc_output_channel();
+        let out_rx = Arc::new(Mutex::new(out_rx));
+
+        let server = handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+        let resp = send_recv(
+            &in_tx,
+            &out_rx,
+            r#"{"id":"1","type":"bash","command":"echo persistence_failure_probe"}"#,
+            "bash(persistence failure)",
+        )
+        .await;
+        assert_ok(&resp, "bash");
+        assert_eq!(resp["data"]["exitCode"], 0);
+        assert!(
+            resp["data"]["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("persistence_failure_probe")),
+            "the command result must survive the independent save failure: {resp}"
+        );
+        assert_eq!(resp["data"]["persisted"], false);
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["event"],
+            "session.persistence.backlog"
+        );
+        let metrics_cx = asupersync::Cx::for_testing();
+        let live_pending_mutations = session
+            .lock(&metrics_cx)
+            .await
+            .expect("lock failed-persistence session")
+            .autosave_metrics()
+            .pending_mutations as u64;
+        assert!(
+            live_pending_mutations > 0,
+            "the failed flush must retain the appended BashExecution mutation"
+        );
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["pendingMessageCount"],
+            live_pending_mutations,
+            "the response must expose the retained autosave backlog: {resp}"
+        );
+        assert!(
+            resp["data"]["persistenceWarning"].is_string(),
+            "the successful command response must carry a non-retryable save warning: {resp}"
+        );
 
         drop(in_tx);
         let result = server.await;
@@ -3236,6 +3329,15 @@ fn rpc_get_state_reflects_session_stats() {
         assert_eq!(resp["data"]["tokens"]["input"], 10);
         assert_eq!(resp["data"]["tokens"]["output"], 5);
         assert_eq!(resp["data"]["tokens"]["total"], 15);
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["event"],
+            "session.persistence.disabled"
+        );
+        assert_eq!(
+            resp["data"]["persistenceStatus"]["pendingMessageCount"],
+            2,
+            "in-memory mutations remain observable without being mislabeled as a durable backlog"
+        );
 
         // get_messages should return the 2 messages
         let resp = send_recv(

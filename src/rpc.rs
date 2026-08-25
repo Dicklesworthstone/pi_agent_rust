@@ -1214,12 +1214,15 @@ pub async fn run(
 
             "get_session_stats" => {
                 let data = {
-                    let inner_session = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx)
+                    let guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
                         .await
                         .map_err(|err| {
-                            Error::session(format!("inner session lock failed: {err}"))
+                            Error::session(format!("session lock failed: {err}"))
                         })?;
-                    session_stats(&inner_session)
+                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("inner session lock failed: {err}"))
+                    })?;
+                    session_stats(&inner_session, guard.save_enabled())
                 };
                 let _ = out_tx.send(response_ok(id, "get_session_stats", Some(data)));
             }
@@ -1787,71 +1790,119 @@ pub async fn run(
                                 (false, Some("outer session lock failed".to_string()))
                             };
 
-                            let (persisted, persistence_warning, persistence_status) = if should_persist {
-                                if let Ok(mut guard) =
-                                    OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
-                                {
-                                    match guard.persist_session().await {
-                                        Ok(()) => (
-                                            true,
-                                            None,
-                                            json!({
-                                                "event": "session.persistence.healthy",
-                                                "severity": "ok",
-                                                "summary": "Session history persisted.",
-                                                "action": "No action required.",
-                                                "sliIds": ["sli_resume_ready_p95_ms"],
-                                                "pendingMessageCount": 0,
-                                            }),
-                                        ),
-                                        Err(err) => {
-                                            tracing::warn!(
-                                                error = %err,
-                                                "Failed to persist bash execution history to session"
-                                            );
+                            let (persisted, persistence_warning, persistence_status) =
+                                if should_persist {
+                                    if let Ok(mut guard) =
+                                        OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
+                                    {
+                                        if !guard.save_enabled() {
+                                            let pending_message_count = match guard
+                                                .session
+                                                .lock(&bash_cx)
+                                                .await
+                                            {
+                                                Ok(inner_session) => json!(
+                                                    inner_session
+                                                        .autosave_metrics()
+                                                        .pending_mutations
+                                                ),
+                                                Err(_) => Value::Null,
+                                            };
                                             (
                                                 false,
-                                                Some(format!("Failed to persist bash execution to session: {err}")),
+                                                None,
                                                 json!({
-                                                    "event": "session.persistence.backlog",
-                                                    "severity": "warning",
-                                                    "summary": "Session history persistence failed after bash execution.",
-                                                    "action": "Trigger manual save or verify session storage permissions.",
-                                                    "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
-                                                    "pendingMessageCount": 1,
-                                                    "errorMessage": err.to_string(),
+                                                    "event": "session.persistence.disabled",
+                                                    "severity": "info",
+                                                    "summary": "Session persistence is disabled; bash history is retained in memory only.",
+                                                    "action": "Enable session saving to make command history durable.",
+                                                    "sliIds": [],
+                                                    "pendingMessageCount": pending_message_count,
                                                 }),
                                             )
+                                        } else {
+                                            let persist_result = guard.persist_session().await;
+                                            let pending_message_count = match guard
+                                                .session
+                                                .lock(&bash_cx)
+                                                .await
+                                            {
+                                                Ok(inner_session) => json!(
+                                                    inner_session
+                                                        .autosave_metrics()
+                                                        .pending_mutations
+                                                ),
+                                                Err(_) => Value::Null,
+                                            };
+                                            match persist_result {
+                                                Ok(()) => (
+                                                    true,
+                                                    None,
+                                                    json!({
+                                                        "event": "session.persistence.healthy",
+                                                        "severity": "ok",
+                                                        "summary": "Session history persisted.",
+                                                        "action": "No action required.",
+                                                        "sliIds": ["sli_resume_ready_p95_ms"],
+                                                        "pendingMessageCount": pending_message_count,
+                                                    }),
+                                                ),
+                                                Err(err) => {
+                                                    tracing::warn!(
+                                                        error = %err,
+                                                        "Failed to persist bash execution history to session"
+                                                    );
+                                                    (
+                                                        false,
+                                                        Some(format!("Failed to persist bash execution to session: {err}")),
+                                                        json!({
+                                                            "event": "session.persistence.backlog",
+                                                            "severity": "warning",
+                                                            "summary": "Session history persistence failed after bash execution.",
+                                                            "action": "Trigger manual save or verify session storage permissions.",
+                                                            "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
+                                                            "pendingMessageCount": pending_message_count,
+                                                            "errorMessage": err.to_string(),
+                                                        }),
+                                                    )
+                                                }
+                                            }
                                         }
+                                    } else {
+                                        (
+                                            false,
+                                            Some(
+                                                "Failed to acquire session lock for persistence"
+                                                    .to_string(),
+                                            ),
+                                            json!({
+                                                "event": "session.persistence.backlog",
+                                                "severity": "warning",
+                                                "summary": "Session lock acquisition failed after bash execution.",
+                                                "action": "Check session concurrency.",
+                                                "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
+                                                "pendingMessageCount": null,
+                                            }),
+                                        )
                                     }
                                 } else {
                                     (
                                         false,
-                                        Some("Failed to acquire session lock for persistence".to_string()),
+                                        append_error.as_deref().map(|e| {
+                                            format!(
+                                                "Failed to append bash execution to session: {e}"
+                                            )
+                                        }),
                                         json!({
-                                            "event": "session.persistence.backlog",
-                                            "severity": "warning",
-                                            "summary": "Session lock acquisition failed after bash execution.",
-                                            "action": "Check session concurrency.",
-                                            "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
-                                            "pendingMessageCount": 1,
+                                            "event": "session.history.append_failed",
+                                            "severity": "error",
+                                            "summary": "Failed to append bash execution message to session.",
+                                            "action": "Check session health.",
+                                            "sliIds": ["sli_failure_recovery_success_rate"],
+                                            "pendingMessageCount": null,
                                         }),
                                     )
-                                }
-                            } else {
-                                (
-                                    false,
-                                    append_error.as_deref().map(|e| format!("Failed to append bash execution to session: {e}")),
-                                    json!({
-                                        "event": "session.persistence.backlog",
-                                        "severity": "warning",
-                                        "summary": "Failed to append bash execution message to session.",
-                                        "action": "Check session health.",
-                                        "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
-                                        "pendingMessageCount": 1,
-                                    }),
-                                )
-                            };
+                                };
 
                             let mut payload = json!({
                                 "output": result.output,
@@ -5088,7 +5139,14 @@ async fn maybe_auto_compact(
                 let messages = inner_session.to_messages_for_current_path();
                 (messages, tokens_after)
             };
+            let save_enabled = guard.save_enabled();
             let persist_res = guard.persist_session().await;
+            let pending_message_count = match guard.session.lock(cx.cx()).await {
+                Ok(inner_session) => {
+                    json!(inner_session.autosave_metrics().pending_mutations)
+                }
+                Err(_) => Value::Null,
+            };
             guard.agent.replace_messages(messages);
             drop(guard);
 
@@ -5101,6 +5159,24 @@ async fn maybe_auto_compact(
                             "tokensBefore": result.tokens_before,
                             "tokensAfter": tokens_after,
                             "details": details_value,
+                            "persisted": save_enabled,
+                            "persistenceStatus": if save_enabled {
+                                json!({
+                                    "event": "session.persistence.healthy",
+                                    "severity": "ok",
+                                    "summary": "Compacted session history persisted.",
+                                    "action": "No action required.",
+                                    "pendingMessageCount": pending_message_count,
+                                })
+                            } else {
+                                json!({
+                                    "event": "session.persistence.disabled",
+                                    "severity": "info",
+                                    "summary": "Session persistence is disabled; compacted history is retained in memory only.",
+                                    "action": "Enable session saving to make compacted history durable.",
+                                    "pendingMessageCount": pending_message_count,
+                                })
+                            },
                         })),
                         aborted: false,
                         will_retry: false,
@@ -5253,7 +5329,7 @@ fn session_state(
     Value::Object(state)
 }
 
-fn session_stats(session: &crate::session::Session) -> Value {
+fn session_stats(session: &crate::session::Session, save_enabled: bool) -> Value {
     let mut user_messages: u64 = 0;
     let mut assistant_messages: u64 = 0;
     let mut tool_results: u64 = 0;
@@ -5299,7 +5375,15 @@ fn session_stats(session: &crate::session::Session) -> Value {
         crate::session::AutosaveDurabilityMode::Throughput => "throughput",
     };
     let (status_event, status_severity, status_summary, status_action, status_sli_ids) =
-        if pending_message_count == 0 {
+        if !save_enabled {
+            (
+                "session.persistence.disabled",
+                "info",
+                "Session persistence is disabled; history is retained in memory only.",
+                "Enable session saving to make history durable.",
+                Vec::new(),
+            )
+        } else if pending_message_count == 0 {
             (
                 "session.persistence.healthy",
                 "ok",
@@ -10060,7 +10144,9 @@ export default function init(pi) {
     }
 
     /// bd-m83oo: bash RPC execution preserves command results and never returns
-    /// a retryable error on persistence failure, while surfacing structured persistence state.
+    /// a retryable error on persistence failure, while structured persistence
+    /// states remain serializable. Production-branch coverage lives in
+    /// `tests/e2e_rpc.rs`.
     #[test]
     fn bash_rpc_persistence_surfaces_state_without_command_failure() {
         let success_payload = json!({
@@ -10084,6 +10170,29 @@ export default function init(pi) {
         assert!(ok_resp.contains("\"persisted\":true"));
         assert!(ok_resp.contains("\"event\":\"session.persistence.healthy\""));
         assert!(!ok_resp.contains("persistenceWarning"));
+
+        let disabled_payload = json!({
+            "output": "memory only\n",
+            "exitCode": 0,
+            "cancelled": false,
+            "truncated": false,
+            "fullOutputPath": null,
+            "persisted": false,
+            "persistenceStatus": {
+                "event": "session.persistence.disabled",
+                "severity": "info",
+                "summary": "Session persistence is disabled; bash history is retained in memory only.",
+                "action": "Enable session saving to make command history durable.",
+                "sliIds": [],
+                "pendingMessageCount": 1,
+            }
+        });
+        let disabled_resp =
+            response_ok(Some("cmd-disabled".to_string()), "bash", Some(disabled_payload));
+        assert!(disabled_resp.contains("\"success\":true"));
+        assert!(disabled_resp.contains("\"persisted\":false"));
+        assert!(disabled_resp.contains("\"event\":\"session.persistence.disabled\""));
+        assert!(!disabled_resp.contains("persistenceWarning"));
 
         let mut warning_payload = json!({
             "output": "side effect executed\n",
@@ -10128,14 +10237,21 @@ export default function init(pi) {
                 "tokensBefore": 5000,
                 "tokensAfter": 1200,
                 "details": {},
+                "persisted": true,
+                "persistenceStatus": {
+                    "event": "session.persistence.healthy",
+                    "severity": "ok",
+                    "pendingMessageCount": 0,
+                },
             })),
             aborted: false,
             will_retry: false,
             error_message: None,
         });
-        assert!(success_event.contains("\"type\":\"agent_event\""));
-        assert!(success_event.contains("\"event\":\"auto_compaction_end\""));
+        assert!(success_event.contains("\"type\":\"auto_compaction_end\""));
         assert!(success_event.contains("\"summary\":\"compacted summary\""));
+        assert!(success_event.contains("\"persisted\":true"));
+        assert!(success_event.contains("\"event\":\"session.persistence.healthy\""));
         assert!(!success_event.contains("\"errorMessage\""));
 
         let failure_event = agent_event(AgentEvent::AutoCompactionEnd {
@@ -10146,8 +10262,7 @@ export default function init(pi) {
                 "Failed to persist compaction to session: disk write error".to_string(),
             ),
         });
-        assert!(failure_event.contains("\"type\":\"agent_event\""));
-        assert!(failure_event.contains("\"event\":\"auto_compaction_end\""));
+        assert!(failure_event.contains("\"type\":\"auto_compaction_end\""));
         assert!(!failure_event.contains("\"summary\""));
         assert!(failure_event.contains(
             "\"errorMessage\":\"Failed to persist compaction to session: disk write error\""
