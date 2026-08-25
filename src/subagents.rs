@@ -1715,7 +1715,7 @@ fn ingest_child_event(line: &str, result: &mut SubagentResult, update: Option<&U
         Some("message_end") => {
             if let Some(text) = assistant_text(event.get("message")) {
                 if result.output.is_empty() {
-                    append_bounded_line(&mut result.output, &text);
+                    append_bounded(&mut result.output, &text);
                 }
                 emit_progress(update, result);
             }
@@ -1726,7 +1726,7 @@ fn ingest_child_event(line: &str, result: &mut SubagentResult, update: Option<&U
             {
                 for message in messages.iter().rev() {
                     if let Some(text) = assistant_text(Some(message)) {
-                        append_bounded_line(&mut result.output, &text);
+                        append_bounded(&mut result.output, &text);
                         break;
                     }
                 }

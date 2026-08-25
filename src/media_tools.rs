@@ -218,7 +218,12 @@ impl Tool for InspectImageTool {
             "gif" => "image/gif",
             "svg" => "image/svg+xml",
             "bmp" => "image/bmp",
-            _ => "application/octet-stream",
+            _ => {
+                return Err(Error::tool(
+                    "inspect_image",
+                    format!("unsupported image extension: .{ext}"),
+                ));
+            }
         };
 
         let is_mock = self
