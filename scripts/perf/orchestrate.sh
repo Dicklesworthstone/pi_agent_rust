@@ -1276,6 +1276,16 @@ for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").spl
     binary_sha256 = environment.get("binary_sha256")
     if not isinstance(binary_path, str) or not binary_path.strip():
         raise SystemExit(f"line {line_number}: binary_path is missing")
+    binary_parent = Path(binary_path).parent
+    executable_profile_from_path = (
+        binary_parent.parent.name
+        if binary_parent.name in {"deps", "examples"}
+        else binary_parent.name
+    )
+    if executable_profile_from_path != expected_profile:
+        raise SystemExit(
+            f"line {line_number}: binary path does not identify profile {expected_profile}"
+        )
     if not isinstance(binary_sha256, str) or re.fullmatch(r"[0-9a-f]{64}", binary_sha256) is None:
         raise SystemExit(f"line {line_number}: binary_sha256 is invalid")
     canonical_provenance = {

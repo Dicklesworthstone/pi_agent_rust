@@ -228,11 +228,20 @@ fn rpc_agent_event_handler(
     out_tx: std::sync::mpsc::SyncSender<String>,
     runtime_handle: RuntimeHandle,
     extensions: Option<ExtensionManager>,
+    deferred_agent_end: Option<Arc<std::sync::Mutex<Option<AgentEvent>>>>,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
     let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
     let output_pressure = Arc::new(std::sync::Mutex::new(RpcOutputPressureState::default()));
 
     move |event: AgentEvent| {
+        if matches!(event, AgentEvent::AgentEnd { .. })
+            && let Some(deferred) = &deferred_agent_end
+        {
+            *deferred
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(event);
+            return;
+        }
         let serialized = if let AgentEvent::AgentEnd {
             messages, error, ..
         } = &event
@@ -574,6 +583,7 @@ async fn rpc_session_transition_blocker(
     is_streaming: &AtomicBool,
     is_compacting: &AtomicBool,
     turn_phase_linearizer: &std::sync::Mutex<()>,
+    session: &Arc<Mutex<AgentSession>>,
     bash_state: &Arc<Mutex<Option<RunningBash>>>,
     cx: &AgentCx,
 ) -> Result<Option<&'static str>> {
@@ -593,6 +603,17 @@ async fn rpc_session_transition_blocker(
             ));
         }
         RpcTurnPhase::Idle => {}
+    }
+
+    let staged_follow_up = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?
+        .agent
+        .has_staged_follow_up();
+    if staged_follow_up {
+        return Ok(Some(
+            "An accepted follow-up is still pending; resume it before changing sessions",
+        ));
     }
 
     let bash_running = OwnedMutexGuard::lock(Arc::clone(bash_state), cx)
@@ -2517,6 +2538,7 @@ pub async fn run(
                     &is_streaming,
                     &is_compacting,
                     &turn_phase_linearizer,
+                    &session,
                     &bash_state,
                     &cx,
                 )
@@ -2610,6 +2632,7 @@ pub async fn run(
                     &is_streaming,
                     &is_compacting,
                     &turn_phase_linearizer,
+                    &session,
                     &bash_state,
                     &cx,
                 )
@@ -2725,6 +2748,7 @@ pub async fn run(
                     &is_streaming,
                     &is_compacting,
                     &turn_phase_linearizer,
+                    &session,
                     &bash_state,
                     &cx,
                 )
@@ -3085,7 +3109,7 @@ async fn preserve_terminal_rpc_input(
         }
     };
     let session_store = Arc::clone(&guard.session);
-    let messages = {
+    let (messages, previous_leaf) = {
         let mut inner = match session_store.lock(cx).await {
             Ok(inner) => inner,
             Err(err) => {
@@ -3099,13 +3123,38 @@ async fn preserve_terminal_rpc_input(
                 return Err(Error::session(lock_error));
             }
         };
-        for delivery in steering.into_iter().chain(follow_up) {
-            inner.append_model_message(delivery.into_message());
+        let previous_leaf = inner.leaf_id().map(str::to_string);
+        for delivery in steering.iter().chain(&follow_up) {
+            inner.append_model_message(delivery.clone().into_message());
         }
-        inner.to_messages_for_current_path()
+        (inner.to_messages_for_current_path(), previous_leaf)
     };
     guard.agent.replace_messages(messages);
-    guard.persist_session().await?;
+    if let Err(persist_err) = guard.persist_session().await {
+        let recovery_cx = AgentCx::for_request();
+        let rollback_messages = {
+            let mut inner = session_store.lock(&recovery_cx).await.map_err(|rollback_err| {
+                Error::session(format!(
+                    "{persist_err}; failed to roll back terminal input: {rollback_err}"
+                ))
+            })?;
+            match previous_leaf.as_deref() {
+                Some(leaf_id) if inner.navigate_to(leaf_id) => {}
+                Some(leaf_id) => {
+                    return Err(Error::session(format!(
+                        "{persist_err}; failed to restore terminal-input leaf {leaf_id}"
+                    )));
+                }
+                None => inner.reset_leaf(),
+            }
+            inner.to_messages_for_current_path()
+        };
+        guard.agent.replace_messages(rollback_messages);
+        restore_terminal_rpc_input(shared_state, steering, follow_up)
+            .await
+            .map_err(|restore_err| Error::session(format!("{persist_err}; {restore_err}")))?;
+        return Err(persist_err);
+    }
     Ok(queued_count)
 }
 
@@ -3150,6 +3199,7 @@ async fn run_prompt_with_retry(
     let mut first_attempt_done = false;
     let mut follow_up_first = false;
     let mut expected_follow_up_fetch: Option<(Arc<AtomicU64>, u64)> = None;
+    let deferred_agent_end = Arc::new(std::sync::Mutex::new(None::<AgentEvent>));
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
@@ -3182,8 +3232,12 @@ async fn run_prompt_with_retry(
                 }
             };
             let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let event_handler =
-                rpc_agent_event_handler(out_tx.clone(), runtime_for_events, extensions);
+            let event_handler = rpc_agent_event_handler(
+                out_tx.clone(),
+                runtime_for_events,
+                extensions,
+                Some(Arc::clone(&deferred_agent_end)),
+            );
 
             if first_attempt_done {
                 // Retry: resume the turn from the last completed state instead of
@@ -3495,20 +3549,42 @@ async fn run_prompt_with_retry(
         // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
         // drain only guarantees flush-before-shutdown for events queued while
         // a flag is still set (gh #137).
-        if let Some(err) = final_error {
-            let mut payload = json!({
-                "type": "agent_end",
-                "messages": [],
-                "error": err
-            });
-            if let Some(hints) = final_error_hints {
-                payload["errorHints"] = hints;
-            }
-            let _ = out_tx.send(event(&payload));
+        let terminal_messages = deferred_agent_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .and_then(|event| match event {
+                AgentEvent::AgentEnd { messages, .. } => Some(messages),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut payload = json!({
+            "type": "agent_end",
+            "messages": terminal_messages,
+            "error": final_error.unwrap_or_else(|| "Request failed".to_string())
+        });
+        if let Some(hints) = final_error_hints {
+            payload["errorHints"] = hints;
         }
+        let _ = out_tx.send(event(&payload));
         is_streaming.store(false, Ordering::SeqCst);
         return;
     }
+
+    let terminal_messages = deferred_agent_end
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .and_then(|event| match event {
+            AgentEvent::AgentEnd { messages, .. } => Some(messages),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let _ = out_tx.send(event(&json!({
+        "type": "agent_end",
+        "messages": terminal_messages,
+        "error": Value::Null,
+    })));
 
     // Claim the turn-finalization/compaction phase before any await. While the
     // previous provider turn has ended, its compaction decision and possible
@@ -3817,7 +3893,8 @@ async fn run_extension_command(
             .extensions
             .as_ref()
             .map(|region| region.manager().clone());
-        let event_handler = rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions);
+        let event_handler =
+            rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions, None);
         guard
             .execute_extension_command_with_abort(
                 &command_name,
