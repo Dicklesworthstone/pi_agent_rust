@@ -182,7 +182,7 @@ impl Tool for FixtureReadUrlTool {
         );
 
         let server = std::thread::spawn(move || -> Result<(), String> {
-            use std::io::Write as _;
+            use std::io::{Read as _, Write as _};
 
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             let mut stream = loop {
@@ -197,6 +197,37 @@ impl Tool for FixtureReadUrlTool {
                     Err(error) => return Err(format!("fixture HTTP accept failed: {error}")),
                 }
             };
+            stream
+                .set_nonblocking(false)
+                .map_err(|error| format!("fixture HTTP blocking mode failed: {error}"))?;
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .map_err(|error| format!("fixture HTTP read timeout failed: {error}"))?;
+
+            const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+            let mut request_headers = Vec::with_capacity(1024);
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream
+                    .read(&mut chunk)
+                    .map_err(|error| format!("fixture HTTP request read failed: {error}"))?;
+                if read == 0 {
+                    return Err(
+                        "fixture HTTP client closed before completing request headers".into(),
+                    );
+                }
+                request_headers.extend_from_slice(&chunk[..read]);
+                if request_headers.len() > MAX_REQUEST_HEADER_BYTES {
+                    return Err("fixture HTTP request headers exceeded 16 KiB".into());
+                }
+                if request_headers
+                    .windows(4)
+                    .any(|window| window == b"\r\n\r\n")
+                {
+                    break;
+                }
+            }
+
             let reason = match status {
                 200 => "OK",
                 404 => "Not Found",
@@ -209,7 +240,10 @@ impl Tool for FixtureReadUrlTool {
             );
             stream
                 .write_all(response.as_bytes())
-                .map_err(|error| format!("fixture HTTP write failed: {error}"))
+                .map_err(|error| format!("fixture HTTP write failed: {error}"))?;
+            stream
+                .flush()
+                .map_err(|error| format!("fixture HTTP flush failed: {error}"))
         });
 
         let result = pi::tools::ReadTool::new(&self.cwd)
