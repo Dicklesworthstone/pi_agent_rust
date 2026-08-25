@@ -14372,6 +14372,71 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_follow_up_batch_remains_staged_when_max_time_expires() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    max_time: Some(std::time::Duration::from_millis(100)),
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+
+            let queued_follow_up = Arc::new(StdTestMutex::new(Some(
+                (0..128)
+                    .map(|index| {
+                        QueuedAgentMessage::from_authored_message(user_message(
+                            format!("staged follow-up {index}").as_str(),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+            let follow_up_fetcher_state = Arc::clone(&queued_follow_up);
+            let follow_up_fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let follow_up_fetcher_state = Arc::clone(&follow_up_fetcher_state);
+                    Box::pin(async move {
+                        std::thread::sleep(std::time::Duration::from_millis(150));
+                        follow_up_fetcher_state
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
+
+            agent
+                .run_with_message_with_abort(user_message("initial turn"), None, |_| {})
+                .await
+                .expect("max-time stop");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(
+                calls.len(),
+                1,
+                "the expired time cap must prevent a follow-up provider turn"
+            );
+            assert_eq!(
+                agent.message_queue.follow_up.len(),
+                128,
+                "the accepted batch must remain staged for a later run"
+            );
+        });
+    }
+
+    #[test]
     fn fetched_message_scans_only_explicit_authored_source() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
