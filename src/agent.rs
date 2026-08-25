@@ -1097,6 +1097,13 @@ impl MessageQueue {
         self.pop_kind(QueueKind::FollowUp)
     }
 
+    fn follow_up_batch_len(&self) -> usize {
+        match self.follow_up_mode {
+            QueueMode::All => self.follow_up.len(),
+            QueueMode::OneAtATime => usize::from(!self.follow_up.is_empty()),
+        }
+    }
+
     fn pop_kind(&mut self, kind: QueueKind) -> Vec<QueuedAgentMessage> {
         let (queue, mode) = match kind {
             QueueKind::Steering => (&mut self.steering, self.steering_mode),
@@ -2404,12 +2411,15 @@ impl Agent {
 
         // Delivery boundary: ordinary continuation starts with steering; the
         // RPC late-follow-up repair explicitly starts with follow-ups instead.
+        let mut initial_follow_up_staged = false;
         let mut pending_messages = if initial_follow_up {
-            self.drain_follow_up_messages().await
+            self.fetch_follow_up_messages().await;
+            initial_follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
+            Vec::new()
         } else {
             self.drain_steering_messages().await
         };
-        if initial_follow_up && pending_messages.is_empty() {
+        if initial_follow_up && !initial_follow_up_staged {
             return Err(Error::session(
                 "accepted follow-up was unavailable at continuation boundary",
             ));
@@ -2467,6 +2477,11 @@ impl Agent {
                 self.dispatch_extension_lifecycle_event(&turn_start_event)
                     .await;
                 on_event(turn_start_event);
+
+                if initial_follow_up_staged {
+                    pending_messages = self.message_queue.pop_follow_up();
+                    initial_follow_up_staged = false;
+                }
 
                 for delivery in std::mem::take(&mut pending_messages) {
                     self.apply_magic_keywords_for_delivery(&delivery, &mut turn_keyword_words);
@@ -3023,13 +3038,17 @@ impl Agent {
     }
 
     async fn drain_follow_up_messages(&mut self) -> Vec<QueuedAgentMessage> {
+        self.fetch_follow_up_messages().await;
+        self.message_queue.pop_follow_up()
+    }
+
+    async fn fetch_follow_up_messages(&mut self) {
         for fetcher in &self.follow_up_fetchers {
             let fetched = self.fetch_messages(Some(fetcher)).await;
             for message in fetched {
                 self.message_queue.push_follow_up(message);
             }
         }
-        self.message_queue.pop_follow_up()
     }
 
     /// Stream an assistant response and emit message events.
