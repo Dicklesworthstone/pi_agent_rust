@@ -1,7 +1,0 @@
-{
-  "manifest_version": 1,
-  "run_id": "2026-08-25T02-13-57Z__only_7637c3",
-  "actions_sha256": "sha256:47edeab52694c7c898040af6df7979d2cbd1b0c820a53c99cd253768c799ce3b",
-  "backups_root_sha256": "sha256:68f8feec6450911577caf53ef98966881614398f028a70fb9074350c4118c55c",
-  "hmac_sha256": "efcfaf79294aaf036813a4544de7a909b81ed36af01f4b8a07c76933278cb899"
-}

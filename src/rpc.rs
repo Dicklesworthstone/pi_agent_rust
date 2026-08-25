@@ -812,6 +812,17 @@ pub async fn run(
                         }
                     };
 
+                if is_compacting.load(Ordering::SeqCst) {
+                    let resp = response_error(
+                        id,
+                        "prompt",
+                        "Agent is currently compacting; wait before sending another prompt"
+                            .to_string(),
+                    );
+                    let _ = out_tx.send(resp);
+                    continue;
+                }
+
                 let extension_command =
                     resolve_extension_command(&message, rpc_extension_manager.as_ref());
 
@@ -951,6 +962,16 @@ pub async fn run(
                     continue;
                 }
 
+                if is_compacting.load(Ordering::SeqCst) {
+                    let resp = response_error(
+                        id,
+                        "steer",
+                        "Agent is currently compacting; wait before steering".to_string(),
+                    );
+                    let _ = out_tx.send(resp);
+                    continue;
+                }
+
                 let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
                     let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
@@ -1022,6 +1043,16 @@ pub async fn run(
                         id,
                         "follow_up",
                         "Extension commands are not allowed with follow_up".to_string(),
+                    );
+                    let _ = out_tx.send(resp);
+                    continue;
+                }
+
+                if is_compacting.load(Ordering::SeqCst) {
+                    let resp = response_error(
+                        id,
+                        "follow_up",
+                        "Agent is currently compacting; wait before sending a follow-up".to_string(),
                     );
                     let _ = out_tx.send(resp);
                     continue;
@@ -1946,6 +1977,18 @@ pub async fn run(
             }
 
             "compact" => {
+                if is_streaming.load(Ordering::SeqCst)
+                    || is_compacting.load(Ordering::SeqCst)
+                {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "compact",
+                        "Agent is currently busy; wait before compacting".to_string(),
+                    ));
+                    continue;
+                }
+                let _compacting_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
+                is_compacting.store(true, Ordering::SeqCst);
                 let custom_instructions = parsed
                     .get("customInstructions")
                     .and_then(Value::as_str)
@@ -2009,10 +2052,8 @@ pub async fn run(
                         )
                     })?;
 
-                    is_compacting.store(true, Ordering::SeqCst);
                     let compact_res =
                         compact(prep, provider, key, custom_instructions.as_deref()).await;
-                    is_compacting.store(false, Ordering::SeqCst);
                     let result_data = compact_res?;
 
                     let details_value = compaction_details_to_value(&result_data.details)?;
@@ -2246,6 +2287,14 @@ pub async fn run(
                 // Retry re-EXECUTES the recovered turn immediately: queueing
                 // it as steering would silently wait for (and then pollute)
                 // the next unrelated prompt.
+                if is_compacting.load(Ordering::SeqCst) {
+                    let _ = out_tx.send(response_error(
+                        id,
+                        "retry",
+                        "Agent is currently compacting; wait before retrying".to_string(),
+                    ));
+                    continue;
+                }
                 if is_streaming.load(Ordering::SeqCst) {
                     let _ = out_tx.send(response_error(
                         id,
@@ -2822,6 +2871,7 @@ async fn run_prompt_with_retry(
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
     let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
+    let _compacting_handoff_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
 
     // Cooldown restore (bd-cv653.3.2): if a previous turn failed over and the
     // cooldown has elapsed, swap back to the primary before running.
@@ -2948,6 +2998,10 @@ async fn run_prompt_with_retry(
                         }
                     }
                 } else {
+                    // Close new-turn admission before leaving the successful
+                    // provider result. The flag covers both the compaction
+                    // decision and any provider-backed compaction that follows.
+                    is_compacting.store(true, Ordering::SeqCst);
                     success = true;
                     break;
                 }
@@ -3096,21 +3150,18 @@ async fn run_prompt_with_retry(
         return;
     }
 
+    // Claim the turn-finalization/compaction phase before any await. While the
+    // previous provider turn has ended, its compaction decision and possible
+    // mutation are not yet complete, so admitting another turn here could race
+    // two snapshots and append competing compactions.
     let auto_compaction_enabled = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
         .await
         .is_ok_and(|state| state.auto_compaction_enabled);
-    if auto_compaction_enabled {
-        // Pre-claim the compaction flag before releasing is_streaming so the
-        // stdin-EOF drain never samples both flags false during the handoff
-        // (maybe_auto_compact only claims it after several awaits).
-        is_compacting.store(true, Ordering::SeqCst);
-    }
+    // Release the streaming phase only after the exclusion flag is visible, so
+    // both new-turn admission and stdin-EOF draining see a continuous handoff.
     is_streaming.store(false, Ordering::SeqCst);
     if auto_compaction_enabled {
         maybe_auto_compact(session, options, Arc::clone(&is_compacting), out_tx).await;
-        // maybe_auto_compact clears the flag on the paths where it claims it
-        // itself; this covers its early returns before that claim.
-        is_compacting.store(false, Ordering::SeqCst);
     }
 }
 

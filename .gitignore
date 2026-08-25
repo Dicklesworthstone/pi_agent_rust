@@ -9,6 +9,9 @@ rustc-ice-*.txt
 # bv (beads viewer) local config and caches
 .bv/
 
+# Agent Mail doctor runs and backups
+.doctor/
+
 # br local history backups and quarantine
 .beads/.br_history/
 .beads/.br_history_quarantine/

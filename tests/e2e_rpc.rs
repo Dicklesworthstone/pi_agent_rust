@@ -2880,6 +2880,7 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
     runtime.block_on(async move {
         let blocked_session_dir = harness.create_file("not-a-session-directory", b"blocked");
         let session = Session::create_with_dir(Some(blocked_session_dir));
+        let metrics_before = session.autosave_metrics();
         let provider: Arc<dyn Provider> = Arc::new(KeylessReplayProvider::new(
             "keyless-rpc-replay",
             KEYLESS_REPLAY_ABORT_WINDOW,
@@ -2921,12 +2922,12 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
             "session.persistence.backlog"
         );
         let metrics_cx = asupersync::Cx::for_testing();
-        let live_pending_mutations = session
+        let metrics_after = session
             .lock(&metrics_cx)
             .await
             .expect("lock failed-persistence session")
-            .autosave_metrics()
-            .pending_mutations as u64;
+            .autosave_metrics();
+        let live_pending_mutations = metrics_after.pending_mutations as u64;
         assert!(
             live_pending_mutations > 0,
             "the failed flush must retain the appended BashExecution mutation"
@@ -2939,6 +2940,33 @@ fn rpc_bash_persistence_failure_reports_real_backlog_without_retryable_error() {
         assert!(
             resp["data"]["persistenceWarning"].is_string(),
             "the successful command response must carry a non-retryable save warning: {resp}"
+        );
+        assert_eq!(
+            metrics_after.coalesced_mutations,
+            metrics_before.coalesced_mutations + 1,
+            "the BashExecution append must enqueue exactly one autosave mutation"
+        );
+        assert_eq!(
+            metrics_after.pending_mutations,
+            metrics_before
+                .pending_mutations
+                .saturating_add(1)
+                .min(metrics_before.max_pending_mutations),
+            "the failed flush must retain the appended mutation"
+        );
+        assert_eq!(
+            metrics_after.flush_started,
+            metrics_before.flush_started + 1,
+            "the backlog response must follow a real flush attempt"
+        );
+        assert_eq!(
+            metrics_after.flush_failed,
+            metrics_before.flush_failed + 1,
+            "the real flush attempt must record its failure"
+        );
+        assert_eq!(
+            metrics_after.flush_succeeded, metrics_before.flush_succeeded,
+            "the failed flush must not claim durable success"
         );
 
         drop(in_tx);
