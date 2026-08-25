@@ -1418,13 +1418,22 @@ impl Agent {
         self.config.approval_state.clone()
     }
 
-    /// Drain the dialect-repair ledger (bd-cv653.7.8): the session layer
-    /// turns entries into session Custom entries for the audit trail.
-    pub fn drain_repair_ledger(&self) -> Vec<crate::dialects::RepairEntry> {
+    /// Report whether the dialect-repair audit ledger has pending entries.
+    #[must_use = "ledger inspection can fail if its mutex is poisoned"]
+    pub fn repair_ledger_is_empty(&self) -> Result<bool> {
+        self.repair_ledger
+            .lock()
+            .map(|ledger| ledger.entries.is_empty())
+            .map_err(|_| Error::session("dialect repair ledger mutex poisoned"))
+    }
+
+    /// Take all pending dialect-repair audit entries.
+    #[must_use = "draining the repair ledger can fail if its mutex is poisoned"]
+    pub fn drain_repair_ledger(&self) -> Result<Vec<crate::dialects::RepairEntry>> {
         self.repair_ledger
             .lock()
             .map(|mut ledger| std::mem::take(&mut ledger.entries))
-            .unwrap_or_default()
+            .map_err(|_| Error::session("dialect repair ledger mutex poisoned"))
     }
 
     /// Drain magic-keyword activations (bd-cv653.3.6) for the session layer
@@ -6278,9 +6287,11 @@ mod extensions_integration_tests {
             let provider = Arc::new(NoopProvider);
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            ))));
             let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+                AgentSession::new(agent, session, true, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -11438,30 +11449,35 @@ impl AgentSession {
     }
 
     async fn finish_turn_ledgers(&mut self) -> Result<()> {
-        self.persist_repair_ledger().await;
+        self.persist_repair_ledger().await?;
         self.persist_keyword_ledger().await
     }
 
     /// Drain the dialect-repair ledger into session Custom entries
     /// (bd-cv653.7.8) so repairs are replayable/auditable.
-    async fn persist_repair_ledger(&self) {
-        let repairs = self.agent.drain_repair_ledger();
-        if repairs.is_empty() {
-            return;
+    async fn persist_repair_ledger(&self) -> Result<()> {
+        if self.agent.repair_ledger_is_empty()? {
+            return Ok(());
         }
         let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
-            for entry in &repairs {
-                inner.append_custom_entry(
-                    "dialect_repair".to_string(),
-                    Some(serde_json::json!({
-                        "tool": entry.tool,
-                        "strippedBytes": entry.stripped_bytes,
-                        "remainingTextBytes": entry.remaining_text_bytes,
-                    })),
-                );
-            }
+        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+            .await
+            .map_err(|err| Error::session(err.to_string()))?;
+        let repairs = self.agent.drain_repair_ledger()?;
+        for entry in &repairs {
+            inner.append_custom_entry(
+                "dialect_repair".to_string(),
+                Some(serde_json::json!({
+                    "tool": entry.tool,
+                    "strippedBytes": entry.stripped_bytes,
+                    "remainingTextBytes": entry.remaining_text_bytes,
+                })),
+            );
         }
+        if self.save_enabled {
+            inner.flush_autosave(AutosaveFlushTrigger::Periodic).await?;
+        }
+        Ok(())
     }
 
     /// Advisor hook (bd-cv653.3.3): after a completed turn, if the advisor
@@ -15886,6 +15902,27 @@ mod tests {
                     .and_then(Value::as_str),
                 Some("read")
             );
+
+            let persisted_path = {
+                let cx = asupersync::Cx::for_request();
+                let inner = agent_session.session.lock(&cx).await.expect("session lock");
+                inner.path.clone().expect("autosave created session file")
+            };
+            let reopened = Session::open(persisted_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen autosaved session");
+            let persisted_repairs = reopened
+                .entries_for_current_path()
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "dialect_repair"
+                    )
+                })
+                .count();
+            assert_eq!(persisted_repairs, 1, "repair audit entry survives reopen");
         });
     }
 
