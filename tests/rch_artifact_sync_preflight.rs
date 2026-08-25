@@ -246,6 +246,40 @@ fn anchored_root_artifacts_ignore_keeps_nested_required_artifacts() -> Result<()
 }
 
 #[test]
+fn leading_bang_is_literal_and_does_not_reinclude_required_artifact()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    write_required_artifact(repo)?;
+    fs::write(
+        repo.join(".rchignore"),
+        "tests/**\n!tests/ext_conformance/artifacts/**\n",
+    )?;
+
+    let output = run_preflight(repo, REQUIRED_ARTIFACT)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "RCH treats a leading bang literally, so it must not reinclude an excluded path\n{}",
+            output_debug(&output)
+        )));
+    }
+
+    let report = parse_json(&output)?;
+    let violations = array_field(&report, "violations")?;
+    let excluded = violations.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "required_path_excluded")
+    });
+    if !excluded {
+        return Err(test_error(format!(
+            "literal bang rule must not mask the original exclusion\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
 fn current_repo_required_artifacts_pass_sync_preflight() -> Result<(), Box<dyn Error>> {
     let output = Command::new("python3")
         .arg(script_path())
@@ -375,6 +409,93 @@ fn postcondition_passes_when_local_generated_artifact_changes() -> Result<(), Bo
     let summary = object_field(&report, "summary")?;
     require_u64_field(summary, "updated_count", 1)?;
     require_u64_field(summary, "violation_count", 0)?;
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_metadata_only_changes_with_identical_bytes() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output = run_postcondition_baseline(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "metadata negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    baseline["generated_artifacts"][0]["snapshot"]["mtime_ns"] = Value::from(0);
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "metadata-only change with identical bytes must remain stale\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let stale = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "generated_artifact_not_updated")
+    });
+    if !stale {
+        return Err(test_error(format!(
+            "metadata-only change must report generated_artifact_not_updated\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_before_manifest_from_another_repo() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    let foreign_repo = temp.path().join("foreign-repo");
+    fs::create_dir_all(&repo)?;
+    fs::create_dir_all(&foreign_repo)?;
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(&repo, "{\"generated_at\":\"old\"}\n")?;
+
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let baseline_output =
+        run_postcondition_baseline(&repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if !baseline_output.status.success() {
+        return Err(test_error(format!(
+            "foreign-root negative baseline capture should pass\n{}",
+            output_debug(&baseline_output)
+        )));
+    }
+
+    let mut baseline: Value = serde_json::from_slice(&fs::read(&before_manifest)?)?;
+    baseline["repo_root"] = Value::from(foreign_repo.display().to_string());
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&baseline)?)?;
+    write_generated_artifact(&repo, "{\"generated_at\":\"new\"}\n")?;
+
+    let output = run_postcondition(&repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "before manifest from another repo must fail closed\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let wrong_root = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_repo_root_mismatch")
+    });
+    if !wrong_root {
+        return Err(test_error(format!(
+            "foreign before manifest must report repo-root mismatch\n{}",
+            output_debug(&output)
+        )));
+    }
     Ok(())
 }
 

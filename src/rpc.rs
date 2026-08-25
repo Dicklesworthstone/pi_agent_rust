@@ -599,9 +599,8 @@ async fn rpc_session_transition_blocker(
         .await
         .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?
         .is_some();
-    Ok(bash_running.then_some(
-        "A background bash command is still running; wait before changing sessions",
-    ))
+    Ok(bash_running
+        .then_some("A background bash command is still running; wait before changing sessions"))
 }
 
 #[derive(Debug, Default)]

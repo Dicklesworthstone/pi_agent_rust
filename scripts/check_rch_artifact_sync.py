@@ -67,11 +67,9 @@ def load_ignore_rules(ignore_file: Path) -> tuple[list[IgnoreRule], list[str]]:
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        negated = stripped.startswith("!")
-        if negated:
-            stripped = stripped[1:].strip()
-        if not stripped:
-            continue
+        # RCH deliberately treats a leading `!` literally; unlike .gitignore,
+        # its source-sync filters do not support negation/re-inclusion.
+        negated = False
         stripped = stripped.replace("\\", "/")
         rules.append(
             IgnoreRule(
@@ -245,10 +243,9 @@ def snapshot_changed(before: dict[str, Any], after: dict[str, Any]) -> bool:
         return True
     if not after.get("exists"):
         return False
-    for key in ("kind", "size_bytes", "mtime_ns", "sha256"):
-        if before.get(key) != after.get(key):
-            return True
-    return False
+    if before.get("kind") != after.get("kind"):
+        return True
+    return before.get("sha256") != after.get("sha256")
 
 
 def build_missing_before_manifest_report(repo_root: Path, generated_artifacts: list[str]) -> dict[str, Any]:
@@ -284,12 +281,62 @@ def build_postcondition_report(
     repo_root: Path, generated_artifacts: list[str], before_manifest: Path
 ) -> dict[str, Any]:
     before_manifest_payload = load_json_file(before_manifest)
-    before_by_path = before_snapshots_by_path(repo_root, before_manifest_payload)
+    manifest_violations: list[dict[str, Any]] = []
+    expected_repo_root = str(repo_root.resolve())
+    manifest_repo_root = before_manifest_payload.get("repo_root")
+    if before_manifest_payload.get("schema") != SCHEMA:
+        manifest_violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_schema_mismatch",
+                "message": f"before manifest does not use schema {SCHEMA}",
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
+    if before_manifest_payload.get("mode") != "postcondition-baseline":
+        manifest_violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_mode_mismatch",
+                "message": "before manifest is not a postcondition baseline",
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
+    try:
+        resolved_manifest_root = str(Path(str(manifest_repo_root)).resolve())
+    except (OSError, TypeError, ValueError):
+        resolved_manifest_root = ""
+    if resolved_manifest_root != expected_repo_root:
+        manifest_violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_repo_root_mismatch",
+                "message": (
+                    "before manifest repo_root does not match the current repo root: "
+                    f"{manifest_repo_root!r} != {expected_repo_root!r}"
+                ),
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
+    before_by_path = (
+        {}
+        if manifest_violations
+        else before_snapshots_by_path(repo_root, before_manifest_payload)
+    )
     if not generated_artifacts:
         generated_artifacts = list(before_by_path)
 
     postconditions: list[dict[str, Any]] = []
-    violations: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = list(manifest_violations)
     updated_count = 0
     unchanged_count = 0
 
@@ -351,6 +398,30 @@ def build_postcondition_report(
                         "generated artifact is not a regular file after remote run: "
                         f"{rel_path} ({after.get('kind', 'unknown')})"
                     ),
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        elif before.get("error"):
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "before_snapshot_error",
+                    "message": f"before snapshot failed for generated artifact: {rel_path}",
+                    "recommended_action": POSTCONDITION_ACTION,
+                }
+            )
+        elif after.get("error"):
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "postcondition",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "after_snapshot_error",
+                    "message": f"after snapshot failed for generated artifact: {rel_path}",
                     "recommended_action": POSTCONDITION_ACTION,
                 }
             )
@@ -544,7 +615,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="append",
         dest="generated_artifacts",
         default=[],
-        help="Repo-relative artifact expected to be generated or rewritten by the remote gate.",
+        help="Artifact path expected to be generated or rewritten by the remote gate; absolute paths are supported.",
     )
     parser.add_argument(
         "--write-before-manifest",

@@ -1771,6 +1771,10 @@ impl Agent {
         self.initial_follow_up_fetcher = Some(fetcher);
     }
 
+    pub(crate) fn has_staged_follow_up(&self) -> bool {
+        self.message_queue.follow_up_batch_len() > 0
+    }
+
     /// Extend the tool registry with additional tools (e.g. extension-registered tools).
     pub fn extend_tools<I>(&mut self, tools: I)
     where
@@ -2446,7 +2450,9 @@ impl Agent {
         let mut follow_up_staged = false;
         let mut required_initial_follow_up_pending = initial_follow_up;
         let mut pending_messages = if initial_follow_up {
-            self.fetch_initial_follow_up_messages().await;
+            if self.message_queue.follow_up_batch_len() == 0 {
+                self.fetch_initial_follow_up_messages().await;
+            }
             follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
             Vec::new()
         } else {
@@ -14431,7 +14437,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_follow_up_batch_remains_staged_when_max_time_expires() {
+    fn ordinary_follow_up_batch_remains_staged_and_resumes_after_max_time() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -14449,12 +14455,14 @@ mod tests {
             );
             agent.set_queue_modes(QueueMode::All, QueueMode::All);
 
+            let expected = (0..128)
+                .map(|index| format!("staged follow-up {index}"))
+                .collect::<Vec<_>>();
             let queued_follow_up = Arc::new(StdTestMutex::new(Some(
-                (0..128)
-                    .map(|index| {
-                        QueuedAgentMessage::from_authored_message(user_message(
-                            format!("staged follow-up {index}").as_str(),
-                        ))
+                expected
+                    .iter()
+                    .map(|text| {
+                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
                     })
                     .collect::<Vec<_>>(),
             )));
@@ -14473,10 +14481,18 @@ mod tests {
                 };
             agent.register_initial_follow_up_fetcher(Arc::new(follow_up_fetcher));
 
-            agent
-                .run_with_message_with_abort(user_message("initial turn"), None, |_| {})
+            let events = StdArc::new(StdTestMutex::new(Vec::new()));
+            let events_for_run = StdArc::clone(&events);
+            let result = agent
+                .run_with_message_with_abort(user_message("initial turn"), None, move |event| {
+                    events_for_run.lock().expect("event capture").push(event);
+                })
                 .await
                 .expect("max-time stop");
+            assert!(
+                assistant_text_content(&result.content).contains("time cap reached"),
+                "the returned terminal message must report the cap"
+            );
 
             let calls_len = match calls.lock() {
                 Ok(calls) => calls.len(),
@@ -14491,6 +14507,56 @@ mod tests {
                 128,
                 "the accepted batch must remain staged for a later run"
             );
+            for (entry, expected_text) in agent.message_queue.follow_up.iter().zip(&expected) {
+                assert_user_text(&entry.delivery.message, expected_text);
+            }
+
+            let captured_events = events.lock().expect("event capture");
+            assert_eq!(
+                captured_events
+                    .iter()
+                    .filter(|event| matches!(event, AgentEvent::AgentStart { .. }))
+                    .count(),
+                1
+            );
+            let agent_ends = captured_events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::AgentEnd {
+                        messages, error, ..
+                    } => Some((messages, error)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(agent_ends.len(), 1, "AgentStart must have one matching AgentEnd");
+            assert!(agent_ends[0].1.is_none());
+            assert!(agent_ends[0].0.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant_text_content(&assistant.content).contains("time cap reached")
+                )
+            }));
+            drop(captured_events);
+
+            agent
+                .run_continue_with_follow_up_with_abort(None, |_| {})
+                .await
+                .expect("resume staged follow-up batch");
+            assert!(agent.message_queue.follow_up.is_empty());
+            let recorded_calls = match calls.lock() {
+                Ok(calls) => calls.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            assert_eq!(recorded_calls.len(), 2);
+            let resumed = &recorded_calls[1].messages;
+            assert!(resumed.len() >= expected.len());
+            for (message, expected_text) in resumed[resumed.len() - expected.len()..]
+                .iter()
+                .zip(&expected)
+            {
+                assert_user_text(message, expected_text);
+            }
         });
     }
 

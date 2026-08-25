@@ -698,7 +698,8 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
     let handle = runtime.handle();
 
     runtime.block_on(async {
-        let options = RpcOptions {
+        let scenario = async {
+            let options = RpcOptions {
             config: Config::default(),
             resources: ResourceLoader::empty(false),
             available_models: Vec::new(),
