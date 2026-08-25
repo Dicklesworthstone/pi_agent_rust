@@ -648,13 +648,15 @@ case " $* " in
 esac
 
 printf '%s\n' "$case_id" >>"${PI_FAKE_INVOCATION_LOG:?}"
+artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"type\":\"artifact\",\"test\":\"$test_name\",\"seq\":1,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"name\":\"$summary_name\",\"path\":\"/tmp/$summary_name\",\"size_bytes\":2,\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}"
+if [[ "${PI_FAKE_MALFORMED_ARTIFACT_INDEX:-0}" == "1" ]]; then
+  artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"test\":\"$test_name\",\"name\":\"$summary_name\"}"
+fi
 cat >"$TEST_LOG_JSONL_PATH" <<JSON
 {"schema":"pi.test.log.v2","type":"log","test":"$test_name","ci_correlation_id":"${CI_CORRELATION_ID:?}","category":"fault","message":"$fault_message"}
-{"schema":"pi.test.artifact.v1","type":"artifact","test":"$test_name","name":"$summary_name"}
+$artifact_record
 JSON
-cat >"$TEST_ARTIFACT_INDEX_PATH" <<JSON
-{"schema":"pi.test.artifact.v1","test":"$test_name","name":"$summary_name"}
-JSON
+printf '%s\n' "$artifact_record" >"$TEST_ARTIFACT_INDEX_PATH"
 "#;
     write_executable(&bin_dir.join("cargo"), cargo_stub);
 }
@@ -664,6 +666,7 @@ fn run_persistence_fault_runner_with_fake_rch(
     temp_root: &Path,
     correlation_id: &str,
     omit_sqlite_reports: bool,
+    malformed_artifact_index: bool,
 ) -> std::process::Output {
     let bin_dir = temp_root.join("bin");
     let target_dir = temp_root.join("target");
@@ -696,6 +699,9 @@ fn run_persistence_fault_runner_with_fake_rch(
     if omit_sqlite_reports {
         command.env("PI_FAKE_OMIT_SQLITE_REPORTS", "1");
     }
+    if malformed_artifact_index {
+        command.env("PI_FAKE_MALFORMED_ARTIFACT_INDEX", "1");
+    }
     command.output().expect("run persistence fault runner")
 }
 
@@ -704,8 +710,12 @@ fn run_persistence_fault_runner_with_fake_rch(
 fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed() {
     let success_root = unique_temp_dir("persistence-rch-success");
     let success_correlation = "persistence-rch-success-correlation";
-    let success =
-        run_persistence_fault_runner_with_fake_rch(&success_root, success_correlation, false);
+    let success = run_persistence_fault_runner_with_fake_rch(
+        &success_root,
+        success_correlation,
+        false,
+        false,
+    );
     assert!(
         success.status.success(),
         "fake RCH evidence run should pass. stdout={}\nstderr={}",
@@ -745,6 +755,7 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         &missing_root,
         "persistence-rch-missing-correlation",
         true,
+        false,
     );
     assert!(
         !missing.status.success(),
@@ -764,10 +775,40 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
     assert_eq!(missing_summary["overall_passed"], false);
     assert_eq!(missing_summary["cases"][0]["passed"], true);
     assert_eq!(missing_summary["cases"][1]["passed"], false);
+
+    let malformed_root = unique_temp_dir("persistence-rch-malformed-artifact");
+    let malformed = run_persistence_fault_runner_with_fake_rch(
+        &malformed_root,
+        "persistence-rch-malformed-correlation",
+        false,
+        true,
+    );
+    assert!(
+        !malformed.status.success(),
+        "malformed artifact evidence must fail closed"
+    );
+    let malformed_summary: Value = serde_json::from_slice(
+        &fs::read(malformed_root.join("artifacts/integrity-summary.json"))
+            .expect("read malformed-evidence integrity summary"),
+    )
+    .expect("parse malformed-evidence integrity summary");
+    assert_eq!(malformed_summary["overall_passed"], false);
+    for case in malformed_summary["cases"]
+        .as_array()
+        .expect("malformed-evidence summary cases")
+    {
+        assert_eq!(
+            case["checks"]["summary_artifact_schema_valid"],
+            false,
+            "schema-incomplete artifact rows must be rejected"
+        );
+    }
 }
 
 #[cfg(unix)]
 const FAKE_ORCHESTRATE_SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+#[cfg(unix)]
+const FAKE_ORCHESTRATE_CORRELATION_ID: &str = "bench-schema-orchestrate-correlation";
 
 #[cfg(unix)]
 #[allow(clippy::literal_string_with_formatting_args)] // bash ${VAR} syntax, not Rust fmt
@@ -7299,15 +7340,27 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     install_fake_orchestrate_toolchain(&bin_dir);
     install_fake_orchestrate_staging_artifacts(&target_dir);
     install_fake_orchestrate_rch_attestation(&target_dir, &output_dir);
-    let fault_injection_summary = fault_injection_root.join("stub/summary.json");
+    let fault_injection_summary = fault_injection_root.join("stub/integrity-summary.json");
     fs::create_dir_all(
         fault_injection_summary
             .parent()
             .expect("fault-injection summary parent"),
     )
     .expect("create fake fault-injection evidence directory");
-    fs::write(&fault_injection_summary, r#"{"overall_status":"pass"}"#)
-        .expect("write fake fault-injection evidence");
+    let fault_injection_passed = !extra_env.iter().any(|(key, value)| {
+        *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1"
+    });
+    fs::write(
+        &fault_injection_summary,
+        serde_json::to_vec(&json!({
+            "schema": "pi.e2e.persistence_fault_injection.summary.v1",
+            "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "overall_passed": fault_injection_passed,
+        }))
+        .expect("encode fake fault-injection evidence"),
+    )
+    .expect("write fake fault-injection evidence");
 
     let path = format!(
         "{}:{}",
@@ -7328,6 +7381,7 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("PERF_OUTPUT_DIR", &output_dir)
         .env("PERF_FAULT_INJECTION_ROOT", &fault_injection_root)
+        .env("CI_CORRELATION_ID", FAKE_ORCHESTRATE_CORRELATION_ID)
         .env("PERF_SKIP_CRITERION", "1");
     for (key, value) in extra_env {
         command.env(key, value);
@@ -7341,6 +7395,48 @@ fn run_orchestrate_with_fake_toolchain_with_env(
 #[cfg(unix)]
 fn run_orchestrate_with_fake_toolchain() -> (std::process::Output, PathBuf) {
     run_orchestrate_with_fake_toolchain_with_env(&[])
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_failed_persistence_summary_for_phase5() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_FAILED_PERSISTENCE_SUMMARY",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when persistence fault injection reports failure"
+    );
+
+    let matrix_path = temp_root
+        .join("run")
+        .join("results")
+        .join("phase1_matrix_validation.json");
+    let matrix: Value =
+        serde_json::from_str(&fs::read_to_string(&matrix_path).expect("read matrix artifact"))
+            .expect("parse matrix artifact");
+
+    assert_eq!(
+        matrix["regression_guards"]["security"].as_str(),
+        Some("fail"),
+        "overall_passed=false must fail the security regression guard"
+    );
+    assert!(
+        matrix["regression_guards"]["failure_or_gap_reasons"]
+            .as_array()
+            .is_some_and(|reasons| {
+                reasons
+                    .iter()
+                    .any(|reason| reason.as_str() == Some("security_regression"))
+            }),
+        "failed persistence evidence must name the security regression"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false),
+        "failed persistence evidence must block Phase 5 readiness"
+    );
 }
 
 #[cfg(unix)]

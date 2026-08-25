@@ -3769,30 +3769,45 @@ for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
 
 fault_injection_candidates = []
 if fault_injection_root.exists():
-    summary_candidates = list(fault_injection_root.glob("*/summary.json"))
-    integrity_candidates = list(
+    fault_injection_candidates = sorted(
         fault_injection_root.glob("*/integrity-summary.json")
     )
-    fault_injection_candidates = sorted(
-        {path for path in summary_candidates + integrity_candidates}
-    )
-fault_injection_summary_path = (
-    fault_injection_candidates[-1] if fault_injection_candidates else None
-)
+fault_injection_summary_path = None
 fault_injection_status = "missing"
 fault_injection_summary = {}
-if fault_injection_summary_path and fault_injection_summary_path.exists():
+matching_fault_injection_summaries = []
+for candidate in fault_injection_candidates:
     try:
-        fault_injection_summary = load_json(fault_injection_summary_path)
+        candidate_summary = load_json(candidate)
     except Exception:
-        fault_injection_summary = {}
-    status_text = str(fault_injection_summary.get("overall_status", "")).strip().lower()
-    if status_text in {"pass", "ok", "passed", "success"}:
-        fault_injection_status = "pass"
-    elif status_text:
-        fault_injection_status = "fail"
-    elif fault_injection_summary:
-        fault_injection_status = "pass"
+        continue
+    if not isinstance(candidate_summary, dict):
+        continue
+    if candidate_summary.get("schema") != "pi.e2e.persistence_fault_injection.summary.v1":
+        continue
+    if candidate_summary.get("correlation_id") != correlation_id:
+        continue
+    candidate_timestamp = parse_record_timestamp(candidate_summary)
+    if candidate_timestamp is None:
+        continue
+    if candidate_timestamp < run_started_at - source_clock_skew:
+        continue
+    if candidate_timestamp > datetime.now(timezone.utc) + source_clock_skew:
+        continue
+    matching_fault_injection_summaries.append(
+        (candidate_timestamp, str(candidate), candidate, candidate_summary)
+    )
+
+if matching_fault_injection_summaries:
+    (
+        _,
+        _,
+        fault_injection_summary_path,
+        fault_injection_summary,
+    ) = max(matching_fault_injection_summaries)
+    fault_injection_status = (
+        "pass" if fault_injection_summary.get("overall_passed") is True else "fail"
+    )
 
 memory_status = suite_status("perf_budgets", suite_result_by_name)
 if memory_status == "pass":

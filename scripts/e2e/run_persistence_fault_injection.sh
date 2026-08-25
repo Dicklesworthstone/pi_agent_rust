@@ -5,11 +5,43 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# RCH retrieves diagnostics through fixed project-root report names. Serialize
+# this runner across agents before creating any run-specific state so two
+# invocations cannot race between the pre-existing-file check, remote execution,
+# and report move.
+if [[ "${PERSISTENCE_REPORT_LOCK_HELD:-0}" != "1" ]]; then
+    exec python3 - "$0" "$@" <<'PY'
+import fcntl
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+script = Path(sys.argv[1]).resolve()
+arguments = sys.argv[2:]
+lock_path = Path(
+    os.environ.get(
+        "PERSISTENCE_REPORT_LOCK_PATH",
+        "/tmp/pi_agent_rust-persistence-fault-injection-reports.lock",
+    )
+)
+lock_path.parent.mkdir(parents=True, exist_ok=True)
+with lock_path.open("a+", encoding="utf-8") as lock_file:
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+    child_env = os.environ.copy()
+    child_env["PERSISTENCE_REPORT_LOCK_HELD"] = "1"
+    completed = subprocess.run(["bash", str(script), *arguments], env=child_env)
+    raise SystemExit(completed.returncode)
+PY
+fi
+
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
-ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-$PROJECT_ROOT/tests/e2e_results/persistence-fault-injection/$STAMP}"
+RUN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
+RUN_ID="$STAMP-$RUN_NONCE"
+ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-$PROJECT_ROOT/tests/e2e_results/persistence-fault-injection/$RUN_ID}"
 mkdir -p "$ARTIFACT_DIR"
 
-CORRELATION_ID="${CI_CORRELATION_ID:-persistence-fault-injection-$STAMP}"
+CORRELATION_ID="${CI_CORRELATION_ID:-persistence-fault-injection-$RUN_ID}"
 export CI_CORRELATION_ID="$CORRELATION_ID"
 export RUST_LOG="${RUST_LOG:-info}"
 
@@ -58,6 +90,10 @@ RCH_ARTIFACT_INDEX_REPORT="test-results.xml"
 available_mb() {
     local path="$1"
     df -Pm "$path" | awk 'NR == 2 { print $4 }'
+}
+
+epoch_ms() {
+    python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
 }
 
 assert_free_mb() {
@@ -199,7 +235,7 @@ run_case() {
     export TEST_ARTIFACT_INDEX_PATH="$harness_artifact_index"
 
     echo "[fault-injection] Running case '$case_id' ($test_name)"
-    start_epoch=$(date +%s%N 2>/dev/null || date +%s)
+    start_epoch=$(epoch_ms)
 
     set +e
     if [[ -n "$feature_name" ]]; then
@@ -242,12 +278,8 @@ run_case() {
         fi
     fi
 
-    end_epoch=$(date +%s%N 2>/dev/null || date +%s)
-    if [[ ${#start_epoch} -gt 12 ]]; then
-        duration_ms=$(((end_epoch - start_epoch) / 1000000))
-    else
-        duration_ms=$(((end_epoch - start_epoch) * 1000))
-    fi
+    end_epoch=$(epoch_ms)
+    duration_ms=$((end_epoch - start_epoch))
 
     write_case_result \
         "$result_file" \
@@ -298,7 +330,9 @@ run_case "sqlite" "sqlite_fault_injection_flush_windows_preserve_integrity" "sql
 set +e
 python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" <<'PY'
 import json
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 artifact_dir = Path(sys.argv[1])
@@ -328,6 +362,52 @@ def load_jsonl(path: Path) -> list[dict]:
     return records
 
 
+def artifact_record_is_valid(
+    record: dict,
+    expected_test_name: str,
+    expected_summary_artifact: str,
+) -> bool:
+    required_fields = {"schema", "type", "seq", "ts", "t_ms", "name", "path"}
+    if not required_fields.issubset(record):
+        return False
+    if record.get("schema") != "pi.test.artifact.v1":
+        return False
+    if record.get("type") != "artifact":
+        return False
+    if record.get("test") != expected_test_name:
+        return False
+    if record.get("name") != expected_summary_artifact:
+        return False
+    seq = record.get("seq")
+    elapsed_ms = record.get("t_ms")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return False
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
+        return False
+    raw_timestamp = record.get("ts")
+    if not isinstance(raw_timestamp, str) or not raw_timestamp.strip():
+        return False
+    normalized_timestamp = raw_timestamp.strip()
+    if normalized_timestamp.endswith("Z"):
+        normalized_timestamp = f"{normalized_timestamp[:-1]}+00:00"
+    try:
+        parsed_timestamp = datetime.fromisoformat(normalized_timestamp)
+    except ValueError:
+        return False
+    if parsed_timestamp.tzinfo is None:
+        return False
+    raw_path = record.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        return False
+    if Path(raw_path).name != expected_summary_artifact:
+        return False
+    size_bytes = record.get("size_bytes")
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes <= 0:
+        return False
+    sha256 = record.get("sha256")
+    return isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256) is not None
+
+
 def case_checks(
     case_id: str,
     expected_test_name: str,
@@ -349,8 +429,14 @@ def case_checks(
         and expected_fault_message in str(record.get("message", ""))
         for record in logs
     )
-    has_summary_artifact = any(
-        record.get("name") == expected_summary_artifact for record in artifacts
+    summary_artifacts = [
+        record
+        for record in artifacts
+        if record.get("name") == expected_summary_artifact
+    ]
+    has_summary_artifact = len(summary_artifacts) == 1
+    has_valid_summary_artifact = has_summary_artifact and artifact_record_is_valid(
+        summary_artifacts[0], expected_test_name, expected_summary_artifact
     )
     has_current_correlation = bool(logs) and all(
         record.get("ci_correlation_id") == correlation_id for record in logs
@@ -363,6 +449,7 @@ def case_checks(
         "test_command_passed": result.get("exit_code") == 0,
         "fault_log_emitted": has_fault_log,
         "summary_artifact_indexed": has_summary_artifact,
+        "summary_artifact_schema_valid": has_valid_summary_artifact,
         "correlation_id_current": has_current_correlation,
         "test_identity_current": has_expected_test_identity,
     }
