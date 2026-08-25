@@ -44,6 +44,11 @@ mkdir -p "$ARTIFACT_DIR"
 CORRELATION_ID="${CI_CORRELATION_ID:-persistence-fault-injection-$RUN_ID}"
 export CI_CORRELATION_ID="$CORRELATION_ID"
 export RUST_LOG="${RUST_LOG:-info}"
+SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+SOURCE_DIRTY=false
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)" ]]; then
+    SOURCE_DIRTY=true
+fi
 
 default_build_root() {
     local base="/data/tmp/pi_agent_rust"
@@ -184,7 +189,10 @@ write_case_result() {
     cat >"$result_file" <<EOF
 {
   "schema": "pi.e2e.persistence_fault_case.v1",
+  "run_id": "$CORRELATION_ID",
   "correlation_id": "$CORRELATION_ID",
+  "source_commit": "$SOURCE_COMMIT",
+  "source_dirty": $SOURCE_DIRTY,
   "case_id": "$case_id",
   "suite": "e2e_session_persistence",
   "test_name": "$test_name",
@@ -328,7 +336,7 @@ run_case "jsonl" "jsonl_fault_injection_flush_windows_preserve_integrity" || jso
 run_case "sqlite" "sqlite_fault_injection_flush_windows_preserve_integrity" "sqlite-sessions" || sqlite_exit=$?
 
 set +e
-python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" <<'PY'
+python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" "$SOURCE_COMMIT" "$SOURCE_DIRTY" <<'PY'
 import json
 import re
 import sys
@@ -338,6 +346,8 @@ from pathlib import Path
 artifact_dir = Path(sys.argv[1])
 correlation_id = sys.argv[2]
 timestamp = sys.argv[3]
+source_commit = sys.argv[4]
+source_dirty = sys.argv[5] == "true"
 
 
 def load_json(path: Path) -> dict:
@@ -480,7 +490,10 @@ sqlite_case = case_checks(
 overall_passed = jsonl_case["passed"] and sqlite_case["passed"]
 summary = {
     "schema": "pi.e2e.persistence_fault_injection.summary.v1",
+    "run_id": correlation_id,
     "correlation_id": correlation_id,
+    "source_commit": source_commit,
+    "source_dirty": source_dirty,
     "timestamp": timestamp,
     "assertions": {
         "crash_windows": ["pre_flush", "mid_flush", "post_flush"],
@@ -511,7 +524,10 @@ fi
 cat >"$ARTIFACT_DIR/run-manifest.json" <<EOF
 {
   "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
+  "run_id": "$CORRELATION_ID",
   "correlation_id": "$CORRELATION_ID",
+  "source_commit": "$SOURCE_COMMIT",
+  "source_dirty": $SOURCE_DIRTY,
   "timestamp": "$STAMP",
   "artifact_dir": "$ARTIFACT_DIR",
   "runner_mode": "$CARGO_RUNNER_MODE",

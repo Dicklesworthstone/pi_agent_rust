@@ -7354,7 +7354,10 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         &fault_injection_summary,
         serde_json::to_vec(&json!({
             "schema": "pi.e2e.persistence_fault_injection.summary.v1",
+            "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
             "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+            "source_commit": FAKE_ORCHESTRATE_SOURCE_COMMIT,
+            "source_dirty": false,
             "timestamp": chrono::Utc::now().to_rfc3339(),
             "overall_passed": fault_injection_passed,
         }))

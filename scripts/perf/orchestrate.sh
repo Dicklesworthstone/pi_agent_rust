@@ -3787,6 +3787,12 @@ for candidate in fault_injection_candidates:
         continue
     if candidate_summary.get("correlation_id") != correlation_id:
         continue
+    if candidate_summary.get("run_id") != correlation_id:
+        continue
+    if candidate_summary.get("source_commit") != source_commit:
+        continue
+    if candidate_summary.get("source_dirty") is not source_dirty:
+        continue
     candidate_timestamp = parse_record_timestamp(candidate_summary)
     if candidate_timestamp is None:
         continue

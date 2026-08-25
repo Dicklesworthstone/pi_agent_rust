@@ -1765,7 +1765,7 @@ pub async fn run(
                             // Acquisition order is unchanged (outer `AgentSession`
                             // then inner `Session`), and the inner guard is still
                             // released before the persist step below.
-                            let should_persist = if let Ok(guard) =
+                            let (should_persist, append_error) = if let Ok(guard) =
                                 OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
                             {
                                 if let Ok(mut inner_session) = guard.session.lock(&bash_cx).await {
@@ -1779,32 +1779,97 @@ pub async fn run(
                                         timestamp: Some(chrono::Utc::now().timestamp_millis()),
                                         extra: std::collections::HashMap::default(),
                                     });
-                                    true
+                                    (true, None)
                                 } else {
-                                    false
+                                    (false, Some("inner session lock poisoned".to_string()))
                                 }
                             } else {
-                                false
+                                (false, Some("outer session lock failed".to_string()))
                             };
 
-                            // Persist session outside the guard scope
-                            if should_persist
-                                && let Ok(mut guard) =
+                            let (persisted, persistence_warning, persistence_status) = if should_persist {
+                                if let Ok(mut guard) =
                                     OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
-                            {
-                                let _ = guard.persist_session().await;
+                                {
+                                    match guard.persist_session().await {
+                                        Ok(()) => (
+                                            true,
+                                            None,
+                                            json!({
+                                                "event": "session.persistence.healthy",
+                                                "severity": "ok",
+                                                "summary": "Session history persisted.",
+                                                "action": "No action required.",
+                                                "sliIds": ["sli_resume_ready_p95_ms"],
+                                                "pendingMessageCount": 0,
+                                            }),
+                                        ),
+                                        Err(err) => {
+                                            tracing::warn!(
+                                                error = %err,
+                                                "Failed to persist bash execution history to session"
+                                            );
+                                            (
+                                                false,
+                                                Some(format!("Failed to persist bash execution to session: {err}")),
+                                                json!({
+                                                    "event": "session.persistence.backlog",
+                                                    "severity": "warning",
+                                                    "summary": "Session history persistence failed after bash execution.",
+                                                    "action": "Trigger manual save or verify session storage permissions.",
+                                                    "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
+                                                    "pendingMessageCount": 1,
+                                                    "errorMessage": err.to_string(),
+                                                }),
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    (
+                                        false,
+                                        Some("Failed to acquire session lock for persistence".to_string()),
+                                        json!({
+                                            "event": "session.persistence.backlog",
+                                            "severity": "warning",
+                                            "summary": "Session lock acquisition failed after bash execution.",
+                                            "action": "Check session concurrency.",
+                                            "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
+                                            "pendingMessageCount": 1,
+                                        }),
+                                    )
+                                }
+                            } else {
+                                (
+                                    false,
+                                    append_error.as_deref().map(|e| format!("Failed to append bash execution to session: {e}")),
+                                    json!({
+                                        "event": "session.persistence.backlog",
+                                        "severity": "warning",
+                                        "summary": "Failed to append bash execution message to session.",
+                                        "action": "Check session health.",
+                                        "sliIds": ["sli_resume_ready_p95_ms", "sli_failure_recovery_success_rate"],
+                                        "pendingMessageCount": 1,
+                                    }),
+                                )
+                            };
+
+                            let mut payload = json!({
+                                "output": result.output,
+                                "exitCode": result.exit_code,
+                                "cancelled": result.cancelled,
+                                "truncated": result.truncated,
+                                "fullOutputPath": result.full_output_path,
+                                "persisted": persisted,
+                                "persistenceStatus": persistence_status,
+                            });
+                            if let Some(warn) = persistence_warning {
+                                payload["persistenceWarning"] = json!(warn);
                             }
 
                             response_ok(
                                 id_clone,
                                 "bash",
-                                Some(json!({
-                                    "output": result.output,
-                                    "exitCode": result.exit_code,
-                                    "cancelled": result.cancelled,
-                                    "truncated": result.truncated,
-                                    "fullOutputPath": result.full_output_path,
-                                })),
+                                Some(payload),
                             )
                         }
                         Err(err) => response_error_with_hints(id_clone, "bash", &err),
@@ -5023,22 +5088,35 @@ async fn maybe_auto_compact(
                 let messages = inner_session.to_messages_for_current_path();
                 (messages, tokens_after)
             };
-            let _ = guard.persist_session().await;
+            let persist_res = guard.persist_session().await;
             guard.agent.replace_messages(messages);
             drop(guard);
 
-            let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
-                result: Some(json!({
-                    "summary": result.summary,
-                    "firstKeptEntryId": result.first_kept_entry_id,
-                    "tokensBefore": result.tokens_before,
-                    "tokensAfter": tokens_after,
-                    "details": details_value,
-                })),
-                aborted: false,
-                will_retry: false,
-                error_message: None,
-            }));
+            match persist_res {
+                Ok(()) => {
+                    let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
+                        result: Some(json!({
+                            "summary": result.summary,
+                            "firstKeptEntryId": result.first_kept_entry_id,
+                            "tokensBefore": result.tokens_before,
+                            "tokensAfter": tokens_after,
+                            "details": details_value,
+                        })),
+                        aborted: false,
+                        will_retry: false,
+                        error_message: None,
+                    }));
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "Failed to persist auto-compaction to session");
+                    let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
+                        result: None,
+                        aborted: false,
+                        will_retry: false,
+                        error_message: Some(format!("Failed to persist compaction to session: {err}")),
+                    }));
+                }
+            }
         }
         Err(err) => {
             let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
