@@ -6287,11 +6287,9 @@ mod extensions_integration_tests {
             let provider = Arc::new(NoopProvider);
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
-                temp.path().join("sessions"),
-            ))));
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session =
-                AgentSession::new(agent, session, true, ResolvedCompactionSettings::default());
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -15837,9 +15835,11 @@ mod tests {
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                temp.path().join("sessions"),
+            ))));
             let mut agent_session =
-                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
+                AgentSession::new(agent, session, true, ResolvedCompactionSettings::default());
 
             let final_message = agent_session
                 .run_text_with_abort("check the fixture".to_string(), None, |_| {})
