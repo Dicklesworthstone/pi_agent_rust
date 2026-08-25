@@ -472,6 +472,10 @@ fn dispatch_agent_event_to_ui(event: &AgentEvent, batcher: &mut UiStreamDeltaBat
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolInvocationRenderer {
     Field(&'static str),
+    FieldOrDefault {
+        field: &'static str,
+        default: &'static str,
+    },
     Search {
         pattern: &'static str,
         scope: &'static str,
@@ -490,7 +494,7 @@ enum ToolInvocationRenderer {
 /// tools form a dynamic namespace and share one renderer; extension-defined
 /// tools retain the extension/custom-renderer fallback.
 fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
-    use ToolInvocationRenderer::{Action, Field, Mcp, Questions, Search, Subagent};
+    use ToolInvocationRenderer::{Action, Field, FieldOrDefault, Mcp, Questions, Search, Subagent};
 
     if tool_name
         .strip_prefix("mcp__")
@@ -501,7 +505,11 @@ fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
 
     Some(match tool_name {
         "bash" => Field("command"),
-        "read" | "write" | "edit" | "hashline_edit" | "ls" | "inspect_image" => Field("path"),
+        "read" | "write" | "edit" | "hashline_edit" | "inspect_image" => Field("path"),
+        "ls" => FieldOrDefault {
+            field: "path",
+            default: ".",
+        },
         "grep" | "find" | "ast_grep" => Search {
             pattern: "pattern",
             scope: "path",
@@ -658,6 +666,14 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
     const MAX: usize = 96;
     let summary = match tool_invocation_renderer(tool_name)? {
         ToolInvocationRenderer::Field(field) => clip(nonblank_str_arg(args, field)?, MAX),
+        ToolInvocationRenderer::FieldOrDefault { field, default } => match args.get(field) {
+            None | Some(serde_json::Value::Null) => default.to_string(),
+            Some(serde_json::Value::String(value)) if value.trim().is_empty() => {
+                default.to_string()
+            }
+            Some(serde_json::Value::String(value)) => clip(value, MAX),
+            Some(_) => return None,
+        },
         ToolInvocationRenderer::Search { pattern, scope } => {
             let pattern = nonblank_str_arg(args, pattern)?.trim();
             match nonblank_str_arg(args, scope) {
@@ -4055,6 +4071,19 @@ mod tool_invocation_summary_coverage {
                 "{name}: head must cite the target path: {summary}"
             );
         }
+    }
+
+    #[test]
+    fn ls_uses_the_documented_current_directory_default() {
+        assert_eq!(
+            tool_invocation_summary("ls", &serde_json::json!({})).as_deref(),
+            Some(".")
+        );
+        assert_eq!(
+            tool_invocation_summary("ls", &serde_json::json!({"path": null})).as_deref(),
+            Some(".")
+        );
+        assert!(tool_invocation_summary("ls", &serde_json::json!({"path": 42})).is_none());
     }
 
     #[test]

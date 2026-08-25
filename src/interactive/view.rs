@@ -977,9 +977,7 @@ impl PiApp {
                 }
 
                 // Render markdown content with rich enhancements
-                let enriched_content = crate::markdown_rich::render_hex_swatches(
-                    &crate::markdown_rich::latex_to_unicode(&msg.content),
-                );
+                let enriched_content = crate::markdown_rich::enrich_markdown(&msg.content);
                 let rendered = glamour::Renderer::new()
                     .with_style_config(self.markdown_style.clone())
                     .with_word_wrap(self.term_width.saturating_sub(6).max(40))

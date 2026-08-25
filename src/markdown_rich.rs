@@ -154,6 +154,174 @@ pub fn render_hex_swatches(text: &str) -> String {
     out
 }
 
+/// Apply prose-only Markdown enhancements without rewriting literal code,
+/// link destinations, URLs, or filesystem paths.
+///
+/// The individual enhancement functions intentionally operate on plain text.
+/// Callers rendering Markdown should use this boundary so syntax-bearing text
+/// reaches the Markdown parser byte-for-byte intact.
+#[must_use]
+pub fn enrich_markdown(markdown: &str) -> String {
+    fn fence_marker(line: &str) -> Option<(u8, usize)> {
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        if indent > 3 {
+            return None;
+        }
+        let rest = line.as_bytes().get(indent..)?;
+        let marker = *rest.first()?;
+        if !matches!(marker, b'`' | b'~') {
+            return None;
+        }
+        let len = rest.iter().take_while(|byte| **byte == marker).count();
+        (len >= 3).then_some((marker, len))
+    }
+
+    fn closes_fence(line: &str, marker: u8, minimum_len: usize) -> bool {
+        let indent = line.bytes().take_while(|byte| *byte == b' ').count();
+        if indent > 3 {
+            return false;
+        }
+        let Some(rest) = line.as_bytes().get(indent..) else {
+            return false;
+        };
+        let len = rest.iter().take_while(|byte| **byte == marker).count();
+        len >= minimum_len && rest[len..].iter().all(u8::is_ascii_whitespace)
+    }
+
+    fn enrich_plain(text: &str) -> String {
+        fn is_path_or_url(chunk: &str) -> bool {
+            chunk.contains('/')
+                || chunk.contains("://")
+                || chunk.contains(":\\")
+                || chunk.starts_with("\\\\")
+        }
+
+        let mut out = String::with_capacity(text.len());
+        let mut start = 0;
+        let mut whitespace = None;
+        for (index, character) in text.char_indices() {
+            let is_whitespace = character.is_whitespace();
+            if whitespace.is_some_and(|current| current != is_whitespace) {
+                let chunk = &text[start..index];
+                if whitespace == Some(true) || is_path_or_url(chunk) {
+                    out.push_str(chunk);
+                } else {
+                    out.push_str(&render_hex_swatches(&latex_to_unicode(chunk)));
+                }
+                start = index;
+            }
+            whitespace = Some(is_whitespace);
+        }
+        let chunk = &text[start..];
+        if whitespace == Some(true) || is_path_or_url(chunk) {
+            out.push_str(chunk);
+        } else {
+            out.push_str(&render_hex_swatches(&latex_to_unicode(chunk)));
+        }
+        out
+    }
+
+    fn inline_code_end(text: &str, start: usize) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let delimiter_len = bytes[start..]
+            .iter()
+            .take_while(|byte| **byte == b'`')
+            .count();
+        let mut cursor = start + delimiter_len;
+        while cursor < bytes.len() {
+            if bytes[cursor] != b'`' {
+                cursor += 1;
+                continue;
+            }
+            let run_len = bytes[cursor..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if run_len == delimiter_len {
+                return Some(cursor + run_len);
+            }
+            cursor += run_len;
+        }
+        None
+    }
+
+    fn link_destination_end(text: &str, start: usize) -> Option<usize> {
+        if !text[start..].starts_with("](") {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        let mut depth = 1_usize;
+        let mut cursor = start + 2;
+        while cursor < bytes.len() {
+            match bytes[cursor] {
+                b'\\' => cursor = (cursor + 2).min(bytes.len()),
+                b'(' => {
+                    depth += 1;
+                    cursor += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    cursor += 1;
+                    if depth == 0 {
+                        return Some(cursor);
+                    }
+                }
+                _ => cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn enrich_inline(text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut plain_start = 0;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            let protected_end = match bytes[cursor] {
+                b'`' => inline_code_end(text, cursor),
+                b']' => link_destination_end(text, cursor),
+                b'<' => text[cursor + 1..]
+                    .find('>')
+                    .map(|offset| cursor + offset + 2),
+                _ => None,
+            };
+            if let Some(end) = protected_end {
+                out.push_str(&enrich_plain(&text[plain_start..cursor]));
+                out.push_str(&text[cursor..end]);
+                cursor = end;
+                plain_start = end;
+            } else {
+                let character_len = text[cursor..].chars().next().map_or(1, char::len_utf8);
+                cursor += character_len;
+            }
+        }
+        out.push_str(&enrich_plain(&text[plain_start..]));
+        out
+    }
+
+    let mut out = String::with_capacity(markdown.len() + 32);
+    let mut active_fence = None;
+    for line in markdown.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if let Some((marker, minimum_len)) = active_fence {
+            out.push_str(line);
+            if closes_fence(body, marker, minimum_len) {
+                active_fence = None;
+            }
+        } else if let Some(marker) = fence_marker(body) {
+            active_fence = Some(marker);
+            out.push_str(line);
+        } else {
+            out.push_str(&enrich_inline(body));
+            if line.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// Emit an OSC-8 terminal hyperlink.
 #[must_use]
 pub fn format_osc8_link(url: &str, label: &str) -> String {
@@ -243,6 +411,29 @@ mod tests {
     fn test_hex_swatch_rejects_longer_alphanumeric_tokens() {
         let input = "Not colors: #1234567, #abcdefg, or #fffz.";
         assert_eq!(render_hex_swatches(input), input);
+    }
+
+    #[test]
+    fn test_markdown_enrichment_preserves_literal_and_destination_bytes() {
+        let input = concat!(
+            "Math \\alpha and color #abc.\n",
+            "Inline `\\alpha #abc` and ``literal ` \\beta #123456``.\n",
+            "A [link](https://example.test/\\alpha#abc) and https://example.test/#abc.\n",
+            "A path /tmp/\\alpha/#abc stays literal.\n",
+            "```rust\n",
+            "let literal = r\"\\alpha #abc\";\n",
+            "```\n",
+        );
+        let enriched = enrich_markdown(input);
+
+        assert!(enriched.contains("Math α and color ■ #abc."));
+        assert!(enriched.contains("`\\alpha #abc`"));
+        assert!(enriched.contains("``literal ` \\beta #123456``"));
+        assert!(enriched.contains("(https://example.test/\\alpha#abc)"));
+        assert!(enriched.contains("https://example.test/#abc"));
+        assert!(enriched.contains("/tmp/\\alpha/#abc"));
+        assert!(enriched.contains("let literal = r\"\\alpha #abc\";"));
+        assert!(!enriched.contains("https://example.test/■"));
     }
 
     #[test]

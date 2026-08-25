@@ -7,6 +7,36 @@
 
 use serde::{Deserialize, Serialize};
 
+fn display_width(text: &str) -> usize {
+    #[cfg(feature = "tui")]
+    {
+        unicode_width::UnicodeWidthStr::width(text)
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        text.chars().count()
+    }
+}
+
+fn truncate_display_width(text: &str, maximum_width: usize) -> String {
+    #[cfg(feature = "tui")]
+    {
+        let mut end = 0;
+        for (index, character) in text.char_indices() {
+            let candidate_end = index + character.len_utf8();
+            if display_width(&text[..candidate_end]) > maximum_width {
+                break;
+            }
+            end = candidate_end;
+        }
+        text[..end].to_string()
+    }
+    #[cfg(not(feature = "tui"))]
+    {
+        text.chars().take(maximum_width).collect()
+    }
+}
+
 /// Predefined status line presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -283,12 +313,12 @@ impl PowerlineStatusLine {
         }
 
         // Sort by priority descending to identify segments to drop first
-        let sep_width = self.separator.glyph().chars().count() + 2;
+        let sep_width = display_width(self.separator.glyph()) + 2;
         let sep_str = format!(" {} ", self.separator.glyph());
         while !rendered_segments.is_empty() {
             let total_len: usize = rendered_segments
                 .iter()
-                .map(|(_, t)| t.chars().count())
+                .map(|(_, text)| display_width(text))
                 .sum::<usize>()
                 + if rendered_segments.len() > 1 {
                     (rendered_segments.len() - 1) * sep_width
@@ -310,14 +340,12 @@ impl PowerlineStatusLine {
             }
         }
 
-        rendered_segments
+        let rendered = rendered_segments
             .into_iter()
             .map(|(_, text)| text)
             .collect::<Vec<_>>()
-            .join(&sep_str)
-            .chars()
-            .take(available_width)
-            .collect()
+            .join(&sep_str);
+        truncate_display_width(&rendered, available_width)
     }
 }
 
@@ -395,7 +423,7 @@ mod tests {
 
         // Narrow terminal: lower priority segments dropped
         let narrow = status_line.render(&ctx, 35);
-        assert!(narrow.chars().count() <= 35);
+        assert!(display_width(&narrow) <= 35);
     }
 
     #[test]
@@ -406,7 +434,21 @@ mod tests {
         };
         let status_line = PowerlineStatusLine::with_preset(StatusLinePreset::Minimal);
         let rendered = status_line.render(&ctx, 8);
-        assert_eq!(rendered.chars().count(), 8);
+        assert_eq!(display_width(&rendered), 8);
+    }
+
+    #[cfg(feature = "tui")]
+    #[test]
+    fn test_status_line_clamps_wide_unicode_to_terminal_cells() {
+        let ctx = StatusContext {
+            model: "模型🙂模型🙂",
+            ..StatusContext::default()
+        };
+        let status_line = PowerlineStatusLine::with_preset(StatusLinePreset::Minimal);
+        let rendered = status_line.render(&ctx, 7);
+
+        assert!(display_width(&rendered) <= 7, "rendered {rendered:?}");
+        assert!(rendered.is_char_boundary(rendered.len()));
     }
 
     #[test]
