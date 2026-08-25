@@ -204,6 +204,26 @@ fn target_output_subdir_rejects_symlink_escape() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn artifact_writer_rejects_preexisting_symlink_leaf() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("create artifact writer tempdir");
+    let external = temp.path().join("external.jsonl");
+    fs::write(&external, b"unchanged\n").expect("create external artifact target");
+    let output = temp.path().join("extension_bench.jsonl");
+    symlink(&external, &output).expect("create output leaf symlink");
+
+    let error = write_new_artifact(&output, b"replacement\n")
+        .expect_err("exclusive artifact creation must reject a symlink leaf");
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(
+        fs::read(&external).expect("read external artifact target"),
+        b"unchanged\n"
+    );
+}
+
 fn artifacts_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/ext_conformance/artifacts")
 }
@@ -1321,30 +1341,70 @@ fn bench_jsonl_schema_validation_is_non_vacuous() {
         env: fixture_env,
         timestamp: "2026-08-25T00:00:00Z".to_string(),
     };
-    let valid_jsonl = format!("{}\n", emit_jsonl_line(&record));
-    assert_eq!(validate_bench_jsonl(&valid_jsonl), Ok(1));
+    let mut warm_record = record.clone();
+    warm_record.scenario = "warm_start".to_string();
+    let mut tool_record = record.clone();
+    tool_record.scenario = "tool_call".to_string();
+    let expected_extensions = vec!["hello".to_string()];
+    let valid_records = vec![record.clone(), warm_record, tool_record];
+    let records_to_jsonl = |records: &[BenchRecord]| {
+        format!(
+            "{}\n",
+            records
+                .iter()
+                .map(emit_jsonl_line)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
+    let valid_jsonl = records_to_jsonl(&valid_records);
+    assert_eq!(
+        validate_bench_jsonl(&valid_jsonl, &expected_extensions),
+        Ok(3)
+    );
 
-    let mut unbound_provenance = record.clone();
-    unbound_provenance.env.binary_path.push_str("-tampered");
-    let unbound_jsonl = format!("{}\n", emit_jsonl_line(&unbound_provenance));
+    let mut unbound_records = valid_records.clone();
+    unbound_records[0].env.binary_path.push_str("-tampered");
+    let unbound_jsonl = records_to_jsonl(&unbound_records);
     assert!(
-        validate_bench_jsonl(&unbound_jsonl).is_err(),
+        validate_bench_jsonl(&unbound_jsonl, &expected_extensions).is_err(),
         "mutating a provenance field without its config hash must fail validation"
     );
 
     for empty in ["", "\n", " \n\t\n"] {
         assert!(
-            validate_bench_jsonl(empty).is_err(),
+            validate_bench_jsonl(empty, &expected_extensions).is_err(),
             "empty or blank JSONL must not pass schema validation"
         );
     }
 
-    let mut no_cold_start = record;
-    no_cold_start.scenario = "warm_start".to_string();
-    let no_cold_jsonl = format!("{}\n", emit_jsonl_line(&no_cold_start));
+    let no_cold_jsonl = records_to_jsonl(&valid_records[1..]);
     assert!(
-        validate_bench_jsonl(&no_cold_jsonl).is_err(),
+        validate_bench_jsonl(&no_cold_jsonl, &expected_extensions).is_err(),
         "JSONL without a positive cold-start record must fail"
+    );
+}
+
+#[test]
+fn benchmark_sample_validation_rejects_survivor_bias() {
+    let partial = ScenarioSamples {
+        attempted: 20,
+        samples_us: vec![1.0],
+    };
+    let error = validate_complete_samples("cold_start", "hello", &partial)
+        .expect_err("one success out of twenty attempts must fail closed");
+    assert!(
+        error.contains("only 1 of 20 benchmark iterations succeeded"),
+        "partial-success diagnostic should preserve attempted and successful counts: {error}"
+    );
+
+    let complete = ScenarioSamples {
+        attempted: 2,
+        samples_us: vec![1.0, 2.0],
+    };
+    assert_eq!(
+        validate_complete_samples("cold_start", "hello", &complete),
+        Ok(complete.samples_us.as_slice())
     );
 }
 
