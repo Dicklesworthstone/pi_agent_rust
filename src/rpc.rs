@@ -47,7 +47,7 @@ use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[derive(Clone)]
@@ -83,6 +83,7 @@ struct RpcStateSnapshot {
     follow_up_count: usize,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
+    follow_up_fetch_generation: Arc<AtomicU64>,
     auto_compaction_enabled: bool,
     auto_retry_enabled: bool,
 }
@@ -504,6 +505,7 @@ impl RpcSharedState {
             follow_up: VecDeque::new(),
             steering_mode: config.steering_queue_mode(),
             follow_up_mode: config.follow_up_queue_mode(),
+            follow_up_fetch_generation: Arc::new(AtomicU64::new(0)),
             auto_compaction_enabled: config.compaction_enabled(),
             auto_retry_enabled: config.retry_enabled(),
             failover_cooldown: config
@@ -550,6 +552,15 @@ impl RpcSharedState {
             QueueMode::All => self.follow_up.drain(..).collect(),
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
         }
+    }
+
+    fn pop_follow_up_for_fetch(&mut self) -> Vec<QueuedAgentMessage> {
+        let messages = self.pop_follow_up();
+        if !messages.is_empty() {
+            self.follow_up_fetch_generation
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        messages
     }
 }
 
@@ -683,7 +694,7 @@ pub async fn run(
                 follow_state
                     .lock(&follow_cx)
                     .await
-                    .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up())
+                    .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up_for_fetch())
             })
         };
         guard.agent.register_message_fetchers(
@@ -2972,6 +2983,7 @@ async fn run_prompt_with_retry(
     // re-execute completed tool cycles — pi_agent_rust#125 semantics).
     let mut first_attempt_done = false;
     let mut follow_up_first = false;
+    let mut expected_follow_up_fetch: Option<(Arc<AtomicU64>, u64)> = None;
     let mut success = false;
     let mut final_error: Option<String> = None;
     let mut final_error_hints: Option<Value> = None;
@@ -3023,20 +3035,31 @@ async fn run_prompt_with_retry(
                     let ready_compacting = Arc::clone(&is_compacting);
                     let ready = Arc::new(AtomicBool::new(false));
                     let ready_for_callback = Arc::clone(&ready);
+                    let expected_fetch = expected_follow_up_fetch.clone();
                     let result = guard
                         .run_continue_with_follow_up_with_abort(
                             true,
                             Some(abort_signal),
                             move || {
+                                let source_ready = expected_fetch.as_ref().is_some_and(
+                                    |(generation, expected)| {
+                                        generation.load(Ordering::SeqCst) == *expected
+                                    },
+                                );
+                                if !source_ready {
+                                    return false;
+                                }
                                 let _phase_guard = lock_rpc_turn_phase(&ready_linearizer);
                                 ready_compacting.store(false, Ordering::SeqCst);
                                 ready_for_callback.store(true, Ordering::SeqCst);
+                                true
                             },
                             event_handler,
                         )
                         .await;
                     if ready.load(Ordering::SeqCst) {
                         follow_up_first = false;
+                        expected_follow_up_fetch = None;
                     }
                     result
                 }
@@ -3117,8 +3140,12 @@ async fn run_prompt_with_retry(
                 } else {
                     let late_queued_input =
                         match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await {
-                            Ok(state) if !state.steering.is_empty() => Some(false),
-                            Ok(state) if !state.follow_up.is_empty() => Some(true),
+                        Ok(state) if !state.steering.is_empty() => Some((false, None)),
+                        Ok(state) if !state.follow_up.is_empty() => {
+                            let generation = Arc::clone(&state.follow_up_fetch_generation);
+                            let expected = generation.load(Ordering::SeqCst).wrapping_add(1);
+                            Some((true, Some((generation, expected))))
+                        }
                             Ok(_) => None,
                             Err(err) => {
                                 final_error =
@@ -3127,12 +3154,13 @@ async fn run_prompt_with_retry(
                                 break;
                             }
                         };
-                    if let Some(needs_follow_up_first) = late_queued_input {
+                    if let Some((needs_follow_up_first, expected_fetch)) = late_queued_input {
                         // A queue insertion that linearized immediately before
                         // our phase claim must not be stranded for a future
                         // unrelated turn. Follow-ups stay in the shared queue
                         // until `Agent` drains them after successful preflight.
                         follow_up_first = needs_follow_up_first;
+                        expected_follow_up_fetch = expected_fetch;
                         if !follow_up_first {
                             let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
                             is_compacting.store(false, Ordering::SeqCst);
@@ -9091,6 +9119,24 @@ export default function init(pi) {
                 ..
             }) if text == expanded
         ));
+    }
+
+    #[test]
+    fn rpc_follow_up_fetch_generation_advances_only_when_rpc_message_is_drained() {
+        let mut shared = RpcSharedState::new(&Config::default());
+        let generation = Arc::clone(&shared.follow_up_fetch_generation);
+
+        assert!(shared.pop_follow_up_for_fetch().is_empty());
+        assert_eq!(generation.load(Ordering::SeqCst), 0);
+
+        shared
+            .push_follow_up(QueuedAgentMessage::from_authored_message(
+                build_user_message("accepted follow-up", &[]),
+            ))
+            .expect("enqueue RPC follow-up");
+        let drained = shared.pop_follow_up_for_fetch();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(generation.load(Ordering::SeqCst), 1);
     }
 
     #[test]

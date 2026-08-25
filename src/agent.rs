@@ -2007,14 +2007,14 @@ impl Agent {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_continue_with_follow_up_on_ready_with_abort(abort, || {}, on_event)
+        self.run_continue_with_follow_up_on_ready_with_abort(abort, || true, on_event)
             .await
     }
 
     pub(crate) async fn run_continue_with_follow_up_on_ready_with_abort(
         &mut self,
         abort: Option<AbortSignal>,
-        on_ready: impl FnOnce() + Send + 'static,
+        on_ready: impl FnOnce() -> bool + Send + 'static,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         self.run_loop_with_initial_follow_up(
@@ -2239,7 +2239,7 @@ impl Agent {
         &mut self,
         prompts: Vec<Message>,
         initial_follow_up: bool,
-        mut initial_queue_ready: Option<Box<dyn FnOnce() + Send>>,
+        initial_queue_ready: Option<Box<dyn FnOnce() -> bool + Send>>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2352,7 +2352,7 @@ impl Agent {
         &mut self,
         prompts: Vec<Message>,
         initial_follow_up: bool,
-        initial_queue_ready: Option<Box<dyn FnOnce() + Send>>,
+        mut initial_queue_ready: Option<Box<dyn FnOnce() -> bool + Send>>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2510,8 +2510,11 @@ impl Agent {
 
                 if delivering_initial_follow_up
                     && let Some(on_ready) = initial_queue_ready.take()
+                    && !on_ready()
                 {
-                    on_ready();
+                    return Err(Error::session(
+                        "required follow-up source was unavailable at continuation boundary",
+                    ));
                 }
 
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
@@ -12692,7 +12695,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_continue_with_follow_up_with_abort(false, abort, || {}, on_event)
+        self.run_continue_with_follow_up_with_abort(false, abort, || true, on_event)
             .await
     }
 
@@ -12702,7 +12705,7 @@ impl AgentSession {
         &mut self,
         follow_up_first: bool,
         abort: Option<AbortSignal>,
-        on_ready: impl FnOnce() + Send + 'static,
+        on_ready: impl FnOnce() -> bool + Send + 'static,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         let on_event: AgentEventHandler = Arc::new(on_event);
