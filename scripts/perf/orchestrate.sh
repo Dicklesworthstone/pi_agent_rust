@@ -4762,7 +4762,6 @@ fi
 
 post_generation_stage_key="$({ printf '%s\0' "$CORRELATION_ID" "$TIMESTAMP" "$$"; } | sha256sum | cut -d' ' -f1)"
 POST_GENERATION_STAGE_RELATIVE=".rch-tmp/pi-perf-evidence/$post_generation_stage_key"
-POST_GENERATION_STAGE_ABSOLUTE="$PROJECT_ROOT/$POST_GENERATION_STAGE_RELATIVE"
 if ! PROJECT_ROOT="$PROJECT_ROOT" \
   OUTPUT_DIR="$OUTPUT_DIR" \
   TARGET_DIR="$TARGET_DIR" \
@@ -4807,10 +4806,6 @@ sources = [
 ]
 optional_files = [
     (target_dir / "release" / "pi", PurePosixPath("release/pi")),
-    (
-        target_dir / "perf" / "examples" / "pijs_workload",
-        PurePosixPath("perf/examples/pijs_workload"),
-    ),
     (
         target_dir / "perf" / "context_intelligence_planner_budget.json",
         PurePosixPath("context_intelligence_planner_budget.json"),
@@ -4894,6 +4889,23 @@ def copy_regular_file(source: Path, relative: PurePosixPath):
     )
 
 
+def sha256_regular_file(path: Path):
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit(f"evidence input is not a regular file: {path}")
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
 def copy_tree(source_root: Path, destination_root: PurePosixPath, required: bool):
     if not source_root.exists():
         if required:
@@ -4929,6 +4941,67 @@ def copy_tree(source_root: Path, destination_root: PurePosixPath, required: bool
 
 for source_root, destination_root, required in sources:
     copy_tree(source_root, destination_root, required)
+
+pijs_artifact = output_dir / "results" / "pijs_workload.jsonl"
+if pijs_artifact.is_file():
+    admitted_pijs_records = []
+    for line_number, line in enumerate(
+        pijs_artifact.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise SystemExit(
+                f"invalid PiJS evidence at line {line_number}: {error}"
+            ) from error
+        if isinstance(record, dict) and record.get("eligible_for_regression_gate") is True:
+            admitted_pijs_records.append(record)
+    if admitted_pijs_records:
+        claimed_binaries = {
+            (record.get("binary_path"), record.get("binary_sha256"))
+            for record in admitted_pijs_records
+        }
+        if len(claimed_binaries) != 1:
+            raise SystemExit(
+                "eligible PiJS records must share one binary_path and binary_sha256"
+            )
+        claimed_path, claimed_sha256 = claimed_binaries.pop()
+        if (
+            not isinstance(claimed_path, str)
+            or not claimed_path
+            or not isinstance(claimed_sha256, str)
+            or len(claimed_sha256) != 64
+        ):
+            raise SystemExit("eligible PiJS records have invalid binary provenance")
+        binary_candidates = [
+            Path(claimed_path),
+            target_dir / "perf" / "examples" / "pijs_workload",
+        ]
+        pijs_binary = None
+        for candidate in binary_candidates:
+            try:
+                candidate_metadata = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(candidate_metadata.st_mode) or not stat.S_ISREG(
+                candidate_metadata.st_mode
+            ):
+                continue
+            observed_sha256 = sha256_regular_file(candidate)
+            if observed_sha256 == claimed_sha256:
+                pijs_binary = candidate
+                break
+        if pijs_binary is None:
+            raise SystemExit(
+                "eligible PiJS evidence has no locally available digest-matching executable"
+            )
+        copy_regular_file(
+            pijs_binary,
+            PurePosixPath("perf/examples/pijs_workload"),
+        )
+
 for source, destination in optional_files:
     if source.exists() or source.is_symlink():
         copy_regular_file(source, destination)
@@ -4951,6 +5024,7 @@ then
   die "Failed to create the post-generation evidence package"
 fi
 POST_GENERATION_EVIDENCE_DIR="$POST_GENERATION_STAGE_RELATIVE"
+log_ok "Post-generation evidence package retained for audit: $POST_GENERATION_STAGE_RELATIVE"
 
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do

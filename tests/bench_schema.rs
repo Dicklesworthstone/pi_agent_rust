@@ -1561,6 +1561,10 @@ case "${1:-}" in
       && "$call_number" -ge "${PI_FAKE_GIT_DRIFT_FROM_REV_PARSE_CALL}" ]]; then
       full_commit='ffffffffffffffffffffffffffffffffffffffff'
     fi
+    if [[ -n "${PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE:-}" \
+      && -e "${PERF_OUTPUT_DIR:?}/${PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE}" ]]; then
+      full_commit='ffffffffffffffffffffffffffffffffffffffff'
+    fi
     if [[ "${2:-}" == "--short" && "${3:-}" == "HEAD" ]]; then
       printf '%s\n' "${full_commit:0:8}"
     elif [[ "${2:-}" == "HEAD" ]]; then
@@ -8544,6 +8548,63 @@ fn orchestrate_rch_perf_harness_rejects_head_drift_after_invocation() {
             .join("run/results/perf_bench_harness/extension_bench.jsonl")
             .exists(),
         "post-invocation HEAD drift must prevent the JSONL from entering accepted results"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_head_drift_before_post_generation_staging() {
+    let (output, _) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE",
+        "results/phase1_matrix_validation.json",
+    )]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH post-generation staging precondition: Git HEAD drifted"),
+        "late pre-staging source drift must fail before packaging evidence: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_head_drift_before_checksums() {
+    let (output, _) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE",
+        "results/perf_budget_preflight.json",
+    )]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH checksum precondition: Git HEAD drifted"),
+        "source drift after evidence consumption must fail before checksums: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_head_drift_before_final_success() {
+    let (output, _) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_GIT_DRIFT_AFTER_OUTPUT_RELATIVE",
+        "checksums.sha256",
+    )]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("RCH final-success precondition: Git HEAD drifted"),
+        "source drift after checksum generation must prevent a green result: {combined}"
     );
 }
 

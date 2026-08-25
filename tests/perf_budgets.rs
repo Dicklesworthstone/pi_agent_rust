@@ -5292,6 +5292,256 @@ fn classify_budget_status_promotes_ci_no_data_to_fail_under_strict() {
     assert_eq!(classify_budget_status(budget, None, true), "FAIL");
 }
 
+fn write_post_generation_inventory_fixture(
+    evidence_root: &Path,
+    source_commit: &str,
+    correlation_id: &str,
+    entries: Vec<Value>,
+) {
+    let inventory = json!({
+        "schema": "pi.perf.post_generation_evidence_inventory.v1",
+        "source_commit": source_commit,
+        "correlation_id": correlation_id,
+        "entries": entries,
+    });
+    std::fs::write(
+        evidence_root.join(POST_GENERATION_INVENTORY_FILE),
+        serde_json::to_vec_pretty(&inventory).expect("serialize evidence inventory fixture"),
+    )
+    .expect("write evidence inventory fixture");
+}
+
+fn post_generation_inventory_entry(
+    evidence_root: &Path,
+    relative_path: &str,
+    logical_input_id: &str,
+) -> Value {
+    let path = evidence_root.join(relative_path);
+    json!({
+        "logical_input_id": logical_input_id,
+        "path": relative_path,
+        "sha256": sha256_file(&path).expect("hash evidence inventory fixture"),
+        "size_bytes": std::fs::metadata(path).expect("inspect evidence fixture").len(),
+    })
+}
+
+#[test]
+fn post_generation_policy_requires_one_confined_root_and_exact_lineage() {
+    let project = tempfile::tempdir().expect("create fake project root");
+    let evidence_root = project.path().join("evidence");
+    std::fs::create_dir(&evidence_root).expect("create evidence root");
+    let source_commit = "1234567890abcdef1234567890abcdef12345678";
+    let policy = post_generation_evidence_policy_from_inputs(
+        project.path(),
+        Some(OsStr::new("1")),
+        Some(OsStr::new("evidence")),
+        None,
+        Some(OsStr::new(source_commit)),
+        Some(OsStr::new("current-run")),
+        &[],
+    )
+    .expect("valid confined post-generation policy")
+    .expect("post-generation policy");
+    assert_eq!(policy.root, std::fs::canonicalize(&evidence_root).unwrap());
+    assert_eq!(policy.expected_source_commit, source_commit);
+    assert_eq!(policy.correlation_id, "current-run");
+
+    for (alternate_roots, expected_commit, correlation_id, overrides, expected_error) in [
+        (
+            Some(OsStr::new("other")),
+            Some(OsStr::new(source_commit)),
+            Some(OsStr::new("current-run")),
+            Vec::new(),
+            "PERF_EVIDENCE_DIRS is forbidden",
+        ),
+        (
+            None,
+            Some(OsStr::new("short")),
+            Some(OsStr::new("current-run")),
+            Vec::new(),
+            "full lowercase nonzero Git SHA-1",
+        ),
+        (
+            None,
+            Some(OsStr::new(source_commit)),
+            Some(OsStr::new("")),
+            Vec::new(),
+            "CI_CORRELATION_ID must be a non-empty",
+        ),
+        (
+            None,
+            Some(OsStr::new(source_commit)),
+            Some(OsStr::new("current-run")),
+            vec!["PERF_RELEASE_BINARY_PATH"],
+            "per-artifact evidence overrides are forbidden",
+        ),
+    ] {
+        let error = post_generation_evidence_policy_from_inputs(
+            project.path(),
+            Some(OsStr::new("1")),
+            Some(OsStr::new("evidence")),
+            alternate_roots,
+            expected_commit,
+            correlation_id,
+            &overrides,
+        )
+        .expect_err("invalid post-generation policy must fail closed");
+        assert!(error.contains(expected_error), "unexpected error: {error}");
+    }
+
+    let outside = tempfile::tempdir().expect("create outside evidence root");
+    let outside_error = post_generation_evidence_policy_from_inputs(
+        project.path(),
+        Some(OsStr::new("1")),
+        Some(outside.path().as_os_str()),
+        None,
+        Some(OsStr::new(source_commit)),
+        Some(OsStr::new("current-run")),
+        &[],
+    )
+    .expect_err("outside evidence root must fail closed");
+    assert!(outside_error.contains("confined beneath the project root"));
+
+    let traversal_error = post_generation_evidence_policy_from_inputs(
+        project.path(),
+        Some(OsStr::new("1")),
+        Some(OsStr::new("evidence/../evidence")),
+        None,
+        Some(OsStr::new(source_commit)),
+        Some(OsStr::new("current-run")),
+        &[],
+    )
+    .expect_err("parent traversal must fail closed");
+    assert!(traversal_error.contains("must not contain '.' or '..'"));
+}
+
+#[cfg(unix)]
+#[test]
+fn post_generation_policy_rejects_symlinked_evidence_root_component() {
+    use std::os::unix::fs::symlink;
+
+    let project = tempfile::tempdir().expect("create fake project root");
+    let real_root = project.path().join("real-evidence");
+    std::fs::create_dir(&real_root).expect("create real evidence root");
+    symlink(&real_root, project.path().join("linked-evidence"))
+        .expect("create evidence-root symlink");
+    let error = post_generation_evidence_policy_from_inputs(
+        project.path(),
+        Some(OsStr::new("1")),
+        Some(OsStr::new("linked-evidence")),
+        None,
+        Some(OsStr::new(
+            "1234567890abcdef1234567890abcdef12345678",
+        )),
+        Some(OsStr::new("current-run")),
+        &[],
+    )
+    .expect_err("symlinked evidence root must fail closed");
+    assert!(error.contains("symlink component"));
+}
+
+#[test]
+fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
+    let project = tempfile::tempdir().expect("create fake project root");
+    let evidence_root = project.path().join("evidence");
+    std::fs::create_dir(&evidence_root).expect("create evidence root");
+    std::fs::write(evidence_root.join("current.json"), b"current evidence\n")
+        .expect("write current evidence");
+    let source_commit = "1234567890abcdef1234567890abcdef12345678";
+    let policy = PostGenerationEvidencePolicy {
+        root: std::fs::canonicalize(&evidence_root).expect("canonical evidence root"),
+        expected_source_commit: source_commit.to_string(),
+        correlation_id: "current-run".to_string(),
+    };
+    let entry = post_generation_inventory_entry(&evidence_root, "current.json", "current-input");
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        vec![entry.clone()],
+    );
+    validate_post_generation_evidence_inventory(&policy).expect("valid evidence inventory");
+
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        "ffffffffffffffffffffffffffffffffffffffff",
+        "current-run",
+        vec![entry.clone()],
+    );
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("wrong source commit must fail")
+            .contains("source_commit mismatch")
+    );
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "foreign-run",
+        vec![entry.clone()],
+    );
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("wrong correlation must fail")
+            .contains("correlation_id mismatch")
+    );
+
+    let mut wrong_digest = entry.clone();
+    wrong_digest["sha256"] = json!("f".repeat(64));
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        vec![wrong_digest],
+    );
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("digest mismatch must fail")
+            .contains("metadata_mismatch")
+    );
+
+    std::fs::write(evidence_root.join("unlisted.json"), b"unlisted evidence\n")
+        .expect("write unlisted evidence");
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        vec![entry.clone()],
+    );
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("unlisted evidence must fail")
+            .contains("unlisted")
+    );
+
+    let missing_entry = json!({
+        "logical_input_id": "missing-input",
+        "path": "missing.json",
+        "sha256": "a".repeat(64),
+        "size_bytes": 1,
+    });
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        vec![entry.clone(), missing_entry],
+    );
+    let missing_error = validate_post_generation_evidence_inventory(&policy)
+        .expect_err("missing and unlisted evidence must fail");
+    assert!(missing_error.contains("missing") && missing_error.contains("unlisted"));
+
+    write_post_generation_inventory_fixture(
+        &evidence_root,
+        source_commit,
+        "current-run",
+        vec![entry.clone(), entry],
+    );
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("duplicate logical input and path must fail")
+            .contains("logical_input_id")
+    );
+}
+
 #[test]
 fn idle_memory_budget_rejects_test_harness_rss_as_release_evidence() {
     let tmp = tempfile::tempdir().expect("create tempdir");

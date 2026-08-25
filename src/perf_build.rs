@@ -561,13 +561,19 @@ fn validate_control_lineage(
 }
 
 fn canonical_regular_file(path: &str, field: &str) -> Result<PathBuf, MeasurementControlError> {
-    let path = PathBuf::from(path);
+    canonical_regular_path(Path::new(path), field)
+}
+
+fn canonical_regular_path(
+    path: &Path,
+    field: &str,
+) -> Result<PathBuf, MeasurementControlError> {
     if !path.is_absolute() {
         return Err(MeasurementControlError::Invalid(format!(
             "{field} must be absolute"
         )));
     }
-    let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
         MeasurementControlError::Invalid(format!("cannot inspect {field}: {error}"))
     })?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -575,7 +581,7 @@ fn canonical_regular_file(path: &str, field: &str) -> Result<PathBuf, Measuremen
             "{field} must identify a regular non-symlink file"
         )));
     }
-    let canonical = std::fs::canonicalize(&path).map_err(|error| {
+    let canonical = std::fs::canonicalize(path).map_err(|error| {
         MeasurementControlError::Invalid(format!("cannot canonicalize {field}: {error}"))
     })?;
     if canonical != path {
@@ -602,10 +608,8 @@ fn measurement_artifact_path(
         )));
     }
     relocated_path.map_or_else(
-        || canonical_regular_file(claimed_path.to_string_lossy().as_ref(), field),
-        |relocated_path| {
-            canonical_regular_file(relocated_path.to_string_lossy().as_ref(), field)
-        },
+        || canonical_regular_path(&claimed_path, field),
+        |relocated_path| canonical_regular_path(relocated_path, field),
     )
 }
 
@@ -1033,8 +1037,12 @@ mod tests {
         MeasurementControlError, benchmark_provenance_config_hash, detect_build_profile_from,
         matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
         profile_from_target_path, resolve_bench_allocator_from,
-        verify_binary_size_measurement_control, verify_cold_load_measurement_control,
+        verify_binary_size_measurement_control,
+        verify_binary_size_measurement_control_with_relocated_artifact,
+        verify_cold_load_measurement_control,
+        verify_cold_load_measurement_control_with_relocated_artifact,
         verify_idle_rss_measurement_control,
+        verify_idle_rss_measurement_control_with_relocated_artifact,
     };
     use std::path::Path;
 
@@ -1078,6 +1086,26 @@ mod tests {
         let verified = verify_binary_size_measurement_control(&control_path)
             .expect("valid release-binary control");
         assert_eq!(verified.size_bytes, 23);
+
+        let relocated_binary_path = temp.path().join("relocated/pi");
+        std::fs::create_dir_all(relocated_binary_path.parent().expect("relocated parent"))
+            .expect("create relocated binary directory");
+        std::fs::write(&relocated_binary_path, b"shipping release binary")
+            .expect("write relocated release binary");
+        let relocated_binary_path = std::fs::canonicalize(relocated_binary_path)
+            .expect("canonicalize relocated release binary");
+        let mut relocated_control = control.clone();
+        relocated_control["binary_path"] =
+            serde_json::json!("/unavailable/producer/target/release/pi");
+        let relocated_control_path = temp.path().join("binary-size-relocated.json");
+        write_json(&relocated_control_path, &relocated_control);
+        assert!(verify_binary_size_measurement_control(&relocated_control_path).is_err());
+        let relocated = verify_binary_size_measurement_control_with_relocated_artifact(
+            &relocated_control_path,
+            Some(&relocated_binary_path),
+        )
+        .expect("relocated binary bytes satisfy the producer control");
+        assert_eq!(relocated.binary_path, relocated_binary_path);
 
         std::fs::write(&binary_path, b"tampered release binary").expect("tamper release binary");
         assert!(matches!(
@@ -1137,6 +1165,32 @@ mod tests {
 
         verify_cold_load_measurement_control(&control_path, "hello")
             .expect("quiet, bound Criterion control");
+
+        let relocated_artifact_path = temp.path().join("relocated/estimates.json");
+        std::fs::create_dir_all(relocated_artifact_path.parent().expect("relocated parent"))
+            .expect("create relocated Criterion directory");
+        std::fs::write(
+            &relocated_artifact_path,
+            br#"{"mean":{"point_estimate":1000000}}"#,
+        )
+        .expect("write relocated Criterion estimate");
+        let relocated_artifact_path = std::fs::canonicalize(relocated_artifact_path)
+            .expect("canonicalize relocated Criterion estimate");
+        let mut relocated_control = control.clone();
+        relocated_control["measurements"]["hello"]["artifact_path"] =
+            serde_json::json!("/unavailable/producer/target/criterion/estimates.json");
+        let relocated_control_path = temp.path().join("cold-load-relocated.json");
+        write_json(&relocated_control_path, &relocated_control);
+        assert!(
+            verify_cold_load_measurement_control(&relocated_control_path, "hello").is_err()
+        );
+        let relocated = verify_cold_load_measurement_control_with_relocated_artifact(
+            &relocated_control_path,
+            "hello",
+            Some(&relocated_artifact_path),
+        )
+        .expect("relocated Criterion bytes satisfy the producer control");
+        assert_eq!(relocated.artifact_path, relocated_artifact_path);
 
         control["bench_env"]["noise_score"] = serde_json::json!(1);
         let noisy_env_sha256 = super::sha256_bytes(
@@ -1232,6 +1286,26 @@ mod tests {
         assert_eq!(verified.pid, 4242);
         assert_eq!(verified.sample_count, 5);
         assert_eq!(verified.rss_spread_bytes, 524_288);
+
+        let relocated_binary_path = temp.path().join("relocated/pi");
+        std::fs::create_dir_all(relocated_binary_path.parent().expect("relocated parent"))
+            .expect("create relocated idle-RSS binary directory");
+        std::fs::write(&relocated_binary_path, b"measured pi executable")
+            .expect("write relocated idle-RSS binary");
+        let relocated_binary_path = std::fs::canonicalize(relocated_binary_path)
+            .expect("canonicalize relocated idle-RSS binary");
+        let mut relocated_control = control.clone();
+        relocated_control["binary_path"] =
+            serde_json::json!("/unavailable/producer/target/release/pi");
+        let relocated_control_path = temp.path().join("idle-rss-relocated.json");
+        write_json(&relocated_control_path, &relocated_control);
+        assert!(verify_idle_rss_measurement_control(&relocated_control_path).is_err());
+        let relocated = verify_idle_rss_measurement_control_with_relocated_artifact(
+            &relocated_control_path,
+            Some(&relocated_binary_path),
+        )
+        .expect("relocated idle-RSS binary bytes satisfy the producer control");
+        assert_eq!(relocated.binary_path, relocated_binary_path);
 
         control["process_name"] = serde_json::json!("cargo-test");
         write_json(&control_path, &control);
