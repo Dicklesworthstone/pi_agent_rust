@@ -14123,7 +14123,7 @@ mod tests {
             agent
                 .run_continue_with_follow_up_with_abort(None, |_| {})
                 .await
-                .expect("initial pending continuation");
+                .expect("follow-up-first continuation");
 
             let calls = match calls.lock() {
                 Ok(calls) => calls,
