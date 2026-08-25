@@ -583,6 +583,189 @@ fn write_executable(path: &Path, content: &str) {
 }
 
 #[cfg(unix)]
+fn install_fake_persistence_fault_toolchain(bin_dir: &Path) {
+    let rch_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" != "exec" || "${2:-}" != "--" ]]; then
+  echo "unexpected fake rch invocation: $*" >&2
+  exit 64
+fi
+if [[ "${RCH_REQUIRE_REMOTE:-0}" != "true" && "${RCH_REQUIRE_REMOTE:-0}" != "1" ]]; then
+  echo "persistence runner did not require remote execution" >&2
+  exit 65
+fi
+for key in CI_CORRELATION_ID RUST_LOG TEST_LOG_JSONL_PATH TEST_ARTIFACT_INDEX_PATH; do
+  case ",${RCH_ENV_ALLOWLIST:-}," in
+    *",$key,"*) ;;
+    *)
+      echo "RCH_ENV_ALLOWLIST omitted $key" >&2
+      exit 66
+      ;;
+  esac
+done
+shift 2
+PI_FAKE_RCH_EXECUTED=1 exec "$@"
+"#;
+    write_executable(&bin_dir.join("rch"), rch_stub);
+
+    let cargo_stub = r#"#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${PI_FAKE_RCH_EXECUTED:-0}" != "1" ]]; then
+  echo "cargo bypassed fake rch" >&2
+  exit 67
+fi
+if [[ "${TEST_LOG_JSONL_PATH:-}" != "junit.xml" ]]; then
+  echo "unexpected remote test log path: ${TEST_LOG_JSONL_PATH:-unset}" >&2
+  exit 68
+fi
+if [[ "${TEST_ARTIFACT_INDEX_PATH:-}" != "test-results.xml" ]]; then
+  echo "unexpected remote artifact index path: ${TEST_ARTIFACT_INDEX_PATH:-unset}" >&2
+  exit 69
+fi
+
+case " $* " in
+  *" jsonl_fault_injection_flush_windows_preserve_integrity "*)
+    case_id="jsonl"
+    test_name="e2e_jsonl_fault_injection_flush_windows"
+    fault_message="jsonl mid-flush failure"
+    summary_name="jsonl-fault-window-summary.json"
+    ;;
+  *" sqlite_fault_injection_flush_windows_preserve_integrity "*)
+    case_id="sqlite"
+    test_name="e2e_sqlite_fault_injection_flush_windows"
+    fault_message="sqlite mid-flush failure"
+    summary_name="sqlite-fault-window-summary.json"
+    if [[ "${PI_FAKE_OMIT_SQLITE_REPORTS:-0}" == "1" ]]; then
+      printf '%s\n' "$case_id" >>"${PI_FAKE_INVOCATION_LOG:?}"
+      exit 0
+    fi
+    ;;
+  *)
+    echo "unexpected fake cargo test: $*" >&2
+    exit 70
+    ;;
+esac
+
+printf '%s\n' "$case_id" >>"${PI_FAKE_INVOCATION_LOG:?}"
+cat >"$TEST_LOG_JSONL_PATH" <<JSON
+{"schema":"pi.test.log.v2","test":"$test_name","ci_correlation_id":"${CI_CORRELATION_ID:?}","category":"fault","message":"$fault_message"}
+JSON
+cat >"$TEST_ARTIFACT_INDEX_PATH" <<JSON
+{"schema":"pi.test.artifact.v1","test":"$test_name","name":"$summary_name"}
+JSON
+"#;
+    write_executable(&bin_dir.join("cargo"), cargo_stub);
+}
+
+#[cfg(unix)]
+fn run_persistence_fault_runner_with_fake_rch(
+    temp_root: &Path,
+    correlation_id: &str,
+    omit_sqlite_reports: bool,
+) -> std::process::Output {
+    let bin_dir = temp_root.join("bin");
+    let target_dir = temp_root.join("target");
+    let tmp_dir = temp_root.join("tmp");
+    let artifact_dir = temp_root.join("artifacts");
+    let invocation_log = temp_root.join("invocations.log");
+    fs::create_dir_all(&bin_dir).expect("create fake persistence bin dir");
+    fs::create_dir_all(&target_dir).expect("create fake persistence target dir");
+    fs::create_dir_all(&tmp_dir).expect("create fake persistence tmp dir");
+    install_fake_persistence_fault_toolchain(&bin_dir);
+
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut command = Command::new("bash");
+    command
+        .arg("scripts/e2e/run_persistence_fault_injection.sh")
+        .current_dir(project_root())
+        .env("PATH", path)
+        .env("CARGO_TARGET_DIR", &target_dir)
+        .env("TMPDIR", &tmp_dir)
+        .env("E2E_ARTIFACT_DIR", &artifact_dir)
+        .env("CI_CORRELATION_ID", correlation_id)
+        .env("PERSISTENCE_CARGO_RUNNER", "rch")
+        .env("PERSISTENCE_MIN_REPO_FREE_MB", "1")
+        .env("PERSISTENCE_MIN_TMP_FREE_MB", "1")
+        .env("PI_FAKE_INVOCATION_LOG", &invocation_log);
+    if omit_sqlite_reports {
+        command.env("PI_FAKE_OMIT_SQLITE_REPORTS", "1");
+    }
+    command.output().expect("run persistence fault runner")
+}
+
+#[cfg(unix)]
+#[test]
+fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed() {
+    let success_root = unique_temp_dir("persistence-rch-success");
+    let success_correlation = "persistence-rch-success-correlation";
+    let success = run_persistence_fault_runner_with_fake_rch(
+        &success_root,
+        success_correlation,
+        false,
+    );
+    assert!(
+        success.status.success(),
+        "fake RCH evidence run should pass. stdout={}\nstderr={}",
+        String::from_utf8_lossy(&success.stdout),
+        String::from_utf8_lossy(&success.stderr)
+    );
+    let success_summary: Value = serde_json::from_slice(
+        &fs::read(success_root.join("artifacts/integrity-summary.json"))
+            .expect("read successful integrity summary"),
+    )
+    .expect("parse successful integrity summary");
+    assert_eq!(success_summary["correlation_id"], success_correlation);
+    assert_eq!(success_summary["overall_passed"], true);
+    for case in success_summary["cases"]
+        .as_array()
+        .expect("successful summary cases")
+    {
+        assert_eq!(case["checks"]["correlation_id_current"], true);
+        assert_eq!(case["checks"]["test_identity_current"], true);
+    }
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(success_root.join("artifacts/run-manifest.json"))
+            .expect("read successful run manifest"),
+    )
+    .expect("parse successful run manifest");
+    assert_eq!(manifest["rch_require_remote"], true);
+    assert_eq!(
+        fs::read_to_string(success_root.join("invocations.log"))
+            .expect("read successful invocation log"),
+        "jsonl\nsqlite\n"
+    );
+
+    let missing_root = unique_temp_dir("persistence-rch-missing");
+    let missing = run_persistence_fault_runner_with_fake_rch(
+        &missing_root,
+        "persistence-rch-missing-correlation",
+        true,
+    );
+    assert!(
+        !missing.status.success(),
+        "missing RCH diagnostics must fail the aggregate runner"
+    );
+    assert!(
+        String::from_utf8_lossy(&missing.stderr)
+            .contains("RCH did not retrieve junit.xml for case 'sqlite'"),
+        "missing-report failure should identify the absent RCH artifact. stderr={}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    let missing_summary: Value = serde_json::from_slice(
+        &fs::read(missing_root.join("artifacts/integrity-summary.json"))
+            .expect("read missing-report integrity summary"),
+    )
+    .expect("parse missing-report integrity summary");
+    assert_eq!(missing_summary["overall_passed"], false);
+    assert_eq!(missing_summary["cases"][0]["passed"], true);
+    assert_eq!(missing_summary["cases"][1]["passed"], false);
+}
+
+#[cfg(unix)]
 const FAKE_ORCHESTRATE_SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 #[cfg(unix)]

@@ -43,7 +43,17 @@ MIN_TMP_FREE_MB="${PERSISTENCE_MIN_TMP_FREE_MB:-8192}"
 
 CARGO_RUNNER_MODE="${PERSISTENCE_CARGO_RUNNER:-rch}"
 PERSISTENCE_RCH_FORCE_REMOTE="${PERSISTENCE_RCH_FORCE_REMOTE:-true}"
+if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
+    PERSISTENCE_RCH_REQUIRE_REMOTE="${PERSISTENCE_RCH_REQUIRE_REMOTE:-true}"
+else
+    PERSISTENCE_RCH_REQUIRE_REMOTE="${PERSISTENCE_RCH_REQUIRE_REMOTE:-false}"
+fi
 declare -a CARGO_RUNNER_PREFIX=()
+
+# RCH retrieves these conventional top-level test reports after `cargo test`.
+# The runner moves them into the case directory immediately after each command.
+RCH_TEST_LOG_REPORT="junit.xml"
+RCH_ARTIFACT_INDEX_REPORT="test-results.xml"
 
 available_mb() {
     local path="$1"
@@ -63,6 +73,28 @@ assert_free_mb() {
     echo "[fault-injection] Free space $label: ${free_mb}MB (path: $path)"
 }
 
+append_rch_env_allowlist() {
+    local key
+    for key in \
+        CI_CORRELATION_ID \
+        RUST_LOG \
+        TEST_LOG_JSONL_PATH \
+        TEST_ARTIFACT_INDEX_PATH
+    do
+        case ",${RCH_ENV_ALLOWLIST:-}," in
+            *",$key,"*) ;;
+            *)
+                if [[ -n "${RCH_ENV_ALLOWLIST:-}" ]]; then
+                    RCH_ENV_ALLOWLIST="$RCH_ENV_ALLOWLIST,$key"
+                else
+                    RCH_ENV_ALLOWLIST="$key"
+                fi
+                ;;
+        esac
+    done
+    export RCH_ENV_ALLOWLIST
+}
+
 configure_cargo_runner() {
     case "$CARGO_RUNNER_MODE" in
         rch)
@@ -71,10 +103,12 @@ configure_cargo_runner() {
                 exit 1
             fi
             CARGO_RUNNER_PREFIX=("rch" "exec" "--")
+            append_rch_env_allowlist
             ;;
         auto)
             if command -v rch >/dev/null 2>&1; then
                 CARGO_RUNNER_PREFIX=("rch" "exec" "--")
+                append_rch_env_allowlist
             else
                 CARGO_RUNNER_PREFIX=()
             fi
@@ -93,7 +127,10 @@ run_cargo() {
     if [[ ${#CARGO_RUNNER_PREFIX[@]} -eq 0 ]]; then
         cargo "$@"
     else
-        env "RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE" "${CARGO_RUNNER_PREFIX[@]}" cargo "$@"
+        env \
+            "RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE" \
+            "RCH_REQUIRE_REMOTE=$PERSISTENCE_RCH_REQUIRE_REMOTE" \
+            "${CARGO_RUNNER_PREFIX[@]}" cargo "$@"
     fi
 }
 
@@ -133,11 +170,33 @@ run_case() {
     local case_dir="$ARTIFACT_DIR/$case_id"
     local log_file="$case_dir/output.log"
     local result_file="$case_dir/result.json"
-    local start_epoch end_epoch duration_ms exit_code
+    local test_log="$case_dir/test-log.jsonl"
+    local artifact_index="$case_dir/artifact-index.jsonl"
+    local harness_test_log="$test_log"
+    local harness_artifact_index="$artifact_index"
+    local start_epoch end_epoch duration_ms exit_code diagnostics_exit
 
     mkdir -p "$case_dir"
-    export TEST_LOG_JSONL_PATH="$case_dir/test-log.jsonl"
-    export TEST_ARTIFACT_INDEX_PATH="$case_dir/artifact-index.jsonl"
+    if [[ ${#CARGO_RUNNER_PREFIX[@]} -gt 0 ]]; then
+        harness_test_log="$RCH_TEST_LOG_REPORT"
+        harness_artifact_index="$RCH_ARTIFACT_INDEX_REPORT"
+        if [[ -e "$PROJECT_ROOT/$harness_test_log" || -e "$PROJECT_ROOT/$harness_artifact_index" ]]; then
+            echo "[fault-injection] Refusing to overwrite pre-existing RCH test reports in $PROJECT_ROOT" >&2
+            write_case_result \
+                "$result_file" \
+                "$case_id" \
+                "$test_name" \
+                68 \
+                0 \
+                "$log_file" \
+                "$test_log" \
+                "$artifact_index" \
+                "$feature_name"
+            return 68
+        fi
+    fi
+    export TEST_LOG_JSONL_PATH="$harness_test_log"
+    export TEST_ARTIFACT_INDEX_PATH="$harness_artifact_index"
 
     echo "[fault-injection] Running case '$case_id' ($test_name)"
     start_epoch=$(date +%s%N 2>/dev/null || date +%s)
@@ -164,6 +223,25 @@ run_case() {
     exit_code=${PIPESTATUS[0]}
     set -e
 
+    diagnostics_exit=0
+    if [[ ${#CARGO_RUNNER_PREFIX[@]} -gt 0 ]]; then
+        if [[ -f "$PROJECT_ROOT/$harness_test_log" ]]; then
+            mv "$PROJECT_ROOT/$harness_test_log" "$test_log"
+        else
+            echo "[fault-injection] RCH did not retrieve $harness_test_log for case '$case_id'" >&2
+            diagnostics_exit=69
+        fi
+        if [[ -f "$PROJECT_ROOT/$harness_artifact_index" ]]; then
+            mv "$PROJECT_ROOT/$harness_artifact_index" "$artifact_index"
+        else
+            echo "[fault-injection] RCH did not retrieve $harness_artifact_index for case '$case_id'" >&2
+            diagnostics_exit=69
+        fi
+        if [[ "$exit_code" -eq 0 && "$diagnostics_exit" -ne 0 ]]; then
+            exit_code="$diagnostics_exit"
+        fi
+    fi
+
     end_epoch=$(date +%s%N 2>/dev/null || date +%s)
     if [[ ${#start_epoch} -gt 12 ]]; then
         duration_ms=$(((end_epoch - start_epoch) / 1000000))
@@ -178,8 +256,8 @@ run_case() {
         "$exit_code" \
         "$duration_ms" \
         "$log_file" \
-        "$case_dir/test-log.jsonl" \
-        "$case_dir/artifact-index.jsonl" \
+        "$test_log" \
+        "$artifact_index" \
         "$feature_name"
 
     if [[ "$exit_code" -eq 0 ]]; then
@@ -207,7 +285,7 @@ echo "[fault-injection] TMPDIR=$TMPDIR"
 if [[ ${#CARGO_RUNNER_PREFIX[@]} -eq 0 ]]; then
     echo "[fault-injection] Cargo runner: local cargo"
 else
-    echo "[fault-injection] Cargo runner: env RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE ${CARGO_RUNNER_PREFIX[*]} cargo"
+    echo "[fault-injection] Cargo runner: env RCH_FORCE_REMOTE=$PERSISTENCE_RCH_FORCE_REMOTE RCH_REQUIRE_REMOTE=$PERSISTENCE_RCH_REQUIRE_REMOTE ${CARGO_RUNNER_PREFIX[*]} cargo"
 fi
 
 jsonl_exit=0
@@ -250,7 +328,12 @@ def load_jsonl(path: Path) -> list[dict]:
     return records
 
 
-def case_checks(case_id: str, expected_fault_message: str, expected_summary_artifact: str) -> dict:
+def case_checks(
+    case_id: str,
+    expected_test_name: str,
+    expected_fault_message: str,
+    expected_summary_artifact: str,
+) -> dict:
     case_dir = artifact_dir / case_id
     result = load_json(case_dir / "result.json")
     logs = load_jsonl(case_dir / "test-log.jsonl")
@@ -264,11 +347,19 @@ def case_checks(case_id: str, expected_fault_message: str, expected_summary_arti
     has_summary_artifact = any(
         record.get("name") == expected_summary_artifact for record in artifacts
     )
+    has_current_correlation = bool(logs) and all(
+        record.get("ci_correlation_id") == correlation_id for record in logs
+    )
+    has_expected_test_identity = bool(artifacts) and all(
+        record.get("test") == expected_test_name for record in artifacts
+    )
 
     checks = {
         "test_command_passed": result.get("exit_code") == 0,
         "fault_log_emitted": has_fault_log,
         "summary_artifact_indexed": has_summary_artifact,
+        "correlation_id_current": has_current_correlation,
+        "test_identity_current": has_expected_test_identity,
     }
 
     return {
@@ -283,11 +374,13 @@ def case_checks(case_id: str, expected_fault_message: str, expected_summary_arti
 
 jsonl_case = case_checks(
     "jsonl",
+    "e2e_jsonl_fault_injection_flush_windows",
     "jsonl mid-flush failure",
     "jsonl-fault-window-summary.json",
 )
 sqlite_case = case_checks(
     "sqlite",
+    "e2e_sqlite_fault_injection_flush_windows",
     "sqlite mid-flush failure",
     "sqlite-fault-window-summary.json",
 )
@@ -330,6 +423,7 @@ cat >"$ARTIFACT_DIR/run-manifest.json" <<EOF
   "timestamp": "$STAMP",
   "artifact_dir": "$ARTIFACT_DIR",
   "runner_mode": "$CARGO_RUNNER_MODE",
+  "rch_require_remote": $PERSISTENCE_RCH_REQUIRE_REMOTE,
   "result_files": [
     "$ARTIFACT_DIR/jsonl/result.json",
     "$ARTIFACT_DIR/sqlite/result.json",
