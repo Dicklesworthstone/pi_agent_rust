@@ -253,6 +253,14 @@ fn hostcall_rewrite_engine() -> &'static HostcallRewriteEngine {
     ENGINE.get_or_init(HostcallRewriteEngine::from_env)
 }
 
+/// The process-wide rewrite-search engine.
+///
+/// Uses `CostModel::measured_default()`, which is a hand-written cost *shape*
+/// rather than a calibrated measurement — so the number this engine yields
+/// today is derived, not measured. `CostModel::from_measured_stages` exists to
+/// replace it from a real run, but nothing wires a calibrated model in here
+/// yet; that is bd-oxu87. Until it does, treat the refined cost as a better
+/// structured estimate than the static constant, not as evidence.
 fn hostcall_egraph_engine() -> &'static HostcallEGraphEngine {
     static ENGINE: OnceLock<HostcallEGraphEngine> = OnceLock::new();
     ENGINE.get_or_init(HostcallEGraphEngine::from_env)
