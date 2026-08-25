@@ -882,20 +882,28 @@ pub async fn run(
                                 .map_err(|err| {
                                     Error::session(format!("state lock failed: {err}"))
                                 })?;
-                            match streaming_behavior {
-                                Some(StreamingBehavior::Steer) => {
-                                    state.push_steering(QueuedAgentMessage::authored(
-                                        build_user_message(&expanded, &images),
-                                        message.clone(),
-                                    ))
-                                }
-                                Some(StreamingBehavior::FollowUp) => {
-                                    state.push_follow_up(QueuedAgentMessage::authored(
-                                        build_user_message(&expanded, &images),
-                                        message.clone(),
-                                    ))
-                                }
-                                None => Ok(()), // Unreachable due to check above
+                            match rpc_turn_phase(&is_streaming, &is_compacting) {
+                                RpcTurnPhase::Streaming => match streaming_behavior {
+                                    Some(StreamingBehavior::Steer) => {
+                                        state.push_steering(QueuedAgentMessage::authored(
+                                            build_user_message(&expanded, &images),
+                                            message.clone(),
+                                        ))
+                                    }
+                                    Some(StreamingBehavior::FollowUp) => {
+                                        state.push_follow_up(QueuedAgentMessage::authored(
+                                            build_user_message(&expanded, &images),
+                                            message.clone(),
+                                        ))
+                                    }
+                                    None => Ok(()), // Unreachable due to check above
+                                },
+                                RpcTurnPhase::Compacting => Err(Error::session(
+                                    "Agent began compacting before the message could be queued",
+                                )),
+                                RpcTurnPhase::Idle => Err(Error::session(
+                                    "Agent stopped streaming before the message could be queued",
+                                )),
                             }
                         };
 
@@ -1005,13 +1013,23 @@ pub async fn run(
                     }
                     RpcTurnPhase::Idle => {}
                     RpcTurnPhase::Streaming => {
-                        let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                        let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                            .push_steering(QueuedAgentMessage::authored(
-                                build_user_message(&expanded, &[]),
-                                message.clone(),
-                            ));
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                        let result = match rpc_turn_phase(&is_streaming, &is_compacting) {
+                            RpcTurnPhase::Streaming => {
+                                state.push_steering(QueuedAgentMessage::authored(
+                                    build_user_message(&expanded, &[]),
+                                    message.clone(),
+                                ))
+                            }
+                            RpcTurnPhase::Compacting => Err(Error::session(
+                                "Agent began compacting before steering could be queued",
+                            )),
+                            RpcTurnPhase::Idle => Err(Error::session(
+                                "Agent stopped streaming before steering could be queued",
+                            )),
+                        };
 
                         match result {
                             Ok(()) => {
@@ -1094,13 +1112,23 @@ pub async fn run(
                     }
                     RpcTurnPhase::Idle => {}
                     RpcTurnPhase::Streaming => {
-                        let result = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+                        let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
-                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-                            .push_follow_up(QueuedAgentMessage::authored(
-                                build_user_message(&expanded, &[]),
-                                message.clone(),
-                            ));
+                            .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+                        let result = match rpc_turn_phase(&is_streaming, &is_compacting) {
+                            RpcTurnPhase::Streaming => {
+                                state.push_follow_up(QueuedAgentMessage::authored(
+                                    build_user_message(&expanded, &[]),
+                                    message.clone(),
+                                ))
+                            }
+                            RpcTurnPhase::Compacting => Err(Error::session(
+                                "Agent began compacting before the follow-up could be queued",
+                            )),
+                            RpcTurnPhase::Idle => Err(Error::session(
+                                "Agent stopped streaming before the follow-up could be queued",
+                            )),
+                        };
 
                         match result {
                             Ok(()) => {
@@ -9675,6 +9703,11 @@ export default function init(pi) {
             assert_eq!(
                 gated_compactions, 1,
                 "exactly one compaction mutation may survive the exclusion window"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "the completed exclusion window must use one turn call and one compaction call"
             );
         });
     }

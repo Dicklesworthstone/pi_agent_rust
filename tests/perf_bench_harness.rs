@@ -83,10 +83,9 @@ fn output_dir() -> PathBuf {
             .unwrap_or_else(|message| panic!("{message}"));
     }
 
-    std::env::var("BENCH_OUTPUT_DIR").ok().map_or_else(
-        || cargo_target_dir().join("perf"),
-        PathBuf::from,
-    )
+    std::env::var("BENCH_OUTPUT_DIR")
+        .ok()
+        .map_or_else(|| cargo_target_dir().join("perf"), PathBuf::from)
 }
 
 #[test]

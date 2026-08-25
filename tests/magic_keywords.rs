@@ -129,20 +129,14 @@ impl pi::provider::Provider for CaptureProvider {
             .lock()
             .expect("first call entered signal")
             .take();
-        let first_call_gate = self
-            .first_call_gate
-            .lock()
-            .expect("first call gate")
-            .take();
+        let first_call_gate = self.first_call_gate.lock().expect("first call gate").take();
         if let Some(entered) = first_call_entered {
             let cx = asupersync::Cx::for_testing();
             entered.send(&cx, ()).expect("signal first provider call");
         }
         if let Some(mut gate) = first_call_gate {
             let cx = asupersync::Cx::for_testing();
-            gate.recv(&cx)
-                .await
-                .expect("release first provider call");
+            gate.recv(&cx).await.expect("release first provider call");
         }
         Ok(Box::pin(futures::stream::iter(vec![
             Ok(StreamEvent::TextDelta {
@@ -647,8 +641,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
     let root = harness.temp_path(".");
     let (first_call_entered, mut wait_for_first_call) =
         asupersync::channel::oneshot::channel::<()>();
-    let (release_first_call, first_call_gate) =
-        asupersync::channel::oneshot::channel::<()>();
+    let (release_first_call, first_call_gate) = asupersync::channel::oneshot::channel::<()>();
     let (agent, capture) = build_gated_agent(&root, first_call_entered, first_call_gate);
 
     let session = Arc::new(AsyncMutex::new(Session::in_memory()));
