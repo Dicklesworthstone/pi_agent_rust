@@ -11647,6 +11647,9 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
+            // Consume the one-shot provenance before extension dispatch so a
+            // blocked/failed input cannot leak it into the next user turn.
+            let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
             let outcome = self.dispatch_input_event(input, Vec::new()).await?;
             let (text, images) = match outcome {
                 InputEventOutcome::Continue { text, images } => (text, images),
@@ -11672,6 +11675,7 @@ impl AgentSession {
             } else {
                 self.agent.set_system_prompt(base_system_prompt.clone());
             }
+            self.agent.magic_keyword_scan_override = keyword_scan_override;
 
             let result = if images.is_empty() {
                 self.run_agent_with_text(text, abort, on_event, custom_messages)
@@ -11681,6 +11685,9 @@ impl AgentSession {
                 self.run_agent_with_content(content, abort, on_event, custom_messages)
                     .await
             };
+            // `run_loop_inner` normally consumes this. Clear it here as the
+            // fail-closed fallback when setup/synchronization returns early.
+            let _ = self.agent.magic_keyword_scan_override.take();
 
             self.agent.set_system_prompt(base_system_prompt);
             match result {
@@ -11715,6 +11722,9 @@ impl AgentSession {
     ) -> Result<AssistantMessage> {
         self.extensions_turn_active.store(true, Ordering::SeqCst);
         let result = async {
+            // See the text path above: provenance is one-shot even when an
+            // input extension blocks before the Agent loop starts.
+            let keyword_scan_override = self.agent.magic_keyword_scan_override.take();
             let (text, images) = Self::split_content_blocks_for_input(&content);
             let outcome = self.dispatch_input_event(text, images).await?;
             let (text, images) = match outcome {
@@ -11741,11 +11751,13 @@ impl AgentSession {
             } else {
                 self.agent.set_system_prompt(base_system_prompt.clone());
             }
+            self.agent.magic_keyword_scan_override = keyword_scan_override;
 
             let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
             let result = self
                 .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
                 .await;
+            let _ = self.agent.magic_keyword_scan_override.take();
 
             self.agent.set_system_prompt(base_system_prompt);
             match result {
