@@ -64,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
@@ -1276,6 +1276,10 @@ pub struct Agent {
     /// session, drained by the session layer into session Custom entries.
     repair_ledger: Arc<StdMutex<crate::dialects::RepairLedger>>,
 
+    /// Session-local sequence used to keep synthesized tool-call IDs unique
+    /// across multiple repaired assistant messages.
+    dialect_repair_sequence: AtomicU64,
+
     /// Magic-keyword activations this run (bd-cv653.3.6), drained by the
     /// session wrapper into session Custom entries for auditability.
     keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
@@ -1346,6 +1350,7 @@ impl Agent {
             tool_defs_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
+            dialect_repair_sequence: AtomicU64::new(0),
             keyword_ledger: Vec::new(),
             keyword_max_thinking_level,
             secrets_vault: crate::secrets::SecretVault::default(),
@@ -1354,7 +1359,7 @@ impl Agent {
 
     /// Dialect repair (bd-cv653.7.8): when a weak model emits its tool call
     /// as text, extract and synthesize it into a real ToolCall block so the
-    /// turn continues. Guards: non-native dialect mapping, Stop reason, no
+    /// turn continues. Guards: explicitly repairable dialect, Stop reason, no
     /// structured calls already present, tools enabled, one repair per
     /// message, candidate names must be registered tools.
     fn maybe_repair_dialect_tool_calls(&self, msg: AssistantMessage) -> AssistantMessage {
@@ -1372,40 +1377,51 @@ impl Agent {
             return msg;
         }
         let provider = self.provider();
-        if dialect_for_model(provider.name(), provider.model_id()) == Dialect::Native {
+        if dialect_for_model(provider.name(), provider.model_id()) != Dialect::Xmlish {
             return msg;
         }
 
-        let text = msg
+        let candidate_block = msg
             .content
             .iter()
-            .filter_map(|block| match block {
-                ContentBlock::Text(t) => Some(t.text.as_str()),
+            .enumerate()
+            .find_map(|(index, block)| match block {
+                ContentBlock::Text(text) => {
+                    let candidates = extract_text_tool_calls(&text.text, &|name| {
+                        self.tools.get(name).is_some()
+                    });
+                    (!candidates.is_empty()).then_some((index, candidates))
+                }
                 _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if text.trim().is_empty() {
+            });
+        let Some((block_index, candidates)) = candidate_block else {
             return msg;
-        }
-        let candidates = extract_text_tool_calls(&text, &|name| self.tools.get(name).is_some());
-        if candidates.is_empty() {
-            return msg;
-        }
+        };
 
-        let remaining = strip_candidates(&text, &candidates);
-        let mut content: Vec<ContentBlock> = Vec::new();
+        let ContentBlock::Text(original_text) = &msg.content[block_index] else {
+            unreachable!("candidate search only returns text blocks");
+        };
+        let remaining = strip_candidates(&original_text.text, &candidates);
+        let repair_sequence = self
+            .dialect_repair_sequence
+            .fetch_add(1, Ordering::Relaxed);
+        let mut replacement = Vec::with_capacity(1 + candidates.len());
         if !remaining.is_empty() {
-            content.push(ContentBlock::Text(TextContent::new(remaining.clone())));
+            // The candidate block changed, so its provider signature no longer
+            // authenticates the bytes. Preserve every untouched block and its
+            // metadata, but clear the modified block's now-invalid signature.
+            replacement.push(ContentBlock::Text(TextContent::new(remaining.clone())));
         }
         for (index, candidate) in candidates.iter().enumerate() {
-            content.push(ContentBlock::ToolCall(ToolCall {
-                id: format!("dialect-repair-{index}"),
+            replacement.push(ContentBlock::ToolCall(ToolCall {
+                id: format!("dialect-repair-{repair_sequence}-{index}"),
                 name: candidate.name.clone(),
                 arguments: candidate.arguments.clone(),
                 thought_signature: None,
             }));
         }
+        let mut content = msg.content.clone();
+        content.splice(block_index..=block_index, replacement);
         if let Ok(mut ledger) = self.repair_ledger.lock() {
             for candidate in &candidates {
                 ledger.record(
@@ -15758,8 +15774,7 @@ mod tests {
     /// Emits a text-embedded tool call on stream 1, plain text on stream 2.
     struct TextCallProvider {
         calls: std::sync::atomic::AtomicUsize,
-        /// When true, report a Native-mapped model id (no repair path).
-        native: bool,
+        model_id: &'static str,
         /// When true, the request after the repaired tool result drops
         /// mid-stream once so retry cleanup can be exercised.
         fail_after_tool_once: bool,
@@ -15775,7 +15790,7 @@ mod tests {
             "test-api"
         }
         fn model_id(&self) -> &str {
-            if self.native { "gpt-4o" } else { "qwen3-mock" }
+            self.model_id
         }
 
         async fn stream(
@@ -15855,6 +15870,73 @@ mod tests {
     }
 
     #[test]
+    fn dialect_repair_preserves_other_blocks_and_uses_unique_ids() {
+        let provider = Arc::new(TextCallProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            model_id: "qwen3-mock",
+            fail_after_tool_once: false,
+        });
+        let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+        let agent = Agent::new(provider, tools, AgentConfig::default());
+        let original = AssistantMessage {
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "reasoning".to_string(),
+                    thinking_signature: Some("thinking-sig".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "preface".to_string(),
+                    text_signature: Some("preface-sig".to_string()),
+                }),
+                ContentBlock::Image(ImageContent {
+                    data: "aGVsbG8=".to_string(),
+                    mime_type: "image/png".to_string(),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: r#"<tool_call>{"name":"read","arguments":{"path":"fixture.txt"}}</tool_call>"#
+                        .to_string(),
+                    text_signature: Some("candidate-sig".to_string()),
+                }),
+                ContentBlock::Text(TextContent {
+                    text: "tail".to_string(),
+                    text_signature: Some("tail-sig".to_string()),
+                }),
+            ],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "qwen3-mock".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            stop_details: None,
+            error_message: None,
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        };
+
+        let first = agent.maybe_repair_dialect_tool_calls(original.clone());
+        let second = agent.maybe_repair_dialect_tool_calls(original);
+        assert!(matches!(
+            &first.content[0],
+            ContentBlock::Thinking(thinking)
+                if thinking.thinking_signature.as_deref() == Some("thinking-sig")
+        ));
+        assert!(matches!(
+            &first.content[1],
+            ContentBlock::Text(text)
+                if text.text == "preface"
+                    && text.text_signature.as_deref() == Some("preface-sig")
+        ));
+        assert!(matches!(&first.content[2], ContentBlock::Image(_)));
+        assert!(matches!(
+            &first.content[4],
+            ContentBlock::Text(text)
+                if text.text == "tail" && text.text_signature.as_deref() == Some("tail-sig")
+        ));
+        let first_id = extract_tool_calls(&first.content)[0].id.clone();
+        let second_id = extract_tool_calls(&second.content)[0].id.clone();
+        assert_ne!(first_id, second_id, "repaired call IDs must be session-unique");
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn dialect_repair_continues_turn_and_executes_tool() {
         let runtime = RuntimeBuilder::current_thread()
@@ -15864,48 +15946,51 @@ mod tests {
             // CONTROL: Native dialect (no repair path) — a plain-text turn
             // must complete without hitting the iteration cap. If this
             // loops, the test provider is the artifact, not the repair.
-            let control = Arc::new(TextCallProvider {
-                calls: std::sync::atomic::AtomicUsize::new(0),
-                native: true,
-                fail_after_tool_once: false,
-            });
-            let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-            let mut control_agent = Agent::new(
-                Arc::clone(&control) as Arc<dyn Provider>,
-                control_tools,
-                AgentConfig::default(),
-            );
-            control_agent.config.max_tool_iterations = 5;
-            let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut control_session = AgentSession::new(
-                control_agent,
-                Arc::clone(&session),
-                false,
-                ResolvedCompactionSettings::default(),
-            );
-            let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let tool_starts_for_events = Arc::clone(&tool_starts);
-            let control_result = control_session
-                .run_text_with_abort("hello".to_string(), None, move |event| {
-                    if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
-                        tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
-                    }
-                })
-                .await
-                .expect("native control completes");
-            assert_eq!(control_result.stop_reason, StopReason::Stop);
-            assert_eq!(control.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(tool_starts.load(Ordering::SeqCst), 0);
-            let cx = asupersync::Cx::for_request();
-            let inner = session.lock(&cx).await.expect("control session lock");
-            assert!(
-                inner.entries_for_current_path().iter().all(|entry| !matches!(
-                    entry,
-                    crate::session::SessionEntry::Custom(custom)
-                        if custom.custom_type == "dialect_repair"
-                )),
-                "native control must not persist repair telemetry"
-            );
+            for model_id in ["gpt-4o", "gpt-5.5"] {
+                let control = Arc::new(TextCallProvider {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                    model_id,
+                    fail_after_tool_once: false,
+                });
+                let control_tools =
+                    ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+                let mut control_agent = Agent::new(
+                    Arc::clone(&control) as Arc<dyn Provider>,
+                    control_tools,
+                    AgentConfig::default(),
+                );
+                control_agent.config.max_tool_iterations = 5;
+                let session = Arc::new(Mutex::new(Session::in_memory()));
+                let mut control_session = AgentSession::new(
+                    control_agent,
+                    Arc::clone(&session),
+                    false,
+                    ResolvedCompactionSettings::default(),
+                );
+                let tool_starts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let tool_starts_for_events = Arc::clone(&tool_starts);
+                let control_result = control_session
+                    .run_text_with_abort("hello".to_string(), None, move |event| {
+                        if matches!(event, AgentEvent::ToolExecutionStart { .. }) {
+                            tool_starts_for_events.fetch_add(1, Ordering::SeqCst);
+                        }
+                    })
+                    .await
+                    .expect("non-repairable control completes");
+                assert_eq!(control_result.stop_reason, StopReason::Stop);
+                assert_eq!(control.calls.load(Ordering::SeqCst), 1, "{model_id}");
+                assert_eq!(tool_starts.load(Ordering::SeqCst), 0, "{model_id}");
+                let cx = asupersync::Cx::for_request();
+                let inner = session.lock(&cx).await.expect("control session lock");
+                assert!(
+                    inner.entries_for_current_path().iter().all(|entry| !matches!(
+                        entry,
+                        crate::session::SessionEntry::Custom(custom)
+                            if custom.custom_type == "dialect_repair"
+                    )),
+                    "{model_id} must not persist repair telemetry"
+                );
+            }
         });
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -15913,7 +15998,7 @@ mod tests {
                 .expect("write fixture");
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                native: false,
+                model_id: "qwen3-mock",
                 fail_after_tool_once: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
@@ -16020,7 +16105,7 @@ mod tests {
                 .expect("write fixture");
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                native: false,
+                model_id: "qwen3-mock",
                 fail_after_tool_once: false,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
@@ -16086,7 +16171,7 @@ mod tests {
                 .expect("write fixture");
             let provider = Arc::new(TextCallProvider {
                 calls: std::sync::atomic::AtomicUsize::new(0),
-                native: false,
+                model_id: "qwen3-mock",
                 fail_after_tool_once: true,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
