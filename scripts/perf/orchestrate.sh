@@ -557,9 +557,7 @@ write_binary_size_measurement_control() {
     "$GIT_DIRTY" \
     "$CORRELATION_ID" <<'PY'
 import hashlib
-import hashlib
 import json
-import re
 import os
 import sys
 import tomllib
@@ -1201,7 +1199,9 @@ validate_retrieved_extension_bench_jsonl() {
     "$expected_commit" \
     "$expected_correlation_id" \
     "$expected_benchmark_run_id" <<'PY'
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 

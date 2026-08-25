@@ -902,28 +902,36 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
     assert_eq!(
         captured.system_prompts[1]
             .as_deref()
-            .map_or(0, |prompt| prompt.matches("`workflowz` for this turn").count()),
+            .map_or(0, |prompt| prompt
+                .matches("`workflowz` for this turn")
+                .count()),
         1,
         "RPC turn 2 must inject the steering workflowz directive exactly once"
     );
     assert_eq!(
         captured.system_prompts[2]
             .as_deref()
-            .map_or(0, |prompt| prompt.matches("`workflowz` for this turn").count()),
+            .map_or(0, |prompt| prompt
+                .matches("`workflowz` for this turn")
+                .count()),
         1,
         "the repeated keyword must activate once in the new logical turn"
     );
     assert_eq!(
         captured.system_prompts[2]
             .as_deref()
-            .map_or(0, |prompt| prompt.matches("`orchestrate` for this turn").count()),
+            .map_or(0, |prompt| prompt
+                .matches("`orchestrate` for this turn")
+                .count()),
         1,
         "RPC turn 3 must inject its orchestrate directive exactly once"
     );
     assert_eq!(
         captured.system_prompts[1]
             .as_deref()
-            .map_or(0, |prompt| prompt.matches("`orchestrate` for this turn").count()),
+            .map_or(0, |prompt| prompt
+                .matches("`orchestrate` for this turn")
+                .count()),
         0,
         "follow-up directives must not leak into the steering request"
     );

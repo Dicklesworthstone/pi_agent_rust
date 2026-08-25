@@ -707,14 +707,24 @@ def build_report(
     config_rules, config_errors = load_config_rules(config_file)
     ignore_rules, ignore_errors = load_ignore_rules(ignore_file)
     rules = config_rules + ignore_rules
-    load_errors = config_errors + ignore_errors
     required_results, violations = evaluate_required_paths(repo_root, rules, required_paths)
 
-    for error in load_errors:
+    for error in config_errors:
+        violations.append(
+            {
+                "path": str(config_file),
+                "source": ".rch/config.toml",
+                "line": None,
+                "pattern": None,
+                "reason": "config_file_error",
+                "message": error,
+            }
+        )
+    for error in ignore_errors:
         violations.append(
             {
                 "path": str(ignore_file),
-                "source": "rch_transfer_config",
+                "source": ".rchignore",
                 "line": None,
                 "pattern": None,
                 "reason": "ignore_file_error",
@@ -740,10 +750,18 @@ def build_report(
 
 def print_text_report(report: dict[str, Any]) -> None:
     if report["mode"] == "postcondition-baseline":
-        print("RCH artifact sync postcondition baseline: PASS")
+        print(
+            "RCH artifact sync postcondition baseline: "
+            f"{report['status'].upper()}"
+        )
         for item in report["generated_artifacts"]:
             snapshot = item["snapshot"]
             print(f"- {item['path']}: {snapshot['kind']}")
+        if report["violations"]:
+            print("\nViolations:")
+            for violation in report["violations"]:
+                print(f"- {violation['message']}")
+                print(f"  action: {violation['recommended_action']}")
         return
 
     if report["mode"] == "postcondition":

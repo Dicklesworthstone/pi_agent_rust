@@ -284,8 +284,7 @@ fn required_artifact_symlink_fails_preflight() -> Result<(), Box<dyn Error>> {
     }
     let report = parse_json(&output)?;
     let non_regular = array_field(&report, "violations")?.iter().any(|violation| {
-        string_field(violation, "reason")
-            .is_ok_and(|reason| reason == "required_path_not_regular")
+        string_field(violation, "reason").is_ok_and(|reason| reason == "required_path_not_regular")
     });
     if !non_regular {
         return Err(test_error(format!(
