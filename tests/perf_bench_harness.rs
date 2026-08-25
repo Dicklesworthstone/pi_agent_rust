@@ -75,12 +75,8 @@ fn prepare_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf
         ));
     }
 
-    fs::create_dir_all(target_dir).map_err(|error| {
-        format!(
-            "create CARGO_TARGET_DIR {}: {error}",
-            target_dir.display()
-        )
-    })?;
+    fs::create_dir_all(target_dir)
+        .map_err(|error| format!("create CARGO_TARGET_DIR {}: {error}", target_dir.display()))?;
     let canonical_target = fs::canonicalize(target_dir).map_err(|error| {
         format!(
             "canonicalize CARGO_TARGET_DIR {}: {error}",
@@ -190,10 +186,7 @@ fn target_output_subdir_rejects_symlink_escape() {
     fs::create_dir_all(&outside_dir).expect("create outside directory");
     symlink(&outside_dir, target_dir.join("nextest")).expect("create escape symlink");
 
-    let result = prepare_target_output_dir(
-        &target_dir,
-        Path::new("nextest/pi-perf/escaped-run"),
-    );
+    let result = prepare_target_output_dir(&target_dir, Path::new("nextest/pi-perf/escaped-run"));
     assert!(
         result.is_err(),
         "symlinked target subdirectory must not redirect benchmark output: {result:?}"
@@ -229,9 +222,20 @@ struct EnvFingerprint {
     cpu_cores: u32,
     mem_total_mb: u64,
     build_profile: String,
+    executable_build_profile: String,
+    executable_profile_verified: bool,
+    build_fingerprint_verified: bool,
+    build_profile_verified: bool,
+    build_fingerprint_contract: String,
+    compiled_profile_family: String,
+    compiled_opt_level: String,
+    compiled_debug: String,
     git_commit: String,
+    source_dirty: bool,
     #[serde(default)]
     features: Vec<String>,
+    binary_path: String,
+    binary_sha256: String,
     config_hash: String,
 }
 
@@ -248,15 +252,52 @@ fn collect_env_fingerprint() -> EnvFingerprint {
     let mem_total_mb = system.total_memory() / (1024 * 1024);
     let os = System::long_os_version().unwrap_or_else(|| std::env::consts::OS.to_string());
     let arch = std::env::consts::ARCH.to_string();
-    let build_profile = detect_build_profile();
+    let build_profile = perf_build::detect_build_profile();
     let git_commit = option_env!("VERGEN_GIT_SHA")
         .unwrap_or("unknown")
         .to_string();
-
-    let config_str = format!(
-        "os={os} arch={arch} cpu={cpu_model} cores={cpu_cores} mem={mem_total_mb} profile={build_profile} git={git_commit}"
-    );
-    let config_hash = sha256_hex(&config_str);
+    let source_dirty = option_env!("VERGEN_GIT_DIRTY") != Some("false");
+    let current_exe = std::env::current_exe().ok();
+    let executable_build_profile = current_exe
+        .as_deref()
+        .and_then(perf_build::profile_from_target_path)
+        .unwrap_or_else(|| "unknown".to_string());
+    let executable_profile_verified = executable_build_profile == "perf";
+    let build_fingerprint_verified = perf_build::has_canonical_perf_build_fingerprint();
+    let build_profile_verified =
+        build_profile == "perf" && executable_profile_verified && build_fingerprint_verified;
+    let binary_path = current_exe
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
+    let binary_sha256 = current_exe
+        .as_deref()
+        .and_then(|path| perf_build::sha256_file(path).ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let compiled_features = perf_build::compiled_feature_set();
+    let features = compiled_features
+        .iter()
+        .map(|feature| (*feature).to_string())
+        .collect::<Vec<_>>();
+    let config_hash =
+        perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
+            source_commit: &git_commit,
+            source_dirty,
+            build_profile: &build_profile,
+            executable_build_profile: &executable_build_profile,
+            verification: perf_build::BenchmarkBuildVerification {
+                executable_profile: executable_profile_verified,
+                build_fingerprint: build_fingerprint_verified,
+                build_profile: build_profile_verified,
+            },
+            build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
+            compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY,
+            compiled_opt_level: perf_build::COMPILED_OPT_LEVEL,
+            compiled_debug: perf_build::COMPILED_DEBUG,
+            compiled_features: &compiled_features,
+            binary_path: &binary_path,
+            binary_sha256: &binary_sha256,
+            debug_assertions: cfg!(debug_assertions),
+        });
 
     EnvFingerprint {
         os,
@@ -265,73 +306,26 @@ fn collect_env_fingerprint() -> EnvFingerprint {
         cpu_cores,
         mem_total_mb,
         build_profile,
+        executable_build_profile,
+        executable_profile_verified,
+        build_fingerprint_verified,
+        build_profile_verified,
+        build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT.to_string(),
+        compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY.to_string(),
+        compiled_opt_level: perf_build::COMPILED_OPT_LEVEL.to_string(),
+        compiled_debug: perf_build::COMPILED_DEBUG.to_string(),
         git_commit,
-        features: Vec::new(),
+        source_dirty,
+        features,
+        binary_path,
+        binary_sha256,
         config_hash,
     }
 }
 
-fn detect_build_profile() -> String {
-    if let Ok(value) = std::env::var("PI_BENCH_BUILD_PROFILE") {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-
-    if let Ok(path) = std::env::current_exe()
-        && let Some(profile) = profile_from_target_path(&path)
-    {
-        return profile;
-    }
-
-    if cfg!(debug_assertions) {
-        "debug".to_string()
-    } else {
-        "release".to_string()
-    }
-}
-
-fn profile_from_target_path(path: &Path) -> Option<String> {
-    let components: Vec<String> = path
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-
-    let target_idx = components
-        .iter()
-        .rposition(|component| component == "target")?;
-    let tail = components.get(target_idx + 1..)?;
-    if tail.len() < 2 {
-        return None;
-    }
-
-    let profile_idx = if tail.len() >= 3 && tail[tail.len() - 2] == "deps" {
-        tail.len().checked_sub(3)?
-    } else {
-        tail.len().checked_sub(2)?
-    };
-
-    let candidate = tail.get(profile_idx)?.trim();
-    if !candidate.is_empty() {
-        return Some(candidate.to_string());
-    }
-
-    None
-}
-
-fn sha256_hex(input: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    pi::package_manager::hex_encode(&hasher.finalize())
-}
-
 // ─── Statistics ──────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Summary {
     count: usize,
     min_ms: f64,
@@ -385,10 +379,15 @@ fn percentile_f64(sorted: &[f64], p: f64) -> f64 {
 
 // ─── JSONL Record ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BenchRecord {
     schema: String,
     runtime: String,
+    run_id: String,
+    correlation_id: String,
+    benchmark_run_id: String,
+    source_commit: String,
+    source_dirty: bool,
     scenario: String,
     extension: String,
     runs: usize,
@@ -401,7 +400,55 @@ struct BenchRecord {
 }
 
 fn emit_jsonl_line(record: &BenchRecord) -> String {
-    serde_json::to_string(record).unwrap_or_default()
+    serde_json::to_string(record).expect("serialize extension benchmark record")
+}
+
+fn validate_bench_jsonl(content: &str) -> Result<usize, String> {
+    let mut record_count = 0usize;
+    let mut has_positive_cold_start = false;
+    for (line_index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: BenchRecord = serde_json::from_str(line).map_err(|error| {
+            format!("line {}: invalid benchmark record: {error}", line_index + 1)
+        })?;
+        if record.schema != "pi.ext.rust_bench.v1" {
+            return Err(format!("line {}: unexpected schema", line_index + 1));
+        }
+        if record.runtime != "pi_agent_rust" {
+            return Err(format!("line {}: unexpected runtime", line_index + 1));
+        }
+        for (field, value) in [
+            ("run_id", record.run_id.as_str()),
+            ("correlation_id", record.correlation_id.as_str()),
+            ("benchmark_run_id", record.benchmark_run_id.as_str()),
+            ("source_commit", record.source_commit.as_str()),
+            ("timestamp", record.timestamp.as_str()),
+            ("env.build_profile", record.env.build_profile.as_str()),
+            (
+                "env.executable_build_profile",
+                record.env.executable_build_profile.as_str(),
+            ),
+            ("env.git_commit", record.env.git_commit.as_str()),
+            ("env.config_hash", record.env.config_hash.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("line {}: {field} is empty", line_index + 1));
+            }
+        }
+        has_positive_cold_start |= record.scenario == "cold_start" && record.summary.count > 0;
+        record_count += 1;
+    }
+    if record_count == 0 {
+        return Err("extension benchmark JSONL contains no records".to_string());
+    }
+    if !has_positive_cold_start {
+        return Err(
+            "extension benchmark JSONL contains no successful cold_start record".to_string(),
+        );
+    }
+    Ok(record_count)
 }
 
 // ─── Extension Helpers ───────────────────────────────────────────────────────
@@ -721,6 +768,14 @@ fn bench_extension_scenarios() {
     std::fs::create_dir_all(&out_dir).expect("create extension benchmark output directory");
 
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let correlation_id = std::env::var("CI_CORRELATION_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "standalone".to_string());
+    let benchmark_run_id = std::env::var("PI_BENCH_RUN_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{correlation_id}:{now}"));
 
     eprintln!("\n══════════════════════════════════════════════════════════");
     eprintln!("  Extension Benchmark Harness (bd-20s9)");
@@ -770,6 +825,11 @@ fn bench_extension_scenarios() {
             records.push(BenchRecord {
                 schema: "pi.ext.rust_bench.v1".to_string(),
                 runtime: "pi_agent_rust".to_string(),
+                run_id: correlation_id.clone(),
+                correlation_id: correlation_id.clone(),
+                benchmark_run_id: benchmark_run_id.clone(),
+                source_commit: env.git_commit.clone(),
+                source_dirty: env.source_dirty,
                 scenario: "cold_start".to_string(),
                 extension: ext_name.clone(),
                 runs: summary.count,
@@ -804,6 +864,11 @@ fn bench_extension_scenarios() {
             records.push(BenchRecord {
                 schema: "pi.ext.rust_bench.v1".to_string(),
                 runtime: "pi_agent_rust".to_string(),
+                run_id: correlation_id.clone(),
+                correlation_id: correlation_id.clone(),
+                benchmark_run_id: benchmark_run_id.clone(),
+                source_commit: env.git_commit.clone(),
+                source_dirty: env.source_dirty,
                 scenario: "warm_start".to_string(),
                 extension: ext_name.clone(),
                 runs: summary.count,
@@ -825,7 +890,10 @@ fn bench_extension_scenarios() {
         }
 
         // ── Tool Call Overhead ──
-        {
+        // Only `hello` in this fixture set registers the `hello` tool. Emitting
+        // zero-count rows for extensions with no matching tool would mislabel a
+        // no-op/error path as a dispatch measurement.
+        if ext_name == "hello" {
             let samples = run_tool_call(ext_name, &entry_path, &cwd, config.tool_iterations);
             let summary = compute_summary(&samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
@@ -838,6 +906,11 @@ fn bench_extension_scenarios() {
             records.push(BenchRecord {
                 schema: "pi.ext.rust_bench.v1".to_string(),
                 runtime: "pi_agent_rust".to_string(),
+                run_id: correlation_id.clone(),
+                correlation_id: correlation_id.clone(),
+                benchmark_run_id: benchmark_run_id.clone(),
+                source_commit: env.git_commit.clone(),
+                source_dirty: env.source_dirty,
                 scenario: "tool_call".to_string(),
                 extension: ext_name.clone(),
                 runs: summary.count,
@@ -859,7 +932,8 @@ fn bench_extension_scenarios() {
         }
 
         // ── Event Hook Dispatch ──
-        {
+        // `pirate` is the fixture in this set that registers before_agent_start.
+        if ext_name == "pirate" {
             let samples = run_event_dispatch(ext_name, &entry_path, &cwd, config.event_iterations);
             let summary = compute_summary(&samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
@@ -872,6 +946,11 @@ fn bench_extension_scenarios() {
             records.push(BenchRecord {
                 schema: "pi.ext.rust_bench.v1".to_string(),
                 runtime: "pi_agent_rust".to_string(),
+                run_id: correlation_id.clone(),
+                correlation_id: correlation_id.clone(),
+                benchmark_run_id: benchmark_run_id.clone(),
+                source_commit: env.git_commit.clone(),
+                source_dirty: env.source_dirty,
                 scenario: "event_hook".to_string(),
                 extension: ext_name.clone(),
                 runs: summary.count,
@@ -902,7 +981,11 @@ fn bench_extension_scenarios() {
         .map(emit_jsonl_line)
         .collect::<Vec<_>>()
         .join("\n");
-    std::fs::write(&jsonl_path, format!("{jsonl}\n")).expect("write extension_bench.jsonl");
+    let jsonl = format!("{jsonl}\n");
+    let validated_record_count =
+        validate_bench_jsonl(&jsonl).expect("validate generated extension benchmark JSONL");
+    assert_eq!(validated_record_count, records.len());
+    std::fs::write(&jsonl_path, jsonl).expect("write extension_bench.jsonl");
 
     // ── Write summary ──
     let scenarios = ["cold_start", "warm_start", "tool_call", "event_hook"];
@@ -963,6 +1046,10 @@ fn bench_extension_scenarios() {
             .iter()
             .any(|r| r.scenario == "cold_start" && r.summary.count > 0),
         "expected at least one successful cold_start measurement"
+    );
+    assert!(
+        records.iter().all(|record| record.summary.count > 0),
+        "every emitted benchmark row must contain a successful measurement"
     );
 
     // Budget gate: cold start p99 < 50ms for simple extensions (hello).

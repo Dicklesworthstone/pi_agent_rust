@@ -97,9 +97,7 @@ async fn recv_rpc_command_response(
     loop {
         let line = recv_rpc_line_before(rx, label, deadline).await?;
         let value = serde_json::from_str::<serde_json::Value>(line.trim()).map_err(|err| {
-            format!(
-                "{label}: invalid RPC JSON while waiting for response id {expected_id}: {err}"
-            )
+            format!("{label}: invalid RPC JSON while waiting for response id {expected_id}: {err}")
         })?;
         if value.get("type").and_then(serde_json::Value::as_str) == Some("response")
             && value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id)
@@ -581,23 +579,23 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
 
     runtime.block_on(async {
         let scenario = async {
-        let options = RpcOptions {
-            config: Config::default(),
-            resources: ResourceLoader::empty(false),
-            available_models: Vec::new(),
-            scoped_models: Vec::new(),
-            cli_api_key: None,
-            auth,
-            runtime_handle: handle.clone(),
-            ask_tool: None,
-        };
-        let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
-        let out_rx = Arc::new(Mutex::new(out_rx));
-        let server =
-            handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
-        let cx = asupersync::Cx::for_testing();
-        in_tx
+            let options = RpcOptions {
+                config: Config::default(),
+                resources: ResourceLoader::empty(false),
+                available_models: Vec::new(),
+                scoped_models: Vec::new(),
+                cli_api_key: None,
+                auth,
+                runtime_handle: handle.clone(),
+                ask_tool: None,
+            };
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(256);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+            let server =
+                handle.spawn(async move { run_rpc(agent_session, options, in_rx, out_tx).await });
+            let cx = asupersync::Cx::for_testing();
+            in_tx
             .send(
                 &cx,
                 r#"{"id":"1","type":"prompt","message":"please ultrathink and orchestrate this"}"#
@@ -606,38 +604,38 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
             .await
             .expect("send RPC prompt");
 
-        let ack: serde_json::Value = serde_json::from_str(
-            recv_rpc_line(&out_rx, "RPC prompt acknowledgment")
-                .await
-                .expect("receive RPC prompt acknowledgment")
-                .trim(),
-        )
-        .expect("parse RPC prompt acknowledgment");
-        assert_eq!(ack["type"], "response");
-        assert_eq!(ack["command"], "prompt");
-        assert!(ack["success"].as_bool().unwrap_or(false));
-
-        let mut saw_agent_end = false;
-        for _ in 0..100 {
-            let event: serde_json::Value = serde_json::from_str(
-                recv_rpc_line(&out_rx, "RPC magic-keyword event")
+            let ack: serde_json::Value = serde_json::from_str(
+                recv_rpc_line(&out_rx, "RPC prompt acknowledgment")
                     .await
-                    .expect("receive RPC magic-keyword event")
+                    .expect("receive RPC prompt acknowledgment")
                     .trim(),
             )
-            .expect("parse RPC event");
-            if event["type"] == "agent_end" {
-                assert!(
-                    event["error"].is_null(),
-                    "RPC agent turn ended with an error: {event}"
-                );
-                saw_agent_end = true;
-                break;
+            .expect("parse RPC prompt acknowledgment");
+            assert_eq!(ack["type"], "response");
+            assert_eq!(ack["command"], "prompt");
+            assert!(ack["success"].as_bool().unwrap_or(false));
+
+            let mut saw_agent_end = false;
+            for _ in 0..100 {
+                let event: serde_json::Value = serde_json::from_str(
+                    recv_rpc_line(&out_rx, "RPC magic-keyword event")
+                        .await
+                        .expect("receive RPC magic-keyword event")
+                        .trim(),
+                )
+                .expect("parse RPC event");
+                if event["type"] == "agent_end" {
+                    assert!(
+                        event["error"].is_null(),
+                        "RPC agent turn ended with an error: {event}"
+                    );
+                    saw_agent_end = true;
+                    break;
+                }
             }
-        }
-        assert!(saw_agent_end, "RPC prompt never reached agent_end");
-        drop(in_tx);
-        server.await.expect("RPC server task join");
+            assert!(saw_agent_end, "RPC prompt never reached agent_end");
+            drop(in_tx);
+            server.await.expect("RPC server task join");
         };
         asupersync::time::timeout(
             asupersync::time::wall_now(),
@@ -839,10 +837,7 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
         last_user_text(1),
         "please ultrathink and workflowz this steering input"
     );
-    assert_eq!(
-        last_user_text(2),
-        "please orchestrate this follow-up"
-    );
+    assert_eq!(last_user_text(2), "please orchestrate this follow-up");
     assert!(
         captured.system_prompts[1]
             .as_deref()

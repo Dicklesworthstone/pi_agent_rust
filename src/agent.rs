@@ -14374,6 +14374,65 @@ mod tests {
     }
 
     #[test]
+    fn owning_steering_fetcher_preserves_full_admitted_batch() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig::default(),
+            );
+            agent.set_queue_modes(QueueMode::All, QueueMode::All);
+
+            let expected = (0..128)
+                .map(|index| format!("admitted steering {index}"))
+                .collect::<Vec<_>>();
+            let queued = Arc::new(StdTestMutex::new(Some(
+                expected
+                    .iter()
+                    .map(|text| {
+                        QueuedAgentMessage::from_authored_message(user_message(text.as_str()))
+                    })
+                    .collect::<Vec<_>>(),
+            )));
+            let fetcher_state = Arc::clone(&queued);
+            let fetcher =
+                move || -> futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>> {
+                    let fetcher_state = Arc::clone(&fetcher_state);
+                    Box::pin(async move {
+                        fetcher_state
+                            .lock()
+                            .ok()
+                            .and_then(|mut queued| queued.take())
+                            .unwrap_or_default()
+                    })
+                };
+            agent.register_message_fetchers(Some(Arc::new(fetcher)), None);
+
+            agent
+                .run_with_message_with_abort(user_message("initial turn"), None, |_| {})
+                .await
+                .expect("full admitted steering batch");
+
+            let recorded_calls = match calls.lock() {
+                Ok(calls) => calls.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            assert_eq!(recorded_calls.len(), 1);
+            assert_eq!(recorded_calls[0].messages.len(), expected.len() + 1);
+            assert_user_text(&recorded_calls[0].messages[0], "initial turn");
+            for (message, expected_text) in recorded_calls[0].messages[1..].iter().zip(&expected) {
+                assert_user_text(message, expected_text);
+            }
+        });
+    }
+
+    #[test]
     fn ordinary_idle_boundary_preserves_full_primary_follow_up_batch() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -14528,7 +14587,11 @@ mod tests {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(agent_ends.len(), 1, "AgentStart must have one matching AgentEnd");
+            assert_eq!(
+                agent_ends.len(),
+                1,
+                "AgentStart must have one matching AgentEnd"
+            );
             assert!(agent_ends[0].1.is_none());
             assert!(agent_ends[0].0.iter().any(|message| {
                 matches!(

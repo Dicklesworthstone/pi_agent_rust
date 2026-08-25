@@ -9497,6 +9497,67 @@ export default function init(pi) {
         assert_eq!(shared.pending_count(), MAX_RPC_PENDING_MESSAGES);
     }
 
+    #[test]
+    fn terminal_queue_preservation_drains_and_records_acknowledged_input_exactly_once() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let cx = AgentCx::for_request();
+            {
+                let mut state = shared_state.lock(&cx).await.expect("shared state lock");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("accepted steering", &[]),
+                    ))
+                    .expect("queue steering");
+                state
+                    .push_follow_up(QueuedAgentMessage::from_authored_message(
+                        build_user_message("accepted follow-up", &[]),
+                    ))
+                    .expect("queue follow-up");
+            }
+
+            let preserved = preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                .await
+                .expect("preserve terminal input");
+            assert_eq!(preserved, 2);
+            assert_eq!(
+                shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state lock")
+                    .pending_count(),
+                0
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            let inner = guard.session.lock(&cx).await.expect("session lock");
+            let user_text = inner
+                .entries_for_current_path()
+                .iter()
+                .filter_map(|entry| match entry {
+                    crate::session::SessionEntry::Message(message) => match &message.message {
+                        SessionMessage::User {
+                            content: UserContent::Text(text),
+                            ..
+                        } => Some(text.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(user_text, vec!["accepted steering", "accepted follow-up"]);
+        });
+    }
+
     // -----------------------------------------------------------------------
     // retry_delay_ms
     // -----------------------------------------------------------------------
@@ -9960,6 +10021,21 @@ export default function init(pi) {
                 ),
                 ("5", r#"{"id":"5","type":"retry"}"#, "retry"),
                 ("6", r#"{"id":"6","type":"compact"}"#, "compact"),
+                (
+                    "7",
+                    r#"{"id":"7","type":"new_session"}"#,
+                    "new_session",
+                ),
+                (
+                    "8",
+                    r#"{"id":"8","type":"switch_session","sessionPath":"unused"}"#,
+                    "switch_session",
+                ),
+                (
+                    "9",
+                    r#"{"id":"9","type":"fork","entryId":"unused"}"#,
+                    "fork",
+                ),
             ] {
                 let response = send_recv(&in_tx, &out_rx, command, "compaction overlap").await;
                 assert_err(&response, expected_command);
