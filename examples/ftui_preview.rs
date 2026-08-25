@@ -56,6 +56,12 @@ fn main() -> std::io::Result<()> {
                     )));
                     continue;
                 }
+                other => {
+                    let _ = agent_tx.send(PiMsg::System(format!(
+                        "(fake agent) received command: {other:?}"
+                    )));
+                    continue;
+                }
             };
             if agent_tx.send(PiMsg::AgentStart).is_err() {
                 return;
@@ -69,6 +75,7 @@ fn main() -> std::io::Result<()> {
                 name: "demo".into(),
                 tool_id: "t1".into(),
                 is_error: false,
+                output: None,
             });
             let reply = format!(
                 "You said: {prompt}\nThis reply streams word by word over the \

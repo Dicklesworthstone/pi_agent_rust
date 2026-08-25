@@ -2195,7 +2195,7 @@ async fn run(
     let session_handle = Arc::clone(&agent_session.session);
 
     #[cfg(feature = "ftui")]
-    let ftui_requested = is_interactive && cli.ftui;
+    let ftui_requested = is_interactive && !cli.classic;
     #[cfg(not(feature = "ftui"))]
     let ftui_requested = false;
 

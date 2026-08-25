@@ -1,0 +1,36 @@
+{
+  "schema": "pi.ftui.cutover_evidence.v1",
+  "generated_at": "2026-08-25T08:10:00Z",
+  "bead": "bd-ti0tq",
+  "purpose": "Verify ftui default cutover, e2e and unit test suite coverage in default build, binary size headroom delta, and charmed stack retirement disposition.",
+  "status": "PASS",
+  "default_stack": "ftui",
+  "fallback_flag": "--classic",
+  "suites": {
+    "e2e_ftui": {
+      "passed": 128,
+      "failed": 0,
+      "ignored": 1,
+      "status": "PASS"
+    },
+    "interactive_ftui_unit": {
+      "passed": 57,
+      "failed": 0,
+      "ignored": 0,
+      "status": "PASS"
+    },
+    "e2e_tui_classic_fallback": {
+      "status": "PASS"
+    }
+  },
+  "binary_size": {
+    "measured_release_mb": 23.05,
+    "threshold_mb": 48.0,
+    "delta_budget_mb": 3.0,
+    "status": "PASS"
+  },
+  "charmed_stack_disposition": {
+    "rule_1_compliance": "Intact; removal deferred per AGENTS.md Rule 1 to follow-up retirement bead pending explicit written authorization.",
+    "fallback_operational": true
+  }
+}

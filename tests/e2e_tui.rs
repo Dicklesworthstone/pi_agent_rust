@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 /// Standard CLI args for interactive mode with minimal features.
 fn base_interactive_args() -> Vec<&'static str> {
     vec![
+        "--classic",
         "--provider",
         "openai",
         "--model",
@@ -180,6 +181,7 @@ fn setup_config_ui_fixture(session: &TuiSession, package_name: &str) -> PathBuf 
 
 fn vcr_interactive_args() -> Vec<&'static str> {
     vec![
+        "--classic",
         "--provider",
         "anthropic",
         "--model",
@@ -199,6 +201,7 @@ fn vcr_interactive_args() -> Vec<&'static str> {
 
 fn vcr_interactive_args_no_tools() -> Vec<&'static str> {
     vec![
+        "--classic",
         "--provider",
         "anthropic",
         "--model",

@@ -441,7 +441,7 @@ rquickjs = { version = "0.12.2", features = ["futures", "loader", "bindgen"] }
 win32job = "2.0.3"
 
 [features]
-default = ["sqlite-sessions", "tui", "bpe-tokens"]
+default = ["sqlite-sessions", "tui", "bpe-tokens", "ftui"]
 full = [
     "image-resize",
     "jemalloc",
