@@ -5,8 +5,7 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::status_line::{
-    PowerlineStatusLine, SegmentId, SeparatorStyle, StatusContext, StatusLinePreset, StatusSegment,
-    compute_session_accent_hue,
+    PowerlineStatusLine, StatusContext, StatusLinePreset, compute_session_accent_hue,
 };
 
 fn finish_case(harness: &TestHarness, case: &str) {

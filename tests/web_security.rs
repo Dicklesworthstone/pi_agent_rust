@@ -5,7 +5,7 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::web_remote::{
-    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, WebAuditEvent, WebFrameType, WebRemoteManager,
+    BindMode, ControlMode, EMBEDDED_WEB_CLIENT_HTML, WebFrameType, WebRemoteManager,
     WebRemoteSettings,
 };
 

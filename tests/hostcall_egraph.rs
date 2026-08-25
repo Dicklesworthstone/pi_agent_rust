@@ -5,9 +5,9 @@ mod common;
 use common::TestHarness;
 use common::logging::validate_jsonl_v2_only;
 use pi::hostcall_egraph::{
-    CostModel, EGraph, HostcallEGraphEngine, PlanExpr, RULE_DROP_ROUNDTRIP_CONVERT,
-    RULE_FUSE_MARSHAL_VALIDATE, RULE_FUSE_TYPED_PIPELINE, Repr, SaturationLimits,
-    SaturationOutcome, StageOp, canonical_plan, typed_plan_with_roundtrip,
+    HostcallEGraphEngine, RULE_DROP_ROUNDTRIP_CONVERT, RULE_FUSE_MARSHAL_VALIDATE,
+    RULE_FUSE_TYPED_PIPELINE, SaturationLimits, SaturationOutcome, canonical_plan,
+    typed_plan_with_roundtrip,
 };
 use pi::hostcall_rewrite::HostcallRewritePlanKind;
 
