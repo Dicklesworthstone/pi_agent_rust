@@ -3176,6 +3176,108 @@ mod stream_delta_batcher_tests {
         );
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn interactive_text_turn_persists_keyword_and_repair_ledgers() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("fixture.txt"), "hello-fixture")
+            .expect("write fixture");
+        let provider = Arc::new(InteractiveRepairProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let (mut app, mut event_rx) =
+            build_test_app_with_provider(Arc::clone(&provider) as Arc<dyn Provider>);
+        let mut entry = model_entry(provider.name(), provider.model_id());
+        entry.compat = Some(crate::models::CompatConfig {
+            tool_call_dialect: Some(crate::dialects::Dialect::Xmlish),
+            ..crate::models::CompatConfig::default()
+        });
+        let agent = Agent::new(
+            Arc::clone(&provider) as Arc<dyn Provider>,
+            ToolRegistry::new(&["read"], temp.path(), None),
+            AgentConfig::default(),
+        );
+        let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+            Some(temp.path().join("sessions")),
+        )));
+        app.agent = Arc::new(asupersync::sync::Mutex::new(agent));
+        app.session = Arc::clone(&session);
+        app.cwd = temp.path().to_path_buf();
+        app.model_entry = entry.clone();
+        app.available_models = vec![entry.clone()];
+        if let Ok(mut shared) = app.model_entry_shared.lock() {
+            *shared = entry;
+        }
+        app.save_enabled = true;
+
+        let _ = app.submit_message("ultrathink check the fixture");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut saw_done = false;
+        while std::time::Instant::now() < deadline {
+            match event_rx.try_recv() {
+                Ok(PiMsg::AgentDone { error_message, .. }) => {
+                    assert!(error_message.is_none(), "turn error: {error_message:?}");
+                    saw_done = true;
+                    break;
+                }
+                Ok(PiMsg::AgentError(err)) => panic!("interactive turn failed: {err}"),
+                Ok(_) | Err(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        assert!(saw_done, "interactive turn did not finish before the deadline");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let persisted_path = runtime().block_on(async {
+            let cx = Cx::for_request();
+            let agent_guard =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+                    .await
+                    .expect("agent completion lock");
+            drop(agent_guard);
+            let session_guard =
+                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                    .await
+                    .expect("session completion lock");
+            session_guard
+                .path
+                .clone()
+                .expect("interactive autosave created a session file")
+        });
+        let reopened = runtime()
+            .block_on(Session::open(persisted_path.to_string_lossy().as_ref()))
+            .expect("reopen interactive session");
+        let entries = reopened.entries_for_current_path();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "dialect_repair"
+                            && custom.data.as_ref().is_some_and(|data| data["tool"] == "read")
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    crate::session::SessionEntry::Custom(custom)
+                        if custom.custom_type == "magic_keyword"
+                            && custom.data.as_ref().is_some_and(|data| {
+                                data["schema"] == "pi.magic_keyword.v1"
+                                    && data["word"] == "ultrathink"
+                            })
+                ))
+                .count(),
+            1
+        );
+    }
+
     fn build_test_extension_manager_with_command_output(
         output: &Value,
     ) -> crate::extensions::ExtensionManager {
@@ -3229,6 +3331,57 @@ mod stream_delta_batcher_tests {
 
     struct ContinueProbeProvider {
         state: Arc<ContinueProbeState>,
+    }
+
+    struct InteractiveRepairProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for InteractiveRepairProvider {
+        fn name(&self) -> &'static str {
+            "repair-probe"
+        }
+
+        fn api(&self) -> &'static str {
+            "openai-completions"
+        }
+
+        fn model_id(&self) -> &'static str {
+            "qwen3-repair-probe"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn futures::Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let content = if call == 0 {
+                vec![ContentBlock::Text(TextContent::new(
+                    "Checking. <tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"fixture.txt\"}}</tool_call>",
+                ))]
+            } else {
+                vec![ContentBlock::Text(TextContent::new("done"))]
+            };
+            let message = AssistantMessage {
+                content,
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                stop_details: None,
+                error_message: None,
+                timestamp: 0,
+            };
+            Ok(Box::pin(stream::iter(vec![Ok(StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            })])))
+        }
     }
 
     impl ContinueProbeProvider {
