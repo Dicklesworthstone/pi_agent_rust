@@ -2189,6 +2189,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
+            let keyword_activations = agent_guard.drain_keyword_ledger();
             drop(agent_guard);
 
             let mut session_guard =
@@ -2208,6 +2209,10 @@ After approving access in the browser, press Enter in Pi to complete login."
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
+            crate::magic_keywords::append_session_telemetry(
+                &mut session_guard,
+                &keyword_activations,
+            );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
                 Some(format!("Failed to save session: {err}"))
             } else {
@@ -2445,6 +2450,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
+            let keyword_activations = agent_guard.drain_keyword_ledger();
             drop(agent_guard);
 
             let mut session_guard =
@@ -2464,6 +2470,10 @@ After approving access in the browser, press Enter in Pi to complete login."
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
+            crate::magic_keywords::append_session_telemetry(
+                &mut session_guard,
+                &keyword_activations,
+            );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
                 Some(format!("Failed to save session: {err}"))
             } else {
@@ -2793,6 +2803,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
+            let keyword_activations = agent_guard.drain_keyword_ledger();
             drop(agent_guard);
 
             let mut session_guard =
@@ -2812,6 +2823,10 @@ After approving access in the browser, press Enter in Pi to complete login."
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
+            crate::magic_keywords::append_session_telemetry(
+                &mut session_guard,
+                &keyword_activations,
+            );
             let save_error = if save_enabled && let Err(err) = session_guard.save().await {
                 Some(format!("Failed to save session: {err}"))
             } else {

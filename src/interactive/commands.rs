@@ -1068,6 +1068,9 @@ impl PiApp {
         let previous_thinking = session_thinking_level(&session_guard);
 
         agent_guard.set_provider(provider_impl);
+        agent_guard.set_keyword_max_thinking_level(
+            next.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
         let stream_options = agent_guard.stream_options_mut();
         stream_options.api_key.clone_from(&resolved_key_opt);
         stream_options.headers.clone_from(&next.headers);
@@ -1208,6 +1211,9 @@ impl PiApp {
             // over the previous model's limit.
             stream_options.max_tokens = Some(target_entry.model.max_tokens);
         }
+        agent_guard.set_keyword_max_thinking_level(
+            target_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
         agent_guard.stream_options_mut().thinking_level = Some(thinking_sync.effective);
         drop(agent_guard);
 

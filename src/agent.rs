@@ -1262,6 +1262,11 @@ pub struct Agent {
     /// session wrapper into session Custom entries for auditability.
     keyword_ledger: Vec<crate::magic_keywords::KeywordActivation>,
 
+    /// Highest effort the active model can accept. The session wrapper keeps
+    /// this synchronized with the model registry so `ultrathink` cannot send
+    /// a raw unsupported `Max` request.
+    keyword_max_thinking_level: crate::model::ThinkingLevel,
+
     /// Session-scoped secrets vault (bd-cv653.7.9): placeholder map lives in
     /// memory and dies with the session — never persisted raw.
     secrets_vault: crate::secrets::SecretVault,
@@ -1320,6 +1325,7 @@ impl Agent {
             plan_state: crate::plan::PlanState::new(),
             repair_ledger: Arc::new(StdMutex::new(crate::dialects::RepairLedger::default())),
             keyword_ledger: Vec::new(),
+            keyword_max_thinking_level: crate::model::ThinkingLevel::Max,
             secrets_vault: crate::secrets::SecretVault::default(),
         }
     }
@@ -1524,6 +1530,11 @@ impl Agent {
     /// Replace the provider implementation (used for model/provider switching).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
+    }
+
+    /// Set the model-clamped target used when a turn contains `ultrathink`.
+    pub const fn set_keyword_max_thinking_level(&mut self, level: crate::model::ThinkingLevel) {
+        self.keyword_max_thinking_level = level;
     }
 
     /// Register async fetchers for queued steering/follow-up messages.
@@ -2027,6 +2038,7 @@ impl Agent {
         let mut turn_index: usize = 0;
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
         let mut last_assistant: Option<Arc<AssistantMessage>> = None;
+        let mut turn_keyword_words = std::collections::HashSet::new();
 
         let agent_start_event = AgentEvent::AgentStart {
             session_id: session_id.clone(),
@@ -2037,21 +2049,38 @@ impl Agent {
 
         for prompt in prompts {
             // Magic keywords (bd-cv653.3.6): pre-send prose scan of the user
-            // message. ultrathink raises the turn's thinking level (clamped
-            // per model downstream); orchestrate/workflowz/custom words
+            // message. ultrathink raises the turn's thinking level to the
+            // active model's pre-clamped maximum; orchestrate/workflowz/custom words
             // append their directive to the system prompt (appended, never
             // inserted, so provider prompt caches stay valid).
-            if let Message::User(user) = &prompt
-                && let UserContent::Text(text) = &user.content
-            {
-                let hits =
-                    crate::magic_keywords::detect(text, self.config.keyword_settings.as_ref());
+            if let Message::User(user) = &prompt {
+                let scan_text = match &user.content {
+                    UserContent::Text(text) => Cow::Borrowed(text.as_str()),
+                    UserContent::Blocks(blocks) => Cow::Owned(
+                        blocks
+                            .iter()
+                            .filter_map(|block| match block {
+                                ContentBlock::Text(text) => Some(text.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                };
+                let hits: Vec<_> = crate::magic_keywords::detect(
+                    &scan_text,
+                    self.config.keyword_settings.as_ref(),
+                )
+                .into_iter()
+                .filter(|hit| turn_keyword_words.insert(hit.word.clone()))
+                .collect();
                 if !hits.is_empty() {
                     let mut directives = Vec::new();
+                    let keyword_max_thinking_level = self.keyword_max_thinking_level;
                     for hit in &hits {
                         if hit.action == "ultrathink" {
                             self.stream_options_mut().thinking_level =
-                                Some(crate::model::ThinkingLevel::Max);
+                                Some(keyword_max_thinking_level);
                         }
                     }
                     directives.extend(crate::magic_keywords::directives_for(
@@ -10105,6 +10134,13 @@ impl AgentSession {
     }
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
+        let provider = self.agent.provider();
+        let keyword_max = registry
+            .find(provider.name(), provider.model_id())
+            .map_or(crate::model::ThinkingLevel::Max, |entry| {
+                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
+            });
+        self.agent.set_keyword_max_thinking_level(keyword_max);
         self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
         // Keep the extension ctx catalog in sync when the registry is
         // replaced after extension boot (e.g. after merging extension
@@ -10224,6 +10260,8 @@ impl AgentSession {
             self.apply_session_model_selection(provider_id, model_id)?;
         }
         self.agent.stream_options_mut().thinking_level = Some(next_thinking);
+        let keyword_max = self.keyword_max_thinking_level_for_model(provider_id, model_id);
+        self.agent.set_keyword_max_thinking_level(keyword_max);
         self.refresh_extension_completion_host_state();
 
         {
@@ -10311,6 +10349,19 @@ impl AgentSession {
             .map_or(level, |entry| entry.clamp_thinking_level(level))
     }
 
+    fn keyword_max_thinking_level_for_model(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> crate::model::ThinkingLevel {
+        self.model_registry
+            .as_ref()
+            .and_then(|registry| registry.find(provider_id, model_id))
+            .map_or(self.agent.keyword_max_thinking_level, |entry| {
+                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max)
+            })
+    }
+
     fn resolve_stream_api_key_for_model(&self, entry: &ModelEntry) -> Option<String> {
         let normalize = |key_opt: Option<String>| {
             key_opt.and_then(|key| {
@@ -10364,13 +10415,17 @@ impl AgentSession {
         });
         let requested = parsed_session_thinking.unwrap_or(current_thinking);
 
-        let effective = if let Some((provider_id, model_id)) = session_model.as_ref() {
-            self.clamp_thinking_level_for_model(provider_id, model_id, requested)
-        } else {
-            requested
-        };
+        let (active_provider_id, active_model_id) = session_model.clone().unwrap_or_else(|| {
+            let provider = self.agent.provider();
+            (provider.name().to_string(), provider.model_id().to_string())
+        });
+        let effective =
+            self.clamp_thinking_level_for_model(&active_provider_id, &active_model_id, requested);
+        let keyword_max =
+            self.keyword_max_thinking_level_for_model(&active_provider_id, &active_model_id);
 
         self.agent.stream_options_mut().thinking_level = Some(effective);
+        self.agent.set_keyword_max_thinking_level(keyword_max);
         self.refresh_extension_completion_host_state();
 
         let thinking_changed = !effective.eq(&current_thinking);
@@ -11362,23 +11417,25 @@ impl AgentSession {
     /// Drain the magic-keyword activation ledger into session Custom
     /// entries (bd-cv653.3.6) so activations are auditable ("why did
     /// thinking jump to max?").
-    async fn persist_keyword_ledger(&mut self) {
-        let activations = self.agent.drain_keyword_ledger();
-        if activations.is_empty() {
-            return;
+    async fn persist_keyword_ledger(&mut self) -> Result<()> {
+        if self.agent.keyword_ledger.is_empty() {
+            return Ok(());
         }
         let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut inner) = self.session.lock(cx.cx()).await {
-            for activation in &activations {
-                inner.append_custom_entry(
-                    "magic_keyword".to_string(),
-                    Some(serde_json::json!({
-                        "word": activation.word,
-                        "action": activation.action,
-                    })),
-                );
-            }
+        let mut inner = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
+            .await
+            .map_err(|err| Error::session(err.to_string()))?;
+        let activations = self.agent.drain_keyword_ledger();
+        crate::magic_keywords::append_session_telemetry(&mut inner, &activations);
+        if self.save_enabled {
+            inner.flush_autosave(AutosaveFlushTrigger::Periodic).await?;
         }
+        Ok(())
+    }
+
+    async fn finish_turn_ledgers(&mut self) -> Result<()> {
+        self.persist_repair_ledger().await;
+        self.persist_keyword_ledger().await
     }
 
     /// Drain the dialect-repair ledger into session Custom entries
@@ -11515,10 +11572,15 @@ impl AgentSession {
             };
 
             self.agent.set_system_prompt(base_system_prompt);
-            self.persist_repair_ledger().await;
-            self.persist_keyword_ledger().await;
+            let ledger_result = self.finish_turn_ledgers().await;
             self.maybe_advise_turn().await;
-            result
+            match result {
+                Ok(message) => {
+                    ledger_result?;
+                    Ok(message)
+                }
+                Err(err) => Err(err),
+            }
         }
         .await;
         self.extensions_turn_active.store(false, Ordering::SeqCst);
@@ -11575,7 +11637,15 @@ impl AgentSession {
                 .await;
 
             self.agent.set_system_prompt(base_system_prompt);
-            result
+            let ledger_result = self.finish_turn_ledgers().await;
+            self.maybe_advise_turn().await;
+            match result {
+                Ok(message) => {
+                    ledger_result?;
+                    Ok(message)
+                }
+                Err(err) => Err(err),
+            }
         }
         .await;
         self.extensions_turn_active.store(false, Ordering::SeqCst);
@@ -14571,6 +14641,11 @@ mod tests {
             assert_eq!(
                 agent_session.agent.stream_options().thinking_level,
                 Some(crate::model::ThinkingLevel::Off)
+            );
+            assert_eq!(
+                agent_session.agent.keyword_max_thinking_level,
+                crate::model::ThinkingLevel::Off,
+                "ultrathink must use the target model's clamped maximum"
             );
 
             let cx = crate::agent_cx::AgentCx::for_request();

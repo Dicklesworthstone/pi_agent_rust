@@ -1312,6 +1312,9 @@ pub async fn run(
                                 .map(crate::extensions::ExtensionRegion::manager),
                         )?;
                         guard.agent.set_provider(provider_impl);
+                        guard.agent.set_keyword_max_thinking_level(
+                            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+                        );
                         guard.agent.stream_options_mut().api_key.clone_from(&key);
                         guard
                             .agent
@@ -3056,6 +3059,9 @@ async fn maybe_restore_primary(
                 .map(crate::extensions::ExtensionRegion::manager),
         )?;
         guard.agent.set_provider(provider_impl);
+        guard.agent.set_keyword_max_thinking_level(
+            entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+        );
         let key = resolve_model_key(options.cli_api_key.as_deref(), &options.auth, &entry);
         guard.agent.stream_options_mut().api_key.clone_from(&key);
         guard
@@ -3167,6 +3173,9 @@ async fn try_failover_to_next_chain_entry(
                     .map(crate::extensions::ExtensionRegion::manager),
             )?;
             guard.agent.set_provider(provider_impl);
+            guard.agent.set_keyword_max_thinking_level(
+                entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+            );
             guard.agent.stream_options_mut().api_key.clone_from(&key);
             guard
                 .agent
@@ -6195,6 +6204,9 @@ async fn cycle_model_for_rpc(
             .map(crate::extensions::ExtensionRegion::manager),
     )?;
     guard.agent.set_provider(provider_impl);
+    guard.agent.set_keyword_max_thinking_level(
+        next_entry.clamp_thinking_level(crate::model::ThinkingLevel::Max),
+    );
 
     guard.agent.stream_options_mut().api_key.clone_from(&key);
     guard
