@@ -10092,7 +10092,7 @@ export default function init(pi) {
     }
 
     #[test]
-    fn terminal_queue_preservation_restores_drained_input_after_cancelled_session_lock() {
+    fn terminal_queue_preservation_keeps_input_queued_during_cancelled_session_lock() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -10136,22 +10136,16 @@ export default function init(pi) {
                     .await
             });
 
-            let drain_deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let pending = shared_state
+            sleep(wall_now(), Duration::from_millis(20)).await;
+            assert_eq!(
+                shared_state
                     .lock(&setup_cx)
                     .await
-                    .expect("observe shared state")
-                    .pending_count();
-                if pending == 0 {
-                    break;
-                }
-                assert!(
-                    Instant::now() < drain_deadline,
-                    "preservation task did not drain the source queues"
-                );
-                sleep(wall_now(), Duration::from_millis(5)).await;
-            }
+                    .expect("observe shared state while session is contended")
+                    .pending_count(),
+                2,
+                "accepted inputs must remain authoritative while session locking awaits"
+            );
             cancel_cx.set_cancel_requested(true);
 
             let preserve_task = async { preserve_task.await };
