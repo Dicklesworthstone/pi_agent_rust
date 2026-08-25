@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Dry-run preflight for RCH artifact sync coverage.
 
-The RCH worker mirror is governed by .rchignore-style rules. This guard checks
-that artifact paths needed by remote cargo/test/report gates are not excluded by
-those rules before an expensive remote run starts.
+The RCH worker mirror is governed by project transfer config, mandatory runtime
+excludes, and project-local ``.rchignore`` rules. This guard checks that artifact
+paths needed by remote cargo/test/report gates are not excluded by that effective
+policy before an expensive remote run starts.
 """
 
 from __future__ import annotations
@@ -23,6 +24,28 @@ SCHEMA = "pi.rch.artifact_sync_preflight.v1"
 POSTCONDITION_ACTION = (
     "Rerun the gate locally or fix RCH artifact retrieval/writeback so the "
     "checked-in evidence artifact updates after the remote command."
+)
+
+# Keep these aligned with RCH 1.0.58's transfer::CONFIG_EXCLUDE_REWRITES,
+# REMOTE_RUNTIME_EXCLUDE_PATTERNS, and SOURCE_EPHEMERAL_EXCLUDE_PATTERNS. The
+# project config replaces lower config arrays, but these runtime protections are
+# appended unconditionally by RCH.
+CONFIG_EXCLUDE_REWRITES = {
+    "core.*": "core.[0-9]*",
+    ".core.*": ".core.[0-9]*",
+    ".git/objects/": ".git/",
+}
+MANDATORY_RCH_EXCLUDES = (
+    ".rch-target/",
+    ".rch-target-*/",
+    ".rch-tmp/",
+    ".rch-go/",
+    ".franken_whisper/tools/ffmpeg/",
+    ".venv/",
+    ".venv-*/",
+    "venv/",
+    "venv-*/",
+    "__pycache__/",
 )
 
 DEFAULT_REQUIRED_PATHS = (
@@ -48,6 +71,10 @@ def normalize_posix_path(path: str) -> str:
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized.strip("/")
+
+
+def normalize_config_exclude_pattern(pattern: str) -> str:
+    return CONFIG_EXCLUDE_REWRITES.get(pattern, pattern)
 
 
 def load_ignore_rules(ignore_file: Path) -> tuple[list[IgnoreRule], list[str]]:
@@ -113,8 +140,8 @@ def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
                 f"entry at index {index}: {config_file}"
             )
             continue
-        pattern = raw_pattern.strip().replace("\\", "/")
-        if not pattern:
+        raw_pattern_text = raw_pattern.strip().replace("\\", "/")
+        if not raw_pattern_text:
             errors.append(
                 "RCH config transfer.exclude_patterns contains an empty "
                 f"entry at index {index}: {config_file}"
@@ -124,10 +151,11 @@ def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
             (
                 line_index
                 for line_index, line in enumerate(lines, start=1)
-                if pattern in line
+                if raw_pattern_text in line
             ),
             None,
         )
+        pattern = normalize_config_exclude_pattern(raw_pattern_text)
         rules.append(
             IgnoreRule(
                 source=".rch/config.toml",
@@ -138,6 +166,19 @@ def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
             )
         )
     return rules, errors
+
+
+def mandatory_rch_rules() -> list[IgnoreRule]:
+    return [
+        IgnoreRule(
+            source="RCH mandatory exclusions",
+            line=None,
+            pattern=pattern,
+            anchored=False,
+            negated=False,
+        )
+        for pattern in MANDATORY_RCH_EXCLUDES
+    ]
 
 
 def core_rule_matches(pattern: str, rel_path: str) -> bool:
@@ -298,8 +339,42 @@ def build_postcondition_baseline(repo_root: Path, generated_artifacts: list[str]
     }
 
 
-def load_json_file(path: Path) -> dict[str, Any]:
+def load_json_file(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def build_before_manifest_error_report(
+    repo_root: Path,
+    generated_artifacts: list[str],
+    before_manifest: Path,
+    reason: str,
+    message: str,
+) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "mode": "postcondition",
+        "status": "fail",
+        "repo_root": str(repo_root),
+        "before_manifest": str(before_manifest),
+        "postconditions": [],
+        "violations": [
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": reason,
+                "message": message,
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        ],
+        "summary": {
+            "generated_artifact_count": len(generated_artifacts),
+            "updated_count": 0,
+            "unchanged_count": len(generated_artifacts),
+            "violation_count": 1,
+        },
+    }
 
 
 def before_snapshots_by_path(
@@ -369,7 +444,24 @@ def build_missing_before_manifest_report(repo_root: Path, generated_artifacts: l
 def build_postcondition_report(
     repo_root: Path, generated_artifacts: list[str], before_manifest: Path
 ) -> dict[str, Any]:
-    before_manifest_payload = load_json_file(before_manifest)
+    try:
+        before_manifest_payload = load_json_file(before_manifest)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return build_before_manifest_error_report(
+            repo_root,
+            generated_artifacts,
+            before_manifest,
+            "before_manifest_read_error",
+            f"failed to read before manifest {before_manifest}: {exc}",
+        )
+    if not isinstance(before_manifest_payload, dict):
+        return build_before_manifest_error_report(
+            repo_root,
+            generated_artifacts,
+            before_manifest,
+            "before_manifest_not_object",
+            f"before manifest must contain a JSON object: {before_manifest}",
+        )
     manifest_violations: list[dict[str, Any]] = []
     expected_repo_root = str(repo_root.resolve())
     manifest_repo_root = before_manifest_payload.get("repo_root")
@@ -706,7 +798,7 @@ def build_report(
 ) -> dict[str, Any]:
     config_rules, config_errors = load_config_rules(config_file)
     ignore_rules, ignore_errors = load_ignore_rules(ignore_file)
-    rules = config_rules + ignore_rules
+    rules = config_rules + mandatory_rch_rules() + ignore_rules
     required_results, violations = evaluate_required_paths(repo_root, rules, required_paths)
 
     for error in config_errors:

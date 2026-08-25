@@ -257,6 +257,101 @@ fn project_rch_config_exclude_blocks_required_artifact() -> Result<(), Box<dyn E
     Ok(())
 }
 
+#[test]
+fn project_rch_config_uses_installed_rch_exclude_normalization() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = ".git/refs/heads/main";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("normalized config artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "0123456789abcdef\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\".git/objects/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "RCH rewrites .git/objects/ to .git/, so sibling Git paths must be excluded\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let normalized = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok(".rch/config.toml"),
+                Ok(".git/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !normalized {
+        return Err(test_error(format!(
+            "config diagnostics must report RCH's normalized .git/ exclusion\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn mandatory_rch_runtime_exclude_blocks_required_artifact() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = ".rch-tmp/current-evidence.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("mandatory-exclude artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+
+    let output = run_preflight(repo, required_path)?;
+    if output.status.success() {
+        return Err(test_error(format!(
+            "RCH's mandatory runtime exclusions must be part of preflight\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    let mandatory = array_field(&report, "violations")?.iter().any(|violation| {
+        matches!(
+            (
+                string_field(violation, "source"),
+                string_field(violation, "pattern"),
+                string_field(violation, "reason"),
+            ),
+            (
+                Ok("RCH mandatory exclusions"),
+                Ok(".rch-tmp/"),
+                Ok("required_path_excluded"),
+            )
+        )
+    });
+    if !mandatory {
+        return Err(test_error(format!(
+            "mandatory exclusion failure must identify RCH's .rch-tmp/ rule\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn required_artifact_symlink_fails_preflight() -> Result<(), Box<dyn Error>> {
@@ -574,6 +669,36 @@ fn postcondition_rejects_before_manifest_from_another_repo() -> Result<(), Box<d
     if !wrong_root {
         return Err(test_error(format!(
             "foreign before manifest must report repo-root mismatch\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_reports_malformed_before_manifest_as_json() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"new\"}\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    fs::write(&before_manifest, "{not-json\n")?;
+
+    let output = run_postcondition(repo, GENERATED_ARTIFACT, &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "a malformed before manifest must fail the postcondition",
+        ));
+    }
+    let report = parse_json(&output)?;
+    require_string_field(&report, "status", "fail")?;
+    let read_error = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_read_error")
+    });
+    if !read_error {
+        return Err(test_error(format!(
+            "malformed baseline must produce a structured read diagnostic\n{}",
             output_debug(&output)
         )));
     }
