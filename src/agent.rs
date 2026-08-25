@@ -14745,10 +14745,11 @@ mod tests {
     }
 
     #[test]
-    fn bare_provider_replacement_resets_keyword_cap_fail_closed() {
+    fn bare_provider_replacement_resets_catalog_controls_fail_closed() {
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let mut agent = Agent::new(Arc::new(SilentProvider), tools, AgentConfig::default());
         agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+        agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
 
         agent.set_provider(Arc::new(SilentProvider));
 
@@ -14756,6 +14757,11 @@ mod tests {
             agent.keyword_max_thinking_level,
             crate::model::ThinkingLevel::Off,
             "provider replacement without registry metadata must not inherit the prior cap"
+        );
+        assert_eq!(
+            agent.tool_call_dialect,
+            crate::dialects::Dialect::Native,
+            "provider replacement without registry metadata must not inherit repair opt-in"
         );
     }
 
