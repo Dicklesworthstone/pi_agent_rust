@@ -222,8 +222,10 @@ fn ultrathink_uses_model_clamped_max() {
     );
     agent_session.set_model_registry(registry);
 
-    block_on_local(agent_session.run_text("please ultrathink this design".to_string(), |_| {}))
-        .expect("run");
+    let response =
+        block_on_local(agent_session.run_text("please ultrathink this design".to_string(), |_| {}))
+            .expect("run");
+    assert_eq!(response.stop_reason, StopReason::Stop);
     let capture = capture.lock().expect("capture").clone();
     harness.log().info(
         "verify",
