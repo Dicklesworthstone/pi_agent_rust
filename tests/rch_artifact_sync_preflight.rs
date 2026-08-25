@@ -246,8 +246,8 @@ fn anchored_root_artifacts_ignore_keeps_nested_required_artifacts() -> Result<()
 }
 
 #[test]
-fn leading_bang_is_literal_and_does_not_reinclude_required_artifact()
--> Result<(), Box<dyn Error>> {
+fn leading_bang_is_literal_and_does_not_reinclude_required_artifact() -> Result<(), Box<dyn Error>>
+{
     let temp = tempfile::tempdir()?;
     let repo = temp.path();
     write_required_artifact(repo)?;
@@ -267,8 +267,7 @@ fn leading_bang_is_literal_and_does_not_reinclude_required_artifact()
     let report = parse_json(&output)?;
     let violations = array_field(&report, "violations")?;
     let excluded = violations.iter().any(|violation| {
-        string_field(violation, "reason")
-            .is_ok_and(|reason| reason == "required_path_excluded")
+        string_field(violation, "reason").is_ok_and(|reason| reason == "required_path_excluded")
     });
     if !excluded {
         return Err(test_error(format!(
@@ -413,7 +412,8 @@ fn postcondition_passes_when_local_generated_artifact_changes() -> Result<(), Bo
 }
 
 #[test]
-fn postcondition_rejects_metadata_only_changes_with_identical_bytes() -> Result<(), Box<dyn Error>> {
+fn postcondition_rejects_metadata_only_changes_with_identical_bytes() -> Result<(), Box<dyn Error>>
+{
     let temp = tempfile::tempdir()?;
     let repo = temp.path();
     fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
@@ -464,8 +464,7 @@ fn postcondition_rejects_before_manifest_from_another_repo() -> Result<(), Box<d
     write_generated_artifact(&repo, "{\"generated_at\":\"old\"}\n")?;
 
     let before_manifest = repo.join("before-rch-artifacts.json");
-    let baseline_output =
-        run_postcondition_baseline(&repo, GENERATED_ARTIFACT, &before_manifest)?;
+    let baseline_output = run_postcondition_baseline(&repo, GENERATED_ARTIFACT, &before_manifest)?;
     if !baseline_output.status.success() {
         return Err(test_error(format!(
             "foreign-root negative baseline capture should pass\n{}",
@@ -511,8 +510,7 @@ fn postcondition_preserves_absolute_artifact_paths_outside_repo() -> Result<(), 
         .to_str()
         .ok_or_else(|| test_error("absolute generated artifact path must be UTF-8"))?;
     let before_manifest = repo.join("before-rch-artifacts.json");
-    let baseline_output =
-        run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
+    let baseline_output = run_postcondition_baseline(&repo, generated_path, &before_manifest)?;
     if !baseline_output.status.success() {
         return Err(test_error(format!(
             "absolute-path baseline capture should pass\n{}",

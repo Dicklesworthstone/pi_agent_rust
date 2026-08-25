@@ -638,6 +638,14 @@ fn rpc_prompt_observes_clamped_thinking_directive_and_telemetry() {
         assert!(saw_agent_end, "RPC prompt never reached agent_end");
         drop(in_tx);
         server.await.expect("RPC server task join");
+        };
+        asupersync::time::timeout(
+            asupersync::time::wall_now(),
+            Duration::from_secs(15),
+            scenario,
+        )
+        .await
+        .expect("RPC scenario exceeded 15 seconds");
     });
 
     let captured = capture.lock().expect("capture").clone();

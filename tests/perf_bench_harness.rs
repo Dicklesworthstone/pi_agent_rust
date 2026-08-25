@@ -35,10 +35,10 @@ use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::perf_build;
 use pi::tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use sysinfo::System;
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ fn cargo_target_dir() -> PathBuf {
         )
 }
 
-fn resolve_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf, String> {
+fn prepare_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf, String> {
     if subdir.as_os_str().is_empty()
         || subdir.is_absolute()
         || !subdir
@@ -74,12 +74,85 @@ fn resolve_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf
             subdir.display()
         ));
     }
-    Ok(target_dir.join(subdir))
+
+    fs::create_dir_all(target_dir).map_err(|error| {
+        format!(
+            "create CARGO_TARGET_DIR {}: {error}",
+            target_dir.display()
+        )
+    })?;
+    let canonical_target = fs::canonicalize(target_dir).map_err(|error| {
+        format!(
+            "canonicalize CARGO_TARGET_DIR {}: {error}",
+            target_dir.display()
+        )
+    })?;
+    let output_dir = target_dir.join(subdir);
+
+    let mut candidate = target_dir.to_path_buf();
+    for component in subdir.components() {
+        let Component::Normal(part) = component else {
+            return Err(format!(
+                "BENCH_OUTPUT_TARGET_SUBDIR contains an invalid component: {}",
+                subdir.display()
+            ));
+        };
+        candidate.push(part);
+        let metadata = match fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&candidate).map_err(|create_error| {
+                    format!(
+                        "create BENCH_OUTPUT_TARGET_SUBDIR component {}: {create_error}",
+                        candidate.display()
+                    )
+                })?;
+                fs::symlink_metadata(&candidate).map_err(|inspect_error| {
+                    format!(
+                        "inspect created BENCH_OUTPUT_TARGET_SUBDIR component {}: {inspect_error}",
+                        candidate.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect BENCH_OUTPUT_TARGET_SUBDIR component {}: {error}",
+                    candidate.display()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "BENCH_OUTPUT_TARGET_SUBDIR must not traverse a symlink: {}",
+                candidate.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "BENCH_OUTPUT_TARGET_SUBDIR component is not a directory: {}",
+                candidate.display()
+            ));
+        }
+    }
+
+    let canonical_output = fs::canonicalize(&output_dir).map_err(|error| {
+        format!(
+            "canonicalize BENCH_OUTPUT_TARGET_SUBDIR {}: {error}",
+            output_dir.display()
+        )
+    })?;
+    if !canonical_output.starts_with(&canonical_target) {
+        return Err(format!(
+            "BENCH_OUTPUT_TARGET_SUBDIR escapes CARGO_TARGET_DIR: {}",
+            canonical_output.display()
+        ));
+    }
+    Ok(canonical_output)
 }
 
 fn output_dir() -> PathBuf {
     if let Some(subdir) = std::env::var_os("BENCH_OUTPUT_TARGET_SUBDIR") {
-        return resolve_target_output_dir(&cargo_target_dir(), Path::new(&subdir))
+        return prepare_target_output_dir(&cargo_target_dir(), Path::new(&subdir))
             .unwrap_or_else(|message| panic!("{message}"));
     }
 
@@ -90,17 +163,41 @@ fn output_dir() -> PathBuf {
 
 #[test]
 fn target_output_subdir_is_confined_to_cargo_target_dir() {
-    let target_dir = Path::new("target-root");
+    let temp = tempfile::tempdir().expect("create target confinement tempdir");
+    let target_dir = temp.path().join("target-root");
     assert_eq!(
-        resolve_target_output_dir(target_dir, Path::new("nextest/pi-perf/run-1")),
-        Ok(PathBuf::from("target-root/nextest/pi-perf/run-1"))
+        prepare_target_output_dir(&target_dir, Path::new("nextest/pi-perf/run-1")),
+        Ok(fs::canonicalize(target_dir.join("nextest/pi-perf/run-1"))
+            .expect("canonical prepared output directory"))
     );
     for unsafe_path in ["", ".", "../outside", "nextest/../../outside", "/absolute"] {
         assert!(
-            resolve_target_output_dir(target_dir, Path::new(unsafe_path)).is_err(),
+            prepare_target_output_dir(&target_dir, Path::new(unsafe_path)).is_err(),
             "unsafe target-relative output path should be rejected: {unsafe_path}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn target_output_subdir_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("create symlink confinement tempdir");
+    let target_dir = temp.path().join("target");
+    let outside_dir = temp.path().join("outside");
+    fs::create_dir_all(&target_dir).expect("create target root");
+    fs::create_dir_all(&outside_dir).expect("create outside directory");
+    symlink(&outside_dir, target_dir.join("nextest")).expect("create escape symlink");
+
+    let result = prepare_target_output_dir(
+        &target_dir,
+        Path::new("nextest/pi-perf/escaped-run"),
+    );
+    assert!(
+        result.is_err(),
+        "symlinked target subdirectory must not redirect benchmark output: {result:?}"
+    );
 }
 
 fn artifacts_dir() -> PathBuf {
