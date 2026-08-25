@@ -1185,6 +1185,14 @@ fn bench_jsonl_schema_validation_is_non_vacuous() {
     let valid_jsonl = format!("{}\n", emit_jsonl_line(&record));
     assert_eq!(validate_bench_jsonl(&valid_jsonl), Ok(1));
 
+    let mut unbound_provenance = record.clone();
+    unbound_provenance.env.binary_path.push_str("-tampered");
+    let unbound_jsonl = format!("{}\n", emit_jsonl_line(&unbound_provenance));
+    assert!(
+        validate_bench_jsonl(&unbound_jsonl).is_err(),
+        "mutating a provenance field without its config hash must fail validation"
+    );
+
     for empty in ["", "\n", " \n\t\n"] {
         assert!(
             validate_bench_jsonl(empty).is_err(),

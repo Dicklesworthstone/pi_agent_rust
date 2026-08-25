@@ -100,10 +100,13 @@ async fn recv_rpc_command_response(
         let value = serde_json::from_str::<serde_json::Value>(line.trim()).map_err(|err| {
             format!("{label}: invalid RPC JSON while waiting for response id {expected_id}: {err}")
         })?;
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("response")
-            && value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id)
-        {
-            return Ok(value);
+        if value.get("type").and_then(serde_json::Value::as_str) == Some("response") {
+            if value.get("id").and_then(serde_json::Value::as_str) == Some(expected_id) {
+                return Ok(value);
+            }
+            return Err(format!(
+                "{label}: unexpected RPC response while waiting for id {expected_id}: {value}"
+            ));
         }
         observed_events.push(value);
     }
@@ -843,6 +846,10 @@ fn rpc_queued_steering_and_follow_up_keyword_provenance() {
                 .collect::<Vec<_>>();
             assert_eq!(agent_end_events.len(), 1, "unexpected lifecycle events");
             assert!(agent_end_events[0]["error"].is_null());
+            assert!(
+                observed_events.iter().all(|event| event["type"] != "response"),
+                "unexpected or duplicate RPC response escaped exact-id validation"
+            );
         };
         asupersync::time::timeout(
             asupersync::time::wall_now(),

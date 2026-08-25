@@ -3041,9 +3041,11 @@ async fn restore_terminal_rpc_input(
     shared_state: &Arc<Mutex<RpcSharedState>>,
     mut steering: VecDeque<QueuedAgentMessage>,
     mut follow_up: VecDeque<QueuedAgentMessage>,
-    cx: &AgentCx,
 ) -> Result<()> {
-    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+    // Rollback must not inherit the cancellation/deadline that made the
+    // session lock fail, or the accepted messages would still be lost.
+    let recovery_cx = AgentCx::for_request();
+    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), &recovery_cx)
         .await
         .map_err(|err| Error::session(format!("state restore lock failed: {err}")))?;
     steering.append(&mut state.steering);
@@ -3076,7 +3078,7 @@ async fn preserve_terminal_rpc_input(
         Ok(guard) => guard,
         Err(err) => {
             let lock_error = format!("session lock failed: {err}");
-            restore_terminal_rpc_input(shared_state, steering, follow_up, cx)
+            restore_terminal_rpc_input(shared_state, steering, follow_up)
                 .await
                 .map_err(|restore_err| Error::session(format!("{lock_error}; {restore_err}")))?;
             return Err(Error::session(lock_error));
@@ -3089,9 +3091,11 @@ async fn preserve_terminal_rpc_input(
             Err(err) => {
                 let lock_error = format!("inner session lock failed: {err}");
                 drop(guard);
-                restore_terminal_rpc_input(shared_state, steering, follow_up, cx)
+                restore_terminal_rpc_input(shared_state, steering, follow_up)
                     .await
-                    .map_err(|restore_err| Error::session(format!("{lock_error}; {restore_err}")))?;
+                    .map_err(|restore_err| {
+                        Error::session(format!("{lock_error}; {restore_err}"))
+                    })?;
                 return Err(Error::session(lock_error));
             }
         };
@@ -3199,11 +3203,12 @@ async fn run_prompt_with_retry(
                             true,
                             Some(abort_signal),
                             move || {
-                                let source_ready = expected_fetch.as_ref().is_none_or(
-                                    |(generation, expected)| {
-                                        generation.load(Ordering::SeqCst) == *expected
-                                    },
-                                );
+                                let source_ready =
+                                    expected_fetch
+                                        .as_ref()
+                                        .is_none_or(|(generation, expected)| {
+                                            generation.load(Ordering::SeqCst) == *expected
+                                        });
                                 if !source_ready {
                                     return false;
                                 }
@@ -9658,8 +9663,7 @@ export default function init(pi) {
                 false,
                 crate::compaction::ResolvedCompactionSettings::default(),
             );
-            let options =
-                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let options = build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
 
             let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
             let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
@@ -9712,7 +9716,10 @@ export default function init(pi) {
                     .is_some_and(|error| error.contains("invalid API key from gated provider")),
                 "terminal error must remain observable: {terminal_event}"
             );
-            server.await.expect("RPC server join").expect("RPC server run");
+            server
+                .await
+                .expect("RPC server join")
+                .expect("RPC server run");
             assert_eq!(calls.load(Ordering::SeqCst), 1);
 
             let session_cx = AgentCx::for_request();
@@ -9842,6 +9849,100 @@ export default function init(pi) {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(user_text, vec!["accepted steering", "accepted follow-up"]);
+        });
+    }
+
+    #[test]
+    fn terminal_queue_preservation_restores_drained_input_after_cancelled_session_lock() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let setup_cx = AgentCx::for_request();
+            {
+                let mut state = shared_state
+                    .lock(&setup_cx)
+                    .await
+                    .expect("shared state lock");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("restore steering", &[]),
+                    ))
+                    .expect("queue steering");
+                state
+                    .push_follow_up(QueuedAgentMessage::from_authored_message(
+                        build_user_message("restore follow-up", &[]),
+                    ))
+                    .expect("queue follow-up");
+            }
+
+            let held_session = session
+                .lock(&setup_cx)
+                .await
+                .expect("hold outer session lock");
+            let operation_cx = AgentCx::for_testing();
+            let cancel_cx = operation_cx.clone();
+            let session_for_task = Arc::clone(&session);
+            let shared_for_task = Arc::clone(&shared_state);
+            let preserve_task = runtime_handle.spawn(async move {
+                preserve_terminal_rpc_input(&session_for_task, &shared_for_task, &operation_cx)
+                    .await
+            });
+
+            let drain_deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let pending = shared_state
+                    .lock(&setup_cx)
+                    .await
+                    .expect("observe shared state")
+                    .pending_count();
+                if pending == 0 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < drain_deadline,
+                    "preservation task did not drain the source queues"
+                );
+                sleep(wall_now(), Duration::from_millis(5)).await;
+            }
+            cancel_cx.set_cancel_requested(true);
+
+            let result = preserve_task.await.expect("preservation task join");
+            assert!(
+                result
+                    .expect_err("cancelled outer session lock must fail")
+                    .to_string()
+                    .contains("session lock failed")
+            );
+            drop(held_session);
+
+            let state = shared_state
+                .lock(&setup_cx)
+                .await
+                .expect("restored shared state");
+            assert_eq!(state.pending_count(), 2);
+            assert!(matches!(
+                state.steering.front().map(QueuedAgentMessage::message),
+                Some(Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                })) if text == "restore steering"
+            ));
+            assert!(matches!(
+                state.follow_up.front().map(QueuedAgentMessage::message),
+                Some(Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                })) if text == "restore follow-up"
+            ));
         });
     }
 

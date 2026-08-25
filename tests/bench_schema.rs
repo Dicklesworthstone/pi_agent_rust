@@ -1320,19 +1320,18 @@ for name in (
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("correlation_id") != expected_correlation_id:
         raise SystemExit(f"{name}: correlation_id mismatch")
+marker = {
+    "schema": "pi.perf.fake_post_generation_invocation.v1",
+    "correlation_id": expected_correlation_id,
+    "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
+    "exact": True,
+}
 (evidence_dir / "perf_budgets_post_generation_invocation.json").write_text(
-    json.dumps(
-        {
-            "schema": "pi.perf.fake_post_generation_invocation.v1",
-            "correlation_id": expected_correlation_id,
-            "test_filter": "ci_enforced_budgets_fail_on_regression_or_missing_data",
-            "exact": True,
-        },
-        sort_keys=True,
-    )
+    json.dumps(marker, sort_keys=True)
     + "\n",
     encoding="utf-8",
 )
+print(json.dumps(marker, sort_keys=True))
 PY
     fi
     ;;
@@ -7990,6 +7989,151 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_default_rch_perf_harness_uses_clean_fail_closed_runner() {
+    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_OMIT_REQUIRE_RCH_CLI", "1"),
+        ("PI_FAKE_RCH_CHECK_OK", "1"),
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+    ]);
+    assert_orchestrate_success(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_env_only_remote_requirement_selects_clean_runner() {
+    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_OMIT_REQUIRE_RCH_CLI", "1"),
+        ("RCH_REQUIRE_REMOTE", "1"),
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+    ]);
+    assert_orchestrate_success(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_explicit_quick_suite_forwards_benchmark_controls() {
+    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+        ("PI_FAKE_REQUIRE_BENCH_CONTROLS", "1"),
+        ("BENCH_ITERATIONS", "1"),
+    ]);
+    assert_orchestrate_success(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_non_positive_build_jobs_before_remote_invocation() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PERF_BUILD_JOBS", "0"),
+    ]);
+    assert!(
+        !output.status.success(),
+        "zero build parallelism must fail before RCH invocation"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("PERF_BUILD_JOBS must be a positive integer"),
+        "invalid build-jobs failure must name the bad control: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "invalid build jobs must be rejected before benchmark invocation"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_rch_local_fallback_marker() {
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_RCH_LOCAL_FALLBACK", "1")]);
+    assert!(
+        !output.status.success(),
+        "local fallback must not satisfy remote benchmark acceptance"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("no remote-success marker")
+            || combined.contains("reported local execution"),
+        "local fallback rejection must name the missing remote proof: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "local fallback output must not enter the accepted result directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_stale_benchmark_invocation_id() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_STALE_RCH_EXTENSION_ARTIFACT",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "artifact from another benchmark invocation must fail freshness admission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("benchmark_run_id does not match current invocation"),
+        "stale invocation rejection must identify benchmark_run_id: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "stale invocation output must not enter the accepted result directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_unbound_benchmark_config_hash() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_INVALID_RCH_EXTENSION_CONFIG_HASH",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "self-asserted provenance with an invalid config hash must fail admission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("config_hash does not bind provenance fields"),
+        "invalid provenance hash rejection must name config_hash: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/perf_bench_harness/extension_bench.jsonl")
+            .exists(),
+        "unbound provenance output must not enter the accepted result directory"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_rch_perf_harness_fails_when_nextest_artifact_is_missing() {
     let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
         "PI_FAKE_DROP_RCH_EXTENSION_ARTIFACT",
@@ -8713,13 +8857,16 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
         }),
         "manifest must record a passing post-generation perf budget consumer"
     );
-    let post_generation_invocation: Value = serde_json::from_str(
-        &fs::read_to_string(
-            output_dir.join("results/perf_budgets_post_generation_invocation.json"),
-        )
-        .expect("read post-generation budget invocation marker"),
-    )
-    .expect("parse post-generation budget invocation marker");
+    let post_generation_stdout =
+        fs::read_to_string(output_dir.join("results/perf_budgets_post_generation/stdout.log"))
+            .expect("read post-generation budget stdout");
+    let post_generation_invocation: Value = post_generation_stdout
+        .lines()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| {
+            value["schema"].as_str() == Some("pi.perf.fake_post_generation_invocation.v1")
+        })
+        .expect("post-generation stdout must prove current-evidence consumption");
     assert_eq!(
         post_generation_invocation["correlation_id"].as_str(),
         Some(expected_correlation_id),
