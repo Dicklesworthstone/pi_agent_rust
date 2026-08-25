@@ -2214,6 +2214,7 @@ pub async fn append_entries(
 
             insert_entry_jsons(&conn, &reconciled.appended_json, existing_entry_count)?;
             write_session_meta(&conn, &reconciled.entries)?;
+            crate::session::persistence_test_failpoint("sqlite_after_mutation_before_commit")?;
 
             Ok((stored_header, reconciled.entries))
         })();

@@ -492,6 +492,9 @@ fuzzing = []
 # single integration test that executes it is gated at the test-function level
 # so the rest of that target remains in ordinary test runs.
 internal-legacy-capture = []
+# Enables deterministic persistence checkpoints used only by causal fault-injection
+# integration tests. Normal builds ignore the corresponding environment variable.
+internal-persistence-fault-injection = []
 # Internal-only MCP fixture server (bd-cv653.6.1): a tiny stdio JSON-RPC
 # binary used by the MCP client e2e lanes. Non-default so end-user installs
 # only get `pi`.

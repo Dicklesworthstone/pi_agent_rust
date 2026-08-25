@@ -415,6 +415,7 @@ SOURCE_DIRTY_FINAL="$(source_dirty_state)"
 SOURCE_TREE_DIGEST_FINAL="$(source_tree_digest)"
 python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" "$SOURCE_COMMIT" "$SOURCE_DIRTY" "$SOURCE_TREE_DIGEST" "$SOURCE_COMMIT_FINAL" "$SOURCE_DIRTY_FINAL" "$SOURCE_TREE_DIGEST_FINAL" <<'PY'
 import base64
+import binascii
 import hashlib
 import json
 import re
@@ -574,7 +575,7 @@ def inline_summary_bytes_are_valid(
         return False
     try:
         payload = base64.b64decode(encoded, validate=True)
-    except (ValueError, base64.binascii.Error):
+    except (ValueError, binascii.Error):
         return False
     digest = hashlib.sha256(payload).hexdigest()
     if digest != context.get("content_sha256") or digest != artifact_record.get("sha256"):

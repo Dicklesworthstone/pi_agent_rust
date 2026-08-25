@@ -1299,6 +1299,24 @@ fn validate_unterminated_jsonl_rewrite_scope(
     )))
 }
 
+#[cfg(feature = "internal-persistence-fault-injection")]
+pub(crate) fn persistence_test_failpoint(point: &str) -> Result<()> {
+    if std::env::var("PI_SESSION_PERSISTENCE_TEST_FAILPOINT")
+        .is_ok_and(|configured| configured == point)
+    {
+        return Err(Error::session(format!(
+            "injected persistence failpoint: {point}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "internal-persistence-fault-injection"))]
+#[inline]
+pub(crate) const fn persistence_test_failpoint(_point: &str) -> Result<()> {
+    Ok(())
+}
+
 /// Atomically publish a complete JSONL snapshot while the caller holds the
 /// session persistence lock.
 fn persist_jsonl_snapshot_locked(
@@ -1336,6 +1354,7 @@ fn persist_jsonl_snapshot_locked(
     temp_file
         .persist(path)
         .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+    persistence_test_failpoint("jsonl_after_rename_before_parent_sync")?;
     sync_parent_dir(path).map_err(|e| crate::Error::Io(Box::new(e)))
 }
 
