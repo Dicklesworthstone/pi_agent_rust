@@ -3504,7 +3504,14 @@ async fn run_prompt_with_retry(
             let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
             is_compacting.store(true, Ordering::SeqCst);
         }
-        if let Err(err) = preserve_terminal_rpc_input(&session, &shared_state, &cx).await {
+        // Terminal preservation is recovery work, so it must outlive a
+        // cancelled turn context. Reusing `cx` here makes every lock fail
+        // immediately after parent cancellation and can strand input that was
+        // already acknowledged to the RPC client.
+        let preservation_cx = AgentCx::for_request();
+        if let Err(err) =
+            preserve_terminal_rpc_input(&session, &shared_state, &preservation_cx).await
+        {
             let preservation_error = format!("failed to preserve queued RPC input: {err}");
             final_error = Some(final_error.map_or_else(
                 || preservation_error.clone(),
