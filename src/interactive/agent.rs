@@ -630,7 +630,7 @@ fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
 /// `src/interactive.rs` when `feature = "ftui"` is active (interactive_ftui
 /// calls `crate::interactive::tool_invocation_summary`; bd-cv653.9.2).
 #[allow(clippy::too_many_lines)]
-pub(super) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
