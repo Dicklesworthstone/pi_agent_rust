@@ -1284,9 +1284,31 @@ PY
       if [[ "${PI_FAKE_INVALID_RCH_EXTENSION_CONFIG_HASH:-0}" == "1" ]]; then
         config_hash="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
       fi
-      cat >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl" <<JSON
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"cold_start","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+      extension_artifact="$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench.jsonl"
+      : >"$extension_artifact"
+      if [[ "${BENCH_QUICK:-0}" == "1" ]]; then
+        extension_names=(hello pirate diff)
+      else
+        extension_names=(
+          hello pirate diff bookmark custom-header custom-footer
+          confirm-destructive dirty-repo-guard
+        )
+      fi
+      for extension_name in "${extension_names[@]}"; do
+        for scenario_name in cold_start warm_start; do
+          cat >>"$extension_artifact" <<JSON
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"$scenario_name","extension":"$extension_name","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
+        done
+      done
+      cat >>"$extension_artifact" <<JSON
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"tool_call","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+JSON
+      if [[ "${PI_FAKE_DROP_RCH_EXTENSION_COVERAGE:-0}" != "1" ]]; then
+        cat >>"$extension_artifact" <<JSON
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"event_hook","extension":"pirate","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+JSON
+      fi
       printf '%s\n' '# fake extension benchmark summary' \
         >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench_summary.md"
     fi

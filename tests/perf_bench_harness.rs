@@ -535,6 +535,42 @@ fn validate_bench_jsonl(content: &str, expected_extensions: &[String]) -> Result
                 line_index + 1
             ));
         }
+        let ordered_summary = [
+            record.summary.min_ms,
+            record.summary.p50_ms,
+            record.summary.p95_ms,
+            record.summary.p99_ms,
+            record.summary.p999_ms,
+            record.summary.max_ms,
+        ];
+        if ordered_summary
+            .iter()
+            .chain(std::iter::once(&record.summary.mean_ms))
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "line {}: benchmark timings must be finite and non-negative",
+                line_index + 1
+            ));
+        }
+        if !ordered_summary.windows(2).all(|window| window[0] <= window[1])
+            || record.summary.mean_ms < record.summary.min_ms
+            || record.summary.mean_ms > record.summary.max_ms
+        {
+            return Err(format!(
+                "line {}: benchmark summary timing order is invalid",
+                line_index + 1
+            ));
+        }
+        if [record.elapsed_ms, record.per_call_us, record.calls_per_sec]
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+        {
+            return Err(format!(
+                "line {}: benchmark aggregate metrics must be finite and non-negative",
+                line_index + 1
+            ));
+        }
         let coverage_key = (record.extension.clone(), record.scenario.clone());
         if !expected_coverage.contains(&coverage_key) {
             return Err(format!(
