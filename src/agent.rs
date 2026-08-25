@@ -2000,8 +2000,24 @@ impl Agent {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.run_loop_with_initial_follow_up(Vec::new(), true, Arc::new(on_event), abort)
+        self.run_continue_with_follow_up_on_ready_with_abort(abort, || {}, on_event)
             .await
+    }
+
+    pub(crate) async fn run_continue_with_follow_up_on_ready_with_abort(
+        &mut self,
+        abort: Option<AbortSignal>,
+        on_ready: impl FnOnce() + Send + 'static,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_loop_with_initial_follow_up(
+            Vec::new(),
+            true,
+            Some(Box::new(on_ready)),
+            Arc::new(on_event),
+            abort,
+        )
+        .await
     }
 
     /// Outbound secrets transform (bd-cv653.7.9): obfuscate credential
@@ -2208,7 +2224,7 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        self.run_loop_with_initial_follow_up(prompts, false, on_event, abort)
+        self.run_loop_with_initial_follow_up(prompts, false, None, on_event, abort)
             .await
     }
 
@@ -2216,6 +2232,7 @@ impl Agent {
         &mut self,
         prompts: Vec<Message>,
         initial_follow_up: bool,
+        initial_queue_ready: Option<Box<dyn FnOnce() + Send>>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2225,7 +2242,13 @@ impl Agent {
         let saved_thinking = self.config.stream_options.thinking_level;
         let saved_system_prompt = self.config.system_prompt.clone();
         let result = self
-            .run_loop_inner(prompts, initial_follow_up, on_event, abort)
+            .run_loop_inner(
+                prompts,
+                initial_follow_up,
+                initial_queue_ready,
+                on_event,
+                abort,
+            )
             .await;
         self.config.stream_options.thinking_level = saved_thinking;
         self.config.system_prompt = saved_system_prompt;
@@ -2322,6 +2345,7 @@ impl Agent {
         &mut self,
         prompts: Vec<Message>,
         initial_follow_up: bool,
+        initial_queue_ready: Option<Box<dyn FnOnce() + Send>>,
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
@@ -2378,12 +2402,21 @@ impl Agent {
             new_messages.push(prompt);
         }
 
-        // Delivery boundary: start of turn (steering messages queued while idle).
+        // Delivery boundary: ordinary continuation starts with steering; the
+        // RPC late-follow-up repair explicitly starts with follow-ups instead.
         let mut pending_messages = if initial_follow_up {
             self.drain_follow_up_messages().await
         } else {
             self.drain_steering_messages().await
         };
+        if initial_follow_up && pending_messages.is_empty() {
+            return Err(Error::session(
+                "accepted follow-up was unavailable at continuation boundary",
+            ));
+        }
+        if let Some(on_ready) = initial_queue_ready {
+            on_ready();
+        }
         let mut turn_recovery =
             crate::turn_recovery::TurnRecoveryState::new(self.config.turn_recovery);
 
@@ -12645,7 +12678,7 @@ impl AgentSession {
         &mut self,
         follow_up_first: bool,
         abort: Option<AbortSignal>,
-        on_ready: impl FnOnce() + Send,
+        on_ready: impl FnOnce() + Send + 'static,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         let on_event: AgentEventHandler = Arc::new(on_event);
@@ -12664,17 +12697,21 @@ impl AgentSession {
         };
         self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
-        on_ready();
 
         let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
         let on_event_for_run = Arc::clone(&on_event);
         let result = if follow_up_first {
             self.agent
-                .run_continue_with_follow_up_with_abort(abort, move |event| {
-                    on_event_for_run(event);
-                })
+                .run_continue_with_follow_up_on_ready_with_abort(
+                    abort,
+                    on_ready,
+                    move |event| {
+                        on_event_for_run(event);
+                    },
+                )
                 .await
         } else {
+            on_ready();
             self.agent
                 .run_continue_with_abort(abort, move |event| {
                     on_event_for_run(event);
@@ -14019,7 +14056,7 @@ mod tests {
     }
 
     #[test]
-    fn continuation_initial_pending_batch_precedes_first_provider_request() {
+    fn continuation_follow_up_first_precedes_provider_and_later_steering() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
