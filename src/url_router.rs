@@ -24,7 +24,7 @@
 //! the mount, so prefer the scheme tools for correctness-critical edits.
 //!
 
-use std::io::Write as _;
+use std::io::{Seek as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -703,7 +703,7 @@ pub fn parse_ssh_target(url: &str) -> Result<SshTarget> {
     }
     Ok(SshTarget {
         host: host.to_string(),
-        path: remote_path.to_string(),
+        path: remote_path,
     })
 }
 
@@ -713,7 +713,7 @@ fn ssh_config_literal_hosts(config_text: &str) -> Vec<String> {
     config_text
         .lines()
         .filter_map(|line| {
-            let mut tokens = line.trim().split_whitespace();
+            let mut tokens = line.split_whitespace();
             if !tokens.next()?.eq_ignore_ascii_case("host") {
                 return None;
             }
@@ -765,9 +765,11 @@ pub fn ssh_host_allowed(host: &str) -> bool {
     ssh_host_allowed_with(host, config.as_deref(), env.as_deref())
 }
 
-/// Shared ssh invocation flags: no interactive auth possible (BatchMode),
-/// bounded connect, and accept-new-then-strict host keys — a *changed* key
-/// still hard-fails and is classified by [`classify_ssh_failure`].
+/// Shared ssh invocation flags.
+///
+/// Disallows interactive auth (BatchMode), bounds connect, and enforces
+/// accept-new-then-strict host keys — a *changed* key still hard-fails and is
+/// classified by [`classify_ssh_failure`].
 ///
 /// `PI_SSH_CLIENT_CONFIG_FILE` (optional) appends `-F <path>` so fixture
 /// and live lanes can pin port/user/identity/known_hosts without touching

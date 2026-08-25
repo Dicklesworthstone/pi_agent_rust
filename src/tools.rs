@@ -5445,27 +5445,25 @@ impl ToolRegistry {
         }
 
         // Computer tool (bd-cv653.2.5): opt-in via config.computer
-        if let Some(comp_cfg) = config.and_then(|c| c.computer.as_ref()) {
-            if comp_cfg.enable_computer.unwrap_or(false)
-                && !tools.iter().any(|t| t.name() == "computer")
-            {
-                let require_approval = comp_cfg.require_approval.unwrap_or(true);
-                tools.push(Box::new(
-                    crate::computer::ComputerTool::new(cwd).with_require_approval(require_approval),
-                ));
-            }
+        if let Some(comp_cfg) = config.and_then(|c| c.computer.as_ref())
+            && comp_cfg.enable_computer.unwrap_or(false)
+            && !tools.iter().any(|t| t.name() == "computer")
+        {
+            let require_approval = comp_cfg.require_approval.unwrap_or(true);
+            tools.push(Box::new(
+                crate::computer::ComputerTool::new(cwd).with_require_approval(require_approval),
+            ));
         }
 
         // Browser tool (bd-cv653.2.4): opt-in via config.browser
-        if let Some(browser_cfg) = config.and_then(|c| c.browser.as_ref()) {
-            if browser_cfg.enable_browser.unwrap_or(false)
-                && !tools.iter().any(|t| t.name() == "browser")
-            {
-                tools.push(Box::new(
-                    crate::browser::BrowserTool::new(cwd)
-                        .with_domain_allowlist(browser_cfg.domain_allowlist.clone()),
-                ));
-            }
+        if let Some(browser_cfg) = config.and_then(|c| c.browser.as_ref())
+            && browser_cfg.enable_browser.unwrap_or(false)
+            && !tools.iter().any(|t| t.name() == "browser")
+        {
+            tools.push(Box::new(
+                crate::browser::BrowserTool::new(cwd)
+                    .with_domain_allowlist(browser_cfg.domain_allowlist.clone()),
+            ));
         }
 
         // manage_skill (bd-cv653.4.2): CRUD over the isolated managed-skills
@@ -9079,6 +9077,7 @@ struct TextReplacementOutcome {
 /// with `new_text`, preserving BOM, line endings, and unmatched bytes
 /// verbatim. Local edits feed the result through atomic-replace with a CAS
 /// expectation; remote edits stage the result atomically over ssh.
+#[allow(clippy::too_many_lines)]
 fn apply_unique_text_replacement(
     raw: &[u8],
     old_text: &str,
@@ -9159,8 +9158,7 @@ fn apply_unique_text_replacement(
         return Err(Error::tool(
             tool,
             format!(
-                "Could not find the exact text in {}. The old text must match exactly including all whitespace and newlines.",
-                display_path
+                "Could not find the exact text in {display_path}. The old text must match exactly including all whitespace and newlines."
             ),
         ));
     };
@@ -9177,8 +9175,7 @@ fn apply_unique_text_replacement(
         return Err(Error::tool(
             tool,
             format!(
-                "Found {occurrences} occurrences of the text in {}. The text must be unique. Please provide more context to make it unique.",
-                display_path
+                "Found {occurrences} occurrences of the text in {display_path}. The text must be unique. Please provide more context to make it unique."
             ),
         ));
     }
@@ -9201,8 +9198,7 @@ fn apply_unique_text_replacement(
         return Err(Error::tool(
             tool,
             format!(
-                "No changes made to {}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.",
-                display_path
+                "No changes made to {display_path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
             ),
         ));
     }
@@ -9236,6 +9232,7 @@ struct HashlineApplyOutcome {
 /// (bd-cv653.6.5): validates every LINE#HASH anchor against the current
 /// lines, dedupes, resolves ranges, rejects overlaps, splices bottom-up,
 /// then restores line endings and BOM.
+#[allow(clippy::too_many_lines)]
 fn apply_hashline_edits_to_content(
     raw_content: &str,
     edits: &[HashlineOp],
@@ -9439,8 +9436,7 @@ fn apply_hashline_edits_to_content(
         return Err(Error::tool(
             "hashline_edit",
             format!(
-                "No changes made to {}. All edits were no-ops (replacement identical to existing content).",
-                display_path
+                "No changes made to {display_path}. All edits were no-ops (replacement identical to existing content)."
             ),
         ));
     }

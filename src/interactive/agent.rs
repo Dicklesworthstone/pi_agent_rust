@@ -597,11 +597,11 @@ fn tool_invocation_renderer(tool_name: &str) -> Option<ToolInvocationRenderer> {
 /// derived through the per-tool renderer registry (the bash command line,
 /// file path, operation and target, first question, ...). A registered
 /// renderer may still return `None` for malformed/incomplete arguments.
-/// LOAD-BEARING VISIBILITY: `pub(crate)` is required by the ftui card
-/// framework (interactive_ftui re-exports and calls this from
-/// crate::interactive; bd-cv653.9.2). Sweeps that demote this to
-/// pub(super) break the ftui build — restore pub(crate).
-pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
+/// LOAD-BEARING VISIBILITY: `pub(super)` is re-exported as `pub(crate)` by
+/// `src/interactive.rs` when `feature = "ftui"` is active (interactive_ftui
+/// calls `crate::interactive::tool_invocation_summary`; bd-cv653.9.2).
+#[allow(clippy::too_many_lines)]
+pub(super) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value) -> Option<String> {
     fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
         args.get(key).and_then(serde_json::Value::as_str)
     }
@@ -676,10 +676,10 @@ pub(crate) fn tool_invocation_summary(tool_name: &str, args: &serde_json::Value)
         },
         ToolInvocationRenderer::Search { pattern, scope } => {
             let pattern = nonblank_str_arg(args, pattern)?.trim();
-            match nonblank_str_arg(args, scope) {
-                Some(scope) => clip(&format!("{pattern} in {}", scope.trim()), MAX),
-                _ => clip(pattern, MAX),
-            }
+            nonblank_str_arg(args, scope).map_or_else(
+                || clip(pattern, MAX),
+                |scope| clip(&format!("{pattern} in {}", scope.trim()), MAX),
+            )
         }
         ToolInvocationRenderer::Action {
             action,

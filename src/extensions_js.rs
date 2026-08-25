@@ -5089,6 +5089,7 @@ fn path_is_in_allowed_extension_root(
 /// Every record carries runtime identity, active extension id, requested vs
 /// normalized path, workspace root, and the full registered-root lists so
 /// full-suite interference can be reconstructed from tracing captures alone.
+#[allow(clippy::too_many_arguments)]
 fn log_host_fs_decision(
     op: &'static str,
     allowed: bool,
@@ -30129,6 +30130,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn host_fs_decision_helper_emits_structured_event() {
         // bd-xhl7u: every host-filesystem allow/deny must carry runtime
         // identity, active extension, and normalized path so full-suite
