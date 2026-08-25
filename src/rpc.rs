@@ -4580,11 +4580,6 @@ mod retry_tests {
 
             let mut shared = RpcSharedState::new(&config);
             shared.auto_compaction_enabled = false;
-            shared
-                .push_follow_up(QueuedAgentMessage::from_authored_message(
-                    build_user_message("accepted follow-up during failed turn", &[]),
-                ))
-                .expect("queue terminal follow-up");
             let shared_state = Arc::new(Mutex::new(shared));
 
             let is_streaming = Arc::new(AtomicBool::new(false));
@@ -4698,6 +4693,11 @@ mod retry_tests {
 
             let mut shared = RpcSharedState::new(&config);
             shared.auto_compaction_enabled = false;
+            shared
+                .push_follow_up(QueuedAgentMessage::from_authored_message(
+                    build_user_message("accepted follow-up during failed turn", &[]),
+                ))
+                .expect("queue terminal follow-up");
             let shared_state = Arc::new(Mutex::new(shared));
 
             let is_streaming = Arc::new(AtomicBool::new(false));
@@ -4730,8 +4730,8 @@ mod retry_tests {
             });
 
             run_prompt_with_retry(
-                session,
-                shared_state,
+                Arc::clone(&session),
+                Arc::clone(&shared_state),
                 is_streaming,
                 is_compacting,
                 Arc::new(std::sync::Mutex::new(())),

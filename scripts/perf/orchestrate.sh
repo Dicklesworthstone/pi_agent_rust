@@ -28,6 +28,7 @@
 #   PERF_OUTPUT_DIR           Override output directory (default: target/perf/runs/<timestamp>)
 #   PERF_PROFILE              Build profile: release, perf, debug (default: perf)
 #   PERF_PARALLELISM          Test parallelism (default: 1 for determinism)
+#   PERF_BUILD_JOBS           Cargo/Nextest build parallelism (default: 8)
 #   PERF_PGO_MODE             PGO mode: off, train, use, compare (default: off)
 #   PERF_PGO_PROFILE_DATA     Explicit .profdata path for profile-use mode
 #   PERF_PGO_ALLOW_FALLBACK   Fail-closed toggle when PGO data is missing/corrupt (default: 1)
@@ -73,6 +74,7 @@ STAGING_MANIFEST_PATH="$OUTPUT_DIR/results/perf_artifact_staging_manifest.json"
 BUILD_TESTS_JSONL_PATH="$OUTPUT_DIR/logs/build_tests.jsonl"
 PERF_BUDGET_BINARY_ATTESTATION_PATH="$OUTPUT_DIR/results/perf_budgets_test_binary.json"
 PARALLELISM="${PERF_PARALLELISM:-1}"
+BUILD_JOBS="${PERF_BUILD_JOBS:-8}"
 PGO_MODE="${PERF_PGO_MODE:-off}"
 PGO_PROFILE_DATA="${PERF_PGO_PROFILE_DATA:-$TARGET_DIR/perf/$CARGO_PROFILE/pgo_profile/pijs_workload.profdata}"
 PGO_ALLOW_FALLBACK="${PERF_PGO_ALLOW_FALLBACK:-1}"
@@ -289,6 +291,17 @@ if [[ "${PERF_QUICK:-0}" == "1" ]]; then
   PROFILE="quick"
 fi
 
+RCH_PROOF_REQUIRED=false
+case "${RCH_REQUIRE_REMOTE:-0}" in
+  1|true|TRUE|yes|YES|on|ON) RCH_PROOF_REQUIRED=true ;;
+esac
+if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+  RCH_PROOF_REQUIRED=true
+fi
+if [[ "$SEEN_NO_RCH" == true && "$RCH_PROOF_REQUIRED" == true ]]; then
+  die "Cannot combine --no-rch with RCH_REQUIRE_REMOTE proof mode"
+fi
+
 # ─── List mode ───────────────────────────────────────────────────────────────
 
 if [[ "$LIST_ONLY" == "true" ]]; then
@@ -362,7 +375,7 @@ if [[ "$CARGO_RUNNER_REQUEST" == "rch" ]]; then
   if ! command -v rch >/dev/null 2>&1; then
     die "PERF_CARGO_RUNNER=rch requested, but 'rch' is not available in PATH."
   fi
-  if [[ "$SEEN_REQUIRE_RCH" == true ]]; then
+  if [[ "$RCH_PROOF_REQUIRED" == true ]]; then
     export RCH_REQUIRE_REMOTE=1
   fi
   if ! rch check --quiet >/dev/null 2>&1; then
@@ -387,6 +400,10 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   for required_env in \
     BENCH_OUTPUT_DIR \
     BENCH_OUTPUT_TARGET_SUBDIR \
+    BENCH_QUICK \
+    BENCH_ITERATIONS \
+    PI_BENCH_RUN_ID \
+    CARGO_BUILD_JOBS \
     PERF_REGRESSION_OUTPUT \
     PERF_RELEASE_BINARY_PATH \
     CI_CORRELATION_ID \
@@ -417,25 +434,35 @@ resolve_suites() {
       if [[ "$SKIP_CRITERION" != "1" ]]; then
         SELECTED_SUITES+=("${!CRITERION_BENCHES[@]}")
       fi
-      export PI_PERF_STRICT=1
       ;;
     quick)
       # Fast subset: schema validation + budgets only, no criterion
       SELECTED_SUITES=(bench_schema perf_budgets)
       SKIP_CRITERION=1
-      export BENCH_QUICK=1
       ;;
     ci)
       # CI: all test suites, skip heavy criterion benches
       SELECTED_SUITES=("${!SUITE_TARGETS[@]}")
       SKIP_CRITERION=1
-      export PI_PERF_STRICT=1
       ;;
     *)
       die "Unknown profile: $PROFILE (available: full, quick, ci)"
       ;;
   esac
 }
+
+apply_profile_settings() {
+  case "$PROFILE" in
+    full|ci) export PI_PERF_STRICT=1 ;;
+    quick)
+      SKIP_CRITERION=1
+      export BENCH_QUICK=1
+      ;;
+    *) die "Unknown profile: $PROFILE (available: full, quick, ci)" ;;
+  esac
+}
+
+apply_profile_settings
 
 if [[ ${#SELECTED_SUITES[@]} -eq 0 ]]; then
   resolve_suites
@@ -477,7 +504,7 @@ verify_current_clean_source_identity() {
   return 0
 }
 
-if [[ "$CARGO_RUNNER_MODE" == "rch" && "$SEEN_REQUIRE_RCH" == true ]] \
+if [[ "$CARGO_RUNNER_MODE" == "rch" && "$RCH_PROOF_REQUIRED" == true ]] \
   && suite_selected "perf_bench_harness"; then
   if [[ ! "$GIT_COMMIT_FULL" =~ ^[0-9a-f]{40}$ ]]; then
     die "Strict RCH performance proof requires a full Git commit identity, got: $GIT_COMMIT_FULL"
@@ -496,6 +523,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" && "$SEEN_REQUIRE_RCH" == true ]] \
   # the committed source archive and needs the ordinary RCH transfer path.
   PERF_BENCH_RUNNER_ARGS=(
     "rch" "exec"
+    "--no-color"
     "--base" "$GIT_COMMIT_FULL"
     "--clean-overlay"
     "--no-overlay"
