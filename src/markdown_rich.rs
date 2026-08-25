@@ -188,6 +188,10 @@ pub fn enrich_markdown(markdown: &str) -> String {
         len >= minimum_len && rest[len..].iter().all(u8::is_ascii_whitespace)
     }
 
+    fn is_indented_code(line: &str) -> bool {
+        line.starts_with('\t') || line.as_bytes().starts_with(b"    ")
+    }
+
     fn enrich_plain(text: &str) -> String {
         fn is_path_or_url(chunk: &str) -> bool {
             chunk.contains('/')
@@ -312,6 +316,8 @@ pub fn enrich_markdown(markdown: &str) -> String {
         } else if let Some(marker) = fence_marker(body) {
             active_fence = Some(marker);
             out.push_str(line);
+        } else if is_indented_code(body) {
+            out.push_str(line);
         } else {
             out.push_str(&enrich_inline(body));
             if line.ends_with('\n') {
@@ -423,6 +429,7 @@ mod tests {
             "```rust\n",
             "let literal = r\"\\alpha #abc\";\n",
             "```\n",
+            "    let indented = r\"\\beta #123456\";\n",
         );
         let enriched = enrich_markdown(input);
 
@@ -433,6 +440,7 @@ mod tests {
         assert!(enriched.contains("https://example.test/#abc"));
         assert!(enriched.contains("/tmp/\\alpha/#abc"));
         assert!(enriched.contains("let literal = r\"\\alpha #abc\";"));
+        assert!(enriched.contains("    let indented = r\"\\beta #123456\";"));
         assert!(!enriched.contains("https://example.test/■"));
     }
 
