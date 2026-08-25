@@ -7493,6 +7493,20 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     install_fake_orchestrate_toolchain(&bin_dir);
     install_fake_orchestrate_staging_artifacts(&target_dir);
     install_fake_orchestrate_rch_attestation(&target_dir, &output_dir);
+    if extra_env.iter().any(|(key, value)| {
+        *key == "PI_FAKE_PRECREATE_RCH_EXTENSION_ARTIFACT" && *value == "1"
+    }) {
+        let stale_artifact = target_dir
+            .join("nextest")
+            .join("pi-perf")
+            .join(FAKE_ORCHESTRATE_CORRELATION_ID)
+            .join("perf_bench_harness")
+            .join("extension_bench.jsonl");
+        fs::create_dir_all(stale_artifact.parent().expect("stale artifact parent"))
+            .expect("create stale RCH artifact directory");
+        fs::write(&stale_artifact, "{\"stale\":true}\n")
+            .expect("write stale RCH artifact negative control");
+    }
     let fault_injection_summary = fault_injection_root.join("stub/integrity-summary.json");
     fs::create_dir_all(
         fault_injection_summary
@@ -7701,6 +7715,28 @@ fn orchestrate_rch_perf_harness_fails_when_nextest_artifact_is_missing() {
     assert!(
         combined.contains("without retrieving extension_bench.jsonl"),
         "missing-artifact failure must name the failed RCH writeback postcondition: {combined}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rch_perf_harness_refuses_preexisting_nextest_artifact() {
+    let (output, _temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_PRECREATE_RCH_EXTENSION_ARTIFACT",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict RCH orchestration must not credit a preexisting JSONL artifact"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Refusing stale RCH extension benchmark artifact"),
+        "stale-artifact failure must identify the freshness postcondition: {combined}"
     );
 }
 

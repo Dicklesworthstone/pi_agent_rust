@@ -1105,24 +1105,31 @@ run_test_suite() {
     # artifact beneath the worker's active CARGO_TARGET_DIR and require it to
     # arrive in the matching local target directory before crediting the suite.
     rch_target_subdir="nextest/pi-perf/$CORRELATION_ID/$suite_name"
-    BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
-    PERF_REGRESSION_OUTPUT="$result_dir" \
-    PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
-    CI_CORRELATION_ID="$CORRELATION_ID" \
-    VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
-    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
-    RUST_TEST_THREADS="$PARALLELISM" \
-      "${CARGO_RUNNER_ARGS[@]}" nextest run \
-        --build-jobs "$PARALLELISM" \
-        --test "$target_name" \
-        --cargo-profile "$CARGO_PROFILE" \
-        --test-threads "$PARALLELISM" \
-        --no-capture \
-      >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
-      || exit_code=$?
-
     local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
-    if [[ "$exit_code" -eq 0 && -f "$retrieved_result_dir/extension_bench.jsonl" ]]; then
+    if [[ -e "$retrieved_result_dir/extension_bench.jsonl" \
+      || -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
+      log_fail "Refusing stale RCH extension benchmark artifact at $rch_target_subdir"
+      exit_code=87
+    else
+      BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
+      PERF_REGRESSION_OUTPUT="$result_dir" \
+      PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
+      CI_CORRELATION_ID="$CORRELATION_ID" \
+      VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+      VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+      RUST_TEST_THREADS="$PARALLELISM" \
+        "${CARGO_RUNNER_ARGS[@]}" nextest run \
+          --build-jobs "$PARALLELISM" \
+          --test "$target_name" \
+          --cargo-profile "$CARGO_PROFILE" \
+          --test-threads "$PARALLELISM" \
+        >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
+        || exit_code=$?
+    fi
+
+    if [[ "$exit_code" -eq 0 \
+      && -f "$retrieved_result_dir/extension_bench.jsonl" \
+      && ! -L "$retrieved_result_dir/extension_bench.jsonl" ]]; then
       cp "$retrieved_result_dir/extension_bench.jsonl" "$result_dir/extension_bench.jsonl"
       if [[ -f "$retrieved_result_dir/extension_bench_summary.md" ]]; then
         cp "$retrieved_result_dir/extension_bench_summary.md" "$result_dir/extension_bench_summary.md"
