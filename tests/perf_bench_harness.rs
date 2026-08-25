@@ -246,6 +246,7 @@ const FULL_EXTENSIONS: &[&str] = &[
 // ─── Environment Fingerprint ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
 struct EnvFingerprint {
     os: String,
     arch: String,
@@ -455,10 +456,16 @@ fn expected_bench_coverage(expected_extensions: &[String]) -> BTreeSet<(String, 
         expected.insert((extension.clone(), "cold_start".to_string()));
         expected.insert((extension.clone(), "warm_start".to_string()));
     }
-    if expected_extensions.iter().any(|extension| extension == "hello") {
+    if expected_extensions
+        .iter()
+        .any(|extension| extension == "hello")
+    {
         expected.insert(("hello".to_string(), "tool_call".to_string()));
     }
-    if expected_extensions.iter().any(|extension| extension == "pirate") {
+    if expected_extensions
+        .iter()
+        .any(|extension| extension == "pirate")
+    {
         expected.insert(("pirate".to_string(), "event_hook".to_string()));
     }
     expected
@@ -1020,8 +1027,7 @@ fn bench_extension_scenarios() {
 
         // ── Cold Start ──
         {
-            let sample_batch =
-                run_cold_start(ext_name, &entry_path, &cwd, config.cold_iterations);
+            let sample_batch = run_cold_start(ext_name, &entry_path, &cwd, config.cold_iterations);
             let samples = validate_complete_samples("cold_start", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);
@@ -1062,8 +1068,7 @@ fn bench_extension_scenarios() {
 
         // ── Warm Start ──
         {
-            let sample_batch =
-                run_warm_start(ext_name, &entry_path, &cwd, config.warm_iterations);
+            let sample_batch = run_warm_start(ext_name, &entry_path, &cwd, config.warm_iterations);
             let samples = validate_complete_samples("warm_start", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);
@@ -1107,8 +1112,7 @@ fn bench_extension_scenarios() {
         // zero-count rows for extensions with no matching tool would mislabel a
         // no-op/error path as a dispatch measurement.
         if ext_name == "hello" {
-            let sample_batch =
-                run_tool_call(ext_name, &entry_path, &cwd, config.tool_iterations);
+            let sample_batch = run_tool_call(ext_name, &entry_path, &cwd, config.tool_iterations);
             let samples = validate_complete_samples("tool_call", ext_name, &sample_batch)
                 .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);

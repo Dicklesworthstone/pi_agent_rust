@@ -309,6 +309,9 @@ fi
 if [[ "$SEEN_NO_RCH" == true && "$RCH_PROOF_REQUIRED" == true ]]; then
   die "Cannot combine --no-rch with RCH_REQUIRE_REMOTE proof mode"
 fi
+if [[ "$RCH_PROOF_REQUIRED" == true && "$CARGO_RUNNER_REQUEST" != "rch" ]]; then
+  die "RCH proof mode requires PERF_CARGO_RUNNER=rch; local and auto runners cannot prove remote execution"
+fi
 
 # ─── List mode ───────────────────────────────────────────────────────────────
 
@@ -1199,14 +1202,17 @@ validate_retrieved_extension_bench_jsonl() {
   local expected_commit="$3"
   local expected_correlation_id="$4"
   local expected_benchmark_run_id="$5"
+  local expected_mode="$6"
   python3 - \
     "$artifact_path" \
     "$expected_profile" \
     "$expected_commit" \
     "$expected_correlation_id" \
-    "$expected_benchmark_run_id" <<'PY'
+    "$expected_benchmark_run_id" \
+    "$expected_mode" <<'PY'
 import hashlib
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -1216,6 +1222,28 @@ expected_profile = sys.argv[2]
 expected_commit = sys.argv[3]
 expected_correlation_id = sys.argv[4]
 expected_benchmark_run_id = sys.argv[5]
+expected_mode = sys.argv[6]
+expected_extensions = (
+    ["hello", "pirate", "diff"]
+    if expected_mode == "quick"
+    else [
+        "hello",
+        "pirate",
+        "diff",
+        "bookmark",
+        "custom-header",
+        "custom-footer",
+        "confirm-destructive",
+        "dirty-repo-guard",
+    ]
+)
+expected_coverage = {
+    (extension, scenario)
+    for extension in expected_extensions
+    for scenario in ("cold_start", "warm_start")
+}
+expected_coverage.update({("hello", "tool_call"), ("pirate", "event_hook")})
+observed_coverage = set()
 records = []
 for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").splitlines(), 1):
     if not line.strip():
@@ -1317,20 +1345,52 @@ for line_number, line in enumerate(artifact_path.read_text(encoding="utf-8").spl
     if environment.get("config_hash") != expected_config_hash:
         raise SystemExit(f"line {line_number}: config_hash does not bind provenance fields")
     summary = record.get("summary")
-    if not isinstance(summary, dict) or summary.get("count") != record.get("runs"):
+    runs = record.get("runs")
+    count = summary.get("count") if isinstance(summary, dict) else None
+    if type(runs) is not int or runs <= 0 or type(count) is not int or count <= 0:
+        raise SystemExit(f"line {line_number}: runs and summary.count must be positive integers")
+    if count != runs:
         raise SystemExit(f"line {line_number}: runs and summary.count differ")
+    summary_values = [
+        summary.get(field)
+        for field in ("min_ms", "p50_ms", "p95_ms", "p99_ms", "p999_ms", "max_ms", "mean_ms")
+    ]
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+        for value in summary_values
+    ):
+        raise SystemExit(f"line {line_number}: summary timings must be finite non-negative numbers")
+    minimum, p50, p95, p99, p999, maximum, mean = summary_values
+    if not minimum <= p50 <= p95 <= p99 <= p999 <= maximum or not minimum <= mean <= maximum:
+        raise SystemExit(f"line {line_number}: summary timing order is invalid")
+    for field in ("elapsed_ms", "per_call_us", "calls_per_sec"):
+        value = record.get(field)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise SystemExit(f"line {line_number}: {field} must be a finite non-negative number")
+    coverage_key = (record.get("extension"), record.get("scenario"))
+    if coverage_key not in expected_coverage:
+        raise SystemExit(f"line {line_number}: unexpected benchmark coverage {coverage_key!r}")
+    if coverage_key in observed_coverage:
+        raise SystemExit(f"line {line_number}: duplicate benchmark coverage {coverage_key!r}")
+    observed_coverage.add(coverage_key)
     records.append(record)
 
 if not records:
     raise SystemExit("extension benchmark JSONL contains no records")
-if not any(
-    record.get("scenario") == "cold_start"
-    and isinstance(record.get("summary"), dict)
-    and isinstance(record["summary"].get("count"), int)
-    and record["summary"]["count"] > 0
-    for record in records
-):
-    raise SystemExit("extension benchmark JSONL has no successful cold_start record")
+if observed_coverage != expected_coverage:
+    raise SystemExit(
+        "extension benchmark coverage mismatch: "
+        f"missing={sorted(expected_coverage - observed_coverage)!r}, "
+        f"unexpected={sorted(observed_coverage - expected_coverage)!r}"
+    )
 PY
 }
 
@@ -1426,7 +1486,8 @@ run_test_suite() {
         "$CARGO_PROFILE" \
         "$GIT_COMMIT_FULL" \
         "$CORRELATION_ID" \
-        "$benchmark_run_id"; then
+        "$benchmark_run_id" \
+        "$PROFILE"; then
         if [[ -e "$result_dir/extension_bench.jsonl" \
           || -L "$result_dir/extension_bench.jsonl" ]]; then
           log_fail "Refusing preexisting accepted extension benchmark destination"
@@ -1438,7 +1499,8 @@ run_test_suite() {
             "$CARGO_PROFILE" \
             "$GIT_COMMIT_FULL" \
             "$CORRELATION_ID" \
-            "$benchmark_run_id"; then
+            "$benchmark_run_id" \
+            "$PROFILE"; then
             log_fail "Accepted extension benchmark copy failed post-copy validation"
             exit_code=96
           fi
