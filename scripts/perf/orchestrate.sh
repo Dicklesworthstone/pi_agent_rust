@@ -3793,6 +3793,19 @@ for candidate in fault_injection_candidates:
         continue
     if candidate_summary.get("source_dirty") is not source_dirty:
         continue
+    source_tree_digest = candidate_summary.get("source_tree_sha256")
+    if not isinstance(source_tree_digest, str) or len(source_tree_digest) != 64:
+        continue
+    if any(character not in "0123456789abcdef" for character in source_tree_digest):
+        continue
+    if candidate_summary.get("source_commit_final") != source_commit:
+        continue
+    if candidate_summary.get("source_dirty_final") is not source_dirty:
+        continue
+    if candidate_summary.get("source_tree_sha256_final") != source_tree_digest:
+        continue
+    if candidate_summary.get("source_tree_stable") is not True:
+        continue
     candidate_timestamp = parse_record_timestamp(candidate_summary)
     if candidate_timestamp is None:
         continue

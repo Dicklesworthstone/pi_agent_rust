@@ -45,10 +45,58 @@ CORRELATION_ID="${CI_CORRELATION_ID:-persistence-fault-injection-$RUN_ID}"
 export CI_CORRELATION_ID="$CORRELATION_ID"
 export RUST_LOG="${RUST_LOG:-info}"
 SOURCE_COMMIT="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
-SOURCE_DIRTY=false
-if [[ -n "$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)" ]]; then
-    SOURCE_DIRTY=true
-fi
+
+source_dirty_state() {
+    if [[ -n "$(git status --porcelain=v1 --untracked-files=all 2>/dev/null)" ]]; then
+        printf '%s\n' true
+    else
+        printf '%s\n' false
+    fi
+}
+
+SOURCE_DIRTY="$(source_dirty_state)"
+
+source_tree_digest() {
+    python3 - "$PROJECT_ROOT" <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+listed = subprocess.run(
+    ["git", "-C", str(root), "ls-files", "-c", "-o", "--exclude-standard", "-z"],
+    check=True,
+    stdout=subprocess.PIPE,
+).stdout
+digest = hashlib.sha256()
+for raw_relative in sorted(filter(None, listed.split(b"\0"))):
+    relative = os.fsdecode(raw_relative)
+    path = root / relative
+    digest.update(b"path\0" + raw_relative + b"\0")
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        digest.update(b"missing\0")
+        continue
+    digest.update(f"mode:{stat.S_IMODE(metadata.st_mode):o}\0".encode())
+    if stat.S_ISLNK(metadata.st_mode):
+        digest.update(b"symlink\0" + os.fsencode(os.readlink(path)) + b"\0")
+    elif stat.S_ISREG(metadata.st_mode):
+        digest.update(b"file\0")
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    else:
+        digest.update(f"other:{stat.S_IFMT(metadata.st_mode):o}\0".encode())
+print(digest.hexdigest())
+PY
+}
+
+SOURCE_TREE_DIGEST="$(source_tree_digest)"
 
 default_build_root() {
     local base="/data/tmp/pi_agent_rust"
@@ -193,6 +241,7 @@ write_case_result() {
   "correlation_id": "$CORRELATION_ID",
   "source_commit": "$SOURCE_COMMIT",
   "source_dirty": $SOURCE_DIRTY,
+  "source_tree_sha256": "$SOURCE_TREE_DIGEST",
   "case_id": "$case_id",
   "suite": "e2e_session_persistence",
   "test_name": "$test_name",
@@ -219,8 +268,26 @@ run_case() {
     local harness_test_log="$test_log"
     local harness_artifact_index="$artifact_index"
     local start_epoch end_epoch duration_ms exit_code diagnostics_exit
+    local source_commit source_dirty source_digest
 
     mkdir -p "$case_dir"
+    source_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    source_dirty="$(source_dirty_state)"
+    source_digest="$(source_tree_digest)"
+    if [[ "$source_commit" != "$SOURCE_COMMIT" || "$source_dirty" != "$SOURCE_DIRTY" || "$source_digest" != "$SOURCE_TREE_DIGEST" ]]; then
+        echo "[fault-injection] Source tree drifted before case '$case_id'" >&2
+        write_case_result \
+            "$result_file" \
+            "$case_id" \
+            "$test_name" \
+            70 \
+            0 \
+            "$log_file" \
+            "$test_log" \
+            "$artifact_index" \
+            "$feature_name"
+        return 70
+    fi
     if [[ ${#CARGO_RUNNER_PREFIX[@]} -gt 0 ]]; then
         harness_test_log="$RCH_TEST_LOG_REPORT"
         harness_artifact_index="$RCH_ARTIFACT_INDEX_REPORT"
@@ -288,6 +355,13 @@ run_case() {
 
     end_epoch=$(epoch_ms)
     duration_ms=$((end_epoch - start_epoch))
+    source_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+    source_dirty="$(source_dirty_state)"
+    source_digest="$(source_tree_digest)"
+    if [[ "$source_commit" != "$SOURCE_COMMIT" || "$source_dirty" != "$SOURCE_DIRTY" || "$source_digest" != "$SOURCE_TREE_DIGEST" ]]; then
+        echo "[fault-injection] Source tree drifted while case '$case_id' ran" >&2
+        exit_code=70
+    fi
 
     write_case_result \
         "$result_file" \
@@ -336,7 +410,12 @@ run_case "jsonl" "jsonl_fault_injection_flush_windows_preserve_integrity" || jso
 run_case "sqlite" "sqlite_fault_injection_flush_windows_preserve_integrity" "sqlite-sessions" || sqlite_exit=$?
 
 set +e
-python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" "$SOURCE_COMMIT" "$SOURCE_DIRTY" <<'PY'
+SOURCE_COMMIT_FINAL="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
+SOURCE_DIRTY_FINAL="$(source_dirty_state)"
+SOURCE_TREE_DIGEST_FINAL="$(source_tree_digest)"
+python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" "$SOURCE_COMMIT" "$SOURCE_DIRTY" "$SOURCE_TREE_DIGEST" "$SOURCE_COMMIT_FINAL" "$SOURCE_DIRTY_FINAL" "$SOURCE_TREE_DIGEST_FINAL" <<'PY'
+import base64
+import hashlib
 import json
 import re
 import sys
@@ -348,6 +427,10 @@ correlation_id = sys.argv[2]
 timestamp = sys.argv[3]
 source_commit = sys.argv[4]
 source_dirty = sys.argv[5] == "true"
+source_tree_digest = sys.argv[6]
+source_commit_final = sys.argv[7]
+source_dirty_final = sys.argv[8] == "true"
+source_tree_digest_final = sys.argv[9]
 
 
 def load_json(path: Path) -> dict:
@@ -359,34 +442,52 @@ def load_jsonl(path: Path) -> list[dict]:
     records: list[dict] = []
     if not path.exists():
         return records
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    for line_number, raw in enumerate(
+        path.read_text(encoding="utf-8", errors="strict").splitlines(), start=1
+    ):
         line = raw.strip()
         if not line:
             continue
         try:
             value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            records.append(value)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{path}:{line_number}: invalid JSON: {error}") from error
+        if not isinstance(value, dict):
+            raise ValueError(f"{path}:{line_number}: expected a JSON object")
+        records.append(value)
     return records
 
 
-def artifact_record_is_valid(
-    record: dict,
-    expected_test_name: str,
-    expected_summary_artifact: str,
-) -> bool:
-    required_fields = {"schema", "type", "seq", "ts", "t_ms", "name", "path"}
+def timestamp_is_valid(value: object) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def log_record_is_valid(record: dict) -> bool:
+    required_fields = {
+        "schema",
+        "type",
+        "trace_id",
+        "seq",
+        "ts",
+        "t_ms",
+        "level",
+        "category",
+        "message",
+    }
     if not required_fields.issubset(record):
         return False
-    if record.get("schema") != "pi.test.artifact.v1":
+    if record.get("schema") != "pi.test.log.v2" or record.get("type") != "log":
         return False
-    if record.get("type") != "artifact":
-        return False
-    if record.get("test") != expected_test_name:
-        return False
-    if record.get("name") != expected_summary_artifact:
+    if not isinstance(record.get("trace_id"), str) or not record["trace_id"].strip():
         return False
     seq = record.get("seq")
     elapsed_ms = record.get("t_ms")
@@ -394,17 +495,46 @@ def artifact_record_is_valid(
         return False
     if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
         return False
-    raw_timestamp = record.get("ts")
-    if not isinstance(raw_timestamp, str) or not raw_timestamp.strip():
+    if not timestamp_is_valid(record.get("ts")):
         return False
-    normalized_timestamp = raw_timestamp.strip()
-    if normalized_timestamp.endswith("Z"):
-        normalized_timestamp = f"{normalized_timestamp[:-1]}+00:00"
-    try:
-        parsed_timestamp = datetime.fromisoformat(normalized_timestamp)
-    except ValueError:
+    if record.get("level") not in {"debug", "info", "warn", "error"}:
         return False
-    if parsed_timestamp.tzinfo is None:
+    return all(
+        isinstance(record.get(field), str)
+        for field in ("category", "message")
+    )
+
+
+def artifact_envelope_is_valid(record: dict, expected_test_name: str) -> bool:
+    required_fields = {"schema", "type", "seq", "ts", "t_ms", "name", "path"}
+    if not required_fields.issubset(record):
+        return False
+    if record.get("schema") != "pi.test.artifact.v1":
+        return False
+    if record.get("type") != "artifact" or record.get("test") != expected_test_name:
+        return False
+    seq = record.get("seq")
+    elapsed_ms = record.get("t_ms")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        return False
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
+        return False
+    if not timestamp_is_valid(record.get("ts")):
+        return False
+    return all(
+        isinstance(record.get(field), str) and bool(record[field].strip())
+        for field in ("name", "path")
+    )
+
+
+def artifact_record_is_valid(
+    record: dict,
+    expected_test_name: str,
+    expected_summary_artifact: str,
+) -> bool:
+    if not artifact_envelope_is_valid(record, expected_test_name):
+        return False
+    if record.get("name") != expected_summary_artifact:
         return False
     raw_path = record.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
@@ -416,6 +546,59 @@ def artifact_record_is_valid(
         return False
     sha256 = record.get("sha256")
     return isinstance(sha256, str) and re.fullmatch(r"[0-9a-f]{64}", sha256) is not None
+
+
+def inline_summary_bytes_are_valid(
+    diagnostic_records: list[dict],
+    artifact_record: dict,
+    case_dir: Path,
+    case_id: str,
+    expected_summary_artifact: str,
+) -> bool:
+    payload_records = [
+        record
+        for record in diagnostic_records
+        if record.get("schema") == "pi.test.log.v2"
+        and record.get("type") == "log"
+        and record.get("category") == "artifact_payload"
+        and isinstance(record.get("context"), dict)
+        and record["context"].get("artifact_name") == expected_summary_artifact
+    ]
+    if len(payload_records) != 1:
+        return False
+    context = payload_records[0]["context"]
+    if context.get("content_encoding") != "base64":
+        return False
+    encoded = context.get("content_base64")
+    if not isinstance(encoded, str) or not encoded:
+        return False
+    try:
+        payload = base64.b64decode(encoded, validate=True)
+    except (ValueError, base64.binascii.Error):
+        return False
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != context.get("content_sha256") or digest != artifact_record.get("sha256"):
+        return False
+    if len(payload) != artifact_record.get("size_bytes"):
+        return False
+    try:
+        summary = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    base_message = f"{case_id}-base"
+    post_message = f"{case_id}-postflush-persisted"
+    if summary != {
+        "scenario": f"{case_id}_fault_windows",
+        "windows": {
+            "pre_flush": [base_message],
+            "mid_flush": [base_message],
+            "post_flush": [base_message, post_message],
+        },
+    }:
+        return False
+    local_summary_path = case_dir / expected_summary_artifact
+    local_summary_path.write_bytes(payload)
+    return local_summary_path.is_file()
 
 
 def case_checks(
@@ -448,18 +631,44 @@ def case_checks(
     has_valid_summary_artifact = has_summary_artifact and artifact_record_is_valid(
         summary_artifacts[0], expected_test_name, expected_summary_artifact
     )
+    has_verified_summary_bytes = has_valid_summary_artifact and inline_summary_bytes_are_valid(
+        diagnostic_records,
+        summary_artifacts[0],
+        case_dir,
+        case_id,
+        expected_summary_artifact,
+    )
     has_current_correlation = bool(logs) and all(
         record.get("ci_correlation_id") == correlation_id for record in logs
+    )
+    diagnostic_log_schema_valid = bool(logs) and all(
+        log_record_is_valid(record)
+        if record.get("schema") == "pi.test.log.v2"
+        else artifact_envelope_is_valid(record, expected_test_name)
+        for record in diagnostic_records
     )
     has_expected_test_identity = bool(artifacts) and all(
         record.get("test") == expected_test_name for record in artifacts
     )
+    artifact_index_schema_valid = bool(artifacts) and all(
+        artifact_envelope_is_valid(record, expected_test_name) for record in artifacts
+    )
 
     checks = {
         "test_command_passed": result.get("exit_code") == 0,
+        "result_identity_current": (
+            result.get("run_id") == correlation_id
+            and result.get("correlation_id") == correlation_id
+            and result.get("source_commit") == source_commit
+            and result.get("source_dirty") == source_dirty
+            and result.get("source_tree_sha256") == source_tree_digest
+        ),
         "fault_log_emitted": has_fault_log,
         "summary_artifact_indexed": has_summary_artifact,
         "summary_artifact_schema_valid": has_valid_summary_artifact,
+        "summary_artifact_bytes_verified": has_verified_summary_bytes,
+        "diagnostic_log_schema_valid": diagnostic_log_schema_valid,
+        "artifact_index_schema_valid": artifact_index_schema_valid,
         "correlation_id_current": has_current_correlation,
         "test_identity_current": has_expected_test_identity,
     }
@@ -487,13 +696,23 @@ sqlite_case = case_checks(
     "sqlite-fault-window-summary.json",
 )
 
-overall_passed = jsonl_case["passed"] and sqlite_case["passed"]
+source_tree_stable = (
+    source_commit_final == source_commit
+    and source_dirty_final == source_dirty
+    and source_tree_digest_final == source_tree_digest
+)
+overall_passed = jsonl_case["passed"] and sqlite_case["passed"] and source_tree_stable
 summary = {
     "schema": "pi.e2e.persistence_fault_injection.summary.v1",
     "run_id": correlation_id,
     "correlation_id": correlation_id,
     "source_commit": source_commit,
     "source_dirty": source_dirty,
+    "source_tree_sha256": source_tree_digest,
+    "source_commit_final": source_commit_final,
+    "source_dirty_final": source_dirty_final,
+    "source_tree_sha256_final": source_tree_digest_final,
+    "source_tree_stable": source_tree_stable,
     "timestamp": timestamp,
     "assertions": {
         "crash_windows": ["pre_flush", "mid_flush", "post_flush"],
@@ -528,6 +747,10 @@ cat >"$ARTIFACT_DIR/run-manifest.json" <<EOF
   "correlation_id": "$CORRELATION_ID",
   "source_commit": "$SOURCE_COMMIT",
   "source_dirty": $SOURCE_DIRTY,
+  "source_tree_sha256": "$SOURCE_TREE_DIGEST",
+  "source_commit_final": "$SOURCE_COMMIT_FINAL",
+  "source_dirty_final": $SOURCE_DIRTY_FINAL,
+  "source_tree_sha256_final": "$SOURCE_TREE_DIGEST_FINAL",
   "timestamp": "$STAMP",
   "artifact_dir": "$ARTIFACT_DIR",
   "runner_mode": "$CARGO_RUNNER_MODE",

@@ -7,6 +7,8 @@ mod common;
 
 use asupersync::runtime::RuntimeBuilder;
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use clap::Parser;
 use common::TestHarness;
 #[cfg(unix)]
@@ -653,6 +655,23 @@ fn write_jsonl_artifacts(harness: &TestHarness, test_name: &str) {
         format!("{test_name}.artifacts.normalized.jsonl"),
         &normalized_artifacts_path,
     );
+}
+
+fn record_inline_json_artifact(harness: &TestHarness, name: &str, value: &Value) {
+    let bytes = serde_json::to_vec(value).expect("serialize inline JSON artifact");
+    let path = harness.temp_path(name);
+    std::fs::write(&path, &bytes).expect("write inline JSON artifact");
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let content_base64 = BASE64_STANDARD.encode(&bytes);
+    harness
+        .log()
+        .info_ctx("artifact_payload", "inline JSON artifact bytes", |ctx| {
+            ctx.push(("artifact_name".into(), name.to_string()));
+            ctx.push(("content_encoding".into(), "base64".into()));
+            ctx.push(("content_sha256".into(), sha256));
+            ctx.push(("content_base64".into(), content_base64));
+        });
+    harness.record_artifact(name, &path);
 }
 
 async fn current_session_path(session: &Arc<asupersync::sync::Mutex<Session>>) -> PathBuf {
@@ -1842,21 +1861,18 @@ fn jsonl_fault_injection_flush_windows_preserve_integrity() {
         );
         assert_no_duplicate_user_texts(&post_texts, "jsonl post-flush window");
 
-        let summary_path = harness.temp_path("jsonl-fault-window-summary.json");
-        std::fs::write(
-            &summary_path,
-            serde_json::to_string_pretty(&json!({
+        record_inline_json_artifact(
+            &harness,
+            "jsonl-fault-window-summary.json",
+            &json!({
                 "scenario": "jsonl_fault_windows",
                 "windows": {
                     "pre_flush": pre_texts,
                     "mid_flush": mid_texts,
                     "post_flush": post_texts
                 }
-            }))
-            .expect("serialize jsonl fault summary"),
-        )
-        .expect("write jsonl fault summary");
-        harness.record_artifact("jsonl-fault-window-summary.json", &summary_path);
+            }),
+        );
     });
 
     write_jsonl_artifacts(&harness, test_name);
@@ -1946,21 +1962,18 @@ fn sqlite_fault_injection_flush_windows_preserve_integrity() {
         );
         assert_no_duplicate_user_texts(&post_texts, "sqlite post-flush window");
 
-        let summary_path = harness.temp_path("sqlite-fault-window-summary.json");
-        std::fs::write(
-            &summary_path,
-            serde_json::to_string_pretty(&json!({
+        record_inline_json_artifact(
+            &harness,
+            "sqlite-fault-window-summary.json",
+            &json!({
                 "scenario": "sqlite_fault_windows",
                 "windows": {
                     "pre_flush": pre_texts,
                     "mid_flush": mid_texts,
                     "post_flush": post_texts
                 }
-            }))
-            .expect("serialize sqlite fault summary"),
-        )
-        .expect("write sqlite fault summary");
-        harness.record_artifact("sqlite-fault-window-summary.json", &summary_path);
+            }),
+        );
     });
 
     write_jsonl_artifacts(&harness, test_name);
