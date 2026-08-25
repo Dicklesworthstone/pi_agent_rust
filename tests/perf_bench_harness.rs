@@ -1067,79 +1067,73 @@ fn bench_extension_scenarios() {
     }
 }
 
-/// Validate that the JSONL output conforms to the schema.
 #[test]
-fn bench_jsonl_schema_valid() -> Result<(), String> {
-    let jsonl_path = output_dir().join("extension_bench.jsonl");
-    if !jsonl_path.exists() {
-        eprintln!("[schema] No extension_bench.jsonl — run bench_extension_scenarios first");
-        return Ok(());
+fn bench_jsonl_schema_validation_is_non_vacuous() {
+    let record = BenchRecord {
+        schema: "pi.ext.rust_bench.v1".to_string(),
+        runtime: "pi_agent_rust".to_string(),
+        run_id: "test-correlation".to_string(),
+        correlation_id: "test-correlation".to_string(),
+        benchmark_run_id: "test-benchmark-run".to_string(),
+        source_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        source_dirty: false,
+        scenario: "cold_start".to_string(),
+        extension: "hello".to_string(),
+        runs: 1,
+        summary: Summary {
+            count: 1,
+            min_ms: 1.0,
+            p50_ms: 1.0,
+            p95_ms: 1.0,
+            p99_ms: 1.0,
+            p999_ms: 1.0,
+            max_ms: 1.0,
+            mean_ms: 1.0,
+        },
+        elapsed_ms: 1.0,
+        per_call_us: 1_000.0,
+        calls_per_sec: 1_000.0,
+        env: EnvFingerprint {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            cpu_model: "fixture".to_string(),
+            cpu_cores: 8,
+            mem_total_mb: 1_024,
+            build_profile: "perf".to_string(),
+            executable_build_profile: "perf".to_string(),
+            executable_profile_verified: true,
+            build_fingerprint_verified: true,
+            build_profile_verified: true,
+            build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT.to_string(),
+            compiled_profile_family: "release".to_string(),
+            compiled_opt_level: "3".to_string(),
+            compiled_debug: "true".to_string(),
+            git_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            source_dirty: false,
+            features: vec!["sqlite-sessions".to_string()],
+            binary_path: "/target/perf/deps/perf_bench_harness-fixture".to_string(),
+            binary_sha256: "fixture-sha256".to_string(),
+            config_hash: "fixture-config-hash".to_string(),
+        },
+        timestamp: "2026-08-25T00:00:00Z".to_string(),
+    };
+    let valid_jsonl = format!("{}\n", emit_jsonl_line(&record));
+    assert_eq!(validate_bench_jsonl(&valid_jsonl), Ok(1));
+
+    for empty in ["", "\n", " \n\t\n"] {
+        assert!(
+            validate_bench_jsonl(empty).is_err(),
+            "empty or blank JSONL must not pass schema validation"
+        );
     }
 
-    let content = std::fs::read_to_string(&jsonl_path).expect("read JSONL");
-    let required_fields = [
-        "schema",
-        "runtime",
-        "scenario",
-        "extension",
-        "runs",
-        "summary",
-        "env",
-    ];
-
-    for (i, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: Value =
-            serde_json::from_str(line).map_err(|e| format!("line {i}: invalid JSON: {e}"))?;
-
-        for field in &required_fields {
-            assert!(
-                record.get(*field).is_some(),
-                "line {i}: missing required field '{field}'"
-            );
-        }
-
-        assert_eq!(
-            record.get("schema").and_then(Value::as_str),
-            Some("pi.ext.rust_bench.v1"),
-            "line {i}: wrong schema"
-        );
-        assert_eq!(
-            record.get("runtime").and_then(Value::as_str),
-            Some("pi_agent_rust"),
-            "line {i}: wrong runtime"
-        );
-
-        // Validate env fingerprint.
-        let env_obj = record.get("env").expect("env field");
-        for env_field in &["os", "arch", "cpu_model", "cpu_cores", "config_hash"] {
-            assert!(
-                env_obj.get(*env_field).is_some(),
-                "line {i}: env missing '{env_field}'"
-            );
-        }
-
-        // Validate summary.
-        let summary = record.get("summary").expect("summary field");
-        for stat_field in &[
-            "count", "min_ms", "p50_ms", "p95_ms", "p99_ms", "p999_ms", "max_ms",
-        ] {
-            assert!(
-                summary.get(*stat_field).is_some(),
-                "line {i}: summary missing '{stat_field}'"
-            );
-        }
-    }
-
-    let line_count = content.lines().filter(|l| !l.trim().is_empty()).count();
-    eprintln!(
-        "[schema] Validated {} JSONL records in {}",
-        line_count,
-        jsonl_path.display()
+    let mut no_cold_start = record;
+    no_cold_start.scenario = "warm_start".to_string();
+    let no_cold_jsonl = format!("{}\n", emit_jsonl_line(&no_cold_start));
+    assert!(
+        validate_bench_jsonl(&no_cold_jsonl).is_err(),
+        "JSONL without a positive cold-start record must fail"
     );
-    Ok(())
 }
 
 #[cfg(unix)]

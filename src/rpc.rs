@@ -4580,6 +4580,11 @@ mod retry_tests {
 
             let mut shared = RpcSharedState::new(&config);
             shared.auto_compaction_enabled = false;
+            shared
+                .push_follow_up(QueuedAgentMessage::from_authored_message(
+                    build_user_message("accepted follow-up during failed turn", &[]),
+                ))
+                .expect("queue terminal follow-up");
             let shared_state = Arc::new(Mutex::new(shared));
 
             let is_streaming = Arc::new(AtomicBool::new(false));
@@ -4606,8 +4611,8 @@ mod retry_tests {
             };
 
             run_prompt_with_retry(
-                session,
-                shared_state,
+                Arc::clone(&session),
+                Arc::clone(&shared_state),
                 is_streaming,
                 is_compacting,
                 Arc::new(std::sync::Mutex::new(())),
@@ -4782,6 +4787,44 @@ mod retry_tests {
                 last_agent_end_error.as_deref(),
                 Some("Retry aborted"),
                 "expected retry-abort terminal error, timeline: {timeline:?}"
+            );
+            assert_eq!(
+                shared_state
+                    .lock(&AgentCx::for_request())
+                    .await
+                    .expect("shared state lock")
+                    .pending_count(),
+                0,
+                "terminal finalization must consume acknowledged queued input"
+            );
+            let terminal_cx = AgentCx::for_request();
+            let guard = session
+                .lock(&terminal_cx)
+                .await
+                .expect("agent session lock");
+            let inner = guard
+                .session
+                .lock(&terminal_cx)
+                .await
+                .expect("session lock");
+            assert_eq!(
+                inner
+                    .entries_for_current_path()
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry,
+                        crate::session::SessionEntry::Message(message)
+                            if matches!(
+                                &message.message,
+                                SessionMessage::User {
+                                    content: UserContent::Text(text),
+                                    ..
+                                } if text == "accepted follow-up during failed turn"
+                            )
+                    ))
+                    .count(),
+                1,
+                "acknowledged terminal follow-up must be retained exactly once"
             );
         });
     }
@@ -10091,6 +10134,121 @@ export default function init(pi) {
                 2,
                 "the completed exclusion window must use one turn call and one compaction call"
             );
+        });
+    }
+
+    #[test]
+    fn auto_compaction_rejects_stale_session_snapshot_with_paired_end_event() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let (compaction_entered, mut wait_for_compaction) =
+                asupersync::channel::oneshot::channel::<()>();
+            let (release_compaction, compaction_gate) =
+                asupersync::channel::oneshot::channel::<()>();
+            let provider: Arc<dyn Provider> = Arc::new(GatedAutoCompactionProvider {
+                calls: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+                compaction_entered: Mutex::new(Some(compaction_entered)),
+                compaction_gate: Mutex::new(Some(compaction_gate)),
+            });
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], temp.path(), None),
+                AgentConfig {
+                    stream_options: crate::provider::StreamOptions {
+                        api_key: Some("test-key".to_string()),
+                        ..crate::provider::StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            let session = Arc::new(asupersync::sync::Mutex::new(
+                seed_auto_compaction_session(Session::in_memory()),
+            ));
+            let agent_session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            )));
+            let mut options =
+                build_test_rpc_options(&runtime_handle, temp.path().join("auth.json"));
+            let mut model = dummy_entry("test-model", false);
+            model.model.provider = "test-provider".to_string();
+            options.available_models = vec![model];
+            options.config.compaction = Some(crate::config::CompactionSettings {
+                enabled: Some(true),
+                reserve_tokens: Some(2),
+                keep_recent_tokens: Some(1),
+                mode: None,
+            });
+
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(16);
+            let compacting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let compact_task = runtime_handle.spawn(maybe_auto_compact(
+                Arc::clone(&agent_session),
+                options,
+                Arc::clone(&compacting),
+                out_tx,
+            ));
+            let entered_cx = AgentCx::for_request();
+            wait_for_compaction
+                .recv(entered_cx.cx())
+                .await
+                .expect("auto-compaction provider entered");
+
+            let replacement_id = {
+                let guard = agent_session
+                    .lock(&entered_cx)
+                    .await
+                    .expect("agent session lock");
+                let mut inner = guard
+                    .session
+                    .lock(&entered_cx)
+                    .await
+                    .expect("session lock");
+                let replacement = Session::in_memory();
+                let replacement_id = replacement.header.id.clone();
+                *inner = replacement;
+                replacement_id
+            };
+            release_compaction
+                .send(entered_cx.cx(), ())
+                .expect("release auto-compaction provider");
+            compact_task.await.expect("auto-compaction task");
+
+            let events = out_rx
+                .try_iter()
+                .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "auto_compaction_start")
+                    .count(),
+                1
+            );
+            let ends = events
+                .iter()
+                .filter(|event| event["type"] == "auto_compaction_end")
+                .collect::<Vec<_>>();
+            assert_eq!(ends.len(), 1, "start must have exactly one terminal end: {events:?}");
+            assert!(
+                ends[0]["errorMessage"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Active session changed")),
+                "stale snapshot must fail closed: {ends:?}"
+            );
+            assert!(ends[0].get("result").is_none());
+            assert!(!compacting.load(Ordering::SeqCst));
+
+            let inner = session.lock(&entered_cx).await.expect("replacement session lock");
+            assert_eq!(inner.header.id, replacement_id);
+            assert_eq!(provider_compaction_count(&inner), 0);
         });
     }
 
