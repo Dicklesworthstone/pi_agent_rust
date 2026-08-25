@@ -15931,6 +15931,8 @@ mod tests {
         /// When true, the request after the repaired tool result drops
         /// mid-stream once so retry cleanup can be exercised.
         fail_after_tool_once: bool,
+        /// Optional mutation-sensitive assertion for the resumed request.
+        expected_retry_thinking: Option<crate::model::ThinkingLevel>,
     }
 
     #[async_trait]
@@ -15949,9 +15951,18 @@ mod tests {
         async fn stream(
             &self,
             context: &Context<'_>,
-            _options: &StreamOptions,
+            options: &StreamOptions,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
             let call_number = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call_number >= 2
+                && let Some(expected) = self.expected_retry_thinking
+            {
+                assert_eq!(
+                    options.thinking_level,
+                    Some(expected),
+                    "retry must preserve the original turn's magic-keyword effort"
+                );
+            }
             let make = |content: Vec<ContentBlock>, reason: StopReason| AssistantMessage {
                 content,
                 api: "test-api".to_string(),
@@ -16028,6 +16039,7 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
             model_id: "qwen3-mock",
             fail_after_tool_once: false,
+            expected_retry_thinking: None,
         });
         let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
         let mut agent = Agent::new(provider, tools, AgentConfig::default());
@@ -16108,6 +16120,7 @@ mod tests {
                     calls: std::sync::atomic::AtomicUsize::new(0),
                     model_id,
                     fail_after_tool_once: false,
+                    expected_retry_thinking: None,
                 });
                 let control_tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
                 let mut control_agent = Agent::new(
@@ -16159,6 +16172,7 @@ mod tests {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 model_id: "qwen3-mock",
                 fail_after_tool_once: false,
+                expected_retry_thinking: None,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let mut agent = Agent::new(provider, tools, AgentConfig::default());
@@ -16267,6 +16281,7 @@ mod tests {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 model_id: "qwen3-mock",
                 fail_after_tool_once: false,
+                expected_retry_thinking: None,
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let mut agent = Agent::new(provider, tools, AgentConfig::default());
@@ -16334,6 +16349,7 @@ mod tests {
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 model_id: "qwen3-mock",
                 fail_after_tool_once: true,
+                expected_retry_thinking: Some(crate::model::ThinkingLevel::High),
             });
             let tools = ToolRegistry::new(&["read"], temp.path(), None);
             let mut agent = Agent::new(
@@ -16342,6 +16358,7 @@ mod tests {
                 AgentConfig::default(),
             );
             agent.set_tool_call_dialect(crate::dialects::Dialect::Xmlish);
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
             let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
                 temp.path().join("retry-sessions"),
             ))));
