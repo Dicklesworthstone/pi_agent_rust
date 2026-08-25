@@ -6630,7 +6630,9 @@ mod tests {
         // Stay above the 200k model window so auto-compaction triggers, but
         // below the 400k forced-local threshold so a broken summary provider
         // cannot make these persistence tests pass through the fallback path.
-        for (index, tokens) in [110_000, 120_000].into_iter().enumerate() {
+        // Provider usage is cumulative, so the latest assistant usage must
+        // itself cross the trigger; the earlier value plants realistic growth.
+        for (index, tokens) in [110_000, 230_000].into_iter().enumerate() {
             session.append_message(crate::session::SessionMessage::User {
                 content: UserContent::Text(format!("user turn {index}")),
                 timestamp: Some(0),
@@ -6665,7 +6667,11 @@ mod tests {
         session: Session,
         save_enabled: bool,
         runtime_handle: RuntimeHandle,
-    ) -> (Vec<Value>, Arc<asupersync::sync::Mutex<Session>>) {
+    ) -> (
+        Vec<Value>,
+        Arc<asupersync::sync::Mutex<Session>>,
+        crate::session::AutosaveQueueMetrics,
+    ) {
         let mut model = dummy_entry("test-model", false);
         model.model.provider = "test-provider".to_string();
         let provider: Arc<dyn Provider> = Arc::new(CompactionSummaryProvider);
@@ -6680,9 +6686,9 @@ mod tests {
                 ..AgentConfig::default()
             },
         );
-        let inner_session = Arc::new(asupersync::sync::Mutex::new(
-            seed_auto_compaction_session(session),
-        ));
+        let seeded_session = seed_auto_compaction_session(session);
+        let metrics_before = seeded_session.autosave_metrics();
+        let inner_session = Arc::new(asupersync::sync::Mutex::new(seeded_session));
         let agent_session = AgentSession::new(
             agent,
             Arc::clone(&inner_session),
@@ -6720,7 +6726,21 @@ mod tests {
             .try_iter()
             .map(|line| serde_json::from_str::<Value>(&line).expect("event json"))
             .collect();
-        (events, inner_session)
+        (events, inner_session, metrics_before)
+    }
+
+    fn provider_compaction_count(session: &Session) -> usize {
+        session
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry,
+                    crate::session::SessionEntry::Compaction(compaction)
+                        if compaction.summary == "causal auto-compaction summary"
+                )
+            })
+            .count()
     }
 
     #[derive(Debug, Clone)]
@@ -9164,7 +9184,7 @@ export default function init(pi) {
         let runtime_handle = runtime.handle();
 
         runtime.block_on(async move {
-            let (events, session) = run_auto_compaction_persistence_case(
+            let (events, session, metrics_before) = run_auto_compaction_persistence_case(
                 Session::in_memory(),
                 false,
                 runtime_handle,
@@ -9190,20 +9210,84 @@ export default function init(pi) {
 
             let cx = asupersync::Cx::for_testing();
             let session = session.lock(&cx).await.expect("lock compacted session");
-            assert!(
-                session
-                    .entries_for_current_path()
-                    .iter()
-                    .any(|entry| matches!(
-                        entry,
-                        crate::session::SessionEntry::Compaction(compaction)
-                            if compaction.summary == "causal auto-compaction summary"
-                    )),
+            assert_eq!(
+                provider_compaction_count(&session),
+                1,
                 "the reported result must correspond to the provider-backed compaction mutation"
             );
-            assert!(
-                session.autosave_metrics().pending_mutations > 0,
-                "disabled persistence must leave the in-memory mutation observable"
+            let metrics_after = session.autosave_metrics();
+            assert_eq!(
+                metrics_after.pending_mutations,
+                metrics_before.pending_mutations + 1,
+                "disabled persistence must retain the new compaction mutation"
+            );
+            assert_eq!(
+                metrics_after.coalesced_mutations,
+                metrics_before.coalesced_mutations + 1,
+                "compaction must enqueue exactly one new autosave mutation"
+            );
+            assert_eq!(
+                metrics_after.flush_started, metrics_before.flush_started,
+                "disabled persistence must not claim a flush attempt"
+            );
+        });
+    }
+
+    #[test]
+    fn auto_compaction_persistence_success_reopens_provider_summary() {
+        let runtime = asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 1)
+            .build()
+            .expect("runtime build");
+        let runtime_handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let session_root = tempfile::tempdir().expect("tempdir");
+            let session = Session::create_with_dir(Some(session_root.path().to_path_buf()));
+            let (events, session, metrics_before) =
+                run_auto_compaction_persistence_case(session, true, runtime_handle).await;
+            let end = events
+                .iter()
+                .find(|event| event["type"] == "auto_compaction_end")
+                .expect("auto_compaction_end");
+            assert_eq!(end["result"]["persisted"], true);
+            assert_eq!(
+                end["result"]["persistenceStatus"]["event"],
+                "session.persistence.healthy"
+            );
+            assert_eq!(
+                end["result"]["persistenceStatus"]["pendingMessageCount"],
+                0
+            );
+
+            let cx = asupersync::Cx::for_testing();
+            let session = session.lock(&cx).await.expect("lock persisted session");
+            assert_eq!(provider_compaction_count(&session), 1);
+            let metrics_after = session.autosave_metrics();
+            assert_eq!(metrics_after.pending_mutations, 0);
+            assert_eq!(
+                metrics_after.coalesced_mutations,
+                metrics_before.coalesced_mutations + 1
+            );
+            assert_eq!(
+                metrics_after.flush_started,
+                metrics_before.flush_started + 1
+            );
+            assert_eq!(
+                metrics_after.flush_succeeded,
+                metrics_before.flush_succeeded + 1
+            );
+            assert_eq!(metrics_after.flush_failed, metrics_before.flush_failed);
+            let path = session.path.clone().expect("persisted session path");
+            drop(session);
+
+            let reopened = Session::open(path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen persisted session");
+            assert_eq!(
+                provider_compaction_count(&reopened),
+                1,
+                "durable bytes must contain exactly one provider-backed compaction"
             );
         });
     }
@@ -9221,7 +9305,7 @@ export default function init(pi) {
             let blocked_session_dir = blocked_root.path().join("not-a-directory");
             std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
             let session = Session::create_with_dir(Some(blocked_session_dir));
-            let (events, session) =
+            let (events, session, metrics_before) =
                 run_auto_compaction_persistence_case(session, true, runtime_handle).await;
             let end = events
                 .iter()
@@ -9240,20 +9324,33 @@ export default function init(pi) {
 
             let cx = asupersync::Cx::for_testing();
             let session = session.lock(&cx).await.expect("lock failed-save session");
-            assert!(
-                session
-                    .entries_for_current_path()
-                    .iter()
-                    .any(|entry| matches!(
-                        entry,
-                        crate::session::SessionEntry::Compaction(compaction)
-                            if compaction.summary == "causal auto-compaction summary"
-                    )),
+            assert_eq!(
+                provider_compaction_count(&session),
+                1,
                 "the persistence error must occur after the provider-backed compaction mutation"
             );
-            assert!(
-                session.autosave_metrics().pending_mutations > 0,
-                "failed persistence must retain retryable pending mutations"
+            let metrics_after = session.autosave_metrics();
+            assert_eq!(
+                metrics_after.pending_mutations,
+                metrics_before.pending_mutations + 1,
+                "failed persistence must retain the new retryable mutation"
+            );
+            assert_eq!(
+                metrics_after.coalesced_mutations,
+                metrics_before.coalesced_mutations + 1,
+                "compaction must enqueue exactly one new autosave mutation"
+            );
+            assert_eq!(
+                metrics_after.flush_started,
+                metrics_before.flush_started + 1
+            );
+            assert_eq!(
+                metrics_after.flush_failed,
+                metrics_before.flush_failed + 1
+            );
+            assert_eq!(
+                metrics_after.flush_succeeded, metrics_before.flush_succeeded,
+                "failed persistence must not claim a successful flush"
             );
         });
     }

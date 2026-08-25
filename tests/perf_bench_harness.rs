@@ -6,9 +6,10 @@
 //! fingerprint for repeatable, machine-readable performance tracking.
 //!
 //! Environment variables:
-//!   BENCH_QUICK=1          — PR-safe subset (3 extensions, fewer iterations)
-//!   BENCH_ITERATIONS=N     — Override iterations per scenario (default: 20/5)
-//!   BENCH_OUTPUT_DIR=path  — Override JSONL output directory
+//!   BENCH_QUICK=1                  — PR-safe subset (3 extensions, fewer iterations)
+//!   BENCH_ITERATIONS=N             — Override iterations per scenario (default: 20/5)
+//!   BENCH_OUTPUT_DIR=path          — Override JSONL output directory
+//!   BENCH_OUTPUT_TARGET_SUBDIR=dir — Write below the active Cargo target directory
 //!
 //! Run:
 //!   cargo test --test perf_bench_harness -- --nocapture
@@ -25,7 +26,7 @@ mod common;
 
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -52,19 +53,55 @@ fn iterations_override() -> Option<usize> {
         .and_then(|v| v.parse().ok())
 }
 
+fn cargo_target_dir() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+            PathBuf::from,
+        )
+}
+
+fn resolve_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf, String> {
+    if subdir.as_os_str().is_empty()
+        || subdir.is_absolute()
+        || !subdir
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(format!(
+            "BENCH_OUTPUT_TARGET_SUBDIR must be a non-empty, normalized relative path: {}",
+            subdir.display()
+        ));
+    }
+    Ok(target_dir.join(subdir))
+}
+
 fn output_dir() -> PathBuf {
+    if let Some(subdir) = std::env::var_os("BENCH_OUTPUT_TARGET_SUBDIR") {
+        return resolve_target_output_dir(&cargo_target_dir(), Path::new(&subdir))
+            .unwrap_or_else(|message| panic!("{message}"));
+    }
+
     std::env::var("BENCH_OUTPUT_DIR").ok().map_or_else(
-        || {
-            std::env::var_os("CARGO_TARGET_DIR")
-                .filter(|value| !value.is_empty())
-                .map_or_else(
-                    || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
-                    PathBuf::from,
-                )
-                .join("perf")
-        },
+        || cargo_target_dir().join("perf"),
         PathBuf::from,
     )
+}
+
+#[test]
+fn target_output_subdir_is_confined_to_cargo_target_dir() {
+    let target_dir = Path::new("target-root");
+    assert_eq!(
+        resolve_target_output_dir(target_dir, Path::new("nextest/pi-perf/run-1")),
+        Ok(PathBuf::from("target-root/nextest/pi-perf/run-1"))
+    );
+    for unsafe_path in ["", ".", "../outside", "nextest/../../outside", "/absolute"] {
+        assert!(
+            resolve_target_output_dir(target_dir, Path::new(unsafe_path)).is_err(),
+            "unsafe target-relative output path should be rejected: {unsafe_path}"
+        );
+    }
 }
 
 fn artifacts_dir() -> PathBuf {
