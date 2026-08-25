@@ -920,11 +920,15 @@ fn harness_config() -> HarnessConfig {
         FULL_EXTENSIONS.iter().map(|s| (*s).to_string()).collect()
     };
 
-    // Filter to extensions that actually exist.
-    let extensions: Vec<String> = extensions
-        .into_iter()
-        .filter(|name| find_entry_path(name).is_some())
+    let missing_extensions: Vec<&str> = extensions
+        .iter()
+        .filter(|name| find_entry_path(name).is_none())
+        .map(String::as_str)
         .collect();
+    assert!(
+        missing_extensions.is_empty(),
+        "selected benchmark extensions are missing entry files: {missing_extensions:?}"
+    );
 
     HarnessConfig {
         extensions,
@@ -987,17 +991,19 @@ fn bench_extension_scenarios() {
     let mut records: Vec<BenchRecord> = Vec::new();
 
     for ext_name in &config.extensions {
-        let Some(entry_path) = find_entry_path(ext_name) else {
-            eprintln!("[bench] SKIP {ext_name}: no entry file found");
-            continue;
-        };
+        let entry_path = find_entry_path(ext_name).unwrap_or_else(|| {
+            panic!("selected benchmark extension disappeared before execution: {ext_name}")
+        });
 
         let cwd = cwd_root.join(ext_name);
         std::fs::create_dir_all(&cwd).expect("create isolated extension benchmark cwd");
 
         // ── Cold Start ──
         {
-            let samples = run_cold_start(ext_name, &entry_path, &cwd, config.cold_iterations);
+            let sample_batch =
+                run_cold_start(ext_name, &entry_path, &cwd, config.cold_iterations);
+            let samples = validate_complete_samples("cold_start", ext_name, &sample_batch)
+                .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
@@ -1016,7 +1022,7 @@ fn bench_extension_scenarios() {
                 source_dirty: env.source_dirty,
                 scenario: "cold_start".to_string(),
                 extension: ext_name.clone(),
-                runs: summary.count,
+                runs: sample_batch.attempted,
                 per_call_us: if summary.count > 0 {
                     samples.iter().sum::<f64>() / summary.count as f64
                 } else {
@@ -1036,7 +1042,10 @@ fn bench_extension_scenarios() {
 
         // ── Warm Start ──
         {
-            let samples = run_warm_start(ext_name, &entry_path, &cwd, config.warm_iterations);
+            let sample_batch =
+                run_warm_start(ext_name, &entry_path, &cwd, config.warm_iterations);
+            let samples = validate_complete_samples("warm_start", ext_name, &sample_batch)
+                .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
@@ -1055,7 +1064,7 @@ fn bench_extension_scenarios() {
                 source_dirty: env.source_dirty,
                 scenario: "warm_start".to_string(),
                 extension: ext_name.clone(),
-                runs: summary.count,
+                runs: sample_batch.attempted,
                 per_call_us: if summary.count > 0 {
                     samples.iter().sum::<f64>() / summary.count as f64
                 } else {
@@ -1078,7 +1087,10 @@ fn bench_extension_scenarios() {
         // zero-count rows for extensions with no matching tool would mislabel a
         // no-op/error path as a dispatch measurement.
         if ext_name == "hello" {
-            let samples = run_tool_call(ext_name, &entry_path, &cwd, config.tool_iterations);
+            let sample_batch =
+                run_tool_call(ext_name, &entry_path, &cwd, config.tool_iterations);
+            let samples = validate_complete_samples("tool_call", ext_name, &sample_batch)
+                .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
@@ -1097,7 +1109,7 @@ fn bench_extension_scenarios() {
                 source_dirty: env.source_dirty,
                 scenario: "tool_call".to_string(),
                 extension: ext_name.clone(),
-                runs: summary.count,
+                runs: sample_batch.attempted,
                 per_call_us: if summary.count > 0 {
                     samples.iter().sum::<f64>() / summary.count as f64
                 } else {
@@ -1118,7 +1130,10 @@ fn bench_extension_scenarios() {
         // ── Event Hook Dispatch ──
         // `pirate` is the fixture in this set that registers before_agent_start.
         if ext_name == "pirate" {
-            let samples = run_event_dispatch(ext_name, &entry_path, &cwd, config.event_iterations);
+            let sample_batch =
+                run_event_dispatch(ext_name, &entry_path, &cwd, config.event_iterations);
+            let samples = validate_complete_samples("event_hook", ext_name, &sample_batch)
+                .unwrap_or_else(|message| panic!("{message}"));
             let summary = compute_summary(&samples);
             let total_elapsed: f64 = samples.iter().sum::<f64>() / 1000.0;
 
@@ -1137,7 +1152,7 @@ fn bench_extension_scenarios() {
                 source_dirty: env.source_dirty,
                 scenario: "event_hook".to_string(),
                 extension: ext_name.clone(),
-                runs: summary.count,
+                runs: sample_batch.attempted,
                 per_call_us: if summary.count > 0 {
                     samples.iter().sum::<f64>() / summary.count as f64
                 } else {
@@ -1166,10 +1181,10 @@ fn bench_extension_scenarios() {
         .collect::<Vec<_>>()
         .join("\n");
     let jsonl = format!("{jsonl}\n");
-    let validated_record_count =
-        validate_bench_jsonl(&jsonl).expect("validate generated extension benchmark JSONL");
+    let validated_record_count = validate_bench_jsonl(&jsonl, &config.extensions)
+        .expect("validate generated extension benchmark JSONL");
     assert_eq!(validated_record_count, records.len());
-    std::fs::write(&jsonl_path, jsonl).expect("write extension_bench.jsonl");
+    write_new_artifact(&jsonl_path, jsonl.as_bytes()).expect("write new extension_bench.jsonl");
 
     // ── Write summary ──
     let scenarios = ["cold_start", "warm_start", "tool_call", "event_hook"];
@@ -1210,7 +1225,8 @@ fn bench_extension_scenarios() {
     }
 
     let summary_path = out_dir.join("extension_bench_summary.md");
-    std::fs::write(&summary_path, &summary_text).expect("write summary");
+    write_new_artifact(&summary_path, summary_text.as_bytes())
+        .expect("write new extension benchmark summary");
 
     // ── Print final summary ──
     eprintln!("══════════════════════════════════════════════════════════");
