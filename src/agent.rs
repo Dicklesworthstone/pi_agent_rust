@@ -2434,15 +2434,16 @@ impl Agent {
 
         // Delivery boundary: ordinary continuation starts with steering; the
         // RPC late-follow-up repair explicitly starts with follow-ups instead.
-        let mut initial_follow_up_staged = false;
+        let mut follow_up_staged = false;
+        let mut required_initial_follow_up_pending = initial_follow_up;
         let mut pending_messages = if initial_follow_up {
             self.fetch_initial_follow_up_messages().await;
-            initial_follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
+            follow_up_staged = self.message_queue.follow_up_batch_len() > 0;
             Vec::new()
         } else {
             self.drain_steering_messages().await
         };
-        if initial_follow_up && !initial_follow_up_staged {
+        if initial_follow_up && !follow_up_staged {
             return Err(Error::session(
                 "accepted follow-up was unavailable at continuation boundary",
             ));
@@ -2461,7 +2462,7 @@ impl Agent {
             let mut steering_after_tools: Option<Vec<QueuedAgentMessage>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if !initial_follow_up_staged
+                if !required_initial_follow_up_pending
                     && let Some(cap) = max_time
                     && run_started.elapsed() >= cap
                 {
@@ -2499,10 +2500,13 @@ impl Agent {
                     .await;
                 on_event(turn_start_event);
 
-                let delivering_initial_follow_up = initial_follow_up_staged;
-                if delivering_initial_follow_up {
+                let delivering_follow_up = follow_up_staged;
+                let delivering_required_initial_follow_up =
+                    delivering_follow_up && required_initial_follow_up_pending;
+                if delivering_follow_up {
                     pending_messages = self.message_queue.pop_follow_up();
-                    initial_follow_up_staged = false;
+                    follow_up_staged = false;
+                    required_initial_follow_up_pending = false;
                 }
 
                 for delivery in std::mem::take(&mut pending_messages) {
@@ -2531,7 +2535,7 @@ impl Agent {
                     new_messages.push(message);
                 }
 
-                if delivering_initial_follow_up
+                if delivering_required_initial_follow_up
                     && let Some(on_ready) = initial_queue_ready.take()
                     && !on_ready()
                 {
@@ -2914,11 +2918,10 @@ impl Agent {
             }
 
             // Delivery boundary: agent idle (after all tool calls + steering).
-            let follow_up = self.drain_follow_up_messages().await;
-            if follow_up.is_empty() {
+            follow_up_staged = self.stage_follow_up_messages().await;
+            if !follow_up_staged {
                 break;
             }
-            pending_messages = follow_up;
         }
 
         let Some(final_arc) = last_assistant else {
@@ -3068,24 +3071,26 @@ impl Agent {
         self.message_queue.pop_steering()
     }
 
-    async fn drain_follow_up_messages(&mut self) -> Vec<QueuedAgentMessage> {
-        let queued = self.message_queue.pop_follow_up();
-        if !queued.is_empty() {
-            return queued;
+    async fn stage_follow_up_messages(&mut self) -> bool {
+        if self.message_queue.follow_up_batch_len() > 0 {
+            return true;
         }
 
         let owning_surface = self
             .fetch_messages(self.initial_follow_up_fetcher.as_ref())
             .await;
         if !owning_surface.is_empty() {
-            // The owning surface already applied its queue mode and admission
-            // bound, so deliver its batch directly instead of truncating it to
-            // the smaller internal producer-queue limit.
-            return owning_surface;
+            for message in owning_surface {
+                // The owning surface already applied its queue mode and
+                // admission bound. Preserve its complete accepted batch until
+                // the synchronous delivery point after TurnStart.
+                self.message_queue.push_follow_up_lossless(message);
+            }
+            return true;
         }
 
         self.fetch_additive_follow_up_messages().await;
-        self.message_queue.pop_follow_up()
+        self.message_queue.follow_up_batch_len() > 0
     }
 
     async fn fetch_additive_follow_up_messages(&mut self) {
@@ -14133,6 +14138,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn continuation_follow_up_first_precedes_provider_and_later_steering() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
@@ -14200,20 +14206,23 @@ mod tests {
                 .await
                 .expect("follow-up-first continuation");
 
-            let calls = match calls.lock() {
-                Ok(calls) => calls,
-                Err(poisoned) => poisoned.into_inner(),
+            let recorded_calls = {
+                let guard = match calls.lock() {
+                    Ok(calls) => calls,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.clone()
             };
             assert_eq!(
-                calls.len(),
+                recorded_calls.len(),
                 2,
                 "initial follow-up and later steering must each drive one provider request"
             );
-            assert_eq!(calls[0].messages.len(), 2);
-            assert_user_text(&calls[0].messages[0], first_visible);
-            assert_user_text(&calls[0].messages[1], second_visible);
+            assert_eq!(recorded_calls[0].messages.len(), 2);
+            assert_user_text(&recorded_calls[0].messages[0], first_visible);
+            assert_user_text(&recorded_calls[0].messages[1], second_visible);
             assert!(
-                calls[0].messages.iter().all(|message| {
+                recorded_calls[0].messages.iter().all(|message| {
                     !matches!(
                         message,
                         Message::User(UserMessage { content: UserContent::Text(text), .. })
@@ -14222,7 +14231,7 @@ mod tests {
                 }),
                 "steering admitted for the resumed turn must not precede its initial follow-up"
             );
-            assert!(calls[1].messages.iter().any(|message| {
+            assert!(recorded_calls[1].messages.iter().any(|message| {
                 matches!(
                     message,
                     Message::User(UserMessage { content: UserContent::Text(text), .. })
@@ -14230,12 +14239,12 @@ mod tests {
                 )
             }));
             assert_eq!(
-                calls[0].thinking_level,
+                recorded_calls[0].thinking_level,
                 Some(crate::model::ThinkingLevel::Low),
                 "generated ultrathink bytes must remain inert"
             );
             assert!(
-                calls[0]
+                recorded_calls[0]
                     .system_prompt
                     .as_deref()
                     .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),

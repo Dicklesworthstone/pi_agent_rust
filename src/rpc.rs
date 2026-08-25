@@ -3028,11 +3028,7 @@ async fn run_prompt_with_retry(
                 // below; every completed tool cycle stays on the path, so the
                 // retry re-issues only the failed provider request — no tool
                 // re-execution, no re-billing of prior work (pi_agent_rust#125).
-                if !follow_up_first {
-                    guard
-                        .run_continue_with_abort(Some(abort_signal), event_handler)
-                        .await
-                } else {
+                if follow_up_first {
                     let ready_linearizer = Arc::clone(&turn_phase_linearizer);
                     let ready_compacting = Arc::clone(&is_compacting);
                     let ready = Arc::new(AtomicBool::new(false));
@@ -3064,6 +3060,10 @@ async fn run_prompt_with_retry(
                         expected_follow_up_fetch = None;
                     }
                     result
+                } else {
+                    guard
+                        .run_continue_with_abort(Some(abort_signal), event_handler)
+                        .await
                 }
             } else {
                 // First attempt: add the user message and run the turn.
@@ -3142,12 +3142,12 @@ async fn run_prompt_with_retry(
                 } else {
                     let late_queued_input =
                         match OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx).await {
-                        Ok(state) if !state.steering.is_empty() => Some((false, None)),
-                        Ok(state) if !state.follow_up.is_empty() => {
-                            let generation = Arc::clone(&state.follow_up_fetch_generation);
-                            let expected = generation.load(Ordering::SeqCst).wrapping_add(1);
-                            Some((true, Some((generation, expected))))
-                        }
+                            Ok(state) if !state.steering.is_empty() => Some((false, None)),
+                            Ok(state) if !state.follow_up.is_empty() => {
+                                let generation = Arc::clone(&state.follow_up_fetch_generation);
+                                let expected = generation.load(Ordering::SeqCst).wrapping_add(1);
+                                Some((true, Some((generation, expected))))
+                            }
                             Ok(_) => None,
                             Err(err) => {
                                 final_error =
