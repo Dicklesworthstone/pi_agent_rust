@@ -448,7 +448,8 @@ mod tests {
         let rendered = status_line.render(&ctx, 7);
 
         assert!(display_width(&rendered) <= 7, "rendered {rendered:?}");
-        assert!(rendered.is_char_boundary(rendered.len()));
+        assert!(rendered.ends_with("模型"), "rendered {rendered:?}");
+        assert!(!rendered.contains('🙂'), "rendered {rendered:?}");
     }
 
     #[test]
