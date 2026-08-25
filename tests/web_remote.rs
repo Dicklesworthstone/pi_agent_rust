@@ -78,7 +78,7 @@ fn test_web_client_authentication_and_capacity() {
     let v2 = manager.connect_client("viewer-2", "127.0.0.1:4003", Some("tok-beta"));
     let v3 = manager.connect_client("viewer-3", "127.0.0.1:4004", Some("tok-gamma"));
     assert!(v2.is_ok());
-    assert!(v2.as_ref().map_or(false, |c| c.is_view_only));
+    assert!(v2.as_ref().is_ok_and(|c| c.is_view_only));
     assert!(v3.is_ok());
 
     // Viewer 2 cannot request control because it is view-only
@@ -91,7 +91,7 @@ fn test_web_client_authentication_and_capacity() {
     assert!(
         v4.as_ref()
             .err()
-            .map_or(false, |e| e.contains("maximum viewer capacity"))
+            .is_some_and(|e| e.contains("maximum viewer capacity"))
     );
 
     finish_case(&harness, "web_client_auth_capacity");

@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::similar_names)]
 
 mod common;
 

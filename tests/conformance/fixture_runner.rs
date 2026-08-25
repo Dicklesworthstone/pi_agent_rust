@@ -2,6 +2,14 @@
 //!
 //! This module provides the infrastructure to run tests defined in JSON fixture files.
 
+#![allow(
+    clippy::unnecessary_literal_bound,
+    clippy::similar_names,
+    clippy::too_many_lines,
+    clippy::items_after_statements,
+    clippy::doc_markdown
+)]
+
 use crate::conformance::{
     FixtureFile, SetupStep, TestCase, TestResult, validate_expected_with_goldens,
 };

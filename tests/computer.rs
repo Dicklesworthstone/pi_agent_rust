@@ -64,7 +64,7 @@ fn test_computer_list_displays() {
 
         let details = output.details.as_ref().expect("details present");
         assert!(details["displays"].is_array());
-        assert_eq!(details["displays"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(details["displays"].as_array().map(Vec::len), Some(2));
     });
 
     finish_case(&harness, "computer_list_displays");
@@ -90,7 +90,7 @@ fn test_computer_list_windows() {
 
         let details = output.details.as_ref().expect("details present");
         assert!(details["windows"].is_array());
-        assert_eq!(details["windows"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(details["windows"].as_array().map(Vec::len), Some(2));
     });
 
     finish_case(&harness, "computer_list_windows");
@@ -343,12 +343,14 @@ fn test_computer_default_gated_off() {
 #[test]
 fn test_computer_opt_in_activation() {
     let harness = TestHarness::new("computer_opt_in");
-    let mut config = Config::default();
-    config.computer = Some(ComputerSettings {
-        enable_computer: Some(true),
-        require_approval: Some(true),
-        screenshot_dir: Some("screenshots".to_string()),
-    });
+    let config = Config {
+        computer: Some(ComputerSettings {
+            enable_computer: Some(true),
+            require_approval: Some(true),
+            screenshot_dir: Some("screenshots".to_string()),
+        }),
+        ..Default::default()
+    };
 
     let enabled_registry =
         ToolRegistry::new(&["read", "computer"], harness.temp_dir(), Some(&config));

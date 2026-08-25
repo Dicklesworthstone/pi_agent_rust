@@ -5,13 +5,15 @@
 //! config) is owned by `scripts/e2e/run_ssh_workspace.sh`, which exports
 //! `PI_SSH_CLIENT_CONFIG_FILE`, `PI_SSH_ALLOWED_HOSTS`, and
 //! `PI_SSH_E2E_WORK`. This target then drives the REAL tool surfaces —
-//! read / write / edit / hashline_edit — through the url_router against
+//! read / write / edit / `hashline_edit` — through the `url_router` against
 //! the fixture, plus the non-allowlisted-host refusal.
 //!
 //! Scratch files live under `$PI_SSH_E2E_WORK` and are intentionally left
 //! in place (repo policy: agents never delete); the OS temp cleaner
 //! reclaims them. The crate's `unsafe_code = "forbid"` lint is honored:
 //! this target performs no environment mutation.
+
+#![allow(clippy::too_many_lines)]
 
 use std::path::{Path, PathBuf};
 mod common;
@@ -242,7 +244,7 @@ fn ssh_workspace_roundtrip_fixture_sshd() {
         logger.info(BEAD, "case=transfer-pull ok");
         let artifact_dir = std::path::PathBuf::from(
             std::env::var("E2E_ARTIFACT_DIR")
-                .unwrap_or_else(|_| format!("tests/e2e_results/ssh/local")),
+                .unwrap_or_else(|_| "tests/e2e_results/ssh/local".to_string()),
         );
         std::fs::create_dir_all(&artifact_dir).expect("artifact dir");
         logger

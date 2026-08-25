@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![allow(clippy::must_use_candidate, clippy::manual_string_new)]
 
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};

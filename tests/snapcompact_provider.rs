@@ -45,6 +45,7 @@ impl Provider for CapturingProvider {
     > {
         let mut guard = self.context.lock().expect("context mutex");
         *guard = Some(context.messages.to_vec());
+        drop(guard);
         Ok(Box::pin(futures::stream::empty()))
     }
 }
@@ -80,7 +81,7 @@ fn image_block_count(messages: &[Message]) -> usize {
         .filter_map(|m| match m {
             Message::User(u) => match &u.content {
                 UserContent::Blocks(blocks) => Some(blocks),
-                _ => None,
+                UserContent::Text(_) => None,
             },
             _ => None,
         })
@@ -118,7 +119,7 @@ fn vision_capable_model_receives_compaction_frames_as_image_blocks() {
         ..AgentConfig::default()
     });
     assert!(
-        messages.iter().any(|m| message_has_summary_text(m)),
+        messages.iter().any(message_has_summary_text),
         "summary text must reach the provider"
     );
     assert_eq!(
@@ -135,7 +136,7 @@ fn text_only_model_receives_no_snapcompact_frames() {
         ..AgentConfig::default()
     });
     assert!(
-        messages.iter().any(|m| message_has_summary_text(m)),
+        messages.iter().any(message_has_summary_text),
         "summary TEXT must still reach text-only providers"
     );
     assert_eq!(

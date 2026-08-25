@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::similar_names
+)]
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -505,13 +516,13 @@ fn main() -> Result<()> {
             let mut shifts = 0;
 
             for series in &series_input.series {
-                let analysis = analyze_series_drift(series, &config)?;
-                match analysis.drift_status.as_str() {
+                let item_analysis = analyze_series_drift(series, &config)?;
+                match item_analysis.drift_status.as_str() {
                     "HEALTHY" => healthy += 1,
                     "DRIFT_WARNING" => warnings += 1,
                     _ => shifts += 1,
                 }
-                analyses.push(analysis);
+                analyses.push(item_analysis);
             }
 
             let overall_status = if shifts > 0 {

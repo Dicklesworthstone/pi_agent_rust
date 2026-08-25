@@ -11,6 +11,7 @@
     clippy::cast_possible_truncation,
     clippy::doc_markdown,
     clippy::too_many_lines,
+    clippy::literal_string_with_formatting_args,
     dead_code
 )]
 

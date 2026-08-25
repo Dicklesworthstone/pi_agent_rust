@@ -3,7 +3,7 @@
 //! Hardware PMU performance profiling and regression budget verification CLI.
 //!
 //! Usage:
-//!   cargo run --example pmu_profile -- eval --cycles 100000 --instructions 150000 --llc-refs 2000 --llc-misses 100
+//!   cargo run --example `pmu_profile` -- eval --cycles 100000 --instructions 150000 --llc-refs 2000 --llc-misses 100
 
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand};

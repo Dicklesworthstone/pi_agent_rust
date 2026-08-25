@@ -1911,9 +1911,8 @@ async fn run(
     // /btw client mid-session against fresh on-disk credentials.
     let btw_api_key = cli.api_key.clone();
     let btw_factory: pi::btw::BtwClientFactory = std::sync::Arc::new(move |entry| {
-        let auth = match pi::auth::AuthStorage::load(pi::config::Config::auth_path()) {
-            Ok(auth) => auth,
-            Err(_) => return None,
+        let Ok(auth) = pi::auth::AuthStorage::load(pi::config::Config::auth_path()) else {
+            return None;
         };
         pi::btw::BtwClient::for_model_entry(entry, btw_api_key.as_deref(), &auth)
     });
@@ -2647,10 +2646,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 pi::web_remote::TokenKind::Steer,
             );
             println!(
-                "Pi Agent Web Remote server listening on {}:{} (view_only={})",
-                bind, port, view_only
+                "Pi Agent Web Remote server listening on {bind}:{port} (view_only={view_only})"
             );
-            println!("Web client interface: http://127.0.0.1:{}", port);
+            println!("Web client interface: http://127.0.0.1:{port}");
             println!("Pairing token: {}", token.token);
         }
         cli::Commands::Gallery { format } => {

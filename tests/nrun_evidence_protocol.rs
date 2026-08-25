@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines,
+    clippy::float_cmp,
+    clippy::redundant_clone
+)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

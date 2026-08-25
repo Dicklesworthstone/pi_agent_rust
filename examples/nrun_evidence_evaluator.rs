@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_lossless,
+    clippy::must_use_candidate,
+    clippy::missing_const_for_fn,
+    clippy::too_many_lines
+)]
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -186,6 +196,12 @@ pub fn calculate_n_eff(samples: &[NRunSample]) -> Result<f64> {
     Ok((sum_w * sum_w) / sum_w_sq)
 }
 
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 pub fn compute_bootstrap_ci95(
     samples: &[NRunSample],
     resamples: usize,
@@ -346,6 +362,8 @@ impl std::fmt::Display for NRunIssue<'_> {
     }
 }
 
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn verify_nrun_artifact(
     artifact: &NRunBudgetEvaluationArtifact,
     contract_path: &Path,

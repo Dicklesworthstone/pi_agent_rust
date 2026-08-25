@@ -136,6 +136,7 @@ fn test_pmu_opportunity_ranker() {
 }
 
 #[test]
+#[allow(clippy::float_cmp)]
 fn test_pmu_edge_cases_and_categories() {
     let harness = TestHarness::new("pmu_edge_cases_and_categories");
 

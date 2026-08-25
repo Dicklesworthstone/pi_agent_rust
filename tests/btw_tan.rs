@@ -36,10 +36,6 @@ fn test_btw_ephemeral_prompt_and_isolation() {
     assert!(BTW_SYSTEM_PROMPT.contains("NEVER use tools"));
     assert!(BTW_SYSTEM_PROMPT.contains("NEVER ask follow-up questions"));
 
-    // Verify /btw format with empty context
-    let q = "What is the capital of France?";
-    assert!(!q.is_empty());
-
     finish_case(&harness, "btw_ephemeral_isolation");
 }
 
@@ -168,13 +164,13 @@ fn e2e_tan_runs_in_background_and_delivers_at_next_turn_boundary() {
                 "api": "openai-completions",
                 "baseUrl": format!("{}/parent/v1", server.base_url()),
                 "apiKey": "test-key",
-                "models": [{"id": "parent-model", "contextWindow": 128000}]
+                "models": [{"id": "parent-model", "contextWindow": 128_000}]
             },
             "tan-role": {
                 "api": "openai-completions",
                 "baseUrl": format!("{}/tan-role/v1", server.base_url()),
                 "apiKey": "test-key",
-                "models": [{"id": "task-model", "contextWindow": 128000}]
+                "models": [{"id": "task-model", "contextWindow": 128_000}]
             }
         }
     });

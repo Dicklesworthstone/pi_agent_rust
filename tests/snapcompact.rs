@@ -12,6 +12,8 @@ use pi::compaction_snap::{
     frames_from_details, png_encode, render_frames, strip_snapcompact_images,
 };
 use pi::model::{ContentBlock, ImageContent, Message, TextContent, UserContent, UserMessage};
+use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 
 const FRAME_WIDTH: u32 = 960;
 
@@ -65,10 +67,15 @@ const GOLDEN_SHA256: &str = "22a1e7ee20b254d1a4859f1b08c3c45244ba7412b218c08c1b5
 fn golden_hash_matches_committed_renderer_output() {
     let small = render_frames("[User]: golden\n");
     assert_eq!(small.len(), 1);
-    use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(small[0].png.as_bytes());
-    let digest: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let digest: String = h
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        });
     assert_eq!(
         digest, GOLDEN_SHA256,
         "renderer output drifted from committed golden"
@@ -212,7 +219,7 @@ fn attach_frames_places_images_after_text_block() {
     match attach_frames(base_summary_message(), None) {
         Message::User(u) => match u.content {
             UserContent::Text(t) => assert_eq!(t, summary_body_text()),
-            other => panic!("expected plain text content, got {other:?}"),
+            other @ UserContent::Blocks(_) => panic!("expected plain text content, got {other:?}"),
         },
         _ => panic!("expected user message"),
     }

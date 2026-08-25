@@ -33,10 +33,7 @@ fn test_resume_latency_and_tail_read() {
 
     let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "open store");
-    let mut store = match store_res {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let Ok(mut store) = store_res else { return };
 
     // Populate 50 entries
     for i in 1..=50 {
@@ -84,10 +81,7 @@ fn test_fork_and_export_snapshot_consistency() {
 
     let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "open origin store");
-    let mut store = match store_res {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let Ok(mut store) = store_res else { return };
 
     // Append 20 entries
     for i in 1..=20 {
@@ -148,8 +142,7 @@ fn test_fork_and_export_snapshot_consistency() {
     assert!(export_res.is_ok(), "export snapshot");
 
     let exported_content = std::fs::read_to_string(&export_file).unwrap_or_default();
-    let exported_lines: Vec<&str> = exported_content.lines().collect();
-    assert_eq!(exported_lines.len(), 20);
+    assert_eq!(exported_content.lines().count(), 20);
 
     harness.log().info(
         "perf",
@@ -167,10 +160,7 @@ fn test_fork_and_export_nonexistent_checkpoint() {
 
     let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "create store");
-    let store = match store_res {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let Ok(store) = store_res else { return };
 
     let fork_dir = harness.temp_path("session_v2_invalid_fork");
     let fork_res = store.fork_at_checkpoint(&fork_dir, 999);
@@ -197,10 +187,7 @@ fn test_fork_preserves_lineage_and_supports_independent_branching() {
 
     let store_res = SessionStoreV2::create(&store_dir, MAX_SEGMENT_BYTES);
     assert!(store_res.is_ok(), "create origin");
-    let mut store = match store_res {
-        Ok(s) => s,
-        Err(_) => return,
-    };
+    let Ok(mut store) = store_res else { return };
 
     // Append 5 entries
     for i in 1..=5 {
