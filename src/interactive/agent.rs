@@ -2671,6 +2671,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
         let message_owned = message.to_string();
         let (message_without_refs, file_refs) = self.extract_file_references(&message_owned);
+        let keyword_scan_source = message_without_refs.trim().to_string();
         let message_for_agent = if file_refs.is_empty() {
             self.resources.expand_input(&message_owned)
         } else {
@@ -2698,7 +2699,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
             };
 
-            let keyword_scan_source = message_for_agent.clone();
             let mut text = processed.text;
             if !message_for_agent.trim().is_empty() {
                 text.push_str(&message_for_agent);
@@ -2754,6 +2754,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         self.scroll_to_bottom();
 
         let runtime_handle = self.runtime_handle.clone();
+        let keyword_scan_source = message_owned;
 
         // Spawn async task to run the agent
         let runtime_handle_for_agent = runtime_handle.clone();
@@ -2820,6 +2821,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                     }
                 };
             let previous_len = agent_guard.messages().len();
+            agent_guard.set_magic_keyword_scan_override(Some(keyword_scan_source));
 
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
