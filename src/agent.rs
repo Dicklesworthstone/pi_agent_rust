@@ -14008,6 +14008,72 @@ mod tests {
     }
 
     #[test]
+    fn continuation_initial_pending_batch_precedes_first_provider_request() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = CapturingProvider::new("openai-responses");
+            let calls = provider.calls();
+            let mut agent = Agent::new(
+                Arc::new(provider),
+                ToolRegistry::from_tools(Vec::new()),
+                AgentConfig {
+                    stream_options: StreamOptions {
+                        thinking_level: Some(crate::model::ThinkingLevel::Low),
+                        ..StreamOptions::default()
+                    },
+                    ..AgentConfig::default()
+                },
+            );
+            agent.set_keyword_max_thinking_level(crate::model::ThinkingLevel::High);
+
+            let first_visible = "expanded payload without a magic word";
+            let second_visible = "generated ultrathink payload";
+            agent
+                .run_continue_with_pending_with_abort(
+                    vec![
+                        QueuedAgentMessage::authored(
+                            user_message(first_visible),
+                            "please orchestrate this follow-up",
+                        ),
+                        QueuedAgentMessage::generated(user_message(second_visible)),
+                    ],
+                    None,
+                    |_| {},
+                )
+                .await
+                .expect("initial pending continuation");
+
+            let calls = match calls.lock() {
+                Ok(calls) => calls,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            assert_eq!(
+                calls.len(),
+                1,
+                "the initial pending batch must not be preceded by an empty provider request"
+            );
+            assert_eq!(calls[0].messages.len(), 2);
+            assert_user_text(&calls[0].messages[0], first_visible);
+            assert_user_text(&calls[0].messages[1], second_visible);
+            assert_eq!(
+                calls[0].thinking_level,
+                Some(crate::model::ThinkingLevel::Low),
+                "generated ultrathink bytes must remain inert"
+            );
+            assert!(
+                calls[0]
+                    .system_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| prompt.contains("invoked `orchestrate`")),
+                "the exact authored source must activate its directive"
+            );
+        });
+    }
+
+    #[test]
     fn fetched_message_scans_only_explicit_authored_source() {
         let runtime = RuntimeBuilder::current_thread()
             .build()
