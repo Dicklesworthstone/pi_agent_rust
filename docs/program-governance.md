@@ -31,21 +31,25 @@ maintenance cadence for the Pi extension platform.
 
 ## Quality Gates
 
-### CI Gates (Enforced on Every PR)
+### DSR Quality Gates (Required Before Integration and Release)
 
 | Gate | Threshold | Enforcement |
 |------|-----------|-------------|
-| `cargo fmt` | Zero diff | `.github/workflows/ci.yml` |
-| `cargo clippy -D warnings` | Zero warnings | `.github/workflows/ci.yml` |
-| Unit tests | 100% pass | `.github/workflows/ci.yml` |
-| VCR/fixture tests | 100% pass | `.github/workflows/ci.yml` |
-| No-mock dependency guard | Zero violations | `.github/workflows/ci.yml` |
-| Suite classification guard | All files classified | `.github/workflows/ci.yml` |
-| Traceability matrix guard | All classified tests traced | `.github/workflows/ci.yml` |
-| VCR leak guard | No cassettes in wrong suite | `.github/workflows/ci.yml` |
-| PR Definition-of-Done evidence guard | Required for feature-surface PRs | `.github/workflows/ci.yml` |
+| `cargo fmt` | Zero diff | `dsr quality pi_agent_rust` |
+| `cargo clippy -D warnings` | Zero warnings | `dsr quality pi_agent_rust` |
+| Unit tests | 100% pass | `dsr quality pi_agent_rust` |
+| VCR/fixture tests | 100% pass | DSR quality recipe |
+| No-mock dependency guard | Zero violations | DSR quality recipe |
+| Suite classification guard | All files classified | DSR quality recipe |
+| Traceability matrix guard | All classified tests traced | DSR quality recipe |
+| VCR leak guard | No cassettes in wrong suite | DSR quality recipe |
+| Definition-of-Done evidence | Required for feature-surface changes | DSR quality output |
 
-### Conformance Gates (Nightly + Release)
+GitHub Actions is permanently disabled for this repository and is never a
+quality or release authority. RCH may offload development compilation, but only
+DSR can authorize cross-platform build or release claims.
+
+### Conformance Gates (DSR Quality + Release)
 
 | Gate | Threshold | Source |
 |------|-----------|--------|
@@ -70,7 +74,7 @@ See [BENCHMARKS.md](../BENCHMARKS.md) for full budget definitions.
 ### Release Gates (1.0 Criteria)
 
 Per [releasing.md](releasing.md):
-- CI green on Linux/macOS/Windows
+- DSR quality and native builds green on Linux/macOS/Windows
 - Core CLI modes stable (print + interactive + RPC)
 - Extension runtime surface and security policy stable
 - Conformance gates met at release thresholds
@@ -79,21 +83,20 @@ Per [releasing.md](releasing.md):
 
 Feature-surface PRs (runtime/provider/tooling behavior changes) are not mergeable until:
 
-1. PR body includes checked evidence for unit, e2e, and extension validation.
-2. PR body links directly to structured artifacts/logs for those runs.
-3. PR body includes reproduction commands for both passing validation and the most recent failing path.
-4. PR body contains no unresolved checklist placeholders.
+1. The change records checked evidence for unit, e2e, and extension validation.
+2. The evidence links directly to DSR or focused development output for those runs.
+3. The handoff includes reproduction commands for both passing validation and the most recent failing path.
+4. The change contains no unresolved placeholders.
 
-The canonical checklist source is `.github/pull_request_template.md`, and CI enforces it in
-the Linux PR lane.
+DSR is the enforcement authority; GitHub Actions must not be used.
 
 #### Migration Guidance for Existing Feature Branches
 
 1. Rebase on latest `main`.
 2. Replace PR body with `.github/pull_request_template.md`.
-3. Backfill evidence links from latest CI/local runs.
+3. Backfill evidence links from the latest DSR/focused development runs.
 4. Include explicit failing-path artifact links plus exact rerun commands.
-5. Re-run CI and merge only after DoD guard passes.
+5. Run the required DSR quality gate before integration.
 
 ---
 
@@ -123,8 +126,8 @@ See [releasing.md](releasing.md) for the full release process.
 
 | Task | Owner | Verification |
 |------|-------|-------------|
-| Dependency audit (`cargo audit`) | Automated | CI gate |
-| Conformance regression review | Agent triage | Nightly CI reports |
+| Dependency audit (`cargo audit`) | DSR | DSR quality gate |
+| Conformance regression review | Agent triage | DSR conformance output |
 | Bead backlog grooming | Primary maintainer | `bv --robot-plan` + `br ready --json` |
 
 ### Weekly QA Burndown (bd-1f42, as of 2026-02-10)

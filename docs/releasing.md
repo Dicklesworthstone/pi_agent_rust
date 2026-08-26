@@ -5,6 +5,18 @@ This repo ships:
 - A library crate: `pi` (Cargo `[lib].name`)
 - A binary: `pi` (Cargo `[[bin]].name`)
 
+## Binding release authority
+
+As of 2026-08-26, Doodlestein Self-Releaser (DSR) is the **only** authorized
+quality, cross-platform build, packaging, signing, publication, and release
+verification path for this repository. GitHub Actions is permanently disabled
+and must never be enabled, dispatched, rerun, cancelled, or cited as evidence.
+
+Any later description of an automated `.github/workflows/*` lane is retained
+only as historical design context. It is non-authoritative and must not be
+executed. The canonical operational path is the DSR lane in this document,
+using the registered `pi_agent_rust` recipe.
+
 The Cargo source package also retains the internal `pi_legacy_capture`
 conformance utility because integration tests execute it through
 `CARGO_BIN_EXE_pi_legacy_capture`. It is gated by the non-default
@@ -20,15 +32,21 @@ repository gates that cover the utility explicitly enable its internal feature.
 - **Coupling:** `pi_agent_rust` (crate), `pi` (lib), and `pi` (binary) are all built from the same package, so they share one version number.
 - **Sibling repos:** `asupersync`, `rich_rust`, `charmed_rust`, `frankensqlite` are versioned independently in their own repos.
 
+### Historical GitHub Actions publishing design (retired)
+
+The material in this subsection documents the former automation design. It is
+not an authorized publication path. Stable publication, when desired, must be
+performed and verified by DSR.
+
 ### Publishing to crates.io
 `.github/workflows/publish.yml` is a manual-dispatch, non-authoritative
 diagnostic. It validates an annotated tag, the exact root package identity, a
 clean frozen checkout, the release gate, and `cargo publish --dry-run --locked`.
 It has no registry secret and never publishes anything.
 
-Stable crates.io publication has exactly two authorized lanes: the automated
-`.github/workflows/release.yml` lane and the audited manual DSR lane documented
-below. No other workflow or ad hoc operator command is an authorized publisher.
+Stable crates.io publication has exactly one authorized lane: DSR. No workflow
+or ad hoc operator command is an authorized publisher. The former automated
+lane described below is historical only.
 In the automated lane, `release.yml` first creates or safely completes a
 verified GitHub draft, builds and inspects the exact `.crate` without a secret,
 then passes the crate and a source-bound checksum receipt to a fresh
@@ -51,7 +69,7 @@ under `Cargo.lock`; they do not build against arbitrary sibling repository
 checkouts. Per-target build manifests therefore record selected locked crate
 versions, registry sources, and checksums rather than unrelated repository HEADs.
 
-### Publishing GitHub Releases binaries
+### Historical GitHub Actions binary-release design (retired)
 `.github/workflows/release.yml` is triggered on tag pushes matching `v*` and will:
 - run the full frozen-SHA format/check/clippy/test and release-evidence gates
 - build `pi` for Linux/macOS/Windows and reject every native binary whose raw
@@ -68,7 +86,7 @@ versions, registry sources, and checksums rather than unrelated repository HEADs
 Release notes are extracted only from the exact `## [vX.Y.Z] ...` changelog
 heading. Ensure that exact heading exists for the tag you are cutting.
 
-### Required GitHub governance for the automated lane
+### Historical GitHub governance notes (retired)
 
 Workflow YAML cannot make tag refs immutable or turn an auto-created
 environment into a protected one. Before enabling the automated lane, an owner
@@ -232,21 +250,13 @@ Until then, `0.x` releases may still change behavior to improve correctness/pari
    - `br changelog --since-tag vX.Y.Z` (or use `--since YYYY-MM-DD` if no prior tags)
    - paste the output into `CHANGELOG.md` under a new version heading
 5) **Commit** (`git commit`).
-6) **Tag according to the selected lane**:
-   - automated: synchronize `main` and legacy `master`, create an annotated tag
-     at their shared tip, then push it
-   - manual/no-Actions: do not pre-create or push the tag here; the fail-closed
-     lane below creates it locally only after the final source is frozen, uses
-     it for the preserved raw build, and pushes it only after packaging passes
-7) **Complete exactly one publication lane**:
-   - automated: `Release (GitHub binaries)` completes the ordered draft → exact
-     stable crate → public release flow after its external governance gate passes
-   - manual/no-Actions: follow every fail-closed step below; do not dispatch,
-     rerun, or otherwise invoke a workflow
-   - optional `Publish validation (no publication)` is diagnostic only and is
-     never evidence that publication occurred
+6) **Do not pre-create or push the tag.** The fail-closed DSR lane creates it
+   locally only after the final source is frozen, uses it for native builds,
+   and pushes it only after packaging passes.
+7) **Complete the DSR publication lane below.** Do not dispatch, rerun, cancel,
+   or otherwise invoke a GitHub Actions workflow.
 
-## Manual DSR lane (no GitHub Actions)
+## Canonical DSR release lane
 
 Use this lane when the release is intentionally built and published from the
 operator hosts. It does not query, dispatch, rerun, cancel, or otherwise use a
@@ -4012,4 +4022,3 @@ For environments with older `v0.1.x` binaries installed:
 - `SHA256SUMS` matches downloaded artifacts.
 - Crates.io publish succeeded (if configured) and the version matches the tag.
 - Smoke test install paths (download binary + run `pi --version`).
-

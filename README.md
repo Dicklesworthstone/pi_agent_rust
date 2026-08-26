@@ -44,6 +44,20 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 **pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Official release archives install the single end-user binary `pi`, with streaming responses and 28 built-in tools (18 live in a default session; 13 always in the model's schema, the rest reachable through the `xdev` dispatcher).
 
+### Current product direction
+
+This project is no longer trying to be a strict drop-in replacement for the
+legacy TypeScript Pi. That target became both impractical and undesirable as
+the legacy implementation evolved. Legacy Pi remains useful historical context,
+but it is not our compatibility authority or definition of completeness.
+
+OMP is the closer reference for where the product is going: feature surface,
+agent workflows, look and feel, and overall UI/UX. Pi Rust still chooses
+Rust-native architecture and may intentionally differ from both projects when
+that produces a simpler, safer, or better coding agent. Historical drop-in and
+parity artifacts remain in the repository as records; they do not gate product
+work, releases, or user-facing claims.
+
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
 - **[rich_rust](https://github.com/Dicklesworthstone/rich_rust)**: A Rust port of [Rich](https://github.com/Textualize/rich) by [Will McGugan](https://github.com/willmcgugan), providing beautiful terminal output with markup syntax
@@ -658,10 +672,9 @@ cargo run --example ext_full_validation --
 ### Historical run snapshot (extension gate refresh 2026-05-15)
 
 These artifacts predate `v0.3.0` and do not certify the current source revision.
-Current strict drop-in status is **NOT CERTIFIED** until the active contract is
-rerun successfully from a clean release source commit and the final release ref
-contains no later non-evidence changes. The figures below are retained only as
-a dated historical snapshot.
+The strict drop-in program has been retired; its contract and verdict are no
+longer release gates and will not be rerun to define product completeness. The
+figures below are retained only as a dated engineering snapshot.
 
 The current extension must-pass corpus is the exact set selected by
 `docs/extension-inclusion-list.json`; the historical counts below do not prove
@@ -742,7 +755,9 @@ bash tests/installer_regression.sh
 
 For migration adoption, packaging and invocation compatibility follows this contract:
 
-- This section covers packaging/invocation behavior only. Strict functional-parity claims are governed by `docs/contracts/dropin-certification-contract.json` and a provenance-matched `docs/evidence/dropin-certification-verdict.json`; `docs/parity-certification.json` is informational progress evidence only. Temporary gate/budget exceptions are governed by the formal waiver ledger (`docs/contracts/waiver-ledger-contract.json` and `docs/evidence/waivers.json`) which enforces automatic re-blocking on expiry and claim copy suppression.
+- This section covers packaging and invocation behavior only. Historical
+  drop-in/parity artifacts do not define the current product or release gate.
+  Current compatibility statements must name the concrete behavior they cover.
 
 - Canonical executable name is `pi` across release assets and installer-managed installs.
 - Installer-managed installs also create an `rpi` compatibility launcher when no conflicting `rpi` command already exists on your PATH.
@@ -1120,9 +1135,10 @@ This is a second comparison pass focused on high-impact architectural deltas and
 | **Runtime context model** | Framework-level conventions and extension APIs | Explicit `AgentCx`/`asupersync::Cx` capability-scoped context threading | Make effect boundaries and testability first-class architectural constraints |
 
 Practical consequence of these deltas:
-- Extension/package workflow compatibility is an implementation goal; current coverage and gaps remain governed by the active drop-in contract and provenance-matched verdict.
-- The goal is parity with pi-mono through Rust-idiomatic patterns; current gaps
-  remain governed by the active certification contract.
+- Extension and package workflows are selected according to current user value,
+  with OMP as the closer product-surface and UX reference. Legacy pi-mono
+  behavior may be adopted selectively when it remains useful.
+- The goal is a coherent Rust-native coding agent, not parity with pi-mono.
 - The Rust SDK provides a companion API for core embedding workflows without
   requiring TypeScript-specific adaptation patterns.
 - `docs/parity-certification.json` tracks informational functional-parity progress; it does not authorize strict replacement claims.
@@ -2592,7 +2608,7 @@ Pi is honest about what it doesn't do:
 | Limitation | Workaround |
 |------------|------------|
 | **Not all provider APIs** | Built-in support is backed by 11 native provider implementation modules: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor; some ecosystem-specific APIs are still TBD |
-| **No web browsing** | Use bash with curl |
+| **Search backend availability varies** | `web_search` uses the configured ranked providers; URL-aware `read` and bash/curl remain available when a provider is unavailable |
 | **No GUI** | Terminal-only by design |
 | **Some extensions need npm stubs** | Common stubs are provided; unlisted npm packages still require a stub. See docs/planning/EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
@@ -2966,23 +2982,21 @@ rch exec -- cargo run --example variance_gate -- verify --input docs/evidence/va
 
 ### Release & Publishing
 
-Releases are tag-driven and must align with `Cargo.toml` versions.
+Releases are tag-driven, must align with `Cargo.toml` versions, and are built
+and published exclusively through Doodlestein Self-Releaser (DSR).
 
 - Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed but skip crates.io publish).
 - The tag version **must** match `package.version` in `Cargo.toml`.
 - Publish order for dependencies: `asupersync` → `rich_rust` → `charmed-*` (lipgloss, bubbletea, bubbles, glamour) → `pi_agent_rust`.
-- `.github/workflows/release.yml` owns the ordered release boundary: verified
-  GitHub draft, exact stable crate publication/reconciliation on a fresh
-  review-gated runner, then public GitHub release last. Pre-releases skip
-  crates.io. `.github/workflows/publish.yml` is a manual dry-run diagnostic;
-  it has no registry secret and never publishes.
-- The no-Actions DSR lane is specified in [docs/releasing.md](docs/releasing.md).
-  It is fail-closed. The audited preserved wrapper documented there is
-  hash-pinned to the v0.2.0 release and was authorized only to produce five
-  raw binaries plus its aggregate build manifest, with a separate
-  source-bound deterministic stage creating the exact 12 public assets;
-  later releases built without that preserved wrapper use the standard DSR
-  fallback under direct operator instruction instead.
+- GitHub Actions is never used for this repository. Files under
+  `.github/workflows/` are disabled historical references and are not build,
+  test, publication, or evidence authorities.
+- DSR owns quality checks, native cross-platform builds, packaging, signing,
+  publication, and public-release verification. RCH may offload development
+  compilation but cannot authorize or publish a release.
+- The canonical DSR operating details are documented in
+  [docs/releasing.md](docs/releasing.md). A tag or source build without
+  DSR-published, publicly verified artifacts is not a release.
   Immutable `v*` tag ruleset `20418963` was created and read back on 2026-08-04
   with update/deletion forbidden and no bypass actors. The manual lane
   re-verifies that live control before tagging and publication and stops on any
@@ -3086,7 +3100,7 @@ broader inventory.
 | Getting started and operations | [development](docs/development.md), [terminal setup](docs/terminal-setup.md), [settings](docs/settings.md), [models](docs/models.md), [keybindings](docs/keybindings.md), [packages](docs/packages.md), [troubleshooting](docs/troubleshooting.md), [releasing](docs/releasing.md) |
 | Swarm operations and replay | [operations runbook](docs/swarm-operations-runbook.md), [replay operator workflow](docs/swarm-replay-operator-workflow.md), [activity ledger](docs/swarm-activity-ledger.md), [flight recorder](docs/swarm-flight-recorder.md) |
 | Core runtime surfaces | [session](docs/session.md), [tree](docs/tree.md), [TUI](docs/tui.md), [RPC](docs/rpc.md), [SDK](docs/sdk.md), [skills](docs/skills.md), [prompt templates](docs/prompt-templates.md), [streaming hostcalls](docs/streaming-hostcalls.md), [context intelligence](docs/context-intelligence.md) |
-| Drop-in certification and migration | [certification contract](docs/contracts/dropin-certification-contract.json), [certification verdict](docs/evidence/dropin-certification-verdict.json), [waiver ledger contract](docs/contracts/waiver-ledger-contract.json), [waiver ledger](docs/evidence/waivers.json), [release evidence ledger contract](docs/contracts/release-evidence-ledger-contract.json), [release evidence ledger](docs/evidence/release-evidence-ledger.json), [nrun evidence contract](docs/contracts/nrun-evidence-protocol-contract.json), [nrun budget evaluation](docs/evidence/nrun-budget-evaluation.json), [sequential budget contract](docs/contracts/sequential-budget-gate-contract.json), [sequential budget evaluations](docs/evidence/sequential-budget-gate-evaluations.json), [drift watch contract](docs/contracts/drift-watch-contract.json), [perf drift watch evidence](docs/evidence/perf-drift-watch.json), [conformal calibration contract](docs/contracts/conformal-budget-calibration-contract.json), [conformal budget calibration evidence](docs/evidence/conformal-budget-calibration.json), [startup benchmark contract](docs/contracts/startup-benchmark-contract.json), [startup benchmark report](docs/evidence/startup-benchmark-report.json), [variance gating contract](docs/contracts/variance-gating-contract.json), [variance gate evidence](docs/evidence/variance-gate-evaluations.json), [parity gap ledger](docs/evidence/dropin-parity-gap-ledger.json), [differential evidence suite](docs/evidence/dropin-differential-evidence-suite.json), [feature inventory](docs/evidence/dropin-feature-inventory-matrix.json), [migration playbook](docs/integrator-migration-playbook.md), [parity snapshot](docs/parity-certification.json), [program governance](docs/program-governance.md) |
+| Historical legacy-Pi comparison and migration records | [retired certification contract](docs/contracts/dropin-certification-contract.json), [historical verdict](docs/evidence/dropin-certification-verdict.json), [historical parity gap ledger](docs/evidence/dropin-parity-gap-ledger.json), [historical differential suite](docs/evidence/dropin-differential-evidence-suite.json), [historical feature inventory](docs/evidence/dropin-feature-inventory-matrix.json), [migration playbook](docs/integrator-migration-playbook.md), [historical parity snapshot](docs/parity-certification.json) |
 | Extensions | [architecture](docs/extension-architecture.md), [compatibility guide](docs/ext-compat.md), [compatibility matrix](docs/extension-compatibility-matrix.md), [conformance plan](docs/extension-conformance-test-plan.json), [runtime threat model](docs/extension-runtime-threat-model.md), [troubleshooting](docs/extension-troubleshooting.md), [registry](docs/extension-registry.md), [WIT ABI](docs/wit/extension.wit) |
 | Providers | [provider guide](docs/providers.md), [auth troubleshooting checked crosswalk](docs/provider-auth-troubleshooting.md), [config examples](docs/provider-config-examples.md), [canonical ID policy](docs/provider-canonical-id-policy.md), [onboarding playbook](docs/provider-onboarding-playbook.md), [test obligations](docs/provider-test-obligations.md), [upstream catalog snapshot](docs/provider-upstream-catalog-snapshot.md), [historical 2026-02-13 support baseline](docs/provider-support-baseline-audit.md) |
 | QA and evidence | [QA runbook](docs/qa-runbook.md), [testing policy](docs/testing-policy.md), [conformance playbook](docs/conformance-operator-playbook.md), [coverage matrix](docs/TEST_COVERAGE_MATRIX.md), [evidence schema](docs/evidence-contract-schema.json), [coverage baseline map](docs/coverage-baseline-map.json), [E2E scenario matrix](docs/e2e_scenario_matrix.json), [non-mock rubric](docs/non-mock-rubric.json) |

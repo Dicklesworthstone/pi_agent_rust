@@ -111,13 +111,42 @@ We do not care about backwards compatibility—we're in early development with n
 
 ---
 
-## Drop-In Claim Messaging Guardrail
+## Product Direction: OMP-Inspired, Not a Legacy Pi Drop-In
 
-When editing docs, release notes, or user-facing copy:
+Pi Rust is **not** pursuing strict drop-in compatibility with legacy TypeScript
+Pi. Legacy Pi changes too quickly, and reproducing its internal implementation
+details would pull this project away from the product we want to build.
 
-- Do not describe Pi Rust as a strict drop-in replacement unless `docs/contracts/dropin-certification-contract.json` hard gates are satisfied.
-- Treat `docs/evidence/dropin-certification-verdict.json` as the release claim gate: strict replacement language requires `overall_verdict = CERTIFIED`.
-- Treat `docs/parity-certification.json` as informational progress evidence only; it does not override release-gate policy.
+- Treat legacy Pi as historical context and a source of selectively useful
+  behavior, never as a compatibility authority or release gate.
+- Use OMP as the closer product reference for feature selection, workflows,
+  look and feel, and UI/UX, while still making Rust-native design decisions.
+- Do not create or prioritize work merely to satisfy historical drop-in,
+  parity, differential, or certification artifacts.
+- Files under `docs/contracts/` and `docs/evidence/` that describe strict
+  drop-in certification are retained historical records. They do not authorize
+  claims, block releases, define completeness, or override current product
+  decisions.
+- User-facing copy must not call Pi Rust a drop-in replacement. Describe the
+  actual supported behavior and independently valuable product surface.
+
+## Build, Quality, and Release Authority: DSR Only
+
+**NEVER use GitHub Actions for this repository, for any reason.** Do not enable,
+dispatch, rerun, cancel, or cite a GitHub Actions workflow as evidence. Workflow
+files may remain in the tree as historical reference, but they are permanently
+non-authoritative and must stay disabled.
+
+- Doodlestein Self-Releaser (`dsr`) is the exclusive quality, cross-platform
+  build, packaging, signing, and release authority.
+- Use `dsr quality pi_agent_rust`, `dsr build pi_agent_rust`, and
+  `dsr release pi_agent_rust <version>` (or the corresponding fail-closed DSR
+  operation) instead of any Actions workflow or ad hoc release upload.
+- RCH remains available as a development-time Cargo compilation offloader. It
+  is not a release authority and cannot substitute for a successful DSR run.
+- A tag, local binary, RCH result, or source build is not a release. A release
+  exists only after DSR publishes the expected artifacts and DSR verification
+  succeeds against the public release.
 
 ---
 
@@ -590,40 +619,21 @@ unrelated legacy findings.
 
 ---
 
-## Beads Ledger Reconciliation — Invariant
+## Historical Drop-In Ledger — Retired
 
-**CRITICAL INVARIANT:** The beads ledger reconciliation script MUST pass before any commit. This prevents "completion illusion" where all beads appear closed but critical gaps remain untracked.
+`docs/evidence/dropin-parity-gap-ledger.json` and
+`scripts/reconcile_beads_ledger.sh` belong to the retired strict drop-in
+program. They are historical diagnostics, not commit, quality, completeness,
+or release gates.
 
 ```bash
+# Optional historical consistency inspection only
 ./scripts/reconcile_beads_ledger.sh
 ```
 
-**Exit 0 = safe to commit.** **Exit 1 = orphan gaps found.**
-
-### What It Checks
-
-The script cross-references:
-- **Active beads** (from `br list --json`, statuses `open` and `in_progress`)
-- **Open critical/high gaps** (from `docs/evidence/dropin-parity-gap-ledger.json`)
-- **Gap-tracking external refs** (`external_ref=<gap-id>`)
-
-If any critical or high-severity gap lacks a corresponding active owner bead or active bead with `external_ref=<gap-id>`, the script fails and lists the orphan gap. If any active bead references a `gap-*` external ref that is not an active critical/high ledger gap, the script also fails so stale tracker work cannot outlive the ledger truth.
-
-### Fix Workflow
-
-1. **Run the script:** `./scripts/reconcile_beads_ledger.sh`
-2. **If it passes:** Proceed with commit
-3. **If it fails:** Create beads for each orphan gap:
-   ```bash
-   br create --title="Address gap-<id>" --type=task --priority=1
-   ```
-4. **Re-run until it passes:** The script must exit 0 before commit
-
-### CI Integration
-
-This check runs automatically in CI as the "Beads ledger reconciliation check" step. It will fail the build if orphan ledger gaps or stale active gap-tracking beads are detected.
-
-**Why This Matters:** Without this invariant, teams can falsely believe all work is complete when critical gaps remain untracked, leading to incomplete drop-in certification or missed functionality gaps.
+Do not create, reopen, or keep product Beads active merely to make this retired
+ledger green. Track current product defects and OMP-inspired improvements
+directly in Beads with concrete user-visible acceptance criteria.
 
 ---
 

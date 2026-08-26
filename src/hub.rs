@@ -38,6 +38,10 @@ const RING_LINE_CAP: usize = 10_000;
 /// Grace window between TERM and KILL on stop, mirroring the bash tool.
 const TERMINATE_GRACE: Duration = Duration::from_secs(3);
 
+/// Keep service identifiers portable and bounded before deriving artifact
+/// names from them.
+const MAX_SERVICE_NAME_BYTES: usize = 128;
+
 /// Readiness gates for `start`. Both supplied gates MUST pass.
 #[derive(Debug, Clone, Default)]
 pub struct ReadySpec {
@@ -221,6 +225,22 @@ fn registry_err() -> Error {
     Error::tool("hub", "hub registry poisoned".to_string())
 }
 
+fn validated_service_name(name: &str) -> Result<&str> {
+    let is_portable = !name.is_empty()
+        && name.len() <= MAX_SERVICE_NAME_BYTES
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+        });
+    if !is_portable {
+        return Err(Error::validation(format!(
+            "PI_HUB_INVALID_NAME: service names must be 1-{MAX_SERVICE_NAME_BYTES} ASCII bytes containing only letters, digits, '.', '-', or '_'"
+        )));
+    }
+    Ok(name)
+}
+
 /// Persist the detached-service roster (name, pid, log, spec) so a later
 /// session can rediscover survivors.
 fn persist_detached_state(reg: &ServiceRegistry) {
@@ -266,12 +286,18 @@ fn persist_detached_state(reg: &ServiceRegistry) {
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::significant_drop_tightening)]
 pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
-    let name = spec.name.trim().to_string();
-    if name.is_empty() {
-        return Err(Error::validation(
-            "hub start requires a non-empty service name".to_string(),
-        ));
-    }
+    let name = validated_service_name(&spec.name)?.to_string();
+    let ready = spec.ready.clone().unwrap_or_default();
+    let has_gates = ready.log.is_some() || ready.port.is_some();
+    let budget = Duration::from_secs(ready.timeout_secs.unwrap_or(DEFAULT_READY_TIMEOUT_SECS));
+    let log_regex = ready
+        .log
+        .as_deref()
+        .map(|pattern| {
+            regex::Regex::new(pattern)
+                .map_err(|e| Error::validation(format!("Invalid ready.log regex '{pattern}': {e}")))
+        })
+        .transpose()?;
     if !spec.cwd.exists() {
         return Err(Error::tool(
             "hub",
@@ -367,18 +393,7 @@ pub fn start(spec: &LaunchSpec) -> Result<ServiceSnapshot> {
     });
 
     // Readiness gate: block until BOTH supplied gates pass.
-    let ready = spec.ready.clone().unwrap_or_default();
-    let has_gates = ready.log.is_some() || ready.port.is_some();
-    let budget = Duration::from_secs(ready.timeout_secs.unwrap_or(DEFAULT_READY_TIMEOUT_SECS));
     let deadline = Instant::now() + budget;
-    let log_regex = ready
-        .log
-        .as_deref()
-        .map(|pattern| {
-            regex::Regex::new(pattern)
-                .map_err(|e| Error::validation(format!("Invalid ready.log regex '{pattern}': {e}")))
-        })
-        .transpose()?;
 
     // Cold error paths, hoisted out of the poll loop (ubs loop-allocation
     // heuristic).
@@ -903,6 +918,42 @@ mod tests {
         let (retained, cursor) = capped.since(0);
         assert_eq!(retained, vec!["b", "c", "d"]);
         assert_eq!(cursor, 4);
+    }
+
+    #[test]
+    fn invalid_name_is_rejected_before_program_resolution() {
+        let _guard = crate::hub::test_lock();
+        let err = start(&spec(
+            "../../outside-hub",
+            "pi-hub-program-that-does-not-exist",
+            &[],
+            None,
+        ))
+        .expect_err("path-like service name must fail before spawn");
+        assert!(
+            err.to_string().contains("PI_HUB_INVALID_NAME"),
+            "name validation must win before program resolution: {err}"
+        );
+    }
+
+    #[test]
+    fn invalid_ready_regex_is_rejected_before_program_resolution() {
+        let _guard = crate::hub::test_lock();
+        let err = start(&spec(
+            "hub-test-invalid-ready-regex",
+            "pi-hub-program-that-does-not-exist",
+            &[],
+            Some(ReadySpec {
+                log: Some("[".to_string()),
+                port: None,
+                timeout_secs: Some(1),
+            }),
+        ))
+        .expect_err("invalid regex must fail before spawn");
+        assert!(
+            err.to_string().contains("Invalid ready.log regex"),
+            "regex validation must win before program resolution: {err}"
+        );
     }
 
     #[test]

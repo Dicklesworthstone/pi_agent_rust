@@ -273,3 +273,65 @@ fn e2e_read_url_ssrf_denied_by_default() {
     assert!(errors.is_empty(), "JSONL violations: {errors:?}");
     harness.record_artifact("e2e_url_ssrf.jsonl", &path);
 }
+
+#[test]
+fn e2e_read_url_raw_preserves_wire_html() {
+    let harness = TestHarness::new("e2e_read_url_raw_preserves_wire_html");
+    harness
+        .log()
+        .info("setup", "raw URL read must bypass reader-mode conversion");
+    let server = harness.start_mock_http_server();
+    server.add_route("GET", "/raw-guide", html_response(FIXTURE_PAGE));
+    server.add_route_queue(
+        "POST",
+        "/v1/chat/completions",
+        vec![
+            sse_response(read_call_sse_body(&format!(
+                "{}/raw-guide:raw",
+                server.base_url()
+            ))),
+            sse_response(text_sse_body("raw page read complete")),
+        ],
+    );
+
+    let env = PiEnv::new(
+        &harness,
+        r#"{"read": {"urlAllowPrivateTargets": true}, "checkForUpdates": false}"#,
+    );
+    env.write_models(&server.base_url());
+
+    let binary = std::path::PathBuf::from(env!("CARGO_BIN_EXE_pi"));
+    let mut command = env.command(&binary);
+    command.args([
+        "--print",
+        "--no-session",
+        "--provider",
+        "e2eurl",
+        "--model",
+        "test-model",
+        "read the raw install guide",
+    ]);
+    let child = command.spawn().expect("spawn pi");
+    let (stdout, stderr) = run_to_finish(child, 90);
+    assert!(
+        stdout.contains("raw page read complete"),
+        "turn completes: stdout {stdout}\nstderr: {stderr}"
+    );
+
+    let requests = server.requests();
+    let second = requests
+        .iter()
+        .filter(|request| request.path == "/v1/chat/completions")
+        .nth(1)
+        .expect("second request (post-tool)");
+    let body = String::from_utf8_lossy(&second.body);
+    assert!(body.contains("<!DOCTYPE html>"), "doctype is preserved");
+    assert!(body.contains("analytics()"), "script source is preserved");
+    assert!(body.contains("Home | Docs | About"), "nav source is preserved");
+
+    let path = harness.temp_path("e2e_url_raw.jsonl");
+    harness.write_jsonl_logs(&path).expect("write logs");
+    let errors = validate_jsonl_v2_only(&std::fs::read_to_string(&path).expect("read logs"));
+    assert!(errors.is_empty(), "JSONL violations: {errors:?}");
+    harness.record_artifact("e2e_url_raw.jsonl", &path);
+}
