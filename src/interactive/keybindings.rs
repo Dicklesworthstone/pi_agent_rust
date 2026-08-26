@@ -557,6 +557,12 @@ impl PiApp {
             // Application actions
             // =========================================================
             AppAction::Interrupt => {
+                // Escape with a pending ask card dismisses the card (the
+                // tool sees `dismissed`), matching the ftui stack; it must
+                // not abort the whole turn (gh #184).
+                if self.dismiss_active_ask_ui() {
+                    return None;
+                }
                 // Escape: Abort if processing, otherwise context-dependent
                 if self.agent_state != AgentState::Idle {
                     self.last_escape_time = None;
@@ -697,6 +703,15 @@ impl PiApp {
             // Text input actions
             // =========================================================
             AppAction::Submit => {
+                // A pending ask/extension card owns the input line. Cards
+                // only ever arrive mid-turn (the tool that raised them is
+                // still executing), so this must run before the busy gate
+                // below — otherwise the answer is silently queued as a
+                // steering message and the card can never be answered
+                // (gh #184).
+                if let Some(cmd) = self.submit_pending_card_answer() {
+                    return cmd;
+                }
                 // Enter: Submit when idle, queue steering when busy
                 if self.agent_state != AgentState::Idle {
                     self.queue_input(QueuedMessageKind::Steering);
@@ -717,6 +732,9 @@ impl PiApp {
             AppAction::FollowUp => {
                 // Alt+Enter: queue follow-up when busy. When idle, toggles multi-line mode if the
                 // editor is empty; otherwise it submits like Enter.
+                if let Some(cmd) = self.submit_pending_card_answer() {
+                    return cmd;
+                }
                 if self.agent_state != AgentState::Idle {
                     self.queue_input(QueuedMessageKind::FollowUp);
                     return None;

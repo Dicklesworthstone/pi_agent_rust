@@ -790,3 +790,83 @@ fn ask_card_consumes_input_and_advances_questions() {
     app.submit_message("cancel");
     assert!(app.active_ask_ui.is_none());
 }
+
+/// gh #184: ask cards arrive while the ask tool is still executing, i.e.
+/// while the agent is busy. Enter must answer the card instead of queueing
+/// the text as a steering message, and Escape must dismiss the card rather
+/// than abort the turn.
+#[test]
+fn ask_card_answer_is_not_queued_as_steering_while_agent_busy() {
+    let dir = tempdir();
+    let mut app = build_test_app(dir.path().to_path_buf());
+    app.set_terminal_size(100, 30);
+    app.ask_tool = Some(crate::ask::AskTool::new(crate::ask::AskPolicy::Recommended));
+
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [
+            {"id": "q1", "question": "Retry or dump?",
+             "options": [{"label": "Retry"}, {"label": "Dump"}]},
+            {"id": "q2", "question": "Where?",
+             "options": [{"label": "Here"}, {"label": "There"}]}
+        ]
+    }))
+    .expect("ask request");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-busy".to_string(),
+        request,
+    }));
+    app.agent_state = AgentState::ToolRunning;
+    assert!(app.view().contains("question 1 of 2"));
+
+    // Number selection through the real Enter keybinding path.
+    app.input.set_value("2");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(
+        app.view().contains("question 2 of 2"),
+        "Enter must advance the card while busy"
+    );
+    let queued = app
+        .message_queue
+        .lock()
+        .expect("message queue")
+        .pop_steering();
+    assert!(
+        queued.is_empty(),
+        "card answer must not be queued as steering"
+    );
+    assert_ne!(
+        app.status_message.as_deref(),
+        Some("Queued steering message")
+    );
+
+    // Free text is accepted the same way.
+    app.input.set_value("somewhere else");
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Enter)));
+    assert!(
+        app.active_ask_ui.is_none(),
+        "card completes after last answer"
+    );
+    assert!(
+        app.input.value().is_empty(),
+        "editor cleared after answering"
+    );
+
+    // Escape dismisses a fresh card without aborting the turn.
+    let request: crate::ask::AskRequest = serde_json::from_value(json!({
+        "questions": [{"question": "Again?", "options": [{"label": "A"}, {"label": "B"}]}]
+    }))
+    .expect("ask request 2");
+    app.handle_pi_message(PiMsg::AskUiRequest(crate::ask::AskUiRequest {
+        id: "req-busy-2".to_string(),
+        request,
+    }));
+    assert!(app.active_ask_ui.is_some());
+    let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Esc)));
+    assert!(app.active_ask_ui.is_none(), "Escape dismisses the card");
+    assert_ne!(
+        app.status_message.as_deref(),
+        Some("Aborting request..."),
+        "Escape on a card must not abort the turn"
+    );
+    assert_eq!(app.agent_state, AgentState::ToolRunning);
+}

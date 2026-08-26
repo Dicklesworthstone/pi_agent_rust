@@ -1791,6 +1791,41 @@ After approving access in the browser, press Enter in Pi to complete login."
         true
     }
 
+    /// Whether a pending ask or extension UI card currently owns the input
+    /// line. Cards arrive mid-turn, so callers must check this before any
+    /// "agent is busy" gating of the editor.
+    pub(super) fn has_pending_input_card(&self) -> bool {
+        self.active_ask_ui.is_some() || self.active_extension_ui.is_some()
+    }
+
+    /// Route the editor content to the pending ask/extension card, if any.
+    /// Returns `None` when no card is pending (the caller continues with its
+    /// normal submit/queue handling); otherwise the card consumed the line.
+    /// An empty editor is a no-op so Enter cannot accidentally answer.
+    pub(super) fn submit_pending_card_answer(&mut self) -> Option<Option<Cmd>> {
+        if !self.has_pending_input_card() {
+            return None;
+        }
+        let value = self.input.value();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Some(None);
+        }
+        Some(self.submit_message(trimmed))
+    }
+
+    /// Dismiss the active ask card (Escape). Returns `true` when a card was
+    /// pending and has been resolved as dismissed.
+    pub(super) fn dismiss_active_ask_ui(&mut self) -> bool {
+        let Some(card) = self.active_ask_ui.take() else {
+            return false;
+        };
+        self.finish_ask_ui(&card, true);
+        self.input.reset();
+        self.input.focus();
+        true
+    }
+
     fn finish_ask_ui(&mut self, card: &crate::interactive::ActiveAskCard, dismissed: bool) {
         let response = crate::ask::AskResponse {
             answers: if dismissed {
