@@ -1165,6 +1165,9 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.abort_handle = None;
                 self.status_message = status;
                 self.message_render_cache.clear();
+                // Session replacement invalidates outstanding prompts: drop
+                // them fail-closed (bd-yllbn).
+                self.drain_capability_prompts_for_session_reset();
                 if let Err(message) = self.sync_runtime_selection_from_session_header() {
                     self.status_message = Some(message);
                 }
@@ -1230,6 +1233,9 @@ After approving access in the browser, press Enter in Pi to complete login."
             PiMsg::ExtensionUiRequest(request) => {
                 return self.handle_extension_ui_request(request);
             }
+            PiMsg::CapabilityPromptExpired { id, generation } => {
+                return self.handle_capability_prompt_expiry(id, generation);
+            }
             PiMsg::ExtensionCommandDone {
                 command: _,
                 display,
@@ -1279,10 +1285,11 @@ After approving access in the browser, press Enter in Pi to complete login."
     }
 
     fn handle_extension_ui_request(&mut self, request: ExtensionUiRequest) -> Option<Cmd> {
-        // Capability-specific prompts get a dedicated modal overlay.
+        // Capability-specific prompts get a dedicated modal overlay fed by
+        // an ordered, generation-bound queue so a second concurrent request
+        // can no longer overwrite (and orphan) the first (bd-yllbn).
         if CapabilityPromptOverlay::is_capability_prompt(&request) {
-            self.capability_prompt = Some(CapabilityPromptOverlay::from_request(request));
-            return None;
+            return self.enqueue_capability_prompt(CapabilityPromptOverlay::from_request(request));
         }
         match request.method.as_str() {
             "getEditorText" | "get_editor_text" => {
@@ -1375,6 +1382,120 @@ After approving access in the browser, press Enter in Pi to complete login."
             self.apply_extension_ui_effect(&request);
         }
         None
+    }
+
+    /// FIFO capacity for queued capability prompts (bd-yllbn).
+    const MAX_CAPABILITY_PROMPT_QUEUE: usize = 8;
+
+    fn next_capability_prompt_generation(&mut self) -> u64 {
+        self.capability_prompt_generation += 1;
+        self.capability_prompt_generation
+    }
+
+    /// Enqueue an incoming capability prompt or activate it immediately.
+    ///
+    /// Arrival order is preserved exactly; a prompt arriving beyond the
+    /// bound is denied fail-closed immediately so every request receives
+    /// exactly one terminal response and no extension can strand on the
+    /// TUI bridge waiting for a decision that was silently discarded.
+    fn enqueue_capability_prompt(&mut self, mut overlay: CapabilityPromptOverlay) -> Option<Cmd> {
+        overlay.generation = self.next_capability_prompt_generation();
+        if self.capability_prompt.is_none() {
+            return self.activate_capability_prompt(overlay);
+        }
+        if self.capability_prompt_queue.len() >= Self::MAX_CAPABILITY_PROMPT_QUEUE {
+            let response = ExtensionUiResponse {
+                id: overlay.request.id.clone(),
+                value: Some(Value::Bool(false)),
+                cancelled: true,
+            };
+            self.send_extension_ui_response_quiet(response);
+            return None;
+        }
+        self.capability_prompt_queue.push_back(overlay);
+        None
+    }
+
+    /// Promote an overlay to the active slot and schedule its expiry wake.
+    fn activate_capability_prompt(&mut self, overlay: CapabilityPromptOverlay) -> Option<Cmd> {
+        let expiry_cmd = Self::capability_prompt_expiry_cmd(&overlay);
+        self.capability_prompt = Some(overlay);
+        expiry_cmd
+    }
+
+    /// Thread-pool command waking exactly once when this prompt's
+    /// authoritative deadline elapses. The sleep targets the absolute
+    /// expiry captured at arrival, the same budget the manager enforces.
+    fn capability_prompt_expiry_cmd(overlay: &CapabilityPromptOverlay) -> Option<Cmd> {
+        let expires_at = overlay.expires_at?;
+        let id = overlay.request.id.clone();
+        let generation = overlay.generation;
+        Some(Cmd::new(move || {
+            let now = std::time::Instant::now();
+            if let Some(remaining) = expires_at.checked_duration_since(now) {
+                std::thread::sleep(remaining);
+            }
+            Message::new(PiMsg::CapabilityPromptExpired { id, generation })
+        }))
+    }
+
+    /// Pop the next queued prompt into the active slot (bd-yllbn).
+    ///
+    /// `pub(super)`: shared with `keybindings`, which promotes the FIFO
+    /// successor whenever the user manually resolves the active prompt.
+    pub(super) fn activate_next_capability_prompt(&mut self) -> Option<Cmd> {
+        let next = self.capability_prompt_queue.pop_front()?;
+        self.activate_capability_prompt(next)
+    }
+
+    /// Auto-deny path for an expired capability prompt (bd-yllbn).
+    ///
+    /// Only the ACTIVE overlay carrying both the exact id and generation
+    /// may resolve; stale, late, or foreign identities are ignored so a
+    /// wake cannot dismiss or answer a different prompt.
+    fn handle_capability_prompt_expiry(&mut self, id: String, generation: u64) -> Option<Cmd> {
+        let matches_active = self
+            .capability_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.request.id == id && prompt.generation == generation);
+        if !matches_active {
+            return None;
+        }
+        let response = ExtensionUiResponse {
+            id,
+            value: Some(Value::Bool(false)),
+            cancelled: true,
+        };
+        self.capability_prompt = None;
+        self.send_extension_ui_response_quiet(response);
+        self.activate_next_capability_prompt()
+    }
+
+    /// Session transitions (compaction/fork/reset) drop prompts wholesale:
+    /// each is answered cancelled so manager pending entries clear promptly
+    /// and hostcalls fail closed. Dropped prompts are never answered allow
+    /// and persistent permission state is untouched (bd-yllbn).
+    fn drain_capability_prompts_for_session_reset(&mut self) {
+        let mut dropped = std::mem::take(&mut self.capability_prompt_queue);
+        if let Some(active) = self.capability_prompt.take() {
+            dropped.push_front(active);
+        }
+        for prompt in dropped.drain(..) {
+            let response = ExtensionUiResponse {
+                id: prompt.request.id,
+                value: Some(Value::Bool(false)),
+                cancelled: true,
+            };
+            self.send_extension_ui_response_quiet(response);
+        }
+    }
+
+    /// Respond without the user-visible "no pending request" status noise;
+    /// used by timer/drain paths racing the manager's own timeout sweep.
+    fn send_extension_ui_response_quiet(&mut self, response: ExtensionUiResponse) {
+        if let Some(manager) = &self.extensions {
+            let _ = manager.respond_ui(response);
+        }
     }
 
     fn collect_extension_theme_infos(&self) -> Vec<Value> {
@@ -4329,6 +4450,182 @@ mod stream_delta_batcher_tests {
         assert!(
             app.extension_custom_key_queue.is_empty(),
             "modal prompt keys must not leak into the custom overlay key queue"
+        );
+    }
+
+    // ===== bd-yllbn: capability prompt FIFO / generation / expiry semantics =====
+
+    fn capability_request(id: &str, extension_id: &str, capability: &str) -> ExtensionUiRequest {
+        ExtensionUiRequest::new(
+            id,
+            "confirm",
+            json!({
+                "extension_id": extension_id,
+                "capability": capability,
+                "message": "bd-yllbn probe",
+                "timeout_ms": 1_000_u64,
+            }),
+        )
+        .with_extension_id(Some(extension_id.to_string()))
+        .with_timeout_ms(1_000)
+    }
+
+    fn active_capability(app: &PiApp) -> Option<(String, u64)> {
+        app.capability_prompt
+            .as_ref()
+            .map(|prompt| (prompt.request.id.clone(), prompt.generation))
+    }
+
+    #[test]
+    fn capability_prompts_queue_fifo_and_resolve_in_order() {
+        let mut app = build_test_app();
+
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "r1", "ext-a", "exec",
+        )));
+        let (first_id, first_gen) = active_capability(&app).expect("first request activates");
+        assert_eq!(first_id, "r1");
+        assert!(app.capability_prompt_queue.is_empty());
+
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "r2", "ext-b", "http",
+        )));
+        let unchanged = active_capability(&app).expect("active survives arrival");
+        assert_eq!(
+            unchanged,
+            (first_id.clone(), first_gen),
+            "a second concurrent request must never overwrite the active overlay"
+        );
+        assert_eq!(app.capability_prompt_queue.len(), 1);
+        assert_eq!(
+            app.capability_prompt_queue
+                .front()
+                .expect("queued prompt")
+                .request
+                .id,
+            "r2"
+        );
+
+        // Only the exact (id, generation) identity resolves the live prompt;
+        // resolution promotes the FIFO successor and schedules its wake.
+        let cmd = app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+            id: first_id.clone(),
+            generation: first_gen,
+        });
+        assert!(
+            cmd.is_some(),
+            "successor activation must schedule its own expiry wake"
+        );
+        let (second_id, second_gen) = active_capability(&app).expect("successor activates");
+        assert_eq!(second_id, "r2");
+        assert_ne!(second_gen, first_gen, "generations are unique per request");
+        assert!(app.capability_prompt_queue.is_empty());
+
+        // Stale replay of the resolved identity must be ignored outright...
+        assert!(
+            app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+                id: first_id,
+                generation: first_gen,
+            })
+            .is_none()
+        );
+        // ...as must a foreign id wearing a live generation.
+        assert!(
+            app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+                id: "zzz-unknown".to_string(),
+                generation: second_gen,
+            })
+            .is_none()
+        );
+        let survived = active_capability(&app).expect("live prompt untouched by stale wakes");
+        assert_eq!(survived, (second_id.clone(), second_gen));
+
+        // Correct final resolution empties everything; no successor exists.
+        let tail_cmd = app.handle_pi_message(PiMsg::CapabilityPromptExpired {
+            id: second_id,
+            generation: second_gen,
+        });
+        assert!(tail_cmd.is_none());
+        assert!(active_capability(&app).is_none());
+        assert!(app.capability_prompt_queue.is_empty());
+    }
+
+    #[test]
+    fn capability_prompt_queue_bound_denies_excess_fail_closed() {
+        let mut app = build_test_app();
+        let total = PiApp::MAX_CAPABILITY_PROMPT_QUEUE + 3;
+        for i in 0..total {
+            let id = format!("cap-{i:02}");
+            let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+                &id,
+                "ext-flood",
+                "exec",
+            )));
+        }
+
+        // The bound holds exactly; ordering of admitted prompts is FIFO.
+        assert_eq!(
+            app.capability_prompt_queue.len(),
+            PiApp::MAX_CAPABILITY_PROMPT_QUEUE
+        );
+        assert_eq!(
+            app.capability_prompt
+                .as_ref()
+                .map(|prompt| prompt.request.id.as_str()),
+            Some("cap-00")
+        );
+        for (slot, expected) in (1..=PiApp::MAX_CAPABILITY_PROMPT_QUEUE).enumerate() {
+            let want = format!("cap-{expected:02}");
+            let got = app
+                .capability_prompt_queue
+                .get(slot)
+                .map(|prompt| prompt.request.id.clone())
+                .unwrap_or_default();
+            assert_eq!(got, want);
+        }
+        // Excess arrivals were denied immediately: they appear nowhere.
+        for i in total - 3..total {
+            let id = format!("cap-{i:02}");
+            assert!(
+                app.capability_prompt_queue
+                    .iter()
+                    .all(|prompt| prompt.request.id != id)
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_reset_drains_prompts_fail_closed_without_permissions() {
+        let mut app = build_test_app();
+        // Real manager attached: quiet deny responses flow through
+        // respond_ui (pending-less probes return false harmlessly).
+        app.extensions = Some(crate::extensions::ExtensionManager::new());
+
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "d1", "ext-d", "http",
+        )));
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "d2", "ext-d", "exec",
+        )));
+        let _ = app.handle_pi_message(PiMsg::ExtensionUiRequest(capability_request(
+            "d3", "ext-e", "exec",
+        )));
+        assert!(active_capability(&app).is_some());
+        assert_eq!(app.capability_prompt_queue.len(), 2);
+
+        app.handle_pi_message(PiMsg::ConversationReset {
+            messages: Vec::new(),
+            usage: Usage::default(),
+            status: Some("session reset".to_string()),
+        });
+
+        assert!(
+            active_capability(&app).is_none(),
+            "session reset clears the active prompt"
+        );
+        assert!(
+            app.capability_prompt_queue.is_empty(),
+            "and the entire FIFO"
         );
     }
 }

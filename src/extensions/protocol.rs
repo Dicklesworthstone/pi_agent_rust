@@ -1808,6 +1808,17 @@ impl ExtensionUiRequest {
         self
     }
 
+    /// Set an explicit timeout budget for this UI request (milliseconds).
+    ///
+    /// `request_ui` enforces this deadline authoritatively: a request whose
+    /// timeout elapses fails closed with a timeout error and its pending
+    /// entry is removed, so callers cannot strand on an unanswered surface.
+    #[must_use]
+    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+        self.timeout_ms = Some(timeout_ms);
+        self
+    }
+
     pub fn expects_response(&self) -> bool {
         matches!(
             self.method.as_str(),

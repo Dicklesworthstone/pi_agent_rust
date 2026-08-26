@@ -1751,3 +1751,111 @@ fn all_opcodes_have_consistent_round_trip_code_parse() {
         );
     }
 }
+// ========================================================================
+// bd-yllbn: bounded, authoritative capability-prompt lifecycle
+// ========================================================================
+
+#[test]
+fn capability_prompt_once_binds_authoritative_deadline_budget() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let cx = asupersync::Cx::for_request();
+
+        let surface = async {
+            let req = ui_rx.recv(&cx).await.expect("capability confirm request");
+            // The typed field is the authoritative budget; the payload mirror
+            // and provenance field must agree with it exactly.
+            assert_eq!(req.method, "confirm");
+            assert_eq!(req.timeout_ms, Some(CAPABILITY_PROMPT_TIMEOUT_MS));
+            assert_eq!(
+                req.payload.get("timeout_ms").and_then(Value::as_u64),
+                Some(CAPABILITY_PROMPT_TIMEOUT_MS)
+            );
+            assert_eq!(req.extension_id.as_deref(), Some("ext.budget"));
+            let id = req.id.clone();
+            (
+                manager.respond_ui(ExtensionUiResponse {
+                    id,
+                    value: Some(json!({ "allow": true, "persist": false })),
+                    cancelled: false,
+                }),
+                true,
+            )
+        };
+        let decision = async { prompt_capability_once(&manager, "ext.budget", "exec").await };
+
+        let (_, (allow, persist)) = futures::join!(surface, decision);
+        assert_eq!((allow, persist), (true, Some(false)));
+    });
+}
+
+#[test]
+fn request_ui_timeout_fails_closed_and_clears_pending_entry() {
+    use asupersync::channel::mpsc;
+
+    let manager = extension_manager_no_persisted_permissions();
+    let (ui_tx, mut ui_rx) = mpsc::channel(4);
+    manager.set_ui_sender(ui_tx);
+
+    run_async(async {
+        let cx = asupersync::Cx::for_request();
+        const TINY_BUDGET_MS: u64 = 50;
+
+        let request = ExtensionUiRequest::new(
+            "cap-timeout-1",
+            "confirm",
+            json!({
+                "extension_id": "ext.timeout",
+                "capability": "exec",
+                "message": "bounded probe"
+            }),
+        )
+        .with_extension_id(Some("ext.timeout".to_string()))
+        .with_timeout_ms(TINY_BUDGET_MS);
+        let late_id = request.id.clone();
+
+        let attempt = async { manager.request_ui(request).await };
+        let stalled_surface = async {
+            // Receive but deliberately never answer inside the budget.
+            let _received = ui_rx.recv(&cx).await.expect("request reaches surface");
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                std::time::Duration::from_millis(TINY_BUDGET_MS * 6),
+            )
+            .await;
+        };
+
+        let started = std::time::Instant::now();
+        let (outcome, _) = futures::join!(attempt, stalled_surface);
+        let elapsed = started.elapsed();
+
+        match outcome {
+            Err(err) => assert!(
+                err.to_string().contains("timed out"),
+                "expected deadline failure, got: {err}"
+            ),
+            Ok(_) => panic!("unanswered request must not resolve successfully"),
+        }
+        assert!(
+            elapsed >= std::time::Duration::from_millis(TINY_BUDGET_MS),
+            "must honor the full authoritative budget before failing closed"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "timeout sweep must stay tight, took {elapsed:?}"
+        );
+
+        // The pending entry is gone: even a late, matching response is a noop.
+        let late = manager.respond_ui(ExtensionUiResponse {
+            id: late_id,
+            value: Some(Value::Bool(true)),
+            cancelled: false,
+        });
+        assert!(!late, "expired request must drop its pending entry");
+    });
+}

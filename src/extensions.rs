@@ -14878,6 +14878,13 @@ fn js_hostcall_timeout_ms(request: &HostcallRequest) -> Option<u64> {
     }
 }
 
+/// Default bounded lifetime for a capability permission prompt (bd-yllbn).
+///
+/// This is the single authoritative deadline for one prompt cycle: the
+/// manager enforces it against `request_ui` waits (failing closed on expiry)
+/// and the TUI derives its visible auto-deny countdown from the same value.
+pub(crate) const CAPABILITY_PROMPT_TIMEOUT_MS: u64 = 30_000;
+
 /// Prompt the UI surface once for a capability decision.
 ///
 /// Returns `(allow, persist_override)`. The response `value` may be either a
@@ -14898,8 +14905,13 @@ async fn prompt_capability_once(
         "message": message,
         "extension_id": extension_id,
         "capability": capability,
+        // Mirrored onto the typed field below; carried in-payload so JS-side
+        // consumers and RPC surfaces observe the identical deadline budget.
+        "timeout_ms": CAPABILITY_PROMPT_TIMEOUT_MS,
     });
-    let request = ExtensionUiRequest::new("", "confirm", payload);
+    let request = ExtensionUiRequest::new("", "confirm", payload)
+        .with_extension_id(Some(extension_id.to_string()))
+        .with_timeout_ms(CAPABILITY_PROMPT_TIMEOUT_MS);
 
     match manager.request_ui(request).await {
         Ok(Some(response)) => {

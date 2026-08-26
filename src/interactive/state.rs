@@ -610,8 +610,14 @@ pub(super) struct CapabilityPromptOverlay {
     pub(super) description: String,
     /// Which button is focused.
     pub(super) focused: usize,
-    /// Auto-deny countdown (remaining seconds).  `None` = no timer.
-    pub(super) auto_deny_secs: Option<u32>,
+    /// Monotonic generation bound to exactly one activation slot (bd-yllbn).
+    ///
+    /// Assigned once at enqueue time; expiry messages carry it so a stale or
+    /// late wake can never resolve a different prompt's overlay.
+    pub(super) generation: u64,
+    /// Authoritative absolute expiry shared with the manager-side timeout.
+    /// `None` = request carried no bounded budget (no timer rendered/fired).
+    pub(super) expires_at: Option<std::time::Instant>,
 }
 
 impl CapabilityPromptOverlay {
@@ -634,14 +640,45 @@ impl CapabilityPromptOverlay {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        // Anchored at arrival so queueing time consumes the same bounded
+        // budget the manager enforces on its side of the same request.
+        let expires_at = Self::deadline_from_request(&request, std::time::Instant::now());
         Self {
             request,
             extension_id,
             capability,
             description,
             focused: 0,
-            auto_deny_secs: Some(30),
+            generation: 0,
+            expires_at,
         }
+    }
+
+    /// Resolve the single authoritative deadline from an incoming request.
+    fn deadline_from_request(
+        request: &ExtensionUiRequest,
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        let ms = request
+            .timeout_ms
+            .or_else(|| request.payload.get("timeout_ms").and_then(Value::as_u64))
+            .or_else(|| request.payload.get("timeout").and_then(Value::as_u64))?;
+        (ms > 0).then(|| now + std::time::Duration::from_millis(ms))
+    }
+
+    /// Whole seconds left on the countdown, clamped at zero.
+    pub(super) fn remaining_secs(&self, now: std::time::Instant) -> Option<u32> {
+        let remaining = self.remaining_ms(now)?;
+        Some(u32::try_from(remaining.div_ceil(1000)).unwrap_or(u32::MAX))
+    }
+
+    /// Milliseconds remaining until expiry (`None` when unbudgeted).
+    pub(super) fn remaining_ms(&self, now: std::time::Instant) -> Option<u64> {
+        self.expires_at.map(|deadline| {
+            deadline
+                .checked_duration_since(now)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        })
     }
 
     pub(super) const fn focus_next(&mut self) {

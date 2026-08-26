@@ -571,10 +571,11 @@ impl PiApp {
         }
 
         // Capability prompt overlay (if open)
-        if let Some(ref prompt) = self.capability_prompt {
-            output.push_str(&self.render_capability_prompt(prompt));
+        if let Some(prompt) = &self.capability_prompt {
+            output.push_str(
+                &self.render_capability_prompt(prompt, self.capability_prompt_queue.len()),
+            );
         }
-
         // Extension custom overlay (if open)
         if let Some(ref overlay) = self.extension_custom_overlay {
             output.push_str(&self.render_extension_custom_overlay(overlay));
@@ -1659,7 +1660,11 @@ impl PiApp {
         output
     }
 
-    pub(super) fn render_capability_prompt(&self, prompt: &CapabilityPromptOverlay) -> String {
+    pub(super) fn render_capability_prompt(
+        &self,
+        prompt: &CapabilityPromptOverlay,
+        queued_count: usize,
+    ) -> String {
         let mut output = String::new();
 
         // Title line.
@@ -1701,8 +1706,10 @@ impl PiApp {
         }
         output.push('\n');
 
-        // Auto-deny timer.
-        if let Some(secs) = prompt.auto_deny_secs {
+        // Auto-deny countdown derived LIVE from the authoritative deadline
+        // captured on arrival (bd-yllbn); it decays in wall-clock time and
+        // expiry resolves the overlay fail-closed.
+        if let Some(secs) = prompt.remaining_secs(std::time::Instant::now()) {
             let _ = writeln!(
                 output,
                 "  {}",
@@ -1712,14 +1719,13 @@ impl PiApp {
             );
         }
 
-        // Help text.
-        let _ = writeln!(
-            output,
-            "  {}",
-            self.styles
-                .muted_italic
-                .render("←/→/Tab: navigate  Enter: confirm  Esc: deny")
-        );
+        // Help text; surface FIFO depth so users see waiting prompts.
+        let help = if queued_count > 0 {
+            format!("←/→/Tab: navigate  Enter: confirm  Esc: deny  ({queued_count} queued)")
+        } else {
+            "←/→/Tab: navigate  Enter: confirm  Esc: deny".to_string()
+        };
+        let _ = writeln!(output, "  {}", self.styles.muted_italic.render(&help));
 
         output
     }

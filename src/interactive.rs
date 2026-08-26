@@ -1935,6 +1935,11 @@ pub enum PiMsg {
     },
     /// Extension UI request (select/confirm/input/editor/custom/notify).
     ExtensionUiRequest(ExtensionUiRequest),
+    /// A queued capability prompt's bounded budget elapsed (bd-yllbn).
+    ///
+    /// Carries the exact request id plus its activation generation so late
+    /// or duplicated wake-ups cannot resolve a different overlay.
+    CapabilityPromptExpired { id: String, generation: u64 },
     /// Extension command finished execution.
     ExtensionCommandDone {
         command: String,
@@ -2483,6 +2488,12 @@ pub struct PiApp {
     // Capability prompt overlay (extension permission request)
     capability_prompt: Option<CapabilityPromptOverlay>,
 
+    /// Ordered FIFO of capability prompts waiting for the active overlay
+    /// to resolve (bd-yllbn). Bounded by MAX_CAPABILITY_PROMPT_QUEUE.
+    capability_prompt_queue: VecDeque<CapabilityPromptOverlay>,
+    /// Monotonic counter assigning one generation per capability request.
+    capability_prompt_generation: u64,
+
     // Branch picker overlay (Ctrl+B quick branch switching)
     branch_picker: Option<BranchPickerOverlay>,
 
@@ -2832,6 +2843,8 @@ impl PiApp {
             theme_picker: None,
             tree_ui: None,
             capability_prompt: None,
+            capability_prompt_queue: VecDeque::new(),
+            capability_prompt_generation: 0,
             branch_picker: None,
             model_selector: None,
             frame_timing: FrameTimingStats::new(),

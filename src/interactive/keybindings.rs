@@ -104,7 +104,10 @@ impl PiApp {
                     value: Some(Value::Bool(action.is_allow())),
                     cancelled: false,
                 };
-                // Record persistent decisions for "Always" choices.
+                // Persistent decisions are recorded ONLY here, keyed to the
+                // exact request the user just resolved through the active
+                // overlay; expiry, overflow denial, and session drains never
+                // touch permission state (bd-yllbn).
                 if action.is_persistent()
                     && let Ok(mut store) = crate::permissions::PermissionStore::open_default()
                 {
@@ -113,6 +116,7 @@ impl PiApp {
                 }
                 self.capability_prompt = None;
                 self.send_extension_ui_response(response);
+                return self.activate_next_capability_prompt();
             }
 
             // Escape = deny once.
@@ -124,6 +128,7 @@ impl PiApp {
                 };
                 self.capability_prompt = None;
                 self.send_extension_ui_response(response);
+                return self.activate_next_capability_prompt();
             }
 
             _ => {}
