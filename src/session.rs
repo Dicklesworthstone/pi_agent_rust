@@ -1437,6 +1437,11 @@ fn plan_jsonl_incremental_append(
         .cloned()
         .collect::<HashSet<_>>();
     let mut merged_entries = disk_session.entries.clone();
+    // Heal only the persisted view: dangling parents among legacy disk rows
+    // are load-time corruption fallout. Pending (in-memory-only) entries with
+    // a missing parent stay a hard error below — that is a programming error,
+    // not corruption, and must not reach the file.
+    heal_orphaned_parent_links(&disk_session.header.id, &mut merged_entries, None);
     merged_entries.extend(pending_entries);
     ensure_session_parent_links_closed(&merged_entries)?;
     let ordered_entries = stable_parent_topological_order(merged_entries)?;
@@ -1750,6 +1755,7 @@ fn prepare_jsonl_full_rewrite(
             )));
         }
     }
+    let disk_entry_ids: HashSet<String> = merged_positions.keys().cloned().collect();
 
     let mut local_entry_ids = HashSet::with_capacity(entries.len());
     for entry in entries {
@@ -1775,6 +1781,10 @@ fn prepare_jsonl_full_rewrite(
         }
     }
 
+    // Heal after the byte-equality merge (healing earlier would make healed
+    // disk rows conflict with their unhealed in-memory copies), restricted to
+    // rows that came from disk — see heal_orphaned_parent_links.
+    heal_orphaned_parent_links(&header.id, &mut merged_entries, Some(&disk_entry_ids));
     ensure_session_parent_links_closed(&merged_entries)?;
     let merged_entries = stable_parent_topological_order(merged_entries)?;
     Ok((header_to_write, merged_entries))
@@ -1796,6 +1806,48 @@ fn ensure_session_parent_links_closed(entries: &[SessionEntry]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Re-parent entries whose parent link resolves nowhere as roots (upstream TS
+/// session-manager semantics: getTree treats a missing-parent entry as a
+/// root). Only persisted rows are healed — dangling parents among legacy disk
+/// rows are load-time corruption fallout, while a pending in-memory entry
+/// with a missing parent is a programming error and stays rejected by the
+/// closure check. Left as an error, one corrupt row would block every future
+/// save of the session (model switch, thinking change, checkpoint — while
+/// plain appends never heal the file). The next full rewrite persists the
+/// healed graph.
+fn heal_orphaned_parent_links(
+    session_id: &str,
+    entries: &mut [SessionEntry],
+    restrict_to_disk_ids: Option<&HashSet<String>>,
+) -> usize {
+    let entry_ids = entries
+        .iter()
+        .filter_map(|entry| entry.base_id().cloned())
+        .collect::<HashSet<_>>();
+    let mut healed = 0;
+    for entry in entries.iter_mut() {
+        let Some(id) = entry.base_id() else {
+            continue;
+        };
+        if restrict_to_disk_ids.is_some_and(|disk_ids| !disk_ids.contains(id)) {
+            continue;
+        }
+        if let Some(parent_id) = entry.base().parent_id.as_deref()
+            && !entry_ids.contains(parent_id)
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                entry_id = %id,
+                missing_parent_id = %parent_id,
+                "session entry references missing parent; re-parenting as root during save"
+            );
+            entry.base_mut().parent_id = None;
+            healed += 1;
+        }
+    }
+    healed
 }
 
 /// Validate the persisted session graph without changing authoritative row order.
@@ -14576,6 +14628,67 @@ mod tests {
             .to_string();
         let header: serde_json::Value = serde_json::from_str(&first_line).unwrap();
         assert_eq!(header["provider"], "new-provider");
+    }
+
+    #[test]
+    fn test_orphaned_parent_link_does_not_block_full_rewrite_save() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut session = Session::create();
+        session.session_dir = Some(temp_dir.path().to_path_buf());
+
+        session.append_message(make_test_message("msg A"));
+        let id_b = session.append_message(make_test_message("msg B"));
+        run_async(async { session.save().await }).unwrap();
+
+        // File surgery: point B's parent at an id that exists nowhere — the
+        // same on-disk state a load-time skipped line leaves behind (corrupt
+        // or legacy row written by an older build).
+        let path = session.path.clone().unwrap();
+        {
+            let content = std::fs::read_to_string(&path).unwrap();
+            let mut lines: Vec<serde_json::Value> = content
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            for line in lines.iter_mut().skip(1) {
+                if line.get("id").and_then(|v| v.as_str()) == Some(id_b.as_str()) {
+                    line["parentId"] = serde_json::json!("missing-parent-id");
+                }
+            }
+            let body = lines
+                .iter()
+                .map(|v| serde_json::to_string(v).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            std::fs::write(&path, body).unwrap();
+        }
+
+        let mut loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        assert_eq!(loaded.entries.len(), 2, "load tolerates the orphan");
+
+        // Header-dirty save (the model-switch path) must heal the file instead
+        // of failing forever with "references missing parent".
+        loaded.set_model_header(Some("new-provider".to_string()), None, None);
+        run_async(async { loaded.save().await })
+            .expect("full rewrite must heal orphaned parent links");
+
+        // The rewritten file is closed: every parentId resolves.
+        let reloaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+        let ids: HashSet<&str> = reloaded
+            .entries
+            .iter()
+            .filter_map(|e| e.base_id().map(String::as_str))
+            .collect();
+        for entry in &reloaded.entries {
+            if let Some(parent) = entry.base().parent_id.as_deref() {
+                assert!(ids.contains(parent), "parent {parent} must exist after heal");
+            }
+        }
+        // B survived the heal as a root entry, not dropped.
+        assert!(reloaded.entry_ids.contains(&id_b));
     }
 
     #[test]
