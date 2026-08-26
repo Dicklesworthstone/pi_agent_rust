@@ -1777,7 +1777,7 @@ fn capability_prompt_once_binds_authoritative_deadline_budget() {
                 Some(CAPABILITY_PROMPT_TIMEOUT_MS)
             );
             assert_eq!(req.extension_id.as_deref(), Some("ext.budget"));
-            let id = req.id.clone();
+            let id = req.id;
             (
                 manager.respond_ui(ExtensionUiResponse {
                     id,
@@ -1803,8 +1803,9 @@ fn request_ui_timeout_fails_closed_and_clears_pending_entry() {
     manager.set_ui_sender(ui_tx);
 
     run_async(async {
-        let cx = asupersync::Cx::for_request();
         const TINY_BUDGET_MS: u64 = 50;
+
+        let cx = asupersync::Cx::for_request();
 
         let request = ExtensionUiRequest::new(
             "cap-timeout-1",
@@ -1831,7 +1832,7 @@ fn request_ui_timeout_fails_closed_and_clears_pending_entry() {
         };
 
         let started = std::time::Instant::now();
-        let (outcome, _) = futures::join!(attempt, stalled_surface);
+        let (outcome, ()) = futures::join!(attempt, stalled_surface);
         let elapsed = started.elapsed();
 
         match outcome {

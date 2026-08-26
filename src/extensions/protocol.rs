@@ -1814,7 +1814,7 @@ impl ExtensionUiRequest {
     /// timeout elapses fails closed with a timeout error and its pending
     /// entry is removed, so callers cannot strand on an unanswered surface.
     #[must_use]
-    pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
+    pub const fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = Some(timeout_ms);
         self
     }

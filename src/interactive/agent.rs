@@ -1387,7 +1387,7 @@ After approving access in the browser, press Enter in Pi to complete login."
     /// FIFO capacity for queued capability prompts (bd-yllbn).
     const MAX_CAPABILITY_PROMPT_QUEUE: usize = 8;
 
-    fn next_capability_prompt_generation(&mut self) -> u64 {
+    const fn next_capability_prompt_generation(&mut self) -> u64 {
         self.capability_prompt_generation += 1;
         self.capability_prompt_generation
     }
@@ -1405,7 +1405,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         }
         if self.capability_prompt_queue.len() >= Self::MAX_CAPABILITY_PROMPT_QUEUE {
             let response = ExtensionUiResponse {
-                id: overlay.request.id.clone(),
+                id: overlay.request.id,
                 value: Some(Value::Bool(false)),
                 cancelled: true,
             };
@@ -1480,7 +1480,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         if let Some(active) = self.capability_prompt.take() {
             dropped.push_front(active);
         }
-        for prompt in dropped.drain(..) {
+        for prompt in dropped {
             let response = ExtensionUiResponse {
                 id: prompt.request.id,
                 value: Some(Value::Bool(false)),
@@ -1492,7 +1492,7 @@ After approving access in the browser, press Enter in Pi to complete login."
 
     /// Respond without the user-visible "no pending request" status noise;
     /// used by timer/drain paths racing the manager's own timeout sweep.
-    fn send_extension_ui_response_quiet(&mut self, response: ExtensionUiResponse) {
+    fn send_extension_ui_response_quiet(&self, response: ExtensionUiResponse) {
         if let Some(manager) = &self.extensions {
             let _ = manager.respond_ui(response);
         }
@@ -4583,8 +4583,9 @@ mod stream_delta_batcher_tests {
                 .unwrap_or_default();
             assert_eq!(got, want);
         }
-        // Excess arrivals were denied immediately: they appear nowhere.
-        for i in total - 3..total {
+        // Admitted identities are exactly active (00) + FIFO (01..=MAX);
+        // everything beyond that bound was denied on arrival.
+        for i in PiApp::MAX_CAPABILITY_PROMPT_QUEUE + 1..total {
             let id = format!("cap-{i:02}");
             assert!(
                 app.capability_prompt_queue
