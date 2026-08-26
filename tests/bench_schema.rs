@@ -1145,6 +1145,140 @@ elif [[ -n "$bench_name" ]]; then
     printf '%s\n' '{"sampling_mode":"Linear","iters":[1.0,1.0,1.0,1.0],"times":[1.0,1.0,1.0,1.0]}' >"$path"
   }
   case "$bench_name" in
+    pijs_workload)
+      expected_args=(
+        bench --bench pijs_workload --profile perf
+        --no-default-features
+        --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+        -- --regression-gate-pair
+      )
+      args=("$@")
+      if (( ${#args[@]} != ${#expected_args[@]} )); then
+        echo "criterion_pijs used the wrong Cargo argv length: $*" >&2
+        exit 78
+      fi
+      for ((i=0; i<${#expected_args[@]}; i++)); do
+        if [[ "${args[i]}" != "${expected_args[i]}" ]]; then
+          echo "criterion_pijs used unexpected Cargo argv at $i: $*" >&2
+          exit 79
+        fi
+      done
+      if [[ "${PI_BENCH_RUN_ID:-}" != "${CI_CORRELATION_ID:?}" \
+        || "${PI_BENCH_CORRELATION_ID:-}" != "${CI_CORRELATION_ID:?}" \
+        || "${PI_BENCH_ALLOCATOR:-}" != "system" \
+        || "${PI_BENCH_BUILD_PROFILE:-}" != "perf" ]]; then
+        echo "criterion_pijs omitted canonical identity, allocator, or profile controls" >&2
+        exit 80
+      fi
+      pijs_binary="$criterion_root/pijs_workload"
+      printf '%s\n' '#!/usr/bin/env sh' 'exit 0' >"$pijs_binary"
+      chmod +x "$pijs_binary"
+      python3 - \
+        "$criterion_root/pijs_workload.jsonl" \
+        "$pijs_binary" \
+        "${VERGEN_GIT_SHA:?}" \
+        "${CI_CORRELATION_ID:?}" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+evidence_path = Path(sys.argv[1])
+returned_binary = Path(sys.argv[2])
+source_commit = sys.argv[3]
+correlation_id = sys.argv[4]
+binary_path = "/rch-worker/target/perf/deps/pijs_workload-0123456789abcdef"
+binary_sha256 = hashlib.sha256(returned_binary.read_bytes()).hexdigest()
+compiled_features = [
+    "clipboard",
+    "image",
+    "image-resize",
+    "sqlite-sessions",
+    "tui",
+    "wasm-host",
+]
+provenance = {
+    "binary_path": binary_path,
+    "binary_sha256": binary_sha256,
+    "build_fingerprint_contract": "cargo_build_fingerprint.v1",
+    "build_fingerprint_verified": True,
+    "build_profile": "perf",
+    "build_profile_verified": True,
+    "compiled_debug": "true",
+    "compiled_features": compiled_features,
+    "compiled_opt_level": "3",
+    "compiled_profile_family": "release",
+    "debug_assertions": False,
+    "executable_build_profile": "perf",
+    "executable_profile_verified": True,
+    "source_commit": source_commit,
+    "source_dirty": False,
+}
+config_hash = hashlib.sha256(
+    json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+records = []
+for tool_calls in (1, 10):
+    total_calls = 2000 * tool_calls
+    elapsed_us = 1_000_000
+    elapsed_us_f64 = 1_000_000.5
+    records.append(
+        {
+            "schema": "pi.perf.workload.v1",
+            "timestamp": timestamp,
+            "run_id": correlation_id,
+            "correlation_id": correlation_id,
+            "source_commit": source_commit,
+            "source_dirty": False,
+            "tool": "pijs_workload",
+            "scenario": "tool_call_roundtrip",
+            "iterations": 2000,
+            "tool_calls_per_iteration": tool_calls,
+            "total_calls": total_calls,
+            "elapsed_ms": 1000,
+            "elapsed_us": elapsed_us,
+            "elapsed_us_f64": elapsed_us_f64,
+            "per_call_us": elapsed_us // total_calls,
+            "per_call_us_f64": elapsed_us_f64 / total_calls,
+            "per_call_ns_f64": elapsed_us_f64 * 1000.0 / total_calls,
+            "calls_per_sec": total_calls * 1_000_000 // elapsed_us,
+            "build_profile": "perf",
+            "build_profile_verified": True,
+            "build_fingerprint_contract": "cargo_build_fingerprint.v1",
+            "build_fingerprint_verified": True,
+            "compiled_profile_family": "release",
+            "compiled_opt_level": "3",
+            "compiled_debug": "true",
+            "compiled_features": compiled_features,
+            "executable_build_profile": "perf",
+            "executable_profile_verified": True,
+            "debug_assertions": False,
+            "config_hash": config_hash,
+            "runtime_engine": "quickjs",
+            "evidence_class": "measured",
+            "confidence": "high",
+            "eligible_for_regression_gate": True,
+            "measurement_method": "wall_clock_observation",
+            "measurement_boundary": "production_extension_manager",
+            "measurement_contract_version": "production_extension_manager.v1",
+            "disk_cache_policy": "disabled",
+            "host_page_cache_policy": "not_applicable_measured_region",
+            "allocator_requested": "system",
+            "allocator_request_source": "env",
+            "allocator_effective": "system",
+            "allocator_fallback_reason": None,
+            "binary_path": binary_path,
+            "binary_sha256": binary_sha256,
+        }
+    )
+evidence_path.write_text(
+    "\n".join(json.dumps(record, separators=(",", ":")) for record in records) + "\n",
+    encoding="utf-8",
+)
+PY
+      ;;
     tools)
       write_estimate "truncation/head/1000/new/estimates.json"
       ;;
@@ -1709,7 +1843,15 @@ case "${1:-}" in
       echo "rch exec was not placed in fail-closed proof mode" >&2
       exit 65
     fi
-    for key in BENCH_OUTPUT_TARGET_SUBDIR BENCH_QUICK BENCH_ITERATIONS PI_BENCH_RUN_ID CARGO_BUILD_JOBS PI_CRITERION_OUTPUT_SUBDIR; do
+    for key in \
+      BENCH_OUTPUT_TARGET_SUBDIR \
+      BENCH_QUICK \
+      BENCH_ITERATIONS \
+      PI_BENCH_RUN_ID \
+      PI_BENCH_CORRELATION_ID \
+      PI_BENCH_ALLOCATOR \
+      CARGO_BUILD_JOBS \
+      PI_CRITERION_OUTPUT_SUBDIR; do
       case ",${RCH_ENV_ALLOWLIST:-}," in
         *",$key,"*) ;;
         *)

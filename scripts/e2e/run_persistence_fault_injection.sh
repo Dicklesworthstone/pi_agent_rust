@@ -135,12 +135,39 @@ for raw_relative in sorted(filter(None, listed.split(b"\0"))):
         continue
     digest.update(f"mode:{stat.S_IMODE(metadata.st_mode):o}\0".encode())
     if stat.S_ISLNK(metadata.st_mode):
-        digest.update(b"symlink\0" + os.fsencode(os.readlink(path)) + b"\0")
+        target = os.readlink(path)
+        final_metadata = path.lstat()
+        if (metadata.st_dev, metadata.st_ino, metadata.st_mtime_ns) != (
+            final_metadata.st_dev,
+            final_metadata.st_ino,
+            final_metadata.st_mtime_ns,
+        ):
+            raise RuntimeError(f"source symlink changed while hashing: {relative}")
+        digest.update(b"symlink\0" + os.fsencode(target) + b"\0")
     elif stat.S_ISREG(metadata.st_mode):
         digest.update(b"file\0")
-        with path.open("rb") as source:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(descriptor, "rb") as source:
+            initial_descriptor_metadata = os.fstat(source.fileno())
+            if not stat.S_ISREG(initial_descriptor_metadata.st_mode):
+                raise RuntimeError(f"source path stopped being a regular file: {relative}")
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 digest.update(chunk)
+            final_descriptor_metadata = os.fstat(source.fileno())
+        final_path_metadata = path.lstat()
+        identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+        initial_identity = tuple(
+            getattr(initial_descriptor_metadata, field) for field in identity_fields
+        )
+        if (
+            initial_identity
+            != tuple(getattr(metadata, field) for field in identity_fields)
+            or initial_identity
+            != tuple(getattr(final_descriptor_metadata, field) for field in identity_fields)
+            or initial_identity
+            != tuple(getattr(final_path_metadata, field) for field in identity_fields)
+        ):
+            raise RuntimeError(f"source file changed while hashing: {relative}")
         digest.update(b"\0")
     else:
         digest.update(f"other:{stat.S_IFMT(metadata.st_mode):o}\0".encode())
