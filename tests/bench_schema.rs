@@ -1696,19 +1696,22 @@ for name in (
         raise SystemExit(f"{name}: correlation_id mismatch")
     if name == "post_generation_producer_admission.json":
         producer_contract = {
-            "bench_schema": ("bench_schema", "cargo_test"),
             "bench_scenario": ("bench_scenario_runner", "cargo_test"),
             "ext_bench_harness": ("ext_bench_harness", "cargo_test"),
             "perf_bench_harness": ("perf_bench_harness", "cargo_test"),
-            "perf_regression": ("perf_regression", "cargo_test"),
-            "perf_comparison": ("perf_comparison", "cargo_test"),
-            "perf_baseline_variance": ("perf_baseline_variance", "cargo_test"),
             "criterion_extensions": ("extensions", "criterion"),
             "criterion_pijs": ("pijs_workload", "criterion"),
             "criterion_system": ("system", "criterion"),
             "criterion_semantic_context": ("semantic_context", "criterion"),
         }
+        support_contract = {
+            "bench_schema": ("bench_schema", "cargo_test"),
+            "perf_regression": ("perf_regression", "cargo_test"),
+            "perf_comparison": ("perf_comparison", "cargo_test"),
+            "perf_baseline_variance": ("perf_baseline_variance", "cargo_test"),
+        }
         producers = payload.get("producers")
+        support_checks = payload.get("support_checks")
         if (
             payload.get("schema")
             != "pi.perf.post_generation_producer_admission.v1"
@@ -1724,45 +1727,53 @@ for name in (
             != "post_generation_evidence_inventory"
             or not isinstance(producers, list)
             or len(producers) != len(producer_contract)
+            or not isinstance(support_checks, list)
+            or len(support_checks) != len(support_contract)
         ):
             raise SystemExit("post-generation producer admission proof mismatch")
-        observed_producers = {}
-        for producer in producers:
-            if not isinstance(producer, dict):
+        for entries, contract, label in (
+            (producers, producer_contract, "producer"),
+            (support_checks, support_contract, "support check"),
+        ):
+            observed_entries = {}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise SystemExit(
+                        f"post-generation admission {label} entry mismatch"
+                    )
+                suite = entry.get("suite")
+                fingerprint = entry.get("overlay_fingerprint")
+                remote_worker = entry.get("remote_worker")
+                remote_marker = entry.get("remote_marker")
+                receipt = entry.get("clean_overlay_receipt")
+                if (
+                    suite in observed_entries
+                    or suite not in contract
+                    or (entry.get("target"), entry.get("kind"))
+                    != contract[suite]
+                    or entry.get("remote_execution_verified") is not True
+                    or not isinstance(fingerprint, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                    or not isinstance(remote_worker, str)
+                    or re.fullmatch(r"[^\s]+", remote_worker) is None
+                    or not isinstance(remote_marker, str)
+                    or re.fullmatch(
+                        rf"\[RCH\] remote {re.escape(remote_worker)} \([^)]+\)",
+                        remote_marker,
+                    )
+                    is None
+                    or receipt
+                    != (
+                        "[RCH] clean-overlay receipt: "
+                        f"base={expected_source_commit} overlay-fingerprint={fingerprint}"
+                    )
+                ):
+                    raise SystemExit(
+                        f"post-generation admission {label} entry mismatch: {suite!r}"
+                    )
+                observed_entries[suite] = (entry.get("target"), entry.get("kind"))
+            if observed_entries != contract:
                 raise SystemExit("post-generation producer admission entry mismatch")
-            suite = producer.get("suite")
-            fingerprint = producer.get("overlay_fingerprint")
-            remote_worker = producer.get("remote_worker")
-            remote_marker = producer.get("remote_marker")
-            receipt = producer.get("clean_overlay_receipt")
-            if (
-                suite in observed_producers
-                or suite not in producer_contract
-                or (producer.get("target"), producer.get("kind"))
-                != producer_contract[suite]
-                or producer.get("remote_execution_verified") is not True
-                or not isinstance(fingerprint, str)
-                or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
-                or not isinstance(remote_worker, str)
-                or re.fullmatch(r"[^\s]+", remote_worker) is None
-                or not isinstance(remote_marker, str)
-                or re.fullmatch(
-                    rf"\[RCH\] remote {re.escape(remote_worker)} \([^)]+\)",
-                    remote_marker,
-                )
-                is None
-                or receipt
-                != (
-                    "[RCH] clean-overlay receipt: "
-                    f"base={expected_source_commit} overlay-fingerprint={fingerprint}"
-                )
-            ):
-                raise SystemExit(
-                    f"post-generation producer admission entry mismatch: {suite!r}"
-                )
-            observed_producers[suite] = (producer.get("target"), producer.get("kind"))
-        if observed_producers != producer_contract:
-            raise SystemExit("post-generation producer admission suite mismatch")
 marker = {
     "schema": "pi.perf.fake_post_generation_invocation.v1",
     "correlation_id": expected_correlation_id,

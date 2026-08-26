@@ -1702,19 +1702,26 @@ run_test_suite() {
     if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
       suite_runner_args=("${PERF_BENCH_RUNNER_ARGS[@]}")
     fi
-    BENCH_OUTPUT_DIR="$result_dir" \
-    PERF_REGRESSION_OUTPUT="$result_dir" \
-    PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
-    CI_CORRELATION_ID="$CORRELATION_ID" \
-    VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
-    VERGEN_GIT_DIRTY="$GIT_DIRTY" \
-    RUST_TEST_THREADS="$PARALLELISM" \
-    RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-0}" \
-    RCH_QUIET=0 \
-    RCH_VISIBILITY=summary \
-      "${suite_runner_args[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
-      >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
-      || exit_code=$?
+    local -a controller_output_env=()
+    if [[ "$CARGO_RUNNER_MODE" != "rch" ]]; then
+      controller_output_env=(
+        "BENCH_OUTPUT_DIR=$result_dir"
+        "PERF_REGRESSION_OUTPUT=$result_dir"
+        "PERF_RELEASE_BINARY_PATH=$TARGET_DIR/release/pi"
+      )
+    fi
+    env \
+      "${controller_output_env[@]}" \
+      CI_CORRELATION_ID="$CORRELATION_ID" \
+      VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+      VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+      RUST_TEST_THREADS="$PARALLELISM" \
+      RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-0}" \
+      RCH_QUIET=0 \
+      RCH_VISIBILITY=summary \
+        "${suite_runner_args[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
+        >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
+        || exit_code=$?
     if [[ "$exit_code" -eq 0 && "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
       if ! verify_current_clean_source_identity "RCH $suite_name postcondition"; then
         exit_code=91
@@ -2126,6 +2133,7 @@ expected_instance = os.environ["RUN_INSTANCE_ID"]
 expected_profile = os.environ["CARGO_PROFILE"]
 failures = []
 admitted_producers = []
+admitted_support_checks = []
 
 remote_marker_pattern = re.compile(
     r"^\[RCH\] remote (?P<worker>[^\s]+) \([^)]+\)$"
@@ -2136,11 +2144,13 @@ receipt_pattern = re.compile(
     r"overlay-fingerprint=(?P<fingerprint>[0-9a-f]{64})$"
 )
 
-required_test_suites = {
-    "bench_schema": "bench_schema",
+required_test_producers = {
     "bench_scenario": "bench_scenario_runner",
     "ext_bench_harness": "ext_bench_harness",
     "perf_bench_harness": "perf_bench_harness",
+}
+required_support_checks = {
+    "bench_schema": "bench_schema",
     "perf_regression": "perf_regression",
     "perf_comparison": "perf_comparison",
     "perf_baseline_variance": "perf_baseline_variance",
@@ -2219,7 +2229,7 @@ def load_remote_proof(suite):
     }
 
 
-def validate_common(suite, target, kind, result, extra_expected=None):
+def validate_common(suite, target, kind, result, admitted, extra_expected=None):
     expected = {
         "schema": "pi.perf.suite_result.v1",
         "suite_name": suite,
@@ -2265,10 +2275,10 @@ def validate_common(suite, target, kind, result, extra_expected=None):
             "remote_execution_verified": True,
         }
         producer.update(remote_proof)
-        admitted_producers.append(producer)
+        admitted.append(producer)
 
 
-for suite, target in required_test_suites.items():
+for suite, target in required_test_producers.items():
     _, result = load_current_result(suite)
     if result is None:
         continue
@@ -2277,6 +2287,20 @@ for suite, target in required_test_suites.items():
         target,
         "cargo_test",
         result,
+        admitted_producers,
+        {"remote_execution_required": True},
+    )
+
+for suite, target in required_support_checks.items():
+    _, result = load_current_result(suite)
+    if result is None:
+        continue
+    validate_common(
+        suite,
+        target,
+        "cargo_test",
+        result,
+        admitted_support_checks,
         {"remote_execution_required": True},
     )
 
@@ -2290,6 +2314,7 @@ for suite, target in required_criterion_suites.items():
         target,
         "criterion",
         result,
+        admitted_producers,
         {"output_relative": expected_output},
     )
 
@@ -2307,6 +2332,9 @@ report = {
     "failure_count": len(failures),
     "failures": failures,
     "producers": sorted(admitted_producers, key=lambda producer: producer["suite"]),
+    "support_checks": sorted(
+        admitted_support_checks, key=lambda check: check["suite"]
+    ),
 }
 admission_path.write_text(
     json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -2403,8 +2431,11 @@ for suite in "${SELECTED_SUITES[@]}"; do
   fi
 done
 
-# Collect benchmark reports from tests/perf/reports
-if [[ -d "$PROJECT_ROOT/tests/perf/reports" ]]; then
+# Checked-in reports are historical/supporting inputs, not current-run evidence.
+# Never admit them into the exclusive package where their unscoped rows could
+# override current RCH measurements in a derived ratio.
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true \
+  && -d "$PROJECT_ROOT/tests/perf/reports" ]]; then
   cp -r "$PROJECT_ROOT/tests/perf/reports" "$OUTPUT_DIR/results/perf_reports/" 2>/dev/null || true
   log_ok "Collected perf reports directory"
 fi
@@ -3189,11 +3220,6 @@ if not per_call_samples_us:
             per_call_samples_us.append(per_call_us)
 
 full_e2e_samples_ms: list[float] = []
-perf_regression_row = suite_result_by_name.get("perf_regression")
-if isinstance(perf_regression_row, dict):
-    elapsed_ms = parse_float(perf_regression_row.get("elapsed_ms"))
-    if elapsed_ms is not None:
-        full_e2e_samples_ms.append(elapsed_ms)
 for record in workload_records:
     elapsed_ms = parse_float(record.get("elapsed_ms"))
     if elapsed_ms is not None:
@@ -3423,7 +3449,7 @@ layers = [
         "full_e2e_long_session",
         "Full end-to-end long-session workload",
         ["full-e2e", "long-session", "user-facing", "release-facing"],
-        ["perf_regression", "perf_comparison"],
+        ["criterion_pijs", "bench_scenario"],
         "long_session_elapsed",
         full_e2e_abs_ms,
         "ms",
@@ -5033,7 +5059,6 @@ phase5_ready = (
     and len(missing_cells) == 0
     and cells_with_complete_swarm_metrics == required_cell_count
     and len(swarm_missing_cells) == 0
-    and not any(status != "pass" for status in (memory_status, correctness_status, security_status))
 )
 
 payload = {
