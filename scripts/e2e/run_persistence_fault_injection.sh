@@ -1341,6 +1341,7 @@ python3 - \
     "$ARTIFACT_DIR/.run-manifest.pending.json" \
     "$ARTIFACT_DIR/run-manifest.json" \
     "$ARTIFACT_DIR" <<'PY'
+import json
 import os
 import stat
 import sys
@@ -1354,7 +1355,7 @@ with os.fdopen(descriptor, "rb") as source:
     pending_metadata = os.fstat(source.fileno())
     if not stat.S_ISREG(pending_metadata.st_mode):
         raise SystemExit("pending run manifest is not a regular file")
-    source.read()
+    manifest_bytes = source.read()
     final_descriptor_metadata = os.fstat(source.fileno())
 path_metadata = pending.lstat()
 if (
@@ -1363,8 +1364,19 @@ if (
     != (final_descriptor_metadata.st_dev, final_descriptor_metadata.st_ino, final_descriptor_metadata.st_size, final_descriptor_metadata.st_mtime_ns)
     or (pending_metadata.st_dev, pending_metadata.st_ino, pending_metadata.st_size, pending_metadata.st_mtime_ns)
     != (path_metadata.st_dev, path_metadata.st_ino, path_metadata.st_size, path_metadata.st_mtime_ns)
+    or len(manifest_bytes) != pending_metadata.st_size
 ):
     raise SystemExit("pending run manifest changed before publication")
+try:
+    manifest = json.loads(manifest_bytes)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"pending run manifest is invalid JSON: {error}") from error
+if (
+    not isinstance(manifest, dict)
+    or manifest.get("schema") != "pi.e2e.persistence_fault_injection.manifest.v1"
+    or manifest.get("terminal_state") != "complete"
+):
+    raise SystemExit("pending run manifest lacks the terminal completion contract")
 if published.exists() or published.is_symlink():
     raise SystemExit("run manifest publication target is unsafe")
 os.link(pending, published, follow_symlinks=False)
@@ -1389,5 +1401,6 @@ PY
 echo "[fault-injection] Completed with exit code $overall_exit"
 echo "[fault-injection] Artifacts: $ARTIFACT_DIR"
 echo "[fault-injection] Integrity summary: $ARTIFACT_DIR/integrity-summary.json"
+echo "[fault-injection] Completion manifest: $ARTIFACT_DIR/run-manifest.json"
 
 exit "$overall_exit"
