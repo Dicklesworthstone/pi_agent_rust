@@ -2182,6 +2182,10 @@ collect_jsonl "$TARGET_DIR/perf/ext_bench_harness.jsonl" "ext_bench_harness.json
 collect_jsonl "$TARGET_DIR/perf/scenario_runner.jsonl" "scenario_runner.jsonl"
 if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true ]]; then
   collect_jsonl "$TARGET_DIR/perf/pijs_workload.jsonl" "pijs_workload.jsonl"
+elif [[ -s "$OUTPUT_DIR/results/pijs_workload.jsonl" \
+  && ! -L "$OUTPUT_DIR/results/pijs_workload.jsonl" ]]; then
+  artifact_count=$((artifact_count + 1))
+  log_ok "Collected: pijs_workload.jsonl ($(wc -l < "$OUTPUT_DIR/results/pijs_workload.jsonl") records)"
 fi
 collect_jsonl "$TARGET_DIR/perf/legacy_extension_workloads.jsonl" "legacy_extension_workloads.jsonl"
 collect_jsonl "$TARGET_DIR/perf/$CARGO_PROFILE/pgo_pipeline_events.jsonl" "pgo_pipeline_events.jsonl"
@@ -6218,6 +6222,19 @@ suite_results.append(
         "status": os.environ["POST_GENERATION_STATUS"],
         "exit_code": int(os.environ["POST_GENERATION_EXIT"]),
         "elapsed_ms": 0,
+    }
+)
+status_counts = {"pass": 0, "fail": 0, "skip": 0}
+for result in suite_results:
+    status = result.get("status") if isinstance(result, dict) else None
+    if status in status_counts:
+        status_counts[status] += 1
+run_summary.update(
+    {
+        "total_suites": len(suite_results),
+        "passed": status_counts["pass"],
+        "failed": status_counts["fail"],
+        "skipped": status_counts["skip"],
     }
 )
 manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

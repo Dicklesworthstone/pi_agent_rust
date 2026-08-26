@@ -644,7 +644,7 @@ def load_jsonl(path: Path) -> list[dict]:
     return records
 
 
-def parse_timestamp(value: object) -> datetime | None:
+def parse_timestamp(value: object):
     if not isinstance(value, str) or not value.strip():
         return None
     normalized = value.strip()
@@ -1149,7 +1149,7 @@ published = Path(sys.argv[2])
 artifact_dir = Path(sys.argv[3])
 
 
-def read_stable_regular(path: Path) -> tuple[bytes, os.stat_result]:
+def read_stable_regular(path: Path):
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as source:
         initial_metadata = os.fstat(source.fileno())
@@ -1227,7 +1227,7 @@ manifest_path = Path(sys.argv[1])
 final_summary_path = Path(sys.argv[2])
 
 
-def read_stable_regular(path: Path, *, missing_ok: bool = False) -> bytes | None:
+def read_stable_regular(path: Path, *, missing_ok: bool = False):
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -1258,7 +1258,14 @@ def read_stable_regular(path: Path, *, missing_ok: bool = False) -> bytes | None
 
 
 def attest_artifact(path: Path) -> dict:
-    contents = read_stable_regular(path, missing_ok=True)
+    try:
+        contents = read_stable_regular(path, missing_ok=True)
+    except (OSError, ValueError) as error:
+        return {
+            "path": str(path),
+            "present": False,
+            "error": f"{type(error).__name__}: {error}",
+        }
     if contents is None:
         return {"path": str(path), "present": False}
     return {
