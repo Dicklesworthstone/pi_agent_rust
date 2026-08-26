@@ -1729,6 +1729,44 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
         };
     }
 
+    // Multi-file extension directories (bd-sog97.29): production discovers
+    // each top-level .ts file as its own extension, so a vendored directory
+    // delivers the UNION of its modules' registrations, and the manifest
+    // records that directory-level capability set. Load every sibling module
+    // into the same manager before observing so the comparison is faithful;
+    // individual sibling failures are logged and never mask the entry
+    // module's own result (a directory registering nothing still fails any
+    // expected-identity validation).
+    let mut sibling_load_notes: Vec<String> = Vec::new();
+    if let Some(dir) = entry_file.parent() {
+        let mut siblings: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ts"))
+                    && p != entry_file
+            })
+            .collect();
+        siblings.sort();
+        for sibling in siblings {
+            let Ok(sibling_spec) = JsExtensionLoadSpec::from_entry_path(&sibling) else {
+                sibling_load_notes.push(format!("{}: load spec error", sibling.display()));
+                continue;
+            };
+            let res = common::run_async({
+                let manager = manager.clone();
+                async move { manager.load_js_extensions(vec![sibling_spec]).await }
+            });
+            if let Err(e) = res {
+                sibling_load_notes.push(format!("{}: {e}", sibling.display()));
+            }
+        }
+    }
+    for note in &sibling_load_notes {
+        eprintln!("    [sibling-load] {note}");
+    }
+
     // Validate both capability presence and exact identity equality with the
     // canonical manifest. Undeclared runtime registrations are evidence drift,
     // not successful conformance.
