@@ -1527,6 +1527,96 @@ run_test_suite() {
     if [[ "$exit_code" -eq 0 ]]; then
       remote_execution_verified=true
     fi
+  elif [[ "$CARGO_RUNNER_MODE" == "rch" \
+    && "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true \
+    && ( "$suite_name" == "bench_scenario" \
+      || "$suite_name" == "ext_bench_harness" ) ]]; then
+    rch_target_subdir="nextest/pi-perf/$RUN_INSTANCE_ID/$suite_name"
+    local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
+    local -a returned_artifacts=()
+    local -a producer_feature_args=()
+    case "$suite_name" in
+      bench_scenario)
+        returned_artifacts=(scenario_runner.jsonl)
+        ;;
+      ext_bench_harness)
+        returned_artifacts=(ext_bench_harness.jsonl ext_bench_harness_report.json)
+        producer_feature_args=(--features ext-conformance)
+        ;;
+    esac
+    if ! verify_current_clean_source_identity "RCH $suite_name producer precondition"; then
+      exit_code=89
+    elif [[ -e "$retrieved_result_dir" || -L "$retrieved_result_dir" ]]; then
+      log_fail "Refusing stale RCH producer directory: $retrieved_result_dir"
+      exit_code=87
+    else
+      BENCH_OUTPUT_TARGET_SUBDIR="$rch_target_subdir" \
+      CI_CORRELATION_ID="$CORRELATION_ID" \
+      VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
+      VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+      RUST_TEST_THREADS="$PARALLELISM" \
+      CARGO_BUILD_JOBS="$BUILD_JOBS" \
+      PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
+      RCH_REQUIRE_REMOTE=1 \
+      RCH_QUIET=0 \
+      RCH_VISIBILITY=summary \
+        "${PERF_BENCH_RUNNER_ARGS[@]}" nextest run \
+          --build-jobs "$BUILD_JOBS" \
+          --test "$target_name" \
+          --cargo-profile "$CARGO_PROFILE" \
+          --test-threads 1 \
+          --no-tests fail \
+          "${producer_feature_args[@]}" \
+          -- --nocapture \
+        >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
+        || exit_code=$?
+    fi
+    if [[ "$exit_code" -eq 0 ]] \
+      && ! verify_current_clean_source_identity "RCH $suite_name producer postcondition"; then
+      exit_code=91
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+      if ! grep -Eqs '^[[]RCH[]] remote [^[:space:]]+ [(][^)]+[)]$' \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "$suite_name producer has no remote-success marker"
+        exit_code=92
+      elif grep -Eqs '^[[]RCH[]] local( |$)' \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "$suite_name producer reported local execution"
+        exit_code=93
+      elif ! grep -Eqs \
+        "^[[]RCH[]] clean-overlay receipt: base=$GIT_COMMIT_FULL overlay-fingerprint=[0-9a-f]{64}$" \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "$suite_name producer has no current-commit clean-overlay receipt"
+        exit_code=94
+      fi
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+      local artifact_name source_path accepted_path
+      for artifact_name in "${returned_artifacts[@]}"; do
+        source_path="$retrieved_result_dir/$artifact_name"
+        accepted_path="$OUTPUT_DIR/results/$artifact_name"
+        if [[ ! -s "$source_path" || -L "$source_path" ]]; then
+          log_fail "$suite_name did not return regular nonempty $artifact_name"
+          exit_code=86
+          break
+        fi
+        if [[ -e "$accepted_path" || -L "$accepted_path" ]]; then
+          log_fail "Refusing preexisting accepted $artifact_name"
+          exit_code=95
+          break
+        fi
+        cp "$source_path" "$accepted_path"
+        if ! cmp -s "$source_path" "$accepted_path"; then
+          log_fail "Accepted $artifact_name copy differs from the RCH return"
+          exit_code=96
+          break
+        fi
+      done
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+      remote_execution_verified=true
+    fi
   else
     local -a suite_runner_args=("${CARGO_RUNNER_ARGS[@]}")
     if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
@@ -2178,20 +2268,30 @@ collect_jsonl() {
 
 # Standard JSONL output paths
 collect_jsonl "$OUTPUT_DIR/results/perf_bench_harness/extension_bench.jsonl" "extension_bench.jsonl"
-collect_jsonl "$TARGET_DIR/perf/ext_bench_harness.jsonl" "ext_bench_harness.jsonl"
-collect_jsonl "$TARGET_DIR/perf/scenario_runner.jsonl" "scenario_runner.jsonl"
 if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true ]]; then
+  collect_jsonl "$TARGET_DIR/perf/ext_bench_harness.jsonl" "ext_bench_harness.jsonl"
+  collect_jsonl "$TARGET_DIR/perf/scenario_runner.jsonl" "scenario_runner.jsonl"
   collect_jsonl "$TARGET_DIR/perf/pijs_workload.jsonl" "pijs_workload.jsonl"
-elif [[ -s "$OUTPUT_DIR/results/pijs_workload.jsonl" \
-  && ! -L "$OUTPUT_DIR/results/pijs_workload.jsonl" ]]; then
-  artifact_count=$((artifact_count + 1))
-  log_ok "Collected: pijs_workload.jsonl ($(wc -l < "$OUTPUT_DIR/results/pijs_workload.jsonl") records)"
+  collect_jsonl "$TARGET_DIR/perf/legacy_extension_workloads.jsonl" "legacy_extension_workloads.jsonl"
+else
+  for accepted_jsonl in ext_bench_harness.jsonl scenario_runner.jsonl pijs_workload.jsonl; do
+    if [[ -s "$OUTPUT_DIR/results/$accepted_jsonl" \
+      && ! -L "$OUTPUT_DIR/results/$accepted_jsonl" ]]; then
+      artifact_count=$((artifact_count + 1))
+      log_ok "Collected: $accepted_jsonl ($(wc -l < "$OUTPUT_DIR/results/$accepted_jsonl") records)"
+    fi
+  done
 fi
-collect_jsonl "$TARGET_DIR/perf/legacy_extension_workloads.jsonl" "legacy_extension_workloads.jsonl"
 collect_jsonl "$TARGET_DIR/perf/$CARGO_PROFILE/pgo_pipeline_events.jsonl" "pgo_pipeline_events.jsonl"
 
-if [[ -f "$TARGET_DIR/perf/ext_bench_harness_report.json" ]]; then
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true \
+  && -f "$TARGET_DIR/perf/ext_bench_harness_report.json" ]]; then
   cp "$TARGET_DIR/perf/ext_bench_harness_report.json" "$OUTPUT_DIR/results/ext_bench_harness_report.json"
+  artifact_count=$((artifact_count + 1))
+  log_ok "Collected: ext_bench_harness_report.json"
+elif [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true \
+  && -s "$OUTPUT_DIR/results/ext_bench_harness_report.json" \
+  && ! -L "$OUTPUT_DIR/results/ext_bench_harness_report.json" ]]; then
   artifact_count=$((artifact_count + 1))
   log_ok "Collected: ext_bench_harness_report.json"
 fi

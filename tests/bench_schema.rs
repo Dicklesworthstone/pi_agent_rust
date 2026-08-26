@@ -1069,6 +1069,11 @@ for ((i=1; i<=$#; i++)); do
 done
 
 mkdir -p "$target_dir/perf"
+artifact_output_dir="$target_dir/perf"
+if [[ -n "${BENCH_OUTPUT_TARGET_SUBDIR:-}" ]]; then
+  artifact_output_dir="$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR"
+  mkdir -p "$artifact_output_dir"
+fi
 
 if [[ -n "$bench_name" && "$no_run" == "1" ]]; then
   :
@@ -1326,7 +1331,7 @@ fi
 
 case "$test_name" in
   bench_scenario_runner)
-    cat >"$target_dir/perf/scenario_runner.jsonl" <<'JSON'
+    cat >"$artifact_output_dir/scenario_runner.jsonl" <<'JSON'
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","stats":{"p95_ms":18.0},"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/cold_start","replay_input":{"runs":5}}}
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"tool_call","extension":"hello","per_call_us":33.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/tool_call","replay_input":{"iterations":500}}}
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"session_workload_matrix","extension":"core","partition":"matched-state","open_ms":48.0,"append_ms":36.0,"save_ms":22.0,"index_ms":11.0,"total_ms":117.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/session_100000","replay_input":{"session_messages":100000}}}
@@ -1341,7 +1346,7 @@ case "$test_name" in
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"session_workload_matrix","extension":"core","partition":"realistic","open_ms":198.0,"append_ms":146.0,"save_ms":88.0,"index_ms":33.0,"total_ms":465.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"realistic/session_5000000","replay_input":{"session_messages":5000000}}}
 JSON
     if [[ "${PI_FAKE_DROP_INDEX_STAGE_SAMPLE:-0}" == "1" ]]; then
-      python3 - "$target_dir/perf/scenario_runner.jsonl" <<'PY'
+      python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
 import json
 import os
 import sys
@@ -1366,7 +1371,7 @@ path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="ut
 PY
     fi
     if [[ "${PI_FAKE_DROP_ALL_STAGE_SAMPLES:-0}" == "1" ]]; then
-      python3 - "$target_dir/perf/scenario_runner.jsonl" <<'PY'
+      python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1383,7 +1388,7 @@ for line in rows:
 path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
 PY
     fi
-    cat >"$target_dir/perf/legacy_extension_workloads.jsonl" <<'JSON'
+    cat >"$artifact_output_dir/legacy_extension_workloads.jsonl" <<'JSON'
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"node","summary":{"p50_ms":10.0}}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"bun","summary":{"p50_ms":8.0}}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"node","per_call_us":20.0}
@@ -1391,7 +1396,7 @@ PY
 {"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"node","elapsed_ms":2400.0}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"bun","elapsed_ms":1800.0}
 JSON
-    python3 - "$target_dir/perf/scenario_runner.jsonl" <<'PY'
+    python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1445,7 +1450,7 @@ for line in rows:
 path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
 PY
     if [[ "${PI_FAKE_DROP_SWARM_METRICS:-0}" == "1" ]]; then
-      python3 - "$target_dir/perf/scenario_runner.jsonl" <<'PY'
+      python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1463,10 +1468,10 @@ PY
     fi
     ;;
   ext_bench_harness)
-    cat >"$target_dir/perf/ext_bench_harness.jsonl" <<'JSON'
+    cat >"$artifact_output_dir/ext_bench_harness.jsonl" <<'JSON'
 {"schema":"pi.ext.rust_bench.v1","scenario":"cold_load","extension":"hello","success":true,"stats":{"p95_us":18000}}
 JSON
-    cat >"$target_dir/perf/ext_bench_harness_report.json" <<'JSON'
+    cat >"$artifact_output_dir/ext_bench_harness_report.json" <<'JSON'
 {"schema":"pi.bench.harness_report.v1","summary":{"total_scenarios":1}}
 JSON
     ;;
@@ -1825,7 +1830,7 @@ for relative_path, correlation_field in artifacts:
     )
 PY
   if [[ "${PI_FAKE_INJECT_MALFORMED_SCENARIO_ROW:-0}" == "1" ]]; then
-    printf '{not-json\n' >>"$target_dir/perf/scenario_runner.jsonl"
+    printf '{not-json\n' >>"$artifact_output_dir/scenario_runner.jsonl"
   fi
 fi
 exit 0
