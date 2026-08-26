@@ -2171,7 +2171,9 @@ collect_jsonl() {
 collect_jsonl "$OUTPUT_DIR/results/perf_bench_harness/extension_bench.jsonl" "extension_bench.jsonl"
 collect_jsonl "$TARGET_DIR/perf/ext_bench_harness.jsonl" "ext_bench_harness.jsonl"
 collect_jsonl "$TARGET_DIR/perf/scenario_runner.jsonl" "scenario_runner.jsonl"
-collect_jsonl "$TARGET_DIR/perf/pijs_workload.jsonl" "pijs_workload.jsonl"
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true ]]; then
+  collect_jsonl "$TARGET_DIR/perf/pijs_workload.jsonl" "pijs_workload.jsonl"
+fi
 collect_jsonl "$TARGET_DIR/perf/legacy_extension_workloads.jsonl" "legacy_extension_workloads.jsonl"
 collect_jsonl "$TARGET_DIR/perf/$CARGO_PROFILE/pgo_pipeline_events.jsonl" "pgo_pipeline_events.jsonl"
 
@@ -5395,6 +5397,7 @@ criterion_required_inputs = {
         "ext_protocol/parse_and_validate/host_call_small/new/estimates.json",
         "ext_protocol/parse_and_validate/log_big/new/estimates.json",
     ],
+    "criterion_pijs": [],
     "criterion_system": [
         "startup/version/warm/new/estimates.json",
         "startup/help/warm/new/estimates.json",
@@ -5410,6 +5413,7 @@ criterion_required_inputs = {
 }
 criterion_expected_targets = {
     "criterion_extensions": "extensions",
+    "criterion_pijs": "pijs_workload",
     "criterion_system": "system",
     "criterion_semantic_context": "semantic_context",
 }
@@ -5719,7 +5723,9 @@ if pijs_artifact.is_file():
             or len(claimed_sha256) != 64
         ):
             raise SystemExit("eligible PiJS records have invalid binary provenance")
-        binary_candidates = [target_dir / "perf" / "examples" / "pijs_workload"]
+        binary_candidates = [
+            criterion_run_root / "criterion_pijs" / "pijs_workload"
+        ]
         pijs_binary = None
         for candidate in binary_candidates:
             try:

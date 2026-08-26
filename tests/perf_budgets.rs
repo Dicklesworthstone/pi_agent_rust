@@ -685,6 +685,11 @@ fn validate_post_generation_producer_admission(
         ("run_instance_id", staged_run_instance_id),
         ("cargo_profile", "perf"),
         ("status", "ready"),
+        ("proof_scope", "producer_execution_receipts"),
+        (
+            "artifact_binding",
+            "post_generation_evidence_inventory",
+        ),
     ] {
         if payload.get(field).and_then(Value::as_str) != Some(expected) {
             return Err(format!(
@@ -707,7 +712,6 @@ fn validate_post_generation_producer_admission(
         ("bench_scenario", ("bench_scenario_runner", "cargo_test")),
         ("ext_bench_harness", ("ext_bench_harness", "cargo_test")),
         ("perf_bench_harness", ("perf_bench_harness", "cargo_test")),
-        ("perf_budgets", ("perf_budgets", "cargo_test")),
         ("perf_regression", ("perf_regression", "cargo_test")),
         ("perf_comparison", ("perf_comparison", "cargo_test")),
         (
@@ -715,6 +719,7 @@ fn validate_post_generation_producer_admission(
             ("perf_baseline_variance", "cargo_test"),
         ),
         ("criterion_extensions", ("extensions", "criterion")),
+        ("criterion_pijs", ("pijs_workload", "criterion")),
         ("criterion_system", ("system", "criterion")),
         (
             "criterion_semantic_context",
@@ -745,10 +750,6 @@ fn validate_post_generation_producer_admission(
             .get("kind")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("producer admission {suite} has no kind"))?;
-        let result_sha256 = producer
-            .get("result_sha256")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no result digest"))?;
         let remote_marker = producer
             .get("remote_marker")
             .and_then(Value::as_str)
@@ -769,8 +770,7 @@ fn validate_post_generation_producer_admission(
             .strip_prefix("[RCH] remote ")
             .and_then(|tail| tail.strip_suffix(')'))
             .and_then(|tail| tail.split_once(" ("));
-        if !is_lowercase_sha256(result_sha256)
-            || !is_lowercase_sha256(overlay_fingerprint)
+        if !is_lowercase_sha256(overlay_fingerprint)
             || marker_tail.is_none_or(|(worker, timing)| {
                 worker != remote_worker
                     || worker.is_empty()
@@ -2964,9 +2964,19 @@ fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
     {
         return Err("binary_path must be normalized".to_string());
     }
-    if path.file_stem().and_then(|name| name.to_str()) != Some("pijs_workload") {
+    let binary_name = path.file_name().and_then(OsStr::to_str);
+    let cargo_bench_name = binary_name
+        .and_then(|name| name.strip_prefix("pijs_workload-"))
+        .is_some_and(|disambiguator| {
+            disambiguator.len() == 16
+                && disambiguator
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && path.parent().and_then(Path::file_name).and_then(OsStr::to_str) == Some("deps")
+        });
+    if binary_name != Some("pijs_workload") && !cargo_bench_name {
         return Err(format!(
-            "binary_path must identify the pijs_workload executable (observed={binary_path:?})"
+            "binary_path must identify the pijs_workload executable or its CargoBench perf/deps artifact (observed={binary_path:?})"
         ));
     }
     let derived_profile = profile_from_target_path(path);
@@ -5638,7 +5648,6 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
                     ("bench_scenario", "bench_scenario_runner", "cargo_test"),
                     ("ext_bench_harness", "ext_bench_harness", "cargo_test"),
                     ("perf_bench_harness", "perf_bench_harness", "cargo_test"),
-                    ("perf_budgets", "perf_budgets", "cargo_test"),
                     ("perf_regression", "perf_regression", "cargo_test"),
                     ("perf_comparison", "perf_comparison", "cargo_test"),
                     (
@@ -5647,6 +5656,7 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
                         "cargo_test",
                     ),
                     ("criterion_extensions", "extensions", "criterion"),
+                    ("criterion_pijs", "pijs_workload", "criterion"),
                     ("criterion_system", "system", "criterion"),
                     (
                         "criterion_semantic_context",
@@ -5660,7 +5670,6 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
                         "suite": suite,
                         "target": target,
                         "kind": kind,
-                        "result_sha256": "a".repeat(64),
                         "remote_execution_verified": true,
                         "remote_marker": "[RCH] remote fixture-worker (1.00s)",
                         "remote_worker": "fixture-worker",
@@ -5681,6 +5690,8 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
                     "correlation_id": "current-run",
                     "run_instance_id": evidence_root.file_name().and_then(OsStr::to_str),
                     "cargo_profile": "perf",
+                    "proof_scope": "producer_execution_receipts",
+                    "artifact_binding": "post_generation_evidence_inventory",
                     "status": "ready",
                     "failure_count": 0,
                     "failures": [],

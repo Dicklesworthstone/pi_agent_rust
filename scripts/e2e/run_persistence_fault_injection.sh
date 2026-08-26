@@ -997,12 +997,17 @@ summary = {
     "execution_attestation": "configuration_only",
     "terminal_state": "complete",
     "assertions": {
-        "crash_windows": ["pre_flush", "mid_flush", "post_flush"],
-        "integrity_invariants": [
-            "no_duplication",
-            "no_data_loss",
-            "ordering_preserved",
+        "process_failure_windows": {
+            "pre_flush": "in_process_drop",
+            "mid_flush": "hard_exit",
+            "post_flush": "hard_exit",
+        },
+        "observed_invariants": [
+            "persisted_baseline_preserved",
+            "no_duplicate_messages",
+            "observed_message_order_exact",
         ],
+        "power_loss_durability_attested": False,
     },
     "cases": [jsonl_case, sqlite_case],
     "overall_passed": overall_passed,

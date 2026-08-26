@@ -1550,11 +1550,11 @@ for name in (
             "bench_scenario": ("bench_scenario_runner", "cargo_test"),
             "ext_bench_harness": ("ext_bench_harness", "cargo_test"),
             "perf_bench_harness": ("perf_bench_harness", "cargo_test"),
-            "perf_budgets": ("perf_budgets", "cargo_test"),
             "perf_regression": ("perf_regression", "cargo_test"),
             "perf_comparison": ("perf_comparison", "cargo_test"),
             "perf_baseline_variance": ("perf_baseline_variance", "cargo_test"),
             "criterion_extensions": ("extensions", "criterion"),
+            "criterion_pijs": ("pijs_workload", "criterion"),
             "criterion_system": ("system", "criterion"),
             "criterion_semantic_context": ("semantic_context", "criterion"),
         }
@@ -1569,6 +1569,9 @@ for name in (
             or payload.get("source_dirty") is not False
             or payload.get("run_instance_id") != run_instance_id
             or payload.get("cargo_profile") != "perf"
+            or payload.get("proof_scope") != "producer_execution_receipts"
+            or payload.get("artifact_binding")
+            != "post_generation_evidence_inventory"
             or not isinstance(producers, list)
             or len(producers) != len(producer_contract)
         ):
@@ -1578,7 +1581,6 @@ for name in (
             if not isinstance(producer, dict):
                 raise SystemExit("post-generation producer admission entry mismatch")
             suite = producer.get("suite")
-            result_sha256 = producer.get("result_sha256")
             fingerprint = producer.get("overlay_fingerprint")
             remote_worker = producer.get("remote_worker")
             remote_marker = producer.get("remote_marker")
@@ -1589,8 +1591,6 @@ for name in (
                 or (producer.get("target"), producer.get("kind"))
                 != producer_contract[suite]
                 or producer.get("remote_execution_verified") is not True
-                or not isinstance(result_sha256, str)
-                or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
                 or not isinstance(fingerprint, str)
                 or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
                 or not isinstance(remote_worker, str)
