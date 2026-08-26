@@ -399,6 +399,16 @@ fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
             "failed to create PiJS Criterion output parent: {error}"
         ))
     })?;
+    let output_parent_metadata = fs::symlink_metadata(output_parent).map_err(|error| {
+        Error::extension(format!(
+            "failed to inspect PiJS Criterion output parent: {error}"
+        ))
+    })?;
+    if output_parent_metadata.file_type().is_symlink() || !output_parent_metadata.is_dir() {
+        return Err(Error::extension(
+            "PiJS Criterion output parent must be a regular directory",
+        ));
+    }
     fs::create_dir(&output_dir).map_err(|error| {
         Error::extension(format!(
             "refusing unavailable or preexisting PiJS Criterion output {}: {error}",
@@ -437,12 +447,12 @@ fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
     io::copy(&mut source, &mut destination).map_err(|error| {
         Error::extension(format!("failed to copy returned workload executable: {error}"))
     })?;
-    destination
-        .sync_all()
-        .map_err(|error| Error::extension(format!("failed to sync workload executable: {error}")))?;
     fs::set_permissions(&returned_binary, source_permissions).map_err(|error| {
         Error::extension(format!("failed to preserve workload executable mode: {error}"))
     })?;
+    destination
+        .sync_all()
+        .map_err(|error| Error::extension(format!("failed to sync workload executable: {error}")))?;
 
     let evidence_path = output_dir.join("pijs_workload.jsonl");
     let mut evidence = OpenOptions::new()
@@ -822,8 +832,8 @@ mod tests {
         Args, NativeBenchRuntime, REGRESSION_GATE_ITERATIONS, RegressionGateInputs,
         RegressionGateRequirement, RegressionGateVerifications, WorkloadRuntimeEngine,
         checked_total_calls, is_full_git_sha, is_regression_gate_eligible,
-        run_identity_is_canonical, run_tool_roundtrip_native, run_tool_roundtrip_native_runtime,
-        setup_native_runtime_bench_handle,
+        normalized_criterion_output_subdir, run_identity_is_canonical, run_tool_roundtrip_native,
+        run_tool_roundtrip_native_runtime, setup_native_runtime_bench_handle,
     };
 
     #[test]
@@ -836,6 +846,39 @@ mod tests {
             Args::try_parse_from(["pijs_workload", "--tool-calls", "0"]).is_err(),
             "zero tool calls must not produce benchmark evidence"
         );
+    }
+
+    #[test]
+    fn workload_args_accept_cargo_bench_regression_pair() {
+        let args = Args::try_parse_from([
+            "pijs_workload",
+            "--bench",
+            "--regression-gate-pair",
+        ])
+        .expect("Cargo's harness-free benchmark arguments must parse");
+        assert!(args.cargo_bench);
+        assert!(args.regression_gate_pair);
+    }
+
+    #[test]
+    fn criterion_output_subdir_is_exact_and_normalized() {
+        let run_instance = "a".repeat(64);
+        let valid = format!("pi-perf-runs/{run_instance}/criterion_pijs");
+        assert_eq!(
+            normalized_criterion_output_subdir(&valid).expect("valid output subdir"),
+            Path::new(&valid)
+        );
+        for invalid in [
+            format!("/pi-perf-runs/{run_instance}/criterion_pijs"),
+            format!("pi-perf-runs/../{run_instance}/criterion_pijs"),
+            format!("pi-perf-runs/{run_instance}/criterion_system"),
+            "pi-perf-runs/short/criterion_pijs".to_string(),
+        ] {
+            assert!(
+                normalized_criterion_output_subdir(&invalid).is_err(),
+                "unsafe or noncanonical output subdir must fail: {invalid}"
+            );
+        }
     }
 
     #[test]

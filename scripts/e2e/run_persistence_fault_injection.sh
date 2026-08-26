@@ -391,7 +391,8 @@ run_case() {
     local artifact_index="$case_dir/artifact-index.jsonl"
     local harness_test_log="$test_log"
     local harness_artifact_index="$artifact_index"
-    local start_epoch end_epoch duration_ms exit_code diagnostics_exit
+    local start_epoch end_epoch duration_ms exit_code diagnostics_exit tee_exit
+    local -a pipeline_status
     local source_commit source_dirty source_digest
 
     if [[ -e "$case_dir" || -L "$case_dir" ]]; then
@@ -419,7 +420,7 @@ run_case() {
     if [[ ${#CARGO_RUNNER_PREFIX[@]} -gt 0 ]]; then
         harness_test_log="$RCH_TEST_LOG_REPORT"
         harness_artifact_index="$RCH_ARTIFACT_INDEX_REPORT"
-        if [[ -e "$PROJECT_ROOT/$harness_test_log" || -e "$PROJECT_ROOT/$harness_artifact_index" ]]; then
+        if [[ -e "$PROJECT_ROOT/$harness_test_log" || -L "$PROJECT_ROOT/$harness_test_log" || -e "$PROJECT_ROOT/$harness_artifact_index" || -L "$PROJECT_ROOT/$harness_artifact_index" ]]; then
             echo "[fault-injection] Refusing to overwrite pre-existing RCH test reports in $PROJECT_ROOT" >&2
             write_case_result \
                 "$result_file" \
@@ -461,7 +462,13 @@ run_case() {
             --test-threads=1 \
             2>&1 | tee "$log_file"
     fi
-    exit_code=${PIPESTATUS[0]}
+    pipeline_status=("${PIPESTATUS[@]}")
+    exit_code="${pipeline_status[0]}"
+    tee_exit="${pipeline_status[1]}"
+    if [[ "$exit_code" -eq 0 && "$tee_exit" -ne 0 ]]; then
+        echo "[fault-injection] Failed to retain output log for case '$case_id' (tee exit $tee_exit)" >&2
+        exit_code=74
+    fi
     set -e
 
     diagnostics_exit=0
@@ -586,7 +593,10 @@ rch_require_remote = sys.argv[14] == "true"
 
 def load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"{path}: expected a JSON object")
+    return value
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -930,18 +940,20 @@ def case_checks(
         and result.get("artifact_index_jsonl") == str(case_dir / "artifact-index.jsonl")
         and timestamp_is_current(result.get("timestamp"))
     )
-    diagnostic_sequence_valid = (
-        bool(diagnostic_records)
-        and [record.get("seq") for record in diagnostic_records]
-        == list(range(1, len(diagnostic_records) + 1))
-        and all(
-            current.get("t_ms", -1) <= following.get("t_ms", -1)
-            for current, following in zip(diagnostic_records, diagnostic_records[1:])
-        )
+    diagnostic_sequences = [record.get("seq") for record in diagnostic_records]
+    diagnostic_elapsed_ms = [record.get("t_ms") for record in diagnostic_records]
+    diagnostic_sequence_valid = bool(diagnostic_records) and all(
+        not isinstance(value, bool) and isinstance(value, int) and value >= 0
+        for value in diagnostic_elapsed_ms
+    ) and diagnostic_sequences == list(range(1, len(diagnostic_records) + 1)) and all(
+        current <= following
+        for current, following in zip(diagnostic_elapsed_ms, diagnostic_elapsed_ms[1:])
     )
+    diagnostic_trace_ids = [record.get("trace_id") for record in logs]
     diagnostic_trace_bound = (
         bool(logs)
-        and len({record.get("trace_id") for record in logs}) == 1
+        and all(isinstance(trace_id, str) and bool(trace_id.strip()) for trace_id in diagnostic_trace_ids)
+        and len(set(diagnostic_trace_ids)) == 1
         and all(record.get("ci_correlation_id") == correlation_id for record in logs)
     )
 
@@ -983,14 +995,48 @@ def case_checks(
     }
 
 
-jsonl_case = case_checks(
+case_check_names = (
+    "test_command_passed",
+    "result_schema_valid",
+    "result_identity_current",
+    "fault_log_emitted",
+    "summary_artifact_indexed",
+    "summary_artifact_schema_valid",
+    "summary_artifact_bytes_verified",
+    "summary_artifact_path_confined",
+    "diagnostic_log_schema_valid",
+    "artifact_index_schema_valid",
+    "diagnostic_sequence_valid",
+    "diagnostic_trace_bound",
+    "correlation_id_current",
+    "test_identity_current",
+)
+
+
+def guarded_case_checks(*args: str) -> dict:
+    case_id = args[0]
+    try:
+        return case_checks(*args)
+    except Exception as error:
+        return {
+            "case_id": case_id,
+            "result_file": str(artifact_dir / case_id / "result.json"),
+            "checks": {name: False for name in case_check_names},
+            "test_log_records": 0,
+            "artifact_records": 0,
+            "evidence_error": f"{type(error).__name__}: {error}",
+            "passed": False,
+        }
+
+
+jsonl_case = guarded_case_checks(
     "jsonl",
     "e2e_jsonl_fault_injection_flush_windows",
     "internal-persistence-fault-injection",
     "jsonl mid-flush failure",
     "jsonl-fault-window-summary.json",
 )
-sqlite_case = case_checks(
+sqlite_case = guarded_case_checks(
     "sqlite",
     "e2e_sqlite_fault_injection_flush_windows",
     "sqlite-sessions,internal-persistence-fault-injection",
