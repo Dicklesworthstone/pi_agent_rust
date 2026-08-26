@@ -877,11 +877,21 @@ struct SemanticContextPromptStats {
 /// only when a human-authored source string is known; generated host,
 /// extension, job, and peer messages leave it absent so their payload bytes
 /// can never activate magic keywords accidentally. This provenance is runtime
-/// state only and is deliberately not serialized into [`Message`].
+/// state only and is deliberately not serialized into [`Message`]. The stable
+/// entry identity likewise stays on the envelope so terminal RPC persistence
+/// can replay a cancelled writer without creating a second durable branch.
 #[derive(Debug, Clone)]
 pub struct QueuedAgentMessage {
     message: Message,
     keyword_scan_source: Option<String>,
+    persistence_identity: Arc<OnceLock<QueuedPersistenceIdentity>>,
+}
+
+#[derive(Debug, Clone)]
+struct QueuedPersistenceIdentity {
+    entry_id: String,
+    timestamp: String,
+    parent_id: Option<String>,
 }
 
 impl QueuedAgentMessage {
@@ -894,6 +904,7 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source,
+            persistence_identity: Arc::new(OnceLock::new()),
         }
     }
 
@@ -922,22 +933,58 @@ impl QueuedAgentMessage {
         Self {
             message,
             keyword_scan_source,
+            persistence_identity: Arc::new(OnceLock::new()),
         }
     }
 
     /// Wrap a generated/internal message. Its provider-visible text is never
     /// eligible for magic-keyword activation.
     #[must_use]
-    pub const fn generated(message: Message) -> Self {
+    pub fn generated(message: Message) -> Self {
         Self {
             message,
             keyword_scan_source: None,
+            persistence_identity: Arc::new(OnceLock::new()),
         }
     }
 
     #[must_use]
     pub const fn message(&self) -> &Message {
         &self.message
+    }
+
+    /// Stable identity used if acknowledged queued input must be persisted
+    /// after a terminal RPC failure. Once bound, clones retain the complete
+    /// entry base so a cancelled writer retry is idempotent.
+    #[must_use]
+    pub(crate) fn bind_persistence_identity(
+        &self,
+        parent_id: Option<String>,
+    ) -> (String, String, Option<String>) {
+        let identity = self
+            .persistence_identity
+            .get_or_init(|| QueuedPersistenceIdentity {
+                entry_id: uuid::Uuid::new_v4().to_string(),
+                timestamp: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                parent_id,
+            });
+        (
+            identity.entry_id.clone(),
+            identity.timestamp.clone(),
+            identity.parent_id.clone(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn persistence_entry_id(&self) -> Option<&str> {
+        self.persistence_identity
+            .get()
+            .map(|identity| identity.entry_id.as_str())
+    }
+
+    fn shares_persistence_identity(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.persistence_identity, &other.persistence_identity)
     }
 
     #[must_use]
@@ -1146,6 +1193,30 @@ impl MessageQueue {
                 .map(|entry| entry.delivery)
                 .collect(),
         }
+    }
+
+    fn discard_persistence_ids(&mut self, entry_ids: &std::collections::HashSet<String>) -> usize {
+        let before = self.pending_count();
+        self.steering.retain(|entry| {
+            !entry
+                .delivery
+                .persistence_entry_id()
+                .is_some_and(|id| entry_ids.contains(id))
+        });
+        self.follow_up.retain(|entry| {
+            !entry
+                .delivery
+                .persistence_entry_id()
+                .is_some_and(|id| entry_ids.contains(id))
+        });
+        before.saturating_sub(self.pending_count())
+    }
+
+    fn contains_delivery(&self, delivery: &QueuedAgentMessage) -> bool {
+        self.steering
+            .iter()
+            .chain(&self.follow_up)
+            .any(|entry| entry.delivery.shares_persistence_identity(delivery))
     }
 }
 
@@ -1835,6 +1906,17 @@ impl Agent {
     #[must_use]
     pub fn queued_message_count(&self) -> usize {
         self.message_queue.pending_count()
+    }
+
+    pub(crate) fn discard_queued_persistence_ids(
+        &mut self,
+        entry_ids: &std::collections::HashSet<String>,
+    ) -> usize {
+        self.message_queue.discard_persistence_ids(entry_ids)
+    }
+
+    pub(crate) fn has_staged_delivery(&self, delivery: &QueuedAgentMessage) -> bool {
+        self.message_queue.contains_delivery(delivery)
     }
 
     pub fn provider(&self) -> Arc<dyn Provider> {
@@ -5843,6 +5925,29 @@ mod message_queue_tests {
 
         let follow = queue.pop_follow_up();
         assert_eq!(follow.len(), 1);
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn queued_message_clones_share_lazy_persistence_identity_for_cleanup() {
+        let delivery = queued_user_message("durably acknowledged");
+        let staged_clone = delivery.clone();
+        let mut queue = MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime);
+        queue.push_steering(staged_clone);
+        assert!(queue.contains_delivery(&delivery));
+
+        let (entry_id, timestamp, parent_id) =
+            delivery.bind_persistence_identity(Some("parent-entry".to_string()));
+        assert_eq!(parent_id.as_deref(), Some("parent-entry"));
+        assert!(!timestamp.is_empty());
+        assert_eq!(
+            queue.steering[0].delivery.persistence_entry_id(),
+            Some(entry_id.as_str()),
+            "a staged Agent clone must observe the identity bound by RPC durability"
+        );
+
+        let entry_ids = std::collections::HashSet::from([entry_id]);
+        assert_eq!(queue.discard_persistence_ids(&entry_ids), 1);
         assert_eq!(queue.pending_count(), 0);
     }
 
@@ -10519,6 +10624,40 @@ impl crate::extensions::ExtensionSession for AgentExtensionSession {
     }
 }
 
+fn finish_turn_persistence<T>(result: Result<T>, persist_result: Result<()>) -> Result<T> {
+    match persist_result {
+        Ok(()) => result,
+        Err(persist_err) => {
+            let message = match result {
+                Ok(_) => persist_err.to_string(),
+                Err(primary_err) => format!(
+                    "{persist_err}; primary provider/tool turn also failed: {primary_err}"
+                ),
+            };
+            Err(Error::session_persistence(message))
+        }
+    }
+}
+
+#[cfg(test)]
+mod finish_turn_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn persistence_failure_is_terminal_without_hiding_primary_turn_error() {
+        let err = finish_turn_persistence::<()>(
+            Err(Error::provider("test", "provider failed")),
+            Err(Error::session("disk flush failed")),
+        )
+        .expect_err("persistence failure must remain terminal");
+
+        assert!(err.is_session_persistence());
+        let message = err.to_string();
+        assert!(message.contains("disk flush failed"));
+        assert!(message.contains("provider failed"));
+    }
+}
+
 impl AgentSession {
     pub const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
         match mode {
@@ -12634,9 +12773,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        let result = result?;
-        persist_result?;
-        Ok(result)
+        finish_turn_persistence(result, persist_result)
     }
 
     pub(crate) async fn run_agent_with_text(
@@ -12720,9 +12857,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        let result = result?;
-        persist_result?;
-        Ok(result)
+        finish_turn_persistence(result, persist_result)
     }
 
     pub(crate) async fn run_agent_with_content(
@@ -12806,9 +12941,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len + 1, result.is_err(), run_incomplete)
             .await;
 
-        let result = result?;
-        persist_result?;
-        Ok(result)
+        finish_turn_persistence(result, persist_result)
     }
 
     /// Resume the current turn after a transient failure WITHOUT adding a new
@@ -12884,9 +13017,7 @@ impl AgentSession {
             .persist_turn_artifacts(start_len, result.is_err(), run_incomplete)
             .await;
 
-        let result = result?;
-        persist_result?;
-        Ok(result)
+        finish_turn_persistence(result, persist_result)
     }
 
     /// Persist the turn transcript and both audit ledgers under one session

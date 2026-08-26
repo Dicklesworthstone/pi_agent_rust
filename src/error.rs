@@ -163,6 +163,8 @@ pub struct AuthDiagnostic {
 }
 
 impl Error {
+    const SESSION_PERSISTENCE_PREFIX: &'static str = "[SESSION_PERSISTENCE_FAILED] ";
+
     /// Create a configuration error.
     pub fn config(message: impl Into<String>) -> Self {
         Self::Config(message.into())
@@ -171,6 +173,28 @@ impl Error {
     /// Create a session error.
     pub fn session(message: impl Into<String>) -> Self {
         Self::Session(message.into())
+    }
+
+    /// Create a session persistence failure with a stable classification marker.
+    ///
+    /// RPC callers use this marker to surface the durability failure without
+    /// retrying a provider turn whose tools or other side effects may already
+    /// have completed.
+    pub fn session_persistence(message: impl Into<String>) -> Self {
+        Self::Session(format!(
+            "{}{}",
+            Self::SESSION_PERSISTENCE_PREFIX,
+            message.into()
+        ))
+    }
+
+    /// Whether this error represents a failed session persistence boundary.
+    #[must_use]
+    pub fn is_session_persistence(&self) -> bool {
+        matches!(
+            self,
+            Self::Session(message) if message.starts_with(Self::SESSION_PERSISTENCE_PREFIX)
+        )
     }
 
     /// Create a provider error.
@@ -1147,6 +1171,16 @@ mod tests {
     fn error_session_constructor() {
         let err = Error::session("session corrupted");
         assert!(matches!(err, Error::Session(ref msg) if msg == "session corrupted"));
+        assert!(!err.is_session_persistence());
+    }
+
+    #[test]
+    fn error_session_persistence_has_stable_non_transport_classification() {
+        let err = Error::session_persistence("connection reset while saving");
+        assert!(err.is_session_persistence());
+        assert!(!err.is_transient());
+        assert_eq!(err.category_code(), "session");
+        assert_eq!(err.hostcall_error_code(), "io");
     }
 
     #[test]

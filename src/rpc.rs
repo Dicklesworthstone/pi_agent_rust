@@ -34,7 +34,7 @@ use crate::models::{ModelEntry, model_requires_configured_credential};
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
-use crate::session::{AutosaveFlushTrigger, SessionMessage};
+use crate::session::{AutosaveFlushTrigger, Session, SessionEntry, SessionMessage};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeHandle;
@@ -42,7 +42,7 @@ use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{sleep, wall_now};
 use memchr::memchr_iter;
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
@@ -90,8 +90,8 @@ struct RpcStateSnapshot {
 impl From<&RpcSharedState> for RpcStateSnapshot {
     fn from(state: &RpcSharedState) -> Self {
         Self {
-            steering_count: state.steering.len(),
-            follow_up_count: state.follow_up.len(),
+            steering_count: state.steering.len() + state.steering_in_flight.len(),
+            follow_up_count: state.follow_up.len() + state.follow_up_in_flight.len(),
             steering_mode: state.steering_mode,
             follow_up_mode: state.follow_up_mode,
             auto_compaction_enabled: state.auto_compaction_enabled,
@@ -167,6 +167,89 @@ fn normalize_command_type(command_type: &str) -> &str {
         "approve-plan" | "approvePlan" => "approve_plan",
         "reject-plan" | "rejectPlan" => "reject_plan",
         _ => command_type,
+    }
+}
+
+fn command_can_advance_rpc_session(command_type: &str) -> bool {
+    matches!(
+        command_type,
+        "prompt"
+            | "steer"
+            | "follow_up"
+            | "set_plan_mode"
+            | "approve_plan"
+            | "reject_plan"
+            | "set_model"
+            | "cycle_model"
+            | "set_thinking_level"
+            | "cycle_thinking_level"
+            | "set_session_name"
+            | "bash"
+            | "compact"
+            | "checkpoint"
+            | "rewind"
+            | "fresh"
+            | "retry"
+            | "new_session"
+            | "switch_session"
+            | "fork"
+    )
+}
+
+fn command_can_queue_while_rpc_agent_streams(command_type: &str) -> bool {
+    matches!(command_type, "prompt" | "steer" | "follow_up")
+}
+
+fn command_resumes_rpc_agent(
+    command_type: &str,
+    parsed: &Value,
+    manager: Option<&ExtensionManager>,
+) -> bool {
+    match command_type {
+        "prompt" => parsed
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| resolve_extension_command(message, manager).is_none()),
+        "steer" | "follow_up" | "retry" => true,
+        _ => false,
+    }
+}
+
+fn command_payload_can_advance_rpc_session(
+    command_type: &str,
+    parsed: &Value,
+    manager: Option<&ExtensionManager>,
+) -> bool {
+    match command_type {
+        "prompt" => {
+            parsed.get("message").and_then(Value::as_str).is_some()
+                && parse_prompt_images(parsed.get("images")).is_ok()
+                && parse_streaming_behavior(streaming_behavior_value(parsed)).is_ok()
+        }
+        "steer" | "follow_up" => parsed
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| resolve_extension_command(message, manager).is_none()),
+        "set_model" => {
+            parsed.get("provider").and_then(Value::as_str).is_some()
+                && parsed.get("modelId").and_then(Value::as_str).is_some()
+        }
+        "set_thinking_level" => parsed
+            .get("level")
+            .and_then(Value::as_str)
+            .is_some_and(|level| parse_thinking_level(level).is_ok()),
+        "set_session_name" => parsed.get("name").and_then(Value::as_str).is_some(),
+        "bash" => parsed.get("command").and_then(Value::as_str).is_some(),
+        "compact" => {
+            parse_optional_u32_field(parsed, "reserveTokens").is_ok()
+                && parse_optional_u32_field(parsed, "keepRecentTokens").is_ok()
+        }
+        "switch_session" => parsed
+            .get("sessionPath")
+            .and_then(Value::as_str)
+            .is_some(),
+        "fork" => parsed.get("entryId").and_then(Value::as_str).is_some(),
+        _ => true,
     }
 }
 
@@ -450,6 +533,10 @@ fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) 
 struct RpcSharedState {
     steering: VecDeque<QueuedAgentMessage>,
     follow_up: VecDeque<QueuedAgentMessage>,
+    steering_in_flight: VecDeque<RpcInFlightMessage>,
+    follow_up_in_flight: VecDeque<RpcInFlightMessage>,
+    completed_tool_transcript: Option<RpcCompletedToolTranscript>,
+    next_lease_sequence: u64,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
     follow_up_fetch_generation: Arc<AtomicU64>,
@@ -461,6 +548,20 @@ struct RpcSharedState {
     active_failover_model: Option<(String, String)>,
     /// Position of the last used entry in the active chain (per-chain walk).
     failover_chain_position: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct RpcInFlightMessage {
+    delivery: QueuedAgentMessage,
+    session_entry_baseline: usize,
+    lease_sequence: u64,
+}
+
+#[derive(Debug)]
+struct RpcCompletedToolTranscript {
+    session_id: String,
+    base_leaf_id: Option<String>,
+    entries: Vec<QueuedAgentMessage>,
 }
 
 const MAX_RPC_PENDING_MESSAGES: usize = 128;
@@ -519,6 +620,10 @@ impl RpcSharedState {
         Self {
             steering: VecDeque::new(),
             follow_up: VecDeque::new(),
+            steering_in_flight: VecDeque::new(),
+            follow_up_in_flight: VecDeque::new(),
+            completed_tool_transcript: None,
+            next_lease_sequence: 0,
             steering_mode: config.steering_queue_mode(),
             follow_up_mode: config.follow_up_queue_mode(),
             follow_up_fetch_generation: Arc::new(AtomicU64::new(0)),
@@ -535,7 +640,10 @@ impl RpcSharedState {
     }
 
     fn pending_count(&self) -> usize {
-        self.steering.len() + self.follow_up.len()
+        self.steering.len()
+            + self.follow_up.len()
+            + self.steering_in_flight.len()
+            + self.follow_up_in_flight.len()
     }
 
     fn push_steering(&mut self, message: QueuedAgentMessage) -> Result<()> {
@@ -556,27 +664,122 @@ impl RpcSharedState {
         Ok(())
     }
 
-    fn pop_steering(&mut self) -> Vec<QueuedAgentMessage> {
-        match self.steering_mode {
+    fn lease_steering(&mut self, session_entry_baseline: usize) -> Vec<QueuedAgentMessage> {
+        let messages: Vec<_> = match self.steering_mode {
             QueueMode::All => self.steering.drain(..).collect(),
             QueueMode::OneAtATime => self.steering.pop_front().into_iter().collect(),
+        };
+        for delivery in messages.iter().cloned() {
+            let lease_sequence = self.next_lease_sequence;
+            self.next_lease_sequence = self.next_lease_sequence.saturating_add(1);
+            self.steering_in_flight.push_back(RpcInFlightMessage {
+                delivery,
+                session_entry_baseline,
+                lease_sequence,
+            });
         }
+        messages
     }
 
-    fn pop_follow_up(&mut self) -> Vec<QueuedAgentMessage> {
-        match self.follow_up_mode {
+    fn lease_follow_up(&mut self, session_entry_baseline: usize) -> Vec<QueuedAgentMessage> {
+        let messages: Vec<_> = match self.follow_up_mode {
             QueueMode::All => self.follow_up.drain(..).collect(),
             QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
+        };
+        for delivery in messages.iter().cloned() {
+            let lease_sequence = self.next_lease_sequence;
+            self.next_lease_sequence = self.next_lease_sequence.saturating_add(1);
+            self.follow_up_in_flight.push_back(RpcInFlightMessage {
+                delivery,
+                session_entry_baseline,
+                lease_sequence,
+            });
         }
+        messages
     }
 
-    fn pop_follow_up_for_fetch(&mut self) -> Vec<QueuedAgentMessage> {
-        let messages = self.pop_follow_up();
+    fn lease_follow_up_for_fetch(
+        &mut self,
+        session_entry_baseline: usize,
+    ) -> Vec<QueuedAgentMessage> {
+        let messages = self.lease_follow_up(session_entry_baseline);
         if !messages.is_empty() {
             self.follow_up_fetch_generation
                 .fetch_add(1, Ordering::SeqCst);
         }
         messages
+    }
+
+    fn acknowledge_in_flight(&mut self) {
+        self.steering_in_flight.clear();
+        self.follow_up_in_flight.clear();
+    }
+
+    fn in_flight_in_lease_order(&self) -> Vec<&RpcInFlightMessage> {
+        let mut messages = self
+            .steering_in_flight
+            .iter()
+            .chain(&self.follow_up_in_flight)
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| message.lease_sequence);
+        messages
+    }
+
+    fn stage_completed_tool_transcript(
+        &mut self,
+        session: &Session,
+        messages: &[Message],
+    ) -> Result<()> {
+        let session_id = session.header.id.clone();
+        let base_leaf_id = session.leaf_id().map(str::to_string);
+        if let Some(staged) = &self.completed_tool_transcript {
+            if staged.session_id != session_id || staged.base_leaf_id != base_leaf_id {
+                return Err(Error::session(
+                    "session base changed during completed-tool transcript recovery",
+                ));
+            }
+            if messages.is_empty() {
+                return Ok(());
+            }
+            if staged.entries.len() != messages.len() {
+                return Err(Error::session(
+                    "live completed-tool transcript changed during terminal recovery",
+                ));
+            }
+            for (existing, message) in staged.entries.iter().zip(messages) {
+                if serde_json::to_vec(existing.message())? != serde_json::to_vec(message)? {
+                    return Err(Error::session(
+                        "live completed-tool transcript changed during terminal recovery",
+                    ));
+                }
+            }
+            return Ok(());
+        }
+        if !messages.is_empty() {
+            self.completed_tool_transcript = Some(RpcCompletedToolTranscript {
+                session_id,
+                base_leaf_id,
+                entries: messages
+                    .iter()
+                    .cloned()
+                    .map(QueuedAgentMessage::generated)
+                    .collect(),
+            });
+        }
+        Ok(())
+    }
+
+    fn completed_tool_transcript_entries(&self) -> &[QueuedAgentMessage] {
+        self.completed_tool_transcript
+            .as_ref()
+            .map_or(&[], |transcript| transcript.entries.as_slice())
+    }
+
+    fn clear_all_pending(&mut self) {
+        self.steering.clear();
+        self.follow_up.clear();
+        self.acknowledge_in_flight();
+        self.completed_tool_transcript = None;
     }
 }
 
@@ -748,6 +951,8 @@ pub async fn run(
         use futures::future::BoxFuture;
         let steering_state = Arc::clone(&shared_state);
         let follow_state = Arc::clone(&shared_state);
+        let steering_session = Arc::clone(&session_handle);
+        let follow_session = Arc::clone(&session_handle);
         let steering_cx = cx.clone();
         let follow_cx = cx.clone();
         let mut guard = OwnedMutexGuard::lock(Arc::clone(&session), &cx)
@@ -759,22 +964,44 @@ pub async fn run(
         );
         let steering_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
             let steering_state = Arc::clone(&steering_state);
+            let steering_session = Arc::clone(&steering_session);
             let steering_cx = steering_cx.clone();
             Box::pin(async move {
+                let Some(session_entry_baseline) = (async {
+                    let session = steering_session.lock(&steering_cx).await.ok()?;
+                    Some(session.entries.len())
+                })
+                .await
+                else {
+                    return Vec::new();
+                };
                 steering_state
                     .lock(&steering_cx)
                     .await
-                    .map_or_else(|_| Vec::new(), |mut state| state.pop_steering())
+                    .map_or_else(|_| Vec::new(), |mut state| {
+                        state.lease_steering(session_entry_baseline)
+                    })
             })
         };
         let follow_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
             let follow_state = Arc::clone(&follow_state);
+            let follow_session = Arc::clone(&follow_session);
             let follow_cx = follow_cx.clone();
             Box::pin(async move {
+                let Some(session_entry_baseline) = (async {
+                    let session = follow_session.lock(&follow_cx).await.ok()?;
+                    Some(session.entries.len())
+                })
+                .await
+                else {
+                    return Vec::new();
+                };
                 follow_state
                     .lock(&follow_cx)
                     .await
-                    .map_or_else(|_| Vec::new(), |mut state| state.pop_follow_up_for_fetch())
+                    .map_or_else(|_| Vec::new(), |mut state| {
+                        state.lease_follow_up_for_fetch(session_entry_baseline)
+                    })
             })
         };
         guard
@@ -904,6 +1131,101 @@ pub async fn run(
         let command_type = normalize_command_type(command_type_raw);
 
         let id = parsed.get("id").and_then(Value::as_str).map(str::to_string);
+
+        // A cancelled or failed terminal writer can leave acknowledged input
+        // authoritative in the shared queues after the turn flags return idle.
+        // Recover it before any command can advance the live session or deliver
+        // the envelope through Agent (which intentionally consumes only its
+        // provider-visible Message). Read-only/control commands remain usable
+        // so clients can inspect health or abort unrelated work.
+        if command_can_advance_rpc_session(command_type) {
+            let phase = {
+                let _phase_guard = lock_rpc_turn_phase(&turn_phase_linearizer);
+                rpc_turn_phase(&is_streaming, &is_compacting)
+            };
+            if phase == RpcTurnPhase::Compacting {
+                let _ = out_tx.send(response_error(
+                    id.clone(),
+                    command_type,
+                    format!(
+                        "Agent is currently compacting; wait before running {command_type}"
+                    ),
+                ));
+                continue;
+            }
+            if phase == RpcTurnPhase::Streaming
+                && !command_can_queue_while_rpc_agent_streams(command_type)
+            {
+                let _ = out_tx.send(response_error(
+                    id.clone(),
+                    command_type,
+                    format!("Agent is currently streaming; wait before running {command_type}"),
+                ));
+                continue;
+            }
+            if phase == RpcTurnPhase::Idle
+                && command_payload_can_advance_rpc_session(
+                    command_type,
+                    &parsed,
+                    rpc_extension_manager.as_ref(),
+                )
+            {
+                let recovery_cx = AgentCx::for_request();
+                let resumes_agent = command_resumes_rpc_agent(
+                    command_type,
+                    &parsed,
+                    rpc_extension_manager.as_ref(),
+                );
+                let recovery_plan = match terminal_rpc_recovery_plan(
+                    &session,
+                    &shared_state,
+                    resumes_agent,
+                    &recovery_cx,
+                )
+                .await
+                {
+                    Ok(plan) => plan,
+                    Err(err) => {
+                        let recovery_error = Error::session(format!(
+                            "failed to inspect terminal RPC recovery state before {command_type}: {err}"
+                        ));
+                        let _ = out_tx.send(response_error_with_hints(
+                            id.clone(),
+                            command_type,
+                            &recovery_error,
+                        ));
+                        continue;
+                    }
+                };
+                let recovery_result = match recovery_plan {
+                    RpcTerminalRecoveryPlan::None => None,
+                    RpcTerminalRecoveryPlan::RecordedToolTranscript { recovery_count } => Some((
+                        recovery_count,
+                        preserve_recorded_tool_transcript(
+                            &session,
+                            &shared_state,
+                            &recovery_cx,
+                        )
+                        .await,
+                    )),
+                    RpcTerminalRecoveryPlan::All { recovery_count } => Some((
+                        recovery_count,
+                        preserve_terminal_rpc_input(&session, &shared_state, &recovery_cx).await,
+                    )),
+                };
+                if let Some((recovery_count, Err(err))) = recovery_result {
+                    let recovery_error = Error::session(format!(
+                        "failed to preserve {recovery_count} terminal RPC recovery item(s) before {command_type}: {err}"
+                    ));
+                    let _ = out_tx.send(response_error_with_hints(
+                        id.clone(),
+                        command_type,
+                        &recovery_error,
+                    ));
+                    continue;
+                }
+            }
+        }
 
         match command_type {
             "prompt" => {
@@ -2635,8 +2957,7 @@ pub async fn run(
                     let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                         .await
                         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                    state.steering.clear();
-                    state.follow_up.clear();
+                    state.clear_all_pending();
                 }
                 rpc_dispatch_session_switch_event(
                     rpc_extension_manager.clone(),
@@ -2743,8 +3064,7 @@ pub async fn run(
                         let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        state.steering.clear();
-                        state.follow_up.clear();
+                        state.clear_all_pending();
                         drop(state);
                         drop(guard);
 
@@ -2852,8 +3172,7 @@ pub async fn run(
                         let mut state = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
                             .await
                             .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-                        state.steering.clear();
-                        state.follow_up.clear();
+                        state.clear_all_pending();
                     }
 
                     Ok(selected_text)
@@ -3083,15 +3402,16 @@ pub async fn run(
         ext.shutdown().await;
     }
 
-    let pending_rpc_input = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+    let preservation_cx = AgentCx::for_request();
+    preserve_terminal_rpc_input(&session, &shared_state, &preservation_cx)
         .await
-        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
-        .pending_count();
-    if pending_rpc_input > 0 {
-        return Err(Error::session(format!(
-            "RPC stdin closed with {pending_rpc_input} acknowledged input message(s) still pending after terminal preservation failure"
-        )));
-    }
+        .map_err(|err| {
+            Error::session(format!(
+                "RPC stdin closed before terminal session state could be preserved: {err}"
+            ))
+        })?;
+
+    flush_rpc_session_on_shutdown(&session, &preservation_cx).await?;
 
     Ok(())
 }
@@ -3100,9 +3420,142 @@ pub async fn run(
 // Prompt Execution
 // =============================================================================
 
+fn rpc_recovery_message_fingerprint(
+    message: &Message,
+    timestamp_is_synthetic: bool,
+) -> Result<Value> {
+    let mut value = serde_json::to_value(message)?;
+    if timestamp_is_synthetic
+        && let Some(object) = value.as_object_mut()
+    {
+        // Legacy rows and summary projections can synthesize a fresh timestamp
+        // on every rebuild. Authored timestamps remain part of causal identity.
+        object.remove("timestamp");
+    }
+    Ok(value)
+}
+
+fn completed_live_tool_effect_suffix(
+    session: &Session,
+    live_messages: &[Message],
+) -> Result<Vec<Message>> {
+    let persisted_messages = session.to_messages_for_current_path_with_timestamp_provenance();
+    if persisted_messages.len() > live_messages.len() {
+        // Session is already ahead of the live Agent view (for example after
+        // an explicit test/session mutation). There cannot be a live suffix
+        // to recover, so keep Session authoritative.
+        return Ok(Vec::new());
+    }
+    for (index, ((persisted, timestamp_is_synthetic), live)) in
+        persisted_messages.iter().zip(live_messages).enumerate()
+    {
+        if rpc_recovery_message_fingerprint(persisted, *timestamp_is_synthetic)?
+            != rpc_recovery_message_fingerprint(live, *timestamp_is_synthetic)?
+        {
+            return Err(Error::session(format!(
+                "persisted Session diverged from the live Agent transcript at message {index}; refusing terminal recovery"
+            )));
+        }
+    }
+
+    let unpersisted = &live_messages[persisted_messages.len()..];
+    let mut open_tool_calls = HashMap::<String, String>::new();
+    let mut last_closed_tool_cycle = None;
+    for (index, message) in unpersisted.iter().enumerate() {
+        match message {
+            Message::Assistant(assistant) => {
+                if matches!(
+                    assistant.stop_reason,
+                    StopReason::PauseTurn | StopReason::Error | StopReason::Aborted
+                ) {
+                    if !open_tool_calls.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+                let tool_calls = assistant.content.iter().filter_map(|block| match block {
+                    ContentBlock::ToolCall(tool_call) => Some(tool_call),
+                    _ => None,
+                });
+                let mut next_calls = HashMap::new();
+                for tool_call in tool_calls {
+                    if next_calls
+                        .insert(tool_call.id.clone(), tool_call.name.clone())
+                        .is_some()
+                    {
+                        return Ok(last_closed_tool_cycle
+                            .map_or_else(Vec::new, |end| unpersisted[..=end].to_vec()));
+                    }
+                }
+                if !next_calls.is_empty() {
+                    if !open_tool_calls.is_empty() {
+                        break;
+                    }
+                    open_tool_calls = next_calls;
+                } else if !open_tool_calls.is_empty() {
+                    break;
+                }
+            }
+            Message::ToolResult(tool_result) => {
+                let Some(expected_name) = open_tool_calls.remove(&tool_result.tool_call_id) else {
+                    break;
+                };
+                if expected_name != tool_result.tool_name {
+                    break;
+                }
+                if open_tool_calls.is_empty() {
+                    last_closed_tool_cycle = Some(index);
+                }
+            }
+            Message::User(_) | Message::Custom(_) if !open_tool_calls.is_empty() => break,
+            Message::User(_) | Message::Custom(_) => {}
+        }
+    }
+    let Some(last_closed_tool_cycle) = last_closed_tool_cycle else {
+        return Ok(Vec::new());
+    };
+    Ok(unpersisted[..=last_closed_tool_cycle].to_vec())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RpcInputPreservation {
+    Include,
+    LeaveForNextAgentTurn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RpcTerminalRecoveryPlan {
+    None,
+    RecordedToolTranscript { recovery_count: usize },
+    All { recovery_count: usize },
+}
+
 async fn preserve_terminal_rpc_input(
     session: &Arc<Mutex<AgentSession>>,
     shared_state: &Arc<Mutex<RpcSharedState>>,
+    cx: &AgentCx,
+) -> Result<usize> {
+    preserve_terminal_rpc_state(session, shared_state, RpcInputPreservation::Include, cx).await
+}
+
+async fn preserve_recorded_tool_transcript(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    cx: &AgentCx,
+) -> Result<usize> {
+    preserve_terminal_rpc_state(
+        session,
+        shared_state,
+        RpcInputPreservation::LeaveForNextAgentTurn,
+        cx,
+    )
+    .await
+}
+
+async fn preserve_terminal_rpc_state(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    input_preservation: RpcInputPreservation,
     cx: &AgentCx,
 ) -> Result<usize> {
     // Acquire locks before touching either queue. If this future is cancelled
@@ -3119,23 +3572,94 @@ async fn preserve_terminal_rpc_input(
     let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
         .await
         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
-    if state.steering.is_empty() && state.follow_up.is_empty() {
+    let completed_tool_transcript =
+        completed_live_tool_effect_suffix(&inner, guard.agent.messages())?;
+    state.stage_completed_tool_transcript(&inner, &completed_tool_transcript)?;
+    let completed_tool_transcript_count = state.completed_tool_transcript_entries().len();
+    if completed_tool_transcript_count == 0
+        && (input_preservation == RpcInputPreservation::LeaveForNextAgentTurn
+            || state.pending_count() == 0)
+    {
         return Ok(0);
     }
 
-    let queued_count = state.steering.len() + state.follow_up.len();
+    // A private first-save candidate would choose and retain its own session
+    // filename. If cancellation landed after that file reached disk but before
+    // the candidate was installed, retrying from a live `path == None` session
+    // would choose a second file that entry-ID reconciliation cannot see. Finish
+    // an empty live save first while the acknowledged queues are still untouched.
+    // Cancellation during this pinning save cannot strand candidate entries
+    // because the candidate has not been created yet; a successful return pins
+    // the one target every later candidate and retry must reconcile against.
+    if save_enabled && inner.path.is_none() {
+        inner.save().await?;
+    }
+
+    let input_recovery_count = if input_preservation == RpcInputPreservation::Include {
+        state.pending_count()
+    } else {
+        0
+    };
+    let recovery_count = completed_tool_transcript_count.saturating_add(input_recovery_count);
+    let state = &mut *state;
     // Build and flush a private candidate while the authoritative queues and
-    // live Session remain unchanged. If this future is cancelled at its only
-    // post-admission await, retry sees the original queues and cannot duplicate
-    // partially appended live entries.
+    // live Session entries remain unchanged. If this future is cancelled during
+    // the candidate flush, retry sees the original queues and reuses their
+    // stable entry metadata against the pinned persistence target.
     let mut candidate = inner.clone();
-    for delivery in state.steering.iter().chain(&state.follow_up) {
-        candidate.append_model_message(delivery.clone().into_message());
+    let mut parent_id = candidate.leaf_id().map(str::to_string);
+    for delivery in state.completed_tool_transcript_entries() {
+        let message = delivery.message().clone();
+        let (entry_id, timestamp, bound_parent_id) =
+            delivery.bind_persistence_identity(parent_id.take());
+        parent_id = Some(entry_id.clone());
+        candidate.append_model_message_with_identity(
+            message,
+            &entry_id,
+            &timestamp,
+            bound_parent_id.as_deref(),
+        )?;
+    }
+    if input_preservation == RpcInputPreservation::Include {
+        let in_flight = state.in_flight_in_lease_order();
+        let in_flight_matches = find_represented_rpc_deliveries(&candidate, &in_flight)?;
+        for (in_flight, represented) in in_flight.into_iter().zip(in_flight_matches) {
+            if represented {
+                // Clones held in Agent's private queue share this lazy identity.
+                // Binding represented deliveries lets terminal recovery discard a
+                // staged duplicate without allocating IDs on the ordinary path.
+                let _ = in_flight.delivery.bind_persistence_identity(None);
+                continue;
+            }
+            let message = in_flight.delivery.message().clone();
+            let (entry_id, timestamp, bound_parent_id) = in_flight
+                .delivery
+                .bind_persistence_identity(parent_id.take());
+            parent_id = Some(entry_id.clone());
+            candidate.append_model_message_with_identity(
+                message,
+                &entry_id,
+                &timestamp,
+                bound_parent_id.as_deref(),
+            )?;
+        }
+        for delivery in state.steering.iter_mut().chain(&mut state.follow_up) {
+            let message = delivery.message().clone();
+            let (entry_id, timestamp, bound_parent_id) =
+                delivery.bind_persistence_identity(parent_id.take());
+            parent_id = Some(entry_id.clone());
+            candidate.append_model_message_with_identity(
+                message,
+                &entry_id,
+                &timestamp,
+                bound_parent_id.as_deref(),
+            )?;
+        }
     }
 
     if save_enabled
         && let Err(persist_err) = candidate
-            .flush_autosave(AutosaveFlushTrigger::Periodic)
+            .flush_autosave(AutosaveFlushTrigger::Manual)
             .await
     {
         return Err(persist_err);
@@ -3144,9 +3668,212 @@ async fn preserve_terminal_rpc_input(
     let messages = candidate.to_messages_for_current_path();
     *inner = candidate;
     guard.agent.replace_messages(messages);
-    state.steering.clear();
-    state.follow_up.clear();
-    Ok(queued_count)
+    if input_preservation == RpcInputPreservation::Include {
+        let in_flight_ids: HashSet<String> = state
+            .steering_in_flight
+            .iter()
+            .chain(&state.follow_up_in_flight)
+            .filter_map(|in_flight| {
+                in_flight
+                    .delivery
+                    .persistence_entry_id()
+                    .map(str::to_string)
+            })
+            .collect();
+        guard.agent.discard_queued_persistence_ids(&in_flight_ids);
+        state.clear_all_pending();
+    } else {
+        state.completed_tool_transcript = None;
+    }
+    Ok(recovery_count)
+}
+
+async fn terminal_rpc_recovery_plan(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    resumes_agent: bool,
+    cx: &AgentCx,
+) -> Result<RpcTerminalRecoveryPlan> {
+    let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let session_store = Arc::clone(&guard.session);
+    let inner = OwnedMutexGuard::lock(session_store, cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    let state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+    let pending_count = state.pending_count();
+    let completed_tool_effect_count = completed_live_tool_effect_suffix(
+        &inner,
+        guard.agent.messages(),
+    )?
+    .len()
+    .max(state.completed_tool_transcript_entries().len());
+
+    // A max-time boundary can return leased steering to Agent's private queue.
+    // Keep that delivery executable when the next command starts a provider
+    // turn. Shared state remains the durable authority until normal turn
+    // acknowledgement confirms that the resumed delivery reached Session.
+    let pending_input_can_resume = if resumes_agent {
+        let in_flight = state.in_flight_in_lease_order();
+        let represented = find_represented_rpc_deliveries(&inner, &in_flight)?;
+        in_flight
+            .into_iter()
+            .zip(represented)
+            .all(|(in_flight, represented)| {
+                represented || guard.agent.has_staged_delivery(&in_flight.delivery)
+            })
+    } else {
+        false
+    };
+
+    if completed_tool_effect_count > 0 && pending_input_can_resume {
+        Ok(RpcTerminalRecoveryPlan::RecordedToolTranscript {
+            recovery_count: completed_tool_effect_count,
+        })
+    } else if completed_tool_effect_count > 0 || (pending_count > 0 && !pending_input_can_resume) {
+        Ok(RpcTerminalRecoveryPlan::All {
+            recovery_count: pending_count.saturating_add(completed_tool_effect_count),
+        })
+    } else {
+        Ok(RpcTerminalRecoveryPlan::None)
+    }
+}
+
+fn find_represented_rpc_deliveries(
+    session: &Session,
+    deliveries: &[&RpcInFlightMessage],
+) -> Result<Vec<bool>> {
+    let current_path_ids: HashSet<&str> = session
+        .entries_for_current_path()
+        .into_iter()
+        .filter_map(|entry| entry.base_id().map(String::as_str))
+        .collect();
+    let mut candidates = Vec::new();
+    for (index, entry) in session
+        .entries
+        .iter()
+        .enumerate()
+    {
+        if !entry
+            .base_id()
+            .is_some_and(|id| current_path_ids.contains(id.as_str()))
+        {
+            continue;
+        }
+        let SessionEntry::Message(message) = entry else {
+            continue;
+        };
+        candidates.push((index, serde_json::to_vec(&message.message)?));
+    }
+
+    let mut matched_entries = HashSet::new();
+    let mut represented = Vec::with_capacity(deliveries.len());
+    for in_flight in deliveries {
+        let expected = serde_json::to_vec(&SessionMessage::from(
+            in_flight.delivery.message().clone(),
+        ))?;
+        let matched = candidates.iter().find_map(|(index, encoded)| {
+            (*index >= in_flight.session_entry_baseline
+                && !matched_entries.contains(index)
+                && encoded == &expected)
+                .then_some(*index)
+        });
+        if let Some(index) = matched {
+            matched_entries.insert(index);
+        }
+        represented.push(matched.is_some());
+    }
+    Ok(represented)
+}
+
+async fn flush_rpc_session_on_shutdown(
+    session: &Arc<Mutex<AgentSession>>,
+    cx: &AgentCx,
+) -> Result<()> {
+    let guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    if !guard.save_enabled() {
+        return Ok(());
+    }
+    let session_store = Arc::clone(&guard.session);
+    let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    inner.flush_autosave_on_shutdown().await
+}
+
+async fn acknowledge_durable_rpc_in_flight(
+    session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
+    cx: &AgentCx,
+) -> Result<usize> {
+    // Match terminal recovery's lock order. Queue authority stays held across
+    // the forced flush, so a newly leased delivery cannot be acknowledged by
+    // an older turn's completion.
+    let mut guard = OwnedMutexGuard::lock(Arc::clone(session), cx)
+        .await
+        .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+    let save_enabled = guard.save_enabled();
+    let session_store = Arc::clone(&guard.session);
+    let mut inner = OwnedMutexGuard::lock(session_store, cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+    let mut state = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
+    let in_flight_count = state.steering_in_flight.len() + state.follow_up_in_flight.len();
+    if in_flight_count == 0 {
+        return Ok(0);
+    }
+
+    let in_flight = state.in_flight_in_lease_order();
+    let represented = find_represented_rpc_deliveries(&inner, &in_flight)?;
+    if represented.iter().any(|represented| !represented) {
+        return Ok(0);
+    }
+    for in_flight in in_flight {
+        let _ = in_flight.delivery.bind_persistence_identity(None);
+    }
+
+    if save_enabled {
+        inner.flush_autosave(AutosaveFlushTrigger::Manual).await?;
+    }
+    let in_flight_ids: HashSet<String> = state
+        .steering_in_flight
+        .iter()
+        .chain(&state.follow_up_in_flight)
+        .filter_map(|in_flight| {
+            in_flight
+                .delivery
+                .persistence_entry_id()
+                .map(str::to_string)
+        })
+        .collect();
+    guard.agent.discard_queued_persistence_ids(&in_flight_ids);
+    state.acknowledge_in_flight();
+    Ok(in_flight_count)
+}
+
+fn finish_rpc_turn_durability<T>(
+    result: Result<T>,
+    durable_ack_result: Result<usize>,
+) -> Result<T> {
+    match durable_ack_result {
+        Ok(_) => result,
+        Err(persist_err) => {
+            let message = match &result {
+                Ok(_) => format!("failed to durably acknowledge queued RPC input: {persist_err}"),
+                Err(primary_err) => format!(
+                    "failed to durably acknowledge queued RPC input: {persist_err}; primary provider/tool turn also failed: {primary_err}"
+                ),
+            };
+            Err(Error::session_persistence(message))
+        }
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3296,6 +4023,11 @@ async fn run_prompt_with_retry(
                 }
             }
         };
+        let durability_cx = AgentCx::for_request();
+        let result = finish_rpc_turn_durability(
+            result,
+            acknowledge_durable_rpc_in_flight(&session, &shared_state, &durability_cx).await,
+        );
 
         if matches!(
             &result,
@@ -3403,6 +4135,11 @@ async fn run_prompt_with_retry(
             }
             Err(err) => {
                 let err_str = err.to_string();
+                if err.is_session_persistence() {
+                    final_error = Some(err_str);
+                    final_error_hints = Some(error_hints_value(&err));
+                    break;
+                }
                 // Classify from the TYPED error first — `is_transient` walks the
                 // source chain for a transient `io::ErrorKind` (connection
                 // reset/abort/EOF/broken pipe/timeout) without depending on the
@@ -8484,6 +9221,82 @@ export default function init(pi) {
         assert_eq!(normalize_command_type("setAutoRetry"), "set_auto_retry");
     }
 
+    #[test]
+    fn session_advancing_commands_require_stranded_input_recovery() {
+        for command in ["prompt", "set_plan_mode", "bash", "checkpoint", "new_session"] {
+            assert!(
+                command_can_advance_rpc_session(command),
+                "{command} can advance the session"
+            );
+        }
+        for command in [
+            "abort",
+            "get_state",
+            "get_messages",
+            "set_auto_retry",
+            "extension_ui_response",
+        ] {
+            assert!(
+                !command_can_advance_rpc_session(command),
+                "{command} must remain available while recovery is blocked"
+            );
+        }
+        for command in ["prompt", "steer", "follow_up"] {
+            assert!(command_can_queue_while_rpc_agent_streams(command));
+        }
+        for command in ["set_model", "checkpoint", "retry", "new_session"] {
+            assert!(!command_can_queue_while_rpc_agent_streams(command));
+        }
+    }
+
+    #[test]
+    fn provider_turn_commands_resume_pending_agent_input() {
+        for command in ["steer", "follow_up", "retry"] {
+            assert!(command_resumes_rpc_agent(command, &json!({}), None));
+        }
+        assert!(command_resumes_rpc_agent(
+            "prompt",
+            &json!({"message": "resume"}),
+            None
+        ));
+        assert!(!command_resumes_rpc_agent("prompt", &json!({}), None));
+        assert!(!command_resumes_rpc_agent(
+            "set_model",
+            &json!({}),
+            None
+        ));
+        assert!(command_payload_can_advance_rpc_session(
+            "prompt",
+            &json!({"message": "resume"}),
+            None
+        ));
+        for (command, payload) in [
+            ("prompt", json!({})),
+            ("set_model", json!({"provider": "test"})),
+            ("bash", json!({})),
+            ("compact", json!({"reserveTokens": "invalid"})),
+        ] {
+            assert!(
+                !command_payload_can_advance_rpc_session(command, &payload, None),
+                "invalid {command} must not trigger terminal recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn rpc_durability_failure_keeps_primary_turn_error_context() {
+        let err = finish_rpc_turn_durability::<()>(
+            Err(Error::provider("test", "provider failed")),
+            Err(Error::session("disk flush failed")),
+        )
+        .expect_err("durability failure must remain terminal");
+
+        assert!(err.is_session_persistence());
+        let message = err.to_string();
+        assert!(message.contains("disk flush failed"));
+        assert!(message.contains("provider failed"));
+    }
+
     // -----------------------------------------------------------------------
     // build_user_message
     // -----------------------------------------------------------------------
@@ -9577,7 +10390,7 @@ export default function init(pi) {
             ))
             .expect("enqueue source-aware steering");
 
-        let queued = shared.pop_steering();
+        let queued = shared.lease_steering(0);
         assert_eq!(queued.len(), 1);
         assert_eq!(
             queued[0].keyword_scan_source(),
@@ -9597,7 +10410,7 @@ export default function init(pi) {
         let mut shared = RpcSharedState::new(&Config::default());
         let generation = Arc::clone(&shared.follow_up_fetch_generation);
 
-        assert!(shared.pop_follow_up_for_fetch().is_empty());
+        assert!(shared.lease_follow_up_for_fetch(0).is_empty());
         assert_eq!(generation.load(Ordering::SeqCst), 0);
 
         shared
@@ -9605,9 +10418,224 @@ export default function init(pi) {
                 build_user_message("accepted follow-up", &[]),
             ))
             .expect("enqueue RPC follow-up");
-        let drained = shared.pop_follow_up_for_fetch();
+        let drained = shared.lease_follow_up_for_fetch(0);
         assert_eq!(drained.len(), 1);
         assert_eq!(generation.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn leased_rpc_input_remains_pending_until_durable_acknowledgement() {
+        let mut shared = RpcSharedState::new(&Config::default());
+        shared
+            .push_steering(QueuedAgentMessage::from_authored_message(
+                build_user_message("leased steering", &[]),
+            ))
+            .expect("enqueue RPC steering");
+
+        let leased = shared.lease_steering(7);
+        assert_eq!(leased.len(), 1);
+        assert!(shared.steering.is_empty());
+        assert_eq!(shared.steering_in_flight.len(), 1);
+        assert_eq!(
+            shared.steering_in_flight[0].session_entry_baseline,
+            7
+        );
+        assert_eq!(
+            shared.pending_count(),
+            1,
+            "leasing must not discard acknowledged queue authority"
+        );
+
+        shared.acknowledge_in_flight();
+        assert_eq!(shared.pending_count(), 0);
+    }
+
+    #[test]
+    fn in_flight_rpc_input_preserves_cross_queue_lease_order() {
+        let mut shared = RpcSharedState::new(&Config::default());
+        for (kind, text) in [
+            ("steering", "first steering"),
+            ("follow_up", "middle follow-up"),
+            ("steering", "last steering"),
+        ] {
+            let delivery = QueuedAgentMessage::from_authored_message(build_user_message(text, &[]));
+            if kind == "steering" {
+                shared.push_steering(delivery).expect("enqueue steering");
+                assert_eq!(shared.lease_steering(0).len(), 1);
+            } else {
+                shared.push_follow_up(delivery).expect("enqueue follow-up");
+                assert_eq!(shared.lease_follow_up_for_fetch(0).len(), 1);
+            }
+        }
+
+        let texts = shared
+            .in_flight_in_lease_order()
+            .into_iter()
+            .map(|in_flight| match in_flight.delivery.message() {
+                Message::User(UserMessage {
+                    content: UserContent::Text(text),
+                    ..
+                }) => text.as_str(),
+                other => panic!("expected text user message, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            vec!["first steering", "middle follow-up", "last steering"]
+        );
+    }
+
+    #[test]
+    fn max_time_staged_input_survives_recorded_tool_transcript_recovery() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let represented_delivery = {
+                let cx = AgentCx::for_request();
+                let mut state = shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state lock");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("already represented steering", &[]),
+                    ))
+                    .expect("enqueue steering");
+                let represented = state
+                    .lease_steering(0)
+                    .into_iter()
+                    .next()
+                    .expect("lease represented steering");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("leased max-time steering", &[]),
+                    ))
+                    .expect("enqueue max-time steering");
+                represented
+            };
+
+            let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+            let mut agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig {
+                    max_time: Some(Duration::ZERO),
+                    ..AgentConfig::default()
+                },
+            );
+            let completed_assistant = Message::Assistant(Arc::new(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "completed-tool".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "completed.txt"}),
+                    thought_signature: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                ..AssistantMessage::default()
+            }));
+            let completed_result = Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+                tool_call_id: "completed-tool".to_string(),
+                tool_name: "write".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("wrote completed.txt"))],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+            }));
+            agent.replace_messages(vec![
+                represented_delivery.message().clone(),
+                completed_assistant,
+                completed_result,
+            ]);
+            let fetch_state = Arc::clone(&shared_state);
+            let steering_fetcher = move || {
+                let fetch_state = Arc::clone(&fetch_state);
+                Box::pin(async move {
+                    let cx = AgentCx::for_request();
+                    fetch_state
+                        .lock(&cx)
+                        .await
+                        .map_or_else(|_| Vec::new(), |mut state| state.lease_steering(0))
+                }) as futures::future::BoxFuture<'static, Vec<QueuedAgentMessage>>
+            };
+            agent.register_message_fetchers(Some(Arc::new(steering_fetcher)), None);
+            let mut inner = Session::in_memory();
+            inner.append_model_message(represented_delivery.message().clone());
+            let session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                agent,
+                Arc::new(asupersync::sync::Mutex::new(inner)),
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            )));
+            let cx = AgentCx::for_request();
+            let capped = session
+                .lock(&cx)
+                .await
+                .expect("agent session lock")
+                .agent
+                .run_with_message_with_abort(
+                    build_user_message("initial prompt", &[]),
+                    None,
+                    |_| {},
+                )
+                .await
+                .expect("time-capped run");
+            assert!(
+                capped.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text(text) if text.text.contains("time cap reached"))
+                }),
+                "run must stop at the configured boundary"
+            );
+            assert_eq!(
+                shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state lock")
+                    .pending_count(),
+                2
+            );
+            assert_eq!(
+                terminal_rpc_recovery_plan(&session, &shared_state, true, &cx)
+                    .await
+                    .expect("resume recovery decision"),
+                RpcTerminalRecoveryPlan::RecordedToolTranscript { recovery_count: 2 },
+                "recorded tool effects must be saved without flattening resumable input"
+            );
+            assert_eq!(
+                preserve_recorded_tool_transcript(&session, &shared_state, &cx)
+                    .await
+                    .expect("preserve recorded tool transcript"),
+                2,
+                "only the recorded assistant/tool-result pair is recovered"
+            );
+            assert_eq!(
+                shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state after transcript recovery")
+                    .pending_count(),
+                2,
+                "transcript recovery must leave represented and staged RPC input authoritative"
+            );
+            assert_eq!(
+                terminal_rpc_recovery_plan(&session, &shared_state, true, &cx)
+                    .await
+                    .expect("post-recovery resume decision"),
+                RpcTerminalRecoveryPlan::None,
+                "the next provider turn must consume the still-staged delivery"
+            );
+            assert_eq!(
+                terminal_rpc_recovery_plan(&session, &shared_state, false, &cx)
+                    .await
+                    .expect("non-resume recovery decision"),
+                RpcTerminalRecoveryPlan::All { recovery_count: 2 },
+                "non-provider session mutations must preserve staged input first"
+            );
+        });
     }
 
     #[test]
@@ -10069,20 +11097,33 @@ export default function init(pi) {
                 let mut state = shared_state.lock(&cx).await.expect("shared state lock");
                 state
                     .push_steering(QueuedAgentMessage::from_authored_message(
-                        build_user_message("accepted steering", &[]),
+                        build_user_message("accepted steering first", &[]),
                     ))
                     .expect("queue steering");
+                assert_eq!(state.lease_steering(0).len(), 1);
                 state
                     .push_follow_up(QueuedAgentMessage::from_authored_message(
                         build_user_message("accepted follow-up", &[]),
                     ))
                     .expect("queue follow-up");
+                assert_eq!(state.lease_follow_up_for_fetch(0).len(), 1);
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("accepted steering last", &[]),
+                    ))
+                    .expect("queue later steering");
+                assert_eq!(state.lease_steering(0).len(), 1);
+                assert_eq!(
+                    state.pending_count(),
+                    3,
+                    "leased input must remain authoritative before preservation"
+                );
             }
 
             let preserved = preserve_terminal_rpc_input(&session, &shared_state, &cx)
                 .await
                 .expect("preserve terminal input");
-            assert_eq!(preserved, 2);
+            assert_eq!(preserved, 3);
             assert_eq!(
                 shared_state
                     .lock(&cx)
@@ -10108,21 +11149,642 @@ export default function init(pi) {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(user_text, vec!["accepted steering", "accepted follow-up"]);
+            assert_eq!(
+                user_text,
+                vec![
+                    "accepted steering first",
+                    "accepted follow-up",
+                    "accepted steering last"
+                ]
+            );
         });
     }
 
     #[test]
-    fn terminal_queue_preservation_rolls_back_and_requeues_after_flush_failure() {
+    fn terminal_recovery_preserves_completed_tool_effects_after_task_drop() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let base = build_user_message("persisted prompt", &[]);
+            let live_base = base.clone();
+            let mut inner = Session::in_memory();
+            inner.append_model_message(base.clone());
+            let assistant = Message::Assistant(Arc::new(AssistantMessage {
+                content: vec![ContentBlock::ToolCall(ToolCall {
+                    id: "tool-1".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "changed.txt"}),
+                    thought_signature: None,
+                })],
+                stop_reason: StopReason::ToolUse,
+                ..AssistantMessage::default()
+            }));
+            let tool_result = Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+                tool_call_id: "tool-1".to_string(),
+                tool_name: "write".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("wrote changed.txt"))],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+            }));
+            let partial_after_effect = Message::Assistant(Arc::new(AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("unfinished response"))],
+                ..AssistantMessage::default()
+            }));
+            let mut agent_session = build_test_agent_session(inner);
+            agent_session.agent.replace_messages(vec![
+                live_base,
+                assistant.clone(),
+                tool_result.clone(),
+                partial_after_effect,
+            ]);
+            let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let cx = AgentCx::for_request();
+
+            assert_eq!(
+                terminal_rpc_recovery_plan(&session, &shared_state, true, &cx)
+                    .await
+                    .expect("terminal recovery decision"),
+                RpcTerminalRecoveryPlan::RecordedToolTranscript { recovery_count: 2 },
+                "a closed assistant/tool-result pair is terminal recovery work"
+            );
+            assert_eq!(
+                preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                    .await
+                    .expect("preserve completed tool transcript"),
+                2
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            let persisted = guard
+                .session
+                .lock(&cx)
+                .await
+                .expect("inner session lock")
+                .to_messages_for_current_path();
+            assert_eq!(persisted.len(), 3);
+            assert_eq!(
+                serde_json::to_value(&persisted[1]).expect("assistant json"),
+                serde_json::to_value(assistant).expect("expected assistant json")
+            );
+            assert_eq!(
+                serde_json::to_value(&persisted[2]).expect("tool result json"),
+                serde_json::to_value(tool_result).expect("expected tool result json")
+            );
+            assert!(persisted.iter().all(|message| {
+                !matches!(
+                    message,
+                    Message::Assistant(assistant)
+                        if assistant.content.iter().any(|block| {
+                            matches!(block, ContentBlock::Text(text) if text.text == "unfinished response")
+                        })
+                )
+            }));
+        });
+    }
+
+    #[test]
+    fn terminal_recovery_refuses_an_incomplete_multi_tool_cycle() {
+        let session = Session::in_memory();
+        let assistant = Message::Assistant(Arc::new(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: "tool-a".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "a.txt"}),
+                    thought_signature: None,
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "tool-b".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "b.txt"}),
+                    thought_signature: None,
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        }));
+        let only_first_result = Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: "tool-a".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("wrote a.txt"))],
+            details: None,
+            is_error: false,
+            timestamp: 2,
+        }));
+
+        assert!(
+            completed_live_tool_effect_suffix(&session, &[assistant, only_first_result])
+                .expect("inspect incomplete tool cycle")
+                .is_empty(),
+            "a partial multi-tool batch must not be recorded as a closed effect cycle"
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_accepts_a_fully_completed_multi_tool_cycle() {
+        let session = Session::in_memory();
+        let assistant = Message::Assistant(Arc::new(AssistantMessage {
+            content: vec![
+                ContentBlock::ToolCall(ToolCall {
+                    id: "tool-a".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "a.txt"}),
+                    thought_signature: None,
+                }),
+                ContentBlock::ToolCall(ToolCall {
+                    id: "tool-b".to_string(),
+                    name: "write".to_string(),
+                    arguments: json!({"path": "b.txt"}),
+                    thought_signature: None,
+                }),
+            ],
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        }));
+        let first_result = Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: "tool-a".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("wrote a.txt"))],
+            details: None,
+            is_error: false,
+            timestamp: 2,
+        }));
+        let second_result = Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: "tool-b".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("wrote b.txt"))],
+            details: None,
+            is_error: false,
+            timestamp: 3,
+        }));
+        let live = vec![assistant, first_result, second_result];
+
+        let recovered = completed_live_tool_effect_suffix(&session, &live)
+            .expect("inspect complete multi-tool cycle");
+        assert_eq!(
+            serde_json::to_value(recovered).expect("serialize recovered tool cycle"),
+            serde_json::to_value(live).expect("serialize expected tool cycle"),
+            "the whole batch becomes recoverable only after every tool result is recorded"
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_ignores_pause_turn_server_calls_before_local_tool_effects() {
+        let session = Session::in_memory();
+        let server_tool_pause = Message::Assistant(Arc::new(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "server-tool".to_string(),
+                name: "web_search".to_string(),
+                arguments: json!({"query": "status"}),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::PauseTurn,
+            ..AssistantMessage::default()
+        }));
+        let local_tool_call = Message::Assistant(Arc::new(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall {
+                id: "local-tool".to_string(),
+                name: "write".to_string(),
+                arguments: json!({"path": "result.txt"}),
+                thought_signature: None,
+            })],
+            stop_reason: StopReason::ToolUse,
+            ..AssistantMessage::default()
+        }));
+        let local_result = Message::ToolResult(Arc::new(crate::model::ToolResultMessage {
+            tool_call_id: "local-tool".to_string(),
+            tool_name: "write".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("wrote result.txt"))],
+            details: None,
+            is_error: false,
+            timestamp: 3,
+        }));
+        let live = vec![server_tool_pause, local_tool_call, local_result];
+
+        let recovered = completed_live_tool_effect_suffix(&session, &live)
+            .expect("inspect PauseTurn followed by local tool cycle");
+        assert_eq!(
+            serde_json::to_value(recovered).expect("serialize recovered transcript"),
+            serde_json::to_value(live).expect("serialize expected transcript"),
+            "server-managed PauseTurn calls must not hide a later completed local tool effect"
+        );
+    }
+
+    #[test]
+    fn terminal_recovery_requires_authored_timestamps_but_accepts_synthetic_legacy_timestamps() {
+        let mut authored_session = Session::in_memory();
+        authored_session.append_model_message(Message::User(UserMessage {
+            content: UserContent::Text("same authored content".to_string()),
+            timestamp: 1,
+        }));
+        let authored_live = [Message::User(UserMessage {
+            content: UserContent::Text("same authored content".to_string()),
+            timestamp: 2,
+        })];
+        let authored_error = completed_live_tool_effect_suffix(&authored_session, &authored_live)
+            .expect_err("different authored timestamps must prove prefix divergence");
+        assert!(authored_error.to_string().contains("diverged"));
+
+        let mut legacy_session = Session::in_memory();
+        legacy_session.append_message(SessionMessage::User {
+            content: UserContent::Text("legacy content".to_string()),
+            timestamp: None,
+        });
+        let mut legacy_live = legacy_session.to_messages_for_current_path();
+        let Message::User(user) = &mut legacy_live[0] else {
+            panic!("expected projected legacy user message");
+        };
+        user.timestamp = user.timestamp.saturating_add(1_000);
+
+        assert!(
+            completed_live_tool_effect_suffix(&legacy_session, &legacy_live)
+                .expect("synthetic legacy timestamp must not break the prefix")
+                .is_empty(),
+            "a reconciled transcript with no live suffix has nothing to recover"
+        );
+    }
+
+    #[test]
+    fn terminal_preservation_keeps_input_authoritative_on_prefix_divergence() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let persisted = Message::User(UserMessage {
+                content: UserContent::Text("same content".to_string()),
+                timestamp: 1,
+            });
+            let live = Message::User(UserMessage {
+                content: UserContent::Text("same content".to_string()),
+                timestamp: 2,
+            });
+            let mut inner = Session::in_memory();
+            inner.append_model_message(persisted);
+            let mut agent_session = build_test_agent_session(inner);
+            agent_session.agent.replace_messages(vec![live]);
+            let session = Arc::new(asupersync::sync::Mutex::new(agent_session));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let cx = AgentCx::for_request();
+            shared_state
+                .lock(&cx)
+                .await
+                .expect("shared state lock")
+                .push_steering(QueuedAgentMessage::from_authored_message(
+                    build_user_message("must remain pending", &[]),
+                ))
+                .expect("queue steering");
+
+            let error = preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                .await
+                .expect_err("prefix divergence must block terminal preservation");
+            assert!(error.to_string().contains("diverged"));
+            assert_eq!(
+                shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state after rejected preservation")
+                    .pending_count(),
+                1,
+                "rejected preservation must not clear authoritative RPC input"
+            );
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            let Message::User(user) = &guard.agent.messages()[0] else {
+                panic!("expected divergent live user message");
+            };
+            assert_eq!(user.timestamp, 2, "live Agent state must remain untouched");
+        });
+    }
+
+    #[test]
+    fn staged_tool_transcript_recovery_rejects_session_base_drift() {
+        let mut session = Session::in_memory();
+        session.append_model_message(build_user_message("base", &[]));
+        let recorded = vec![Message::ToolResult(Arc::new(
+            crate::model::ToolResultMessage {
+                tool_call_id: "tool-1".to_string(),
+                tool_name: "write".to_string(),
+                content: vec![ContentBlock::Text(TextContent::new("done"))],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+            },
+        ))];
+        let mut state = RpcSharedState::new(&Config::default());
+        state
+            .stage_completed_tool_transcript(&session, &recorded)
+            .expect("stage recovery transcript");
+        session.append_custom_entry("drift".to_string(), Some(json!({"changed": true})));
+
+        let err = state
+            .stage_completed_tool_transcript(&session, &recorded)
+            .expect_err("session-base drift must fail closed");
+        assert!(err.to_string().contains("session base changed"));
+    }
+
+    #[test]
+    fn terminal_preservation_recognizes_in_flight_input_already_in_live_session() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let cx = AgentCx::for_request();
+            let delivered = {
+                let mut state = shared_state.lock(&cx).await.expect("shared state lock");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("already appended in-flight", &[]),
+                    ))
+                    .expect("queue steering");
+                state
+                    .lease_steering(0)
+                    .into_iter()
+                    .next()
+                    .expect("leased delivery")
+            };
+            {
+                let guard = session.lock(&cx).await.expect("agent session lock");
+                let mut inner = guard.session.lock(&cx).await.expect("inner session lock");
+                inner.append_model_message(delivered.into_message());
+            }
+
+            let preserved = preserve_terminal_rpc_input(&session, &shared_state, &cx)
+                .await
+                .expect("preserve represented in-flight input");
+            assert_eq!(preserved, 1);
+            assert_eq!(
+                shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state lock")
+                    .pending_count(),
+                0
+            );
+
+            let guard = session.lock(&cx).await.expect("agent session lock");
+            let inner = guard.session.lock(&cx).await.expect("inner session lock");
+            let represented_count = inner
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text == "already appended in-flight"
+                    )
+                })
+                .count();
+            assert_eq!(
+                represented_count, 1,
+                "terminal recovery must not duplicate an Agent-appended delivery"
+            );
+        });
+    }
+
+    #[test]
+    fn normal_rpc_acknowledgement_flushes_represented_input_before_release() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(
+                Session::create_with_dir(Some(temp.path().join("sessions"))),
+            ));
+            let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
+            let agent = Agent::new(
+                provider,
+                ToolRegistry::new(&[], Path::new("."), None),
+                AgentConfig::default(),
+            );
+            let session = Arc::new(asupersync::sync::Mutex::new(AgentSession::new(
+                agent,
+                Arc::clone(&inner_session),
+                true,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let cx = AgentCx::for_request();
+            let delivered = {
+                let mut state = shared_state.lock(&cx).await.expect("shared state lock");
+                state
+                    .push_steering(QueuedAgentMessage::from_authored_message(
+                        build_user_message("durable normal acknowledgement", &[]),
+                    ))
+                    .expect("queue steering");
+                state
+                    .lease_steering(0)
+                    .into_iter()
+                    .next()
+                    .expect("leased delivery")
+            };
+            inner_session
+                .lock(&cx)
+                .await
+                .expect("inner session lock")
+                .append_model_message(delivered.message().clone());
+
+            let acknowledged =
+                acknowledge_durable_rpc_in_flight(&session, &shared_state, &cx)
+                    .await
+                    .expect("durably acknowledge represented input");
+            assert_eq!(acknowledged, 1);
+            assert_eq!(
+                shared_state
+                    .lock(&cx)
+                    .await
+                    .expect("shared state lock")
+                    .pending_count(),
+                0
+            );
+
+            let session_path = inner_session
+                .lock(&cx)
+                .await
+                .expect("inner session lock")
+                .path
+                .clone()
+                .expect("manual acknowledgement flush must create a session file");
+            let reopened = Session::open(session_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen durably acknowledged session");
+            let represented_count = reopened
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text == "durable normal acknowledgement"
+                    )
+                })
+                .count();
+            assert_eq!(represented_count, 1);
+        });
+    }
+
+    fn assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+        store_kind: crate::session::SessionStoreKind,
+    ) {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let mut live = Session::create_with_dir_and_store(
+                Some(temp.path().join("sessions")),
+                store_kind,
+            );
+            live.append_model_message(build_user_message("durable base", &[]));
+            live.save().await.expect("persist replay base entry");
+            let session_path = live.path.clone().expect("pinned session path");
+            assert_eq!(live.entries.len(), 1, "replay base must be durable");
+            let queued = [
+                QueuedAgentMessage::from_authored_message(build_user_message(
+                    "cancelled-writer steering",
+                    &[],
+                )),
+                QueuedAgentMessage::from_authored_message(build_user_message(
+                    "cancelled-writer follow-up",
+                    &[],
+                )),
+            ];
+
+            let append_queued =
+                |candidate: &mut Session, queued: &[QueuedAgentMessage]| -> Result<()> {
+                    let mut parent_id = candidate.leaf_id().map(str::to_string);
+                    for delivery in queued {
+                        let message = delivery.message().clone();
+                        let (entry_id, timestamp, bound_parent_id) =
+                            delivery.bind_persistence_identity(parent_id.take());
+                        parent_id = Some(entry_id.clone());
+                        candidate.append_model_message_with_identity(
+                            message,
+                            &entry_id,
+                            &timestamp,
+                            bound_parent_id.as_deref(),
+                        )?;
+                    }
+                    Ok(())
+                };
+
+            let mut cancelled_candidate = live.clone();
+            append_queued(&mut cancelled_candidate, &queued)
+                .expect("prepare first candidate");
+            cancelled_candidate
+                .flush_autosave(AutosaveFlushTrigger::Periodic)
+                .await
+                .expect("simulate writer reaching disk before cancellation");
+            drop(cancelled_candidate);
+
+            live.append_model_message(build_user_message("later live branch", &[]));
+            live.flush_autosave(AutosaveFlushTrigger::Periodic)
+                .await
+                .expect("advance and reconcile live session before retry");
+
+            let mut retry_candidate = live.clone();
+            append_queued(&mut retry_candidate, &queued).expect("prepare retry candidate");
+            retry_candidate
+                .flush_autosave(AutosaveFlushTrigger::Periodic)
+                .await
+                .expect("retry identical durable append");
+
+            let reopened = Session::open(session_path.to_string_lossy().as_ref())
+                .await
+                .expect("reopen replayed session");
+            assert_eq!(
+                reopened.entries.len(),
+                4,
+                "cancelled-writer replay must not retain a duplicate durable branch"
+            );
+            let later_branch_count = reopened
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry,
+                        crate::session::SessionEntry::Message(message)
+                            if matches!(
+                                &message.message,
+                                SessionMessage::User {
+                                    content: UserContent::Text(text),
+                                    ..
+                                } if text == "later live branch"
+                            )
+                    )
+                })
+                .count();
+            assert_eq!(later_branch_count, 1, "later live branch must be retained");
+            for expected in ["cancelled-writer steering", "cancelled-writer follow-up"] {
+                let count = reopened
+                    .to_messages_for_current_path()
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            message,
+                            Message::User(UserMessage {
+                                content: UserContent::Text(text),
+                                ..
+                            }) if text == expected
+                        )
+                    })
+                    .count();
+                assert_eq!(count, 1, "{expected} must be durable exactly once");
+            }
+        });
+    }
+
+    #[test]
+    fn terminal_jsonl_queue_replay_reuses_stable_entry_identity() {
+        assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+            crate::session::SessionStoreKind::Jsonl,
+        );
+    }
+
+    #[cfg(feature = "sqlite-sessions")]
+    #[test]
+    fn terminal_sqlite_queue_replay_reuses_stable_entry_identity() {
+        assert_terminal_queue_persistence_replay_reuses_stable_entry_identity(
+            crate::session::SessionStoreKind::Sqlite,
+        );
+    }
+
+    #[test]
+    fn terminal_queue_preservation_rolls_back_after_candidate_flush_failure() {
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
 
         runtime.block_on(async {
             let blocked_root = tempfile::tempdir().expect("tempdir");
-            let blocked_session_dir = blocked_root.path().join("not-a-directory");
-            std::fs::write(&blocked_session_dir, b"blocked").expect("write path blocker");
-            let session_value = Session::create_with_dir(Some(blocked_session_dir));
+            let mut session_value = Session::in_memory();
+            // A non-file persistence target skips the preliminary path-pinning
+            // branch, then fails only after the private candidate has appended
+            // both accepted deliveries.
+            session_value.path = Some(blocked_root.path().to_path_buf());
             let inner_session = Arc::new(asupersync::sync::Mutex::new(session_value));
             let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
             let agent = Agent::new(
@@ -10157,11 +11819,12 @@ export default function init(pi) {
 
             let err = preserve_terminal_rpc_input(&session, &shared_state, &cx)
                 .await
-                .expect_err("blocked session directory must fail persistence");
+                .expect_err("candidate flush to a directory must fail persistence");
+            let err_text = err.to_string();
             assert!(
-                err.to_string().contains("not-a-directory")
-                    || err.to_string().contains("Not a directory")
-                    || err.to_string().contains("Failed"),
+                err_text.contains("directory")
+                    || err_text.contains("regular file")
+                    || err_text.contains("Failed"),
                 "unexpected persistence error: {err}"
             );
 

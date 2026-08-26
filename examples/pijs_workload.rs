@@ -160,7 +160,7 @@ impl RegressionGateVerifications {
         Self(verified)
     }
 
-    #[cfg(test)]
+    #[allow(dead_code)]
     const fn without(self, requirement: RegressionGateRequirement) -> Self {
         Self(self.0 & !requirement.bit())
     }
@@ -827,18 +827,10 @@ fn run_tool_roundtrip_native_runtime(runtime: &ExtensionRuntimeHandle) -> Result
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use super::*;
     use pi::perf_build::profile_from_target_path;
     use std::path::Path;
     use std::time::Duration;
-
-    use crate::{
-        Args, NativeBenchRuntime, REGRESSION_GATE_ITERATIONS, RegressionGateInputs,
-        RegressionGateRequirement, RegressionGateVerifications, WorkloadRuntimeEngine,
-        checked_total_calls, is_full_git_sha, is_regression_gate_eligible,
-        normalized_criterion_output_subdir, run_identity_is_canonical, run_tool_roundtrip_native,
-        run_tool_roundtrip_native_runtime, setup_native_runtime_bench_handle,
-    };
 
     #[test]
     fn workload_args_reject_zero_work() {

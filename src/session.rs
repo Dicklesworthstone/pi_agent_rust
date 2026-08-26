@@ -3065,7 +3065,7 @@ fn session_cold_start_storage_trace(path: &Path) -> Result<SessionColdStartStora
 /// replay its collapse: truncate back to the checkpoint boundary and stand
 /// the rewind report in for the span (mirroring what the live rewind did).
 struct PathRebuildState {
-    messages: Vec<Message>,
+    messages: Vec<(Message, bool)>,
     /// checkpoint entry id -> message count when the marker was walked.
     checkpoint_positions: HashMap<String, usize>,
 }
@@ -3082,7 +3082,10 @@ impl PathRebuildState {
         match entry {
             SessionEntry::Message(msg_entry) => {
                 if let Some(message) = session_message_to_model(&msg_entry.message) {
-                    self.messages.push(message);
+                    self.messages.push((
+                        message,
+                        session_message_has_synthetic_timestamp(&msg_entry.message),
+                    ));
                 }
             }
             SessionEntry::BranchSummary(summary) => {
@@ -3091,7 +3094,7 @@ impl PathRebuildState {
                     from_id: summary.from_id.clone(),
                 };
                 if let Some(message) = session_message_to_model(&summary_message) {
-                    self.messages.push(message);
+                    self.messages.push((message, true));
                 }
             }
             SessionEntry::Custom(custom) => match custom.custom_type.as_str() {
@@ -3130,12 +3133,15 @@ impl PathRebuildState {
             .unwrap_or("checkpoint");
         let summary = data.get("summary").and_then(|v| v.as_str()).unwrap_or("");
         if !summary.is_empty() {
-            self.messages.push(Message::User(crate::model::UserMessage {
-                content: crate::model::UserContent::Text(crate::checkpoint::rewind_report_text(
-                    name, summary,
-                )),
-                timestamp: 0,
-            }));
+            self.messages.push((
+                Message::User(crate::model::UserMessage {
+                    content: crate::model::UserContent::Text(
+                        crate::checkpoint::rewind_report_text(name, summary),
+                    ),
+                    timestamp: 0,
+                }),
+                false,
+            ));
         }
     }
 }
@@ -4790,6 +4796,15 @@ impl Session {
     pub fn append_message(&mut self, message: SessionMessage) -> String {
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        self.append_message_entry(message, base, id)
+    }
+
+    fn append_message_entry(
+        &mut self,
+        message: SessionMessage,
+        base: EntryBase,
+        id: String,
+    ) -> String {
         let entry = SessionEntry::Message(MessageEntry { base, message });
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
@@ -4804,6 +4819,64 @@ impl Session {
     /// Append a message from the model message types.
     pub fn append_model_message(&mut self, message: Message) -> String {
         self.append_message(SessionMessage::from(message))
+    }
+
+    /// Append a model message using caller-owned stable entry metadata.
+    ///
+    /// Terminal RPC recovery binds this identity before its first persistence
+    /// attempt. If a save future is cancelled after its writer reaches disk,
+    /// retrying with the same ID, timestamp, and parent lets the persistence layer
+    /// recognize the entry as an identical replay instead of creating a duplicate
+    /// branch.
+    pub(crate) fn append_model_message_with_identity(
+        &mut self,
+        message: Message,
+        id: &str,
+        timestamp: &str,
+        parent_id: Option<&str>,
+    ) -> Result<String> {
+        if id.trim().is_empty() {
+            return Err(Error::session("stable session entry ID cannot be empty"));
+        }
+        chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|err| {
+            Error::session(format!(
+                "stable session entry timestamp is not RFC 3339: {err}"
+            ))
+        })?;
+
+        let id = id.to_string();
+        let base = EntryBase {
+            id: Some(id.clone()),
+            parent_id: parent_id.map(str::to_string),
+            timestamp: timestamp.to_string(),
+        };
+        let message = SessionMessage::from(message);
+        if let Some(&existing_index) = self.entry_index.get(&id) {
+            let existing = &self.entries[existing_index];
+            let expected = SessionEntry::Message(MessageEntry {
+                base,
+                message: message.clone(),
+            });
+            if serde_json::to_vec(existing)? != serde_json::to_vec(&expected)? {
+                return Err(Error::session(format!(
+                    "stable session entry ID {id} has conflicting in-memory content"
+                )));
+            }
+            if !self.navigate_to(&id) {
+                return Err(Error::session(format!(
+                    "stable session entry ID {id} disappeared during replay"
+                )));
+            }
+            return Ok(id);
+        }
+        if let Some(parent_id) = parent_id
+            && !self.entry_ids.contains(parent_id)
+        {
+            return Err(Error::session(format!(
+                "stable session entry ID {id} references missing parent {parent_id}"
+            )));
+        }
+        Ok(self.append_message_entry(message, base, id))
     }
 
     pub fn append_model_change(&mut self, provider: String, model_id: String) -> String {
@@ -5480,6 +5553,17 @@ impl Session {
     /// Convert session entries along the current path to model messages.
     /// This follows parent_id links from leaf_id back to root.
     pub fn to_messages_for_current_path(&self) -> Vec<Message> {
+        self.to_messages_for_current_path_with_timestamp_provenance()
+            .into_iter()
+            .map(|(message, _)| message)
+            .collect()
+    }
+
+    /// Convert the current path while retaining whether each model timestamp
+    /// was synthesized during projection rather than loaded from durable data.
+    pub(crate) fn to_messages_for_current_path_with_timestamp_provenance(
+        &self,
+    ) -> Vec<(Message, bool)> {
         if self.leaf_id.is_none() {
             return Vec::new();
         }
@@ -5492,7 +5576,7 @@ impl Session {
         Self::to_messages_from_path(path_entries.len(), |idx| path_entries[idx])
     }
 
-    fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<Message>
+    fn to_messages_from_path<'a, F>(path_len: usize, entry_at: F) -> Vec<(Message, bool)>
     where
         F: Fn(usize) -> &'a SessionEntry,
     {
@@ -5519,9 +5603,9 @@ impl Session {
                 // this entry's details so vision-capable models can consume them.
                 let payload =
                     crate::compaction_snap::frames_from_details(compaction.details.as_ref());
-                rebuild.messages.push(crate::compaction_snap::attach_frames(
-                    message,
-                    payload.as_ref(),
+                rebuild.messages.push((
+                    crate::compaction_snap::attach_frames(message, payload.as_ref()),
+                    true,
                 ));
             }
 
@@ -6529,6 +6613,17 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             )))]),
             timestamp: chrono::Utc::now().timestamp_millis(),
         })),
+    }
+}
+
+const fn session_message_has_synthetic_timestamp(message: &SessionMessage) -> bool {
+    match message {
+        SessionMessage::User { timestamp, .. }
+        | SessionMessage::ToolResult { timestamp, .. }
+        | SessionMessage::Custom { timestamp, .. }
+        | SessionMessage::BashExecution { timestamp, .. } => timestamp.is_none(),
+        SessionMessage::BranchSummary { .. } | SessionMessage::CompactionSummary { .. } => true,
+        SessionMessage::Assistant { .. } => false,
     }
 }
 
