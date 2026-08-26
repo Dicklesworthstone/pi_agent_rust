@@ -5779,10 +5779,9 @@ impl ReadTool {
         })
     }
 
-    /// URL reads (bd-cv653.2.2): fetch + convert, then window with the same
-    /// 1-based offset/limit and continuation-notice shapes as file reads.
-    /// 1-based offset/limit and continuation-notice shapes as file reads.
-    /// A trailing `:raw` selector bypasses conversion (plaintext passthrough).
+    /// URL reads (bd-cv653.2.2): fetch, optionally convert, then window with
+    /// the same 1-based offset/limit and continuation-notice shapes as file
+    /// reads. A trailing `:raw` selector bypasses conversion.
     async fn execute_url_read(&self, input: &ReadInput) -> Result<ToolOutput> {
         let (raw, url) = input.path.strip_suffix(":raw").map_or_else(
             || (false, input.path.clone()),
@@ -5793,13 +5792,12 @@ impl ReadTool {
         } else {
             crate::url_read::SsrfPolicy::BlockPrivateTargets
         };
-        let mut outcome = crate::url_read::fetch_and_convert(&url, policy).await?;
-        if raw {
-            outcome.content = format!(
-                "[raw fetch of {url}]\n\n{}",
-                outcome.content // converters already ran; raw shows the wire text when it was plaintext
-            );
-        }
+        let mode = if raw {
+            crate::url_read::UrlReadMode::Raw
+        } else {
+            crate::url_read::UrlReadMode::Reader
+        };
+        let mut outcome = crate::url_read::fetch(&url, policy, mode).await?;
         if outcome.download_truncated {
             outcome.content.push_str(
                 "\n\n[Download truncated at 10 MiB; the source page continues beyond this point.]",

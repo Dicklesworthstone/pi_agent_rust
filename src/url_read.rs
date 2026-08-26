@@ -42,7 +42,14 @@ impl UrlContentKind {
     }
 }
 
-/// A fetched + converted URL read.
+/// Whether a URL read should produce reader-mode text or the wire body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrlReadMode {
+    Reader,
+    Raw,
+}
+
+/// A fetched URL read rendered for tool output.
 #[derive(Debug)]
 pub struct UrlReadOutcome {
     pub content: String,
@@ -128,19 +135,23 @@ fn url_host(url: &str) -> Option<String> {
     Some(host.to_string())
 }
 
-/// The full fetch + convert pipeline. Honors the global request-timeout
-/// override (`PI_HTTP_REQUEST_TIMEOUT_SECS`) via the shared HTTP client.
-pub async fn fetch_and_convert(
+/// The full fetch pipeline. Reader mode converts supported documents to
+/// markdown; raw mode returns the downloaded body without conversion. Honors
+/// the global request-timeout override (`PI_HTTP_REQUEST_TIMEOUT_SECS`) via the
+/// shared HTTP client.
+pub async fn fetch(
     url: &str,
     policy: SsrfPolicy,
+    mode: UrlReadMode,
 ) -> crate::error::Result<UrlReadOutcome> {
-    fetch_and_convert_with_redirects(url, policy, 0).await
+    fetch_with_redirects(url, policy, mode, 0).await
 }
 
 #[allow(clippy::too_many_lines)]
-fn fetch_and_convert_with_redirects<'a>(
+fn fetch_with_redirects<'a>(
     url: &'a str,
     policy: SsrfPolicy,
+    mode: UrlReadMode,
     depth: u32,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = crate::error::Result<UrlReadOutcome>> + Send + 'a>,
@@ -180,7 +191,7 @@ fn fetch_and_convert_with_redirects<'a>(
                 .map(|(_, value)| value.clone());
             if let Some(location) = location {
                 let next = resolve_redirect(url, &location);
-                return fetch_and_convert_with_redirects(&next, policy, depth + 1).await;
+                return fetch_with_redirects(&next, policy, mode, depth + 1).await;
             }
         }
         if !(200..300).contains(&status) {
@@ -212,8 +223,34 @@ fn fetch_and_convert_with_redirects<'a>(
             drop(stream);
         }
 
-        convert_bytes(url, &wire_content_type, &bytes, download_truncated)
+        match mode {
+            UrlReadMode::Reader => {
+                convert_bytes(url, &wire_content_type, &bytes, download_truncated)
+            }
+            UrlReadMode::Raw => Ok(raw_bytes(
+                url,
+                &wire_content_type,
+                &bytes,
+                download_truncated,
+            )),
+        }
     })
+}
+
+fn raw_bytes(
+    url: &str,
+    wire_content_type: &str,
+    bytes: &[u8],
+    download_truncated: bool,
+) -> UrlReadOutcome {
+    UrlReadOutcome {
+        content: String::from_utf8_lossy(bytes).into_owned(),
+        kind: classify(url, wire_content_type, bytes),
+        extractor: "raw",
+        final_url: url.to_string(),
+        wire_content_type: wire_content_type.to_string(),
+        download_truncated,
+    }
 }
 
 /// Follow a Location header, resolving relative redirects against the source.
@@ -680,5 +717,14 @@ mod tests {
         .expect("convert");
         assert_eq!(outcome.kind, UrlContentKind::PlainText);
         assert!(outcome.content.contains("User-agent: *"));
+    }
+
+    #[test]
+    fn raw_mode_preserves_wire_html_without_reader_conversion() {
+        let html = b"<!DOCTYPE html><html><body><nav>raw navigation</nav><script>raw_script()</script></body></html>";
+        let outcome = raw_bytes("https://x.test/page", "text/html", html, false);
+        assert_eq!(outcome.kind, UrlContentKind::Html);
+        assert_eq!(outcome.extractor, "raw");
+        assert_eq!(outcome.content.as_bytes(), html);
     }
 }
