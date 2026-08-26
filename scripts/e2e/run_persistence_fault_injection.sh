@@ -8,38 +8,81 @@ cd "$PROJECT_ROOT"
 # RCH retrieves diagnostics through fixed project-root report names. Serialize
 # this runner across agents before creating any run-specific state so two
 # invocations cannot race between the pre-existing-file check, remote execution,
-# and report move.
-if [[ "${PERSISTENCE_REPORT_LOCK_HELD:-0}" != "1" ]]; then
+# and report move. A caller-provided "lock held" flag is not authority: the
+# child must also inherit an open descriptor for the one fixed lock inode.
+if python3 - "${PERSISTENCE_REPORT_LOCK_HELD:-0}" "${_PI_PERSISTENCE_REPORT_LOCK_FD:-}" <<'PY'
+import fcntl
+import os
+import stat
+import sys
+from pathlib import Path
+
+lock_path = Path("/tmp/pi_agent_rust-persistence-fault-injection-reports.lock")
+try:
+    if sys.argv[1] != "1":
+        raise ValueError("lock-held flag is absent")
+    lock_fd = int(sys.argv[2])
+    descriptor = os.fstat(lock_fd)
+    path_metadata = lock_path.lstat()
+    if not stat.S_ISREG(descriptor.st_mode) or not stat.S_ISREG(path_metadata.st_mode):
+        raise ValueError("report lock is not a regular file")
+    if (descriptor.st_dev, descriptor.st_ino) != (path_metadata.st_dev, path_metadata.st_ino):
+        raise ValueError("report lock descriptor does not match the fixed lock path")
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except (BlockingIOError, OSError, TypeError, ValueError):
+    raise SystemExit(1)
+PY
+then
+    :
+else
     exec python3 - "$0" "$@" <<'PY'
 import fcntl
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 script = Path(sys.argv[1]).resolve()
 arguments = sys.argv[2:]
-lock_path = Path(
-    os.environ.get(
-        "PERSISTENCE_REPORT_LOCK_PATH",
-        "/tmp/pi_agent_rust-persistence-fault-injection-reports.lock",
-    )
-)
+lock_path = Path("/tmp/pi_agent_rust-persistence-fault-injection-reports.lock")
 lock_path.parent.mkdir(parents=True, exist_ok=True)
-with lock_path.open("a+", encoding="utf-8") as lock_file:
+lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+lock_fd = os.open(lock_path, lock_flags, 0o600)
+with os.fdopen(lock_fd, "a+", encoding="utf-8") as lock_file:
+    lock_metadata = os.fstat(lock_file.fileno())
+    if not stat.S_ISREG(lock_metadata.st_mode):
+        raise SystemExit("persistence report lock is not a regular file")
+    os.fchmod(lock_file.fileno(), 0o600)
     fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
     child_env = os.environ.copy()
     child_env["PERSISTENCE_REPORT_LOCK_HELD"] = "1"
-    completed = subprocess.run(["bash", str(script), *arguments], env=child_env)
+    child_env["_PI_PERSISTENCE_REPORT_LOCK_FD"] = str(lock_file.fileno())
+    completed = subprocess.run(
+        ["bash", str(script), *arguments],
+        env=child_env,
+        pass_fds=(lock_file.fileno(),),
+    )
     raise SystemExit(completed.returncode)
 PY
 fi
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+RUN_STARTED_AT="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())')"
 RUN_NONCE="$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
 RUN_ID="$STAMP-$RUN_NONCE"
 ARTIFACT_DIR="${E2E_ARTIFACT_DIR:-$PROJECT_ROOT/tests/e2e_results/persistence-fault-injection/$RUN_ID}"
 mkdir -p "$ARTIFACT_DIR"
+for aggregate_path in \
+    "$ARTIFACT_DIR/integrity-summary.json" \
+    "$ARTIFACT_DIR/.integrity-summary.pending.json" \
+    "$ARTIFACT_DIR/run-manifest.json"
+do
+    if [[ -e "$aggregate_path" || -L "$aggregate_path" ]]; then
+        echo "[fault-injection] Refusing pre-existing aggregate artifact: $aggregate_path" >&2
+        exit 68
+    fi
+done
 
 CORRELATION_ID="${CI_CORRELATION_ID:-persistence-fault-injection-$RUN_ID}"
 export CI_CORRELATION_ID="$CORRELATION_ID"
@@ -149,6 +192,10 @@ epoch_ms() {
     python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
 }
 
+utc_timestamp() {
+    python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat())'
+}
+
 assert_free_mb() {
     local path="$1"
     local min_mb="$2"
@@ -233,27 +280,50 @@ write_case_result() {
     local test_log="$7"
     local artifact_index="$8"
     local feature_name="${9:-}"
+    local completed_at
+    completed_at="$(utc_timestamp)"
 
-    cat >"$result_file" <<EOF
-{
-  "schema": "pi.e2e.persistence_fault_case.v1",
-  "run_id": "$CORRELATION_ID",
-  "correlation_id": "$CORRELATION_ID",
-  "source_commit": "$SOURCE_COMMIT",
-  "source_dirty": $SOURCE_DIRTY,
-  "source_tree_sha256": "$SOURCE_TREE_DIGEST",
-  "case_id": "$case_id",
-  "suite": "e2e_session_persistence",
-  "test_name": "$test_name",
-  "feature": "$feature_name",
-  "exit_code": $exit_code,
-  "duration_ms": $duration_ms,
-  "log_file": "$log_file",
-  "test_log_jsonl": "$test_log",
-  "artifact_index_jsonl": "$artifact_index",
-  "timestamp": "$STAMP"
+    python3 - \
+        "$result_file" \
+        "$CORRELATION_ID" \
+        "$RUN_ID" \
+        "$SOURCE_COMMIT" \
+        "$SOURCE_DIRTY" \
+        "$SOURCE_TREE_DIGEST" \
+        "$case_id" \
+        "$test_name" \
+        "$feature_name" \
+        "$exit_code" \
+        "$duration_ms" \
+        "$log_file" \
+        "$test_log" \
+        "$artifact_index" \
+        "$completed_at" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = {
+    "schema": "pi.e2e.persistence_fault_case.v1",
+    "run_id": sys.argv[2],
+    "attempt_id": sys.argv[3],
+    "correlation_id": sys.argv[2],
+    "source_commit": sys.argv[4],
+    "source_dirty": sys.argv[5] == "true",
+    "source_tree_sha256": sys.argv[6],
+    "case_id": sys.argv[7],
+    "suite": "e2e_session_persistence",
+    "test_name": sys.argv[8],
+    "feature": sys.argv[9],
+    "exit_code": int(sys.argv[10]),
+    "duration_ms": int(sys.argv[11]),
+    "log_file": sys.argv[12],
+    "test_log_jsonl": sys.argv[13],
+    "artifact_index_jsonl": sys.argv[14],
+    "timestamp": sys.argv[15],
 }
-EOF
+Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+PY
 }
 
 run_case() {
@@ -270,6 +340,10 @@ run_case() {
     local start_epoch end_epoch duration_ms exit_code diagnostics_exit
     local source_commit source_dirty source_digest
 
+    if [[ -e "$case_dir" || -L "$case_dir" ]]; then
+        echo "[fault-injection] Refusing pre-existing case artifact directory: $case_dir" >&2
+        return 68
+    fi
     mkdir -p "$case_dir"
     source_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
     source_dirty="$(source_dirty_state)"

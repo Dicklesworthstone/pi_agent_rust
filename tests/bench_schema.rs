@@ -2018,7 +2018,16 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         record["config_hash"] = json!(config_hash);
         record
     });
-    write_pijs_workload_records(&target_dir.join("perf/pijs_workload.jsonl"), &pijs_records);
+    let pijs_workload_path = target_dir.join("perf/pijs_workload.jsonl");
+    if let Some(parent) = pijs_workload_path.parent() {
+        fs::create_dir_all(parent).expect("create pijs workload parent dir");
+    }
+    let mut payload = String::new();
+    for record in &pijs_records {
+        payload.push_str(&serde_json::to_string(record).expect("serialize pijs record"));
+        payload.push('\n');
+    }
+    fs::write(pijs_workload_path, payload).expect("write pijs workload records");
 }
 
 fn canonical_protocol_contract() -> Value {
