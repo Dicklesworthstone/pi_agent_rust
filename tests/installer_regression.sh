@@ -2296,7 +2296,7 @@ test_cxxabi_only_diagnostic_names_component() {
     --no-agent-skills
 
   assert_exit_code "$dir" 1
-  assert_output_contains "$dir" "(CXXABI) CXXABI_1.3.15"
+  assert_output_contains "$dir" "requires libstdc++ runtime symbol CXXABI_1.3.15"
   assert_output_not_contains "$dir" "needs glibc"
   if [ -e "${dir}/dest/pi" ]; then
     echo "a CXXABI-broken release binary must not be installed" >&2
