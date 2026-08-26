@@ -1135,10 +1135,69 @@ if [[ "$jsonl_exit" -ne 0 || "$sqlite_exit" -ne 0 || "$summary_exit" -ne 0 ]]; t
     overall_exit=1
 fi
 
+python3 - \
+    "$ARTIFACT_DIR/.integrity-summary.pending.json" \
+    "$ARTIFACT_DIR/integrity-summary.json" \
+    "$ARTIFACT_DIR" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+pending = Path(sys.argv[1])
+published = Path(sys.argv[2])
+artifact_dir = Path(sys.argv[3])
+
+
+def read_stable_regular(path: Path) -> tuple[bytes, os.stat_result]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        initial_metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"publication artifact is not a regular file: {path}")
+        contents = source.read()
+        final_descriptor_metadata = os.fstat(source.fileno())
+    final_path_metadata = path.lstat()
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    initial_identity = tuple(getattr(initial_metadata, field) for field in identity_fields)
+    if (
+        not stat.S_ISREG(final_descriptor_metadata.st_mode)
+        or not stat.S_ISREG(final_path_metadata.st_mode)
+        or initial_identity
+        != tuple(getattr(final_descriptor_metadata, field) for field in identity_fields)
+        or initial_identity
+        != tuple(getattr(final_path_metadata, field) for field in identity_fields)
+        or len(contents) != initial_metadata.st_size
+    ):
+        raise ValueError(f"publication artifact changed while read: {path}")
+    return contents, initial_metadata
+
+
+pending_bytes, pending_metadata = read_stable_regular(pending)
+if published.exists() or published.is_symlink():
+    raise SystemExit("integrity summary publication target is unsafe")
+os.link(pending, published, follow_symlinks=False)
+published_metadata = published.lstat()
+if (
+    not stat.S_ISREG(published_metadata.st_mode)
+    or (published_metadata.st_dev, published_metadata.st_ino)
+    != (pending_metadata.st_dev, pending_metadata.st_ino)
+):
+    raise SystemExit("published integrity summary inode does not match attested bytes")
+pending.unlink()
+directory_descriptor = os.open(
+    artifact_dir,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
+
 MANIFEST_COMPLETED_AT="$(utc_timestamp)"
 python3 - \
-    "$ARTIFACT_DIR/run-manifest.json" \
-    "$ARTIFACT_DIR/.integrity-summary.pending.json" \
+    "$ARTIFACT_DIR/.run-manifest.pending.json" \
     "$ARTIFACT_DIR/integrity-summary.json" \
     "$CORRELATION_ID" \
     "$RUN_ID" \
@@ -1165,8 +1224,7 @@ import sys
 from pathlib import Path
 
 manifest_path = Path(sys.argv[1])
-pending_summary_path = Path(sys.argv[2])
-final_summary_path = Path(sys.argv[3])
+final_summary_path = Path(sys.argv[2])
 
 
 def read_stable_regular(path: Path, *, missing_ok: bool = False) -> bytes | None:
@@ -1211,10 +1269,10 @@ def attest_artifact(path: Path) -> dict:
     }
 
 
-summary_bytes = read_stable_regular(pending_summary_path)
+summary_bytes = read_stable_regular(final_summary_path)
 if summary_bytes is None:
-    raise ValueError(f"missing pending integrity summary: {pending_summary_path}")
-artifact_dir = Path(sys.argv[13])
+    raise ValueError(f"missing published integrity summary: {final_summary_path}")
+artifact_dir = Path(sys.argv[12])
 case_artifacts = [
     attest_artifact(artifact_dir / case_id / filename)
     for case_id in ("jsonl", "sqlite")
@@ -1226,27 +1284,30 @@ case_artifacts = [
         f"{case_id}-fault-window-summary.json",
     )
 ]
+overall_exit = int(sys.argv[19])
+if overall_exit == 0 and not all(artifact.get("present") is True for artifact in case_artifacts):
+    raise ValueError("successful run is missing a mandatory attested artifact")
 payload = {
     "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
-    "run_id": sys.argv[4],
-    "attempt_id": sys.argv[5],
-    "correlation_id": sys.argv[4],
-    "source_commit": sys.argv[6],
-    "source_dirty": sys.argv[7] == "true",
-    "source_tree_sha256": sys.argv[8],
-    "source_commit_final": sys.argv[9],
-    "source_dirty_final": sys.argv[10] == "true",
-    "source_tree_sha256_final": sys.argv[11],
-    "timestamp": sys.argv[12],
-    "artifact_dir": sys.argv[13],
-    "runner_mode": sys.argv[14],
-    "rch_force_remote": sys.argv[15] == "true",
-    "rch_require_remote": sys.argv[16] == "true",
+    "run_id": sys.argv[3],
+    "attempt_id": sys.argv[4],
+    "correlation_id": sys.argv[3],
+    "source_commit": sys.argv[5],
+    "source_dirty": sys.argv[6] == "true",
+    "source_tree_sha256": sys.argv[7],
+    "source_commit_final": sys.argv[8],
+    "source_dirty_final": sys.argv[9] == "true",
+    "source_tree_sha256_final": sys.argv[10],
+    "timestamp": sys.argv[11],
+    "artifact_dir": sys.argv[12],
+    "runner_mode": sys.argv[13],
+    "rch_force_remote": sys.argv[14] == "true",
+    "rch_require_remote": sys.argv[15] == "true",
     "execution_attestation": "configuration_only",
     "terminal_state": "complete",
     "result_files": [
-        str(Path(sys.argv[13]) / "jsonl/result.json"),
-        str(Path(sys.argv[13]) / "sqlite/result.json"),
+        str(artifact_dir / "jsonl/result.json"),
+        str(artifact_dir / "sqlite/result.json"),
         str(final_summary_path),
     ],
     "integrity_summary": {
@@ -1256,10 +1317,10 @@ payload = {
     },
     "artifacts": case_artifacts,
     "exit_codes": {
-        "jsonl": int(sys.argv[17]),
-        "sqlite": int(sys.argv[18]),
-        "summary_validation": int(sys.argv[19]),
-        "overall": int(sys.argv[20]),
+        "jsonl": int(sys.argv[16]),
+        "sqlite": int(sys.argv[17]),
+        "summary_validation": int(sys.argv[18]),
+        "overall": overall_exit,
     },
 }
 with manifest_path.open("x", encoding="utf-8") as manifest:
@@ -1270,59 +1331,35 @@ with manifest_path.open("x", encoding="utf-8") as manifest:
 PY
 
 python3 - \
+    "$ARTIFACT_DIR/.run-manifest.pending.json" \
     "$ARTIFACT_DIR/run-manifest.json" \
-    "$ARTIFACT_DIR/.integrity-summary.pending.json" \
-    "$ARTIFACT_DIR/integrity-summary.json" <<'PY'
-import hashlib
-import json
+    "$ARTIFACT_DIR" <<'PY'
 import os
 import stat
 import sys
 from pathlib import Path
 
-manifest_path = Path(sys.argv[1])
-pending = Path(sys.argv[2])
-published = Path(sys.argv[3])
-
-
-def read_stable_regular(path: Path) -> tuple[bytes, os.stat_result]:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    with os.fdopen(descriptor, "rb") as source:
-        initial_metadata = os.fstat(source.fileno())
-        if not stat.S_ISREG(initial_metadata.st_mode):
-            raise ValueError(f"publication artifact is not a regular file: {path}")
-        contents = source.read()
-        final_descriptor_metadata = os.fstat(source.fileno())
-    final_path_metadata = path.lstat()
-    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
-    initial_identity = tuple(getattr(initial_metadata, field) for field in identity_fields)
-    if (
-        not stat.S_ISREG(final_descriptor_metadata.st_mode)
-        or not stat.S_ISREG(final_path_metadata.st_mode)
-        or initial_identity
-        != tuple(getattr(final_descriptor_metadata, field) for field in identity_fields)
-        or initial_identity
-        != tuple(getattr(final_path_metadata, field) for field in identity_fields)
-        or len(contents) != initial_metadata.st_size
-    ):
-        raise ValueError(f"publication artifact changed while read: {path}")
-    return contents, initial_metadata
-
-
-manifest_bytes, _ = read_stable_regular(manifest_path)
-manifest = json.loads(manifest_bytes)
-pending_bytes, pending_metadata = read_stable_regular(pending)
-expected_summary = manifest.get("integrity_summary")
-if not isinstance(expected_summary, dict):
-    raise SystemExit("run manifest lacks integrity summary attestation")
+pending = Path(sys.argv[1])
+published = Path(sys.argv[2])
+artifact_dir = Path(sys.argv[3])
+descriptor = os.open(pending, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+with os.fdopen(descriptor, "rb") as source:
+    pending_metadata = os.fstat(source.fileno())
+    if not stat.S_ISREG(pending_metadata.st_mode):
+        raise SystemExit("pending run manifest is not a regular file")
+    source.read()
+    final_descriptor_metadata = os.fstat(source.fileno())
+path_metadata = pending.lstat()
 if (
-    expected_summary.get("path") != str(published)
-    or expected_summary.get("size_bytes") != len(pending_bytes)
-    or expected_summary.get("sha256") != hashlib.sha256(pending_bytes).hexdigest()
+    not stat.S_ISREG(path_metadata.st_mode)
+    or (pending_metadata.st_dev, pending_metadata.st_ino, pending_metadata.st_size, pending_metadata.st_mtime_ns)
+    != (final_descriptor_metadata.st_dev, final_descriptor_metadata.st_ino, final_descriptor_metadata.st_size, final_descriptor_metadata.st_mtime_ns)
+    or (pending_metadata.st_dev, pending_metadata.st_ino, pending_metadata.st_size, pending_metadata.st_mtime_ns)
+    != (path_metadata.st_dev, path_metadata.st_ino, path_metadata.st_size, path_metadata.st_mtime_ns)
 ):
-    raise SystemExit("pending integrity summary does not match run manifest")
+    raise SystemExit("pending run manifest changed before publication")
 if published.exists() or published.is_symlink():
-    raise SystemExit("integrity summary publication target is unsafe")
+    raise SystemExit("run manifest publication target is unsafe")
 os.link(pending, published, follow_symlinks=False)
 published_metadata = published.lstat()
 if (
@@ -1330,8 +1367,16 @@ if (
     or (published_metadata.st_dev, published_metadata.st_ino)
     != (pending_metadata.st_dev, pending_metadata.st_ino)
 ):
-    raise SystemExit("published integrity summary inode does not match attested bytes")
+    raise SystemExit("published run manifest inode does not match attested bytes")
 pending.unlink()
+directory_descriptor = os.open(
+    artifact_dir,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
 PY
 
 echo "[fault-injection] Completed with exit code $overall_exit"
