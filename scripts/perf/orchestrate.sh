@@ -4798,20 +4798,47 @@ if stage_relative.is_absolute() or not stage_relative.parts or any(
     raise SystemExit("invalid post-generation evidence stage path")
 stage = project_root.joinpath(*stage_relative.parts)
 
-cursor = project_root
-for index, part in enumerate(stage_relative.parts):
-    cursor = cursor / part
-    final = index == len(stage_relative.parts) - 1
-    try:
-        metadata = cursor.lstat()
-    except FileNotFoundError:
-        cursor.mkdir()
-        metadata = cursor.lstat()
-    else:
-        if final:
-            raise SystemExit(f"refusing preexisting post-generation evidence stage: {cursor}")
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        raise SystemExit(f"post-generation evidence stage has unsafe ancestor: {cursor}")
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | no_follow
+project_fd = os.open(project_root, directory_flags)
+cursor_fd = os.dup(project_fd)
+try:
+    for index, part in enumerate(stage_relative.parts):
+        final = index == len(stage_relative.parts) - 1
+        created = False
+        try:
+            metadata = os.stat(part, dir_fd=cursor_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.mkdir(part, 0o700, dir_fd=cursor_fd)
+            metadata = os.stat(part, dir_fd=cursor_fd, follow_symlinks=False)
+            created = True
+        if final and not created:
+            raise SystemExit(f"refusing preexisting post-generation evidence stage: {stage}")
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise SystemExit(f"post-generation evidence stage has unsafe component: {part}")
+        next_fd = os.open(part, directory_flags, dir_fd=cursor_fd)
+        opened_metadata = os.fstat(next_fd)
+        if (metadata.st_dev, metadata.st_ino) != (
+            opened_metadata.st_dev,
+            opened_metadata.st_ino,
+        ):
+            os.close(next_fd)
+            raise SystemExit(f"post-generation evidence stage component changed: {part}")
+        os.close(cursor_fd)
+        cursor_fd = next_fd
+    stage_fd = cursor_fd
+    cursor_fd = None
+finally:
+    if cursor_fd is not None:
+        os.close(cursor_fd)
+
+output_fd = os.open(output_dir, directory_flags)
+target_fd = os.open(target_dir, directory_flags)
+source_anchors = sorted(
+    ((output_dir, output_fd), (target_dir, target_fd)),
+    key=lambda item: len(item[0].parts),
+    reverse=True,
+)
 
 sources = [
     (output_dir / "results", PurePosixPath("."), True),
@@ -4856,7 +4883,11 @@ for suite, relative_paths in criterion_required_inputs.items():
         continue
     suite_root = criterion_run_root / suite
     required_files.extend(
-        (suite_root.joinpath(*PurePosixPath(relative).parts), PurePosixPath("criterion") / relative)
+        (
+            suite_root.joinpath(*PurePosixPath(relative).parts),
+            PurePosixPath("criterion") / relative,
+            suite,
+        )
         for relative in relative_paths
     )
 if "criterion_semantic_context" in selected_suites:
@@ -4867,6 +4898,7 @@ if "criterion_semantic_context" in selected_suites:
             / "context_intelligence"
             / "perf_budget.json",
             PurePosixPath("context_intelligence/perf_budget.json"),
+            "criterion_semantic_context",
         )
     )
 
@@ -4874,59 +4906,144 @@ entries = []
 destinations = set()
 
 
-def copy_regular_file(source: Path, relative: PurePosixPath):
+def stable_identity(metadata):
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def source_anchor_and_relative(source: Path):
+    for anchor, anchor_fd in source_anchors:
+        try:
+            relative = source.relative_to(anchor)
+        except ValueError:
+            continue
+        if relative.parts and all(part not in {"", ".", ".."} for part in relative.parts):
+            return anchor_fd, relative
+    raise SystemExit(f"post-generation evidence source is outside admitted roots: {source}")
+
+
+def open_source_parent(source: Path):
+    anchor_fd, relative = source_anchor_and_relative(source)
+    parent_fd = os.dup(anchor_fd)
+    try:
+        for part in relative.parts[:-1]:
+            metadata = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise SystemExit(f"post-generation evidence source has unsafe ancestor: {source}")
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            opened_metadata = os.fstat(next_fd)
+            if (metadata.st_dev, metadata.st_ino) != (
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+            ):
+                os.close(next_fd)
+                raise SystemExit(f"post-generation evidence source ancestor changed: {source}")
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd, relative.parts[-1]
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def open_destination_parent(relative: PurePosixPath):
+    parent_fd = os.dup(stage_fd)
+    try:
+        for part in relative.parts[:-1]:
+            try:
+                metadata = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(part, 0o700, dir_fd=parent_fd)
+                metadata = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+                raise SystemExit(f"staged evidence destination has unsafe ancestor: {relative}")
+            next_fd = os.open(part, directory_flags, dir_fd=parent_fd)
+            opened_metadata = os.fstat(next_fd)
+            if (metadata.st_dev, metadata.st_ino) != (
+                opened_metadata.st_dev,
+                opened_metadata.st_ino,
+            ):
+                os.close(next_fd)
+                raise SystemExit(f"staged evidence destination ancestor changed: {relative}")
+            os.close(parent_fd)
+            parent_fd = next_fd
+        return parent_fd, relative.parts[-1]
+    except BaseException:
+        os.close(parent_fd)
+        raise
+
+
+def copy_regular_from_parent(
+    source_parent_fd, source_name, source_label: Path, relative: PurePosixPath, source_metadata=None
+):
     relative_text = relative.as_posix()
     if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
         raise SystemExit(f"invalid staged evidence path: {relative_text}")
     if relative_text in destinations:
         raise SystemExit(f"duplicate staged evidence path: {relative_text}")
     destinations.add(relative_text)
-    source_metadata = source.lstat()
+    if source_metadata is None:
+        source_metadata = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
     if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISREG(source_metadata.st_mode):
-        raise SystemExit(f"post-generation evidence source is not a regular file: {source}")
+        raise SystemExit(f"post-generation evidence source is not a regular file: {source_label}")
 
-    destination = stage.joinpath(*relative.parts)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    source_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    destination_flags = (
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    )
+    source_flags = os.O_RDONLY | no_follow
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow
     digest = hashlib.sha256()
-    source_fd = os.open(source, source_flags)
+    source_fd = os.open(source_name, source_flags, dir_fd=source_parent_fd)
     try:
         opened_metadata = os.fstat(source_fd)
-        if not stat.S_ISREG(opened_metadata.st_mode):
-            raise SystemExit(f"post-generation evidence source changed type: {source}")
-        destination_fd = os.open(destination, destination_flags, 0o600)
+        if stable_identity(source_metadata) != stable_identity(opened_metadata):
+            raise SystemExit(f"post-generation evidence source changed before copy: {source_label}")
+        destination_parent_fd, destination_name = open_destination_parent(relative)
         try:
-            copied = 0
-            while True:
-                chunk = os.read(source_fd, 1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(destination_fd, view)
-                    if written <= 0:
-                        raise SystemExit(f"short write while staging evidence: {destination}")
-                    copied += written
-                    view = view[written:]
+            destination_fd = os.open(
+                destination_name,
+                destination_flags,
+                0o600,
+                dir_fd=destination_parent_fd,
+            )
+            try:
+                copied = 0
+                while True:
+                    chunk = os.read(source_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(destination_fd, view)
+                        if written <= 0:
+                            raise SystemExit(
+                                f"short write while staging evidence: {relative_text}"
+                            )
+                        copied += written
+                        view = view[written:]
+                destination_metadata = os.fstat(destination_fd)
+                if copied != destination_metadata.st_size:
+                    raise SystemExit(f"staged evidence size mismatch: {relative_text}")
+            finally:
+                os.close(destination_fd)
         finally:
-            os.close(destination_fd)
-        final_metadata = source.lstat()
+            os.close(destination_parent_fd)
+        final_opened_metadata = os.fstat(source_fd)
+        final_path_metadata = os.stat(
+            source_name, dir_fd=source_parent_fd, follow_symlinks=False
+        )
         if (
-            source_metadata.st_dev,
-            source_metadata.st_ino,
-            source_metadata.st_size,
-            source_metadata.st_mtime_ns,
-        ) != (
-            final_metadata.st_dev,
-            final_metadata.st_ino,
-            final_metadata.st_size,
-            final_metadata.st_mtime_ns,
-        ) or copied != opened_metadata.st_size:
-            raise SystemExit(f"post-generation evidence source changed while copied: {source}")
+            stable_identity(source_metadata) != stable_identity(final_opened_metadata)
+            or stable_identity(source_metadata) != stable_identity(final_path_metadata)
+            or copied != opened_metadata.st_size
+        ):
+            raise SystemExit(
+                f"post-generation evidence source changed while copied: {source_label}"
+            )
     finally:
         os.close(source_fd)
     entries.append(
@@ -4939,55 +5056,153 @@ def copy_regular_file(source: Path, relative: PurePosixPath):
     )
 
 
+def copy_regular_file(source: Path, relative: PurePosixPath):
+    source_parent_fd, source_name = open_source_parent(source)
+    try:
+        copy_regular_from_parent(source_parent_fd, source_name, source, relative)
+    finally:
+        os.close(source_parent_fd)
+
+
 def sha256_regular_file(path: Path):
     digest = hashlib.sha256()
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    parent_fd, name = open_source_parent(path)
     try:
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise SystemExit(f"evidence input is not a regular file: {path}")
-        while True:
-            chunk = os.read(descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            digest.update(chunk)
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, os.O_RDONLY | no_follow, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or stable_identity(before) != stable_identity(opened):
+                raise SystemExit(f"evidence input is not a stable regular file: {path}")
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            after_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stable_identity(before) != stable_identity(after) or stable_identity(before) != stable_identity(after_path):
+                raise SystemExit(f"evidence input changed while hashed: {path}")
+        finally:
+            os.close(descriptor)
     finally:
-        os.close(descriptor)
+        os.close(parent_fd)
     return digest.hexdigest()
 
 
+def read_stable_regular_file(path: Path):
+    parent_fd, name = open_source_parent(path)
+    try:
+        before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        descriptor = os.open(name, os.O_RDONLY | no_follow, dir_fd=parent_fd)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or stable_identity(before) != stable_identity(opened):
+                raise SystemExit(f"evidence input is not a stable regular file: {path}")
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(descriptor)
+            after_path = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stable_identity(before) != stable_identity(after) or stable_identity(before) != stable_identity(after_path):
+                raise SystemExit(f"evidence input changed while read: {path}")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent_fd)
+
+
 def copy_tree(source_root: Path, destination_root: PurePosixPath, required: bool):
-    if not source_root.exists():
+    try:
+        source_parent_fd, source_name = open_source_parent(source_root)
+        root_metadata = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
         if required:
             raise SystemExit(f"required post-generation evidence root is missing: {source_root}")
         return
-    root_metadata = source_root.lstat()
-    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
-        raise SystemExit(f"post-generation evidence root is unsafe: {source_root}")
-    pending = [(source_root, PurePosixPath("."))]
+    try:
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+            raise SystemExit(f"post-generation evidence root is unsafe: {source_root}")
+        root_fd = os.open(source_name, directory_flags, dir_fd=source_parent_fd)
+        opened_root = os.fstat(root_fd)
+        if (root_metadata.st_dev, root_metadata.st_ino) != (
+            opened_root.st_dev,
+            opened_root.st_ino,
+        ):
+            os.close(root_fd)
+            raise SystemExit(f"post-generation evidence root changed: {source_root}")
+    finally:
+        os.close(source_parent_fd)
+    pending = [(root_fd, PurePosixPath("."), source_root)]
     while pending:
-        directory, relative_directory = pending.pop()
-        with os.scandir(directory) as iterator:
-            children = sorted(iterator, key=lambda entry: entry.name)
-        for child in children:
-            child_relative = relative_directory / child.name
-            child_path = Path(child.path)
-            if child.is_symlink():
-                raise SystemExit(f"post-generation evidence contains symlink: {child_path}")
-            if child.is_dir(follow_symlinks=False):
-                pending.append((child_path, child_relative))
-            elif child.is_file(follow_symlinks=False):
-                relative = (
-                    child_relative
-                    if destination_root == PurePosixPath(".")
-                    else destination_root / child_relative
+        directory_fd, relative_directory, directory_label = pending.pop()
+        try:
+            with os.scandir(directory_fd) as iterator:
+                child_names = sorted(entry.name for entry in iterator)
+            for child_name in child_names:
+                child_relative = relative_directory / child_name
+                child_label = directory_label / child_name
+                child_metadata = os.stat(
+                    child_name, dir_fd=directory_fd, follow_symlinks=False
                 )
-                copy_regular_file(child_path, relative)
-            else:
-                raise SystemExit(
-                    f"post-generation evidence contains non-regular entry: {child_path}"
-                )
+                if stat.S_ISLNK(child_metadata.st_mode):
+                    raise SystemExit(
+                        f"post-generation evidence contains symlink: {child_label}"
+                    )
+                if stat.S_ISDIR(child_metadata.st_mode):
+                    child_fd = os.open(child_name, directory_flags, dir_fd=directory_fd)
+                    opened_child = os.fstat(child_fd)
+                    if (child_metadata.st_dev, child_metadata.st_ino) != (
+                        opened_child.st_dev,
+                        opened_child.st_ino,
+                    ):
+                        os.close(child_fd)
+                        raise SystemExit(
+                            f"post-generation evidence directory changed: {child_label}"
+                        )
+                    pending.append((child_fd, child_relative, child_label))
+                elif stat.S_ISREG(child_metadata.st_mode):
+                    relative = (
+                        child_relative
+                        if destination_root == PurePosixPath(".")
+                        else destination_root / child_relative
+                    )
+                    copy_regular_from_parent(
+                        directory_fd,
+                        child_name,
+                        child_label,
+                        relative,
+                        child_metadata,
+                    )
+                else:
+                    raise SystemExit(
+                        f"post-generation evidence contains non-regular entry: {child_label}"
+                    )
+        finally:
+            os.close(directory_fd)
 
+
+for suite in sorted(selected_suites.intersection(criterion_required_inputs)):
+    suite_result_path = output_dir / "results" / suite / "result.json"
+    try:
+        suite_result = json.loads(read_stable_regular_file(suite_result_path))
+    except (FileNotFoundError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            f"Criterion producer {suite} has no parseable current suite result: {error}"
+        ) from error
+    if (
+        suite_result.get("suite_name") != suite
+        or suite_result.get("status") != "pass"
+        or suite_result.get("exit_code") != 0
+        or suite_result.get("correlation_id") != os.environ["CORRELATION_ID"]
+    ):
+        raise SystemExit(
+            f"Criterion producer {suite} did not pass in the current correlation"
+        )
 
 for source_root, destination_root, required in sources:
     copy_tree(source_root, destination_root, required)
@@ -4995,9 +5210,12 @@ for source_root, destination_root, required in sources:
 pijs_artifact = output_dir / "results" / "pijs_workload.jsonl"
 if pijs_artifact.is_file():
     admitted_pijs_records = []
-    for line_number, line in enumerate(
-        pijs_artifact.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    pijs_bytes = read_stable_regular_file(pijs_artifact)
+    try:
+        pijs_text = pijs_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SystemExit(f"invalid UTF-8 PiJS evidence: {error}") from error
+    for line_number, line in enumerate(pijs_text.splitlines(), start=1):
         if not line.strip():
             continue
         try:
@@ -5052,8 +5270,13 @@ if pijs_artifact.is_file():
 for source, destination in optional_files:
     if source.exists() or source.is_symlink():
         copy_regular_file(source, destination)
-for source, destination in required_files:
-    copy_regular_file(source, destination)
+for source, destination, producer_suite in required_files:
+    try:
+        copy_regular_file(source, destination)
+    except FileNotFoundError as error:
+        raise SystemExit(
+            f"missing required input {destination.as_posix()} from successful {producer_suite}"
+        ) from error
 if not entries:
     raise SystemExit("post-generation evidence stage contains no regular files")
 
@@ -5064,10 +5287,22 @@ inventory = {
     "correlation_id": os.environ["CORRELATION_ID"],
     "entries": entries,
 }
-inventory_path = stage / "post_generation_evidence_inventory.json"
-with inventory_path.open("x", encoding="utf-8") as handle:
-    json.dump(inventory, handle, indent=2, sort_keys=True)
-    handle.write("\n")
+inventory_bytes = (json.dumps(inventory, indent=2, sort_keys=True) + "\n").encode("utf-8")
+inventory_fd = os.open(
+    "post_generation_evidence_inventory.json",
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow,
+    0o600,
+    dir_fd=stage_fd,
+)
+try:
+    view = memoryview(inventory_bytes)
+    while view:
+        written = os.write(inventory_fd, view)
+        if written <= 0:
+            raise SystemExit("short write while creating post-generation evidence inventory")
+        view = view[written:]
+finally:
+    os.close(inventory_fd)
 PY
 then
   die "Failed to create the post-generation evidence package"

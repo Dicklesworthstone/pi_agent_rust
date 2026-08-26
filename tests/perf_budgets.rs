@@ -5461,7 +5461,11 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
         expected_source_commit: source_commit.to_string(),
         correlation_id: "current-run".to_string(),
     };
-    let entry = post_generation_inventory_entry(&evidence_root, "current.json", "current-input");
+    let entry = post_generation_inventory_entry(
+        &evidence_root,
+        "current.json",
+        "file:current.json",
+    );
     write_post_generation_inventory_fixture(
         &evidence_root,
         source_commit,
@@ -5522,7 +5526,7 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
     );
 
     let missing_entry = json!({
-        "logical_input_id": "missing-input",
+        "logical_input_id": "file:missing.json",
         "path": "missing.json",
         "sha256": "a".repeat(64),
         "size_bytes": 1,
@@ -5856,7 +5860,7 @@ fn write_context_intelligence_budget_artifact(path: &Path, payload: &Value) {
 }
 
 #[test]
-fn context_intelligence_budget_reader_prefers_machine_artifact() {
+fn context_intelligence_budget_reader_uses_criterion_latency_and_artifact_size() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let artifact = tmp
         .path()
@@ -5865,6 +5869,13 @@ fn context_intelligence_budget_reader_prefers_machine_artifact() {
         &artifact,
         &valid_context_intelligence_budget_artifact_fixture(),
     );
+    let criterion = tmp.path().join(
+        "target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json",
+    );
+    write_context_intelligence_budget_artifact(
+        &criterion,
+        &serde_json::json!({"mean": {"point_estimate": 99_000_000.0}}),
+    );
 
     let (actual, source) = read_context_intelligence_budget_metric(
         tmp.path(),
@@ -5872,9 +5883,20 @@ fn context_intelligence_budget_reader_prefers_machine_artifact() {
         Some("graph_build_cold"),
     );
 
-    assert_eq!(actual, Some(42.0));
+    assert_eq!(actual, Some(99.0));
     assert_eq!(
         source,
+        "cargo-target[0]://criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json"
+    );
+
+    let (bundle_bytes, bundle_source) = read_context_intelligence_budget_metric(
+        tmp.path(),
+        "context_bundle_estimated_bytes_max",
+        None,
+    );
+    assert_eq!(bundle_bytes, Some(8192.0));
+    assert_eq!(
+        bundle_source,
         "cargo-target[0]://perf/context_intelligence_planner_budget.json"
     );
 }

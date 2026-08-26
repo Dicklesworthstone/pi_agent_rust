@@ -591,6 +591,7 @@ fn canonical_regular_path(
 fn measurement_artifact_path(
     claimed_path: &str,
     relocated_path: Option<&Path>,
+    required_claimed_suffix: &Path,
     field: &str,
 ) -> Result<PathBuf, MeasurementControlError> {
     let claimed_path = PathBuf::from(claimed_path);
@@ -601,6 +602,12 @@ fn measurement_artifact_path(
     {
         return Err(MeasurementControlError::Invalid(format!(
             "{field} must claim an absolute normalized producer path"
+        )));
+    }
+    if !claimed_path.ends_with(required_claimed_suffix) {
+        return Err(MeasurementControlError::Invalid(format!(
+            "{field} must end with the required producer path {}",
+            required_claimed_suffix.display()
         )));
     }
     relocated_path.map_or_else(
@@ -667,6 +674,7 @@ pub fn verify_binary_size_measurement_control_with_relocated_artifact(
     let binary_path = measurement_artifact_path(
         &control.binary_path,
         relocated_binary_path,
+        Path::new("release/pi"),
         "binary_path",
     )?;
     let metadata = std::fs::metadata(&binary_path).map_err(|error| {
@@ -759,9 +767,13 @@ pub fn verify_cold_load_measurement_control_with_relocated_artifact(
         ))
     })?;
     validate_sha256(&measurement.sha256, "artifact_sha256")?;
+    let required_suffix = PathBuf::from(format!(
+        "criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json"
+    ));
     let artifact_path = measurement_artifact_path(
         &measurement.path,
         relocated_artifact_path,
+        &required_suffix,
         "artifact_path",
     )?;
     let artifact_metadata = std::fs::metadata(&artifact_path).map_err(|error| {
@@ -938,6 +950,7 @@ pub fn verify_idle_rss_measurement_control_with_relocated_artifact(
     let binary_path = measurement_artifact_path(
         &control.binary_path,
         relocated_binary_path,
+        Path::new("release/pi"),
         "binary_path",
     )?;
     if binary_path.file_name().and_then(|name| name.to_str()) != Some("pi") {
@@ -1174,7 +1187,9 @@ mod tests {
             .expect("canonicalize relocated Criterion estimate");
         let mut relocated_control = control.clone();
         relocated_control["measurements"]["hello"]["artifact_path"] =
-            serde_json::json!("/unavailable/producer/target/criterion/estimates.json");
+            serde_json::json!(
+                "/unavailable/producer/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json"
+            );
         let relocated_control_path = temp.path().join("cold-load-relocated.json");
         write_json(&relocated_control_path, &relocated_control);
         assert!(
@@ -1187,6 +1202,20 @@ mod tests {
         )
         .expect("relocated Criterion bytes satisfy the producer control");
         assert_eq!(relocated.artifact_path, relocated_artifact_path);
+
+        relocated_control["measurements"]["hello"]["artifact_path"] = serde_json::json!(
+            "/unavailable/producer/target/criterion/ext_load_init/load_init_cold/pirate/new/estimates.json"
+        );
+        write_json(&relocated_control_path, &relocated_control);
+        assert!(
+            verify_cold_load_measurement_control_with_relocated_artifact(
+                &relocated_control_path,
+                "hello",
+                Some(&relocated_artifact_path),
+            )
+            .is_err(),
+            "digest-identical relocated bytes must not excuse the wrong producer suffix"
+        );
 
         control["bench_env"]["noise_score"] = serde_json::json!(1);
         let noisy_env_sha256 = super::sha256_bytes(
