@@ -1623,7 +1623,7 @@ run_criterion_bench() {
     exit_code=91
   fi
   if [[ "$exit_code" -eq 0 \
-    && { ! -d "$criterion_dir" || -L "$criterion_dir"; } ]]; then
+    && ( ! -d "$criterion_dir" || -L "$criterion_dir" ) ]]; then
     log_fail "$suite_name did not produce its isolated Criterion directory"
     exit_code=92
   fi
