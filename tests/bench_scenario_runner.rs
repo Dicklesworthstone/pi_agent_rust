@@ -32,6 +32,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1357,6 +1358,68 @@ fn run_scenario_suite_and_emit_jsonl() {
     );
 
     print_scenario_summary(records);
+    emit_legacy_runtime_comparison_if_requested();
+}
+
+fn emit_legacy_runtime_comparison_if_requested() {
+    if std::env::var("PI_BENCH_LEGACY_RUNTIMES").as_deref() != Ok("1") {
+        return;
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/bench_legacy_extension_workloads.mjs");
+    let output_path = perf_output_path("legacy_extension_workloads.jsonl");
+    assert!(
+        !output_path.exists(),
+        "refusing preexisting legacy benchmark output: {}",
+        output_path.display()
+    );
+
+    for (runtime, append) in [("node", false), ("bun", true)] {
+        let mut command = Command::new(runtime);
+        command
+            .current_dir(root)
+            .arg(&script)
+            .args([
+                "--load-runs",
+                "10",
+                "--iterations",
+                "2000",
+                "--tool-calls",
+                "10",
+                "--out",
+            ])
+            .arg(&output_path);
+        if append {
+            command.arg("--append");
+        }
+        let child_output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to launch {runtime} legacy benchmark: {error}"));
+        assert!(
+            child_output.status.success(),
+            "{runtime} legacy benchmark failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            child_output.status,
+            String::from_utf8_lossy(&child_output.stdout),
+            String::from_utf8_lossy(&child_output.stderr),
+        );
+    }
+
+    let metadata = fs::symlink_metadata(&output_path).unwrap_or_else(|error| {
+        panic!(
+            "legacy benchmark output is missing at {}: {error}",
+            output_path.display()
+        )
+    });
+    assert!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0,
+        "legacy benchmark output must be a regular nonempty file: {}",
+        output_path.display()
+    );
+    eprintln!(
+        "[output] Node+Bun legacy benchmark rows written to {}",
+        output_path.display()
+    );
 }
 
 #[test]

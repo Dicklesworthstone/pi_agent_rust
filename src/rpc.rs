@@ -599,6 +599,7 @@ async fn rpc_session_transition_blocker(
     is_compacting: &AtomicBool,
     turn_phase_linearizer: &std::sync::Mutex<()>,
     session: &Arc<Mutex<AgentSession>>,
+    shared_state: &Arc<Mutex<RpcSharedState>>,
     bash_state: &Arc<Mutex<Option<RunningBash>>>,
     cx: &AgentCx,
 ) -> Result<Option<&'static str>> {
@@ -628,6 +629,16 @@ async fn rpc_session_transition_blocker(
     if staged_follow_up {
         return Ok(Some(
             "An accepted follow-up is still pending; resume it before changing sessions",
+        ));
+    }
+
+    let pending_input_count = OwnedMutexGuard::lock(Arc::clone(shared_state), cx)
+        .await
+        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
+        .pending_count();
+    if pending_input_count > 0 {
+        return Ok(Some(
+            "Acknowledged RPC input is still pending; resume or persist it before changing sessions",
         ));
     }
 
@@ -2554,6 +2565,7 @@ pub async fn run(
                     &is_compacting,
                     &turn_phase_linearizer,
                     &session,
+                    &shared_state,
                     &bash_state,
                     &cx,
                 )
@@ -2648,6 +2660,7 @@ pub async fn run(
                     &is_compacting,
                     &turn_phase_linearizer,
                     &session,
+                    &shared_state,
                     &bash_state,
                     &cx,
                 )
@@ -2764,6 +2777,7 @@ pub async fn run(
                     &is_compacting,
                     &turn_phase_linearizer,
                     &session,
+                    &shared_state,
                     &bash_state,
                     &cx,
                 )
@@ -3100,28 +3114,28 @@ async fn preserve_terminal_rpc_input(
     }
 
     let queued_count = state.steering.len() + state.follow_up.len();
-    let rollback_session = inner.clone();
-    let steering = std::mem::take(&mut state.steering);
-    let follow_up = std::mem::take(&mut state.follow_up);
-    for delivery in steering.iter().chain(&follow_up) {
-        inner.append_model_message(delivery.clone().into_message());
+    // Build and flush a private candidate while the authoritative queues and
+    // live Session remain unchanged. If this future is cancelled at its only
+    // post-admission await, retry sees the original queues and cannot duplicate
+    // partially appended live entries.
+    let mut candidate = inner.clone();
+    for delivery in state.steering.iter().chain(&state.follow_up) {
+        candidate.append_model_message(delivery.clone().into_message());
     }
-    guard
-        .agent
-        .replace_messages(inner.to_messages_for_current_path());
 
     if save_enabled
-        && let Err(persist_err) = inner.flush_autosave(AutosaveFlushTrigger::Periodic).await
+        && let Err(persist_err) = candidate
+            .flush_autosave(AutosaveFlushTrigger::Periodic)
+            .await
     {
-        *inner = rollback_session;
-        guard
-            .agent
-            .replace_messages(inner.to_messages_for_current_path());
-        state.steering = steering;
-        state.follow_up = follow_up;
         return Err(persist_err);
     }
 
+    let messages = candidate.to_messages_for_current_path();
+    *inner = candidate;
+    guard.agent.replace_messages(messages);
+    state.steering.clear();
+    state.follow_up.clear();
     Ok(queued_count)
 }
 

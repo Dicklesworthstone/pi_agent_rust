@@ -1878,6 +1878,7 @@ case "${1:-}" in
       PI_BENCH_CORRELATION_ID \
       PI_BENCH_ALLOCATOR \
       PI_BENCH_MODE \
+      PI_BENCH_LEGACY_RUNTIMES \
       CARGO_BUILD_JOBS \
       PI_CRITERION_OUTPUT_SUBDIR; do
       case ",${RCH_ENV_ALLOWLIST:-}," in

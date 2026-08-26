@@ -659,6 +659,90 @@ fn collect_post_generation_evidence_files(
     Ok(())
 }
 
+fn validate_admission_receipts<'a>(
+    payload: &'a Value,
+    field: &str,
+    label: &str,
+    required: &BTreeMap<&str, (&str, &str)>,
+    expected_source_commit: &str,
+) -> Result<(), String> {
+    let entries = payload
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("post-generation producer admission has no {label} list"))?;
+    let is_lowercase_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    let mut observed = BTreeMap::new();
+    for entry in entries {
+        let suite = entry
+            .get("suite")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission entry has no suite"))?;
+        let target = entry
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission {suite} has no target"))?;
+        let kind = entry
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission {suite} has no kind"))?;
+        let remote_marker = entry
+            .get("remote_marker")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission {suite} has no remote marker"))?;
+        let remote_worker = entry
+            .get("remote_worker")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission {suite} has no remote worker"))?;
+        let clean_overlay_receipt = entry
+            .get("clean_overlay_receipt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission {suite} has no clean-overlay receipt"))?;
+        let overlay_fingerprint = entry
+            .get("overlay_fingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label} admission {suite} has no overlay fingerprint"))?;
+        let marker_tail = remote_marker
+            .strip_prefix("[RCH] remote ")
+            .and_then(|tail| tail.strip_suffix(')'))
+            .and_then(|tail| tail.split_once(" ("));
+        if !is_lowercase_sha256(overlay_fingerprint)
+            || marker_tail.is_none_or(|(worker, timing)| {
+                worker != remote_worker
+                    || worker.is_empty()
+                    || worker.chars().any(char::is_whitespace)
+                    || timing.is_empty()
+                    || timing.contains(')')
+            })
+            || clean_overlay_receipt
+                != format!(
+                    "[RCH] clean-overlay receipt: base={expected_source_commit} overlay-fingerprint={overlay_fingerprint}"
+                )
+            || entry
+                .get("remote_execution_verified")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err(format!(
+                "{label} admission {suite} has invalid remote proof metadata"
+            ));
+        }
+        if observed.insert(suite, (target, kind)).is_some() {
+            return Err(format!("duplicate {label} admission suite {suite}"));
+        }
+    }
+    if &observed != required {
+        return Err(format!(
+            "post-generation producer admission {label} suite contract mismatch"
+        ));
+    }
+    Ok(())
+}
+
 fn validate_post_generation_producer_admission(
     policy: &PostGenerationEvidencePolicy,
 ) -> Result<(), String> {
@@ -707,17 +791,10 @@ fn validate_post_generation_producer_admission(
         return Err("post-generation producer admission is not failure-free".to_string());
     }
 
-    let required = BTreeMap::from([
-        ("bench_schema", ("bench_schema", "cargo_test")),
+    let required_producers = BTreeMap::from([
         ("bench_scenario", ("bench_scenario_runner", "cargo_test")),
         ("ext_bench_harness", ("ext_bench_harness", "cargo_test")),
         ("perf_bench_harness", ("perf_bench_harness", "cargo_test")),
-        ("perf_regression", ("perf_regression", "cargo_test")),
-        ("perf_comparison", ("perf_comparison", "cargo_test")),
-        (
-            "perf_baseline_variance",
-            ("perf_baseline_variance", "cargo_test"),
-        ),
         ("criterion_extensions", ("extensions", "criterion")),
         ("criterion_pijs", ("pijs_workload", "criterion")),
         ("criterion_system", ("system", "criterion")),
@@ -726,79 +803,29 @@ fn validate_post_generation_producer_admission(
             ("semantic_context", "criterion"),
         ),
     ]);
-    let producers = payload
-        .get("producers")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "post-generation producer admission has no producer list".to_string())?;
-    let is_lowercase_sha256 = |value: &str| {
-        value.len() == 64
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    };
-    let mut observed = BTreeMap::new();
-    for producer in producers {
-        let suite = producer
-            .get("suite")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "producer admission entry has no suite".to_string())?;
-        let target = producer
-            .get("target")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no target"))?;
-        let kind = producer
-            .get("kind")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no kind"))?;
-        let remote_marker = producer
-            .get("remote_marker")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no remote marker"))?;
-        let remote_worker = producer
-            .get("remote_worker")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no remote worker"))?;
-        let clean_overlay_receipt = producer
-            .get("clean_overlay_receipt")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no clean-overlay receipt"))?;
-        let overlay_fingerprint = producer
-            .get("overlay_fingerprint")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("producer admission {suite} has no overlay fingerprint"))?;
-        let marker_tail = remote_marker
-            .strip_prefix("[RCH] remote ")
-            .and_then(|tail| tail.strip_suffix(')'))
-            .and_then(|tail| tail.split_once(" ("));
-        if !is_lowercase_sha256(overlay_fingerprint)
-            || marker_tail.is_none_or(|(worker, timing)| {
-                worker != remote_worker
-                    || worker.is_empty()
-                    || worker.chars().any(char::is_whitespace)
-                    || timing.is_empty()
-                    || timing.contains(')')
-            })
-            || clean_overlay_receipt
-                != format!(
-                    "[RCH] clean-overlay receipt: base={} overlay-fingerprint={overlay_fingerprint}",
-                    policy.expected_source_commit
-                )
-            || producer
-                .get("remote_execution_verified")
-                .and_then(Value::as_bool)
-                != Some(true)
-        {
-            return Err(format!(
-                "producer admission {suite} has invalid remote proof metadata"
-            ));
-        }
-        if observed.insert(suite, (target, kind)).is_some() {
-            return Err(format!("duplicate producer admission suite {suite}"));
-        }
-    }
-    if observed != required {
-        return Err("post-generation producer admission suite contract mismatch".to_string());
-    }
+    let required_support_checks = BTreeMap::from([
+        ("bench_schema", ("bench_schema", "cargo_test")),
+        ("perf_regression", ("perf_regression", "cargo_test")),
+        ("perf_comparison", ("perf_comparison", "cargo_test")),
+        (
+            "perf_baseline_variance",
+            ("perf_baseline_variance", "cargo_test"),
+        ),
+    ]);
+    validate_admission_receipts(
+        &payload,
+        "producers",
+        "producer",
+        &required_producers,
+        &policy.expected_source_commit,
+    )?;
+    validate_admission_receipts(
+        &payload,
+        "support_checks",
+        "support check",
+        &required_support_checks,
+        &policy.expected_source_commit,
+    )?;
     Ok(())
 }
 
