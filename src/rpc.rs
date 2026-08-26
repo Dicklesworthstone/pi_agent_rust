@@ -3083,6 +3083,16 @@ pub async fn run(
         ext.shutdown().await;
     }
 
+    let pending_rpc_input = OwnedMutexGuard::lock(Arc::clone(&shared_state), &cx)
+        .await
+        .map_err(|err| Error::session(format!("state lock failed: {err}")))?
+        .pending_count();
+    if pending_rpc_input > 0 {
+        return Err(Error::session(format!(
+            "RPC stdin closed with {pending_rpc_input} acknowledged input message(s) still pending after terminal preservation failure"
+        )));
+    }
+
     Ok(())
 }
 
@@ -9940,12 +9950,16 @@ export default function init(pi) {
                 .expect("agent session lock")
                 .agent
                 .queue_follow_up(build_user_message("old-session follow-up", &[]));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
             let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
             let reason = rpc_session_transition_blocker(
                 &AtomicBool::new(false),
                 &AtomicBool::new(false),
                 &std::sync::Mutex::new(()),
                 &session,
+                &shared_state,
                 &bash_state,
                 &cx,
             )
@@ -9954,6 +9968,50 @@ export default function init(pi) {
             assert_eq!(
                 reason,
                 Some("An accepted follow-up is still pending; resume it before changing sessions")
+            );
+        });
+    }
+
+    #[test]
+    fn session_transition_blocker_rejects_acknowledged_shared_input() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let session = Arc::new(asupersync::sync::Mutex::new(build_test_agent_session(
+                Session::in_memory(),
+            )));
+            let shared_state = Arc::new(asupersync::sync::Mutex::new(RpcSharedState::new(
+                &Config::default(),
+            )));
+            let bash_state = Arc::new(asupersync::sync::Mutex::new(None));
+            let cx = AgentCx::for_request();
+            shared_state
+                .lock(&cx)
+                .await
+                .expect("shared state lock")
+                .push_follow_up(QueuedAgentMessage::from_authored_message(
+                    build_user_message("acknowledged shared follow-up", &[]),
+                ))
+                .expect("queue shared follow-up");
+
+            let reason = rpc_session_transition_blocker(
+                &AtomicBool::new(false),
+                &AtomicBool::new(false),
+                &std::sync::Mutex::new(()),
+                &session,
+                &shared_state,
+                &bash_state,
+                &cx,
+            )
+            .await
+            .expect("transition blocker");
+            assert_eq!(
+                reason,
+                Some(
+                    "Acknowledged RPC input is still pending; resume or persist it before changing sessions"
+                )
             );
         });
     }

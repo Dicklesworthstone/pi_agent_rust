@@ -1369,11 +1369,17 @@ fn emit_legacy_runtime_comparison_if_requested() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let script = root.join("scripts/bench_legacy_extension_workloads.mjs");
     let output_path = perf_output_path("legacy_extension_workloads.jsonl");
-    assert!(
-        !output_path.exists(),
-        "refusing preexisting legacy benchmark output: {}",
-        output_path.display()
-    );
+    match fs::symlink_metadata(&output_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => panic!(
+            "refusing preexisting legacy benchmark output: {}",
+            output_path.display()
+        ),
+        Err(error) => panic!(
+            "cannot inspect legacy benchmark output path {}: {error}",
+            output_path.display()
+        ),
+    }
 
     for (runtime, append) in [("node", false), ("bun", true)] {
         let mut command = Command::new(runtime);

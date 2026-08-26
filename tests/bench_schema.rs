@@ -1481,7 +1481,7 @@ PY
 {"schema":"pi.ext.rust_bench.v1","scenario":"cold_load","extension":"hello","success":true,"stats":{"p95_us":18000}}
 JSON
     cat >"$artifact_output_dir/ext_bench_harness_report.json" <<JSON
-{"schema":"pi.bench.harness_report.v1","mode":"${PI_BENCH_MODE:-pr}","config":{"max_extensions":$ext_bench_max,"iterations":$ext_bench_iterations,"event_dispatch_count":$ext_bench_events},"summary":{"total_scenarios":1,"total_passed":1,"total_failed":0}}
+{"schema":"pi.bench.harness_report.v1","mode":"${PI_BENCH_MODE:-pr}","config":{"max_extensions":$ext_bench_max,"iterations":$ext_bench_iterations,"event_dispatch_count":$ext_bench_events},"summary":{"total_scenarios":1,"total_passed":1,"total_failed":0,"budgets_passed":1,"budgets_failed":0,"budgets_no_data":0}}
 JSON
     ;;
   perf_bench_harness)

@@ -420,6 +420,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     PI_BENCH_CORRELATION_ID \
     PI_BENCH_ALLOCATOR \
     PI_BENCH_MODE \
+    PI_BENCH_LEGACY_RUNTIMES \
     CARGO_BUILD_JOBS \
     PERF_REGRESSION_OUTPUT \
     PERF_REGRESSION_FULL \
@@ -1455,6 +1456,181 @@ if summary["total_scenarios"] <= 0:
     raise SystemExit("extension benchmark harness report contains no scenarios")
 if summary["total_passed"] + summary["total_failed"] != summary["total_scenarios"]:
     raise SystemExit("extension benchmark harness summary totals are inconsistent")
+if summary["total_failed"] != 0:
+    raise SystemExit("extension benchmark harness report contains failed scenarios")
+for field in ("budgets_passed", "budgets_failed", "budgets_no_data"):
+    value = summary.get(field)
+    if type(value) is not int or value < 0:
+        raise SystemExit(
+            f"extension benchmark harness summary.{field} must be a non-negative integer"
+        )
+if summary["budgets_passed"] <= 0:
+    raise SystemExit("extension benchmark harness report contains no passing budgets")
+if summary["budgets_failed"] != 0 or summary["budgets_no_data"] != 0:
+    raise SystemExit("extension benchmark harness report has failed or missing budget data")
+PY
+}
+
+validate_retrieved_rust_bench_jsonl() {
+  local artifact_path="$1"
+  local producer_kind="$2"
+  local expected_commit="$3"
+  local expected_correlation_id="$4"
+  python3 - \
+    "$artifact_path" \
+    "$producer_kind" \
+    "$expected_commit" \
+    "$expected_correlation_id" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+artifact_path = Path(sys.argv[1])
+producer_kind = sys.argv[2]
+expected_commit = sys.argv[3]
+expected_correlation_id = sys.argv[4]
+required_scenarios = {
+    "scenario": {
+        "cold_start",
+        "warm_start",
+        "tool_call",
+        "event_dispatch",
+        "session_workload_matrix",
+    },
+    "extension": {"cold_load", "warm_load", "event_dispatch"},
+}[producer_kind]
+observed_scenarios = set()
+record_count = 0
+
+for line_number, line in enumerate(
+    artifact_path.read_text(encoding="utf-8").splitlines(), start=1
+):
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"line {line_number}: invalid JSON: {error}") from error
+    if not isinstance(record, dict):
+        raise SystemExit(f"line {line_number}: benchmark record must be an object")
+    if record.get("schema") != "pi.ext.rust_bench.v1":
+        raise SystemExit(f"line {line_number}: benchmark schema mismatch")
+    if record.get("source_commit") != expected_commit:
+        raise SystemExit(f"line {line_number}: source_commit mismatch")
+    if record.get("source_dirty") is not False:
+        raise SystemExit(f"line {line_number}: source_dirty must equal false")
+    if record.get("run_id") != expected_correlation_id:
+        raise SystemExit(f"line {line_number}: run_id mismatch")
+    timestamp = record.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        raise SystemExit(f"line {line_number}: timestamp is missing")
+    if producer_kind == "scenario":
+        if record.get("runtime") != "pi_agent_rust":
+            raise SystemExit(f"line {line_number}: runtime mismatch")
+        if record.get("orchestration_correlation_id") != expected_correlation_id:
+            raise SystemExit(
+                f"line {line_number}: orchestration_correlation_id mismatch"
+            )
+    else:
+        if record.get("correlation_id") != expected_correlation_id:
+            raise SystemExit(f"line {line_number}: correlation_id mismatch")
+        if record.get("success") is not True:
+            raise SystemExit(f"line {line_number}: extension scenario did not succeed")
+    scenario = record.get("scenario")
+    if not isinstance(scenario, str) or not scenario:
+        raise SystemExit(f"line {line_number}: scenario is missing")
+    observed_scenarios.add(scenario)
+    record_count += 1
+
+if record_count == 0:
+    raise SystemExit("benchmark JSONL contains no records")
+missing_scenarios = required_scenarios - observed_scenarios
+if missing_scenarios:
+    raise SystemExit(
+        f"benchmark JSONL is missing required scenarios: {sorted(missing_scenarios)!r}"
+    )
+PY
+}
+
+validate_retrieved_legacy_bench_jsonl() {
+  local artifact_path="$1"
+  local expected_commit="$2"
+  local expected_correlation_id="$3"
+  python3 - \
+    "$artifact_path" \
+    "$expected_commit" \
+    "$expected_correlation_id" <<'PY'
+import json
+import math
+import sys
+from pathlib import Path
+
+artifact_path = Path(sys.argv[1])
+expected_commit = sys.argv[2]
+expected_correlation_id = sys.argv[3]
+required = {
+    (runtime_kind, scenario)
+    for runtime_kind in ("node", "bun")
+    for scenario in (
+        "ext_load_init/load_init_cold",
+        "ext_tool_call/hello",
+        "full_e2e_long_session",
+    )
+}
+observed = set()
+
+for line_number, line in enumerate(
+    artifact_path.read_text(encoding="utf-8").splitlines(), start=1
+):
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"line {line_number}: invalid JSON: {error}") from error
+    if not isinstance(record, dict):
+        raise SystemExit(f"line {line_number}: legacy benchmark record must be an object")
+    if record.get("schema") != "pi.ext.legacy_bench.v1":
+        raise SystemExit(f"line {line_number}: legacy benchmark schema mismatch")
+    if record.get("source_commit") != expected_commit:
+        raise SystemExit(f"line {line_number}: source_commit mismatch")
+    if record.get("source_dirty") is not False:
+        raise SystemExit(f"line {line_number}: source_dirty must equal false")
+    for field in ("run_id", "correlation_id"):
+        if record.get(field) != expected_correlation_id:
+            raise SystemExit(f"line {line_number}: {field} mismatch")
+    timestamp = record.get("timestamp")
+    if not isinstance(timestamp, str) or not timestamp.strip():
+        raise SystemExit(f"line {line_number}: timestamp is missing")
+    runtime_kind = record.get("runtime_kind")
+    scenario = record.get("scenario")
+    if runtime_kind not in {"node", "bun"} or not isinstance(scenario, str):
+        raise SystemExit(f"line {line_number}: runtime/scenario contract mismatch")
+    key = (runtime_kind, scenario)
+    if key not in required:
+        continue
+    if key in observed:
+        raise SystemExit(f"line {line_number}: duplicate required legacy row {key!r}")
+    if scenario == "ext_load_init/load_init_cold":
+        value = record.get("summary", {}).get("p50_ms")
+    elif scenario == "ext_tool_call/hello":
+        value = record.get("per_call_us")
+    else:
+        value = record.get("elapsed_ms")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise SystemExit(f"line {line_number}: required legacy metric is invalid")
+    observed.add(key)
+
+if observed != required:
+    raise SystemExit(
+        "legacy benchmark coverage mismatch: "
+        f"missing={sorted(required - observed)!r}"
+    )
 PY
 }
 
@@ -1604,12 +1780,17 @@ run_test_suite() {
     local -a returned_artifacts=()
     local -a producer_feature_args=()
     local producer_bench_mode="pr"
+    local producer_legacy_runtimes=0
     if [[ "$PROFILE" == "full" ]]; then
       producer_bench_mode="nightly"
     fi
     case "$suite_name" in
       bench_scenario)
-        returned_artifacts=(scenario_runner.jsonl legacy_extension_workloads.jsonl)
+        returned_artifacts=(scenario_runner.jsonl)
+        if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+          returned_artifacts+=(legacy_extension_workloads.jsonl)
+          producer_legacy_runtimes=1
+        fi
         ;;
       ext_bench_harness)
         returned_artifacts=(ext_bench_harness.jsonl ext_bench_harness_report.json)
@@ -1630,6 +1811,7 @@ run_test_suite() {
       CARGO_BUILD_JOBS="$BUILD_JOBS" \
       PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
       PI_BENCH_MODE="$producer_bench_mode" \
+      PI_BENCH_LEGACY_RUNTIMES="$producer_legacy_runtimes" \
       RCH_REQUIRE_REMOTE=1 \
       RCH_QUIET=0 \
       RCH_VISIBILITY=summary \
@@ -1672,6 +1854,27 @@ run_test_suite() {
         if [[ ! -s "$source_path" || -L "$source_path" ]]; then
           log_fail "$suite_name did not return regular nonempty $artifact_name"
           exit_code=86
+          break
+        fi
+        if [[ "$artifact_name" == "scenario_runner.jsonl" ]] \
+          && ! validate_retrieved_rust_bench_jsonl \
+            "$source_path" scenario "$GIT_COMMIT_FULL" "$CORRELATION_ID"; then
+          log_fail "$suite_name returned invalid scenario benchmark evidence"
+          exit_code=88
+          break
+        fi
+        if [[ "$artifact_name" == "ext_bench_harness.jsonl" ]] \
+          && ! validate_retrieved_rust_bench_jsonl \
+            "$source_path" extension "$GIT_COMMIT_FULL" "$CORRELATION_ID"; then
+          log_fail "$suite_name returned invalid extension benchmark evidence"
+          exit_code=88
+          break
+        fi
+        if [[ "$artifact_name" == "legacy_extension_workloads.jsonl" ]] \
+          && ! validate_retrieved_legacy_bench_jsonl \
+            "$source_path" "$GIT_COMMIT_FULL" "$CORRELATION_ID"; then
+          log_fail "$suite_name returned invalid Node+Bun legacy benchmark evidence"
+          exit_code=88
           break
         fi
         if [[ "$artifact_name" == "ext_bench_harness_report.json" ]] \
