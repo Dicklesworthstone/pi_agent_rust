@@ -253,6 +253,55 @@ fn command_payload_can_advance_rpc_session(
     }
 }
 
+async fn take_last_rpc_user_turn_for_retry(
+    session: &mut AgentSession,
+) -> Result<Option<String>> {
+    // Session is the durable authority. Truncating only Agent history is undone
+    // by `run_agent_with_text`, which rehydrates Agent from this path before it
+    // appends the retried prompt. Read the same retryable turn shape as
+    // checkpoint retry, then move the active leaf behind that user entry while
+    // retaining the original branch in the session tree.
+    let text = {
+        let cx = AgentCx::for_request();
+        let inner = session
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+        let messages = inner.to_messages_for_current_path();
+        let Some(last_user) = messages.iter().rev().find(|message| {
+            matches!(
+                message,
+                Message::User(user)
+                    if !matches!(
+                        &user.content,
+                        UserContent::Text(text) if text.starts_with("[REWIND REPORT:")
+                    )
+            )
+        }) else {
+            return Ok(None);
+        };
+        match last_user {
+            Message::User(UserMessage {
+                content: UserContent::Text(text),
+                ..
+            }) => text.clone(),
+            Message::User(UserMessage {
+                content: UserContent::Blocks(_),
+                ..
+            }) => return Ok(None),
+            _ => return Ok(None),
+        }
+    };
+
+    if !session.revert_last_user_message().await? {
+        return Err(Error::session(
+            "RPC retry found a user turn but could not rewind the active session path",
+        ));
+    }
+    Ok(Some(text))
+}
+
 fn build_user_message(text: &str, images: &[ImageContent]) -> Message {
     let timestamp = chrono::Utc::now().timestamp_millis();
     if images.is_empty() {
@@ -2818,7 +2867,7 @@ pub async fn run(
                     }
                     RpcTurnPhase::Idle => {}
                 }
-                let text = {
+                let retry_turn = {
                     let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
                     else {
                         let _ = out_tx.send(response_error(
@@ -2828,15 +2877,22 @@ pub async fn run(
                         ));
                         continue;
                     };
-                    crate::checkpoint::take_last_user_turn(&mut guard.agent)
+                    take_last_rpc_user_turn_for_retry(&mut guard).await
                 };
-                let Some(text) = text else {
-                    let _ = out_tx.send(response_error(
-                        id,
-                        "retry",
-                        "No user turn to retry".to_string(),
-                    ));
-                    continue;
+                let text = match retry_turn {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        let _ = out_tx.send(response_error(
+                            id,
+                            "retry",
+                            "No user turn to retry".to_string(),
+                        ));
+                        continue;
+                    }
+                    Err(err) => {
+                        let _ = out_tx.send(response_error_with_hints(id, "retry", &err));
+                        continue;
+                    }
                 };
                 let _ = out_tx.send(response_ok(
                     id,
@@ -9295,6 +9351,81 @@ export default function init(pi) {
         let message = err.to_string();
         assert!(message.contains("disk flush failed"));
         assert!(message.contains("provider failed"));
+    }
+
+    #[test]
+    fn rpc_retry_rewinds_durable_path_before_reappending_user_turn() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let prompt = build_user_message("retry this durable turn", &[]);
+            let mut inner = Session::in_memory();
+            let original_user_id = inner.append_model_message(prompt.clone());
+            let original_assistant_id = inner.append_model_message(Message::Assistant(Arc::new(
+                AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("original response"))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                },
+            )));
+            let original_entry_count = inner.entries.len();
+            let mut agent_session = build_test_agent_session(inner);
+            agent_session.agent.replace_messages(vec![
+                prompt,
+                Message::Assistant(Arc::new(AssistantMessage {
+                    content: vec![ContentBlock::Text(TextContent::new("original response"))],
+                    stop_reason: StopReason::Stop,
+                    ..AssistantMessage::default()
+                })),
+            ]);
+
+            let text = take_last_rpc_user_turn_for_retry(&mut agent_session)
+                .await
+                .expect("rewind retry path")
+                .expect("retryable user turn");
+            assert_eq!(text, "retry this durable turn");
+
+            let cx = AgentCx::for_request();
+            let mut rewound = agent_session
+                .session
+                .lock(&cx)
+                .await
+                .expect("rewound session lock");
+            assert_eq!(
+                rewound.entries.len(),
+                original_entry_count,
+                "rewind must preserve the abandoned branch"
+            );
+            assert!(rewound.get_entry(&original_user_id).is_some());
+            assert!(rewound.get_entry(&original_assistant_id).is_some());
+            assert!(
+                rewound.to_messages_for_current_path().is_empty(),
+                "the active path must move behind the original root user turn"
+            );
+
+            rewound.append_model_message(build_user_message(&text, &[]));
+            let active_prompt_count = rewound
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text == "retry this durable turn"
+                    )
+                })
+                .count();
+            assert_eq!(active_prompt_count, 1);
+            assert_eq!(
+                rewound.entries.len(),
+                original_entry_count + 1,
+                "retry must append one new branch entry without deleting the original path"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
