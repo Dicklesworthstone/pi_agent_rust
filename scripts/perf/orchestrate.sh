@@ -1729,12 +1729,14 @@ for index, record in enumerate(records, start=1):
     claimed_path = record.get("binary_path")
     claimed_sha256 = record.get("binary_sha256")
     config_hash = record.get("config_hash")
+    claimed_parts = Path(claimed_path).parts if isinstance(claimed_path, str) else ()
     if (
         not isinstance(claimed_path, str)
         or not Path(claimed_path).is_absolute()
         or any(part in {"", ".", ".."} for part in Path(claimed_path).parts)
         or re.fullmatch(r"pijs_workload-[0-9a-f]{16}", Path(claimed_path).name) is None
-        or "perf/deps" not in Path(claimed_path).as_posix()
+        or len(claimed_parts) < 3
+        or claimed_parts[-3:-1] != ("perf", "deps")
         or not isinstance(claimed_sha256, str)
         or re.fullmatch(r"[0-9a-f]{64}", claimed_sha256) is None
         or not isinstance(config_hash, str)

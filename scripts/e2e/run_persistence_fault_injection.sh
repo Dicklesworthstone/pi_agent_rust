@@ -85,6 +85,7 @@ ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd -P)"
 for aggregate_path in \
     "$ARTIFACT_DIR/integrity-summary.json" \
     "$ARTIFACT_DIR/.integrity-summary.pending.json" \
+    "$ARTIFACT_DIR/.run-manifest.pending.json" \
     "$ARTIFACT_DIR/run-manifest.json"
 do
     if [[ -e "$aggregate_path" || -L "$aggregate_path" ]]; then
@@ -570,7 +571,9 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -591,9 +594,31 @@ rch_force_remote = sys.argv[13] == "true"
 rch_require_remote = sys.argv[14] == "true"
 
 
+def read_stable_regular(path: Path) -> bytes:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        initial_metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"{path}: expected a regular file")
+        contents = source.read()
+        final_descriptor_metadata = os.fstat(source.fileno())
+    final_path_metadata = path.lstat()
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    initial_identity = tuple(getattr(initial_metadata, field) for field in identity_fields)
+    if (
+        not stat.S_ISREG(final_path_metadata.st_mode)
+        or initial_identity
+        != tuple(getattr(final_descriptor_metadata, field) for field in identity_fields)
+        or initial_identity
+        != tuple(getattr(final_path_metadata, field) for field in identity_fields)
+        or len(contents) != initial_metadata.st_size
+    ):
+        raise ValueError(f"{path}: file changed while read")
+    return contents
+
+
 def load_json(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f:
-        value = json.load(f)
+    value = json.loads(read_stable_regular(path))
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected a JSON object")
     return value
@@ -604,7 +629,7 @@ def load_jsonl(path: Path) -> list[dict]:
     if not path.exists():
         return records
     for line_number, raw in enumerate(
-        path.read_text(encoding="utf-8", errors="strict").splitlines(), start=1
+        read_stable_regular(path).decode("utf-8", errors="strict").splitlines(), start=1
     ):
         line = raw.strip()
         if not line:
@@ -807,8 +832,8 @@ def inline_summary_bytes_are_valid(
         local_summary.write(payload)
     if (
         not local_summary_path.is_file()
-        or local_summary_path.stat().st_size != len(payload)
-        or hashlib.sha256(local_summary_path.read_bytes()).hexdigest() != digest
+        or local_summary_path.is_symlink()
+        or hashlib.sha256(read_stable_regular(local_summary_path)).hexdigest() != digest
     ):
         return False
     artifact_record["remote_path"] = artifact_record["path"]
@@ -833,7 +858,7 @@ def canonical_summary_artifact_is_valid(
     if relative_summary_path.parts != (expected_summary_artifact,):
         return False
     try:
-        payload = summary_path.read_bytes()
+        payload = read_stable_regular(summary_path)
     except OSError:
         return False
     return (
@@ -859,6 +884,11 @@ def case_checks(
         if record.get("schema") == "pi.test.log.v2" and record.get("type") == "log"
     ]
     artifacts = load_jsonl(case_dir / "artifact-index.jsonl")
+    try:
+        read_stable_regular(case_dir / "output.log")
+        output_log_regular = True
+    except (OSError, ValueError):
+        output_log_regular = False
 
     has_fault_log = any(
         record.get("test") == expected_test_name
@@ -959,6 +989,7 @@ def case_checks(
 
     checks = {
         "test_command_passed": result_schema_valid and result_exit_code == 0,
+        "output_log_regular": output_log_regular,
         "result_schema_valid": result_schema_valid,
         "result_identity_current": (
             result.get("run_id") == correlation_id
@@ -997,6 +1028,7 @@ def case_checks(
 
 case_check_names = (
     "test_command_passed",
+    "output_log_regular",
     "result_schema_valid",
     "result_identity_current",
     "fault_log_emitted",
@@ -1068,7 +1100,7 @@ summary = {
     "rch_force_remote": rch_force_remote,
     "rch_require_remote": rch_require_remote,
     "execution_attestation": "configuration_only",
-    "terminal_state": "complete",
+    "terminal_state": "summary_validated",
     "assertions": {
         "process_failure_windows": {
             "pre_flush": "in_process_drop",
@@ -1090,6 +1122,8 @@ summary_path = artifact_dir / ".integrity-summary.pending.json"
 with summary_path.open("x", encoding="utf-8") as pending_summary:
     json.dump(summary, pending_summary, indent=2)
     pending_summary.write("\n")
+    pending_summary.flush()
+    os.fsync(pending_summary.fileno())
 
 sys.exit(0 if overall_passed else 1)
 PY

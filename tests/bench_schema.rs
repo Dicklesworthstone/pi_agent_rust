@@ -1173,7 +1173,8 @@ elif [[ -n "$bench_name" ]]; then
       pijs_binary="$criterion_root/pijs_workload"
       printf '%s\n' '#!/usr/bin/env sh' 'exit 0' >"$pijs_binary"
       chmod +x "$pijs_binary"
-      python3 - \
+      if [[ "${PI_FAKE_DROP_RCH_PIJS_ARTIFACT:-0}" != "1" ]]; then
+        python3 - \
         "$criterion_root/pijs_workload.jsonl" \
         "$pijs_binary" \
         "${VERGEN_GIT_SHA:?}" \
@@ -1278,6 +1279,7 @@ evidence_path.write_text(
     encoding="utf-8",
 )
 PY
+      fi
       ;;
     tools)
       write_estimate "truncation/head/1000/new/estimates.json"
@@ -8502,9 +8504,20 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
         "retrieved extension benchmark must retain the full source commit"
     );
 
-    let pijs_binary = fs::canonicalize(temp_root.join("target/perf/examples/pijs_workload"))
-        .expect("canonical fake PiJS binary");
-    let pijs_binary_path = pijs_binary.to_string_lossy().into_owned();
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(temp_root.join("run/manifest.json")).expect("read orchestrator manifest"),
+    )
+    .expect("parse orchestrator manifest");
+    let run_instance_id = manifest["post_generation_evidence_package"]["run_instance_id"]
+        .as_str()
+        .expect("manifest run_instance_id");
+    let pijs_binary = fs::canonicalize(
+        temp_root
+            .join("target/criterion/pi-perf-runs")
+            .join(run_instance_id)
+            .join("criterion_pijs/pijs_workload"),
+    )
+    .expect("canonical returned PiJS binary");
     let pijs_binary_sha256 = sha256_file(&pijs_binary).expect("hash fake PiJS binary");
     let pijs_records = fs::read_to_string(temp_root.join("run/results/pijs_workload.jsonl"))
         .expect("read collected paired PiJS evidence");
@@ -8512,8 +8525,8 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
         let record: Value = serde_json::from_str(line).expect("parse collected PiJS record");
         assert_eq!(
             record["binary_path"].as_str(),
-            Some(pijs_binary_path.as_str()),
-            "PiJS evidence must claim the exact executable admitted by staging"
+            Some("/rch-worker/target/perf/deps/pijs_workload-0123456789abcdef"),
+            "PiJS evidence must preserve the remote CargoBench execution path"
         );
         assert_eq!(
             record["binary_sha256"].as_str(),
@@ -8521,6 +8534,44 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
             "PiJS evidence must hash-bind the exact executable admitted by staging"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_missing_rch_pijs_pair_before_producer_admission() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_DROP_RCH_PIJS_ARTIFACT",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict full orchestration must reject a successful remote command with no PiJS JSONL"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("criterion_pijs returned an invalid workload pair or executable"),
+        "failure must name the rejected PiJS return contract: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/pijs_workload.jsonl")
+            .exists(),
+        "missing worker evidence must not create an accepted PiJS artifact"
+    );
+    let admission: Value = serde_json::from_slice(
+        &fs::read(temp_root.join("run/results/post_generation_producer_admission.json"))
+            .expect("read blocked producer admission"),
+    )
+    .expect("parse blocked producer admission");
+    assert_eq!(
+        admission["status"].as_str(),
+        Some("blocked"),
+        "failed PiJS return must not earn ready producer admission"
+    );
 }
 
 #[cfg(unix)]

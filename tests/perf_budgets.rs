@@ -4613,6 +4613,22 @@ fn pijs_gate_reader_accepts_custom_cargo_target_dir_layout() {
 }
 
 #[test]
+fn pijs_gate_reader_accepts_hash_bound_cargo_bench_executable() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let artifact = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let binary = tmp
+        .path()
+        .join("pi-build/perf/deps/pijs_workload-0123456789abcdef");
+    let mut latency = valid_pijs_gate_record(tmp.path(), 1);
+    let mut throughput = valid_pijs_gate_record(tmp.path(), 10);
+    retarget_pijs_record(&mut latency, &binary, b"cargo-bench-pijs-binary");
+    retarget_pijs_record(&mut throughput, &binary, b"cargo-bench-pijs-binary");
+    write_pijs_workload_records(&artifact, &[latency, throughput]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, Some(49.5));
+}
+
+#[test]
 fn pijs_gate_reader_rejects_forged_metrics() {
     let cases = [
         (
