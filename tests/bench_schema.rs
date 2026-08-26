@@ -1049,6 +1049,7 @@ fi
 target_dir="${CARGO_TARGET_DIR:-target}"
 test_name=""
 bench_name=""
+no_run=0
 for ((i=1; i<=$#; i++)); do
   if [[ "${!i}" == "--test" ]]; then
     j=$((i+1))
@@ -1062,11 +1063,78 @@ for ((i=1; i<=$#; i++)); do
       bench_name="${!j}"
     fi
   fi
+  if [[ "${!i}" == "--no-run" ]]; then
+    no_run=1
+  fi
 done
 
 mkdir -p "$target_dir/perf"
 
-if [[ -n "$bench_name" ]]; then
+if [[ "$no_run" == "1" && -z "$bench_name" ]]; then
+  printf '{"reason":"compiler-artifact","target":{"name":"perf_budgets"},"executable":"%s"}\n' \
+    "$target_dir/perf/deps/perf_budgets-fake"
+fi
+
+if [[ -n "$bench_name" && "$no_run" == "1" ]]; then
+  :
+elif [[ -n "$bench_name" && -n "${PI_IDLE_RSS_RAW_RELATIVE_PATH:-}" ]]; then
+  python3 - "$target_dir/release/pi" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+binary_path = sys.argv[1]
+with open(binary_path, "rb") as handle:
+    binary_sha256 = hashlib.sha256(handle.read()).hexdigest()
+bench_env = {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_brand": "fixture",
+    "cpu_cores": 8,
+    "mem_total_mb": 1024,
+    "governor": "performance",
+    "turbo_boost": "disabled",
+    "aslr": "disabled",
+    "thp": "never",
+    "noise_score": 0,
+    "config_hash": "a" * 64,
+}
+bench_env_sha256 = hashlib.sha256(
+    json.dumps(bench_env, separators=(",", ":"), sort_keys=True).encode()
+).hexdigest()
+record = {
+    "schema": "pi.perf.idle_rss_measurement.v1",
+    "run_id": os.environ["PI_IDLE_RSS_CORRELATION_ID"],
+    "correlation_id": os.environ["PI_IDLE_RSS_CORRELATION_ID"],
+    "source_commit": os.environ["PI_IDLE_RSS_SOURCE_COMMIT"],
+    "source_dirty": False,
+    "pid": 1005,
+    "process_name": "pi",
+    "allocator": "system",
+    "binary_path": binary_path,
+    "binary_sha256": binary_sha256,
+    "rss_bytes": 1572864,
+    "idle_state": "startup_before_user_input",
+    "cargo_profile": "release",
+    "build_command": "cargo build --bin pi --release",
+    "sample_count": 5,
+    "samples": [
+        {"pid": 1001, "process_name": "pi", "rss_bytes": 1048576},
+        {"pid": 1002, "process_name": "pi", "rss_bytes": 1179648},
+        {"pid": 1003, "process_name": "pi", "rss_bytes": 1310720},
+        {"pid": 1004, "process_name": "pi", "rss_bytes": 1441792},
+        {"pid": 1005, "process_name": "pi", "rss_bytes": 1572864},
+    ],
+    "rss_spread_bytes": 524288,
+    "settle_ms": 1000,
+    "bench_env_source": "benches/bench_env.rs",
+    "bench_env": bench_env,
+    "bench_env_sha256": bench_env_sha256,
+}
+print("[idle-rss-control] " + json.dumps(record, separators=(",", ":")))
+PY
+elif [[ -n "$bench_name" ]]; then
   criterion_root="$target_dir/criterion/${PI_CRITERION_OUTPUT_SUBDIR:?}"
   mkdir -p "$criterion_root/report"
   printf '%s\n' '<html>current isolated fixture report</html>' >"$criterion_root/report/index.html"
@@ -1380,9 +1448,6 @@ JSON
       printf '%s\n' '# fake extension benchmark summary' \
         >"$target_dir/$BENCH_OUTPUT_TARGET_SUBDIR/extension_bench_summary.md"
     fi
-    cat >"$target_dir/perf/pijs_workload.jsonl" <<'JSON'
-{"schema":"pi.perf.workload.v1","scenario":"200x10","iterations":200,"tool_calls_per_iteration":10,"total_calls":2000,"elapsed_ms":1200,"per_call_us":45,"calls_per_sec":1666}
-JSON
     ;;
   perf_budgets)
     if [[ "${PI_PERF_POST_GENERATION:-0}" == "1" ]]; then
@@ -1405,6 +1470,7 @@ JSON
         "${PI_PERF_EXPECTED_SOURCE_COMMIT:?}" <<'PY'
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -1430,16 +1496,128 @@ if (
     raise SystemExit("post-generation evidence inventory run_instance_id mismatch")
 if evidence_dir.name != run_instance_id:
     raise SystemExit("post-generation evidence inventory staged-root mismatch")
-if not inventory.get("entries"):
+entries = inventory.get("entries")
+if not isinstance(entries, list) or not entries:
     raise SystemExit("post-generation evidence inventory is empty")
+observed_paths = {
+    entry.get("path")
+    for entry in entries
+    if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+}
+expected_paths = {
+    "context_intelligence/perf_budget.json",
+    "criterion/ext_load_init/load_init_cold/hello/new/estimates.json",
+    "criterion/ext_load_init/load_init_cold/pirate/new/estimates.json",
+    "criterion/ext_policy/evaluate/permissive_allow/new/estimates.json",
+    "criterion/ext_policy/evaluate/prompt_allow/new/estimates.json",
+    "criterion/ext_policy/evaluate/prompt_deny/new/estimates.json",
+    "criterion/ext_policy/evaluate/prompt_prompt/new/estimates.json",
+    "criterion/ext_policy/evaluate/strict_allow/new/estimates.json",
+    "criterion/ext_policy/evaluate/strict_deny/new/estimates.json",
+    "criterion/ext_protocol/parse_and_validate/host_call_small/new/estimates.json",
+    "criterion/ext_protocol/parse_and_validate/log_big/new/estimates.json",
+    "criterion/semantic_context/bundle_serialization/large_workspace/new/sample.json",
+    "criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json",
+    "criterion/semantic_context/graph_build_warm/large_workspace/new/sample.json",
+    "criterion/semantic_context/incremental_update/large_workspace/new/sample.json",
+    "criterion/semantic_context/planning/large_workspace/new/sample.json",
+    "criterion/startup/help/warm/new/estimates.json",
+    "criterion/startup/list_models/warm/new/estimates.json",
+    "criterion/startup/version/warm/new/estimates.json",
+    "extension_benchmark_stratification.json",
+    "perf/examples/pijs_workload",
+    "phase1_matrix_validation.json",
+    "pijs_workload.jsonl",
+    "post_generation_producer_admission.json",
+    "release/pi",
+    "release_evidence/binary_size_measurement.json",
+    "release_evidence/cold_load_measurement.json",
+    "release_evidence/idle_memory_rss.json",
+}
+if observed_paths != expected_paths or len(entries) != len(expected_paths):
+    raise SystemExit(
+        "post-generation evidence inventory exact path mismatch: "
+        f"missing={sorted(expected_paths - observed_paths)}, "
+        f"unexpected={sorted(observed_paths - expected_paths)}"
+    )
 for name in (
     "extension_benchmark_stratification.json",
     "phase1_matrix_validation.json",
+    "post_generation_producer_admission.json",
 ):
     path = evidence_dir / name
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("correlation_id") != expected_correlation_id:
         raise SystemExit(f"{name}: correlation_id mismatch")
+    if name == "post_generation_producer_admission.json":
+        producer_contract = {
+            "bench_schema": ("bench_schema", "cargo_test"),
+            "bench_scenario": ("bench_scenario_runner", "cargo_test"),
+            "ext_bench_harness": ("ext_bench_harness", "cargo_test"),
+            "perf_bench_harness": ("perf_bench_harness", "cargo_test"),
+            "perf_budgets": ("perf_budgets", "cargo_test"),
+            "perf_regression": ("perf_regression", "cargo_test"),
+            "perf_comparison": ("perf_comparison", "cargo_test"),
+            "perf_baseline_variance": ("perf_baseline_variance", "cargo_test"),
+            "criterion_extensions": ("extensions", "criterion"),
+            "criterion_system": ("system", "criterion"),
+            "criterion_semantic_context": ("semantic_context", "criterion"),
+        }
+        producers = payload.get("producers")
+        if (
+            payload.get("schema")
+            != "pi.perf.post_generation_producer_admission.v1"
+            or payload.get("status") != "ready"
+            or payload.get("failure_count") != 0
+            or payload.get("failures") != []
+            or payload.get("source_commit") != expected_source_commit
+            or payload.get("source_dirty") is not False
+            or payload.get("run_instance_id") != run_instance_id
+            or payload.get("cargo_profile") != "perf"
+            or not isinstance(producers, list)
+            or len(producers) != len(producer_contract)
+        ):
+            raise SystemExit("post-generation producer admission proof mismatch")
+        observed_producers = {}
+        for producer in producers:
+            if not isinstance(producer, dict):
+                raise SystemExit("post-generation producer admission entry mismatch")
+            suite = producer.get("suite")
+            result_sha256 = producer.get("result_sha256")
+            fingerprint = producer.get("overlay_fingerprint")
+            remote_worker = producer.get("remote_worker")
+            remote_marker = producer.get("remote_marker")
+            receipt = producer.get("clean_overlay_receipt")
+            if (
+                suite in observed_producers
+                or suite not in producer_contract
+                or (producer.get("target"), producer.get("kind"))
+                != producer_contract[suite]
+                or producer.get("remote_execution_verified") is not True
+                or not isinstance(result_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", result_sha256) is None
+                or not isinstance(fingerprint, str)
+                or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+                or not isinstance(remote_worker, str)
+                or re.fullmatch(r"[^\s]+", remote_worker) is None
+                or not isinstance(remote_marker, str)
+                or re.fullmatch(
+                    rf"\[RCH\] remote {re.escape(remote_worker)} \([^)]+\)",
+                    remote_marker,
+                )
+                is None
+                or receipt
+                != (
+                    "[RCH] clean-overlay receipt: "
+                    f"base={expected_source_commit} overlay-fingerprint={fingerprint}"
+                )
+            ):
+                raise SystemExit(
+                    f"post-generation producer admission entry mismatch: {suite!r}"
+                )
+            observed_producers[suite] = (producer.get("target"), producer.get("kind"))
+        if observed_producers != producer_contract:
+            raise SystemExit("post-generation producer admission suite mismatch")
 marker = {
     "schema": "pi.perf.fake_post_generation_invocation.v1",
     "correlation_id": expected_correlation_id,
@@ -1703,9 +1881,8 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
             .join("criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json"),
         target_dir
             .join("criterion/semantic_context/graph_build_warm/large_workspace/new/sample.json"),
-        target_dir.join(
-            "criterion/semantic_context/incremental_update/large_workspace/new/sample.json",
-        ),
+        target_dir
+            .join("criterion/semantic_context/incremental_update/large_workspace/new/sample.json"),
         target_dir.join("criterion/semantic_context/planning/large_workspace/new/sample.json"),
         target_dir.join(
             "criterion/semantic_context/bundle_serialization/large_workspace/new/sample.json",
@@ -1763,10 +1940,9 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         "noise_score": 0,
         "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
     });
-    let bench_env_sha256 = format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&bench_env).expect("serialize fake bench environment"))
-    );
+    let bench_env_sha256 = pi::package_manager::hex_encode(&Sha256::digest(
+        serde_json::to_vec(&bench_env).expect("serialize fake bench environment"),
+    ));
     write_json(
         &target_dir.join("perf/release_evidence/idle_memory_rss.json"),
         &serde_json::to_string(&json!({
@@ -1810,6 +1986,44 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         &target_dir.join("perf/results/phase1_matrix_validation.json"),
         r#"{"schema":"pi.perf.phase1_matrix_validation.v1"}"#,
     );
+
+    let fixture_root = target_dir
+        .parent()
+        .expect("fake Cargo target directory has a parent");
+    let pijs_binary = target_dir.join("perf/examples/pijs_workload");
+    fs::create_dir_all(pijs_binary.parent().expect("fake PiJS binary parent"))
+        .expect("create fake PiJS binary directory");
+    write_executable(&pijs_binary, "#!/usr/bin/env sh\nexit 0\n");
+    let pijs_binary = fs::canonicalize(pijs_binary).expect("canonicalize fake PiJS binary");
+    let pijs_binary_path = pijs_binary.display().to_string();
+    let pijs_binary_sha256 = sha256_file(&pijs_binary).expect("hash fake PiJS binary");
+    let pijs_records = [1, 10].map(|tool_calls_per_iteration| {
+        let mut record = pijs_gate_workload_fixture(fixture_root, tool_calls_per_iteration);
+        let config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+            source_commit: FAKE_ORCHESTRATE_SOURCE_COMMIT,
+            source_dirty: false,
+            build_profile: "perf",
+            executable_build_profile: "perf",
+            verification: BenchmarkBuildVerification {
+                executable_profile: true,
+                build_fingerprint: true,
+                build_profile: true,
+            },
+            build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+            compiled_profile_family: "release",
+            compiled_opt_level: "3",
+            compiled_debug: "true",
+            compiled_features: CANONICAL_PIJS_PERF_FEATURES,
+            binary_path: &pijs_binary_path,
+            binary_sha256: &pijs_binary_sha256,
+            debug_assertions: false,
+        });
+        record["binary_path"] = json!(pijs_binary_path.clone());
+        record["binary_sha256"] = json!(pijs_binary_sha256.clone());
+        record["config_hash"] = json!(config_hash);
+        record
+    });
+    write_pijs_workload_records(&target_dir.join("perf/pijs_workload.jsonl"), &pijs_records);
 }
 
 #[cfg(unix)]
@@ -8053,7 +8267,6 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         .arg("scripts/perf/orchestrate.sh")
         .arg("--profile")
         .arg(profile)
-        .arg("--skip-build")
         .arg("--skip-env-check")
         .current_dir(project_root())
         .env("PATH", path)
@@ -8207,6 +8420,26 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
         Some(FAKE_ORCHESTRATE_SOURCE_COMMIT),
         "retrieved extension benchmark must retain the full source commit"
     );
+
+    let pijs_binary = fs::canonicalize(temp_root.join("target/perf/examples/pijs_workload"))
+        .expect("canonical fake PiJS binary");
+    let pijs_binary_path = pijs_binary.to_string_lossy().into_owned();
+    let pijs_binary_sha256 = sha256_file(&pijs_binary).expect("hash fake PiJS binary");
+    let pijs_records = fs::read_to_string(temp_root.join("run/results/pijs_workload.jsonl"))
+        .expect("read collected paired PiJS evidence");
+    for line in pijs_records.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line).expect("parse collected PiJS record");
+        assert_eq!(
+            record["binary_path"].as_str(),
+            Some(pijs_binary_path.as_str()),
+            "PiJS evidence must claim the exact executable admitted by staging"
+        );
+        assert_eq!(
+            record["binary_sha256"].as_str(),
+            Some(pijs_binary_sha256.as_str()),
+            "PiJS evidence must hash-bind the exact executable admitted by staging"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -8301,6 +8534,143 @@ fn orchestrate_explicit_quick_suite_forwards_benchmark_controls() {
         ("BENCH_ITERATIONS", "1"),
     ]);
     assert_orchestrate_success(&output);
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_partial_suite_records_post_generation_skip_without_package() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_PERF_ONLY", "1"),
+        ("PI_FAKE_PROFILE_QUICK", "1"),
+    ]);
+    assert_orchestrate_success(&output);
+
+    let output_dir = temp_root.join("run");
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.join("manifest.json")).expect("read quick manifest"),
+    )
+    .expect("parse quick manifest");
+    let package = &manifest["post_generation_evidence_package"];
+    assert_eq!(package["status"].as_str(), Some("skip"));
+    assert_eq!(package["exclusive_gate_selected"].as_bool(), Some(false));
+    assert_eq!(
+        package["skip_reason"].as_str(),
+        Some("incomplete_full_evidence_suite_set")
+    );
+    for field in ["relative_path", "inventory_sha256", "package_sha256"] {
+        assert!(
+            package[field].is_null(),
+            "a partial suite must not publish {field}"
+        );
+    }
+    assert_eq!(package["file_count"].as_u64(), Some(0));
+    assert_eq!(package["size_bytes"].as_u64(), Some(0));
+    assert_eq!(
+        manifest["artifact_staging"]["status"].as_str(),
+        Some("skipped")
+    );
+
+    let suite_results = manifest["suite_results"]
+        .as_array()
+        .expect("quick suite_results array");
+    for suite in ["perf_budgets_post_generation", "post_generation_evidence"] {
+        assert!(
+            suite_results.iter().any(|result| {
+                result["suite"].as_str() == Some(suite)
+                    && result["status"].as_str() == Some("skip")
+                    && result["exit_code"].as_i64() == Some(0)
+            }),
+            "partial suite manifest must record {suite} as skipped"
+        );
+    }
+    assert!(
+        manifest["run_summary"]["skipped"]
+            .as_u64()
+            .is_some_and(|skipped| skipped >= 2),
+        "the run summary must account for both skipped post-generation gates"
+    );
+    assert!(
+        !output_dir
+            .join("results/post_generation_evidence_contract.json")
+            .exists()
+            && !output_dir
+                .join("results/post_generation_producer_admission.json")
+                .exists()
+            && !project_root()
+                .join(".rch-tmp/pi-perf-evidence")
+                .join(
+                    package["run_instance_id"]
+                        .as_str()
+                        .expect("quick run_instance_id"),
+                )
+                .exists(),
+        "a partial suite must not create or retain exclusive evidence artifacts"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_full_suite_rejects_local_exclusive_evidence_runner() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_OMIT_REQUIRE_RCH_CLI", "1"),
+        ("PERF_CARGO_RUNNER", "local"),
+    ]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("full evidence suite set requires RCH"),
+        "a local full-suite run must fail before claiming exclusive evidence: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "the invalid local full-suite runner must fail before benchmark execution"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_full_suite_rejects_skip_build_exclusive_evidence() {
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PERF_SKIP_BUILD", "1")]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("cannot claim exclusive post-generation evidence with --skip-build"),
+        "a build-skipping full-suite run must fail admission: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "the build-skipping full suite must fail before benchmark execution"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_full_suite_rejects_iteration_override() {
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("BENCH_ITERATIONS", "1")]);
+    assert!(!output.status.success());
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("forbids BENCH_ITERATIONS overrides"),
+        "a noncanonical full-suite iteration count must fail admission: {combined}"
+    );
+    assert!(
+        !temp_root.join("target/perf-bench-invoked").exists(),
+        "the iteration override must fail before benchmark execution"
+    );
 }
 
 #[cfg(unix)]
@@ -8777,6 +9147,10 @@ fn orchestrate_rejects_post_generation_consumer_package_mutation() {
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("pi.perf.fake_post_generation_invocation.v1"),
+        "the mutation fixture must prove the remote consumer reached the exact budget test: {combined}"
     );
     assert!(
         combined.contains("changed during remote consumption")
@@ -9340,18 +9714,24 @@ fn orchestrate_generates_phase1_matrix_validation_artifact() {
     );
     for digest_field in ["inventory_sha256", "package_sha256"] {
         assert!(
-            retained_package[digest_field].as_str().is_some_and(|digest| {
-                digest.len() == 64
-                    && digest
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            }),
+            retained_package[digest_field]
+                .as_str()
+                .is_some_and(|digest| {
+                    digest.len() == 64
+                        && digest
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                }),
             "manifest must bind a lowercase SHA-256 in {digest_field}"
         );
     }
     assert!(
-        retained_package["file_count"].as_u64().is_some_and(|count| count > 0)
-            && retained_package["size_bytes"].as_u64().is_some_and(|size| size > 0),
+        retained_package["file_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+            && retained_package["size_bytes"]
+                .as_u64()
+                .is_some_and(|size| size > 0),
         "manifest must bind the retained package size and file count"
     );
     assert_eq!(

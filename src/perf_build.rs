@@ -560,10 +560,7 @@ fn validate_control_lineage(
     Ok(())
 }
 
-fn canonical_regular_path(
-    path: &Path,
-    field: &str,
-) -> Result<PathBuf, MeasurementControlError> {
+fn canonical_regular_path(path: &Path, field: &str) -> Result<PathBuf, MeasurementControlError> {
     if !path.is_absolute() {
         return Err(MeasurementControlError::Invalid(format!(
             "{field} must be absolute"
@@ -596,9 +593,12 @@ fn measurement_artifact_path(
 ) -> Result<PathBuf, MeasurementControlError> {
     let claimed_path = PathBuf::from(claimed_path);
     if !claimed_path.is_absolute()
-        || claimed_path
-            .components()
-            .any(|component| matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir))
+        || claimed_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
     {
         return Err(MeasurementControlError::Invalid(format!(
             "{field} must claim an absolute normalized producer path"
@@ -638,8 +638,7 @@ fn validate_isolated_cold_load_producer_path(
     ];
     if components.len() < suffix.len() + 3 {
         return Err(MeasurementControlError::Invalid(
-            "artifact_path must identify an isolated criterion_extensions producer"
-                .to_string(),
+            "artifact_path must identify an isolated criterion_extensions producer".to_string(),
         ));
     }
     let suffix_start = components.len() - suffix.len();
@@ -650,7 +649,7 @@ fn validate_isolated_cold_load_producer_path(
         || !run_instance_id
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || components[suffix_start..] != suffix.as_slice()
+        || components[suffix_start..] != suffix
     {
         return Err(MeasurementControlError::Invalid(format!(
             "artifact_path must identify criterion/pi-perf-runs/<run-instance>/criterion_extensions/ext_load_init/load_init_cold/{extension}/new/estimates.json"
@@ -1168,9 +1167,11 @@ mod tests {
             Some(&relocated_binary_path),
         )
         .expect_err("digest-identical relocated bytes must not excuse a non-release producer path");
-        assert!(wrong_suffix.to_string().contains(
-            "binary_path must end with the required producer path release/pi"
-        ));
+        assert!(
+            wrong_suffix
+                .to_string()
+                .contains("binary_path must end with the required producer path release/pi")
+        );
 
         std::fs::write(&binary_path, b"tampered release binary").expect("tamper release binary");
         assert!(matches!(
@@ -1187,9 +1188,7 @@ mod tests {
             .path()
             .join("criterion/pi-perf-runs")
             .join(&run_instance_id)
-            .join(
-                "criterion_extensions/ext_load_init/load_init_cold/hello/new/estimates.json",
-            );
+            .join("criterion_extensions/ext_load_init/load_init_cold/hello/new/estimates.json");
         std::fs::create_dir_all(artifact_path.parent().expect("Criterion estimate parent"))
             .expect("create Criterion estimate directory");
         std::fs::write(&artifact_path, br#"{"mean":{"point_estimate":1000000}}"#)
@@ -1251,15 +1250,12 @@ mod tests {
         let relocated_artifact_path = std::fs::canonicalize(relocated_artifact_path)
             .expect("canonicalize relocated Criterion estimate");
         let mut relocated_control = control.clone();
-        relocated_control["measurements"]["hello"]["artifact_path"] =
-            serde_json::json!(format!(
-                "/unavailable/producer/target/criterion/pi-perf-runs/{run_instance_id}/criterion_extensions/ext_load_init/load_init_cold/hello/new/estimates.json"
-            ));
+        relocated_control["measurements"]["hello"]["artifact_path"] = serde_json::json!(format!(
+            "/unavailable/producer/target/criterion/pi-perf-runs/{run_instance_id}/criterion_extensions/ext_load_init/load_init_cold/hello/new/estimates.json"
+        ));
         let relocated_control_path = temp.path().join("cold-load-relocated.json");
         write_json(&relocated_control_path, &relocated_control);
-        assert!(
-            verify_cold_load_measurement_control(&relocated_control_path, "hello").is_err()
-        );
+        assert!(verify_cold_load_measurement_control(&relocated_control_path, "hello").is_err());
         let relocated = verify_cold_load_measurement_control_with_relocated_artifact(
             &relocated_control_path,
             "hello",
@@ -1268,10 +1264,9 @@ mod tests {
         .expect("relocated Criterion bytes satisfy the producer control");
         assert_eq!(relocated.artifact_path, relocated_artifact_path);
 
-        relocated_control["measurements"]["hello"]["artifact_path"] =
-            serde_json::json!(format!(
-                "/unavailable/producer/target/criterion/pi-perf-runs/{run_instance_id}/criterion_extensions/ext_load_init/load_init_cold/pirate/new/estimates.json"
-            ));
+        relocated_control["measurements"]["hello"]["artifact_path"] = serde_json::json!(format!(
+            "/unavailable/producer/target/criterion/pi-perf-runs/{run_instance_id}/criterion_extensions/ext_load_init/load_init_cold/pirate/new/estimates.json"
+        ));
         write_json(&relocated_control_path, &relocated_control);
         assert!(
             verify_cold_load_measurement_control_with_relocated_artifact(
@@ -1406,9 +1401,11 @@ mod tests {
             Some(&relocated_binary_path),
         )
         .expect_err("digest-identical relocated bytes must not excuse a non-release producer path");
-        assert!(wrong_suffix.to_string().contains(
-            "binary_path must end with the required producer path release/pi"
-        ));
+        assert!(
+            wrong_suffix
+                .to_string()
+                .contains("binary_path must end with the required producer path release/pi")
+        );
 
         control["process_name"] = serde_json::json!("cargo-test");
         write_json(&control_path, &control);

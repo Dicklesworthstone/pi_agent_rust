@@ -388,6 +388,7 @@ const POST_GENERATION_REQUIRED_INPUT_PATHS: &[&str] = &[
     "perf/examples/pijs_workload",
     "phase1_matrix_validation.json",
     "pijs_workload.jsonl",
+    "post_generation_producer_admission.json",
     "release/pi",
     "release_evidence/binary_size_measurement.json",
     "release_evidence/cold_load_measurement.json",
@@ -658,6 +659,149 @@ fn collect_post_generation_evidence_files(
     Ok(())
 }
 
+fn validate_post_generation_producer_admission(
+    policy: &PostGenerationEvidencePolicy,
+) -> Result<(), String> {
+    let path = policy.root.join("post_generation_producer_admission.json");
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|error| format!("post-generation producer admission is missing: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("post-generation producer admission must be a regular file".to_string());
+    }
+    let payload: Value = serde_json::from_slice(
+        &std::fs::read(&path)
+            .map_err(|error| format!("cannot read producer admission: {error}"))?,
+    )
+    .map_err(|error| format!("invalid producer admission JSON: {error}"))?;
+    let staged_run_instance_id = policy
+        .root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| "post-generation evidence root has no run-instance component".to_string())?;
+    for (field, expected) in [
+        ("schema", "pi.perf.post_generation_producer_admission.v1"),
+        ("source_commit", policy.expected_source_commit.as_str()),
+        ("correlation_id", policy.correlation_id.as_str()),
+        ("run_instance_id", staged_run_instance_id),
+        ("cargo_profile", "perf"),
+        ("status", "ready"),
+    ] {
+        if payload.get(field).and_then(Value::as_str) != Some(expected) {
+            return Err(format!(
+                "post-generation producer admission {field} mismatch"
+            ));
+        }
+    }
+    if payload.get("source_dirty").and_then(Value::as_bool) != Some(false)
+        || payload.get("failure_count").and_then(Value::as_u64) != Some(0)
+        || payload
+            .get("failures")
+            .and_then(Value::as_array)
+            .is_none_or(|failures| !failures.is_empty())
+    {
+        return Err("post-generation producer admission is not failure-free".to_string());
+    }
+
+    let required = BTreeMap::from([
+        ("bench_schema", ("bench_schema", "cargo_test")),
+        ("bench_scenario", ("bench_scenario_runner", "cargo_test")),
+        ("ext_bench_harness", ("ext_bench_harness", "cargo_test")),
+        ("perf_bench_harness", ("perf_bench_harness", "cargo_test")),
+        ("perf_budgets", ("perf_budgets", "cargo_test")),
+        ("perf_regression", ("perf_regression", "cargo_test")),
+        ("perf_comparison", ("perf_comparison", "cargo_test")),
+        (
+            "perf_baseline_variance",
+            ("perf_baseline_variance", "cargo_test"),
+        ),
+        ("criterion_extensions", ("extensions", "criterion")),
+        ("criterion_system", ("system", "criterion")),
+        (
+            "criterion_semantic_context",
+            ("semantic_context", "criterion"),
+        ),
+    ]);
+    let producers = payload
+        .get("producers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "post-generation producer admission has no producer list".to_string())?;
+    let is_lowercase_sha256 = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    let mut observed = BTreeMap::new();
+    for producer in producers {
+        let suite = producer
+            .get("suite")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "producer admission entry has no suite".to_string())?;
+        let target = producer
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no target"))?;
+        let kind = producer
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no kind"))?;
+        let result_sha256 = producer
+            .get("result_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no result digest"))?;
+        let remote_marker = producer
+            .get("remote_marker")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no remote marker"))?;
+        let remote_worker = producer
+            .get("remote_worker")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no remote worker"))?;
+        let clean_overlay_receipt = producer
+            .get("clean_overlay_receipt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no clean-overlay receipt"))?;
+        let overlay_fingerprint = producer
+            .get("overlay_fingerprint")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("producer admission {suite} has no overlay fingerprint"))?;
+        let marker_tail = remote_marker
+            .strip_prefix("[RCH] remote ")
+            .and_then(|tail| tail.strip_suffix(')'))
+            .and_then(|tail| tail.split_once(" ("));
+        if !is_lowercase_sha256(result_sha256)
+            || !is_lowercase_sha256(overlay_fingerprint)
+            || marker_tail.is_none_or(|(worker, timing)| {
+                worker != remote_worker
+                    || worker.is_empty()
+                    || worker.chars().any(char::is_whitespace)
+                    || timing.is_empty()
+                    || timing.contains(')')
+            })
+            || clean_overlay_receipt
+                != format!(
+                    "[RCH] clean-overlay receipt: base={} overlay-fingerprint={overlay_fingerprint}",
+                    policy.expected_source_commit
+                )
+            || producer
+                .get("remote_execution_verified")
+                .and_then(Value::as_bool)
+                != Some(true)
+        {
+            return Err(format!(
+                "producer admission {suite} has invalid remote proof metadata"
+            ));
+        }
+        if observed.insert(suite, (target, kind)).is_some() {
+            return Err(format!("duplicate producer admission suite {suite}"));
+        }
+    }
+    if observed != required {
+        return Err("post-generation producer admission suite contract mismatch".to_string());
+    }
+    Ok(())
+}
+
 fn validate_post_generation_evidence_inventory(
     policy: &PostGenerationEvidencePolicy,
 ) -> Result<(), String> {
@@ -695,13 +839,14 @@ fn validate_post_generation_evidence_inventory(
                 .to_string(),
         );
     }
-    let staged_run_instance_id = policy
-        .root
-        .file_name()
-        .and_then(OsStr::to_str)
-        .ok_or_else(|| {
-            "post-generation evidence root has no UTF-8 run-instance component".to_string()
-        })?;
+    let staged_run_instance_id =
+        policy
+            .root
+            .file_name()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| {
+                "post-generation evidence root has no UTF-8 run-instance component".to_string()
+            })?;
     if inventory.run_instance_id != staged_run_instance_id {
         return Err(format!(
             "post-generation evidence inventory run_instance_id does not match its staged root (inventory={}, root={staged_run_instance_id})",
@@ -780,6 +925,7 @@ fn validate_post_generation_evidence_inventory(
                 .collect::<Vec<_>>()
         ));
     }
+    validate_post_generation_producer_admission(policy)?;
     Ok(())
 }
 
@@ -3632,7 +3778,10 @@ fn read_criterion_context_intelligence(root: &Path, bench_name: &str) -> (Option
             continue;
         }
         let Some(sample) = read_json_file(&path) else {
-            rejected.push(format!("{} (invalid JSON)", display_source_path(root, &path)));
+            rejected.push(format!(
+                "{} (invalid JSON)",
+                display_source_path(root, &path)
+            ));
             continue;
         };
         let Some(p95_ns) = criterion_sample_p95_ns(&sample) else {
@@ -3642,10 +3791,7 @@ fn read_criterion_context_intelligence(root: &Path, bench_name: &str) -> (Option
             ));
             continue;
         };
-        return (
-            Some(p95_ns / 1_000_000.0),
-            display_source_path(root, &path),
-        );
+        return (Some(p95_ns / 1_000_000.0), display_source_path(root, &path));
     }
     (
         None,
@@ -4024,7 +4170,7 @@ fn ci_enforced_budgets_have_data_sources() {
 fn ci_enforced_budgets_fail_on_regression_or_missing_data() {
     let strict = perf_strict_mode();
     let root = project_root();
-    if post_generation_mode_is_active() {
+    let post_generation_policy = if post_generation_mode_is_active() {
         let policy = post_generation_evidence_policy(&root).unwrap_or_else(|detail| {
             panic!("invalid_post_generation_evidence_configuration: {detail}")
         });
@@ -4036,7 +4182,10 @@ fn ci_enforced_budgets_fail_on_regression_or_missing_data() {
         validate_post_generation_evidence_inventory(&policy).unwrap_or_else(|detail| {
             panic!("invalid_post_generation_evidence_inventory: {detail}")
         });
-    }
+        Some(policy)
+    } else {
+        None
+    };
 
     let mut checked_with_data = 0usize;
     let mut checked_without_data = 0usize;
@@ -4138,6 +4287,11 @@ fn ci_enforced_budgets_fail_on_regression_or_missing_data() {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
+    }
+    if let Some(policy) = post_generation_policy.as_ref() {
+        validate_post_generation_evidence_inventory(policy).unwrap_or_else(|detail| {
+            panic!("post_generation_evidence_changed_during_consumption: {detail}")
+        });
     }
 }
 
@@ -5478,8 +5632,70 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).expect("create evidence input parent");
             }
-            std::fs::write(&path, format!("fixture:{relative_path}\n"))
-                .expect("write evidence input fixture");
+            if *relative_path == "post_generation_producer_admission.json" {
+                let producers = [
+                    ("bench_schema", "bench_schema", "cargo_test"),
+                    ("bench_scenario", "bench_scenario_runner", "cargo_test"),
+                    ("ext_bench_harness", "ext_bench_harness", "cargo_test"),
+                    ("perf_bench_harness", "perf_bench_harness", "cargo_test"),
+                    ("perf_budgets", "perf_budgets", "cargo_test"),
+                    ("perf_regression", "perf_regression", "cargo_test"),
+                    ("perf_comparison", "perf_comparison", "cargo_test"),
+                    (
+                        "perf_baseline_variance",
+                        "perf_baseline_variance",
+                        "cargo_test",
+                    ),
+                    ("criterion_extensions", "extensions", "criterion"),
+                    ("criterion_system", "system", "criterion"),
+                    (
+                        "criterion_semantic_context",
+                        "semantic_context",
+                        "criterion",
+                    ),
+                ]
+                .into_iter()
+                .map(|(suite, target, kind)| {
+                    json!({
+                        "suite": suite,
+                        "target": target,
+                        "kind": kind,
+                        "result_sha256": "a".repeat(64),
+                        "remote_execution_verified": true,
+                        "remote_marker": "[RCH] remote fixture-worker (1.00s)",
+                        "remote_worker": "fixture-worker",
+                        "clean_overlay_receipt": format!(
+                            "[RCH] clean-overlay receipt: base={} overlay-fingerprint={}",
+                            "1234567890abcdef1234567890abcdef12345678",
+                            "a".repeat(64),
+                        ),
+                        "overlay_fingerprint": "a".repeat(64),
+                    })
+                })
+                .collect::<Vec<_>>();
+                let payload = json!({
+                    "schema": "pi.perf.post_generation_producer_admission.v1",
+                    "generated_at": "2026-08-26T00:00:00Z",
+                    "source_commit": "1234567890abcdef1234567890abcdef12345678",
+                    "source_dirty": false,
+                    "correlation_id": "current-run",
+                    "run_instance_id": evidence_root.file_name().and_then(OsStr::to_str),
+                    "cargo_profile": "perf",
+                    "status": "ready",
+                    "failure_count": 0,
+                    "failures": [],
+                    "producers": producers,
+                });
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&payload)
+                        .expect("serialize producer admission fixture"),
+                )
+                .expect("write producer admission fixture");
+            } else {
+                std::fs::write(&path, format!("fixture:{relative_path}\n"))
+                    .expect("write evidence input fixture");
+            }
             post_generation_inventory_entry(
                 evidence_root,
                 relative_path,
@@ -5750,6 +5966,47 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
         validate_post_generation_evidence_inventory(&policy)
             .expect_err("duplicate logical input and path must fail")
             .contains("logical_input_id")
+    );
+}
+
+#[test]
+fn post_generation_inventory_rejects_fabricated_producer_remote_receipt() {
+    let project = tempfile::tempdir().expect("create fake project root");
+    let evidence_root = project.path().join("a".repeat(64));
+    std::fs::create_dir(&evidence_root).expect("create evidence root");
+    let source_commit = "1234567890abcdef1234567890abcdef12345678";
+    let policy = PostGenerationEvidencePolicy {
+        root: std::fs::canonicalize(&evidence_root).expect("canonical evidence root"),
+        expected_source_commit: source_commit.to_string(),
+        correlation_id: "current-run".to_string(),
+    };
+    let mut entries = write_complete_post_generation_input_fixture(&evidence_root);
+    let admission_path = evidence_root.join("post_generation_producer_admission.json");
+    let mut admission: Value = serde_json::from_slice(
+        &std::fs::read(&admission_path).expect("read producer admission fixture"),
+    )
+    .expect("parse producer admission fixture");
+    admission["producers"][0]["remote_marker"] = json!("[RCH] local (fixture fallback)");
+    std::fs::write(
+        &admission_path,
+        serde_json::to_vec_pretty(&admission).expect("serialize mutated producer admission"),
+    )
+    .expect("write mutated producer admission");
+    let admission_entry = entries
+        .iter_mut()
+        .find(|entry| entry["path"].as_str() == Some("post_generation_producer_admission.json"))
+        .expect("producer admission inventory entry");
+    *admission_entry = post_generation_inventory_entry(
+        &evidence_root,
+        "post_generation_producer_admission.json",
+        "file:post_generation_producer_admission.json",
+    );
+    write_post_generation_inventory_fixture(&evidence_root, source_commit, "current-run", entries);
+
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("a local fallback marker must not satisfy producer admission")
+            .contains("invalid remote proof metadata")
     );
 }
 
@@ -6068,9 +6325,9 @@ fn context_intelligence_budget_reader_uses_criterion_latency_and_artifact_size()
         &artifact,
         &valid_context_intelligence_budget_artifact_fixture(),
     );
-    let criterion = tmp.path().join(
-        "target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json",
-    );
+    let criterion = tmp
+        .path()
+        .join("target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json");
     write_context_intelligence_budget_artifact(
         &criterion,
         &serde_json::json!({
@@ -6128,9 +6385,9 @@ fn context_intelligence_budget_reader_rejects_stale_criterion_sample() {
     use std::time::{Duration, SystemTime};
 
     let tmp = tempfile::tempdir().expect("create tempdir");
-    let sample = tmp.path().join(
-        "target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json",
-    );
+    let sample = tmp
+        .path()
+        .join("target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json");
     write_context_intelligence_budget_artifact(
         &sample,
         &json!({"iters": [1.0], "times": [10_000_000.0]}),
@@ -6150,7 +6407,10 @@ fn context_intelligence_budget_reader_rejects_stale_criterion_sample() {
 
     let (actual, source) = read_criterion_context_intelligence(tmp.path(), "graph_build_cold");
     assert_eq!(actual, None);
-    assert!(source.contains("stale:"), "unexpected rejection source: {source}");
+    assert!(
+        source.contains("stale:"),
+        "unexpected rejection source: {source}"
+    );
 }
 
 #[test]

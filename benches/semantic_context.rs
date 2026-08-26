@@ -217,16 +217,15 @@ fn write_context_budget_artifact(
     });
 
     let target_dir = resolved_target_dir();
-    let output_root = bench_env::criterion_output_directory()
-        .unwrap_or_else(|| target_dir.join("criterion"));
+    let output_root =
+        bench_env::criterion_output_directory().unwrap_or_else(|| target_dir.join("criterion"));
     let output_path = output_root.join("context_intelligence/perf_budget.json");
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).expect("create semantic context perf budget dir");
     }
-    let correlation_id = std::env::var("CI_CORRELATION_ID")
-        .unwrap_or_else(|_| "standalone-unclaimable".to_string());
-    let source_commit = std::env::var("VERGEN_GIT_SHA")
-        .unwrap_or_else(|_| "unknown".to_string());
+    let correlation_id =
+        std::env::var("CI_CORRELATION_ID").unwrap_or_else(|_| "standalone-unclaimable".to_string());
+    let source_commit = std::env::var("VERGEN_GIT_SHA").unwrap_or_else(|_| "unknown".to_string());
     let source_dirty = std::env::var("VERGEN_GIT_DIRTY")
         .ok()
         .and_then(|value| value.parse::<bool>().ok())

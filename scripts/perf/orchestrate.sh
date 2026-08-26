@@ -419,6 +419,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     PI_BENCH_RUN_ID \
     CARGO_BUILD_JOBS \
     PERF_REGRESSION_OUTPUT \
+    PERF_REGRESSION_FULL \
     PERF_RELEASE_BINARY_PATH \
     CI_CORRELATION_ID \
     VERGEN_GIT_SHA \
@@ -468,7 +469,12 @@ resolve_suites() {
 
 apply_profile_settings() {
   case "$PROFILE" in
-    full|ci) export PI_PERF_STRICT=1 ;;
+    full)
+      export PI_PERF_STRICT=1
+      export PERF_REGRESSION_FULL=1
+      export BENCH_QUICK=0
+      ;;
+    ci) export PI_PERF_STRICT=1 ;;
     quick)
       SKIP_CRITERION=1
       export BENCH_QUICK=1
@@ -492,6 +498,44 @@ suite_selected() {
   done
   return 1
 }
+
+exclusive_post_generation_suite_set_selected() {
+  local required_suite
+  for required_suite in \
+    "${!SUITE_TARGETS[@]}" \
+    criterion_extensions \
+    criterion_system \
+    criterion_semantic_context; do
+    if ! suite_selected "$required_suite"; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+RUN_EXCLUSIVE_POST_GENERATION_GATE=false
+post_generation_skip_reason="incomplete_full_evidence_suite_set"
+if exclusive_post_generation_suite_set_selected; then
+  if [[ "$PROFILE" != "full" ]]; then
+    die "The full evidence suite set requires --profile full for the exclusive post-generation gate"
+  fi
+  if [[ "$CARGO_RUNNER_MODE" != "rch" ]]; then
+    die "The full evidence suite set requires RCH for the exclusive post-generation gate"
+  fi
+  if [[ "$SKIP_BUILD" != "0" ]]; then
+    die "The full evidence suite set cannot claim exclusive post-generation evidence with --skip-build"
+  fi
+  if [[ -n "${BENCH_ITERATIONS:-}" ]]; then
+    die "The exclusive post-generation gate forbids BENCH_ITERATIONS overrides"
+  fi
+  if [[ "${BENCH_QUICK:-0}" != "0" || "${PERF_REGRESSION_FULL:-0}" != "1" ]]; then
+    die "The exclusive post-generation gate requires canonical full benchmark settings"
+  fi
+  RUN_EXCLUSIVE_POST_GENERATION_GATE=true
+  post_generation_skip_reason=""
+  RCH_PROOF_REQUIRED=true
+  export RCH_REQUIRE_REMOTE=1
+fi
 
 verify_current_clean_source_identity() {
   local label="$1"
@@ -548,6 +592,11 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
   )
 else
   PERF_BENCH_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
+fi
+
+declare -a PHASE2_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+  PHASE2_RUNNER_ARGS=("${PERF_BENCH_RUNNER_ARGS[@]}")
 fi
 
 write_binary_size_measurement_control() {
@@ -1042,7 +1091,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
   log_step "Building test binaries..."
   if VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
     VERGEN_GIT_DIRTY="$GIT_DIRTY" \
-    "${CARGO_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" \
+    "${PHASE2_RUNNER_ARGS[@]}" test --no-run --profile "$CARGO_PROFILE" \
       --message-format=json-render-diagnostics \
       >"$BUILD_TESTS_JSONL_PATH" \
       2>"$OUTPUT_DIR/logs/build_tests.log"; then
@@ -1122,7 +1171,7 @@ PY
     log_step "Building criterion benchmarks..."
     for bench in "${!CRITERION_BENCHES[@]}"; do
       bench_name="${CRITERION_BENCHES[$bench]}"
-      if "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
+      if "${PHASE2_RUNNER_ARGS[@]}" bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
         log_ok "Built bench: $bench_name"
       else
         log_warn "Build warning for bench: $bench_name"
@@ -1133,7 +1182,7 @@ PY
   if suite_selected "perf_budgets" || suite_selected "perf_regression"; then
     release_pi_built=0
     log_step "Building release pi binary for release-size gates..."
-    if "${CARGO_RUNNER_ARGS[@]}" build --bin pi --release >"$OUTPUT_DIR/logs/build_release_pi.log" 2>&1; then
+    if "${PHASE2_RUNNER_ARGS[@]}" build --bin pi --release >"$OUTPUT_DIR/logs/build_release_pi.log" 2>&1; then
       release_pi_built=1
       log_ok "Release pi binary built: $TARGET_DIR/release/pi"
       write_binary_size_measurement_control "$TARGET_DIR/release/pi"
@@ -1151,7 +1200,7 @@ PY
         PI_IDLE_RSS_SOURCE_DIRTY="$GIT_DIRTY" \
         PI_IDLE_RSS_CORRELATION_ID="$CORRELATION_ID" \
         PI_BENCH_BUILD_PROFILE=release \
-        "${CARGO_RUNNER_ARGS[@]}" bench --bench system --profile release -- __idle_rss_control__ \
+        "${PHASE2_RUNNER_ARGS[@]}" bench --bench system --profile release -- __idle_rss_control__ \
         >"$OUTPUT_DIR/logs/idle_memory_rss.log" 2>&1; then
         write_idle_rss_measurement_control \
           "$OUTPUT_DIR/logs/idle_memory_rss.log" \
@@ -1402,6 +1451,11 @@ run_test_suite() {
   local suite_start suite_end suite_elapsed exit_code
   local rch_target_subdir=""
   local benchmark_run_id=""
+  local remote_execution_required=false
+  local remote_execution_verified=false
+  case "${RCH_REQUIRE_REMOTE:-0}" in
+    1|true|TRUE|yes|YES|on|ON) remote_execution_required=true ;;
+  esac
 
   log_step "Running suite: $suite_name (target=$target_name)"
   suite_start=$(epoch_ms)
@@ -1526,7 +1580,14 @@ run_test_suite() {
       log_fail "RCH completed $suite_name without retrieving extension_bench.jsonl from $rch_target_subdir"
       exit_code=86
     fi
+    if [[ "$exit_code" -eq 0 ]]; then
+      remote_execution_verified=true
+    fi
   else
+    local -a suite_runner_args=("${CARGO_RUNNER_ARGS[@]}")
+    if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+      suite_runner_args=("${PERF_BENCH_RUNNER_ARGS[@]}")
+    fi
     BENCH_OUTPUT_DIR="$result_dir" \
     PERF_REGRESSION_OUTPUT="$result_dir" \
     PERF_RELEASE_BINARY_PATH="$TARGET_DIR/release/pi" \
@@ -1534,9 +1595,32 @@ run_test_suite() {
     VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
     VERGEN_GIT_DIRTY="$GIT_DIRTY" \
     RUST_TEST_THREADS="$PARALLELISM" \
-      "${CARGO_RUNNER_ARGS[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
+    RCH_REQUIRE_REMOTE="${RCH_REQUIRE_REMOTE:-0}" \
+    RCH_QUIET=0 \
+    RCH_VISIBILITY=summary \
+      "${suite_runner_args[@]}" test --test "$target_name" --profile "$CARGO_PROFILE" -- --nocapture \
       >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
       || exit_code=$?
+    if [[ "$exit_code" -eq 0 && "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+      if ! verify_current_clean_source_identity "RCH $suite_name postcondition"; then
+        exit_code=91
+      elif ! grep -Eqs '^[[]RCH[]] remote [^[:space:]]+ [(][^)]+[)]$' \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "$suite_name has no remote-success marker"
+        exit_code=92
+      elif grep -Eqs '^[[]RCH[]] local( |$)' \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "$suite_name reported local execution"
+        exit_code=93
+      elif ! grep -Eqs \
+        "^[[]RCH[]] clean-overlay receipt: base=$GIT_COMMIT_FULL overlay-fingerprint=[0-9a-f]{64}$" \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+        log_fail "$suite_name has no current-commit clean-overlay receipt"
+        exit_code=94
+      else
+        remote_execution_verified=true
+      fi
+    fi
   fi
 
   suite_end=$(epoch_ms)
@@ -1561,10 +1645,17 @@ run_test_suite() {
   "schema": "pi.perf.suite_result.v1",
   "suite_name": "$suite_name",
   "target": "$target_name",
+  "kind": "cargo_test",
   "status": "$status",
   "exit_code": $exit_code,
   "elapsed_ms": $suite_elapsed,
   "correlation_id": "$CORRELATION_ID",
+  "run_instance_id": "$RUN_INSTANCE_ID",
+  "source_commit": "$GIT_COMMIT_FULL",
+  "source_dirty": $GIT_DIRTY,
+  "runner_mode": "$CARGO_RUNNER_MODE",
+  "remote_execution_required": $remote_execution_required,
+  "remote_execution_verified": $remote_execution_verified,
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "profile": "$CARGO_PROFILE"
 }
@@ -1585,6 +1676,10 @@ run_criterion_bench() {
   local criterion_run_subdir="pi-perf-runs/$RUN_INSTANCE_ID/$suite_name"
   local criterion_dir="$TARGET_DIR/criterion/$criterion_run_subdir"
   local remote_execution_verified=false
+  local -a criterion_runner_args=("${CARGO_RUNNER_ARGS[@]}")
+  if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+    criterion_runner_args=("${PERF_BENCH_RUNNER_ARGS[@]}")
+  fi
   mkdir -p "$result_dir"
 
   exit_code=0
@@ -1599,7 +1694,7 @@ run_criterion_bench() {
     RCH_REQUIRE_REMOTE=1 \
     RCH_QUIET=0 \
     RCH_VISIBILITY=summary \
-      "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
+      "${criterion_runner_args[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
       >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
       || exit_code=$?
   fi
@@ -1613,6 +1708,12 @@ run_criterion_bench() {
       "$result_dir/stdout.log" "$result_dir/stderr.log"; then
       log_fail "$suite_name reported local execution"
       exit_code=90
+    elif [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]] \
+      && ! grep -Eqs \
+        "^\\[RCH\\] clean-overlay receipt: base=$GIT_COMMIT_FULL overlay-fingerprint=[0-9a-f]{64}$" \
+        "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+      log_fail "$suite_name has no current-commit clean-overlay receipt"
+      exit_code=93
     else
       remote_execution_verified=true
     fi
@@ -1691,6 +1792,225 @@ done
 
 if [[ "$deferred_perf_budgets" == "true" ]]; then
   run_test_suite "perf_budgets" "${SUITE_TARGETS[perf_budgets]}"
+fi
+
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+  POST_GENERATION_PRODUCER_ADMISSION_PATH="$OUTPUT_DIR/results/post_generation_producer_admission.json"
+  if ! OUTPUT_DIR="$OUTPUT_DIR" \
+    ADMISSION_PATH="$POST_GENERATION_PRODUCER_ADMISSION_PATH" \
+    GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+    CORRELATION_ID="$CORRELATION_ID" \
+    RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
+    CARGO_PROFILE="$CARGO_PROFILE" \
+    python3 - <<'PY'
+import json
+import hashlib
+import os
+import re
+import stat
+from datetime import datetime, timezone
+from pathlib import Path
+
+output_dir = Path(os.environ["OUTPUT_DIR"])
+admission_path = Path(os.environ["ADMISSION_PATH"])
+expected_commit = os.environ["GIT_COMMIT_FULL"]
+expected_correlation = os.environ["CORRELATION_ID"]
+expected_instance = os.environ["RUN_INSTANCE_ID"]
+expected_profile = os.environ["CARGO_PROFILE"]
+failures = []
+admitted_producers = []
+
+remote_marker_pattern = re.compile(
+    r"^\[RCH\] remote (?P<worker>[^\s]+) \([^)]+\)$"
+)
+local_marker_pattern = re.compile(r"^\[RCH\] local(?: |$)")
+receipt_pattern = re.compile(
+    rf"^\[RCH\] clean-overlay receipt: base={re.escape(expected_commit)} "
+    r"overlay-fingerprint=(?P<fingerprint>[0-9a-f]{64})$"
+)
+
+required_test_suites = {
+    "bench_schema": "bench_schema",
+    "bench_scenario": "bench_scenario_runner",
+    "ext_bench_harness": "ext_bench_harness",
+    "perf_bench_harness": "perf_bench_harness",
+    "perf_budgets": "perf_budgets",
+    "perf_regression": "perf_regression",
+    "perf_comparison": "perf_comparison",
+    "perf_baseline_variance": "perf_baseline_variance",
+}
+required_criterion_suites = {
+    "criterion_extensions": "extensions",
+    "criterion_system": "system",
+    "criterion_semantic_context": "semantic_context",
+}
+
+
+def load_current_result(suite):
+    path = output_dir / "results" / suite / "result.json"
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise OSError("result is not a regular file")
+        encoded = path.read_bytes()
+        return path, json.loads(encoded), hashlib.sha256(encoded).hexdigest()
+    except (OSError, json.JSONDecodeError) as error:
+        failures.append(
+            {"suite": suite, "reason": "missing_or_invalid_result", "detail": str(error)}
+        )
+        return path, None, None
+
+
+def load_remote_proof(suite):
+    lines = []
+    for log_name in ("stdout.log", "stderr.log"):
+        path = output_dir / "results" / suite / log_name
+        try:
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+                raise OSError("log is not a regular file")
+            lines.extend(path.read_text(encoding="utf-8").splitlines())
+        except (OSError, UnicodeDecodeError) as error:
+            failures.append(
+                {
+                    "suite": suite,
+                    "reason": "missing_or_invalid_remote_log",
+                    "log": log_name,
+                    "detail": str(error),
+                }
+            )
+            return None
+
+    remote_markers = [
+        match for line in lines if (match := remote_marker_pattern.fullmatch(line))
+    ]
+    local_markers = [line for line in lines if local_marker_pattern.match(line)]
+    receipts = [
+        match for line in lines if (match := receipt_pattern.fullmatch(line))
+    ]
+    if len(remote_markers) != 1 or local_markers or len(receipts) != 1:
+        failures.append(
+            {
+                "suite": suite,
+                "reason": "invalid_remote_execution_receipt",
+                "remote_marker_count": len(remote_markers),
+                "local_marker_count": len(local_markers),
+                "clean_overlay_receipt_count": len(receipts),
+            }
+        )
+        return None
+
+    remote_marker = remote_markers[0].group(0)
+    remote_worker = remote_markers[0].group("worker")
+    clean_overlay_receipt = receipts[0].group(0)
+    overlay_fingerprint = receipts[0].group("fingerprint")
+    return {
+        "remote_marker": remote_marker,
+        "remote_worker": remote_worker,
+        "clean_overlay_receipt": clean_overlay_receipt,
+        "overlay_fingerprint": overlay_fingerprint,
+    }
+
+
+def validate_common(suite, target, kind, result, result_sha256, extra_expected=None):
+    expected = {
+        "schema": "pi.perf.suite_result.v1",
+        "suite_name": suite,
+        "target": target,
+        "kind": kind,
+        "status": "pass",
+        "correlation_id": expected_correlation,
+        "run_instance_id": expected_instance,
+        "source_commit": expected_commit,
+        "source_dirty": False,
+        "runner_mode": "rch",
+        "profile": expected_profile,
+        "remote_execution_verified": True,
+    }
+    if extra_expected:
+        expected.update(extra_expected)
+    mismatches = {
+        key: {"expected": expected_value, "observed": result.get(key)}
+        for key, expected_value in expected.items()
+        if result.get(key) != expected_value
+    }
+    if type(result.get("exit_code")) is not int or result.get("exit_code") != 0:
+        mismatches["exit_code"] = {
+            "expected": 0,
+            "observed": result.get("exit_code"),
+        }
+    elapsed_ms = result.get("elapsed_ms")
+    if type(elapsed_ms) is not int or elapsed_ms < 0:
+        mismatches["elapsed_ms"] = {
+            "expected": "non-negative integer",
+            "observed": elapsed_ms,
+        }
+    remote_proof = load_remote_proof(suite)
+    if mismatches:
+        failures.append(
+            {"suite": suite, "reason": "producer_result_mismatch", "fields": mismatches}
+        )
+    if not mismatches and remote_proof is not None:
+        producer = {
+            "suite": suite,
+            "target": target,
+            "kind": kind,
+            "result_sha256": result_sha256,
+            "remote_execution_verified": True,
+        }
+        producer.update(remote_proof)
+        admitted_producers.append(producer)
+
+
+for suite, target in required_test_suites.items():
+    _, result, result_sha256 = load_current_result(suite)
+    if result is None:
+        continue
+    validate_common(
+        suite,
+        target,
+        "cargo_test",
+        result,
+        result_sha256,
+        {"remote_execution_required": True},
+    )
+
+for suite, target in required_criterion_suites.items():
+    _, result, result_sha256 = load_current_result(suite)
+    if result is None:
+        continue
+    expected_output = f"criterion/pi-perf-runs/{expected_instance}/{suite}"
+    validate_common(
+        suite,
+        target,
+        "criterion",
+        result,
+        result_sha256,
+        {"output_relative": expected_output},
+    )
+
+report = {
+    "schema": "pi.perf.post_generation_producer_admission.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "source_commit": expected_commit,
+    "source_dirty": False,
+    "correlation_id": expected_correlation,
+    "run_instance_id": expected_instance,
+    "cargo_profile": expected_profile,
+    "status": "ready" if not failures else "blocked",
+    "failure_count": len(failures),
+    "failures": failures,
+    "producers": sorted(admitted_producers, key=lambda producer: producer["suite"]),
+}
+admission_path.write_text(
+    json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+)
+raise SystemExit(0 if not failures else 1)
+PY
+  then
+    die "Exclusive post-generation producer admission failed"
+  fi
+  log_ok "Exclusive post-generation producer admission passed"
 fi
 
 run_end=$(epoch_ms)
@@ -4576,9 +4896,16 @@ fi
 
 log_phase "Phase 5g: Post-Generation Evidence Gate"
 
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+  if ! verify_current_clean_source_identity "Exclusive post-generation evidence admission"; then
+    die "Exclusive post-generation evidence requires a stable clean source identity"
+  fi
+fi
+
 POST_GENERATION_CONTRACT_PATH="$OUTPUT_DIR/results/post_generation_evidence_contract.json"
 post_generation_exit=0
-if OUTPUT_DIR="$OUTPUT_DIR" \
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+  if OUTPUT_DIR="$OUTPUT_DIR" \
   CORRELATION_ID="$CORRELATION_ID" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   GIT_DIRTY="$GIT_DIRTY" \
@@ -4784,26 +5111,32 @@ report = {
 report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 raise SystemExit(0 if not failures else 1)
 PY
-then
-  log_ok "Post-generation evidence contract passed"
+  then
+    log_ok "Post-generation evidence contract passed"
+  else
+    post_generation_exit=$?
+    log_warn "Post-generation evidence contract blocked: results/$(basename "$POST_GENERATION_CONTRACT_PATH")"
+  fi
+  artifact_count=$((artifact_count + 1))
 else
-  post_generation_exit=$?
-  log_warn "Post-generation evidence contract blocked: results/$(basename "$POST_GENERATION_CONTRACT_PATH")"
+  log_warn "Exclusive post-generation evidence skipped: $post_generation_skip_reason"
 fi
-artifact_count=$((artifact_count + 1))
 
 POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
 post_generation_budget_exit=0
 post_generation_package_status="pending"
+post_generation_budget_status="skip"
 post_generation_inventory_sha256=""
 post_generation_package_sha256=""
 post_generation_package_file_count=0
 post_generation_package_size_bytes=0
+POST_GENERATION_STAGE_RELATIVE=""
+POST_GENERATION_EVIDENCE_DIR=""
 declare -a POST_GENERATION_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
-if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
-  && ! verify_current_clean_source_identity "RCH post-generation staging precondition"; then
-  die "RCH post-generation staging source identity is not stable"
-fi
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+  if ! verify_current_clean_source_identity "RCH post-generation staging precondition"; then
+    die "RCH post-generation staging source identity is not stable"
+  fi
 
 post_generation_stage_key="$RUN_INSTANCE_ID"
 POST_GENERATION_STAGE_RELATIVE=".rch-tmp/pi-perf-evidence/$post_generation_stage_key"
@@ -4815,6 +5148,7 @@ if ! PROJECT_ROOT="$PROJECT_ROOT" \
   CORRELATION_ID="$CORRELATION_ID" \
   RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
   CARGO_RUNNER_MODE="$CARGO_RUNNER_MODE" \
+  CARGO_PROFILE="$CARGO_PROFILE" \
   SELECTED_SUITES="${SELECTED_SUITES[*]}" \
   python3 - <<'PY'
 import hashlib
@@ -4889,6 +5223,11 @@ required_files = [
         output_dir / "results" / "phase1_matrix_validation.json",
         PurePosixPath("phase1_matrix_validation.json"),
         "post-generation derivation",
+    ),
+    (
+        output_dir / "results" / "post_generation_producer_admission.json",
+        PurePosixPath("post_generation_producer_admission.json"),
+        "post-generation producer admission",
     ),
     (
         output_dir / "results" / "pijs_workload.jsonl",
@@ -5208,8 +5547,10 @@ for suite in sorted(selected_suites.intersection(criterion_required_inputs)):
         or suite_result.get("output_relative")
         != f"criterion/pi-perf-runs/{os.environ['RUN_INSTANCE_ID']}/{suite}"
         or suite_result.get("runner_mode") != os.environ["CARGO_RUNNER_MODE"]
+        or suite_result.get("profile") != os.environ["CARGO_PROFILE"]
+        or type(suite_result.get("remote_execution_verified")) is not bool
         or suite_result.get("remote_execution_verified")
-        is not (os.environ["CARGO_RUNNER_MODE"] == "rch")
+        != (os.environ["CARGO_RUNNER_MODE"] == "rch")
     ):
         raise SystemExit(
             f"Criterion producer {suite} did not pass in the current correlation"
@@ -5564,32 +5905,37 @@ else
   suite_fail=$((suite_fail + 1))
   log_warn "Post-generation perf budget data-contract evaluation failed (exit=$post_generation_budget_exit)"
 fi
+else
+  post_generation_package_status="skip"
+  suite_skip=$((suite_skip + 1))
+fi
 
 staging_exit=0
-if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH" --artifact-readiness-only; then
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+  if run_budget_preflight "$PREFLIGHT_AFTER_RUN_PATH" --artifact-readiness-only; then
   log_ok "Final budget preflight passed: results/$(basename "$PREFLIGHT_AFTER_RUN_PATH")"
-else
-  staging_exit=$?
-  log_warn "Final budget preflight found blockers:"
-  log_warn "  results/$(basename "$PREFLIGHT_AFTER_RUN_PATH") (exit=$staging_exit)"
-fi
+  else
+    staging_exit=$?
+    log_warn "Final budget preflight found blockers:"
+    log_warn "  results/$(basename "$PREFLIGHT_AFTER_RUN_PATH") (exit=$staging_exit)"
+  fi
 
-if [[ -f "$PREFLIGHT_AFTER_RUN_PATH" ]]; then
-  artifact_count=$((artifact_count + 1))
-  log_ok "Collected: $(basename "$PREFLIGHT_AFTER_RUN_PATH")"
-fi
+  if [[ -f "$PREFLIGHT_AFTER_RUN_PATH" ]]; then
+    artifact_count=$((artifact_count + 1))
+    log_ok "Collected: $(basename "$PREFLIGHT_AFTER_RUN_PATH")"
+  fi
 
-if run_artifact_staging_manifest "$STAGING_MANIFEST_PATH"; then
-  log_ok "Final artifact staging passed: results/$(basename "$STAGING_MANIFEST_PATH")"
-else
-  staging_exit=$?
-  log_warn "Final artifact staging found blockers: results/$(basename "$STAGING_MANIFEST_PATH") (exit=$staging_exit)"
-fi
+  if run_artifact_staging_manifest "$STAGING_MANIFEST_PATH"; then
+    log_ok "Final artifact staging passed: results/$(basename "$STAGING_MANIFEST_PATH")"
+  else
+    staging_exit=$?
+    log_warn "Final artifact staging found blockers: results/$(basename "$STAGING_MANIFEST_PATH") (exit=$staging_exit)"
+  fi
 
-if [[ -f "$STAGING_MANIFEST_PATH" ]]; then
-  artifact_count=$((artifact_count + 1))
-  staging_summary="$(
-    python3 - "$STAGING_MANIFEST_PATH" <<'PY'
+  if [[ -f "$STAGING_MANIFEST_PATH" ]]; then
+    artifact_count=$((artifact_count + 1))
+    staging_summary="$(
+      python3 - "$STAGING_MANIFEST_PATH" <<'PY'
 import json
 import sys
 
@@ -5610,22 +5956,27 @@ print(
     + str(len(payload.get("blockers", [])))
 )
 PY
-  )"
-  IFS='|' read -r \
-    ARTIFACT_STAGING_STATUS \
-    ARTIFACT_STAGING_MISSING_REQUIRED \
-    ARTIFACT_STAGING_STALE_REQUIRED \
-    ARTIFACT_STAGING_PRESENT_REQUIRED \
-    ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
-  log_ok "Final artifact staging: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
-  log_ok "Final artifact blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
+    )"
+    IFS='|' read -r \
+      ARTIFACT_STAGING_STATUS \
+      ARTIFACT_STAGING_MISSING_REQUIRED \
+      ARTIFACT_STAGING_STALE_REQUIRED \
+      ARTIFACT_STAGING_PRESENT_REQUIRED \
+      ARTIFACT_STAGING_BLOCKERS <<< "$staging_summary"
+    log_ok "Final artifact staging: status=$ARTIFACT_STAGING_STATUS present=$ARTIFACT_STAGING_PRESENT_REQUIRED"
+    log_ok "Final artifact blockers: missing=$ARTIFACT_STAGING_MISSING_REQUIRED stale=$ARTIFACT_STAGING_STALE_REQUIRED"
+  else
+    log_warn "Final artifact staging manifest was not generated"
+  fi
 else
-  log_warn "Final artifact staging manifest was not generated"
+  ARTIFACT_STAGING_STATUS="skipped"
 fi
 
-post_generation_status="pass"
+post_generation_status="skip"
 post_generation_result_exit=0
-if [[ "$post_generation_exit" -ne 0 \
+if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true ]]; then
+  suite_skip=$((suite_skip + 1))
+elif [[ "$post_generation_exit" -ne 0 \
   || "$post_generation_budget_exit" -ne 0 \
   || "$staging_exit" -ne 0 \
   || "$ARTIFACT_STAGING_STATUS" == "blocked" ]]; then
@@ -5639,6 +5990,7 @@ if [[ "$post_generation_exit" -ne 0 \
   post_generation_status="fail"
   suite_fail=$((suite_fail + 1))
 else
+  post_generation_status="pass"
   suite_pass=$((suite_pass + 1))
 fi
 
@@ -5663,7 +6015,10 @@ OUTPUT_DIR="$OUTPUT_DIR" \
   POST_GENERATION_PACKAGE_SIZE_BYTES="$post_generation_package_size_bytes" \
   POST_GENERATION_RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
   POST_GENERATION_SOURCE_COMMIT="$GIT_COMMIT_FULL" \
+  POST_GENERATION_SOURCE_DIRTY="$GIT_DIRTY" \
   POST_GENERATION_CORRELATION_ID="$CORRELATION_ID" \
+  POST_GENERATION_GATE_SELECTED="$RUN_EXCLUSIVE_POST_GENERATION_GATE" \
+  POST_GENERATION_SKIP_REASON="$post_generation_skip_reason" \
   python3 - <<'PY'
 import json
 import os
@@ -5694,15 +6049,17 @@ manifest.setdefault("artifact_staging", {}).update(
 )
 manifest["post_generation_evidence_package"] = {
     "status": os.environ["POST_GENERATION_PACKAGE_STATUS"],
-    "relative_path": os.environ["POST_GENERATION_PACKAGE_PATH"],
+    "relative_path": os.environ["POST_GENERATION_PACKAGE_PATH"] or None,
     "inventory_sha256": os.environ["POST_GENERATION_INVENTORY_SHA256"] or None,
     "package_sha256": os.environ["POST_GENERATION_PACKAGE_SHA256"] or None,
     "file_count": int(os.environ["POST_GENERATION_PACKAGE_FILE_COUNT"]),
     "size_bytes": int(os.environ["POST_GENERATION_PACKAGE_SIZE_BYTES"]),
     "run_instance_id": os.environ["POST_GENERATION_RUN_INSTANCE_ID"],
     "source_commit": os.environ["POST_GENERATION_SOURCE_COMMIT"],
-    "source_dirty": False,
+    "source_dirty": os.environ["POST_GENERATION_SOURCE_DIRTY"] == "true",
     "correlation_id": os.environ["POST_GENERATION_CORRELATION_ID"],
+    "exclusive_gate_selected": os.environ["POST_GENERATION_GATE_SELECTED"] == "true",
+    "skip_reason": os.environ["POST_GENERATION_SKIP_REASON"] or None,
 }
 suite_results = manifest.setdefault("suite_results", [])
 suite_results.append(
