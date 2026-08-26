@@ -3724,7 +3724,7 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   GIT_DIRTY="$GIT_DIRTY" \
   TIMESTAMP="$TIMESTAMP" \
-  STRATIFICATION_PATH="$STRATIFICATION_PATH" \
+STRATIFICATION_PATH="$STRATIFICATION_PATH" \
   python3 - <<'PY'
 import hashlib
 import json
@@ -4607,6 +4607,7 @@ import json
 import math
 import os
 import re
+import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -6106,6 +6107,15 @@ for (
         continue
     if candidate_manifest.get("source_tree_sha256_final") != source_tree_digest:
         continue
+    if candidate_manifest.get("artifact_dir") != str(candidate.parent):
+        continue
+    if (
+        candidate_manifest.get("runner_mode") != "rch"
+        or candidate_manifest.get("rch_force_remote") is not True
+        or candidate_manifest.get("rch_require_remote") is not True
+        or candidate_manifest.get("execution_attestation") != "configuration_only"
+    ):
+        continue
     overall_passed = candidate_manifest.get("overall_passed")
     if type(overall_passed) is not bool:
         continue
@@ -6154,25 +6164,9 @@ for (
     expected_summary_path = candidate.parent / "integrity-summary.json"
     if summary_attestation.get("path") != str(expected_summary_path):
         continue
-    if expected_summary_path.is_symlink() or not expected_summary_path.is_file():
-        continue
     try:
-        summary_metadata_before = expected_summary_path.stat()
-        summary_bytes = expected_summary_path.read_bytes()
-        summary_metadata_after = expected_summary_path.stat()
-    except OSError:
-        continue
-    if (
-        summary_metadata_before.st_dev,
-        summary_metadata_before.st_ino,
-        summary_metadata_before.st_size,
-        summary_metadata_before.st_mtime_ns,
-    ) != (
-        summary_metadata_after.st_dev,
-        summary_metadata_after.st_ino,
-        summary_metadata_after.st_size,
-        summary_metadata_after.st_mtime_ns,
-    ):
+        summary_bytes = read_stable_regular_at(child_fd, "integrity-summary.json")
+    except (OSError, ValueError):
         continue
     if summary_attestation.get("size_bytes") != len(summary_bytes):
         continue
@@ -6202,12 +6196,20 @@ for (
             "source_commit_final",
             "source_dirty_final",
             "source_tree_sha256_final",
+            "runner_mode",
+            "rch_force_remote",
+            "rch_require_remote",
+            "execution_attestation",
         )
     ):
         continue
     if (
         candidate_summary.get("source_dirty") is not source_dirty
         or candidate_summary.get("source_dirty_final") is not source_dirty
+        or candidate_summary.get("runner_mode") != "rch"
+        or candidate_summary.get("rch_force_remote") is not True
+        or candidate_summary.get("rch_require_remote") is not True
+        or candidate_summary.get("execution_attestation") != "configuration_only"
     ):
         continue
     if candidate_summary.get("source_tree_stable") is not True:
@@ -6216,9 +6218,15 @@ for (
     if type(validation_passed) is not bool or validation_passed != overall_passed:
         continue
     summary_timestamp = parse_record_timestamp(candidate_summary)
+    summary_started_at = parse_record_timestamp(
+        {"timestamp": candidate_summary.get("run_started_at")}
+    )
     if (
         summary_timestamp is None
-        or summary_timestamp < run_started_at - source_clock_skew
+        or summary_started_at is None
+        or summary_started_at < run_started_at - source_clock_skew
+        or summary_started_at > summary_timestamp
+        or summary_timestamp > candidate_timestamp
         or summary_timestamp > datetime.now(timezone.utc) + source_clock_skew
     ):
         continue
@@ -6234,6 +6242,44 @@ for (
     }
     if set(cases_by_id) != {"jsonl", "sqlite"}:
         continue
+    required_case_checks = {
+        "test_command_passed",
+        "output_log_regular",
+        "result_schema_valid",
+        "result_identity_current",
+        "fault_log_emitted",
+        "summary_artifact_indexed",
+        "summary_artifact_schema_valid",
+        "summary_artifact_bytes_verified",
+        "summary_artifact_path_confined",
+        "diagnostic_log_schema_valid",
+        "artifact_index_schema_valid",
+        "diagnostic_sequence_valid",
+        "diagnostic_trace_bound",
+        "correlation_id_current",
+        "test_identity_current",
+    }
+    case_contracts_valid = True
+    for case_id, case in cases_by_id.items():
+        checks = case.get("checks")
+        test_log_records = case.get("test_log_records")
+        artifact_records = case.get("artifact_records")
+        if (
+            case.get("result_file") != str(candidate.parent / case_id / "result.json")
+            or not isinstance(checks, dict)
+            or set(checks) != required_case_checks
+            or any(type(value) is not bool for value in checks.values())
+            or case["passed"] != all(checks.values())
+            or type(test_log_records) is not int
+            or test_log_records < 0
+            or type(artifact_records) is not int
+            or artifact_records < 0
+            or (case["passed"] and (test_log_records == 0 or artifact_records == 0))
+        ):
+            case_contracts_valid = False
+            break
+    if not case_contracts_valid:
+        continue
     if validation_passed != (
         all(case["passed"] for case in cases_by_id.values())
         and candidate_summary.get("source_tree_stable") is True
@@ -6241,16 +6287,36 @@ for (
         continue
     if exit_codes["summary_validation"] != (0 if validation_passed else 1):
         continue
+    try:
+        final_child_metadata = os.stat(
+            child_name, dir_fd=fault_injection_root_fd, follow_symlinks=False
+        )
+    except OSError:
+        continue
+    if (
+        not stat.S_ISDIR(final_child_metadata.st_mode)
+        or (final_child_metadata.st_dev, final_child_metadata.st_ino) != child_identity
+    ):
+        continue
     matching_fault_injection_runs.append(
         (
             candidate_timestamp,
             str(candidate),
             candidate,
             candidate_manifest,
+            hashlib.sha256(candidate_manifest_bytes).hexdigest(),
+            len(candidate_manifest_bytes),
             expected_summary_path,
             candidate_summary,
+            hashlib.sha256(summary_bytes).hexdigest(),
+            len(summary_bytes),
         )
     )
+
+for descriptor in fault_injection_child_descriptors:
+    os.close(descriptor)
+if fault_injection_root_fd is not None:
+    os.close(fault_injection_root_fd)
 
 if matching_fault_injection_runs:
     (
@@ -6258,9 +6324,13 @@ if matching_fault_injection_runs:
         _,
         fault_injection_manifest_path,
         fault_injection_manifest,
+        fault_injection_manifest_sha256,
+        fault_injection_manifest_size_bytes,
         fault_injection_summary_path,
         fault_injection_summary,
-    ) = max(matching_fault_injection_runs)
+        fault_injection_summary_sha256,
+        fault_injection_summary_size_bytes,
+    ) = max(matching_fault_injection_runs, key=lambda candidate: (candidate[0], candidate[1]))
     fault_injection_status = (
         "pass" if fault_injection_manifest.get("overall_passed") is True else "fail"
     )
@@ -6474,6 +6544,24 @@ payload = {
             ),
             "fault_injection_summary_path": (
                 str(fault_injection_summary_path)
+                if fault_injection_summary_path is not None
+                else None
+            ),
+            "fault_injection_manifest": (
+                {
+                    "path": str(fault_injection_manifest_path),
+                    "sha256": fault_injection_manifest_sha256,
+                    "size_bytes": fault_injection_manifest_size_bytes,
+                }
+                if fault_injection_manifest_path is not None
+                else None
+            ),
+            "fault_injection_summary": (
+                {
+                    "path": str(fault_injection_summary_path),
+                    "sha256": fault_injection_summary_sha256,
+                    "size_bytes": fault_injection_summary_size_bytes,
+                }
                 if fault_injection_summary_path is not None
                 else None
             ),

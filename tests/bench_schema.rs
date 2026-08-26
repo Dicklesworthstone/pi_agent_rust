@@ -1933,6 +1933,7 @@ PY
       fi
       binary_sha256="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       binary_path="/target/perf/deps/perf_bench_harness-stub"
+      extension_features_json='["bpe-tokens","ext-conformance","ftui","sqlite-sessions","tui"]'
       if [[ "${PI_FAKE_WRONG_RCH_EXTENSION_BINARY_PROFILE:-0}" == "1" ]]; then
         binary_path="/target/release/deps/perf_bench_harness-stub"
       fi
@@ -1949,7 +1950,13 @@ payload = {
     "build_profile": "perf",
     "build_profile_verified": True,
     "compiled_debug": "true",
-    "compiled_features": [],
+    "compiled_features": [
+        "bpe-tokens",
+        "ext-conformance",
+        "ftui",
+        "sqlite-sessions",
+        "tui",
+    ],
     "compiled_opt_level": "3",
     "compiled_profile_family": "release",
     "debug_assertions": False,
@@ -1978,16 +1985,16 @@ PY
       for extension_name in "${extension_names[@]}"; do
         for scenario_name in cold_start warm_start; do
           cat >>"$extension_artifact" <<JSON
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"$scenario_name","extension":"$extension_name","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"$scenario_name","extension":"$extension_name","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":$extension_features_json,"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
         done
       done
       cat >>"$extension_artifact" <<JSON
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"tool_call","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"tool_call","extension":"hello","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":$extension_features_json,"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
       if [[ "${PI_FAKE_DROP_RCH_EXTENSION_COVERAGE:-0}" != "1" ]]; then
         cat >>"$extension_artifact" <<JSON
-{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"event_hook","extension":"pirate","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":[],"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","run_id":"${CI_CORRELATION_ID:?}","correlation_id":"${CI_CORRELATION_ID:?}","benchmark_run_id":"$benchmark_run_id","source_commit":"$extension_commit","source_dirty":false,"scenario":"event_hook","extension":"pirate","runs":1,"summary":{"count":1,"min_ms":1.0,"p50_ms":1.0,"p95_ms":1.0,"p99_ms":1.0,"p999_ms":1.0,"max_ms":1.0,"mean_ms":1.0},"elapsed_ms":1.0,"per_call_us":1000.0,"calls_per_sec":1000.0,"env":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8,"mem_total_mb":1024,"build_profile":"perf","executable_build_profile":"perf","executable_profile_verified":true,"build_fingerprint_verified":true,"build_profile_verified":true,"build_fingerprint_contract":"cargo_build_fingerprint.v1","compiled_profile_family":"release","compiled_opt_level":"3","compiled_debug":"true","debug_assertions":false,"git_commit":"$extension_commit","source_dirty":false,"features":$extension_features_json,"binary_path":"$binary_path","binary_sha256":"$binary_sha256","config_hash":"$config_hash"},"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 JSON
       fi
       printf '%s\n' '# fake extension benchmark summary' \
@@ -6043,12 +6050,17 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     )?;
     let fault_manifest_path = phase1_fault_evidence.get("fault_injection_manifest_path");
     let fault_summary_path = phase1_fault_evidence.get("fault_injection_summary_path");
+    let fault_manifest_attestation = phase1_fault_evidence.get("fault_injection_manifest");
+    let fault_summary_attestation = phase1_fault_evidence.get("fault_injection_summary");
     if security_guard_status == "missing" {
         if !fault_manifest_path.is_some_and(Value::is_null)
             || !fault_summary_path.is_some_and(Value::is_null)
+            || !fault_manifest_attestation.is_some_and(Value::is_null)
+            || !fault_summary_attestation.is_some_and(Value::is_null)
         {
             return Err(
-                "missing security evidence must have null manifest and summary paths".to_string(),
+                "missing security evidence must have null manifest and summary paths and attestations"
+                    .to_string(),
             );
         }
     } else {
@@ -6065,6 +6077,18 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 ));
             }
         }
+        require_artifact_attestation(
+            phase1_fault_evidence,
+            "evidence_links.phase1_unit_and_fault_injection",
+            "fault_injection_manifest",
+            fault_manifest_path.and_then(Value::as_str).unwrap_or_default(),
+        )?;
+        require_artifact_attestation(
+            phase1_fault_evidence,
+            "evidence_links.phase1_unit_and_fault_injection",
+            "fault_injection_summary",
+            fault_summary_path.and_then(Value::as_str).unwrap_or_default(),
+        )?;
     }
     let required_artifacts = evidence_links
         .get("required_artifacts")
@@ -6388,6 +6412,55 @@ fn require_non_empty_string_field(
         return Err(format!("{context}.{field} must be a non-empty string"));
     }
     Ok(value.to_string())
+}
+
+fn require_artifact_attestation(
+    obj: &serde_json::Map<String, Value>,
+    context: &str,
+    field: &str,
+    expected_path: &str,
+) -> Result<(), String> {
+    let attestation = obj
+        .get(field)
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("{context}.{field} must be an artifact attestation object"))?;
+    if attestation.len() != 3
+        || !attestation.contains_key("path")
+        || !attestation.contains_key("sha256")
+        || !attestation.contains_key("size_bytes")
+    {
+        return Err(format!(
+            "{context}.{field} must contain exactly path, sha256, and size_bytes"
+        ));
+    }
+    if attestation.get("path").and_then(Value::as_str) != Some(expected_path) {
+        return Err(format!(
+            "{context}.{field}.path must equal the corresponding legacy path"
+        ));
+    }
+    let sha256 = attestation
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if sha256.len() != 64
+        || !sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "{context}.{field}.sha256 must be a lowercase SHA-256 digest"
+        ));
+    }
+    if attestation
+        .get("size_bytes")
+        .and_then(Value::as_u64)
+        .is_none_or(|size| size == 0)
+    {
+        return Err(format!(
+            "{context}.{field}.size_bytes must be a positive integer"
+        ));
+    }
+    Ok(())
 }
 
 fn swarm_metrics_fixture(
@@ -6814,7 +6887,17 @@ fn phase1_matrix_validation_golden_fixture() -> Value {
                 "suite_logs": {},
                 "fault_injection_script": "scripts/e2e/run_persistence_fault_injection.sh",
                 "fault_injection_manifest_path": "tests/e2e_results/persistence-fault-injection/run/run-manifest.json",
-                "fault_injection_summary_path": "tests/e2e_results/persistence-fault-injection/run/integrity-summary.json"
+                "fault_injection_summary_path": "tests/e2e_results/persistence-fault-injection/run/integrity-summary.json",
+                "fault_injection_manifest": {
+                    "path": "tests/e2e_results/persistence-fault-injection/run/run-manifest.json",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size_bytes": 1024
+                },
+                "fault_injection_summary": {
+                    "path": "tests/e2e_results/persistence-fault-injection/run/integrity-summary.json",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "size_bytes": 2048
+                }
             },
             "required_artifacts": {
                 "scenario_runner": "target/perf/scenario_runner.jsonl",
@@ -8919,6 +9002,19 @@ fn phase1_matrix_validator_rejects_reason_for_passing_regression_guard() {
 }
 
 #[test]
+fn phase1_matrix_validator_rejects_persistence_attestation_path_mismatch() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["evidence_links"]["phase1_unit_and_fault_injection"]
+        ["fault_injection_summary"]["path"] = json!("foreign/integrity-summary.json");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("fault_injection_summary.path must equal the corresponding legacy path"),
+        "expected persistence attestation path-binding failure, got: {err}"
+    );
+}
+
+#[test]
 fn phase1_matrix_validator_rejects_unknown_regression_guard_reason() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["regression_guards"]["memory"] = json!("missing");
@@ -9534,6 +9630,27 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let fault_injection_timestamp = chrono::Utc::now().to_rfc3339();
     let fault_injection_attempt_id = "fixture-attempt";
+    let successful_fault_checks = json!({
+        "test_command_passed": true,
+        "output_log_regular": true,
+        "result_schema_valid": true,
+        "result_identity_current": true,
+        "fault_log_emitted": true,
+        "summary_artifact_indexed": true,
+        "summary_artifact_schema_valid": true,
+        "summary_artifact_bytes_verified": true,
+        "summary_artifact_path_confined": true,
+        "diagnostic_log_schema_valid": true,
+        "artifact_index_schema_valid": true,
+        "diagnostic_sequence_valid": true,
+        "diagnostic_trace_bound": true,
+        "correlation_id_current": true,
+        "test_identity_current": true,
+    });
+    let mut sqlite_fault_checks = successful_fault_checks.clone();
+    if !fault_injection_passed {
+        sqlite_fault_checks["test_command_passed"] = json!(false);
+    }
     let fault_injection_summary_payload = json!({
         "schema": "pi.e2e.persistence_fault_injection.summary.v1",
         "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
@@ -9546,11 +9663,30 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "source_dirty_final": false,
         "source_tree_sha256_final": fault_injection_source_tree,
         "source_tree_stable": true,
+        "run_started_at": fault_injection_timestamp,
         "timestamp": fault_injection_timestamp,
+        "runner_mode": "rch",
+        "rch_force_remote": true,
+        "rch_require_remote": true,
+        "execution_attestation": "configuration_only",
         "terminal_state": "summary_validated",
         "cases": [
-            {"case_id": "jsonl", "passed": true},
-            {"case_id": "sqlite", "passed": fault_injection_passed}
+            {
+                "case_id": "jsonl",
+                "result_file": fault_injection_run_dir.join("jsonl/result.json"),
+                "checks": successful_fault_checks,
+                "test_log_records": 1,
+                "artifact_records": 1,
+                "passed": true
+            },
+            {
+                "case_id": "sqlite",
+                "result_file": fault_injection_run_dir.join("sqlite/result.json"),
+                "checks": sqlite_fault_checks,
+                "test_log_records": 1,
+                "artifact_records": 1,
+                "passed": fault_injection_passed
+            }
         ],
         "validation_passed": fault_injection_passed,
     });
@@ -9577,6 +9713,11 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "source_dirty_final": false,
         "source_tree_sha256_final": fault_injection_source_tree,
         "timestamp": fault_injection_timestamp,
+        "artifact_dir": fault_injection_run_dir,
+        "runner_mode": "rch",
+        "rch_force_remote": true,
+        "rch_require_remote": true,
+        "execution_attestation": "configuration_only",
         "terminal_state": "complete",
         "overall_passed": fault_injection_passed,
         "integrity_summary": {

@@ -2063,6 +2063,30 @@ fn is_positive_finite_metric(value: Option<f64>) -> bool {
     value.is_some_and(|v| v.is_finite() && v > 0.0)
 }
 
+fn phase1_artifact_attestation_is_valid(value: Option<&Value>, expected_path: Option<&str>) -> bool {
+    let Some(attestation) = value.and_then(Value::as_object) else {
+        return false;
+    };
+    if attestation.len() != 3
+        || attestation.get("path").and_then(Value::as_str) != expected_path
+        || attestation
+            .get("size_bytes")
+            .and_then(Value::as_u64)
+            .is_none_or(|size| size == 0)
+    {
+        return false;
+    }
+    attestation
+        .get("sha256")
+        .and_then(Value::as_str)
+        .is_some_and(|sha256| {
+            sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+}
+
 fn metric_state(value: Option<f64>) -> &'static str {
     match value {
         Some(v) if v.is_finite() && v > 0.0 => "valid",
@@ -2444,6 +2468,42 @@ fn evaluate_phase1_weighted_attribution_contract(
                 path.display()
             ),
             remediation: "Regenerate measured current-run matrix evidence with all regression guards passing before post-generation budget admission."
+                .to_string(),
+        });
+    }
+
+    let persistence_evidence = payload
+        .pointer("/evidence_links/phase1_unit_and_fault_injection")
+        .and_then(Value::as_object);
+    let fault_manifest_path = persistence_evidence
+        .and_then(|evidence| evidence.get("fault_injection_manifest_path"))
+        .and_then(Value::as_str);
+    let fault_summary_path = persistence_evidence
+        .and_then(|evidence| evidence.get("fault_injection_summary_path"))
+        .and_then(Value::as_str);
+    let fault_manifest_valid = phase1_artifact_attestation_is_valid(
+        persistence_evidence.and_then(|evidence| evidence.get("fault_injection_manifest")),
+        fault_manifest_path,
+    );
+    let fault_summary_valid = phase1_artifact_attestation_is_valid(
+        persistence_evidence.and_then(|evidence| evidence.get("fault_injection_summary")),
+        fault_summary_path,
+    );
+    if fault_manifest_path.is_none()
+        || fault_summary_path.is_none()
+        || !fault_manifest_valid
+        || !fault_summary_valid
+    {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_phase1_persistence_evidence_attestation".to_string(),
+            budget_name: None,
+            detail: format!(
+                "phase1 matrix must bind persistence manifest and summary paths to exact SHA-256 and byte-size attestations (manifest_path_present={}, manifest_attestation_valid={fault_manifest_valid}, summary_path_present={}, summary_attestation_valid={fault_summary_valid}) in {}",
+                fault_manifest_path.is_some(),
+                fault_summary_path.is_some(),
+                path.display()
+            ),
+            remediation: "Regenerate phase1_matrix_validation.json from directory-anchored persistence evidence reads."
                 .to_string(),
         });
     }
@@ -7293,6 +7353,22 @@ fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attr
             "security": "pass",
             "failure_or_gap_reasons": []
         },
+        "evidence_links": {
+            "phase1_unit_and_fault_injection": {
+                "fault_injection_manifest_path": "tests/e2e_results/persistence-fault-injection/run/run-manifest.json",
+                "fault_injection_summary_path": "tests/e2e_results/persistence-fault-injection/run/integrity-summary.json",
+                "fault_injection_manifest": {
+                    "path": "tests/e2e_results/persistence-fault-injection/run/run-manifest.json",
+                    "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "size_bytes": 1024
+                },
+                "fault_injection_summary": {
+                    "path": "tests/e2e_results/persistence-fault-injection/run/integrity-summary.json",
+                    "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "size_bytes": 2048
+                }
+            }
+        },
         "stage_summary": {
             "required_evidence_contract": {
                 "evidence_class": "measured",
@@ -7651,6 +7727,38 @@ fn phase1_weighted_contract_rejects_ready_artifact_with_unverified_guard() {
                 && failure.detail.contains("missing")
         }),
         "ready=true must not override an unverified memory guard: {failures:?}"
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_rejects_unbound_persistence_evidence() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    write_phase1_matrix_validation_artifact(
+        &artifact,
+        &valid_weighted_bottleneck_attribution_fixture(),
+    );
+    let mut payload: Value = serde_json::from_slice(
+        &std::fs::read(&artifact).expect("read phase1 fixture"),
+    )
+    .expect("parse phase1 fixture");
+    payload["evidence_links"]["phase1_unit_and_fault_injection"]
+        ["fault_injection_summary"]["sha256"] = json!("not-a-digest");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&payload).expect("serialize mutated phase1 fixture"),
+    )
+    .expect("write mutated phase1 fixture");
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_phase1_persistence_evidence_attestation"
+                && failure.detail.contains("summary_attestation_valid=false")
+        }),
+        "unbound persistence bytes must not satisfy the Phase-5 consumer: {failures:?}"
     );
 }
 
