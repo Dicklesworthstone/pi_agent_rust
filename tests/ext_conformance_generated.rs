@@ -1744,8 +1744,7 @@ fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> Extension
             .flatten()
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| {
-                p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ts"))
-                    && p != entry_file
+                p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ts")) && p != entry_file
             })
             .collect();
         siblings.sort();
