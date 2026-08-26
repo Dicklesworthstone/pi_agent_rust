@@ -261,44 +261,149 @@ async fn take_last_rpc_user_turn_for_retry(
     // appends the retried prompt. Read the same retryable turn shape as
     // checkpoint retry, then move the active leaf behind that user entry while
     // retaining the original branch in the session tree.
-    let text = {
+    let (text, messages) = {
         let cx = AgentCx::for_request();
-        let inner = session
+        let mut inner = session
             .session
             .lock(cx.cx())
             .await
             .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
-        let messages = inner.to_messages_for_current_path();
-        let Some(last_user) = messages.iter().rev().find(|message| {
-            matches!(
-                message,
-                Message::User(user)
-                    if !matches!(
-                        &user.content,
-                        UserContent::Text(text) if text.starts_with("[REWIND REPORT:")
-                    )
-            )
-        }) else {
+
+        #[derive(Debug)]
+        enum ProjectedUserTurn {
+            Text { entry_id: String, text: String },
+            Other,
+            NotUser,
+        }
+
+        let selected = {
+            let path = inner.entries_for_current_path();
+            let last_compaction = path
+                .iter()
+                .rposition(|entry| matches!(entry, SessionEntry::Compaction(_)));
+            let mut projected = if last_compaction.is_some() {
+                // Session projection begins with the compaction summary, which
+                // is a non-text user message and therefore is not retryable.
+                vec![ProjectedUserTurn::Other]
+            } else {
+                Vec::new()
+            };
+            let mut checkpoint_positions = HashMap::<String, usize>::new();
+
+            let mut append_entry = |entry: &SessionEntry| match entry {
+                SessionEntry::Message(message_entry) => {
+                    let Some(message) =
+                        crate::session::session_message_to_model(&message_entry.message)
+                    else {
+                        return;
+                    };
+                    let projected_turn = match message {
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) => message_entry
+                            .base
+                            .id
+                            .clone()
+                            .map_or(ProjectedUserTurn::NotUser, |entry_id| {
+                                ProjectedUserTurn::Text { entry_id, text }
+                            }),
+                        Message::User(_) => ProjectedUserTurn::Other,
+                        _ => ProjectedUserTurn::NotUser,
+                    };
+                    projected.push(projected_turn);
+                }
+                SessionEntry::BranchSummary(_) => projected.push(ProjectedUserTurn::Other),
+                SessionEntry::Custom(custom) if custom.custom_type == "checkpoint" => {
+                    if let Some(id) = &custom.base.id {
+                        checkpoint_positions.insert(id.clone(), projected.len());
+                    }
+                }
+                SessionEntry::Custom(custom) if custom.custom_type == "rewind" => {
+                    let checkpoint_entry_id = custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("checkpointEntryId"))
+                        .and_then(Value::as_str);
+                    let Some(boundary) = checkpoint_entry_id
+                        .and_then(|id| checkpoint_positions.get(id))
+                        .copied()
+                    else {
+                        return;
+                    };
+                    projected.truncate(boundary);
+                    checkpoint_positions.retain(|_, position| *position <= boundary);
+                    let has_report = custom
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("summary"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|summary| !summary.is_empty());
+                    if has_report {
+                        projected.push(ProjectedUserTurn::NotUser);
+                    }
+                }
+                _ => {}
+            };
+
+            if let Some(compaction_index) = last_compaction {
+                let SessionEntry::Compaction(compaction) = path[compaction_index] else {
+                    return Err(Error::session("RPC retry compaction projection drifted"));
+                };
+                let has_kept_entry = path.iter().any(|entry| {
+                    entry
+                        .base_id()
+                        .is_some_and(|id| id == &compaction.first_kept_entry_id)
+                });
+                let mut keep = false;
+                let mut past_compaction = false;
+                for (index, entry) in path.iter().enumerate() {
+                    if index == compaction_index {
+                        past_compaction = true;
+                    }
+                    if !keep {
+                        if has_kept_entry {
+                            if entry
+                                .base_id()
+                                .is_some_and(|id| id == &compaction.first_kept_entry_id)
+                            {
+                                keep = true;
+                            } else {
+                                continue;
+                            }
+                        } else if past_compaction {
+                            keep = true;
+                        } else {
+                            continue;
+                        }
+                    }
+                    append_entry(entry);
+                }
+            } else {
+                for entry in path {
+                    append_entry(entry);
+                }
+            }
+
+            projected
+                .into_iter()
+                .rev()
+                .find(|turn| !matches!(turn, ProjectedUserTurn::NotUser))
+        };
+
+        let Some(ProjectedUserTurn::Text { entry_id, text }) = selected else {
             return Ok(None);
         };
-        match last_user {
-            Message::User(UserMessage {
-                content: UserContent::Text(text),
-                ..
-            }) => text.clone(),
-            Message::User(UserMessage {
-                content: UserContent::Blocks(_),
-                ..
-            }) => return Ok(None),
-            _ => return Ok(None),
+
+        if !inner.navigate_to(&entry_id) || !inner.revert_last_user_message() {
+            return Err(Error::session(
+                "RPC retry found a projected user turn but could not rewind to its durable entry",
+            ));
         }
+        (text, inner.to_messages_for_current_path())
     };
 
-    if !session.revert_last_user_message().await? {
-        return Err(Error::session(
-            "RPC retry found a user turn but could not rewind the active session path",
-        ));
-    }
+    session.agent.replace_messages(messages);
     Ok(Some(text))
 }
 
@@ -9360,7 +9465,7 @@ export default function init(pi) {
             .expect("runtime build");
 
         runtime.block_on(async {
-            let prompt = build_user_message("retry this durable turn", &[]);
+            let prompt = build_user_message("[REWIND REPORT: literal user prompt", &[]);
             let mut inner = Session::in_memory();
             let original_user_id = inner.append_model_message(prompt.clone());
             let original_assistant_id = inner.append_model_message(Message::Assistant(Arc::new(
@@ -9385,7 +9490,7 @@ export default function init(pi) {
                 .await
                 .expect("rewind retry path")
                 .expect("retryable user turn");
-            assert_eq!(text, "retry this durable turn");
+            assert_eq!(text, "[REWIND REPORT: literal user prompt");
 
             let cx = AgentCx::for_request();
             let mut rewound = agent_session
@@ -9415,7 +9520,7 @@ export default function init(pi) {
                         Message::User(UserMessage {
                             content: UserContent::Text(text),
                             ..
-                        }) if text == "retry this durable turn"
+                        }) if text == "[REWIND REPORT: literal user prompt"
                     )
                 })
                 .count();
@@ -9425,6 +9530,85 @@ export default function init(pi) {
                 original_entry_count + 1,
                 "retry must append one new branch entry without deleting the original path"
             );
+        });
+    }
+
+    #[test]
+    fn rpc_retry_uses_rewind_aware_durable_user_provenance() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let original_prompt = build_user_message("retry before checkpoint", &[]);
+            let hidden_prompt = build_user_message("hidden after checkpoint", &[]);
+            let mut inner = Session::in_memory();
+            let original_user_id = inner.append_model_message(original_prompt.clone());
+            inner.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("original response"))],
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::default()
+            })));
+            let checkpoint_id = inner.append_custom_entry(
+                "checkpoint".to_string(),
+                Some(json!({"name": "before-hidden-turn"})),
+            );
+            let hidden_user_id = inner.append_model_message(hidden_prompt);
+            inner.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("hidden response"))],
+                stop_reason: StopReason::Stop,
+                ..AssistantMessage::default()
+            })));
+            let rewind_id = inner.append_custom_entry(
+                "rewind".to_string(),
+                Some(json!({
+                    "checkpoint": "before-hidden-turn",
+                    "checkpointEntryId": checkpoint_id,
+                    "summary": "discard the later turn"
+                })),
+            );
+            let projected_messages = inner.to_messages_for_current_path();
+            let original_entry_count = inner.entries.len();
+            let mut agent_session = build_test_agent_session(inner);
+            agent_session.agent.replace_messages(projected_messages);
+
+            let text = take_last_rpc_user_turn_for_retry(&mut agent_session)
+                .await
+                .expect("rewind-aware retry path")
+                .expect("retryable projected user turn");
+            assert_eq!(text, "retry before checkpoint");
+
+            let cx = AgentCx::for_request();
+            let mut rewound = agent_session
+                .session
+                .lock(&cx)
+                .await
+                .expect("rewound session lock");
+            for preserved_id in [&original_user_id, &hidden_user_id, &rewind_id] {
+                assert!(
+                    rewound.get_entry(preserved_id).is_some(),
+                    "retry must preserve every entry on the abandoned rewind branch"
+                );
+            }
+            assert_eq!(rewound.entries.len(), original_entry_count);
+            assert!(rewound.to_messages_for_current_path().is_empty());
+
+            rewound.append_model_message(build_user_message(&text, &[]));
+            let retry_prompt_count = rewound
+                .to_messages_for_current_path()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        Message::User(UserMessage {
+                            content: UserContent::Text(text),
+                            ..
+                        }) if text == "retry before checkpoint"
+                    )
+                })
+                .count();
+            assert_eq!(retry_prompt_count, 1);
+            assert_eq!(rewound.entries.len(), original_entry_count + 1);
         });
     }
 

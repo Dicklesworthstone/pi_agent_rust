@@ -2147,22 +2147,60 @@ fn required_e2e_metric_failure(
 fn cross_runtime_comparison_contract_failure(
     path: &Path,
     payload: &Value,
-    full_e2e: Option<&Value>,
 ) -> Option<DataContractFailure> {
     const MATCHED_COMPARISON_BASIS: &str = "matched_legacy_pi_mono_extension_loader";
+    const REQUIRED_LAYERS: [&str; 3] = [
+        "cold_load_init",
+        "per_call_dispatch_micro",
+        "full_e2e_long_session",
+    ];
 
-    let node_ratio_basis = full_e2e
-        .and_then(|row| row.pointer("/relative_metrics/rust_vs_node_ratio_basis"))
-        .and_then(Value::as_str);
-    let bun_ratio_basis = full_e2e
-        .and_then(|row| row.pointer("/relative_metrics/rust_vs_bun_ratio_basis"))
-        .and_then(Value::as_str);
-    let evidence_state = full_e2e
-        .and_then(|row| row.get("evidence_state"))
-        .and_then(Value::as_str);
-    let confidence = full_e2e
-        .and_then(|row| row.get("confidence"))
-        .and_then(Value::as_str);
+    let mut observed_layer_contracts = BTreeMap::new();
+    let mut duplicate_or_unexpected_layer = false;
+    if let Some(layers) = payload.get("layers").and_then(Value::as_array) {
+        for layer in layers {
+            let Some(layer_id) = layer.get("layer_id").and_then(Value::as_str) else {
+                duplicate_or_unexpected_layer = true;
+                continue;
+            };
+            if !REQUIRED_LAYERS.contains(&layer_id)
+                || observed_layer_contracts.contains_key(layer_id)
+            {
+                duplicate_or_unexpected_layer = true;
+                continue;
+            }
+            let absolute = layer
+                .pointer("/absolute_metrics/value")
+                .and_then(Value::as_f64);
+            let node_ratio = layer
+                .pointer("/relative_metrics/rust_vs_node_ratio")
+                .and_then(Value::as_f64);
+            let bun_ratio = layer
+                .pointer("/relative_metrics/rust_vs_bun_ratio")
+                .and_then(Value::as_f64);
+            let matched = is_positive_finite_metric(absolute)
+                && is_positive_finite_metric(node_ratio)
+                && is_positive_finite_metric(bun_ratio)
+                && layer
+                    .pointer("/relative_metrics/rust_vs_node_ratio_basis")
+                    .and_then(Value::as_str)
+                    == Some(MATCHED_COMPARISON_BASIS)
+                && layer
+                    .pointer("/relative_metrics/rust_vs_bun_ratio_basis")
+                    .and_then(Value::as_str)
+                    == Some(MATCHED_COMPARISON_BASIS)
+                && layer.get("evidence_state").and_then(Value::as_str) == Some("measured")
+                && layer.get("confidence").and_then(Value::as_str) == Some("high");
+            observed_layer_contracts.insert(layer_id.to_string(), matched);
+        }
+    } else {
+        duplicate_or_unexpected_layer = true;
+    }
+    let exact_layers_valid = !duplicate_or_unexpected_layer
+        && observed_layer_contracts.len() == REQUIRED_LAYERS.len()
+        && REQUIRED_LAYERS
+            .iter()
+            .all(|layer_id| observed_layer_contracts.get(*layer_id) == Some(&true));
     let contract_schema = payload
         .pointer("/claim_integrity/cross_runtime_comparison/contract_schema")
         .and_then(Value::as_str);
@@ -2182,43 +2220,33 @@ fn cross_runtime_comparison_contract_failure(
     let true_legacy_record_count = payload
         .pointer("/claim_integrity/cross_runtime_comparison/true_legacy_pi_mono_record_count")
         .and_then(Value::as_u64);
-    let full_e2e_contract_matched = payload
-        .pointer(
-            "/claim_integrity/cross_runtime_comparison/matched_layer_contracts/full_e2e_long_session",
-        )
-        .and_then(Value::as_bool);
-    let cold_load_contract_matched = payload
-        .pointer(
-            "/claim_integrity/cross_runtime_comparison/matched_layer_contracts/cold_load_init",
-        )
-        .and_then(Value::as_bool);
-    let per_call_contract_matched = payload
-        .pointer(
-            "/claim_integrity/cross_runtime_comparison/matched_layer_contracts/per_call_dispatch_micro",
-        )
-        .and_then(Value::as_bool);
+    let declared_layer_contracts = payload
+        .pointer("/claim_integrity/cross_runtime_comparison/matched_layer_contracts")
+        .and_then(Value::as_object);
+    let declared_layers_valid = declared_layer_contracts.is_some_and(|declared| {
+        declared.len() == REQUIRED_LAYERS.len()
+            && REQUIRED_LAYERS.iter().all(|layer_id| {
+                declared.get(*layer_id).and_then(Value::as_bool)
+                    == observed_layer_contracts.get(*layer_id).copied()
+                    && observed_layer_contracts.get(*layer_id) == Some(&true)
+            })
+    });
 
-    let valid = node_ratio_basis == Some(MATCHED_COMPARISON_BASIS)
-        && bun_ratio_basis == Some(MATCHED_COMPARISON_BASIS)
-        && evidence_state == Some("measured")
-        && confidence == Some("high")
+    let valid = exact_layers_valid
+        && declared_layers_valid
         && contract_schema == Some("pi.perf.cross_runtime_comparison.v1")
         && legacy_required == Some(true)
         && exact_contract_required == Some(true)
         && portable_shim_record_count == Some(0)
-        && true_legacy_record_count == Some(10)
-        && cold_load_contract_matched == Some(true)
-        && per_call_contract_matched == Some(true)
-        && full_e2e_contract_matched == Some(true);
+        && true_legacy_record_count == Some(10);
 
     (!valid).then(|| DataContractFailure {
         contract_id: "invalid_cross_runtime_comparison_contract".to_string(),
         budget_name: None,
         detail: format!(
-            "full_e2e_long_session ratios require evidence_state=measured, confidence=high, basis={MATCHED_COMPARISON_BASIS}, contract_schema=pi.perf.cross_runtime_comparison.v1, legacy flags=true, portable_shim_record_count=0, true_legacy_pi_mono_record_count=10, and matched_layer_contracts.full_e2e_long_session=true (evidence_state={evidence_state:?}, confidence={confidence:?}, node_basis={node_ratio_basis:?}, bun_basis={bun_ratio_basis:?}, contract_schema={contract_schema:?}, legacy_required={}, exact_contract_required={}, portable_count={portable_shim_record_count:?}, true_legacy_count={true_legacy_record_count:?}, full_e2e_matched={}) in {}",
+            "all three exact layers require finite positive absolute/Node/Bun values, evidence_state=measured, confidence=high, basis={MATCHED_COMPARISON_BASIS}, and matching declarations; source counts and comparison flags must also be canonical (observed_layers={observed_layer_contracts:?}, declared_layers={declared_layer_contracts:?}, contract_schema={contract_schema:?}, legacy_required={}, exact_contract_required={}, portable_count={portable_shim_record_count:?}, true_legacy_count={true_legacy_record_count:?}) in {}",
             required_bool_state(legacy_required),
             required_bool_state(exact_contract_required),
-            required_bool_state(full_e2e_contract_matched),
             path.display()
         ),
         remediation:
@@ -2428,6 +2456,186 @@ fn evaluate_phase1_weighted_attribution_contract(
         "measurement_boundary": "production_session_stage_instrumentation",
         "measurement_contract_version": "production_session_stage_instrumentation.v1"
     });
+    const REQUIRED_PARTITIONS: [&str; 2] = ["matched-state", "realistic"];
+    const REQUIRED_SESSION_SIZES: [u64; 5] = [
+        100_000,
+        200_000,
+        500_000,
+        1_000_000,
+        5_000_000,
+    ];
+    const REQUIRED_STAGES: [&str; 4] = ["open_ms", "append_ms", "save_ms", "index_ms"];
+    const REQUIRED_SWARM_GROUPS: [(&str, &[&str]); 6] = [
+        ("latency_quantiles_ms", &["p50", "p95", "p99", "p999"]),
+        ("queue_depth", &["p50", "p95", "p99", "p999", "max"]),
+        ("resource_usage", &["rss_mb", "cpu_pct"]),
+        (
+            "component_breakdown_ms",
+            &["tool", "provider", "extension", "session"],
+        ),
+        ("stage_breakdown_ms", &["open", "append", "save", "index"]),
+        (
+            "host_capacity",
+            &["target_cpu_cores", "observed_cpu_cores", "mem_total_mb"],
+        ),
+    ];
+    let expected_cell_keys = REQUIRED_PARTITIONS
+        .iter()
+        .flat_map(|partition| {
+            REQUIRED_SESSION_SIZES
+                .iter()
+                .map(move |size| ((*partition).to_string(), *size))
+        })
+        .collect::<BTreeSet<_>>();
+    let required_partitions_valid = payload
+        .pointer("/matrix_requirements/required_partition_tags")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.len() == REQUIRED_PARTITIONS.len()
+                && values
+                    .iter()
+                    .zip(REQUIRED_PARTITIONS)
+                    .all(|(value, expected)| value.as_str() == Some(expected))
+        });
+    let required_sizes_valid = payload
+        .pointer("/matrix_requirements/required_session_message_sizes")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values.len() == REQUIRED_SESSION_SIZES.len()
+                && values
+                    .iter()
+                    .zip(REQUIRED_SESSION_SIZES)
+                    .all(|(value, expected)| value.as_u64() == Some(expected))
+        });
+    let required_cell_count = payload
+        .pointer("/matrix_requirements/required_cell_count")
+        .and_then(Value::as_u64);
+    let mut matrix_contract_errors = Vec::new();
+    if !required_partitions_valid
+        || !required_sizes_valid
+        || required_cell_count != Some(expected_cell_keys.len() as u64)
+    {
+        matrix_contract_errors.push("canonical matrix requirements mismatch".to_string());
+    }
+    let mut observed_cell_keys = BTreeSet::new();
+    let mut observed_valid_matrix_cell_count = 0_u64;
+    if let Some(matrix_cells) = payload.get("matrix_cells").and_then(Value::as_array) {
+        if matrix_cells.len() != expected_cell_keys.len() {
+            matrix_contract_errors.push(format!(
+                "matrix cell count {} does not equal {}",
+                matrix_cells.len(),
+                expected_cell_keys.len()
+            ));
+        }
+        for (index, cell) in matrix_cells.iter().enumerate() {
+            let Some(cell_object) = cell.as_object() else {
+                matrix_contract_errors.push(format!("matrix cell {index} is not an object"));
+                continue;
+            };
+            let partition = cell_object
+                .get("workload_partition")
+                .and_then(Value::as_str);
+            let session_messages = cell_object
+                .get("session_messages")
+                .and_then(Value::as_u64);
+            let Some((partition, session_messages)) = partition.zip(session_messages) else {
+                matrix_contract_errors.push(format!("matrix cell {index} identity is invalid"));
+                continue;
+            };
+            let cell_key = (partition.to_string(), session_messages);
+            if !observed_cell_keys.insert(cell_key.clone()) {
+                matrix_contract_errors.push(format!("matrix cell {index} duplicates {cell_key:?}"));
+            }
+            let missing_reasons_empty = cell_object
+                .get("missing_reasons")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty);
+            let stage = cell_object
+                .get("stage_attribution")
+                .and_then(Value::as_object);
+            let stage_values = REQUIRED_STAGES.map(|stage_name| {
+                stage
+                    .and_then(|values| values.get(stage_name))
+                    .and_then(Value::as_f64)
+            });
+            let stages_valid = stage_values
+                .iter()
+                .all(|value| value.is_some_and(|metric| metric.is_finite() && metric >= 0.0));
+            let observed_stage_total = stages_valid
+                .then(|| stage_values.iter().flatten().sum::<f64>());
+            let reported_stage_total = stage
+                .and_then(|values| values.get("total_stage_ms"))
+                .and_then(Value::as_f64);
+            let stage_total_valid = reported_stage_total.is_some_and(|reported| {
+                reported.is_finite()
+                    && reported > 0.0
+                    && observed_stage_total.is_some_and(|observed| {
+                        (reported - observed).abs() <= 1e-9 * observed.abs().max(1.0)
+                    })
+            });
+            let primary_valid = cell_object
+                .get("primary_e2e")
+                .and_then(Value::as_object)
+                .is_some_and(|primary| {
+                    ["wall_clock_ms", "rust_vs_node_ratio", "rust_vs_bun_ratio"]
+                        .iter()
+                        .all(|field| {
+                            primary.get(*field).and_then(Value::as_f64).is_some_and(
+                                |metric| metric.is_finite() && metric > 0.0,
+                            )
+                        })
+                });
+            let swarm_valid = cell_object
+                .get("swarm_metrics")
+                .and_then(Value::as_object)
+                .is_some_and(|swarm| {
+                    swarm.len() == REQUIRED_SWARM_GROUPS.len()
+                        && REQUIRED_SWARM_GROUPS.iter().all(|(group_name, fields)| {
+                            swarm
+                                .get(*group_name)
+                                .and_then(Value::as_object)
+                                .is_some_and(|group| {
+                                    group.len() == fields.len()
+                                        && fields.iter().all(|field| {
+                                            group.get(*field).and_then(Value::as_f64).is_some_and(
+                                                |metric| metric.is_finite() && metric >= 0.0,
+                                            )
+                                        })
+                                })
+                        })
+                });
+            let cell_valid = expected_cell_keys.contains(&cell_key)
+                && cell_object.get("status").and_then(Value::as_str) == Some("pass")
+                && missing_reasons_empty
+                && stages_valid
+                && stage_total_valid
+                && primary_valid
+                && swarm_valid;
+            if cell_valid {
+                observed_valid_matrix_cell_count += 1;
+            } else {
+                matrix_contract_errors.push(format!(
+                    "matrix cell {index} is not complete measured pass evidence"
+                ));
+            }
+        }
+    } else {
+        matrix_contract_errors.push("matrix_cells must be an array".to_string());
+    }
+    if observed_cell_keys != expected_cell_keys {
+        matrix_contract_errors.push("matrix cell identity set mismatch".to_string());
+    }
+    if !matrix_contract_errors.is_empty() {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_phase1_matrix_validation_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "phase1 matrix is not the exact complete measured Cartesian product ({matrix_contract_errors:?}) in {}",
+                path.display()
+            ),
+            remediation: "Regenerate the exact matched-state/realistic 100k-5m matrix with passing stage, swarm, primary, and lineage evidence.".to_string(),
+        });
+    }
     let mut invalid_pass_cell_lineage = Vec::new();
     if let Some(matrix_cells) = payload.get("matrix_cells").and_then(Value::as_array) {
         let expected_evidence = required_evidence_contract
@@ -2607,6 +2815,19 @@ fn evaluate_phase1_weighted_attribution_contract(
             });
         }
     }
+    if valid_cell_count != observed_valid_matrix_cell_count {
+        failures.push(DataContractFailure {
+            contract_id: "invalid_weighted_bottleneck_attribution_contract".to_string(),
+            budget_name: None,
+            detail: format!(
+                "weighted_bottleneck_attribution.lineage.valid_cell_count ({valid_cell_count}) must equal independently observed complete pass cells ({observed_valid_matrix_cell_count}) in {}",
+                path.display()
+            ),
+            remediation:
+                "Recompute weighted attribution only from exact complete measured matrix cells."
+                    .to_string(),
+        });
+    }
 
     let per_scale_len = per_scale.map_or(0, Vec::len);
     let global_ranking_len = global_ranking.map_or(0, Vec::len);
@@ -2704,11 +2925,7 @@ fn evaluate_required_e2e_ratio_contract(
     if let Some(failure) = required_e2e_metric_failure(&path, full_e2e_rows.first().copied()) {
         failures.push(failure);
     }
-    if let Some(failure) = cross_runtime_comparison_contract_failure(
-        &path,
-        &payload,
-        full_e2e_rows.first().copied(),
-    ) {
+    if let Some(failure) = cross_runtime_comparison_contract_failure(&path, &payload) {
         failures.push(failure);
     }
     if let Some(failure) =
@@ -6872,6 +7089,8 @@ fn write_stratification_artifact_with_claim_guard(
     let mut layers = vec![
         json!({
             "layer_id": "cold_load_init",
+            "evidence_state": "measured",
+            "confidence": "high",
             "absolute_metrics": {"value": 10.0},
             "relative_metrics": {
                 "rust_vs_node_ratio": 2.1,
@@ -6882,6 +7101,8 @@ fn write_stratification_artifact_with_claim_guard(
         }),
         json!({
             "layer_id": "per_call_dispatch_micro",
+            "evidence_state": "measured",
+            "confidence": "high",
             "absolute_metrics": {"value": 40.0},
             "relative_metrics": {
                 "rust_vs_node_ratio": 2.0,
@@ -6943,6 +7164,53 @@ fn write_stratification_artifact_with_claim_guard(
     .expect("write stratification artifact");
 }
 
+fn phase1_swarm_metrics_fixture(seed: f64) -> Value {
+    json!({
+        "latency_quantiles_ms": {
+            "p50": seed,
+            "p95": seed + 1.0,
+            "p99": seed + 2.0,
+            "p999": seed + 3.0
+        },
+        "queue_depth": {"p50": 1.0, "p95": 2.0, "p99": 3.0, "p999": 4.0, "max": 5.0},
+        "resource_usage": {"rss_mb": 128.0, "cpu_pct": 50.0},
+        "component_breakdown_ms": {"tool": 10.0, "provider": 20.0, "extension": 5.0, "session": 7.0},
+        "stage_breakdown_ms": {"open": 48.0, "append": 36.0, "save": 22.0, "index": 11.0},
+        "host_capacity": {"target_cpu_cores": 4.0, "observed_cpu_cores": 8.0, "mem_total_mb": 65_536.0}
+    })
+}
+
+fn phase1_matrix_cell_fixture(partition: &str, session_messages: u64, seed: f64) -> Value {
+    json!({
+        "workload_partition": partition,
+        "session_messages": session_messages,
+        "scenario_id": format!("{partition}/session_{session_messages}"),
+        "status": "pass",
+        "missing_reasons": [],
+        "stage_attribution": {
+            "open_ms": 48.0,
+            "append_ms": 36.0,
+            "save_ms": 22.0,
+            "index_ms": 11.0,
+            "total_stage_ms": 117.0
+        },
+        "swarm_metrics": phase1_swarm_metrics_fixture(seed),
+        "primary_e2e": {
+            "wall_clock_ms": 120.0,
+            "rust_vs_node_ratio": 0.8,
+            "rust_vs_bun_ratio": 0.9
+        },
+        "lineage": {
+            "evidence_class": "measured",
+            "confidence": "high",
+            "eligible_for_regression_gate": true,
+            "measurement_method": "wall_clock_observation",
+            "measurement_boundary": "production_session_stage_instrumentation",
+            "measurement_contract_version": "production_session_stage_instrumentation.v1"
+        }
+    })
+}
+
 fn valid_weighted_bottleneck_attribution_fixture() -> Value {
     json!({
         "schema": "pi.perf.phase1_weighted_bottleneck_attribution.v1",
@@ -6988,66 +7256,37 @@ fn valid_weighted_bottleneck_attribution_fixture() -> Value {
                 "mean_share_pct": 41.4,
                 "ci95_lower_pct": 40.8,
                 "ci95_upper_pct": 42.0,
-                "sample_size": 2
+                "sample_size": 10
             }
         ],
         "lineage": {
             "source_stream": "phase1_matrix_validation.matrix_cells",
-            "source_cell_count": 2,
-            "valid_cell_count": 2
+            "source_cell_count": 10,
+            "valid_cell_count": 10
         }
     })
 }
 
 fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attribution: &Value) {
+    let required_sizes = [100_000_u64, 200_000, 500_000, 1_000_000, 5_000_000];
+    let matrix_cells = ["matched-state", "realistic"]
+        .into_iter()
+        .flat_map(|partition| {
+            required_sizes.into_iter().enumerate().map(move |(index, size)| {
+                phase1_matrix_cell_fixture(partition, size, 10.0 + index as f64)
+            })
+        })
+        .collect::<Vec<_>>();
     let payload = json!({
         "schema": "pi.perf.phase1_matrix_validation.v1",
         "run_id": "20260217T000000Z",
         "correlation_id": "abc123def456",
-        "matrix_cells": [
-            {
-                "workload_partition": "matched-state",
-                "session_messages": 100_000,
-                "scenario_id": "matched-state/session_100000",
-                "status": "pass",
-                "stage_attribution": {
-                    "open_ms": 48.0,
-                    "append_ms": 36.0,
-                    "save_ms": 22.0,
-                    "index_ms": 11.0,
-                    "total_stage_ms": 117.0
-                },
-                "lineage": {
-                    "evidence_class": "measured",
-                    "confidence": "high",
-                    "eligible_for_regression_gate": true,
-                    "measurement_method": "wall_clock_observation",
-                    "measurement_boundary": "production_session_stage_instrumentation",
-                    "measurement_contract_version": "production_session_stage_instrumentation.v1"
-                }
-            },
-            {
-                "workload_partition": "realistic",
-                "session_messages": 100_000,
-                "scenario_id": "realistic/session_100000",
-                "status": "pass",
-                "stage_attribution": {
-                    "open_ms": 44.0,
-                    "append_ms": 32.0,
-                    "save_ms": 19.0,
-                    "index_ms": 10.0,
-                    "total_stage_ms": 105.0
-                },
-                "lineage": {
-                    "evidence_class": "measured",
-                    "confidence": "high",
-                    "eligible_for_regression_gate": true,
-                    "measurement_method": "wall_clock_observation",
-                    "measurement_boundary": "production_session_stage_instrumentation",
-                    "measurement_contract_version": "production_session_stage_instrumentation.v1"
-                }
-            }
-        ],
+        "matrix_requirements": {
+            "required_partition_tags": ["matched-state", "realistic"],
+            "required_session_message_sizes": required_sizes,
+            "required_cell_count": 10
+        },
+        "matrix_cells": matrix_cells,
         "regression_guards": {
             "memory": "pass",
             "correctness": "pass",
@@ -7062,7 +7301,28 @@ fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attr
                 "measurement_method": "wall_clock_observation",
                 "measurement_boundary": "production_session_stage_instrumentation",
                 "measurement_contract_version": "production_session_stage_instrumentation.v1"
-            }
+            },
+            "cells_with_complete_stage_breakdown": 10,
+            "cells_missing_stage_breakdown": 0,
+            "covered_cells": 10,
+            "missing_cells": []
+        },
+        "swarm_summary": {
+            "required_latency_quantiles": ["p50", "p95", "p99", "p999"],
+            "required_queue_depth_quantiles": ["p50", "p95", "p99", "p999", "max"],
+            "required_resource_usage_keys": ["rss_mb", "cpu_pct"],
+            "required_component_breakdown_keys": ["tool", "provider", "extension", "session"],
+            "required_stage_breakdown_keys": ["open", "append", "save", "index"],
+            "cells_with_complete_swarm_metrics": 10,
+            "cells_missing_swarm_metrics": 0,
+            "missing_cells": []
+        },
+        "primary_outcomes": {
+            "status": "pass",
+            "wall_clock_ms": 120.0,
+            "rust_vs_node_ratio": 0.8,
+            "rust_vs_bun_ratio": 0.9,
+            "missing_reasons": []
         },
         "consumption_contract": {
             "artifact_ready_for_phase5": true
@@ -7205,7 +7465,6 @@ fn required_e2e_ratio_contract_rejects_inferred_release_evidence() {
     assert!(
         failures.iter().any(|failure| {
             failure.contract_id == "invalid_cross_runtime_comparison_contract"
-                && failure.detail.contains("evidence_state=Some(\"inferred\")")
         }),
         "expected inferred release evidence failure, got: {failures:?}",
     );
@@ -7423,6 +7682,37 @@ fn phase1_weighted_contract_rejects_inferred_passing_cell_lineage() {
                 && failure.detail.contains("invalid_pass_cell_indexes=[0]")
         }),
         "inferred pass-cell lineage must not satisfy the Phase-5 consumer: {failures:?}"
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_rejects_ready_artifact_with_failed_matrix_cell() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    write_phase1_matrix_validation_artifact(
+        &artifact,
+        &valid_weighted_bottleneck_attribution_fixture(),
+    );
+    let mut payload: Value = serde_json::from_slice(
+        &std::fs::read(&artifact).expect("read phase1 fixture"),
+    )
+    .expect("parse phase1 fixture");
+    payload["matrix_cells"][0]["status"] = json!("fail");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&payload).expect("serialize mutated phase1 fixture"),
+    )
+    .expect("write mutated phase1 fixture");
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_phase1_matrix_validation_contract"
+                && failure.detail.contains("not complete measured pass evidence")
+        }),
+        "artifact_ready_for_phase5=true must not override a failed matrix cell: {failures:?}"
     );
 }
 
