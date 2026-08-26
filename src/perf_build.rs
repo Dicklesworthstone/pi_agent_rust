@@ -1082,6 +1082,93 @@ pub fn profile_from_target_path(path: &Path) -> Option<String> {
     Some(candidate.to_string())
 }
 
+/// Create a normalized target-relative output directory without traversing a
+/// symlink. RCH only returns selected subtrees beneath the active Cargo target,
+/// so benchmark producers use this helper to place evidence in a supported
+/// return path without trusting a controller-absolute environment value.
+pub fn prepare_target_output_dir(target_dir: &Path, subdir: &Path) -> Result<PathBuf, String> {
+    if subdir.as_os_str().is_empty()
+        || subdir.is_absolute()
+        || !subdir
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "target output subdir must be a non-empty, normalized relative path: {}",
+            subdir.display()
+        ));
+    }
+
+    std::fs::create_dir_all(target_dir)
+        .map_err(|error| format!("create CARGO_TARGET_DIR {}: {error}", target_dir.display()))?;
+    let canonical_target = std::fs::canonicalize(target_dir).map_err(|error| {
+        format!(
+            "canonicalize CARGO_TARGET_DIR {}: {error}",
+            target_dir.display()
+        )
+    })?;
+    let output_dir = target_dir.join(subdir);
+    let mut candidate = target_dir.to_path_buf();
+    for component in subdir.components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(format!(
+                "target output subdir contains an invalid component: {}",
+                subdir.display()
+            ));
+        };
+        candidate.push(part);
+        let metadata = match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&candidate).map_err(|create_error| {
+                    format!(
+                        "create target output component {}: {create_error}",
+                        candidate.display()
+                    )
+                })?;
+                std::fs::symlink_metadata(&candidate).map_err(|inspect_error| {
+                    format!(
+                        "inspect created target output component {}: {inspect_error}",
+                        candidate.display()
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect target output component {}: {error}",
+                    candidate.display()
+                ));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "target output subdir must not traverse a symlink: {}",
+                candidate.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "target output component is not a directory: {}",
+                candidate.display()
+            ));
+        }
+    }
+
+    let canonical_output = std::fs::canonicalize(&output_dir).map_err(|error| {
+        format!(
+            "canonicalize target output subdir {}: {error}",
+            output_dir.display()
+        )
+    })?;
+    if !canonical_output.starts_with(&canonical_target) {
+        return Err(format!(
+            "target output subdir escapes CARGO_TARGET_DIR: {}",
+            canonical_output.display()
+        ));
+    }
+    Ok(canonical_output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

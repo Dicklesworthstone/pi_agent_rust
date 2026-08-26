@@ -322,6 +322,11 @@ fn perf_output_path(name: &str) -> PathBuf {
             }
         },
     );
+    if let Some(subdir) = std::env::var_os("BENCH_OUTPUT_TARGET_SUBDIR") {
+        return perf_build::prepare_target_output_dir(&target_dir, Path::new(&subdir))
+            .unwrap_or_else(|message| panic!("{message}"))
+            .join(name);
+    }
     target_dir.join("perf").join(name)
 }
 

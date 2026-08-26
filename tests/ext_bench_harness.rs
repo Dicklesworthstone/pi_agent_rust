@@ -51,6 +51,7 @@ use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::perf_build;
 use pi::tools::ToolRegistry;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -334,6 +335,10 @@ fn output_dir() -> PathBuf {
             }
         },
     );
+    if let Some(subdir) = std::env::var_os("BENCH_OUTPUT_TARGET_SUBDIR") {
+        return perf_build::prepare_target_output_dir(&target_dir, Path::new(&subdir))
+            .unwrap_or_else(|message| panic!("{message}"));
+    }
     target_dir.join("perf")
 }
 
