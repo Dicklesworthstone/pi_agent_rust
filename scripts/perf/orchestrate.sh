@@ -4905,11 +4905,11 @@ criterion_required_inputs = {
         "startup/list_models/warm/new/estimates.json",
     ],
     "criterion_semantic_context": [
-        "semantic_context/graph_build_cold/large_workspace/new/estimates.json",
-        "semantic_context/graph_build_warm/large_workspace/new/estimates.json",
-        "semantic_context/incremental_update/large_workspace/new/estimates.json",
-        "semantic_context/planning/large_workspace/new/estimates.json",
-        "semantic_context/bundle_serialization/large_workspace/new/estimates.json",
+        "semantic_context/graph_build_cold/large_workspace/new/sample.json",
+        "semantic_context/graph_build_warm/large_workspace/new/sample.json",
+        "semantic_context/incremental_update/large_workspace/new/sample.json",
+        "semantic_context/planning/large_workspace/new/sample.json",
+        "semantic_context/bundle_serialization/large_workspace/new/sample.json",
     ],
 }
 for suite, relative_paths in criterion_required_inputs.items():

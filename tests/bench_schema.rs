@@ -1075,6 +1075,11 @@ if [[ -n "$bench_name" ]]; then
     mkdir -p "$(dirname "$path")"
     printf '%s\n' '{"mean":{"point_estimate":1.0},"median":{"point_estimate":1.0},"median_abs_dev":{"point_estimate":0.0}}' >"$path"
   }
+  write_sample() {
+    local path="$criterion_root/$1"
+    mkdir -p "$(dirname "$path")"
+    printf '%s\n' '{"sampling_mode":"Linear","iters":[1.0,1.0,1.0,1.0],"times":[1.0,1.0,1.0,1.0]}' >"$path"
+  }
   case "$bench_name" in
     tools)
       write_estimate "truncation/head/1000/new/estimates.json"
@@ -1104,12 +1109,12 @@ if [[ -n "$bench_name" ]]; then
       ;;
     semantic_context)
       for relative in \
-        semantic_context/graph_build_cold/large_workspace/new/estimates.json \
-        semantic_context/graph_build_warm/large_workspace/new/estimates.json \
-        semantic_context/incremental_update/large_workspace/new/estimates.json \
-        semantic_context/planning/large_workspace/new/estimates.json \
-        semantic_context/bundle_serialization/large_workspace/new/estimates.json; do
-        write_estimate "$relative"
+        semantic_context/graph_build_cold/large_workspace/new/sample.json \
+        semantic_context/graph_build_warm/large_workspace/new/sample.json \
+        semantic_context/incremental_update/large_workspace/new/sample.json \
+        semantic_context/planning/large_workspace/new/sample.json \
+        semantic_context/bundle_serialization/large_workspace/new/sample.json; do
+        write_sample "$relative"
       done
       mkdir -p "$criterion_root/context_intelligence"
       cat >"$criterion_root/context_intelligence/perf_budget.json" <<JSON

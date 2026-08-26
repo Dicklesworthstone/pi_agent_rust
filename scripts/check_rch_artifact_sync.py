@@ -146,7 +146,7 @@ def load_config_rules(config_file: Path) -> tuple[list[IgnoreRule], list[str]]:
             continue
         # Preserve the exact pattern bytes RCH hands to rsync. A backslash is an
         # rsync escape on Unix, not a portable path separator to rewrite here.
-        raw_pattern_text = raw_pattern.strip()
+        raw_pattern_text = raw_pattern
         if not raw_pattern_text:
             errors.append(
                 "RCH config transfer.exclude_patterns contains an empty "
@@ -580,6 +580,18 @@ def before_snapshots_by_path(
                 "pattern": None,
                 "reason": "before_manifest_artifact_set_invalid",
                 "message": "before manifest does not contain a generated-artifact array",
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        ]
+    if not items:
+        return {}, [
+            {
+                "path": None,
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_artifact_set_invalid",
+                "message": "before manifest generated-artifact array is empty",
                 "recommended_action": POSTCONDITION_ACTION,
             }
         ]
@@ -1337,7 +1349,9 @@ def requested_invocation_identity(args: argparse.Namespace) -> dict[str, str] | 
         "correlation_id": args.correlation_id,
         "command_digest": args.command_digest,
     }
-    supplied = {key: value for key, value in values.items() if value}
+    # An explicitly supplied empty value is still an identity request and must
+    # fail validation; it must not silently collapse into legacy unbound mode.
+    supplied = {key: value for key, value in values.items() if value is not None}
     if supplied and len(supplied) != len(values):
         missing = sorted(set(values) - set(supplied))
         raise ValueError(
@@ -1355,8 +1369,11 @@ def requested_invocation_identity(args: argparse.Namespace) -> dict[str, str] | 
             character not in "0123456789abcdef" for character in command_digest
         ):
             raise ValueError("--command-digest must be a lowercase hexadecimal SHA-256")
-        if supplied["correlation_id"].strip() != supplied["correlation_id"]:
-            raise ValueError("--correlation-id must not have leading or trailing whitespace")
+        correlation_id = supplied["correlation_id"]
+        if not correlation_id or correlation_id.strip() != correlation_id:
+            raise ValueError(
+                "--correlation-id must be non-empty without leading or trailing whitespace"
+            )
     return supplied or None
 
 

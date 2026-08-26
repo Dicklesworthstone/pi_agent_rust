@@ -376,11 +376,11 @@ const POST_GENERATION_REQUIRED_INPUT_PATHS: &[&str] = &[
     "criterion/ext_policy/evaluate/strict_deny/new/estimates.json",
     "criterion/ext_protocol/parse_and_validate/host_call_small/new/estimates.json",
     "criterion/ext_protocol/parse_and_validate/log_big/new/estimates.json",
-    "criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json",
-    "criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json",
-    "criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json",
-    "criterion/semantic_context/incremental_update/large_workspace/new/estimates.json",
-    "criterion/semantic_context/planning/large_workspace/new/estimates.json",
+    "criterion/semantic_context/bundle_serialization/large_workspace/new/sample.json",
+    "criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json",
+    "criterion/semantic_context/graph_build_warm/large_workspace/new/sample.json",
+    "criterion/semantic_context/incremental_update/large_workspace/new/sample.json",
+    "criterion/semantic_context/planning/large_workspace/new/sample.json",
     "criterion/startup/help/warm/new/estimates.json",
     "criterion/startup/list_models/warm/new/estimates.json",
     "criterion/startup/version/warm/new/estimates.json",
@@ -1466,17 +1466,17 @@ fn budget_artifact_candidates(root: &Path, budget_name: &str) -> Vec<PathBuf> {
             "criterion/startup/version/warm/new/estimates.json",
         ),
         "context_graph_build_cold_p95" => {
-            context_criterion_estimate_candidate_paths(root, "graph_build_cold")
+            context_criterion_sample_candidate_paths(root, "graph_build_cold")
         }
         "context_graph_build_warm_p95" => {
-            context_criterion_estimate_candidate_paths(root, "graph_build_warm")
+            context_criterion_sample_candidate_paths(root, "graph_build_warm")
         }
         "context_incremental_update_p95" => {
-            context_criterion_estimate_candidate_paths(root, "incremental_update")
+            context_criterion_sample_candidate_paths(root, "incremental_update")
         }
-        "context_planning_p95" => context_criterion_estimate_candidate_paths(root, "planning"),
+        "context_planning_p95" => context_criterion_sample_candidate_paths(root, "planning"),
         "context_bundle_serialization_p95" => {
-            context_criterion_estimate_candidate_paths(root, "bundle_serialization")
+            context_criterion_sample_candidate_paths(root, "bundle_serialization")
         }
         "context_bundle_estimated_bytes_max" => context_intelligence_budget_candidate_paths(root),
         "policy_eval_p99" => collect_estimate_json_files_from_bases(&criterion_base_candidates(
@@ -1746,12 +1746,12 @@ fn criterion_estimate_candidate_paths(root: &Path, relative: &str) -> Vec<PathBu
     evidence_then_target_paths(root, &[relative], &[relative])
 }
 
-fn context_criterion_relative(bench_name: &str) -> String {
-    format!("criterion/semantic_context/{bench_name}/{CONTEXT_BENCH_CASE}/new/estimates.json")
+fn context_criterion_sample_relative(bench_name: &str) -> String {
+    format!("criterion/semantic_context/{bench_name}/{CONTEXT_BENCH_CASE}/new/sample.json")
 }
 
-fn context_criterion_estimate_candidate_paths(root: &Path, bench_name: &str) -> Vec<PathBuf> {
-    let relative = context_criterion_relative(bench_name);
+fn context_criterion_sample_candidate_paths(root: &Path, bench_name: &str) -> Vec<PathBuf> {
+    let relative = context_criterion_sample_relative(bench_name);
     criterion_estimate_candidate_paths(root, &relative)
 }
 
@@ -3588,23 +3588,71 @@ fn read_criterion_startup(root: &Path, subcommand: &str) -> (Option<f64>, String
     (None, format!("no criterion data for startup/{subcommand}"))
 }
 
-fn read_criterion_context_intelligence(root: &Path, bench_name: &str) -> (Option<f64>, String) {
-    for path in context_criterion_estimate_candidate_paths(root, bench_name) {
-        if let Some(estimates) = read_json_file(&path)
-            && let Some(mean_ns) = estimates
-                .get("mean")
-                .and_then(|m| m.get("point_estimate"))
-                .and_then(Value::as_f64)
-        {
-            return (
-                Some(mean_ns / 1_000_000.0),
-                display_source_path(root, &path),
-            );
+fn criterion_sample_p95_ns(sample: &Value) -> Option<f64> {
+    let iterations = sample.get("iters")?.as_array()?;
+    let times = sample.get("times")?.as_array()?;
+    if iterations.is_empty() || iterations.len() != times.len() {
+        return None;
+    }
+    let mut per_iteration_ns = Vec::with_capacity(iterations.len());
+    for (iterations, elapsed_ns) in iterations.iter().zip(times) {
+        let iterations = iterations
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0)?;
+        let elapsed_ns = elapsed_ns
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0)?;
+        let value = elapsed_ns / iterations;
+        if !value.is_finite() || value <= 0.0 {
+            return None;
         }
+        per_iteration_ns.push(value);
+    }
+    per_iteration_ns.sort_by(f64::total_cmp);
+    let rank = (per_iteration_ns.len() * 95).div_ceil(100);
+    per_iteration_ns.get(rank.saturating_sub(1)).copied()
+}
+
+fn read_criterion_context_intelligence(root: &Path, bench_name: &str) -> (Option<f64>, String) {
+    let max_age_hours = max_artifact_age_hours();
+    let mut rejected = Vec::new();
+    for path in context_criterion_sample_candidate_paths(root, bench_name) {
+        let Some(age_hours) = artifact_age_hours(&path) else {
+            rejected.push(format!(
+                "{} (missing or timestamp unavailable)",
+                display_source_path(root, &path)
+            ));
+            continue;
+        };
+        if age_hours > max_age_hours {
+            rejected.push(format!(
+                "{} (stale: {age_hours:.2}h)",
+                display_source_path(root, &path)
+            ));
+            continue;
+        }
+        let Some(sample) = read_json_file(&path) else {
+            rejected.push(format!("{} (invalid JSON)", display_source_path(root, &path)));
+            continue;
+        };
+        let Some(p95_ns) = criterion_sample_p95_ns(&sample) else {
+            rejected.push(format!(
+                "{} (invalid positive iters/times sample)",
+                display_source_path(root, &path)
+            ));
+            continue;
+        };
+        return (
+            Some(p95_ns / 1_000_000.0),
+            display_source_path(root, &path),
+        );
     }
     (
         None,
-        format!("no criterion data for semantic_context/{bench_name}/{CONTEXT_BENCH_CASE}"),
+        format!(
+            "no fresh valid Criterion p95 sample for semantic_context/{bench_name}/{CONTEXT_BENCH_CASE}: {}",
+            rejected.join(", ")
+        ),
     )
 }
 
@@ -3843,7 +3891,7 @@ fn context_intelligence_budget_artifacts_follow_resolved_target_dir() {
 
     assert!(
         candidates.contains(&root.join(
-            "target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json"
+            "target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json"
         )),
         "context graph build budget must inspect the resolved cargo target dir: {candidates:?}"
     );
@@ -6021,11 +6069,14 @@ fn context_intelligence_budget_reader_uses_criterion_latency_and_artifact_size()
         &valid_context_intelligence_budget_artifact_fixture(),
     );
     let criterion = tmp.path().join(
-        "target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json",
+        "target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json",
     );
     write_context_intelligence_budget_artifact(
         &criterion,
-        &serde_json::json!({"mean": {"point_estimate": 99_000_000.0}}),
+        &serde_json::json!({
+            "iters": [1.0, 1.0, 1.0, 1.0],
+            "times": [10_000_000.0, 20_000_000.0, 30_000_000.0, 99_000_000.0]
+        }),
     );
 
     let (actual, source) = read_context_intelligence_budget_metric(
@@ -6037,7 +6088,7 @@ fn context_intelligence_budget_reader_uses_criterion_latency_and_artifact_size()
     assert_eq!(actual, Some(99.0));
     assert_eq!(
         source,
-        "cargo-target[0]://criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json"
+        "cargo-target[0]://criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json"
     );
 
     let (bundle_bytes, bundle_source) = read_context_intelligence_budget_metric(
@@ -6050,6 +6101,56 @@ fn context_intelligence_budget_reader_uses_criterion_latency_and_artifact_size()
         bundle_source,
         "cargo-target[0]://perf/context_intelligence_planner_budget.json"
     );
+}
+
+#[test]
+fn criterion_context_p95_rejects_malformed_or_non_positive_samples() {
+    assert_eq!(
+        criterion_sample_p95_ns(&json!({
+            "iters": [1.0, 2.0, 4.0],
+            "times": [10.0, 40.0, 60.0]
+        })),
+        Some(20.0)
+    );
+    for invalid in [
+        json!({"iters": [], "times": []}),
+        json!({"iters": [1.0], "times": []}),
+        json!({"iters": [0.0], "times": [1.0]}),
+        json!({"iters": [1.0], "times": [0.0]}),
+    ] {
+        assert_eq!(criterion_sample_p95_ns(&invalid), None);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn context_intelligence_budget_reader_rejects_stale_criterion_sample() {
+    use std::time::{Duration, SystemTime};
+
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let sample = tmp.path().join(
+        "target/criterion/semantic_context/graph_build_cold/large_workspace/new/sample.json",
+    );
+    write_context_intelligence_budget_artifact(
+        &sample,
+        &json!({"iters": [1.0], "times": [10_000_000.0]}),
+    );
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&sample)
+        .expect("open Criterion sample for timestamp mutation");
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(
+            SystemTime::now()
+                .checked_sub(Duration::from_secs(48 * 60 * 60))
+                .expect("represent old Criterion timestamp"),
+        ),
+    )
+    .expect("set stale Criterion timestamp");
+
+    let (actual, source) = read_criterion_context_intelligence(tmp.path(), "graph_build_cold");
+    assert_eq!(actual, None);
+    assert!(source.contains("stale:"), "unexpected rejection source: {source}");
 }
 
 #[test]

@@ -386,6 +386,37 @@ fn project_rch_config_uses_installed_rch_exclude_normalization() -> Result<(), B
 }
 
 #[test]
+fn project_rch_config_preserves_literal_pattern_whitespace() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    let required_path = "target-worker/perf/current.json";
+    let artifact = repo.join(required_path);
+    fs::create_dir_all(
+        artifact
+            .parent()
+            .ok_or_else(|| test_error("whitespace-pattern artifact should have a parent"))?,
+    )?;
+    fs::write(&artifact, "{\"current\":true}\n")?;
+    fs::write(repo.join(".rchignore"), "# no project-local ignore rules\n")?;
+    fs::create_dir_all(repo.join(".rch"))?;
+    fs::write(
+        repo.join(".rch/config.toml"),
+        "[transfer]\nexclude_patterns = [\" target-*/\"]\n",
+    )?;
+
+    let output = run_preflight(repo, required_path)?;
+    if !output.status.success() {
+        return Err(test_error(format!(
+            "RCH passes config pattern whitespace literally to rsync\n{}",
+            output_debug(&output)
+        )));
+    }
+    let report = parse_json(&output)?;
+    require_string_field(&report, "status", "pass")?;
+    Ok(())
+}
+
+#[test]
 fn mandatory_rch_runtime_exclude_blocks_required_artifact() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path();
@@ -962,6 +993,82 @@ fn postcondition_rejects_invocation_identity_mismatch() -> Result<(), Box<dyn Er
         return Err(test_error(format!(
             "changed bytes with the exact baseline invocation identity should pass\n{}",
             output_debug(&matching_output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_explicit_empty_invocation_identity() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    write_generated_artifact(repo, "{\"generated_at\":\"old\"}\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+
+    let output = run_postcondition_baseline_with_identity(
+        repo,
+        GENERATED_ARTIFACT,
+        &before_manifest,
+        "",
+        "",
+        "",
+    )?;
+    if output.status.success() {
+        return Err(test_error(
+            "explicit empty identity fields must not collapse into unbound mode",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let invalid_arguments = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "invalid_postcondition_arguments")
+    });
+    if !invalid_arguments {
+        return Err(test_error(format!(
+            "empty invocation identity must produce a structured argument diagnostic\n{}",
+            output_debug(&output)
+        )));
+    }
+    Ok(())
+}
+
+#[test]
+fn postcondition_rejects_empty_baseline_artifact_set() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path();
+    fs::write(repo.join(".rchignore"), "/artifacts/\n")?;
+    let before_manifest = repo.join("before-rch-artifacts.json");
+    let empty_baseline = serde_json::json!({
+        "schema": "pi.rch.artifact_sync_preflight.v1",
+        "mode": "postcondition-baseline",
+        "status": "pass",
+        "repo_root": repo.display().to_string(),
+        "invocation_identity": {},
+        "generated_artifacts": [],
+        "violations": [],
+        "summary": {
+            "generated_artifact_count": 0,
+            "violation_count": 0,
+        },
+    });
+    fs::write(&before_manifest, serde_json::to_vec_pretty(&empty_baseline)?)?;
+
+    let output = run_postcondition_many(repo, &[], &before_manifest)?;
+    if output.status.success() {
+        return Err(test_error(
+            "an empty baseline must not pass a zero-artifact postcondition",
+        ));
+    }
+    let report = parse_json(&output)?;
+    let invalid_set = array_field(&report, "violations")?.iter().any(|violation| {
+        string_field(violation, "reason")
+            .is_ok_and(|reason| reason == "before_manifest_artifact_set_invalid")
+    });
+    if !invalid_set {
+        return Err(test_error(format!(
+            "empty artifact set must produce a structured artifact-set diagnostic\n{}",
+            output_debug(&output)
         )));
     }
     Ok(())
