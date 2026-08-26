@@ -5953,6 +5953,9 @@ def stable_file_identity(metadata):
     )
 
 
+MAX_PERSISTENCE_CONTROL_BYTES = 4 * 1024 * 1024
+
+
 def open_anchored_directory(parent_fd, child_name):
     try:
         path_metadata = os.stat(child_name, dir_fd=parent_fd, follow_symlinks=False)
@@ -5966,17 +5969,21 @@ def open_anchored_directory(parent_fd, child_name):
             | getattr(os, "O_CLOEXEC", 0),
             dir_fd=parent_fd,
         )
-        descriptor_metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISDIR(descriptor_metadata.st_mode)
-            or descriptor_metadata.st_dev != path_metadata.st_dev
-            or descriptor_metadata.st_ino != path_metadata.st_ino
-        ):
-            os.close(descriptor)
-            return None
-        return descriptor, (path_metadata.st_dev, path_metadata.st_ino)
     except OSError:
         return None
+    try:
+        descriptor_metadata = os.fstat(descriptor)
+    except OSError:
+        os.close(descriptor)
+        return None
+    if (
+        not stat.S_ISDIR(descriptor_metadata.st_mode)
+        or descriptor_metadata.st_dev != path_metadata.st_dev
+        or descriptor_metadata.st_ino != path_metadata.st_ino
+    ):
+        os.close(descriptor)
+        return None
+    return descriptor, (path_metadata.st_dev, path_metadata.st_ino)
 
 
 def read_stable_regular_at(parent_fd, file_name):
@@ -5994,6 +6001,14 @@ def read_stable_regular_at(parent_fd, file_name):
         descriptor_metadata_before = os.fstat(descriptor)
         if not stat.S_ISREG(descriptor_metadata_before.st_mode):
             raise ValueError(f"{file_name}: expected a regular file")
+        if (
+            descriptor_metadata_before.st_size < 0
+            or descriptor_metadata_before.st_size > MAX_PERSISTENCE_CONTROL_BYTES
+        ):
+            raise ValueError(
+                f"{file_name}: size {descriptor_metadata_before.st_size} exceeds "
+                f"{MAX_PERSISTENCE_CONTROL_BYTES}-byte control limit"
+            )
         chunks = []
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
@@ -6019,12 +6034,153 @@ def read_stable_regular_at(parent_fd, file_name):
     return contents
 
 
+def stable_regular_attestation_at(parent_fd, file_name):
+    path_metadata_before = os.stat(
+        file_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    descriptor = os.open(
+        file_name,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        descriptor_metadata_before = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_metadata_before.st_mode):
+            raise ValueError(f"{file_name}: expected a regular file")
+        digest = hashlib.sha256()
+        observed_size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            observed_size += len(chunk)
+        descriptor_metadata_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_metadata_after = os.stat(
+        file_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    expected_identity = stable_file_identity(path_metadata_before)
+    if (
+        not stat.S_ISREG(path_metadata_after.st_mode)
+        or stable_file_identity(descriptor_metadata_before) != expected_identity
+        or stable_file_identity(descriptor_metadata_after) != expected_identity
+        or stable_file_identity(path_metadata_after) != expected_identity
+        or observed_size != path_metadata_before.st_size
+    ):
+        raise ValueError(f"{file_name}: file changed while hashed")
+    return observed_size, digest.hexdigest()
+
+
+def manifest_artifact_contract_is_valid(
+    child_fd, artifact_dir: Path, manifest: dict, overall_passed: bool
+):
+    case_files = (
+        "result.json",
+        "output.log",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "{case_id}-fault-window-summary.json",
+    )
+    expected_result_files = [
+        str(artifact_dir / "jsonl" / "result.json"),
+        str(artifact_dir / "sqlite" / "result.json"),
+        str(artifact_dir / "integrity-summary.json"),
+    ]
+    if manifest.get("result_files") != expected_result_files:
+        return False
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or len(artifacts) != 10:
+        return False
+    artifacts_by_path = {}
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            return False
+        artifact_path = artifact.get("path")
+        if not isinstance(artifact_path, str) or artifact_path in artifacts_by_path:
+            return False
+        artifacts_by_path[artifact_path] = artifact
+
+    expected_paths = {
+        str(artifact_dir / case_id / file_name.format(case_id=case_id))
+        for case_id in ("jsonl", "sqlite")
+        for file_name in case_files
+    }
+    if set(artifacts_by_path) != expected_paths:
+        return False
+
+    for case_id in ("jsonl", "sqlite"):
+        case_entries = [
+            (
+                file_name.format(case_id=case_id),
+                artifacts_by_path[
+                    str(
+                        artifact_dir
+                        / case_id
+                        / file_name.format(case_id=case_id)
+                    )
+                ],
+            )
+            for file_name in case_files
+        ]
+        for _, entry in case_entries:
+            present = entry.get("present")
+            if type(present) is not bool:
+                return False
+            if not present:
+                if overall_passed or "size_bytes" in entry or "sha256" in entry:
+                    return False
+                if "error" in entry and (
+                    not isinstance(entry["error"], str) or not entry["error"].strip()
+                ):
+                    return False
+        present_entries = [
+            (file_name, entry)
+            for file_name, entry in case_entries
+            if entry["present"] is True
+        ]
+        if not present_entries:
+            continue
+        opened_case = open_anchored_directory(child_fd, case_id)
+        if opened_case is None:
+            return False
+        case_fd, _ = opened_case
+        try:
+            for file_name, entry in present_entries:
+                size_bytes = entry.get("size_bytes")
+                sha256 = entry.get("sha256")
+                if (
+                    type(size_bytes) is not int
+                    or size_bytes < 0
+                    or not isinstance(sha256, str)
+                    or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+                ):
+                    return False
+                try:
+                    observed_size, observed_sha256 = stable_regular_attestation_at(
+                        case_fd, file_name
+                    )
+                except (OSError, ValueError):
+                    return False
+                if size_bytes != observed_size or sha256 != observed_sha256:
+                    return False
+        finally:
+            os.close(case_fd)
+    return True
+
+
 fault_injection_root_resolved = None
 fault_injection_root_fd = None
+fault_injection_root_identity = None
 fault_injection_candidates = []
-fault_injection_child_descriptors = []
 try:
     fault_injection_root_resolved = fault_injection_root.resolve(strict=True)
+    root_path_metadata = fault_injection_root_resolved.lstat()
+    if not stat.S_ISDIR(root_path_metadata.st_mode):
+        raise ValueError("persistence fault-injection root is not a directory")
     fault_injection_root_fd = os.open(
         fault_injection_root_resolved,
         os.O_RDONLY
@@ -6032,6 +6188,14 @@ try:
         | getattr(os, "O_NOFOLLOW", 0)
         | getattr(os, "O_CLOEXEC", 0),
     )
+    root_descriptor_metadata = os.fstat(fault_injection_root_fd)
+    fault_injection_root_identity = stable_file_identity(root_path_metadata)
+    if (
+        not stat.S_ISDIR(root_descriptor_metadata.st_mode)
+        or stable_file_identity(root_descriptor_metadata)
+        != fault_injection_root_identity
+    ):
+        raise ValueError("persistence fault-injection root identity mismatch")
     for child_name in sorted(os.listdir(fault_injection_root_fd)):
         if not child_name or child_name in {".", ".."}:
             continue
@@ -6040,20 +6204,15 @@ try:
             continue
         child_fd, child_identity = opened_child
         try:
-            manifest_bytes = read_stable_regular_at(child_fd, "run-manifest.json")
-        except (OSError, ValueError):
-            os.close(child_fd)
-            continue
-        fault_injection_child_descriptors.append(child_fd)
-        fault_injection_candidates.append(
-            (
-                child_name,
-                child_fd,
-                child_identity,
-                fault_injection_root_resolved / child_name / "run-manifest.json",
-                manifest_bytes,
+            fault_injection_candidates.append(
+                (
+                    child_name,
+                    child_identity,
+                    fault_injection_root_resolved / child_name / "run-manifest.json",
+                )
             )
-        )
+        finally:
+            os.close(child_fd)
 except (OSError, ValueError):
     fault_injection_root_resolved = None
     if fault_injection_root_fd is not None:
@@ -6069,13 +6228,48 @@ fault_injection_status = "missing"
 fault_injection_summary = {}
 fault_injection_manifest = {}
 matching_fault_injection_runs = []
+
+
+def opened_fault_injection_candidates(root_fd, candidates):
+    for child_name, expected_child_identity, candidate in candidates:
+        opened_child = open_anchored_directory(root_fd, child_name)
+        if opened_child is None:
+            continue
+        child_fd, observed_child_identity = opened_child
+        if observed_child_identity != expected_child_identity:
+            os.close(child_fd)
+            continue
+        try:
+            manifest_bytes = read_stable_regular_at(child_fd, "run-manifest.json")
+        except (OSError, ValueError):
+            os.close(child_fd)
+            continue
+        try:
+            yield (
+                child_name,
+                child_fd,
+                expected_child_identity,
+                candidate,
+                manifest_bytes,
+            )
+        finally:
+            os.close(child_fd)
+
+
+opened_candidates = (
+    opened_fault_injection_candidates(
+        fault_injection_root_fd, fault_injection_candidates
+    )
+    if fault_injection_root_fd is not None
+    else ()
+)
 for (
     child_name,
     child_fd,
     child_identity,
     candidate,
     candidate_manifest_bytes,
-) in fault_injection_candidates:
+) in opened_candidates:
     try:
         candidate_manifest = json.loads(candidate_manifest_bytes)
     except (UnicodeDecodeError, json.JSONDecodeError):
@@ -6118,6 +6312,10 @@ for (
         continue
     overall_passed = candidate_manifest.get("overall_passed")
     if type(overall_passed) is not bool:
+        continue
+    if not manifest_artifact_contract_is_valid(
+        child_fd, candidate.parent, candidate_manifest, overall_passed
+    ):
         continue
     exit_codes = candidate_manifest.get("exit_codes")
     if not isinstance(exit_codes, dict):
@@ -6168,9 +6366,19 @@ for (
         summary_bytes = read_stable_regular_at(child_fd, "integrity-summary.json")
     except (OSError, ValueError):
         continue
-    if summary_attestation.get("size_bytes") != len(summary_bytes):
+    summary_size_bytes = summary_attestation.get("size_bytes")
+    if (
+        type(summary_size_bytes) is not int
+        or summary_size_bytes <= 0
+        or summary_size_bytes != len(summary_bytes)
+    ):
         continue
-    if summary_attestation.get("sha256") != hashlib.sha256(summary_bytes).hexdigest():
+    summary_sha256 = summary_attestation.get("sha256")
+    if (
+        not isinstance(summary_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", summary_sha256) is None
+        or summary_sha256 != hashlib.sha256(summary_bytes).hexdigest()
+    ):
         continue
     try:
         candidate_summary = json.loads(summary_bytes)
@@ -6183,6 +6391,20 @@ for (
         != "pi.e2e.persistence_fault_injection.summary.v1"
         or candidate_summary.get("terminal_state") != "summary_validated"
     ):
+        continue
+    if candidate_summary.get("assertions") != {
+        "process_failure_windows": {
+            "pre_flush": "in_process_drop",
+            "mid_flush": "hard_exit",
+            "post_flush": "hard_exit",
+        },
+        "observed_invariants": [
+            "persisted_baseline_preserved",
+            "no_duplicate_messages",
+            "observed_message_order_exact",
+        ],
+        "power_loss_durability_attested": False,
+    }:
         continue
     if any(
         candidate_summary.get(field) != candidate_manifest.get(field)
@@ -6313,9 +6535,19 @@ for (
         )
     )
 
-for descriptor in fault_injection_child_descriptors:
-    os.close(descriptor)
 if fault_injection_root_fd is not None:
+    try:
+        final_root_path_metadata = fault_injection_root_resolved.lstat()
+        final_root_descriptor_metadata = os.fstat(fault_injection_root_fd)
+        if (
+            stable_file_identity(final_root_path_metadata)
+            != fault_injection_root_identity
+            or stable_file_identity(final_root_descriptor_metadata)
+            != fault_injection_root_identity
+        ):
+            matching_fault_injection_runs = []
+    except OSError:
+        matching_fault_injection_runs = []
     os.close(fault_injection_root_fd)
 
 if matching_fault_injection_runs:

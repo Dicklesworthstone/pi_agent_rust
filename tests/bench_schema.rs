@@ -9612,7 +9612,11 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             .expect("fault-injection summary parent"),
     )
     .expect("create fake fault-injection evidence directory");
-    let fault_injection_passed = !extra_env
+    let fault_injection_summary_only_failure = extra_env.iter().any(|(key, value)| {
+        *key == "PI_FAKE_PERSISTENCE_SUMMARY_ONLY_FAILURE" && *value == "1"
+    });
+    let fault_injection_passed = !fault_injection_summary_only_failure
+        && !extra_env
         .iter()
         .any(|(key, value)| *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1");
     let fault_injection_case_exit_69 = extra_env
@@ -9648,8 +9652,35 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "test_identity_current": true,
     });
     let mut sqlite_fault_checks = successful_fault_checks.clone();
-    if !fault_injection_passed {
+    if fault_injection_summary_only_failure {
+        sqlite_fault_checks["diagnostic_log_schema_valid"] = json!(false);
+    } else if !fault_injection_passed {
         sqlite_fault_checks["test_command_passed"] = json!(false);
+    }
+    let fault_case_artifact_names = [
+        "result.json",
+        "output.log",
+        "test-log.jsonl",
+        "artifact-index.jsonl",
+        "{case_id}-fault-window-summary.json",
+    ];
+    let mut fault_case_artifacts = Vec::new();
+    for case_id in ["jsonl", "sqlite"] {
+        let case_dir = fault_injection_run_dir.join(case_id);
+        fs::create_dir_all(&case_dir).expect("create fake fault-injection case directory");
+        for name_template in fault_case_artifact_names {
+            let artifact_name = name_template.replace("{case_id}", case_id);
+            let artifact_path = case_dir.join(&artifact_name);
+            let artifact_bytes = format!("fixture:{case_id}:{artifact_name}\n").into_bytes();
+            fs::write(&artifact_path, &artifact_bytes)
+                .expect("write fake fault-injection case artifact");
+            fault_case_artifacts.push(json!({
+                "path": artifact_path,
+                "present": true,
+                "size_bytes": artifact_bytes.len(),
+                "sha256": pi::package_manager::hex_encode(&Sha256::digest(&artifact_bytes)),
+            }));
+        }
     }
     let fault_injection_summary_payload = json!({
         "schema": "pi.e2e.persistence_fault_injection.summary.v1",
@@ -9670,6 +9701,19 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "rch_require_remote": true,
         "execution_attestation": "configuration_only",
         "terminal_state": "summary_validated",
+        "assertions": {
+            "process_failure_windows": {
+                "pre_flush": "in_process_drop",
+                "mid_flush": "hard_exit",
+                "post_flush": "hard_exit"
+            },
+            "observed_invariants": [
+                "persisted_baseline_preserved",
+                "no_duplicate_messages",
+                "observed_message_order_exact"
+            ],
+            "power_loss_durability_attested": false
+        },
         "cases": [
             {
                 "case_id": "jsonl",
@@ -9720,6 +9764,12 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "execution_attestation": "configuration_only",
         "terminal_state": "complete",
         "overall_passed": fault_injection_passed,
+        "result_files": [
+            fault_injection_run_dir.join("jsonl/result.json"),
+            fault_injection_run_dir.join("sqlite/result.json"),
+            &fault_injection_summary
+        ],
+        "artifacts": fault_case_artifacts,
         "integrity_summary": {
             "path": fault_injection_summary,
             "size_bytes": fault_injection_summary_bytes.len(),
@@ -9728,6 +9778,8 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         "exit_codes": {
             "jsonl": 0,
             "sqlite": if fault_injection_passed {
+                0
+            } else if fault_injection_summary_only_failure {
                 0
             } else if fault_injection_case_exit_69 {
                 69
@@ -9752,8 +9804,11 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     if extra_env.iter().any(|(key, value)| {
         *key == "PI_FAKE_TAMPER_PERSISTENCE_SUMMARY_AFTER_MANIFEST" && *value == "1"
     }) {
-        fs::write(&fault_injection_summary, b"{}\n")
-            .expect("tamper fake fault-injection summary after manifest binding");
+        let mut tampered_summary = fs::read(&fault_injection_summary)
+            .expect("read fake fault-injection summary before tampering");
+        tampered_summary.push(b' ');
+        fs::write(&fault_injection_summary, tampered_summary)
+            .expect("append JSON-insignificant bytes after manifest binding");
     }
 
     let path = format!(
@@ -9860,6 +9915,42 @@ fn orchestrate_rejects_failed_persistence_summary_for_phase5() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_preserves_summary_validation_failure_with_zero_case_exit() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_PERSISTENCE_SUMMARY_ONLY_FAILURE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when post-command persistence validation fails"
+    );
+
+    let matrix_path = temp_root
+        .join("run")
+        .join("results")
+        .join("phase1_matrix_validation.json");
+    let matrix: Value =
+        serde_json::from_str(&fs::read_to_string(&matrix_path).expect("read matrix artifact"))
+            .expect("parse matrix artifact");
+
+    assert_eq!(
+        matrix["regression_guards"]["security"].as_str(),
+        Some("fail"),
+        "completed evidence whose diagnostics fail validation must remain a failed run"
+    );
+    assert!(
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
+            ["fault_injection_manifest"]
+            .is_object()
+            && matrix["evidence_links"]["phase1_unit_and_fault_injection"]
+                ["fault_injection_summary"]
+                .is_object(),
+        "completed failed evidence must retain exact manifest and summary byte attestations"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_rejects_persistence_summary_without_completion_manifest() {
     let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
         "PI_FAKE_MISSING_PERSISTENCE_MANIFEST",
@@ -9880,12 +9971,18 @@ fn orchestrate_rejects_persistence_summary_without_completion_manifest() {
         matrix["regression_guards"]["security"].as_str(),
         Some("missing")
     );
-    assert!(
-        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
-            ["fault_injection_manifest_path"]
-            .is_null(),
-        "summary-only evidence must not be linked as a completed run"
-    );
+    let fault_evidence = &matrix["evidence_links"]["phase1_unit_and_fault_injection"];
+    for field in [
+        "fault_injection_manifest_path",
+        "fault_injection_summary_path",
+        "fault_injection_manifest",
+        "fault_injection_summary",
+    ] {
+        assert!(
+            fault_evidence[field].is_null(),
+            "summary-only evidence field {field} must remain null"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -9910,12 +10007,18 @@ fn orchestrate_rejects_persistence_summary_that_breaks_manifest_binding() {
         matrix["regression_guards"]["security"].as_str(),
         Some("missing")
     );
-    assert!(
-        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
-            ["fault_injection_summary_path"]
-            .is_null(),
-        "tampered summary bytes must not be linked as consumed evidence"
-    );
+    let fault_evidence = &matrix["evidence_links"]["phase1_unit_and_fault_injection"];
+    for field in [
+        "fault_injection_manifest_path",
+        "fault_injection_summary_path",
+        "fault_injection_manifest",
+        "fault_injection_summary",
+    ] {
+        assert!(
+            fault_evidence[field].is_null(),
+            "tampered summary evidence field {field} must remain null"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -10139,6 +10242,43 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
             record["binary_sha256"].as_str(),
             Some(pijs_binary_sha256.as_str()),
             "PiJS evidence must hash-bind the exact executable admitted by staging"
+        );
+    }
+
+    let phase1: Value = serde_json::from_slice(
+        &fs::read(temp_root.join("run/results/phase1_matrix_validation.json"))
+            .expect("read phase1 matrix"),
+    )
+    .expect("parse phase1 matrix");
+    let fault_evidence = &phase1["evidence_links"]["phase1_unit_and_fault_injection"];
+    for (path_field, attestation_field) in [
+        ("fault_injection_manifest_path", "fault_injection_manifest"),
+        ("fault_injection_summary_path", "fault_injection_summary"),
+    ] {
+        let artifact_path = PathBuf::from(
+            fault_evidence[path_field]
+                .as_str()
+                .expect("accepted persistence evidence path"),
+        );
+        let attestation = &fault_evidence[attestation_field];
+        let artifact_path_string = artifact_path.to_string_lossy().into_owned();
+        let artifact_sha256 =
+            sha256_file(&artifact_path).expect("hash accepted persistence evidence");
+        assert_eq!(
+            attestation["path"].as_str(),
+            Some(artifact_path_string.as_str())
+        );
+        assert_eq!(
+            attestation["size_bytes"].as_u64(),
+            Some(
+                fs::metadata(&artifact_path)
+                    .expect("stat accepted persistence evidence")
+                    .len()
+            )
+        );
+        assert_eq!(
+            attestation["sha256"].as_str(),
+            Some(artifact_sha256.as_str())
         );
     }
 }
