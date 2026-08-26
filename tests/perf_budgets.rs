@@ -4443,7 +4443,7 @@ fn pijs_gate_reader_rejects_stale_timestamp_even_when_artifact_mtime_is_fresh() 
     assert!(
         failures
             .iter()
-            .all(|failure| failure.detail.contains("timestamp is stale"))
+            .all(|failure| failure.detail.contains("is stale"))
     );
 }
 
@@ -4738,13 +4738,12 @@ fn pijs_gate_freshness_is_bound_to_selected_canonical_artifact() {
     let fallback = tmp
         .path()
         .join("target/perf/release/pijs_workload_release.jsonl");
-    write_pijs_workload_records(
-        &canonical,
-        &[
-            valid_pijs_gate_record(tmp.path(), 1),
-            valid_pijs_gate_record(tmp.path(), 10),
-        ],
-    );
+    let stale = (chrono::Utc::now() - chrono::TimeDelta::hours(48)).to_rfc3339();
+    let mut canonical_latency = valid_pijs_gate_record(tmp.path(), 1);
+    let mut canonical_throughput = valid_pijs_gate_record(tmp.path(), 10);
+    canonical_latency["timestamp"] = json!(stale);
+    canonical_throughput["timestamp"] = json!(stale);
+    write_pijs_workload_records(&canonical, &[canonical_latency, canonical_throughput]);
     write_pijs_workload_records(
         &fallback,
         &[
@@ -5411,6 +5410,25 @@ fn post_generation_inventory_entry(
     })
 }
 
+fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Value> {
+    POST_GENERATION_REQUIRED_INPUT_PATHS
+        .iter()
+        .map(|relative_path| {
+            let path = evidence_root.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create evidence input parent");
+            }
+            std::fs::write(&path, format!("fixture:{relative_path}\n"))
+                .expect("write evidence input fixture");
+            post_generation_inventory_entry(
+                evidence_root,
+                relative_path,
+                &format!("file:{relative_path}"),
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn post_generation_policy_requires_one_confined_root_and_exact_lineage() {
     let project = tempfile::tempdir().expect("create fake project root");
@@ -5531,24 +5549,18 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
     let project = tempfile::tempdir().expect("create fake project root");
     let evidence_root = project.path().join("evidence");
     std::fs::create_dir(&evidence_root).expect("create evidence root");
-    std::fs::write(evidence_root.join("current.json"), b"current evidence\n")
-        .expect("write current evidence");
     let source_commit = "1234567890abcdef1234567890abcdef12345678";
     let policy = PostGenerationEvidencePolicy {
         root: std::fs::canonicalize(&evidence_root).expect("canonical evidence root"),
         expected_source_commit: source_commit.to_string(),
         correlation_id: "current-run".to_string(),
     };
-    let entry = post_generation_inventory_entry(
-        &evidence_root,
-        "current.json",
-        "file:current.json",
-    );
+    let entries = write_complete_post_generation_input_fixture(&evidence_root);
     write_post_generation_inventory_fixture(
         &evidence_root,
         source_commit,
         "current-run",
-        vec![entry.clone()],
+        entries.clone(),
     );
     validate_post_generation_evidence_inventory(&policy).expect("valid evidence inventory");
 
@@ -5556,7 +5568,7 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
         &evidence_root,
         "ffffffffffffffffffffffffffffffffffffffff",
         "current-run",
-        vec![entry.clone()],
+        entries.clone(),
     );
     assert!(
         validate_post_generation_evidence_inventory(&policy)
@@ -5567,7 +5579,7 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
         &evidence_root,
         source_commit,
         "foreign-run",
-        vec![entry.clone()],
+        entries.clone(),
     );
     assert!(
         validate_post_generation_evidence_inventory(&policy)
@@ -5575,13 +5587,13 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
             .contains("correlation_id mismatch")
     );
 
-    let mut wrong_digest = entry.clone();
-    wrong_digest["sha256"] = json!("f".repeat(64));
+    let mut wrong_digest = entries.clone();
+    wrong_digest[0]["sha256"] = json!("f".repeat(64));
     write_post_generation_inventory_fixture(
         &evidence_root,
         source_commit,
         "current-run",
-        vec![wrong_digest],
+        wrong_digest,
     );
     assert!(
         validate_post_generation_evidence_inventory(&policy)
@@ -5595,7 +5607,7 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
         &evidence_root,
         source_commit,
         "current-run",
-        vec![entry.clone()],
+        entries.clone(),
     );
     assert!(
         validate_post_generation_evidence_inventory(&policy)
@@ -5603,27 +5615,24 @@ fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
             .contains("unlisted")
     );
 
-    let missing_entry = json!({
-        "logical_input_id": "file:missing.json",
-        "path": "missing.json",
-        "sha256": "a".repeat(64),
-        "size_bytes": 1,
-    });
+    let missing_entry_set = entries[1..].to_vec();
     write_post_generation_inventory_fixture(
         &evidence_root,
         source_commit,
         "current-run",
-        vec![entry.clone(), missing_entry],
+        missing_entry_set,
     );
     let missing_error = validate_post_generation_evidence_inventory(&policy)
-        .expect_err("missing and unlisted evidence must fail");
-    assert!(missing_error.contains("missing") && missing_error.contains("unlisted"));
+        .expect_err("missing required logical input must fail");
+    assert!(missing_error.contains("input contract mismatch") && missing_error.contains("missing"));
 
+    let mut duplicate_entries = entries.clone();
+    duplicate_entries.push(entries[0].clone());
     write_post_generation_inventory_fixture(
         &evidence_root,
         source_commit,
         "current-run",
-        vec![entry.clone(), entry],
+        duplicate_entries,
     );
     assert!(
         validate_post_generation_evidence_inventory(&policy)

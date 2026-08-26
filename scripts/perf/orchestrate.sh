@@ -4765,6 +4765,11 @@ artifact_count=$((artifact_count + 1))
 
 POST_GENERATION_BUDGET_DIR="$OUTPUT_DIR/results/perf_budgets_post_generation"
 post_generation_budget_exit=0
+post_generation_package_status="pending"
+post_generation_inventory_sha256=""
+post_generation_package_sha256=""
+post_generation_package_file_count=0
+post_generation_package_size_bytes=0
 declare -a POST_GENERATION_RUNNER_ARGS=("${CARGO_RUNNER_ARGS[@]}")
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]] \
   && ! verify_current_clean_source_identity "RCH post-generation staging precondition"; then
@@ -5339,7 +5344,7 @@ POST_GENERATION_EVIDENCE_DIR="$POST_GENERATION_STAGE_RELATIVE"
 log_ok "Post-generation evidence package retained for audit: $POST_GENERATION_STAGE_RELATIVE"
 
 if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
-  for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT; do
+  for required_env in PERF_EVIDENCE_DIR PI_PERF_POST_GENERATION PI_PERF_EXPECTED_SOURCE_COMMIT CI_CORRELATION_ID PI_PERF_STRICT; do
     case ",${RCH_ENV_ALLOWLIST:-}," in
       *",$required_env,"*) ;;
       *) RCH_ENV_ALLOWLIST="${RCH_ENV_ALLOWLIST:+$RCH_ENV_ALLOWLIST,}$required_env" ;;
@@ -5370,6 +5375,182 @@ RCH_VISIBILITY=summary \
   > "$POST_GENERATION_BUDGET_DIR/stdout.log" \
   2> "$POST_GENERATION_BUDGET_DIR/stderr.log" \
   || post_generation_budget_exit=$?
+
+post_generation_package_summary=""
+if post_generation_package_summary="$(
+  PROJECT_ROOT="$PROJECT_ROOT" \
+    POST_GENERATION_STAGE_RELATIVE="$POST_GENERATION_STAGE_RELATIVE" \
+    GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
+    CORRELATION_ID="$CORRELATION_ID" \
+    RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
+    python3 - <<'PY'
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path, PurePosixPath
+
+project_root = Path(os.environ["PROJECT_ROOT"]).resolve(strict=True)
+stage_relative = PurePosixPath(os.environ["POST_GENERATION_STAGE_RELATIVE"])
+if stage_relative.is_absolute() or not stage_relative.parts or any(
+    part in {"", ".", ".."} for part in stage_relative.parts
+):
+    raise SystemExit("invalid retained post-generation evidence stage path")
+
+stage = project_root
+for part in stage_relative.parts:
+    stage = stage / part
+    metadata = stage.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise SystemExit(f"retained post-generation evidence has unsafe ancestor: {stage}")
+
+inventory_path = stage / "post_generation_evidence_inventory.json"
+inventory_metadata = inventory_path.lstat()
+if stat.S_ISLNK(inventory_metadata.st_mode) or not stat.S_ISREG(
+    inventory_metadata.st_mode
+):
+    raise SystemExit("retained post-generation evidence inventory is not a regular file")
+
+
+def stable_regular_digest(path: Path):
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"retained post-generation evidence is not a regular file: {path}")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        identity = lambda value: (
+            stat.S_IFMT(value.st_mode),
+            value.st_dev,
+            value.st_ino,
+            value.st_size,
+            value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if identity(before) != identity(opened):
+            raise SystemExit(f"retained post-generation evidence changed before read: {path}")
+        digest = hashlib.sha256()
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        after_path = path.lstat()
+        if identity(before) != identity(after) or identity(before) != identity(after_path):
+            raise SystemExit(f"retained post-generation evidence changed while read: {path}")
+        return digest.hexdigest(), before.st_size, b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+inventory_sha256, _, inventory_bytes = stable_regular_digest(inventory_path)
+try:
+    inventory = json.loads(inventory_bytes)
+except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    raise SystemExit(f"retained post-generation evidence inventory is invalid: {error}") from error
+expected_header = {
+    "schema": "pi.perf.post_generation_evidence_inventory.v1",
+    "source_commit": os.environ["GIT_COMMIT_FULL"],
+    "source_dirty": False,
+    "correlation_id": os.environ["CORRELATION_ID"],
+    "run_instance_id": os.environ["RUN_INSTANCE_ID"],
+}
+for key, expected in expected_header.items():
+    if inventory.get(key) != expected:
+        raise SystemExit(
+            f"retained post-generation evidence inventory {key} mismatch"
+        )
+entries = inventory.get("entries")
+if not isinstance(entries, list) or not entries:
+    raise SystemExit("retained post-generation evidence inventory has no entries")
+
+expected = {}
+for entry in entries:
+    if not isinstance(entry, dict):
+        raise SystemExit("retained post-generation evidence inventory entry is invalid")
+    relative = entry.get("path")
+    relative_path = PurePosixPath(relative) if isinstance(relative, str) else None
+    if (
+        relative_path is None
+        or relative_path.is_absolute()
+        or not relative_path.parts
+        or any(part in {"", ".", ".."} for part in relative_path.parts)
+        or entry.get("logical_input_id") != f"file:{relative}"
+        or not isinstance(entry.get("size_bytes"), int)
+        or entry["size_bytes"] < 0
+        or not isinstance(entry.get("sha256"), str)
+        or len(entry["sha256"]) != 64
+        or any(character not in "0123456789abcdef" for character in entry["sha256"])
+    ):
+        raise SystemExit("retained post-generation evidence inventory entry is invalid")
+    if relative in expected:
+        raise SystemExit(f"duplicate retained post-generation evidence path: {relative}")
+    expected[relative] = (entry["size_bytes"], entry["sha256"])
+
+observed = {}
+for directory, directory_names, file_names in os.walk(stage, followlinks=False):
+    directory_path = Path(directory)
+    for name in directory_names:
+        child = directory_path / name
+        metadata = child.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+            raise SystemExit(f"retained post-generation evidence has unsafe entry: {child}")
+    for name in file_names:
+        path = directory_path / name
+        relative = path.relative_to(stage).as_posix()
+        if relative == "post_generation_evidence_inventory.json":
+            continue
+        digest, size_bytes, _ = stable_regular_digest(path)
+        observed[relative] = (size_bytes, digest)
+
+if observed != expected:
+    raise SystemExit(
+        "retained post-generation evidence changed during remote consumption: "
+        f"missing={sorted(set(expected) - set(observed))}, "
+        f"unlisted={sorted(set(observed) - set(expected))}, "
+        f"metadata_mismatch={sorted(path for path in set(expected) & set(observed) if expected[path] != observed[path])}"
+    )
+
+package_digest = hashlib.sha256()
+package_size = 0
+for relative, (size_bytes, digest) in sorted(observed.items()):
+    package_digest.update(relative.encode("utf-8"))
+    package_digest.update(b"\0")
+    package_digest.update(str(size_bytes).encode("ascii"))
+    package_digest.update(b"\0")
+    package_digest.update(digest.encode("ascii"))
+    package_digest.update(b"\n")
+    package_size += size_bytes
+print(
+    "|".join(
+        (
+            inventory_sha256,
+            package_digest.hexdigest(),
+            str(len(observed)),
+            str(package_size),
+        )
+    )
+)
+PY
+)"; then
+  IFS='|' read -r \
+    post_generation_inventory_sha256 \
+    post_generation_package_sha256 \
+    post_generation_package_file_count \
+    post_generation_package_size_bytes <<< "$post_generation_package_summary"
+  post_generation_package_status="pass"
+  log_ok "Post-generation evidence package remained exact after remote consumption"
+else
+  log_fail "Post-generation evidence package changed or became unsafe during remote consumption"
+  post_generation_package_status="fail"
+  if [[ "$post_generation_budget_exit" -eq 0 ]]; then
+    post_generation_budget_exit=95
+  fi
+fi
 
 if [[ "$post_generation_budget_exit" -eq 0 && "$CARGO_RUNNER_MODE" == "rch" ]]; then
   if ! grep -Eqs '^\[RCH\] remote [^[:space:]]+ \([^)]+\)$' \
@@ -5496,6 +5677,15 @@ OUTPUT_DIR="$OUTPUT_DIR" \
   ARTIFACT_STAGING_MISSING_REQUIRED="$ARTIFACT_STAGING_MISSING_REQUIRED" \
   ARTIFACT_STAGING_STALE_REQUIRED="$ARTIFACT_STAGING_STALE_REQUIRED" \
   ARTIFACT_STAGING_BLOCKERS="$ARTIFACT_STAGING_BLOCKERS" \
+  POST_GENERATION_PACKAGE_STATUS="$post_generation_package_status" \
+  POST_GENERATION_PACKAGE_PATH="$POST_GENERATION_STAGE_RELATIVE" \
+  POST_GENERATION_INVENTORY_SHA256="$post_generation_inventory_sha256" \
+  POST_GENERATION_PACKAGE_SHA256="$post_generation_package_sha256" \
+  POST_GENERATION_PACKAGE_FILE_COUNT="$post_generation_package_file_count" \
+  POST_GENERATION_PACKAGE_SIZE_BYTES="$post_generation_package_size_bytes" \
+  POST_GENERATION_RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
+  POST_GENERATION_SOURCE_COMMIT="$GIT_COMMIT_FULL" \
+  POST_GENERATION_CORRELATION_ID="$CORRELATION_ID" \
   python3 - <<'PY'
 import json
 import os
@@ -5524,6 +5714,18 @@ manifest.setdefault("artifact_staging", {}).update(
         "blocker_count": int(os.environ["ARTIFACT_STAGING_BLOCKERS"]),
     }
 )
+manifest["post_generation_evidence_package"] = {
+    "status": os.environ["POST_GENERATION_PACKAGE_STATUS"],
+    "relative_path": os.environ["POST_GENERATION_PACKAGE_PATH"],
+    "inventory_sha256": os.environ["POST_GENERATION_INVENTORY_SHA256"] or None,
+    "package_sha256": os.environ["POST_GENERATION_PACKAGE_SHA256"] or None,
+    "file_count": int(os.environ["POST_GENERATION_PACKAGE_FILE_COUNT"]),
+    "size_bytes": int(os.environ["POST_GENERATION_PACKAGE_SIZE_BYTES"]),
+    "run_instance_id": os.environ["POST_GENERATION_RUN_INSTANCE_ID"],
+    "source_commit": os.environ["POST_GENERATION_SOURCE_COMMIT"],
+    "source_dirty": False,
+    "correlation_id": os.environ["POST_GENERATION_CORRELATION_ID"],
+}
 suite_results = manifest.setdefault("suite_results", [])
 suite_results.append(
     {
