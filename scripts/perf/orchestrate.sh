@@ -419,6 +419,7 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     PI_BENCH_RUN_ID \
     PI_BENCH_CORRELATION_ID \
     PI_BENCH_ALLOCATOR \
+    PI_BENCH_MODE \
     CARGO_BUILD_JOBS \
     PERF_REGRESSION_OUTPUT \
     PERF_REGRESSION_FULL \
@@ -531,6 +532,11 @@ if exclusive_post_generation_suite_set_selected; then
   if [[ -n "${BENCH_ITERATIONS:-}" ]]; then
     die "The exclusive post-generation gate forbids BENCH_ITERATIONS overrides"
   fi
+  for ext_bench_override in PI_BENCH_MAX PI_BENCH_ITERATIONS PI_BENCH_EVENT_COUNT; do
+    if [[ -v $ext_bench_override ]]; then
+      die "The exclusive post-generation gate forbids $ext_bench_override overrides"
+    fi
+  done
   if [[ "${BENCH_QUICK:-0}" != "0" || "${PERF_REGRESSION_FULL:-0}" != "1" ]]; then
     die "The exclusive post-generation gate requires canonical full benchmark settings"
   fi
@@ -1389,6 +1395,69 @@ if observed_coverage != expected_coverage:
 PY
 }
 
+validate_retrieved_ext_bench_harness_report() {
+  local artifact_path="$1"
+  local expected_mode="$2"
+  python3 - "$artifact_path" "$expected_mode" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+artifact_path = Path(sys.argv[1])
+expected_mode = sys.argv[2]
+expected_config = {
+    "pr": {
+        "max_extensions": 10,
+        "iterations": 10,
+        "event_dispatch_count": 50,
+    },
+    "nightly": {
+        "max_extensions": 200,
+        "iterations": 100,
+        "event_dispatch_count": 200,
+    },
+}[expected_mode]
+
+try:
+    report = json.loads(artifact_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid extension benchmark harness report: {error}") from error
+
+if not isinstance(report, dict):
+    raise SystemExit("extension benchmark harness report must be an object")
+if report.get("schema") != "pi.bench.harness_report.v1":
+    raise SystemExit("extension benchmark harness report schema mismatch")
+if report.get("mode") != expected_mode:
+    raise SystemExit(
+        "extension benchmark harness mode mismatch: "
+        f"expected={expected_mode!r} observed={report.get('mode')!r}"
+    )
+config = report.get("config")
+if not isinstance(config, dict):
+    raise SystemExit("extension benchmark harness report has no config object")
+for field, expected in expected_config.items():
+    observed = config.get(field)
+    if type(observed) is not int or observed != expected:
+        raise SystemExit(
+            f"extension benchmark harness config.{field} mismatch: "
+            f"expected={expected!r} observed={observed!r}"
+        )
+summary = report.get("summary")
+if not isinstance(summary, dict):
+    raise SystemExit("extension benchmark harness report has no summary object")
+for field in ("total_scenarios", "total_passed", "total_failed"):
+    value = summary.get(field)
+    if type(value) is not int or value < 0:
+        raise SystemExit(
+            f"extension benchmark harness summary.{field} must be a non-negative integer"
+        )
+if summary["total_scenarios"] <= 0:
+    raise SystemExit("extension benchmark harness report contains no scenarios")
+if summary["total_passed"] + summary["total_failed"] != summary["total_scenarios"]:
+    raise SystemExit("extension benchmark harness summary totals are inconsistent")
+PY
+}
+
 run_test_suite() {
   local suite_name="$1"
   local target_name="$2"
@@ -1528,16 +1597,19 @@ run_test_suite() {
       remote_execution_verified=true
     fi
   elif [[ "$CARGO_RUNNER_MODE" == "rch" \
-    && "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true \
     && ( "$suite_name" == "bench_scenario" \
       || "$suite_name" == "ext_bench_harness" ) ]]; then
     rch_target_subdir="nextest/pi-perf/$RUN_INSTANCE_ID/$suite_name"
     local retrieved_result_dir="$TARGET_DIR/$rch_target_subdir"
     local -a returned_artifacts=()
     local -a producer_feature_args=()
+    local producer_bench_mode="pr"
+    if [[ "$PROFILE" == "full" ]]; then
+      producer_bench_mode="nightly"
+    fi
     case "$suite_name" in
       bench_scenario)
-        returned_artifacts=(scenario_runner.jsonl)
+        returned_artifacts=(scenario_runner.jsonl legacy_extension_workloads.jsonl)
         ;;
       ext_bench_harness)
         returned_artifacts=(ext_bench_harness.jsonl ext_bench_harness_report.json)
@@ -1557,6 +1629,7 @@ run_test_suite() {
       RUST_TEST_THREADS="$PARALLELISM" \
       CARGO_BUILD_JOBS="$BUILD_JOBS" \
       PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
+      PI_BENCH_MODE="$producer_bench_mode" \
       RCH_REQUIRE_REMOTE=1 \
       RCH_QUIET=0 \
       RCH_VISIBILITY=summary \
@@ -1599,6 +1672,13 @@ run_test_suite() {
         if [[ ! -s "$source_path" || -L "$source_path" ]]; then
           log_fail "$suite_name did not return regular nonempty $artifact_name"
           exit_code=86
+          break
+        fi
+        if [[ "$artifact_name" == "ext_bench_harness_report.json" ]] \
+          && ! validate_retrieved_ext_bench_harness_report \
+            "$source_path" "$producer_bench_mode"; then
+          log_fail "$suite_name returned an invalid $producer_bench_mode harness report"
+          exit_code=88
           break
         fi
         if [[ -e "$accepted_path" || -L "$accepted_path" ]]; then
@@ -2274,7 +2354,11 @@ if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" != true ]]; then
   collect_jsonl "$TARGET_DIR/perf/pijs_workload.jsonl" "pijs_workload.jsonl"
   collect_jsonl "$TARGET_DIR/perf/legacy_extension_workloads.jsonl" "legacy_extension_workloads.jsonl"
 else
-  for accepted_jsonl in ext_bench_harness.jsonl scenario_runner.jsonl pijs_workload.jsonl; do
+  for accepted_jsonl in \
+    ext_bench_harness.jsonl \
+    scenario_runner.jsonl \
+    pijs_workload.jsonl \
+    legacy_extension_workloads.jsonl; do
     if [[ -s "$OUTPUT_DIR/results/$accepted_jsonl" \
       && ! -L "$OUTPUT_DIR/results/$accepted_jsonl" ]]; then
       artifact_count=$((artifact_count + 1))
