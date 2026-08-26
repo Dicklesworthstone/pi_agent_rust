@@ -121,8 +121,9 @@ is a hard stop. The automated lane remains disabled because the protected
 `release` environment and acknowledgement described above are not configured.
 Repeated local ref comparisons are never a substitute for the server-side rule.
 
-## Distribution compatibility strategy (DROPIN-146)
-Goal: keep packaging and invocation ergonomics compatible enough for frictionless migration from upstream Pi.
+## Distribution and migration strategy
+Goal: make installation and upgrades predictable without treating legacy Pi
+compatibility as a product or release gate.
 
 ### Supported distribution paths
 - **Installer path (`install.sh`)**: default channel for end users; installs GitHub release binary, verifies checksums, and manages migration state.
@@ -148,7 +149,7 @@ Run this matrix before declaring distribution parity complete for a release cand
 3. Keep-existing path:
    - `install.sh --keep-existing-pi`
    - `pi` remains TypeScript CLI, `pi-rust --version` resolves to Rust build
-4. Pinned enterprise/CI rollout:
+4. Pinned managed rollout:
    - `install.sh --version vX.Y.Z`
    - binary checksum validation passes against release `SHA256SUMS`
 
@@ -156,8 +157,8 @@ Run this matrix before declaring distribution parity complete for a release cand
 
 Release operations must keep benchmark evidence and shipping artifacts distinct.
 
-- **Shipping/distribution artifacts**: built with Cargo `release` profile and published via
-  `release.yml` + installer flows (`pi` binaries + `SHA256SUMS`).
+- **Shipping/distribution artifacts**: built, packaged, and published by DSR
+  using the Cargo `release` profile (`pi` binaries + `SHA256SUMS`).
 - **Benchmark evidence artifacts**: produced by PERF-3X lanes (`scripts/perf/orchestrate.sh`,
   `scripts/bench_extension_workloads.sh`) using benchmark profile labeling (typically `perf`)
   with run-level provenance (`correlation_id`, build/profile metadata, allocator/PGO metadata).
@@ -226,37 +227,54 @@ When the report blocks:
 
 ## When do we call it 1.0?
 We call it `1.0.0` when:
-- CI is green on Linux/macOS/Windows (`.github/workflows/ci.yml`)
-- Required execution surfaces are parity-stable (interactive + print + JSON mode + RPC + SDK contract) with conformance evidence green
+- DSR quality and native build gates are green on Linux/macOS/Windows
+- Required execution surfaces are product-stable (interactive + print + JSON mode + RPC + SDK contract) with conformance evidence green
 - Extension runtime surface and security policy are stable enough that we can commit to not breaking users without an intentional SemVer bump
-- Drop-in certification artifacts report `CERTIFIED` for the clean release
-  source commit, and the final release ref equals it or contains only
-  allowlisted evidence-only descendants, before strict replacement claims are
-  used
 
-Until then, `0.x` releases may still change behavior to improve correctness/parity, and release messaging must not claim strict drop-in replacement.
+Until then, `0.x` releases may change behavior to improve correctness and the
+OMP-inspired product experience. Legacy-Pi drop-in certification is not a
+release objective.
 
 ## Cutting a release (patch/minor)
 1) **Pick version** (SemVer):
    - patch: bugfixes / internal refactors
    - minor: new user-facing features
 2) **Update version** in `Cargo.toml` (`[package].version`).
-3) **Run quality gates locally**:
-   - `cargo fmt --check`
-   - `cargo check --locked --all-targets --features internal-legacy-capture`
-   - `cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings`
-   - `cargo test --locked --all-targets --features internal-legacy-capture`
+3) **Run the configured DSR quality gate**:
+   - `dsr quality --tool pi_agent_rust`
 4) **Update changelog**:
    - `br changelog --since-tag vX.Y.Z` (or use `--since YYYY-MM-DD` if no prior tags)
    - paste the output into `CHANGELOG.md` under a new version heading
 5) **Commit** (`git commit`).
-6) **Do not pre-create or push the tag.** The fail-closed DSR lane creates it
-   locally only after the final source is frozen, uses it for native builds,
-   and pushes it only after packaging passes.
+6) **Create the annotated tag only after the source is frozen and DSR quality
+   passes.** DSR release verification requires that exact version tag; do not
+   move or replace it after any build begins.
 7) **Complete the DSR publication lane below.** Do not dispatch, rerun, cancel,
    or otherwise invoke a GitHub Actions workflow.
 
 ## Canonical DSR release lane
+
+Run DSR from a clean, frozen `main` commit after the version and changelog are
+committed. DSR is responsible for quality, native builds, packaging, signing,
+publication, and verification:
+
+```bash
+dsr quality --tool pi_agent_rust
+dsr build pi_agent_rust --version X.Y.Z
+dsr release pi_agent_rust X.Y.Z --verify-tag --no-dispatch
+dsr release verify pi_agent_rust X.Y.Z
+```
+
+`--no-dispatch` is mandatory: this repository never delegates any follow-up to
+GitHub Actions. A tag, Cargo build, or uploaded-but-unverified asset set is not
+a completed release.
+
+## Historical manual no-Actions procedure (retired)
+
+The remainder of this long-form procedure records the predecessor to native
+DSR orchestration. It is retained for incident archaeology only. Do not execute
+it, and do not substitute any of its ad hoc shell steps for the canonical DSR
+commands above.
 
 Use this lane when the release is intentionally built and published from the
 operator hosts. It does not query, dispatch, rerun, cancel, or otherwise use a
@@ -3917,15 +3935,9 @@ d040d967dbf63644a29d72068aa6ac35e5ff74a7e168cb5eda08a46ff828f32b
     ```
 
 ## Pre-release flow (rc)
-Use an annotated pre-release tag to exercise the configured automated release
-lane without publishing to crates.io:
-- `git tag -a vX.Y.Z-rc.1 -m "vX.Y.Z-rc.1 release" && git push origin vX.Y.Z-rc.1`
-
-`release.yml` skips crates.io and publishes a GitHub pre-release only after its
-governance and artifact gates pass. `publish.yml` does not run on tag push; it
-is an optional manual dry-run diagnostic. For the no-Actions DSR lane, keep the
-tagged commit message marked `[skip actions]` and do not dispatch either
-workflow.
+Use DSR with a SemVer pre-release version. Run the same quality/build/release/
+verify sequence above with `X.Y.Z-rc.N`; pass `--prerelease --no-dispatch` to
+`dsr release`. DSR must not publish a pre-release crate to crates.io.
 
 ## Merge-Gate DoD Policy
 Feature-surface pull requests must satisfy the Definition-of-Done evidence checklist before merge:
@@ -3934,8 +3946,8 @@ Feature-surface pull requests must satisfy the Definition-of-Done evidence check
 - Extension evidence link(s)
 - Reproduction commands for pass/fail validation paths
 
-CI enforces this via `.github/workflows/ci.yml` using `.github/pull_request_template.md` as the
-canonical checklist format.
+DSR quality output and the handoff evidence enforce this policy;
+`.github/pull_request_template.md` is the canonical checklist format.
 
 ### Migration Guidance for Existing Feature Branches
 For branches opened before this gate was introduced:
@@ -3943,26 +3955,20 @@ For branches opened before this gate was introduced:
 2. Replace the PR body with `.github/pull_request_template.md`.
 3. Backfill links to current evidence artifacts.
 4. Include exact rerun commands used to validate fixes for the most recent failing path.
-5. Re-run CI and merge only after the DoD evidence guard passes.
+5. Re-run `dsr quality --tool pi_agent_rust` and merge only after the DoD evidence guard passes.
 
 ## Pre-release checklist
-- The selected publication lane has its own complete proof:
-  - automated lane: CI is green on `main` (Linux/macOS/Windows), and the
-    protected automated release-governance gate is satisfied
-  - manual/no-Actions lane: every fail-fast manual gate above is green and no
-    workflow was queried, dispatched, rerun, canceled, or used as evidence
-- Local gates are green:
-  - `cargo fmt --check`
-  - `cargo check --locked --all-targets --features internal-legacy-capture`
-  - `cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings`
-  - `cargo test --locked --all-targets --features internal-legacy-capture`
+- The single DSR publication lane has complete quality, native-build,
+  packaging, signing, publication, and verification receipts.
+- No workflow was queried, dispatched, rerun, canceled, or used as evidence.
+- `dsr quality --tool pi_agent_rust` is green for the frozen source commit.
 - Feature PRs merged since the previous tag satisfy the DoD evidence checklist (unit + e2e + extension + repro commands).
 - `CHANGELOG.md` updated for the version you’re tagging.
 - Benchmarks run if this release is performance-sensitive (see the
   [benchmark guide](planning/BENCHMARKS.md)).
 - Distribution compatibility matrix (above) passes for all required paths.
 
-## Canonical Binary Adoption and `rpi` Interim Migration Policy (RI-ADOPT, DROPIN-R13)
+## Canonical Binary Adoption and `rpi` Coexistence Policy
 
 ### Background & Existing Host State
 
@@ -3970,9 +3976,9 @@ In developer and owner environments:
 - The TypeScript Pi CLI (`~/.bun/bin/pi` or `/opt/homebrew/bin/pi`) may historically occupy the canonical `pi` command name.
 - The Rust Pi port is installed and managed via `install.sh` with the compatibility alias `rpi` (`~/.local/bin/rpi`) or legacy `pi-rust` (`~/.local/bin/pi-rust`).
 
-### Interim Adoption Policy (Pre-RI-AUTH)
+### Coexistence Policy
 
-During active development and before final strict drop-in authorization (`RI-AUTH`):
+When another tool already owns the `pi` command name:
 1. **Non-Destructive Coexistence**:
    - The installer creates and manages the `rpi -> pi` symlink/launcher to allow instant side-by-side evaluation without displacing the TypeScript CLI.
    - When `install.sh` detects an existing `pi` binary from another toolchain, it preserves the existing binary and informs the operator:
@@ -3982,9 +3988,9 @@ During active development and before final strict drop-in authorization (`RI-AUT
 2. **Subagent & Child Process Delegation**:
    - Pi Rust subagent delegation inspects `PI_SUBAGENT_PI_BINARY` or defaults to the current executable path, ensuring child processes invoke the matching Rust binary regardless of canonical PATH priority.
 
-### Canonical Migration Procedure (Post-RI-AUTH)
+### Optional Canonical Migration Procedure
 
-Once `RI-AUTH` authorizes strict drop-in replacement (`docs/evidence/dropin-certification-verdict.json` reports `overall_verdict = CERTIFIED`):
+When an operator intentionally chooses Pi Rust as their canonical `pi` command:
 1. **Preserve Legacy Binary**:
    ```bash
    # Move legacy TypeScript binary to an explicit compatibility name

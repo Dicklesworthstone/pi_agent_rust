@@ -4809,7 +4809,7 @@ async fn handle_handoff(
         let index = pi::session_index::SessionIndex::new();
         let cwd_str = cwd.display().to_string();
         let sessions = index.list_sessions(Some(&cwd_str))?;
-        if let Some(latest) = sessions.last() {
+        if let Some(latest) = sessions.first() {
             Session::open(&latest.path).await?
         } else {
             bail!("No active or previous sessions found in {}", cwd.display());

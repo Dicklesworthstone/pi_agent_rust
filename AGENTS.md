@@ -139,7 +139,7 @@ non-authoritative and must stay disabled.
 
 - Doodlestein Self-Releaser (`dsr`) is the exclusive quality, cross-platform
   build, packaging, signing, and release authority.
-- Use `dsr quality pi_agent_rust`, `dsr build pi_agent_rust`, and
+- Use `dsr quality --tool pi_agent_rust`, `dsr build pi_agent_rust`, and
   `dsr release pi_agent_rust <version>` (or the corresponding fail-closed DSR
   operation) instead of any Actions workflow or ad hoc release upload.
 - RCH remains available as a development-time Cargo compilation offloader. It
@@ -316,7 +316,7 @@ This port uses two key libraries from sibling projects:
 | Metric | Target | Notes |
 |--------|--------|-------|
 | Startup time | <100ms | No heavy initialization |
-| Binary size (release) | <48 MiB | CI size budget with LTO + strip enabled (raised from 26 MiB for the v0.3.0 capability wave: BPE tables, LSP/DAP, MCP, eval kernels) |
+| Binary size (release) | <48 MiB | DSR release-size budget with LTO + strip enabled (raised from 26 MiB for the v0.3.0 capability wave: BPE tables, LSP/DAP, MCP, eval kernels) |
 | TUI framerate | 60fps | Differential rendering |
 | Memory (idle) | <50MB | No leaks on long sessions |
 

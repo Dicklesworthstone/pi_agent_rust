@@ -135,7 +135,7 @@ Two additional machine-recognized citation forms exist:
   existence and validity are still checked, but staleness is not enforced
   because such claims never satisfy current release-facing requirements.
 
-CI checks both file freshness and artifact content so stale, no-data, or
+DSR quality checks both file freshness and artifact content so stale, no-data, or
 correlation-mismatched evidence cannot back user-facing performance claims.
 The README evidence checker reports line-numbered proof obligations for cited
 claims and extracts claim-gated performance phrases for reviewer audit.
@@ -156,7 +156,7 @@ assuming one optimization proves an end-to-end result.
 | Efficient long-session storage | SQLite session index + v2 sidecar (segmented log + offset index) with O(index+tail) reopen path | Avoid full-history work on eligible resumes |
 | Streaming parser tuned for real networks | SSE parser tracks scanned bytes, handles UTF-8 tails, normalizes chunk boundaries, interns event-type strings | Reduce repeated scanning and parser stalls |
 | Safe fast-path controls | Shadow dual execution sampling, automatic backoff on divergence/overhead, compatibility-lane kill switches for containment | Bound optimization risk and preserve fallback behavior |
-| CI-level performance governance | Scenario matrices, strict artifact contracts, fail-closed perf gates | Detect regressions before release |
+| DSR performance governance | Scenario matrices, strict artifact contracts, fail-closed perf gates | Detect regressions before release |
 
 If you want the full implementation inventory, see [Performance Engineering](#performance-engineering).
 
@@ -2054,7 +2054,7 @@ panic = "abort"      # No unwinding machinery
 strip = true         # Remove symbol tables
 ```
 
-Binary size is explicitly budgeted in CI via `binary_size_release`, with a target
+Binary size is explicitly budgeted by the DSR quality recipe via `binary_size_release`, with a target
 threshold of `48.0 MiB` (the harness computes bytes / 1024 / 1024; raised from
 `26.0 MiB` for the v0.3.0 capability wave — BPE token tables, LSP/DAP
 bridges, the MCP client, and eval kernels — and previously from
@@ -3000,8 +3000,7 @@ and published exclusively through Doodlestein Self-Releaser (DSR).
   Immutable `v*` tag ruleset `20418963` was created and read back on 2026-08-04
   with update/deletion forbidden and no bypass actors. The manual lane
   re-verifies that live control before tagging and publication and stops on any
-  drift; the automated lane remains disabled until its separate
-  protected-environment governance is configured.
+  drift. No automated GitHub Actions lane exists or may be enabled.
 
 ### Coverage
 

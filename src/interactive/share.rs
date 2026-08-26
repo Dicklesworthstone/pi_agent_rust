@@ -2,7 +2,10 @@ use asupersync::sync::OwnedMutexGuard;
 use chrono::Utc;
 use std::ffi::OsString;
 use std::path::Path;
+use std::process::{Child, ChildStderr, ChildStdout, ExitStatus};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use url::Url;
 
 use super::{AgentState, Cmd, PiApp, PiMsg};
@@ -10,16 +13,140 @@ use super::{AgentState, Cmd, PiApp, PiMsg};
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard as ArboardClipboard;
 
+const SHARE_COMMAND_OUTPUT_MAX_BYTES: u64 = 64 * 1024;
+const SHARE_AUTH_TIMEOUT: Duration = Duration::from_secs(15);
+const SHARE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+const SHARE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug)]
+pub(super) struct ShareCommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+}
+
+/// Owns the complete lifecycle of a `/share` subprocess and its pipe readers.
+///
+/// Dropping an in-flight command is fail-closed: the isolated process tree is
+/// terminated, the root child is reaped, and both bounded pipe readers are
+/// joined before ownership is released.
+struct ShareProcess {
+    child: Option<Child>,
+    stdout_reader: Option<JoinHandle<std::result::Result<Vec<u8>, String>>>,
+    stderr_reader: Option<JoinHandle<std::result::Result<Vec<u8>, String>>>,
+}
+
+impl ShareProcess {
+    const fn new(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            stdout_reader: None,
+            stderr_reader: None,
+        }
+    }
+
+    fn take_stdout(&mut self) -> std::io::Result<ChildStdout> {
+        self.child
+            .as_mut()
+            .and_then(|child| child.stdout.take())
+            .ok_or_else(|| std::io::Error::other("share command stdout pipe missing"))
+    }
+
+    fn take_stderr(&mut self) -> std::io::Result<ChildStderr> {
+        self.child
+            .as_mut()
+            .and_then(|child| child.stderr.take())
+            .ok_or_else(|| std::io::Error::other("share command stderr pipe missing"))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        self.child
+            .as_mut()
+            .map_or(Ok(None), std::process::Child::try_wait)
+    }
+
+    fn join_reader(
+        reader: Option<JoinHandle<std::result::Result<Vec<u8>, String>>>,
+        stream: &str,
+    ) -> std::io::Result<Vec<u8>> {
+        let reader = reader.ok_or_else(|| {
+            std::io::Error::other(format!("share command {stream} reader missing"))
+        })?;
+        reader
+            .join()
+            .map_err(|_| std::io::Error::other(format!("share command {stream} reader panicked")))?
+            .map_err(std::io::Error::other)
+    }
+
+    fn finish(mut self, status: ExitStatus) -> std::io::Result<ShareCommandOutput> {
+        // `try_wait` already reaped the child and caches its status. Remove it
+        // before joining readers so Drop cannot misclassify a completed command.
+        drop(self.child.take());
+        let stdout_result = Self::join_reader(self.stdout_reader.take(), "stdout");
+        let stderr_result = Self::join_reader(self.stderr_reader.take(), "stderr");
+        let mut stdout = stdout_result?;
+        let mut stderr = stderr_result?;
+        let stdout_truncated = stdout.len() > SHARE_COMMAND_OUTPUT_MAX_BYTES as usize;
+        let stderr_truncated = stderr.len() > SHARE_COMMAND_OUTPUT_MAX_BYTES as usize;
+        stdout.truncate(SHARE_COMMAND_OUTPUT_MAX_BYTES as usize);
+        stderr.truncate(SHARE_COMMAND_OUTPUT_MAX_BYTES as usize);
+        Ok(ShareCommandOutput {
+            status,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
+    }
+
+    fn terminate_and_reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            crate::tools::kill_process_group_tree(Some(child.id()));
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+impl Drop for ShareProcess {
+    fn drop(&mut self) {
+        self.terminate_and_reap();
+    }
+}
+
 pub(super) async fn run_command_output(
     program: &str,
     args: &[OsString],
     cwd: &Path,
     abort_signal: &crate::agent::AbortSignal,
-) -> std::io::Result<std::process::Output> {
+) -> std::io::Result<ShareCommandOutput> {
+    run_command_output_with_timeout(program, args, cwd, abort_signal, SHARE_UPLOAD_TIMEOUT).await
+}
+
+async fn run_command_output_with_timeout(
+    program: &str,
+    args: &[OsString],
+    cwd: &Path,
+    abort_signal: &crate::agent::AbortSignal,
+    timeout: Duration,
+) -> std::io::Result<ShareCommandOutput> {
     use asupersync::time::{sleep, wall_now};
     use std::process::{Command, Stdio};
-    use std::sync::mpsc as std_mpsc;
-    use std::time::Duration;
+
+    if abort_signal.is_aborted() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "command aborted before spawn",
+        ));
+    }
 
     let mut child = Command::new(program);
     child
@@ -31,35 +158,55 @@ pub(super) async fn run_command_output(
     crate::tools::isolate_command_process_group(&mut child);
     let child = child.spawn()?;
     crate::tools::attach_child_job_discipline(&child);
-    let pid = child.id();
+    let mut process = ShareProcess::new(child);
+    let stdout = process.take_stdout()?;
+    let stderr = process.take_stderr()?;
+    process.stdout_reader = Some(
+        std::thread::Builder::new()
+            .name("share-stdout".into())
+            .spawn(move || {
+                crate::tools::read_to_end_capped_and_drain(
+                    stdout,
+                    SHARE_COMMAND_OUTPUT_MAX_BYTES,
+                )
+            })?,
+    );
+    process.stderr_reader = Some(
+        std::thread::Builder::new()
+            .name("share-stderr".into())
+            .spawn(move || {
+                crate::tools::read_to_end_capped_and_drain(
+                    stderr,
+                    SHARE_COMMAND_OUTPUT_MAX_BYTES,
+                )
+            })?,
+    );
 
-    let (tx, rx) = std_mpsc::channel();
-    let _handle = std::thread::Builder::new()
-        .name("share".into())
-        .spawn(move || {
-            let result = child.wait_with_output();
-            let _ = tx.send(result);
-        });
-
-    let tick = Duration::from_millis(10);
+    let started = Instant::now();
     loop {
+        // Completion wins a same-tick race with cancellation. This preserves a
+        // successfully-created gist URL instead of falsely reporting cancellation.
+        if let Some(status) = process.try_wait()? {
+            return process.finish(status);
+        }
+
         if abort_signal.is_aborted() {
-            crate::tools::kill_process_group_tree(Some(pid));
+            process.terminate_and_reap();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
                 "command aborted",
             ));
         }
 
-        match rx.try_recv() {
-            Ok(result) => return result,
-            Err(std_mpsc::TryRecvError::Empty) => {
-                sleep(wall_now(), tick).await;
-            }
-            Err(std_mpsc::TryRecvError::Disconnected) => {
-                return Err(std::io::Error::other("command output channel disconnected"));
-            }
+        if started.elapsed() >= timeout {
+            process.terminate_and_reap();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("command timed out after {} seconds", timeout.as_secs()),
+            ));
         }
+
+        sleep(wall_now(), SHARE_COMMAND_POLL_INTERVAL).await;
     }
 }
 

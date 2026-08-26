@@ -4764,6 +4764,35 @@ fn write_rich_session(path: &Path, cwd: &Path) -> String {
     session_id.to_string()
 }
 
+fn write_identifiable_handoff_session(
+    path: &Path,
+    cwd: &Path,
+    session_id: &str,
+    timestamp: &str,
+    marker: &str,
+) {
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": session_id,
+        "timestamp": timestamp,
+        "cwd": cwd.display().to_string(),
+        "provider": "anthropic",
+        "modelId": "claude-sonnet-4-5"
+    });
+    let user_msg = json!({
+        "type": "message",
+        "id": format!("{session_id}-user"),
+        "timestamp": timestamp,
+        "message": {
+            "role": "user",
+            "content": marker
+        }
+    });
+
+    fs::write(path, format!("{header}\n{user_msg}\n")).expect("write handoff session jsonl");
+}
+
 /// Encode a CWD path into the session directory name format (mirrors `encode_cwd`
 /// from `src/session.rs`).
 #[cfg(unix)]
@@ -4772,6 +4801,77 @@ fn encode_cwd_for_test(path: &Path) -> String {
     let s = s.trim_start_matches(['/', '\\']).to_string();
     let s = s.replace(['/', '\\', ':'], "-");
     format!("--{s}--")
+}
+
+#[test]
+fn e2e_cli_handoff_defaults_to_newest_session_and_preserves_explicit_session() {
+    let harness = CliTestHarness::new(
+        "e2e_cli_handoff_defaults_to_newest_session_and_preserves_explicit_session",
+    );
+    let cwd = harness.harness.temp_dir();
+    let sessions_root = PathBuf::from(
+        harness
+            .env
+            .get("PI_SESSIONS_DIR")
+            .expect("PI_SESSIONS_DIR set"),
+    );
+    let project_sessions = sessions_root.join(encode_cwd(cwd));
+    fs::create_dir_all(&project_sessions).expect("create project sessions directory");
+
+    let older_id = "handoff-older-session";
+    let newer_id = "handoff-newer-session";
+    let older_marker = "HANDOFF_OLDER_SESSION_MARKER";
+    let newer_marker = "HANDOFF_NEWER_SESSION_MARKER";
+    let older_path = project_sessions.join("older.jsonl");
+    let newer_path = project_sessions.join("newer.jsonl");
+
+    write_identifiable_handoff_session(
+        &older_path,
+        cwd,
+        older_id,
+        "2026-02-04T10:00:00.000Z",
+        older_marker,
+    );
+    write_identifiable_handoff_session(
+        &newer_path,
+        cwd,
+        newer_id,
+        "2026-02-04T11:00:00.000Z",
+        newer_marker,
+    );
+    filetime::set_file_mtime(
+        &older_path,
+        filetime::FileTime::from_unix_time(1_700_000_000, 0),
+    )
+    .expect("set older session mtime");
+    filetime::set_file_mtime(
+        &newer_path,
+        filetime::FileTime::from_unix_time(1_800_000_000, 0),
+    )
+    .expect("set newer session mtime");
+
+    let index = pi::session_index::SessionIndex::for_sessions_root(&sessions_root);
+    index.reindex_all().expect("index handoff sessions");
+
+    let default_result = harness.run(&["handoff", "--print"]);
+    assert_exit_code(&harness.harness, &default_result, 0);
+    assert_contains(&harness.harness, &default_result.stdout, newer_marker);
+    assert!(
+        !default_result.stdout.contains(older_marker),
+        "default handoff must not select the older session\nstdout:\n{}\nstderr:\n{}",
+        default_result.stdout,
+        default_result.stderr
+    );
+
+    let explicit_result = harness.run(&["handoff", "--session", older_id, "--print"]);
+    assert_exit_code(&harness.harness, &explicit_result, 0);
+    assert_contains(&harness.harness, &explicit_result.stdout, older_marker);
+    assert!(
+        !explicit_result.stdout.contains(newer_marker),
+        "explicit handoff must select the requested session\nstdout:\n{}\nstderr:\n{}",
+        explicit_result.stdout,
+        explicit_result.stderr
+    );
 }
 
 /// Test 1: Rich session export contains all entry types.
