@@ -21,3 +21,7 @@ recovery_*/
 # Merge artifacts (temporary files from 3-way merge)
 beads.base.jsonl
 beads.base.meta.json
+*.db-journal
+*.db-wal*
+*.vacuum-wal-cert*
+*.fsqlite-migration-state
