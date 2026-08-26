@@ -126,6 +126,7 @@ declare -A SUITE_TARGETS=(
 declare -A CRITERION_BENCHES=(
   [criterion_tools]="tools"
   [criterion_extensions]="extensions"
+  [criterion_pijs]="pijs_workload"
   [criterion_system]="system"
   [criterion_semantic_context]="semantic_context"
 )
@@ -416,6 +417,8 @@ if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
     BENCH_QUICK \
     BENCH_ITERATIONS \
     PI_BENCH_RUN_ID \
+    PI_BENCH_CORRELATION_ID \
+    PI_BENCH_ALLOCATOR \
     CARGO_BUILD_JOBS \
     PERF_REGRESSION_OUTPUT \
     PERF_REGRESSION_FULL \
@@ -503,6 +506,7 @@ exclusive_post_generation_suite_set_selected() {
   for required_suite in \
     "${!SUITE_TARGETS[@]}" \
     criterion_extensions \
+    criterion_pijs \
     criterion_system \
     criterion_semantic_context; do
     if ! suite_selected "$required_suite"; then

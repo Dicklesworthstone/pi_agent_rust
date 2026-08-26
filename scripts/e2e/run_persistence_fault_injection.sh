@@ -347,7 +347,9 @@ payload = {
     "artifact_index_jsonl": sys.argv[14],
     "timestamp": sys.argv[15],
 }
-Path(sys.argv[1]).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+with Path(sys.argv[1]).open("x", encoding="utf-8") as result:
+    json.dump(payload, result, indent=2)
+    result.write("\n")
 PY
 }
 
@@ -437,13 +439,13 @@ run_case() {
 
     diagnostics_exit=0
     if [[ ${#CARGO_RUNNER_PREFIX[@]} -gt 0 ]]; then
-        if [[ -f "$PROJECT_ROOT/$harness_test_log" ]]; then
+        if [[ -f "$PROJECT_ROOT/$harness_test_log" && ! -L "$PROJECT_ROOT/$harness_test_log" ]]; then
             mv "$PROJECT_ROOT/$harness_test_log" "$test_log"
         else
             echo "[fault-injection] RCH did not retrieve $harness_test_log for case '$case_id'" >&2
             diagnostics_exit=69
         fi
-        if [[ -f "$PROJECT_ROOT/$harness_artifact_index" ]]; then
+        if [[ -f "$PROJECT_ROOT/$harness_artifact_index" && ! -L "$PROJECT_ROOT/$harness_artifact_index" ]]; then
             mv "$PROJECT_ROOT/$harness_artifact_index" "$artifact_index"
         else
             echo "[fault-injection] RCH did not retrieve $harness_artifact_index for case '$case_id'" >&2
@@ -764,7 +766,8 @@ def inline_summary_bytes_are_valid(
         return False
     if relative_summary_path.parts != (expected_summary_artifact,):
         return False
-    local_summary_path.write_bytes(payload)
+    with local_summary_path.open("xb") as local_summary:
+        local_summary.write(payload)
     if (
         not local_summary_path.is_file()
         or local_summary_path.stat().st_size != len(payload)
@@ -1006,7 +1009,9 @@ summary = {
 }
 
 summary_path = artifact_dir / ".integrity-summary.pending.json"
-summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+with summary_path.open("x", encoding="utf-8") as pending_summary:
+    json.dump(summary, pending_summary, indent=2)
+    pending_summary.write("\n")
 
 sys.exit(0 if overall_passed else 1)
 PY
@@ -1042,6 +1047,7 @@ python3 - \
     "$overall_exit" <<'PY'
 import hashlib
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -1049,30 +1055,42 @@ from pathlib import Path
 manifest_path = Path(sys.argv[1])
 pending_summary_path = Path(sys.argv[2])
 final_summary_path = Path(sys.argv[3])
-summary_bytes = pending_summary_path.read_bytes()
+
+
+def read_stable_regular(path: Path, *, missing_ok: bool = False) -> bytes | None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
+    with os.fdopen(descriptor, "rb") as source:
+        initial_metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"manifest artifact is not a regular file: {path}")
+        contents = source.read()
+        final_descriptor_metadata = os.fstat(source.fileno())
+    final_path_metadata = path.lstat()
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    initial_identity = tuple(getattr(initial_metadata, field) for field in identity_fields)
+    if (
+        not stat.S_ISREG(final_descriptor_metadata.st_mode)
+        or not stat.S_ISREG(final_path_metadata.st_mode)
+        or initial_identity
+        != tuple(getattr(final_descriptor_metadata, field) for field in identity_fields)
+        or initial_identity
+        != tuple(getattr(final_path_metadata, field) for field in identity_fields)
+        or len(contents) != initial_metadata.st_size
+    ):
+        raise ValueError(f"manifest artifact changed while read: {path}")
+    return contents
 
 
 def attest_artifact(path: Path) -> dict:
-    try:
-        metadata = path.lstat()
-    except FileNotFoundError:
+    contents = read_stable_regular(path, missing_ok=True)
+    if contents is None:
         return {"path": str(path), "present": False}
-    if not stat.S_ISREG(metadata.st_mode):
-        raise ValueError(f"manifest artifact is not a regular file: {path}")
-    contents = path.read_bytes()
-    final_metadata = path.lstat()
-    if (
-        not stat.S_ISREG(final_metadata.st_mode)
-        or (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
-        != (
-            final_metadata.st_dev,
-            final_metadata.st_ino,
-            final_metadata.st_size,
-            final_metadata.st_mtime_ns,
-        )
-        or len(contents) != metadata.st_size
-    ):
-        raise ValueError(f"manifest artifact changed while read: {path}")
     return {
         "path": str(path),
         "present": True,
@@ -1081,6 +1099,9 @@ def attest_artifact(path: Path) -> dict:
     }
 
 
+summary_bytes = read_stable_regular(pending_summary_path)
+if summary_bytes is None:
+    raise ValueError(f"missing pending integrity summary: {pending_summary_path}")
 artifact_dir = Path(sys.argv[13])
 case_artifacts = [
     attest_artifact(artifact_dir / case_id / filename)
@@ -1132,22 +1153,72 @@ payload = {
 with manifest_path.open("x", encoding="utf-8") as manifest:
     json.dump(payload, manifest, indent=2)
     manifest.write("\n")
+    manifest.flush()
+    os.fsync(manifest.fileno())
 PY
 
 python3 - \
+    "$ARTIFACT_DIR/run-manifest.json" \
     "$ARTIFACT_DIR/.integrity-summary.pending.json" \
     "$ARTIFACT_DIR/integrity-summary.json" <<'PY'
+import hashlib
+import json
 import os
 import stat
 import sys
 from pathlib import Path
 
-pending = Path(sys.argv[1])
-published = Path(sys.argv[2])
-metadata = pending.lstat()
-if not stat.S_ISREG(metadata.st_mode) or published.exists() or published.is_symlink():
+manifest_path = Path(sys.argv[1])
+pending = Path(sys.argv[2])
+published = Path(sys.argv[3])
+
+
+def read_stable_regular(path: Path) -> tuple[bytes, os.stat_result]:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as source:
+        initial_metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(initial_metadata.st_mode):
+            raise ValueError(f"publication artifact is not a regular file: {path}")
+        contents = source.read()
+        final_descriptor_metadata = os.fstat(source.fileno())
+    final_path_metadata = path.lstat()
+    identity_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns")
+    initial_identity = tuple(getattr(initial_metadata, field) for field in identity_fields)
+    if (
+        not stat.S_ISREG(final_descriptor_metadata.st_mode)
+        or not stat.S_ISREG(final_path_metadata.st_mode)
+        or initial_identity
+        != tuple(getattr(final_descriptor_metadata, field) for field in identity_fields)
+        or initial_identity
+        != tuple(getattr(final_path_metadata, field) for field in identity_fields)
+        or len(contents) != initial_metadata.st_size
+    ):
+        raise ValueError(f"publication artifact changed while read: {path}")
+    return contents, initial_metadata
+
+
+manifest_bytes, _ = read_stable_regular(manifest_path)
+manifest = json.loads(manifest_bytes)
+pending_bytes, pending_metadata = read_stable_regular(pending)
+expected_summary = manifest.get("integrity_summary")
+if not isinstance(expected_summary, dict):
+    raise SystemExit("run manifest lacks integrity summary attestation")
+if (
+    expected_summary.get("path") != str(published)
+    or expected_summary.get("size_bytes") != len(pending_bytes)
+    or expected_summary.get("sha256") != hashlib.sha256(pending_bytes).hexdigest()
+):
+    raise SystemExit("pending integrity summary does not match run manifest")
+if published.exists() or published.is_symlink():
     raise SystemExit("integrity summary publication target is unsafe")
 os.link(pending, published, follow_symlinks=False)
+published_metadata = published.lstat()
+if (
+    not stat.S_ISREG(published_metadata.st_mode)
+    or (published_metadata.st_dev, published_metadata.st_ino)
+    != (pending_metadata.st_dev, pending_metadata.st_ino)
+):
+    raise SystemExit("published integrity summary inode does not match attested bytes")
 pending.unlink()
 PY
 
