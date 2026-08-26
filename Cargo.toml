@@ -402,6 +402,11 @@ name = "semantic_context"
 harness = false
 
 [[bench]]
+name = "pijs_workload"
+path = "examples/pijs_workload.rs"
+harness = false
+
+[[bench]]
 name = "system"
 harness = false
 

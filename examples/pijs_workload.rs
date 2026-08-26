@@ -15,9 +15,10 @@ use pi::scheduler::HostcallOutcome;
 use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::collections::VecDeque;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write as _};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,12 @@ const NATIVE_RUNTIME_DESCRIPTOR: &str = r#"
 #[command(name = "pijs_workload")]
 #[command(about = "Deterministic PiJS workload runner for perf baselines")]
 struct Args {
+    /// Compatibility flag injected by `cargo bench` for harness-free targets.
+    #[arg(long = "bench", hide = true)]
+    cargo_bench: bool,
+    /// Emit the exact 2000x1 and 2000x10 regression-gate pair for RCH return.
+    #[arg(long, hide = true)]
+    regression_gate_pair: bool,
     /// Outer loop iterations.
     #[arg(
         long,
@@ -299,9 +306,43 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn run() -> Result<()> {
     let args = Args::parse();
+    if args.regression_gate_pair {
+        if !args.cargo_bench {
+            return Err(Error::extension(
+                "--regression-gate-pair is reserved for cargo bench".to_string(),
+            ));
+        }
+        if args.iterations.get() != REGRESSION_GATE_ITERATIONS
+            || args.tool_calls != NonZeroUsize::MIN
+            || args.runtime_engine != WorkloadRuntimeEngine::Quickjs
+        {
+            return Err(Error::extension(
+                "--regression-gate-pair requires the canonical iterations, tool-calls, and QuickJS runtime"
+                    .to_string(),
+            ));
+        }
+        let mut records = Vec::with_capacity(REGRESSION_GATE_TOOL_CALLS.len());
+        for tool_calls in REGRESSION_GATE_TOOL_CALLS {
+            records.push(run_measurement(
+                &args,
+                NonZeroUsize::new(tool_calls)
+                    .expect("regression-gate tool-call counts are nonzero"),
+            )?);
+        }
+        write_regression_gate_pair(&records)?;
+        for record in records {
+            println!("{record}");
+        }
+    } else {
+        println!("{}", run_measurement(&args, args.tool_calls)?);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_measurement(args: &Args, tool_calls: NonZeroUsize) -> Result<serde_json::Value> {
     let build_profile = perf_build::detect_build_profile();
     let current_exe = std::env::current_exe().map_err(|err| {
         Error::extension(format!(
@@ -365,10 +406,10 @@ fn run() -> Result<()> {
             ),
         ]),
         iterations: args.iterations.get(),
-        tool_calls: args.tool_calls.get(),
+        tool_calls: tool_calls.get(),
     });
     let (total_calls, total_calls_u32) =
-        checked_total_calls(args.iterations.get(), args.tool_calls.get())?;
+        checked_total_calls(args.iterations.get(), tool_calls.get())?;
     let binary_sha256 = perf_build::sha256_file(&current_exe).map_err(|err| {
         Error::extension(format!(
             "failed to hash workload executable {}: {err}",
@@ -418,7 +459,7 @@ fn run() -> Result<()> {
 
     let start = Instant::now();
     for _ in 0..args.iterations.get() {
-        for _ in 0..args.tool_calls.get() {
+        for _ in 0..tool_calls.get() {
             match args.runtime_engine {
                 WorkloadRuntimeEngine::Quickjs => {
                     if let Some(runtime) = quickjs_runtime.as_ref() {
@@ -489,9 +530,7 @@ fn run() -> Result<()> {
         ));
     }
 
-    println!(
-        "{}",
-        json!({
+    Ok(json!({
             "schema": "pi.perf.workload.v1",
             "timestamp": timestamp,
             "run_id": run_id,
@@ -501,7 +540,7 @@ fn run() -> Result<()> {
             "tool": "pijs_workload",
             "scenario": "tool_call_roundtrip",
             "iterations": args.iterations.get(),
-            "tool_calls_per_iteration": args.tool_calls.get(),
+            "tool_calls_per_iteration": tool_calls.get(),
             "total_calls": total_calls,
             "elapsed_ms": elapsed_millis,
             "elapsed_us": elapsed_micros,
@@ -545,10 +584,7 @@ fn run() -> Result<()> {
             "allocator_fallback_reason": allocator.fallback_reason,
             "binary_path": binary_path,
             "binary_sha256": binary_sha256,
-        })
-    );
-
-    Ok(())
+        }))
 }
 
 fn setup_quickjs_runtime() -> Result<QuickJsBenchRuntime> {
