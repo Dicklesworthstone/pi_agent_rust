@@ -1108,7 +1108,14 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     log_step "Building criterion benchmarks..."
     for bench in "${!CRITERION_BENCHES[@]}"; do
       bench_name="${CRITERION_BENCHES[$bench]}"
-      if "${PHASE2_RUNNER_ARGS[@]}" bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
+      bench_build_args=(bench --bench "$bench_name" --no-run --profile "$CARGO_PROFILE")
+      if [[ "$bench" == "criterion_pijs" ]]; then
+        bench_build_args+=(
+          --no-default-features
+          --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+        )
+      fi
+      if "${PHASE2_RUNNER_ARGS[@]}" "${bench_build_args[@]}" 2>>"$OUTPUT_DIR/logs/build_benches.log"; then
         log_ok "Built bench: $bench_name"
       else
         log_warn "Build warning for bench: $bench_name"
