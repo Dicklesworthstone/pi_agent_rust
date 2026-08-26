@@ -1601,6 +1601,152 @@ EOF
   SUITE_RESULTS+=("{\"suite\":\"$suite_name\",\"status\":\"$status\",\"exit_code\":$exit_code,\"elapsed_ms\":$suite_elapsed}")
 }
 
+validate_retrieved_pijs_pair() {
+  local artifact_path="$1"
+  local binary_path="$2"
+  local expected_commit="$3"
+  local expected_correlation_id="$4"
+  python3 - \
+    "$artifact_path" \
+    "$binary_path" \
+    "$expected_commit" \
+    "$expected_correlation_id" <<'PY'
+import hashlib
+import json
+import re
+import stat
+import sys
+from pathlib import Path
+
+artifact_path = Path(sys.argv[1])
+binary_path = Path(sys.argv[2])
+expected_commit = sys.argv[3]
+expected_correlation = sys.argv[4]
+
+
+def stable_regular_bytes(path, executable=False):
+    before = path.lstat()
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise SystemExit(f"retrieved PiJS artifact is not a regular file: {path}")
+    if executable and before.st_mode & 0o111 == 0:
+        raise SystemExit(f"retrieved PiJS executable has no execute bit: {path}")
+    encoded = path.read_bytes()
+    after = path.lstat()
+    identity = lambda metadata: (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+    if identity(before) != identity(after) or len(encoded) != after.st_size:
+        raise SystemExit(f"retrieved PiJS artifact changed while read: {path}")
+    return encoded
+
+
+binary_bytes = stable_regular_bytes(binary_path, executable=True)
+binary_sha256 = hashlib.sha256(binary_bytes).hexdigest()
+try:
+    artifact_text = stable_regular_bytes(artifact_path).decode("utf-8")
+except UnicodeDecodeError as error:
+    raise SystemExit(f"retrieved PiJS JSONL is not UTF-8: {error}") from error
+lines = artifact_text.splitlines()
+if len(lines) != 2 or any(not line.strip() for line in lines):
+    raise SystemExit("retrieved PiJS JSONL must contain exactly two nonempty records")
+try:
+    records = [json.loads(line) for line in lines]
+except json.JSONDecodeError as error:
+    raise SystemExit(f"retrieved PiJS JSONL is invalid: {error}") from error
+
+expected_features = [
+    "clipboard",
+    "image",
+    "image-resize",
+    "sqlite-sessions",
+    "tui",
+    "wasm-host",
+]
+observed_tool_calls = set()
+claimed_binaries = set()
+for index, record in enumerate(records, start=1):
+    if not isinstance(record, dict):
+        raise SystemExit(f"retrieved PiJS record {index} is not an object")
+    expected = {
+        "schema": "pi.perf.workload.v1",
+        "run_id": expected_correlation,
+        "correlation_id": expected_correlation,
+        "source_commit": expected_commit,
+        "source_dirty": False,
+        "tool": "pijs_workload",
+        "scenario": "tool_call_roundtrip",
+        "iterations": 2000,
+        "build_profile": "perf",
+        "build_profile_verified": True,
+        "build_fingerprint_contract": "cargo_build_fingerprint.v1",
+        "build_fingerprint_verified": True,
+        "compiled_profile_family": "release",
+        "compiled_opt_level": "3",
+        "compiled_debug": "true",
+        "compiled_features": expected_features,
+        "executable_build_profile": "perf",
+        "executable_profile_verified": True,
+        "debug_assertions": False,
+        "runtime_engine": "quickjs",
+        "evidence_class": "measured",
+        "confidence": "high",
+        "eligible_for_regression_gate": True,
+        "measurement_method": "wall_clock_observation",
+        "measurement_boundary": "production_extension_manager",
+        "measurement_contract_version": "production_extension_manager.v1",
+        "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
+        "allocator_requested": "system",
+        "allocator_request_source": "env",
+        "allocator_effective": "system",
+        "allocator_fallback_reason": None,
+    }
+    mismatches = {
+        field: {"expected": value, "observed": record.get(field)}
+        for field, value in expected.items()
+        if record.get(field) != value
+    }
+    if mismatches:
+        raise SystemExit(f"retrieved PiJS record {index} mismatch: {mismatches}")
+    tool_calls = record.get("tool_calls_per_iteration")
+    if type(tool_calls) is not int or tool_calls not in {1, 10}:
+        raise SystemExit(f"retrieved PiJS record {index} has invalid tool-call count")
+    if record.get("total_calls") != 2000 * tool_calls:
+        raise SystemExit(f"retrieved PiJS record {index} has invalid total_calls")
+    elapsed_us = record.get("elapsed_us")
+    if type(elapsed_us) is not int or elapsed_us <= 0:
+        raise SystemExit(f"retrieved PiJS record {index} has invalid elapsed_us")
+    claimed_path = record.get("binary_path")
+    claimed_sha256 = record.get("binary_sha256")
+    config_hash = record.get("config_hash")
+    if (
+        not isinstance(claimed_path, str)
+        or not Path(claimed_path).is_absolute()
+        or any(part in {"", ".", ".."} for part in Path(claimed_path).parts)
+        or re.fullmatch(r"pijs_workload-[0-9a-f]{16}", Path(claimed_path).name) is None
+        or "perf/deps" not in Path(claimed_path).as_posix()
+        or not isinstance(claimed_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", claimed_sha256) is None
+        or not isinstance(config_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", config_hash) is None
+    ):
+        raise SystemExit(f"retrieved PiJS record {index} has invalid binary provenance")
+    observed_tool_calls.add(tool_calls)
+    claimed_binaries.add((claimed_path, claimed_sha256))
+
+if observed_tool_calls != {1, 10} or len(claimed_binaries) != 1:
+    raise SystemExit("retrieved PiJS records do not form one exact same-binary 2000x1/2000x10 pair")
+_, claimed_sha256 = claimed_binaries.pop()
+if claimed_sha256 != binary_sha256:
+    raise SystemExit(
+        "retrieved PiJS executable digest does not match the two measurement records"
+    )
+PY
+}
+
 run_criterion_bench() {
   local suite_name="$1"
   local bench_name="$2"
@@ -1614,8 +1760,19 @@ run_criterion_bench() {
   local criterion_dir="$TARGET_DIR/criterion/$criterion_run_subdir"
   local remote_execution_verified=false
   local -a criterion_runner_args=("${CARGO_RUNNER_ARGS[@]}")
+  local -a criterion_cargo_args=(
+    bench --bench "$bench_name" --profile "$CARGO_PROFILE"
+  )
   if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
     criterion_runner_args=("${PERF_BENCH_RUNNER_ARGS[@]}")
+  fi
+  if [[ "$suite_name" == "criterion_pijs" ]]; then
+    criterion_cargo_args+=(
+      --no-default-features
+      --features clipboard,image,image-resize,sqlite-sessions,tui,wasm-host
+      --
+      --regression-gate-pair
+    )
   fi
   mkdir -p "$result_dir"
 
@@ -1625,13 +1782,17 @@ run_criterion_bench() {
     exit_code=88
   else
     PI_CRITERION_OUTPUT_SUBDIR="$criterion_run_subdir" \
+    PI_BENCH_RUN_ID="$CORRELATION_ID" \
+    PI_BENCH_CORRELATION_ID="$CORRELATION_ID" \
+    PI_BENCH_ALLOCATOR=system \
+    PI_BENCH_BUILD_PROFILE="$CARGO_PROFILE" \
     CI_CORRELATION_ID="$CORRELATION_ID" \
     VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
     VERGEN_GIT_DIRTY="$GIT_DIRTY" \
     RCH_REQUIRE_REMOTE=1 \
     RCH_QUIET=0 \
     RCH_VISIBILITY=summary \
-      "${criterion_runner_args[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
+      "${criterion_runner_args[@]}" "${criterion_cargo_args[@]}" \
       >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
       || exit_code=$?
   fi
@@ -1664,6 +1825,32 @@ run_criterion_bench() {
     && ( ! -d "$criterion_dir" || -L "$criterion_dir" ) ]]; then
     log_fail "$suite_name did not produce its isolated Criterion directory"
     exit_code=92
+  fi
+  if [[ "$exit_code" -eq 0 && "$suite_name" == "criterion_pijs" ]]; then
+    local retrieved_pijs="$criterion_dir/pijs_workload.jsonl"
+    local retrieved_binary="$criterion_dir/pijs_workload"
+    local accepted_pijs="$OUTPUT_DIR/results/pijs_workload.jsonl"
+    if ! validate_retrieved_pijs_pair \
+      "$retrieved_pijs" \
+      "$retrieved_binary" \
+      "$GIT_COMMIT_FULL" \
+      "$CORRELATION_ID"; then
+      log_fail "criterion_pijs returned an invalid workload pair or executable"
+      exit_code=94
+    elif [[ -e "$accepted_pijs" || -L "$accepted_pijs" ]]; then
+      log_fail "Refusing preexisting accepted PiJS evidence destination"
+      exit_code=95
+    else
+      cp "$retrieved_pijs" "$accepted_pijs"
+      if ! validate_retrieved_pijs_pair \
+        "$accepted_pijs" \
+        "$retrieved_binary" \
+        "$GIT_COMMIT_FULL" \
+        "$CORRELATION_ID"; then
+        log_fail "Accepted PiJS evidence copy failed post-copy validation"
+        exit_code=96
+      fi
+    fi
   fi
 
   suite_end=$(epoch_ms)
@@ -1714,7 +1901,11 @@ EOF
 deferred_perf_budgets=false
 for suite in "${SELECTED_SUITES[@]}"; do
   if [[ "$suite" == "perf_budgets" ]]; then
-    deferred_perf_budgets=true
+    if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
+      log_step "Deferring perf_budgets to the hermetic post-generation evidence package"
+    else
+      deferred_perf_budgets=true
+    fi
     continue
   fi
   if [[ -n "${SUITE_TARGETS[$suite]+x}" ]]; then
@@ -1771,13 +1962,13 @@ required_test_suites = {
     "bench_scenario": "bench_scenario_runner",
     "ext_bench_harness": "ext_bench_harness",
     "perf_bench_harness": "perf_bench_harness",
-    "perf_budgets": "perf_budgets",
     "perf_regression": "perf_regression",
     "perf_comparison": "perf_comparison",
     "perf_baseline_variance": "perf_baseline_variance",
 }
 required_criterion_suites = {
     "criterion_extensions": "extensions",
+    "criterion_pijs": "pijs_workload",
     "criterion_system": "system",
     "criterion_semantic_context": "semantic_context",
 }
@@ -1790,12 +1981,12 @@ def load_current_result(suite):
         if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
             raise OSError("result is not a regular file")
         encoded = path.read_bytes()
-        return path, json.loads(encoded), hashlib.sha256(encoded).hexdigest()
+        return path, json.loads(encoded)
     except (OSError, json.JSONDecodeError) as error:
         failures.append(
             {"suite": suite, "reason": "missing_or_invalid_result", "detail": str(error)}
         )
-        return path, None, None
+        return path, None
 
 
 def load_remote_proof(suite):
@@ -1849,7 +2040,7 @@ def load_remote_proof(suite):
     }
 
 
-def validate_common(suite, target, kind, result, result_sha256, extra_expected=None):
+def validate_common(suite, target, kind, result, extra_expected=None):
     expected = {
         "schema": "pi.perf.suite_result.v1",
         "suite_name": suite,
@@ -1892,7 +2083,6 @@ def validate_common(suite, target, kind, result, result_sha256, extra_expected=N
             "suite": suite,
             "target": target,
             "kind": kind,
-            "result_sha256": result_sha256,
             "remote_execution_verified": True,
         }
         producer.update(remote_proof)
@@ -1900,7 +2090,7 @@ def validate_common(suite, target, kind, result, result_sha256, extra_expected=N
 
 
 for suite, target in required_test_suites.items():
-    _, result, result_sha256 = load_current_result(suite)
+    _, result = load_current_result(suite)
     if result is None:
         continue
     validate_common(
@@ -1908,12 +2098,11 @@ for suite, target in required_test_suites.items():
         target,
         "cargo_test",
         result,
-        result_sha256,
         {"remote_execution_required": True},
     )
 
 for suite, target in required_criterion_suites.items():
-    _, result, result_sha256 = load_current_result(suite)
+    _, result = load_current_result(suite)
     if result is None:
         continue
     expected_output = f"criterion/pi-perf-runs/{expected_instance}/{suite}"
@@ -1922,7 +2111,6 @@ for suite, target in required_criterion_suites.items():
         target,
         "criterion",
         result,
-        result_sha256,
         {"output_relative": expected_output},
     )
 
@@ -1934,6 +2122,8 @@ report = {
     "correlation_id": expected_correlation,
     "run_instance_id": expected_instance,
     "cargo_profile": expected_profile,
+    "proof_scope": "producer_execution_receipts",
+    "artifact_binding": "post_generation_evidence_inventory",
     "status": "ready" if not failures else "blocked",
     "failure_count": len(failures),
     "failures": failures,
