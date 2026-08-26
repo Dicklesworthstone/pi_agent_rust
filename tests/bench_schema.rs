@@ -669,7 +669,8 @@ summary_base64="$(python3 -c 'import base64,sys; print(base64.b64encode(sys.argv
 if [[ "${PI_FAKE_TAMPERED_SUMMARY_PAYLOAD:-0}" == "1" ]]; then
   summary_base64="$(python3 -c 'import base64; print(base64.b64encode(b"{}").decode())')"
 fi
-artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"type\":\"artifact\",\"test\":\"$test_name\",\"seq\":3,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"name\":\"$summary_name\",\"path\":\"/tmp/$summary_name\",\"size_bytes\":$summary_size,\"sha256\":\"$summary_sha\"}"
+diagnostic_ts="$(python3 -c 'from datetime import datetime, timezone; print(datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))')"
+artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"type\":\"artifact\",\"test\":\"$test_name\",\"seq\":3,\"ts\":\"$diagnostic_ts\",\"t_ms\":0,\"name\":\"$summary_name\",\"path\":\"/tmp/$summary_name\",\"size_bytes\":$summary_size,\"sha256\":\"$summary_sha\"}"
 if [[ "${PI_FAKE_MALFORMED_ARTIFACT_INDEX:-0}" == "1" ]]; then
   artifact_record="{\"schema\":\"pi.test.artifact.v1\",\"test\":\"$test_name\",\"name\":\"$summary_name\"}"
 fi
@@ -677,11 +678,11 @@ diagnostic_test_name="$test_name"
 if [[ "${PI_FAKE_WRONG_TEST_LOG_IDENTITY:-0}" == "1" ]]; then
   diagnostic_test_name="wrong-$test_name"
 fi
-log_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$diagnostic_test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":1,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"level\":\"info\",\"category\":\"fault\",\"message\":\"$fault_message\"}"
+log_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$diagnostic_test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":1,\"ts\":\"$diagnostic_ts\",\"t_ms\":0,\"level\":\"info\",\"category\":\"fault\",\"message\":\"$fault_message\"}"
 if [[ "${PI_FAKE_MALFORMED_TEST_LOG:-0}" == "1" ]]; then
   log_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$test_name\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"category\":\"fault\",\"message\":\"$fault_message\"}"
 fi
-payload_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$diagnostic_test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":2,\"ts\":\"2026-08-25T00:00:00Z\",\"t_ms\":0,\"level\":\"info\",\"category\":\"artifact_payload\",\"message\":\"inline JSON artifact bytes\",\"context\":{\"artifact_name\":\"$summary_name\",\"content_encoding\":\"base64\",\"content_sha256\":\"$summary_sha\",\"content_base64\":\"$summary_base64\"}}"
+payload_record="{\"schema\":\"pi.test.log.v2\",\"type\":\"log\",\"test\":\"$diagnostic_test_name\",\"trace_id\":\"trace-$case_id\",\"ci_correlation_id\":\"${CI_CORRELATION_ID:?}\",\"seq\":2,\"ts\":\"$diagnostic_ts\",\"t_ms\":0,\"level\":\"info\",\"category\":\"artifact_payload\",\"message\":\"inline JSON artifact bytes\",\"context\":{\"artifact_name\":\"$summary_name\",\"content_encoding\":\"base64\",\"content_sha256\":\"$summary_sha\",\"content_base64\":\"$summary_base64\"}}"
 cat >"$TEST_LOG_JSONL_PATH" <<JSON
 $log_record
 $payload_record
@@ -763,6 +764,76 @@ fn run_persistence_fault_runner_with_fake_rch(
 }
 
 #[cfg(unix)]
+fn assert_persistence_completion_contract(
+    artifact_root: &Path,
+    correlation_id: &str,
+    expected_passed: bool,
+) -> (Value, Value) {
+    let summary_path = artifact_root.join("integrity-summary.json");
+    let summary_bytes = fs::read(&summary_path).expect("read integrity summary");
+    let summary: Value =
+        serde_json::from_slice(&summary_bytes).expect("parse integrity summary");
+    assert_eq!(
+        summary["schema"],
+        "pi.e2e.persistence_fault_injection.summary.v1"
+    );
+    assert_eq!(summary["terminal_state"], "summary_validated");
+    assert_eq!(summary["validation_passed"], expected_passed);
+    assert_eq!(summary["run_id"], correlation_id);
+    assert_eq!(summary["correlation_id"], correlation_id);
+
+    let manifest_path = artifact_root.join("run-manifest.json");
+    let manifest: Value = serde_json::from_slice(
+        &fs::read(&manifest_path).expect("read run manifest"),
+    )
+    .expect("parse run manifest");
+    assert_eq!(
+        manifest["schema"],
+        "pi.e2e.persistence_fault_injection.manifest.v1"
+    );
+    assert_eq!(manifest["terminal_state"], "complete");
+    assert_eq!(manifest["overall_passed"], expected_passed);
+    assert_eq!(manifest["run_id"], correlation_id);
+    assert_eq!(manifest["correlation_id"], correlation_id);
+    for field in [
+        "source_commit",
+        "source_dirty",
+        "source_tree_sha256",
+        "source_commit_final",
+        "source_dirty_final",
+        "source_tree_sha256_final",
+    ] {
+        assert_eq!(
+            manifest[field], summary[field],
+            "manifest and summary must share {field}"
+        );
+    }
+    assert_eq!(
+        manifest["exit_codes"]["overall"].as_i64(),
+        Some(if expected_passed { 0 } else { 1 })
+    );
+    assert_eq!(
+        manifest["exit_codes"]["summary_validation"].as_i64(),
+        Some(if expected_passed { 0 } else { 1 })
+    );
+    assert_eq!(
+        manifest["integrity_summary"]["path"].as_str(),
+        summary_path.to_str()
+    );
+    assert_eq!(
+        manifest["integrity_summary"]["size_bytes"].as_u64(),
+        Some(summary_bytes.len() as u64)
+    );
+    let summary_sha256 = sha256_file(&summary_path).expect("hash integrity summary");
+    assert_eq!(
+        manifest["integrity_summary"]["sha256"].as_str(),
+        Some(summary_sha256.as_str())
+    );
+
+    (summary, manifest)
+}
+
+#[cfg(unix)]
 #[test]
 fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed() {
     let runner =
@@ -796,11 +867,11 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         String::from_utf8_lossy(&success.stdout),
         String::from_utf8_lossy(&success.stderr)
     );
-    let success_summary: Value = serde_json::from_slice(
-        &fs::read(success_root.join("artifacts/integrity-summary.json"))
-            .expect("read successful integrity summary"),
-    )
-    .expect("parse successful integrity summary");
+    let (success_summary, manifest) = assert_persistence_completion_contract(
+        &success_root.join("artifacts"),
+        success_correlation,
+        true,
+    );
     assert_eq!(success_summary["run_id"], success_correlation);
     assert_eq!(success_summary["correlation_id"], success_correlation);
     assert!(
@@ -820,7 +891,8 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         "persistence summary must bind the exact tracked and untracked source bytes"
     );
     assert_eq!(success_summary["source_tree_stable"], true);
-    assert_eq!(success_summary["overall_passed"], true);
+    assert_eq!(success_summary["terminal_state"], "summary_validated");
+    assert_eq!(success_summary["validation_passed"], true);
     for case in success_summary["cases"]
         .as_array()
         .expect("successful summary cases")
@@ -869,11 +941,6 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
             "remote-only path must be preserved as provenance, not retained as the canonical path"
         );
     }
-    let manifest: Value = serde_json::from_slice(
-        &fs::read(success_root.join("artifacts/run-manifest.json"))
-            .expect("read successful run manifest"),
-    )
-    .expect("parse successful run manifest");
     assert_eq!(manifest["rch_require_remote"], true);
     assert_eq!(
         fs::read_to_string(success_root.join("invocations.log"))
@@ -897,12 +964,12 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         "missing-report failure should identify the absent RCH artifact. stderr={}",
         String::from_utf8_lossy(&missing.stderr)
     );
-    let missing_summary: Value = serde_json::from_slice(
-        &fs::read(missing_root.join("artifacts/integrity-summary.json"))
-            .expect("read missing-report integrity summary"),
-    )
-    .expect("parse missing-report integrity summary");
-    assert_eq!(missing_summary["overall_passed"], false);
+    let (missing_summary, _) = assert_persistence_completion_contract(
+        &missing_root.join("artifacts"),
+        "persistence-rch-missing-correlation",
+        false,
+    );
+    assert_eq!(missing_summary["validation_passed"], false);
     assert_eq!(missing_summary["cases"][0]["passed"], true);
     assert_eq!(missing_summary["cases"][1]["passed"], false);
 
@@ -916,12 +983,12 @@ fn persistence_fault_runner_retrieves_current_rch_diagnostics_and_fails_closed()
         !malformed.status.success(),
         "malformed artifact evidence must fail closed"
     );
-    let malformed_summary: Value = serde_json::from_slice(
-        &fs::read(malformed_root.join("artifacts/integrity-summary.json"))
-            .expect("read malformed-evidence integrity summary"),
-    )
-    .expect("parse malformed-evidence integrity summary");
-    assert_eq!(malformed_summary["overall_passed"], false);
+    let (malformed_summary, _) = assert_persistence_completion_contract(
+        &malformed_root.join("artifacts"),
+        "persistence-rch-malformed-correlation",
+        false,
+    );
+    assert_eq!(malformed_summary["validation_passed"], false);
     for case in malformed_summary["cases"]
         .as_array()
         .expect("malformed-evidence summary cases")
@@ -1083,6 +1150,7 @@ import hashlib
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
 binary_path = sys.argv[1]
 with open(binary_path, "rb") as handle:
@@ -1103,30 +1171,34 @@ bench_env = {
 bench_env_sha256 = hashlib.sha256(
     json.dumps(bench_env, separators=(",", ":"), sort_keys=True).encode()
 ).hexdigest()
+rss_values = [1048576, 1179648, 1310720, 1441792, 1572864]
+if os.environ.get("PI_FAKE_IDLE_RSS_OVER_BUDGET") == "1":
+    rss_values[-1] = 64 * 1024 * 1024
+samples = [
+    {"pid": 1001 + index, "process_name": "pi", "rss_bytes": rss_bytes}
+    for index, rss_bytes in enumerate(rss_values)
+]
+max_rss = max(rss_values)
+representative = samples[rss_values.index(max_rss)]
 record = {
     "schema": "pi.perf.idle_rss_measurement.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     "run_id": os.environ["PI_IDLE_RSS_CORRELATION_ID"],
     "correlation_id": os.environ["PI_IDLE_RSS_CORRELATION_ID"],
     "source_commit": os.environ["PI_IDLE_RSS_SOURCE_COMMIT"],
     "source_dirty": False,
-    "pid": 1005,
+    "pid": representative["pid"],
     "process_name": "pi",
     "allocator": "system",
     "binary_path": binary_path,
     "binary_sha256": binary_sha256,
-    "rss_bytes": 1572864,
+    "rss_bytes": max_rss,
     "idle_state": "startup_before_user_input",
     "cargo_profile": "release",
     "build_command": "cargo build --bin pi --release",
     "sample_count": 5,
-    "samples": [
-        {"pid": 1001, "process_name": "pi", "rss_bytes": 1048576},
-        {"pid": 1002, "process_name": "pi", "rss_bytes": 1179648},
-        {"pid": 1003, "process_name": "pi", "rss_bytes": 1310720},
-        {"pid": 1004, "process_name": "pi", "rss_bytes": 1441792},
-        {"pid": 1005, "process_name": "pi", "rss_bytes": 1572864},
-    ],
-    "rss_spread_bytes": 524288,
+    "samples": samples,
+    "rss_spread_bytes": max_rss - min(rss_values),
     "settle_ms": 1000,
     "bench_env_source": "benches/bench_env.rs",
     "bench_env": bench_env,
@@ -1186,6 +1258,7 @@ elif [[ -n "$bench_name" ]]; then
         "${CI_CORRELATION_ID:?}" <<'PY'
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1333,7 +1406,9 @@ case "$test_name" in
   bench_scenario_runner)
     cat >"$artifact_output_dir/scenario_runner.jsonl" <<'JSON'
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"cold_start","extension":"hello","stats":{"p95_ms":18.0},"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/cold_start","replay_input":{"runs":5}}}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"warm_start","extension":"hello","stats":{"p95_ms":8.0},"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/warm_start","replay_input":{"runs":5}}}
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"tool_call","extension":"hello","per_call_us":33.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/tool_call","replay_input":{"iterations":500}}}
+{"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"event_dispatch","extension":"hello","per_event_us":21.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","partition":"matched-state","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/event_dispatch","replay_input":{"iterations":500}}}
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"session_workload_matrix","extension":"core","partition":"matched-state","open_ms":48.0,"append_ms":36.0,"save_ms":22.0,"index_ms":11.0,"total_ms":117.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/session_100000","replay_input":{"session_messages":100000}}}
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"session_workload_matrix","extension":"core","partition":"matched-state","open_ms":62.0,"append_ms":45.0,"save_ms":29.0,"index_ms":13.0,"total_ms":149.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/session_200000","replay_input":{"session_messages":200000}}}
 {"schema":"pi.ext.rust_bench.v1","runtime":"pi_agent_rust","scenario":"session_workload_matrix","extension":"core","partition":"matched-state","open_ms":91.0,"append_ms":68.0,"save_ms":43.0,"index_ms":18.0,"total_ms":220.0,"protocol_schema":"pi.bench.protocol.v1","protocol_version":"1.0.0","evidence_class":"measured","confidence":"high","correlation_id":"stub-correlation","scenario_metadata":{"runtime":"pi_agent_rust","build_profile":"perf","host":{"os":"linux","arch":"x86_64","cpu_model":"stub","cpu_cores":8},"scenario_id":"matched-state/session_500000","replay_input":{"session_messages":500000}}}
@@ -1388,18 +1463,43 @@ for line in rows:
 path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
 PY
     fi
+    if [[ "${PI_FAKE_ZERO_STAGE_SAMPLE:-0}" == "1" ]]; then
+      python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+rows = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+rewritten = []
+mutated = False
+for line in rows:
+    record = json.loads(line)
+    if not mutated and record.get("scenario") == "session_workload_matrix":
+        for field in ("open_ms", "append_ms", "save_ms", "index_ms"):
+            record[field] = 0.0
+        mutated = True
+    rewritten.append(json.dumps(record, separators=(",", ":")))
+path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
+PY
+    fi
     if [[ "${PI_BENCH_LEGACY_RUNTIMES:-0}" == "1" ]]; then
       cat >"$artifact_output_dir/legacy_extension_workloads.jsonl" <<'JSON'
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"node","summary":{"p50_ms":10.0}}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"bun","summary":{"p50_ms":8.0}}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"node","per_call_us":20.0}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"bun","per_call_us":15.0}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","extension":"hello+pirate","runtime_kind":"node","elapsed_ms":2400.0}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","extension":"hello+pirate","runtime_kind":"bun","elapsed_ms":1800.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"node","runs":10,"summary":{"count":10,"p50_ms":10.0,"p95_ms":10.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"pirate","runtime_kind":"node","runs":10,"summary":{"count":10,"p50_ms":12.0,"p95_ms":12.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"node","iterations":2000,"per_call_us":20.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_event_hook/before_agent_start","extension":"pirate","runtime_kind":"node","iterations":2000,"per_call_us":22.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","extension":"hello+pirate","runtime_kind":"node","iterations":2000,"tool_calls_per_iteration":10,"tool_executions":20000,"event_executions":2000,"elapsed_ms":2400.0,"workload_shape":{"extension_loads_per_iteration":2,"tool_calls_per_iteration":10,"event_hooks_per_iteration":1}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"bun","runs":10,"summary":{"count":10,"p50_ms":8.0,"p95_ms":8.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"pirate","runtime_kind":"bun","runs":10,"summary":{"count":10,"p50_ms":9.0,"p95_ms":9.0}}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"bun","iterations":2000,"per_call_us":15.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"ext_event_hook/before_agent_start","extension":"pirate","runtime_kind":"bun","iterations":2000,"per_call_us":16.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","extension":"hello+pirate","runtime_kind":"bun","iterations":2000,"tool_calls_per_iteration":10,"tool_executions":20000,"event_executions":2000,"elapsed_ms":1800.0,"workload_shape":{"extension_loads_per_iteration":2,"tool_calls_per_iteration":10,"event_hooks_per_iteration":1}}
 JSON
     fi
     python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -1409,6 +1509,28 @@ rewritten = []
 for line in rows:
     record = json.loads(line)
     if record.get("scenario") == "session_workload_matrix":
+        if os.environ.get("PI_FAKE_SYNTHETIC_MATRIX_EVIDENCE") == "1":
+            record.update(
+                {
+                    "evidence_class": "inferred",
+                    "confidence": "low",
+                    "eligible_for_regression_gate": False,
+                    "measurement_method": "synthetic_seed_projection",
+                    "measurement_boundary": "synthetic_seed_projection",
+                    "measurement_contract_version": "synthetic_seed_projection.v1",
+                }
+            )
+        else:
+            record.update(
+                {
+                    "evidence_class": "measured",
+                    "confidence": "high",
+                    "eligible_for_regression_gate": True,
+                    "measurement_method": "wall_clock_observation",
+                    "measurement_boundary": "production_session_stage_instrumentation",
+                    "measurement_contract_version": "production_session_stage_instrumentation.v1",
+                }
+            )
         session_messages = int(record.get("session_messages") or 0)
         total_ms = float(record.get("total_ms") or 0.0)
         queue_p50 = max(1, session_messages // 100000)
@@ -1479,14 +1601,276 @@ PY
       ext_bench_iterations=10
       ext_bench_events=50
     fi
-    cat >"$artifact_output_dir/ext_bench_harness.jsonl" <<'JSON'
-{"schema":"pi.ext.rust_bench.v1","scenario":"cold_load","extension":"hello","success":true,"stats":{"p95_us":18000}}
-{"schema":"pi.ext.rust_bench.v1","scenario":"warm_load","extension":"hello","success":true,"stats":{"p95_us":9000}}
-{"schema":"pi.ext.rust_bench.v1","scenario":"event_dispatch","extension":"1_extensions","success":true,"stats":{"p95_us":120}}
-JSON
-    cat >"$artifact_output_dir/ext_bench_harness_report.json" <<JSON
-{"schema":"pi.bench.harness_report.v1","mode":"${PI_BENCH_MODE:-pr}","config":{"max_extensions":$ext_bench_max,"iterations":$ext_bench_iterations,"event_dispatch_count":$ext_bench_events},"summary":{"total_scenarios":3,"total_passed":3,"total_failed":0,"budgets_passed":1,"budgets_failed":0,"budgets_no_data":0}}
-JSON
+    python3 - \
+      "$artifact_output_dir/ext_bench_harness.jsonl" \
+      "$artifact_output_dir/ext_bench_harness_report.json" \
+      "${PI_BENCH_MODE:-pr}" \
+      "$ext_bench_max" \
+      "$ext_bench_iterations" \
+      "$ext_bench_events" \
+      "${PI_FAKE_DROP_EXT_BENCH_HARNESS_COVERAGE:-0}" \
+      "${PI_FAKE_CORRUPT_EXT_BENCH_BUDGET:-0}" <<'PY'
+import hashlib
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+jsonl_path = Path(sys.argv[1])
+report_path = Path(sys.argv[2])
+mode = sys.argv[3]
+max_extensions = int(sys.argv[4])
+iterations = int(sys.argv[5])
+event_count = int(sys.argv[6])
+drop_coverage = sys.argv[7] == "1"
+corrupt_budget = sys.argv[8] == "1"
+manifest = json.loads(
+    Path("tests/ext_conformance/VALIDATED_MANIFEST.json").read_text(encoding="utf-8")
+)
+safe_entries = [
+    entry
+    for entry in manifest["extensions"]
+    if not entry["capabilities"]["is_multi_file"]
+    and not entry["capabilities"]["uses_exec"]
+]
+
+
+def select_pr_entries(entries, maximum):
+    selected_entries = []
+    selected_ids = set()
+
+    def pick(predicate):
+        if len(selected_entries) >= maximum:
+            return
+        selected_entry = next(
+            (
+                entry
+                for entry in entries
+                if entry["id"] not in selected_ids and predicate(entry)
+            ),
+            None,
+        )
+        if selected_entry is not None:
+            selected_entries.append(selected_entry)
+            selected_ids.add(selected_entry["id"])
+
+    pick(
+        lambda entry: entry["source_tier"] == "official-pi-mono"
+        and entry["capabilities"]["registers_tools"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "official-pi-mono"
+        and "agent_start" in entry["capabilities"]["subscribes_events"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "community"
+        and entry["capabilities"]["registers_commands"]
+        and "agent_start" in entry["capabilities"]["subscribes_events"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "community"
+        and entry["capabilities"]["registers_tools"]
+        and entry["capabilities"]["registers_flags"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "npm-registry"
+        and entry["capabilities"]["registers_commands"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "npm-registry"
+        and "agent_start" in entry["capabilities"]["subscribes_events"]
+    )
+    for entry in entries:
+        if len(selected_entries) >= maximum:
+            break
+        if entry["id"] not in selected_ids:
+            selected_entries.append(entry)
+            selected_ids.add(entry["id"])
+    return selected_entries
+
+
+selected = (
+    select_pr_entries(safe_entries, max_extensions)
+    if mode == "pr"
+    else safe_entries[:max_extensions]
+)
+
+fake_env = {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_model": "fake-rch-worker",
+    "cpu_cores": 8,
+    "mem_total_mb": 65536,
+    "build_profile": "release",
+    "git_commit": "abcdef0",
+    "features": ["ext-conformance"],
+}
+fake_env_hash_input = "|".join(
+    str(fake_env[field])
+    for field in (
+        "os",
+        "arch",
+        "cpu_model",
+        "cpu_cores",
+        "mem_total_mb",
+        "build_profile",
+        "git_commit",
+    )
+)
+fake_env["config_hash"] = hashlib.sha256(fake_env_hash_input.encode()).hexdigest()
+
+
+def group_for(entry):
+    if entry["source_tier"] == "official-pi-mono":
+        return (
+            "official-simple"
+            if entry["conformance_tier"] <= 3
+            else "official-complex"
+        )
+    return "community"
+
+
+def stats(count, value):
+    return {
+        "count": count,
+        "min_us": value,
+        "max_us": value,
+        "mean_us": value,
+        "p50_us": value,
+        "p95_us": value,
+        "p99_us": value,
+    }
+
+
+records = []
+for entry in selected:
+    records.append(
+        {
+            "schema": "pi.ext.rust_bench.v1",
+            "runtime": "pi_agent_rust",
+            "scenario": "cold_load",
+            "extension": entry["id"],
+            "group": group_for(entry),
+            "tier": entry["conformance_tier"],
+            "success": True,
+            "stats": stats(iterations, 18_000),
+            "env": fake_env,
+        }
+    )
+for index, entry in enumerate(selected):
+    if drop_coverage and index == 0:
+        continue
+    records.append(
+        {
+            "schema": "pi.ext.rust_bench.v1",
+            "runtime": "pi_agent_rust",
+            "scenario": "warm_load",
+            "extension": entry["id"],
+            "group": group_for(entry),
+            "tier": entry["conformance_tier"],
+            "success": True,
+            "stats": stats(iterations, 9_000),
+            "env": fake_env,
+        }
+    )
+records.append(
+    {
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "event_dispatch",
+        "extension": f"{len(selected)}_extensions",
+        "group": "aggregate",
+        "tier": 0,
+        "success": True,
+        "stats": stats(event_count, 120),
+        "env": fake_env,
+    }
+)
+jsonl_path.write_text(
+    "\n".join(json.dumps(record, separators=(",", ":")) for record in records) + "\n",
+    encoding="utf-8",
+)
+
+scenario_counts = {
+    scenario: sum(record["scenario"] == scenario for record in records)
+    for scenario in ("cold_load", "warm_load", "event_dispatch")
+}
+scenario_aggregate_values = {
+    "cold_load": 18_000,
+    "warm_load": 9_000,
+    "event_dispatch": 120,
+}
+worst_extension = selected[-1]["id"]
+budget_checks = [
+    {
+        "budget_name": "ext_cold_load_simple_p95",
+        "threshold_us": 200_000,
+        "actual_us": 18_000,
+        "status": "PASS",
+    },
+    {
+        "budget_name": "ext_cold_load_per_ext_p99",
+        "threshold_us": 100_000,
+        "actual_us": 18_000,
+        "status": "PASS",
+        "worst_extension": worst_extension,
+    },
+    {
+        "budget_name": "ext_warm_load_per_ext_p99",
+        "threshold_us": 100_000,
+        "actual_us": 9_000,
+        "status": "PASS",
+        "worst_extension": worst_extension,
+    },
+    {
+        "budget_name": "event_dispatch_p99",
+        "threshold_us": 5_000,
+        "actual_us": 120,
+        "status": "PASS",
+    },
+    {
+        "budget_name": "ext_warm_load_p95",
+        "threshold_us": 100_000,
+        "actual_us": 9_000,
+        "status": "PASS",
+    },
+]
+if corrupt_budget:
+    budget_checks[0]["actual_us"] = 1
+report = {
+    "schema": "pi.bench.harness_report.v1",
+    "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    "mode": mode,
+    "env": fake_env,
+    "config": {
+        "max_extensions": max_extensions,
+        "iterations": iterations,
+        "event_dispatch_count": event_count,
+        "debug_build": False,
+    },
+    "summary": {
+        "total_scenarios": len(records),
+        "total_passed": len(records),
+        "total_failed": 0,
+        "budgets_passed": len(budget_checks),
+        "budgets_failed": 0,
+        "budgets_no_data": 0,
+    },
+    "by_scenario": {
+        scenario: {
+            "scenario": scenario,
+            "extensions_tested": count,
+            "passed": count,
+            "failed": 0,
+            "aggregate_stats": stats(count, scenario_aggregate_values[scenario]),
+        }
+        for scenario, count in scenario_counts.items()
+    },
+    "budget_checks": budget_checks,
+    "results": records,
+}
+report_path.write_text(json.dumps(report, separators=(",", ":")), encoding="utf-8")
+PY
     ;;
   perf_bench_harness)
     if [[ -n "${PI_FAKE_PERF_BENCH_INVOCATION_MARKER:-}" ]]; then
@@ -1806,6 +2190,41 @@ artifact_output_dir = Path(sys.argv[1])
 correlation_id = sys.argv[2]
 source_commit = sys.argv[3]
 generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+comparison_host_fingerprint = "b" * 64
+
+
+def fake_comparison_contract(claim_scope):
+    definitions = {
+        "cold_load_init": (
+            "matched_extension_cold_load",
+            {"extension": "hello", "operation": "cold_load_init", "statistic": "p95"},
+        ),
+        "per_call_dispatch_micro": (
+            "matched_extension_tool_dispatch",
+            {"extension": "hello", "operation": "tool_call", "statistic": "mean"},
+        ),
+        "full_e2e_long_session": (
+            "matched_full_session_workflow",
+            {
+                "session_turns": 2000,
+                "extension_loads_per_iteration": 2,
+                "tool_calls_per_iteration": 10,
+                "event_hooks_per_iteration": 1,
+                "statistic": "elapsed",
+            },
+        ),
+    }
+    boundary, workload_shape = definitions[claim_scope]
+    return {
+        "schema": "pi.perf.cross_runtime_comparison.v1",
+        "claim_scope": claim_scope,
+        "measurement_boundary": boundary,
+        "release_claim_eligible": True,
+        "host_fingerprint_sha256": comparison_host_fingerprint,
+        "workload_shape": workload_shape,
+    }
+
+
 artifacts = (
     ("scenario_runner.jsonl", "orchestration_correlation_id"),
     ("pijs_workload.jsonl", "correlation_id"),
@@ -1821,12 +2240,76 @@ for relative_path, correlation_field in artifacts:
         for line in path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    if (
+        relative_path == "legacy_extension_workloads.jsonl"
+        and os.environ.get("PI_FAKE_DROP_LEGACY_BENCH_COVERAGE") == "1"
+        and records
+    ):
+        records.pop()
     for record in records:
         record["timestamp"] = generated_at
         record["run_id"] = correlation_id
         record[correlation_field] = correlation_id
         record["source_commit"] = source_commit
         record["source_dirty"] = False
+        if relative_path == "scenario_runner.jsonl":
+            if record.get("scenario") == "cold_start" and record.get("extension") == "hello":
+                record["comparison_contract"] = fake_comparison_contract("cold_load_init")
+            elif record.get("scenario") == "tool_call" and record.get("extension") == "hello":
+                record["comparison_contract"] = fake_comparison_contract(
+                    "per_call_dispatch_micro"
+                )
+        elif relative_path == "pijs_workload.jsonl" and record.get(
+            "tool_calls_per_iteration"
+        ) == 10:
+            record.update(
+                {
+                    "comparison_scenario": "full_e2e_long_session",
+                    "session_turns": 2000,
+                    "extension_loads_per_iteration": 2,
+                    "event_hooks_per_iteration": 1,
+                    "tool_executions": 20000,
+                    "event_executions": 2000,
+                }
+            )
+            record["comparison_contract"] = fake_comparison_contract(
+                "full_e2e_long_session"
+            )
+        elif relative_path == "legacy_extension_workloads.jsonl":
+            portable_shim = os.environ.get("PI_FAKE_PORTABLE_LEGACY_SHIM") == "1"
+            if portable_shim:
+                record["runtime"] = (
+                    f"portable_{record['runtime_kind']}_extension_api"
+                )
+                record["runtime_family"] = "portable_extension_api"
+                record["legacy_pi_mono_executed"] = False
+            else:
+                record["runtime"] = "legacy_pi_mono"
+                record["runtime_family"] = "legacy_pi_mono_extension_loader"
+                record["legacy_pi_mono_executed"] = True
+            scenario = record.get("scenario")
+            if (
+                not portable_shim
+                and scenario == "ext_load_init/load_init_cold"
+                and record.get("extension") == "hello"
+            ):
+                record["comparison_contract"] = fake_comparison_contract("cold_load_init")
+            elif (
+                not portable_shim
+                and scenario == "ext_tool_call/hello"
+                and record.get("extension") == "hello"
+            ):
+                record["comparison_contract"] = fake_comparison_contract(
+                    "per_call_dispatch_micro"
+                )
+            elif scenario == "full_e2e_long_session":
+                record["workload_shape"]["description"] = (
+                    "fixture matched full-session workflow"
+                )
+                if not portable_shim:
+                    record["comparison_contract"] = fake_comparison_contract(
+                        "full_e2e_long_session"
+                    )
     if (
         relative_path == "scenario_runner.jsonl"
         and records
@@ -3572,6 +4055,13 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
 }
 
 fn validate_extension_stratification_record(record: &Value) -> Result<(), String> {
+    const MATCHED_COMPARISON_BASIS: &str = "matched_legacy_pi_mono_extension_loader";
+    const REQUIRED_LAYER_IDS: [&str; 3] = [
+        "cold_load_init",
+        "per_call_dispatch_micro",
+        "full_e2e_long_session",
+    ];
+
     let required_top_level = [
         "schema",
         "run_id",
@@ -3597,11 +4087,15 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
         .get("layers")
         .and_then(Value::as_array)
         .ok_or_else(|| "layers must be an array".to_string())?;
-    if layers.len() < 3 {
-        return Err("layers must include cold-load, per-call, and full-e2e entries".to_string());
+    if layers.len() != REQUIRED_LAYER_IDS.len() {
+        return Err(
+            "layers must contain exactly cold-load, per-call, and full-e2e entries".to_string(),
+        );
     }
 
     let mut layer_ids = HashSet::new();
+    let mut observed_layer_coverage = HashMap::new();
+    let mut observed_matched_contracts = HashMap::new();
     for layer in layers {
         let layer_obj = layer
             .as_object()
@@ -3627,7 +4121,12 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
         if layer_id.trim().is_empty() {
             return Err("layer_id must be non-empty".to_string());
         }
-        layer_ids.insert(layer_id.to_string());
+        if !REQUIRED_LAYER_IDS.contains(&layer_id) {
+            return Err(format!("unexpected layer_id: {layer_id}"));
+        }
+        if !layer_ids.insert(layer_id.to_string()) {
+            return Err(format!("duplicate layer_id: {layer_id}"));
+        }
 
         let scenario_tags = layer_obj
             .get("scenario_tags")
@@ -3641,11 +4140,24 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
             .get("absolute_metrics")
             .and_then(Value::as_object)
             .ok_or_else(|| format!("layer {layer_id} absolute_metrics must be object"))?;
-        for field in &["metric_name", "unit"] {
+        for field in &["metric_name", "value", "unit"] {
             if !absolute_metrics.contains_key(*field) {
                 return Err(format!("layer {layer_id} absolute_metrics missing {field}"));
             }
         }
+        let absolute_present = match absolute_metrics.get("value") {
+            Some(Value::Null) => false,
+            Some(value) => value
+                .as_f64()
+                .filter(|number| number.is_finite() && *number > 0.0)
+                .map(|_| true)
+                .ok_or_else(|| {
+                    format!(
+                        "layer {layer_id} absolute_metrics.value must be null or a finite positive number"
+                    )
+                })?,
+            None => unreachable!("absolute_metrics.value presence checked above"),
+        };
 
         let relative_metrics = layer_obj
             .get("relative_metrics")
@@ -3662,6 +4174,79 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
             }
         }
 
+        let validate_ratio = |ratio_field: &str, basis_field: &str| -> Result<bool, String> {
+            let basis = relative_metrics
+                .get(basis_field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("layer {layer_id} relative_metrics.{basis_field} must be a string")
+                })?;
+            match relative_metrics.get(ratio_field) {
+                Some(Value::Null) if basis == "missing" => Ok(false),
+                Some(Value::Null) => Err(format!(
+                    "layer {layer_id} null {ratio_field} requires {basis_field}=missing"
+                )),
+                Some(value)
+                    if value
+                        .as_f64()
+                        .is_some_and(|number| number.is_finite() && number > 0.0)
+                        && basis == MATCHED_COMPARISON_BASIS =>
+                {
+                    Ok(true)
+                }
+                Some(value) if value.as_f64().is_some() => Err(format!(
+                    "layer {layer_id} positive {ratio_field} requires {basis_field}={MATCHED_COMPARISON_BASIS}"
+                )),
+                Some(_) => Err(format!(
+                    "layer {layer_id} {ratio_field} must be null or a finite positive number"
+                )),
+                None => unreachable!("relative ratio field presence checked above"),
+            }
+        };
+        let node_ratio_present =
+            validate_ratio("rust_vs_node_ratio", "rust_vs_node_ratio_basis")?;
+        let bun_ratio_present =
+            validate_ratio("rust_vs_bun_ratio", "rust_vs_bun_ratio_basis")?;
+        if node_ratio_present != bun_ratio_present {
+            return Err(format!(
+                "layer {layer_id} must provide matched Node and Bun ratios together"
+            ));
+        }
+        let evidence_state = layer_obj
+            .get("evidence_state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("layer {layer_id} evidence_state must be a string"))?;
+        if !matches!(
+            evidence_state,
+            EVIDENCE_CLASS_MEASURED | EVIDENCE_CLASS_INFERRED | "absolute_only" | "no_data"
+        ) {
+            return Err(format!(
+                "layer {layer_id} has invalid evidence_state: {evidence_state}"
+            ));
+        }
+        let confidence = layer_obj
+            .get("confidence")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("layer {layer_id} confidence must be a string"))?;
+        let expected_confidence = match evidence_state {
+            EVIDENCE_CLASS_MEASURED => CONFIDENCE_HIGH,
+            EVIDENCE_CLASS_INFERRED => CONFIDENCE_MEDIUM,
+            "absolute_only" | "no_data" => CONFIDENCE_LOW,
+            _ => unreachable!("evidence_state allowlist checked above"),
+        };
+        if confidence != expected_confidence {
+            return Err(format!(
+                "layer {layer_id} evidence_state={evidence_state} requires confidence={expected_confidence}, got {confidence}"
+            ));
+        }
+        let evidence_measured = evidence_state == EVIDENCE_CLASS_MEASURED;
+        let matched_contract = node_ratio_present && bun_ratio_present;
+        observed_matched_contracts.insert(layer_id.to_string(), matched_contract);
+        observed_layer_coverage.insert(
+            layer_id.to_string(),
+            absolute_present && matched_contract && evidence_measured,
+        );
+
         let lineage = layer_obj
             .get("lineage")
             .and_then(Value::as_object)
@@ -3677,12 +4262,8 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
         }
     }
 
-    for expected in &[
-        "cold_load_init",
-        "per_call_dispatch_micro",
-        "full_e2e_long_session",
-    ] {
-        if !layer_ids.contains(*expected) {
+    for expected in REQUIRED_LAYER_IDS {
+        if !layer_ids.contains(expected) {
             return Err(format!("missing required layer_id: {expected}"));
         }
     }
@@ -3691,10 +4272,87 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
         .get("claim_integrity")
         .and_then(Value::as_object)
         .ok_or_else(|| "claim_integrity must be an object".to_string())?;
-    for field in &["anti_conflation", "cherry_pick_guard", "partition_coverage"] {
+    for field in &[
+        "anti_conflation",
+        "cross_runtime_comparison",
+        "cherry_pick_guard",
+        "required_partition_tags",
+        "partition_coverage",
+    ] {
         if !claim_integrity.contains_key(*field) {
             return Err(format!("claim_integrity missing {field}"));
         }
+    }
+    let cross_runtime = claim_integrity
+        .get("cross_runtime_comparison")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "claim_integrity.cross_runtime_comparison must be object".to_string())?;
+    if cross_runtime.get("contract_schema").and_then(Value::as_str)
+        != Some("pi.perf.cross_runtime_comparison.v1")
+        || cross_runtime
+            .get("legacy_pi_mono_executed_required")
+            .and_then(Value::as_bool)
+            != Some(true)
+        || cross_runtime
+            .get("exact_workload_and_host_contract_required")
+            .and_then(Value::as_bool)
+            != Some(true)
+    {
+        return Err(
+            "claim_integrity.cross_runtime_comparison has an invalid comparison contract"
+                .to_string(),
+        );
+    }
+    let portable_shim_record_count = cross_runtime
+        .get("portable_shim_record_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "claim_integrity.cross_runtime_comparison.portable_shim_record_count must be a non-negative integer"
+                .to_string()
+        })?;
+    let true_legacy_record_count = cross_runtime
+        .get("true_legacy_pi_mono_record_count")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "claim_integrity.cross_runtime_comparison.true_legacy_pi_mono_record_count must be a non-negative integer"
+                .to_string()
+        })?;
+    let matched_layer_contracts = cross_runtime
+        .get("matched_layer_contracts")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "claim_integrity.cross_runtime_comparison.matched_layer_contracts must be object"
+                .to_string()
+        })?;
+    if matched_layer_contracts.len() != REQUIRED_LAYER_IDS.len() {
+        return Err(
+            "claim_integrity.cross_runtime_comparison.matched_layer_contracts must contain exactly the required layers"
+                .to_string(),
+        );
+    }
+    for layer_id in REQUIRED_LAYER_IDS {
+        let declared = matched_layer_contracts
+            .get(layer_id)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                format!(
+                    "claim_integrity.cross_runtime_comparison.matched_layer_contracts.{layer_id} must be boolean"
+                )
+            })?;
+        let observed = observed_matched_contracts.get(layer_id).copied() == Some(true);
+        if declared != observed {
+            return Err(format!(
+                "matched_layer_contracts.{layer_id}={declared} does not match observed ratio evidence {observed}"
+            ));
+        }
+    }
+    if observed_matched_contracts.values().any(|matched| *matched)
+        && (portable_shim_record_count != 0 || true_legacy_record_count != 10)
+    {
+        return Err(
+            "matched ratios require exactly 10 true pi-mono records and zero portable shim records"
+                .to_string(),
+        );
     }
     let cherry_pick_guard = claim_integrity
         .get("cherry_pick_guard")
@@ -3709,6 +4367,108 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
         if !cherry_pick_guard.contains_key(*field) {
             return Err(format!("claim_integrity.cherry_pick_guard missing {field}"));
         }
+    }
+    if cherry_pick_guard
+        .get("requires_all_layers_for_global_claim")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(
+            "claim_integrity.cherry_pick_guard.requires_all_layers_for_global_claim must be true"
+                .to_string(),
+        );
+    }
+    let declared_layer_coverage = cherry_pick_guard
+        .get("layer_coverage")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "claim_integrity.cherry_pick_guard.layer_coverage must be object".to_string())?;
+    if declared_layer_coverage.len() != REQUIRED_LAYER_IDS.len() {
+        return Err(
+            "claim_integrity.cherry_pick_guard.layer_coverage must contain exactly the required layers"
+                .to_string(),
+        );
+    }
+    for layer_id in REQUIRED_LAYER_IDS {
+        let declared = declared_layer_coverage
+            .get(layer_id)
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("layer_coverage.{layer_id} must be boolean"))?;
+        let observed = observed_layer_coverage.get(layer_id).copied() == Some(true);
+        if declared != observed {
+            return Err(format!(
+                "layer_coverage.{layer_id}={declared} does not match observed complete evidence {observed}"
+            ));
+        }
+    }
+    let invalidity_reasons = cherry_pick_guard
+        .get("invalidity_reasons")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "claim_integrity.cherry_pick_guard.invalidity_reasons must be array".to_string()
+        })?;
+    if invalidity_reasons.iter().any(|reason| reason.as_str().is_none()) {
+        return Err(
+            "claim_integrity.cherry_pick_guard.invalidity_reasons entries must be strings"
+                .to_string(),
+        );
+    }
+    let required_partition_tags = claim_integrity
+        .get("required_partition_tags")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "claim_integrity.required_partition_tags must be array".to_string())?;
+    if required_partition_tags.is_empty() {
+        return Err("claim_integrity.required_partition_tags must be non-empty".to_string());
+    }
+    let mut required_partitions = HashSet::new();
+    for tag in required_partition_tags {
+        let tag = tag
+            .as_str()
+            .filter(|tag| !tag.trim().is_empty())
+            .ok_or_else(|| {
+                "claim_integrity.required_partition_tags entries must be non-empty strings"
+                    .to_string()
+            })?;
+        if !required_partitions.insert(tag) {
+            return Err(format!("duplicate required partition tag: {tag}"));
+        }
+    }
+    let partition_coverage = claim_integrity
+        .get("partition_coverage")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "claim_integrity.partition_coverage must be object".to_string())?;
+    if partition_coverage.len() != required_partitions.len() {
+        return Err(
+            "claim_integrity.partition_coverage must exactly match required_partition_tags"
+                .to_string(),
+        );
+    }
+    let all_partitions_covered = required_partitions.iter().try_fold(true, |all, tag| {
+        partition_coverage
+            .get(*tag)
+            .and_then(Value::as_bool)
+            .map(|covered| all && covered)
+            .ok_or_else(|| format!("partition_coverage.{tag} must be boolean"))
+    })?;
+    let all_layers_covered = REQUIRED_LAYER_IDS.iter().all(|layer_id| {
+        observed_layer_coverage.get(*layer_id).copied() == Some(true)
+    });
+    let all_comparison_contracts_matched = REQUIRED_LAYER_IDS.iter().all(|layer_id| {
+        observed_matched_contracts.get(*layer_id).copied() == Some(true)
+    });
+    let expected_global_claim_valid = all_layers_covered
+        && all_comparison_contracts_matched
+        && all_partitions_covered
+        && invalidity_reasons.is_empty()
+        && portable_shim_record_count == 0
+        && true_legacy_record_count == 10;
+    let global_claim_valid = cherry_pick_guard
+        .get("global_claim_valid")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "global_claim_valid must be boolean".to_string())?;
+    if global_claim_valid != expected_global_claim_valid {
+        return Err(format!(
+            "global_claim_valid={global_claim_valid} does not match validated global evidence {expected_global_claim_valid}"
+        ));
     }
 
     let lineage = record
@@ -3852,9 +4612,9 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         return Err("matrix_requirements.required_cell_count must be > 0".to_string());
     }
     let max_unique_cells = required_partitions.len() as u64 * required_sizes.len() as u64;
-    if required_cell_count > max_unique_cells {
+    if required_cell_count != max_unique_cells {
         return Err(format!(
-            "matrix_requirements.required_cell_count ({required_cell_count}) exceeds unique partition-size combinations ({max_unique_cells})"
+            "matrix_requirements.required_cell_count ({required_cell_count}) must equal the complete partition-size Cartesian product ({max_unique_cells})"
         ));
     }
 
@@ -3872,6 +4632,14 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         ));
     }
     let expected_required_stage_keys = ["open_ms", "append_ms", "save_ms", "index_ms"];
+    let expected_required_evidence_contract = json!({
+        "evidence_class": "measured",
+        "confidence": "high",
+        "eligible_for_regression_gate": true,
+        "measurement_method": "wall_clock_observation",
+        "measurement_boundary": "production_session_stage_instrumentation",
+        "measurement_contract_version": "production_session_stage_instrumentation.v1"
+    });
     let mut observed_stage_coverage: HashMap<&'static str, u64> = HashMap::new();
     for key in &expected_required_stage_keys {
         observed_stage_coverage.insert(*key, 0);
@@ -3939,6 +4707,23 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         if !matches!(status, "pass" | "fail") {
             return Err(format!("matrix cell has invalid status: {status}"));
         }
+        let lineage = cell_obj
+            .get("lineage")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "matrix cell lineage must be an object".to_string())?;
+        if status == "pass" {
+            let expected_evidence = expected_required_evidence_contract
+                .as_object()
+                .expect("required evidence contract fixture must be an object");
+            for (field, expected) in expected_evidence {
+                if lineage.get(field) != Some(expected) {
+                    return Err(format!(
+                        "passing matrix cell ({workload_partition}, {session_messages}) lineage.{field} must equal {expected}, got {}",
+                        lineage.get(field).unwrap_or(&Value::Null)
+                    ));
+                }
+            }
+        }
 
         let stage = cell_obj
             .get("stage_attribution")
@@ -3955,26 +4740,61 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 return Err(format!("matrix cell stage_attribution missing {field}"));
             }
         }
-        let total_stage_ms = stage
-            .get("total_stage_ms")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| {
-                "matrix cell stage_attribution.total_stage_ms must be a finite number".to_string()
-            })?;
-        if !total_stage_ms.is_finite() || total_stage_ms <= 0.0 {
-            return Err(format!(
-                "matrix cell stage_attribution.total_stage_ms must be > 0, got: {total_stage_ms}"
-            ));
-        }
         let mut missing_stage_metrics = 0_u64;
+        let mut observed_stage_total_ms = 0.0;
         for key in &expected_required_stage_keys {
-            if stage.get(*key).is_some_and(|value| !value.is_null()) {
-                *observed_stage_coverage.entry(*key).or_insert(0) += 1;
-            } else {
-                missing_stage_metrics += 1;
+            match stage.get(*key) {
+                Some(Value::Null) => missing_stage_metrics += 1,
+                Some(value) => {
+                    let stage_value = value.as_f64().ok_or_else(|| {
+                        format!(
+                            "matrix cell stage_attribution.{key} must be null or a finite non-negative number"
+                        )
+                    })?;
+                    if !stage_value.is_finite() || stage_value < 0.0 {
+                        return Err(format!(
+                            "matrix cell stage_attribution.{key} must be null or a finite non-negative number, got: {stage_value}"
+                        ));
+                    }
+                    observed_stage_total_ms += stage_value;
+                    *observed_stage_coverage.entry(*key).or_insert(0) += 1;
+                }
+                None => unreachable!("required stage field presence checked above"),
             }
         }
-        if missing_stage_metrics == 0 {
+        let observed_stage_value_count =
+            expected_required_stage_keys.len() as u64 - missing_stage_metrics;
+        match stage.get("total_stage_ms") {
+            Some(Value::Null) if observed_stage_value_count == 0 => {}
+            Some(Value::Null) => {
+                return Err(format!(
+                    "matrix cell stage_attribution.total_stage_ms must equal the sum of its {observed_stage_value_count} observed stages"
+                ));
+            }
+            Some(value) => {
+                let reported_total = value.as_f64().ok_or_else(|| {
+                    "matrix cell stage_attribution.total_stage_ms must be null or a finite non-negative number"
+                        .to_string()
+                })?;
+                if !reported_total.is_finite() || reported_total < 0.0 {
+                    return Err(format!(
+                        "matrix cell stage_attribution.total_stage_ms must be null or a finite non-negative number, got: {reported_total}"
+                    ));
+                }
+                let tolerance = 1e-9_f64 * observed_stage_total_ms.abs().max(1.0);
+                if observed_stage_value_count == 0
+                    || (reported_total - observed_stage_total_ms).abs() > tolerance
+                {
+                    return Err(format!(
+                        "matrix cell stage_attribution.total_stage_ms ({reported_total}) must equal observed stage sum ({observed_stage_total_ms})"
+                    ));
+                }
+            }
+            None => unreachable!("total_stage_ms presence checked above"),
+        }
+        let complete_stage_breakdown =
+            missing_stage_metrics == 0 && observed_stage_total_ms > 0.0;
+        if complete_stage_breakdown {
             observed_complete_stage_breakdown_cells += 1;
         } else {
             observed_missing_stage_breakdown_cells += 1;
@@ -4010,12 +4830,23 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                     ));
                 }
             }
-            if !missing_reason_set
-                .iter()
-                .any(|reason| reason.starts_with("missing_stage_metrics:"))
-            {
+            let has_required_stage_reason = if missing_stage_metrics > 0 {
+                missing_reason_set
+                    .iter()
+                    .any(|reason| reason.starts_with("missing_stage_metrics:"))
+            } else {
+                missing_reason_set
+                    .iter()
+                    .any(|reason| reason.starts_with("invalid_stage_total:"))
+            };
+            if !has_required_stage_reason {
+                if missing_stage_metrics > 0 {
+                    return Err(format!(
+                        "matrix cell ({workload_partition}, {session_messages}) missing_reasons must include at least one missing_stage_metrics:* reason when stage attribution is incomplete"
+                    ));
+                }
                 return Err(format!(
-                    "matrix cell ({workload_partition}, {session_messages}) missing_reasons must include at least one missing_stage_metrics:* reason when stage attribution is incomplete"
+                    "matrix cell ({workload_partition}, {session_messages}) missing_reasons must include invalid_stage_total:* when observed stage total is non-positive"
                 ));
             }
             observed_missing_stage_reasons_by_key
@@ -4062,6 +4893,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             .get("primary_e2e")
             .and_then(Value::as_object)
             .ok_or_else(|| "matrix cell primary_e2e must be object".to_string())?;
+        let mut primary_complete = true;
         for field in &["wall_clock_ms", "rust_vs_node_ratio", "rust_vs_bun_ratio"] {
             if !primary.contains_key(*field) {
                 return Err(format!("matrix cell primary_e2e missing {field}"));
@@ -4071,9 +4903,27 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             if status == "pass" {
                 let _ = require_positive_metric(primary, "matrix cell primary_e2e", field)?;
             } else {
-                let _ =
-                    require_nullable_positive_metric(primary, "matrix cell primary_e2e", field)?;
+                if require_nullable_positive_metric(primary, "matrix cell primary_e2e", field)?
+                    .is_none()
+                {
+                    primary_complete = false;
+                }
             }
+        }
+
+        if status == "fail" && missing_reason_set.is_empty() {
+            return Err(format!(
+                "failed matrix cell ({workload_partition}, {session_messages}) must include at least one causal missing_reasons entry"
+            ));
+        }
+        let observed_cell_pass = complete_stage_breakdown
+            && swarm_complete
+            && primary_complete
+            && missing_reason_set.is_empty();
+        if (status == "pass") != observed_cell_pass {
+            return Err(format!(
+                "matrix cell ({workload_partition}, {session_messages}) status={status} does not match derived evidence completeness pass={observed_cell_pass}"
+            ));
         }
 
         if status == "pass" {
@@ -4088,6 +4938,8 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         .ok_or_else(|| "stage_summary must be an object".to_string())?;
     for field in &[
         "required_stage_keys",
+        "required_evidence_contract",
+        "evidence_rejections",
         "operation_stage_coverage",
         "cells_with_complete_stage_breakdown",
         "cells_missing_stage_breakdown",
@@ -4114,6 +4966,105 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         return Err(format!(
             "stage_summary.required_stage_keys must equal {expected_required_stage_keys:?}, got {parsed_required_stage_keys:?}"
         ));
+    }
+    let required_evidence_contract = stage_summary
+        .get("required_evidence_contract")
+        .ok_or_else(|| "stage_summary.required_evidence_contract is required".to_string())?;
+    if required_evidence_contract != &expected_required_evidence_contract {
+        return Err(format!(
+            "stage_summary.required_evidence_contract must equal {expected_required_evidence_contract}, got {required_evidence_contract}"
+        ));
+    }
+    let evidence_rejections = stage_summary
+        .get("evidence_rejections")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "stage_summary.evidence_rejections must be an array".to_string())?;
+    let expected_evidence = expected_required_evidence_contract
+        .as_object()
+        .expect("required evidence contract fixture must be an object");
+    let mut seen_evidence_rejections = HashSet::new();
+    for rejection in evidence_rejections {
+        let rejection = rejection.as_object().ok_or_else(|| {
+            "stage_summary.evidence_rejections entries must be objects".to_string()
+        })?;
+        let source_name = rejection
+            .get("source_name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                "stage_summary.evidence_rejections source_name must be a non-empty string"
+                    .to_string()
+            })?;
+        let source_record_index = rejection
+            .get("source_record_index")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                "stage_summary.evidence_rejections source_record_index must be an integer"
+                    .to_string()
+            })?;
+        if !seen_evidence_rejections.insert((source_name.to_string(), source_record_index)) {
+            return Err(format!(
+                "stage_summary.evidence_rejections duplicates source record ({source_name}, {source_record_index})"
+            ));
+        }
+        let partition = rejection
+            .get("partition")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                "stage_summary.evidence_rejections partition must be a string".to_string()
+            })?;
+        if !required_partitions.contains(partition) {
+            return Err(format!(
+                "stage_summary.evidence_rejections partition '{partition}' is not required"
+            ));
+        }
+        let session_messages = rejection
+            .get("session_messages")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                "stage_summary.evidence_rejections session_messages must be an integer"
+                    .to_string()
+            })?;
+        if !required_sizes.contains(&session_messages) {
+            return Err(format!(
+                "stage_summary.evidence_rejections session_messages ({session_messages}) is not required"
+            ));
+        }
+        let mismatches = rejection
+            .get("mismatches")
+            .and_then(Value::as_object)
+            .filter(|mismatches| !mismatches.is_empty())
+            .ok_or_else(|| {
+                "stage_summary.evidence_rejections mismatches must be a non-empty object"
+                    .to_string()
+            })?;
+        for (field, mismatch) in mismatches {
+            let expected = expected_evidence.get(field).ok_or_else(|| {
+                format!(
+                    "stage_summary.evidence_rejections mismatches contains unknown field {field}"
+                )
+            })?;
+            let mismatch = mismatch.as_object().ok_or_else(|| {
+                format!(
+                    "stage_summary.evidence_rejections mismatches.{field} must be an object"
+                )
+            })?;
+            if mismatch.get("expected") != Some(expected) {
+                return Err(format!(
+                    "stage_summary.evidence_rejections mismatches.{field}.expected must equal {expected}"
+                ));
+            }
+            let observed = mismatch.get("observed").ok_or_else(|| {
+                format!(
+                    "stage_summary.evidence_rejections mismatches.{field} missing observed"
+                )
+            })?;
+            if observed == expected {
+                return Err(format!(
+                    "stage_summary.evidence_rejections mismatches.{field}.observed must differ from expected"
+                ));
+            }
+        }
     }
     let operation_stage_coverage = stage_summary
         .get("operation_stage_coverage")
@@ -4237,12 +5188,13 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 ));
             }
         }
-        if !reason_set
-            .iter()
-            .any(|reason| reason.starts_with("missing_stage_metrics:"))
+        if !reason_set.iter().any(|reason| {
+            reason.starts_with("missing_stage_metrics:")
+                || reason.starts_with("invalid_stage_total:")
+        })
         {
             return Err(format!(
-                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons must include at least one missing_stage_metrics:* token"
+                "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons must include a missing_stage_metrics:* or invalid_stage_total:* token"
             ));
         }
         let missing_key = (workload_partition.to_string(), session_messages);
@@ -5066,6 +6018,42 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             return Err(format!("evidence_links missing {field}"));
         }
     }
+    let phase1_fault_evidence = evidence_links
+        .get("phase1_unit_and_fault_injection")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            "evidence_links.phase1_unit_and_fault_injection must be an object".to_string()
+        })?;
+    require_non_empty_string_field(
+        phase1_fault_evidence,
+        "evidence_links.phase1_unit_and_fault_injection",
+        "fault_injection_script",
+    )?;
+    let fault_manifest_path = phase1_fault_evidence.get("fault_injection_manifest_path");
+    let fault_summary_path = phase1_fault_evidence.get("fault_injection_summary_path");
+    if security_guard_status == "missing" {
+        if !fault_manifest_path.is_some_and(Value::is_null)
+            || !fault_summary_path.is_some_and(Value::is_null)
+        {
+            return Err(
+                "missing security evidence must have null manifest and summary paths".to_string(),
+            );
+        }
+    } else {
+        for (field, value) in [
+            ("fault_injection_manifest_path", fault_manifest_path),
+            ("fault_injection_summary_path", fault_summary_path),
+        ] {
+            if value
+                .and_then(Value::as_str)
+                .is_none_or(|path| path.trim().is_empty())
+            {
+                return Err(format!(
+                    "evidence_links.phase1_unit_and_fault_injection.{field} must be a non-empty string when security guard is {security_guard_status}"
+                ));
+            }
+        }
+    }
     let required_artifacts = evidence_links
         .get("required_artifacts")
         .and_then(Value::as_object)
@@ -5135,6 +6123,38 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     if artifact_ready_for_phase5 != expected_artifact_ready_for_phase5 {
         return Err(format!(
             "consumption_contract.artifact_ready_for_phase5 ({artifact_ready_for_phase5}) must equal expected deterministic value ({expected_artifact_ready_for_phase5}) from primary_outcomes.status={primary_status}, stage_summary(cells_with_complete_stage_breakdown={complete_cells}, cells_missing_stage_breakdown={missing_cells_count}, required_cell_count={required_cell_count}), swarm_summary(cells_with_complete_swarm_metrics={complete_swarm_cells}, cells_missing_swarm_metrics={missing_swarm_cells_count}), regression_guards(memory={memory_guard_status}, correctness={correctness_guard_status}, security={security_guard_status})"
+        ));
+    }
+    let expected_fail_closed_conditions: BTreeSet<String> = [
+        "missing_current_run_source",
+        "mixed_source_lineage",
+        "missing_matrix_source_record",
+        "missing_stage_metrics",
+        "missing_primary_wall_clock",
+        "missing_primary_relative_ratios",
+        "missing_swarm_metrics",
+        "non_measured_matrix_evidence",
+        "memory_regression",
+        "memory_regression_unverified",
+        "correctness_regression",
+        "correctness_regression_unverified",
+        "security_regression",
+        "security_regression_unverified",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let fail_closed_conditions = collect_string_set(
+        consumption_contract
+            .get("fail_closed_conditions")
+            .ok_or_else(|| {
+                "consumption_contract.fail_closed_conditions is required".to_string()
+            })?,
+        "consumption_contract.fail_closed_conditions",
+    )?;
+    if fail_closed_conditions != expected_fail_closed_conditions {
+        return Err(format!(
+            "consumption_contract.fail_closed_conditions must equal {expected_fail_closed_conditions:?}, got {fail_closed_conditions:?}"
         ));
     }
     let downstream_beads = consumption_contract
@@ -5606,6 +6626,13 @@ fn phase1_matrix_validation_golden_fixture() -> Value {
                 },
                 "lineage": {
                     "source_record_index": 2,
+                    "source_record_stream": "scenario_runner",
+                    "evidence_class": "measured",
+                    "confidence": "high",
+                    "eligible_for_regression_gate": true,
+                    "measurement_method": "wall_clock_observation",
+                    "measurement_boundary": "production_session_stage_instrumentation",
+                    "measurement_contract_version": "production_session_stage_instrumentation.v1",
                     "source_artifacts": ["target/perf/scenario_runner.jsonl"]
                 }
             },
@@ -5634,12 +6661,28 @@ fn phase1_matrix_validation_golden_fixture() -> Value {
                 },
                 "lineage": {
                     "source_record_index": 7,
+                    "source_record_stream": "scenario_runner",
+                    "evidence_class": "measured",
+                    "confidence": "high",
+                    "eligible_for_regression_gate": true,
+                    "measurement_method": "wall_clock_observation",
+                    "measurement_boundary": "production_session_stage_instrumentation",
+                    "measurement_contract_version": "production_session_stage_instrumentation.v1",
                     "source_artifacts": ["target/perf/scenario_runner.jsonl"]
                 }
             }
         ],
         "stage_summary": {
             "required_stage_keys": ["open_ms", "append_ms", "save_ms", "index_ms"],
+            "required_evidence_contract": {
+                "evidence_class": "measured",
+                "confidence": "high",
+                "eligible_for_regression_gate": true,
+                "measurement_method": "wall_clock_observation",
+                "measurement_boundary": "production_session_stage_instrumentation",
+                "measurement_contract_version": "production_session_stage_instrumentation.v1"
+            },
+            "evidence_rejections": [],
             "operation_stage_coverage": {
                 "open_ms": 2,
                 "append_ms": 2,
@@ -5758,7 +6801,8 @@ fn phase1_matrix_validation_golden_fixture() -> Value {
             "phase1_unit_and_fault_injection": {
                 "suite_logs": {},
                 "fault_injection_script": "scripts/e2e/run_persistence_fault_injection.sh",
-                "fault_injection_summary_path": null
+                "fault_injection_manifest_path": "tests/e2e_results/persistence-fault-injection/run/run-manifest.json",
+                "fault_injection_summary_path": "tests/e2e_results/persistence-fault-injection/run/integrity-summary.json"
             },
             "required_artifacts": {
                 "scenario_runner": "target/perf/scenario_runner.jsonl",
@@ -5785,7 +6829,22 @@ fn phase1_matrix_validation_golden_fixture() -> Value {
                 }
             },
             "artifact_ready_for_phase5": true,
-            "fail_closed_conditions": ["missing_stage_metrics", "missing_swarm_metrics"]
+            "fail_closed_conditions": [
+                "missing_current_run_source",
+                "mixed_source_lineage",
+                "missing_matrix_source_record",
+                "missing_stage_metrics",
+                "missing_primary_wall_clock",
+                "missing_primary_relative_ratios",
+                "missing_swarm_metrics",
+                "non_measured_matrix_evidence",
+                "memory_regression",
+                "memory_regression_unverified",
+                "correctness_regression",
+                "correctness_regression_unverified",
+                "security_regression",
+                "security_regression_unverified"
+            ]
         },
         "lineage": {
             "run_id_lineage": ["20260216T010101Z", "abc123def456"],
@@ -6862,9 +7921,8 @@ fn protocol_record_validator_rejects_invalid_partition_or_size() {
     );
 }
 
-#[test]
-fn extension_stratification_validator_accepts_golden_fixture() {
-    let golden = json!({
+fn extension_stratification_golden_fixture() -> Value {
+    json!({
         "schema": EXT_STRATIFICATION_SCHEMA,
         "run_id": "20260216T010101Z",
         "correlation_id": "abc123def456",
@@ -6876,9 +7934,9 @@ fn extension_stratification_validator_accepts_golden_fixture() {
                 "absolute_metrics": {"metric_name": "cold_load_p95", "value": 12.4, "unit": "ms"},
                 "relative_metrics": {
                     "rust_vs_node_ratio": 1.8,
-                    "rust_vs_node_ratio_basis": "direct_or_derived",
+                    "rust_vs_node_ratio_basis": "matched_legacy_pi_mono_extension_loader",
                     "rust_vs_bun_ratio": 1.8,
-                    "rust_vs_bun_ratio_basis": "node_proxy"
+                    "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
                 },
                 "confidence": CONFIDENCE_MEDIUM,
                 "evidence_state": EVIDENCE_CLASS_INFERRED,
@@ -6896,9 +7954,9 @@ fn extension_stratification_validator_accepts_golden_fixture() {
                 "absolute_metrics": {"metric_name": "dispatch_per_call", "value": 42.0, "unit": "us"},
                 "relative_metrics": {
                     "rust_vs_node_ratio": 1.2,
-                    "rust_vs_node_ratio_basis": "direct_or_derived",
+                    "rust_vs_node_ratio_basis": "matched_legacy_pi_mono_extension_loader",
                     "rust_vs_bun_ratio": 1.2,
-                    "rust_vs_bun_ratio_basis": "node_proxy"
+                    "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
                 },
                 "confidence": CONFIDENCE_HIGH,
                 "evidence_state": EVIDENCE_CLASS_MEASURED,
@@ -6936,27 +7994,74 @@ fn extension_stratification_validator_accepts_golden_fixture() {
                 "per_call_wins_do_not_imply_full_e2e": true,
                 "full_e2e_is_release_facing_primary_signal": true
             },
+            "cross_runtime_comparison": {
+                "contract_schema": "pi.perf.cross_runtime_comparison.v1",
+                "legacy_pi_mono_executed_required": true,
+                "exact_workload_and_host_contract_required": true,
+                "portable_shim_record_count": 0,
+                "true_legacy_pi_mono_record_count": 10,
+                "matched_layer_contracts": {
+                    "cold_load_init": true,
+                    "per_call_dispatch_micro": true,
+                    "full_e2e_long_session": false
+                }
+            },
             "cherry_pick_guard": {
                 "requires_all_layers_for_global_claim": true,
                 "layer_coverage": {
-                    "cold_load_init": true,
+                    "cold_load_init": false,
                     "per_call_dispatch_micro": true,
                     "full_e2e_long_session": false
                 },
                 "global_claim_valid": false,
-                "invalidity_reasons": ["missing_layer_coverage:full_e2e_long_session"]
+                "invalidity_reasons": [
+                    "missing_layer_coverage:cold_load_init",
+                    "missing_layer_coverage:full_e2e_long_session"
+                ]
             },
+            "required_partition_tags": ["matched-state", "realistic"],
             "partition_coverage": {"matched-state": true, "realistic": false}
         },
         "lineage": {
             "run_id_lineage": ["20260216T010101Z", "abc123def456"],
             "source_manifest_path": "target/perf/runs/20260216T010101Z/manifest.json"
         }
-    });
+    })
+}
+
+#[test]
+fn extension_stratification_validator_accepts_golden_fixture() {
+    let golden = extension_stratification_golden_fixture();
 
     assert!(
         validate_extension_stratification_record(&golden).is_ok(),
         "golden extension stratification fixture should pass validation"
+    );
+}
+
+#[test]
+fn extension_stratification_validator_rejects_unmatched_ratio_basis() {
+    let mut malformed = extension_stratification_golden_fixture();
+    malformed["layers"][0]["relative_metrics"]["rust_vs_node_ratio_basis"] =
+        json!("node_legacy_extension_workloads");
+
+    let err = validate_extension_stratification_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("matched_legacy_pi_mono_extension_loader"),
+        "expected unmatched ratio basis failure, got: {err}"
+    );
+}
+
+#[test]
+fn extension_stratification_validator_rejects_inferred_layer_claimed_as_covered() {
+    let mut malformed = extension_stratification_golden_fixture();
+    malformed["claim_integrity"]["cherry_pick_guard"]["layer_coverage"]
+        ["cold_load_init"] = json!(true);
+
+    let err = validate_extension_stratification_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("does not match observed complete evidence false"),
+        "expected inferred layer coverage failure, got: {err}"
     );
 }
 
@@ -6984,6 +8089,41 @@ fn phase1_matrix_validator_accepts_golden_fixture() {
     assert!(
         validate_phase1_matrix_validation_record(&golden).is_ok(),
         "golden phase1 matrix fixture should pass validation"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_inferred_lineage_on_passing_cell() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][0]["lineage"]["evidence_class"] = json!("inferred");
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("lineage.evidence_class") && err.contains("measured"),
+        "expected pass-cell measured-evidence lineage failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_fabricated_evidence_rejection() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["stage_summary"]["evidence_rejections"] = json!([{
+        "source_name": "scenario_runner",
+        "source_record_index": 3,
+        "partition": "matched-state",
+        "session_messages": 100_000,
+        "mismatches": {
+            "evidence_class": {
+                "expected": "measured",
+                "observed": "measured"
+            }
+        }
+    }]);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("observed must differ from expected"),
+        "expected fabricated evidence-rejection failure, got: {err}"
     );
 }
 
@@ -7382,6 +8522,14 @@ fn phase1_matrix_validator_accepts_nullable_fail_metrics() {
     candidate["matrix_cells"][1]["primary_e2e"]["wall_clock_ms"] = Value::Null;
     candidate["matrix_cells"][1]["primary_e2e"]["rust_vs_node_ratio"] = Value::Null;
     candidate["matrix_cells"][1]["primary_e2e"]["rust_vs_bun_ratio"] = Value::Null;
+    candidate["matrix_cells"][0]["missing_reasons"] = json!([
+        "missing_primary_wall_clock",
+        "missing_primary_relative_ratios"
+    ]);
+    candidate["matrix_cells"][1]["missing_reasons"] = json!([
+        "missing_primary_wall_clock",
+        "missing_primary_relative_ratios"
+    ]);
     candidate["primary_outcomes"]["status"] = json!("fail");
     candidate["primary_outcomes"]["wall_clock_ms"] = Value::Null;
     candidate["primary_outcomes"]["rust_vs_node_ratio"] = Value::Null;
@@ -7410,6 +8558,18 @@ fn phase1_matrix_validator_rejects_missing_stage_attribution() {
     assert!(
         err.contains("matrix cell missing stage_attribution"),
         "expected stage_attribution validation failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_incoherent_stage_total() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_cells"][0]["stage_attribution"]["total_stage_ms"] = json!(118.0);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("must equal observed stage sum"),
+        "expected stage-total coherence failure, got: {err}"
     );
 }
 
@@ -7460,6 +8620,7 @@ fn phase1_matrix_validator_rejects_complete_stage_count_mismatch_vs_attribution(
 fn phase1_matrix_validator_rejects_missing_cells_identity_mismatch() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
+    malformed["matrix_cells"][1]["stage_attribution"]["total_stage_ms"] = json!(95.0);
     malformed["matrix_cells"][1]["missing_reasons"] = json!(["missing_stage_metrics:index_ms"]);
     malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
     malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
@@ -7489,6 +8650,7 @@ fn phase1_matrix_validator_rejects_missing_cells_identity_mismatch() {
 fn phase1_matrix_validator_rejects_missing_cells_reason_mismatch_vs_matrix_cell() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
+    malformed["matrix_cells"][1]["stage_attribution"]["total_stage_ms"] = json!(95.0);
     malformed["matrix_cells"][1]["missing_reasons"] = json!([
         "missing_stage_metrics:index_ms",
         "missing_matrix_source_record"
@@ -7517,6 +8679,7 @@ fn phase1_matrix_validator_rejects_missing_cells_reason_mismatch_vs_matrix_cell(
 fn phase1_matrix_validator_rejects_missing_stage_cell_without_missing_stage_reason_token() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["matrix_cells"][1]["stage_attribution"]["index_ms"] = Value::Null;
+    malformed["matrix_cells"][1]["stage_attribution"]["total_stage_ms"] = json!(95.0);
     malformed["matrix_cells"][1]["missing_reasons"] = json!(["missing_matrix_source_record"]);
     malformed["stage_summary"]["operation_stage_coverage"]["index_ms"] = json!(1);
     malformed["stage_summary"]["cells_with_complete_stage_breakdown"] = json!(1);
@@ -7595,7 +8758,7 @@ fn phase1_matrix_validator_rejects_non_primary_ordering_policy() {
 }
 
 #[test]
-fn phase1_matrix_validator_rejects_required_cell_count_exceeding_partition_size_space() {
+fn phase1_matrix_validator_rejects_required_cell_count_mismatching_partition_size_space() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
     malformed["matrix_requirements"]["required_partition_tags"] = json!(["matched-state"]);
     malformed["matrix_requirements"]["required_session_message_sizes"] = json!([100_000]);
@@ -7603,8 +8766,21 @@ fn phase1_matrix_validator_rejects_required_cell_count_exceeding_partition_size_
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
-        err.contains("exceeds unique partition-size combinations"),
+        err.contains("must equal the complete partition-size Cartesian product"),
         "expected partition/size cardinality failure, got: {err}"
+    );
+}
+
+#[test]
+fn phase1_matrix_validator_rejects_required_cell_count_below_partition_size_space() {
+    let mut malformed = phase1_matrix_validation_golden_fixture();
+    malformed["matrix_requirements"]["required_session_message_sizes"] =
+        json!([100_000, 200_000]);
+
+    let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
+    assert!(
+        err.contains("must equal the complete partition-size Cartesian product"),
+        "expected complete Cartesian-product failure, got: {err}"
     );
 }
 
@@ -8319,7 +9495,9 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         fs::write(&stale_artifact, "{\"stale\":true}\n")
             .expect("write stale RCH artifact negative control");
     }
-    let fault_injection_summary = fault_injection_root.join("stub/integrity-summary.json");
+    let fault_injection_run_dir = fault_injection_root.join("stub");
+    let fault_injection_summary = fault_injection_run_dir.join("integrity-summary.json");
+    let fault_injection_manifest = fault_injection_run_dir.join("run-manifest.json");
     fs::create_dir_all(
         fault_injection_summary
             .parent()
@@ -8329,6 +9507,9 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     let fault_injection_passed = !extra_env
         .iter()
         .any(|(key, value)| *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1");
+    let fault_injection_case_exit_69 = extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_PERSISTENCE_CASE_EXIT_69" && *value == "1");
     let fault_injection_source_commit = if extra_env
         .iter()
         .any(|(key, value)| *key == "PI_FAKE_FOREIGN_PERSISTENCE_SOURCE" && *value == "1")
@@ -8339,25 +9520,88 @@ fn run_orchestrate_with_fake_toolchain_with_env(
     };
     let fault_injection_source_tree =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let fault_injection_timestamp = chrono::Utc::now().to_rfc3339();
+    let fault_injection_attempt_id = "fixture-attempt";
+    let fault_injection_summary_payload = json!({
+        "schema": "pi.e2e.persistence_fault_injection.summary.v1",
+        "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+        "attempt_id": fault_injection_attempt_id,
+        "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+        "source_commit": fault_injection_source_commit,
+        "source_dirty": false,
+        "source_tree_sha256": fault_injection_source_tree,
+        "source_commit_final": fault_injection_source_commit,
+        "source_dirty_final": false,
+        "source_tree_sha256_final": fault_injection_source_tree,
+        "source_tree_stable": true,
+        "timestamp": fault_injection_timestamp,
+        "terminal_state": "summary_validated",
+        "cases": [
+            {"case_id": "jsonl", "passed": true},
+            {"case_id": "sqlite", "passed": fault_injection_passed}
+        ],
+        "validation_passed": fault_injection_passed,
+    });
+    let fault_injection_summary_bytes =
+        serde_json::to_vec(&fault_injection_summary_payload)
+            .expect("encode fake fault-injection summary");
     fs::write(
         &fault_injection_summary,
-        serde_json::to_vec(&json!({
-            "schema": "pi.e2e.persistence_fault_injection.summary.v1",
-            "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
-            "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
-            "source_commit": fault_injection_source_commit,
-            "source_dirty": false,
-            "source_tree_sha256": fault_injection_source_tree,
-            "source_commit_final": fault_injection_source_commit,
-            "source_dirty_final": false,
-            "source_tree_sha256_final": fault_injection_source_tree,
-            "source_tree_stable": true,
-            "timestamp": chrono::Utc::now().to_rfc3339(),
-            "overall_passed": fault_injection_passed,
-        }))
-        .expect("encode fake fault-injection evidence"),
+        &fault_injection_summary_bytes,
     )
     .expect("write fake fault-injection evidence");
+    let fault_injection_summary_sha256 = pi::package_manager::hex_encode(&Sha256::digest(
+        &fault_injection_summary_bytes,
+    ));
+    let fault_injection_manifest_payload = json!({
+        "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
+        "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+        "attempt_id": fault_injection_attempt_id,
+        "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+        "source_commit": fault_injection_source_commit,
+        "source_dirty": false,
+        "source_tree_sha256": fault_injection_source_tree,
+        "source_commit_final": fault_injection_source_commit,
+        "source_dirty_final": false,
+        "source_tree_sha256_final": fault_injection_source_tree,
+        "timestamp": fault_injection_timestamp,
+        "terminal_state": "complete",
+        "overall_passed": fault_injection_passed,
+        "integrity_summary": {
+            "path": fault_injection_summary,
+            "size_bytes": fault_injection_summary_bytes.len(),
+            "sha256": fault_injection_summary_sha256,
+        },
+        "exit_codes": {
+            "jsonl": 0,
+            "sqlite": if fault_injection_passed {
+                0
+            } else if fault_injection_case_exit_69 {
+                69
+            } else {
+                1
+            },
+            "summary_validation": if fault_injection_passed { 0 } else { 1 },
+            "overall": if fault_injection_passed { 0 } else { 1 },
+        }
+    });
+    if !extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_MISSING_PERSISTENCE_MANIFEST" && *value == "1")
+    {
+        fs::write(
+            &fault_injection_manifest,
+            serde_json::to_vec(&fault_injection_manifest_payload)
+                .expect("encode fake fault-injection manifest"),
+        )
+        .expect("write fake fault-injection manifest");
+    }
+    if extra_env.iter().any(|(key, value)| {
+        *key == "PI_FAKE_TAMPER_PERSISTENCE_SUMMARY_AFTER_MANIFEST" && *value == "1"
+    }) {
+        fs::write(&fault_injection_summary, b"{}\n")
+            .expect("tamper fake fault-injection summary after manifest binding");
+    }
 
     let path = format!(
         "{}:{}",
@@ -8422,10 +9666,10 @@ fn run_orchestrate_with_fake_toolchain() -> (std::process::Output, PathBuf) {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rejects_failed_persistence_summary_for_phase5() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_FAILED_PERSISTENCE_SUMMARY",
-        "1",
-    )]);
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[
+        ("PI_FAKE_FAILED_PERSISTENCE_SUMMARY", "1"),
+        ("PI_FAKE_PERSISTENCE_CASE_EXIT_69", "1"),
+    ]);
     assert!(
         !output.status.success(),
         "strict orchestration must fail when persistence fault injection reports failure"
@@ -8442,7 +9686,7 @@ fn orchestrate_rejects_failed_persistence_summary_for_phase5() {
     assert_eq!(
         matrix["regression_guards"]["security"].as_str(),
         Some("fail"),
-        "overall_passed=false must fail the security regression guard"
+        "a completed manifest with a realistic nonzero case exit must fail, not disappear as missing evidence"
     );
     assert!(
         matrix["regression_guards"]["failure_or_gap_reasons"]
@@ -8458,6 +9702,185 @@ fn orchestrate_rejects_failed_persistence_summary_for_phase5() {
         matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
         Some(false),
         "failed persistence evidence must block Phase 5 readiness"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_persistence_summary_without_completion_manifest() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_MISSING_PERSISTENCE_MANIFEST",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "summary-only persistence evidence must not satisfy strict Phase-5 admission"
+    );
+    let matrix: Value = serde_json::from_str(
+        &fs::read_to_string(
+            temp_root.join("run/results/phase1_matrix_validation.json"),
+        )
+        .expect("read matrix artifact"),
+    )
+    .expect("parse matrix artifact");
+    assert_eq!(
+        matrix["regression_guards"]["security"].as_str(),
+        Some("missing")
+    );
+    assert!(
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
+            ["fault_injection_manifest_path"]
+            .is_null(),
+        "summary-only evidence must not be linked as a completed run"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_persistence_summary_that_breaks_manifest_binding() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_TAMPER_PERSISTENCE_SUMMARY_AFTER_MANIFEST",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "a summary whose bytes no longer match the final manifest must fail admission"
+    );
+    let matrix: Value = serde_json::from_str(
+        &fs::read_to_string(
+            temp_root.join("run/results/phase1_matrix_validation.json"),
+        )
+        .expect("read matrix artifact"),
+    )
+    .expect("parse matrix artifact");
+    assert_eq!(
+        matrix["regression_guards"]["security"].as_str(),
+        Some("missing")
+    );
+    assert!(
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
+            ["fault_injection_summary_path"]
+            .is_null(),
+        "tampered summary bytes must not be linked as consumed evidence"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_refuses_portable_extension_shim_as_legacy_release_comparator() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_PORTABLE_LEGACY_SHIM",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "portable callback-shim timings must not satisfy strict cross-runtime claims"
+    );
+    let stratification: Value = serde_json::from_str(
+        &fs::read_to_string(
+            temp_root.join("run/results/extension_benchmark_stratification.json"),
+        )
+        .expect("read stratification artifact"),
+    )
+    .expect("parse stratification artifact");
+    let full_e2e = stratification["layers"]
+        .as_array()
+        .and_then(|layers| {
+            layers
+                .iter()
+                .find(|layer| layer["layer_id"] == "full_e2e_long_session")
+        })
+        .expect("full E2E layer");
+    assert!(
+        full_e2e["relative_metrics"]["rust_vs_node_ratio"].is_null()
+            && full_e2e["relative_metrics"]["rust_vs_bun_ratio"].is_null(),
+        "portable shim metrics must remain diagnostic and never become release ratios"
+    );
+    assert_eq!(
+        stratification["claim_integrity"]["cherry_pick_guard"]["global_claim_valid"]
+            .as_bool(),
+        Some(false)
+    );
+    assert!(
+        stratification["claim_integrity"]["cherry_pick_guard"]["invalidity_reasons"]
+            .as_array()
+            .is_some_and(|reasons| {
+                let reason_strings = reasons.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                reason_strings.contains(&"portable_extension_api_not_release_comparator")
+                    && reason_strings.contains(&"missing_layer_coverage:full_e2e_long_session")
+            }),
+        "the claim guard must causally name the portable shim and missing matched comparison"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_incomplete_legacy_runtime_workload_coverage() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_DROP_LEGACY_BENCH_COVERAGE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "a missing Node or Bun workload row must fail exact legacy artifact admission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("legacy benchmark coverage mismatch"),
+        "undercoverage must report the exact missing runtime/scenario row: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/legacy_extension_workloads.jsonl")
+            .exists(),
+        "incomplete legacy evidence must not enter accepted results"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_current_run_idle_rss_over_budget_for_phase5() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_IDLE_RSS_OVER_BUDGET",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when current-run idle RSS exceeds 50 MiB"
+    );
+
+    let matrix: Value = serde_json::from_str(
+        &fs::read_to_string(
+            temp_root
+                .join("run/results/phase1_matrix_validation.json"),
+        )
+        .expect("read matrix artifact"),
+    )
+    .expect("parse matrix artifact");
+    assert_eq!(matrix["regression_guards"]["memory"].as_str(), Some("fail"));
+    assert!(
+        matrix["regression_guards"]["failure_or_gap_reasons"]
+            .as_array()
+            .is_some_and(|reasons| reasons
+                .iter()
+                .any(|reason| reason.as_str() == Some("memory_regression"))),
+        "over-budget current-run RSS must name the memory regression"
+    );
+    assert_eq!(
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
+            ["idle_memory_rss"]["rss_bytes"]
+            .as_u64(),
+        Some(64 * 1024 * 1024),
+        "memory guard must expose the measured current-run RSS"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false),
+        "memory regression must block Phase 5 readiness"
     );
 }
 
@@ -9069,6 +10492,68 @@ fn orchestrate_rch_perf_harness_rejects_incomplete_scenario_coverage() {
             .join("run/results/perf_bench_harness/extension_bench.jsonl")
             .exists(),
         "incomplete benchmark coverage must not enter accepted results"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_incomplete_nightly_extension_harness_manifest_coverage() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_DROP_EXT_BENCH_HARNESS_COVERAGE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "nightly extension evidence missing one manifest-selected row must fail admission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("extension benchmark coverage mismatch"),
+        "nightly undercoverage must report the exact manifest coverage mismatch: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/ext_bench_harness.jsonl")
+            .exists(),
+        "invalid extension JSONL must not enter accepted results"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/ext_bench_harness_report.json")
+            .exists(),
+        "an internally consistent report must not be copied before JSONL coverage is admitted"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_rejects_extension_budget_report_not_derived_from_jsonl() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_CORRUPT_EXT_BENCH_BUDGET",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "an extension budget report that disagrees with its JSONL must fail admission"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("differs from recomputed JSONL evidence"),
+        "budget tampering rejection must identify the recomputation mismatch: {combined}"
+    );
+    assert!(
+        !temp_root
+            .join("run/results/ext_bench_harness_report.json")
+            .exists(),
+        "a budget report that disagrees with JSONL must not enter accepted results"
     );
 }
 
@@ -10059,6 +11544,57 @@ fn orchestrate_rejects_malformed_source_row_before_finalization() {
 
 #[cfg(unix)]
 #[test]
+fn orchestrate_phase1_matrix_rejects_synthetic_seed_rows_as_release_evidence() {
+    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
+        "PI_FAKE_SYNTHETIC_MATRIX_EVIDENCE",
+        "1",
+    )]);
+    assert!(
+        !output.status.success(),
+        "synthetic inferred matrix seeds must not satisfy strict Phase-5 admission"
+    );
+
+    let matrix: Value = serde_json::from_str(
+        &fs::read_to_string(
+            temp_root
+                .join("run/results/phase1_matrix_validation.json"),
+        )
+        .expect("read matrix artifact"),
+    )
+    .expect("parse matrix artifact");
+    assert_eq!(
+        matrix["stage_summary"]["cells_with_complete_stage_breakdown"].as_u64(),
+        Some(0),
+        "planning-only seeds must not enter the measured stage matrix"
+    );
+    assert_eq!(
+        matrix["stage_summary"]["evidence_rejections"]
+            .as_array()
+            .map(Vec::len),
+        Some(10),
+        "every required synthetic matrix row must receive a causal evidence rejection"
+    );
+    assert!(
+        matrix["stage_summary"]["evidence_rejections"]
+            .as_array()
+            .is_some_and(|rejections| rejections.iter().all(|rejection| {
+                rejection["mismatches"]["evidence_class"]["observed"].as_str()
+                    == Some("inferred")
+                    && rejection["mismatches"]["eligible_for_regression_gate"]["observed"]
+                        .as_bool()
+                        == Some(false)
+            })),
+        "synthetic evidence rejection must name classification and eligibility mismatches"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false),
+        "synthetic stage evidence must block Phase 5"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn orchestrate_phase1_matrix_treats_missing_index_as_incomplete() {
     let (output, temp_root) =
         run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_INDEX_STAGE_SAMPLE", "1")]);
@@ -10255,6 +11791,51 @@ fn orchestrate_phase1_matrix_treats_missing_swarm_metrics_as_incomplete() {
     );
 
     let _ = fs::remove_dir_all(temp_root);
+}
+
+#[cfg(unix)]
+#[test]
+fn orchestrate_phase1_matrix_reports_zero_stage_total_as_invalid() {
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_ZERO_STAGE_SAMPLE", "1")]);
+    assert!(
+        !output.status.success(),
+        "strict orchestration must fail when a required stage breakdown sums to zero"
+    );
+
+    let matrix_path = temp_root.join("run/results/phase1_matrix_validation.json");
+    let matrix: Value =
+        serde_json::from_str(&fs::read_to_string(&matrix_path).expect("read matrix artifact"))
+            .expect("parse matrix artifact");
+
+    assert!(
+        validate_phase1_matrix_validation_record(&matrix).is_ok(),
+        "the fail-closed zero-total artifact must remain internally schema-consistent"
+    );
+    assert_eq!(
+        matrix["stage_summary"]["cells_with_complete_stage_breakdown"].as_u64(),
+        Some(9)
+    );
+    assert_eq!(
+        matrix["stage_summary"]["cells_missing_stage_breakdown"].as_u64(),
+        Some(1)
+    );
+    assert!(
+        matrix["stage_summary"]["missing_cells"]
+            .as_array()
+            .is_some_and(|cells| cells.iter().any(|cell| {
+                cell["reasons"].as_array().is_some_and(|reasons| {
+                    reasons
+                        .iter()
+                        .any(|reason| reason.as_str() == Some("invalid_stage_total:non_positive"))
+                })
+            })),
+        "stage_summary must causally report the non-positive stage total"
+    );
+    assert_eq!(
+        matrix["consumption_contract"]["artifact_ready_for_phase5"].as_bool(),
+        Some(false)
+    );
 }
 
 #[cfg(unix)]

@@ -2144,6 +2144,89 @@ fn required_e2e_metric_failure(
     })
 }
 
+fn cross_runtime_comparison_contract_failure(
+    path: &Path,
+    payload: &Value,
+    full_e2e: Option<&Value>,
+) -> Option<DataContractFailure> {
+    const MATCHED_COMPARISON_BASIS: &str = "matched_legacy_pi_mono_extension_loader";
+
+    let node_ratio_basis = full_e2e
+        .and_then(|row| row.pointer("/relative_metrics/rust_vs_node_ratio_basis"))
+        .and_then(Value::as_str);
+    let bun_ratio_basis = full_e2e
+        .and_then(|row| row.pointer("/relative_metrics/rust_vs_bun_ratio_basis"))
+        .and_then(Value::as_str);
+    let evidence_state = full_e2e
+        .and_then(|row| row.get("evidence_state"))
+        .and_then(Value::as_str);
+    let confidence = full_e2e
+        .and_then(|row| row.get("confidence"))
+        .and_then(Value::as_str);
+    let contract_schema = payload
+        .pointer("/claim_integrity/cross_runtime_comparison/contract_schema")
+        .and_then(Value::as_str);
+    let legacy_required = payload
+        .pointer(
+            "/claim_integrity/cross_runtime_comparison/legacy_pi_mono_executed_required",
+        )
+        .and_then(Value::as_bool);
+    let exact_contract_required = payload
+        .pointer(
+            "/claim_integrity/cross_runtime_comparison/exact_workload_and_host_contract_required",
+        )
+        .and_then(Value::as_bool);
+    let portable_shim_record_count = payload
+        .pointer("/claim_integrity/cross_runtime_comparison/portable_shim_record_count")
+        .and_then(Value::as_u64);
+    let true_legacy_record_count = payload
+        .pointer("/claim_integrity/cross_runtime_comparison/true_legacy_pi_mono_record_count")
+        .and_then(Value::as_u64);
+    let full_e2e_contract_matched = payload
+        .pointer(
+            "/claim_integrity/cross_runtime_comparison/matched_layer_contracts/full_e2e_long_session",
+        )
+        .and_then(Value::as_bool);
+    let cold_load_contract_matched = payload
+        .pointer(
+            "/claim_integrity/cross_runtime_comparison/matched_layer_contracts/cold_load_init",
+        )
+        .and_then(Value::as_bool);
+    let per_call_contract_matched = payload
+        .pointer(
+            "/claim_integrity/cross_runtime_comparison/matched_layer_contracts/per_call_dispatch_micro",
+        )
+        .and_then(Value::as_bool);
+
+    let valid = node_ratio_basis == Some(MATCHED_COMPARISON_BASIS)
+        && bun_ratio_basis == Some(MATCHED_COMPARISON_BASIS)
+        && evidence_state == Some("measured")
+        && confidence == Some("high")
+        && contract_schema == Some("pi.perf.cross_runtime_comparison.v1")
+        && legacy_required == Some(true)
+        && exact_contract_required == Some(true)
+        && portable_shim_record_count == Some(0)
+        && true_legacy_record_count == Some(10)
+        && cold_load_contract_matched == Some(true)
+        && per_call_contract_matched == Some(true)
+        && full_e2e_contract_matched == Some(true);
+
+    (!valid).then(|| DataContractFailure {
+        contract_id: "invalid_cross_runtime_comparison_contract".to_string(),
+        budget_name: None,
+        detail: format!(
+            "full_e2e_long_session ratios require evidence_state=measured, confidence=high, basis={MATCHED_COMPARISON_BASIS}, contract_schema=pi.perf.cross_runtime_comparison.v1, legacy flags=true, portable_shim_record_count=0, true_legacy_pi_mono_record_count=10, and matched_layer_contracts.full_e2e_long_session=true (evidence_state={evidence_state:?}, confidence={confidence:?}, node_basis={node_ratio_basis:?}, bun_basis={bun_ratio_basis:?}, contract_schema={contract_schema:?}, legacy_required={}, exact_contract_required={}, portable_count={portable_shim_record_count:?}, true_legacy_count={true_legacy_record_count:?}, full_e2e_matched={}) in {}",
+            required_bool_state(legacy_required),
+            required_bool_state(exact_contract_required),
+            required_bool_state(full_e2e_contract_matched),
+            path.display()
+        ),
+        remediation:
+            "Regenerate ratios from an exact, same-host pi-mono comparison contract; portable callback shims are diagnostic-only."
+                .to_string(),
+    })
+}
+
 fn bun_killer_ratio_release_gate_failure(
     path: &Path,
     full_e2e: Option<&Value>,
@@ -2174,22 +2257,42 @@ fn claim_integrity_guard_failure(path: &Path, payload: &Value) -> Option<DataCon
     let global_claim_valid = payload
         .pointer("/claim_integrity/cherry_pick_guard/global_claim_valid")
         .and_then(Value::as_bool);
-    let full_e2e_layer_coverage = payload
-        .pointer("/claim_integrity/cherry_pick_guard/layer_coverage/full_e2e_long_session")
-        .and_then(Value::as_bool);
+    let layer_coverage = [
+        "cold_load_init",
+        "per_call_dispatch_micro",
+        "full_e2e_long_session",
+    ]
+    .map(|layer_id| {
+        (
+            layer_id,
+            payload
+                .pointer(&format!(
+                    "/claim_integrity/cherry_pick_guard/layer_coverage/{layer_id}"
+                ))
+                .and_then(Value::as_bool),
+        )
+    });
+    let invalidity_reasons_empty = payload
+        .pointer("/claim_integrity/cherry_pick_guard/invalidity_reasons")
+        .and_then(Value::as_array)
+        .is_some_and(|reasons| reasons.is_empty());
 
-    (global_claim_valid != Some(true) || full_e2e_layer_coverage != Some(true)).then(|| {
+    (global_claim_valid != Some(true)
+        || layer_coverage
+            .iter()
+            .any(|(_, covered)| *covered != Some(true))
+        || !invalidity_reasons_empty)
+    .then(|| {
         DataContractFailure {
             contract_id: "invalid_claim_integrity_guard".to_string(),
             budget_name: None,
             detail: format!(
-                "claim_integrity.cherry_pick_guard requires global_claim_valid=true and layer_coverage.full_e2e_long_session=true (global_claim_valid={}, full_e2e_layer_coverage={}) in {}",
+                "claim_integrity.cherry_pick_guard requires global_claim_valid=true, empty invalidity_reasons, and complete coverage for all required layers (global_claim_valid={}, layer_coverage={layer_coverage:?}, invalidity_reasons_empty={invalidity_reasons_empty}) in {}",
                 required_bool_state(global_claim_valid),
-                required_bool_state(full_e2e_layer_coverage),
                 path.display()
             ),
             remediation:
-                "Emit claim_integrity.cherry_pick_guard.global_claim_valid=true and layer_coverage.full_e2e_long_session=true for valid global claims."
+                "Emit a recomputed global claim with empty invalidity_reasons and complete cold-load, per-call, and full-E2E coverage."
                     .to_string(),
         }
     })
@@ -2282,6 +2385,82 @@ fn evaluate_phase1_weighted_attribution_contract(
             remediation:
                 "Set phase1_matrix_validation.schema to pi.perf.phase1_matrix_validation.v1."
                     .to_string(),
+        });
+    }
+
+    let phase5_ready = payload
+        .pointer("/consumption_contract/artifact_ready_for_phase5")
+        .and_then(Value::as_bool);
+    let regression_guards = payload
+        .get("regression_guards")
+        .and_then(Value::as_object);
+    let guard_statuses = ["memory", "correctness", "security"].map(|guard| {
+        (
+            guard,
+            regression_guards
+                .and_then(|guards| guards.get(guard))
+                .and_then(Value::as_str),
+        )
+    });
+    if phase5_ready != Some(true)
+        || guard_statuses
+            .iter()
+            .any(|(_, status)| *status != Some("pass"))
+    {
+        failures.push(DataContractFailure {
+            contract_id: "phase1_matrix_not_ready_for_phase5".to_string(),
+            budget_name: None,
+            detail: format!(
+                "phase1 matrix requires artifact_ready_for_phase5=true and passing memory/correctness/security guards (ready={}, guards={guard_statuses:?}) in {}",
+                phase5_ready.map_or("missing", |ready| if ready { "true" } else { "false" }),
+                path.display()
+            ),
+            remediation: "Regenerate measured current-run matrix evidence with all regression guards passing before post-generation budget admission."
+                .to_string(),
+        });
+    }
+
+    let required_evidence_contract = json!({
+        "evidence_class": "measured",
+        "confidence": "high",
+        "eligible_for_regression_gate": true,
+        "measurement_method": "wall_clock_observation",
+        "measurement_boundary": "production_session_stage_instrumentation",
+        "measurement_contract_version": "production_session_stage_instrumentation.v1"
+    });
+    let mut invalid_pass_cell_lineage = Vec::new();
+    if let Some(matrix_cells) = payload.get("matrix_cells").and_then(Value::as_array) {
+        let expected_evidence = required_evidence_contract
+            .as_object()
+            .expect("required evidence contract fixture must be an object");
+        for (index, cell) in matrix_cells.iter().enumerate() {
+            if cell.get("status").and_then(Value::as_str) != Some("pass") {
+                continue;
+            }
+            let lineage = cell.get("lineage").and_then(Value::as_object);
+            if expected_evidence.iter().any(|(field, expected)| {
+                lineage.and_then(|value| value.get(field)) != Some(expected)
+            })
+            {
+                invalid_pass_cell_lineage.push(index);
+            }
+        }
+    } else {
+        invalid_pass_cell_lineage.push(usize::MAX);
+    }
+    if payload.pointer("/stage_summary/required_evidence_contract")
+        != Some(&required_evidence_contract)
+        || !invalid_pass_cell_lineage.is_empty()
+    {
+        failures.push(DataContractFailure {
+            contract_id: "phase1_matrix_unmeasured_stage_evidence".to_string(),
+            budget_name: None,
+            detail: format!(
+                "phase1 matrix requires the exact production stage evidence contract and measured lineage on every passing cell (invalid_pass_cell_indexes={invalid_pass_cell_lineage:?}) in {}",
+                path.display()
+            ),
+            remediation: "Regenerate the Phase-1 matrix from production session-stage instrumentation; inferred or synthetic stage rows are not eligible for Phase-5 decisions."
+                .to_string(),
         });
     }
 
@@ -2523,6 +2702,13 @@ fn evaluate_required_e2e_ratio_contract(
         failures.push(failure);
     }
     if let Some(failure) = required_e2e_metric_failure(&path, full_e2e_rows.first().copied()) {
+        failures.push(failure);
+    }
+    if let Some(failure) = cross_runtime_comparison_contract_failure(
+        &path,
+        &payload,
+        full_e2e_rows.first().copied(),
+    ) {
         failures.push(failure);
     }
     if let Some(failure) =
@@ -5688,17 +5874,9 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
             }
             if *relative_path == "post_generation_producer_admission.json" {
                 let producers = [
-                    ("bench_schema", "bench_schema", "cargo_test"),
                     ("bench_scenario", "bench_scenario_runner", "cargo_test"),
                     ("ext_bench_harness", "ext_bench_harness", "cargo_test"),
                     ("perf_bench_harness", "perf_bench_harness", "cargo_test"),
-                    ("perf_regression", "perf_regression", "cargo_test"),
-                    ("perf_comparison", "perf_comparison", "cargo_test"),
-                    (
-                        "perf_baseline_variance",
-                        "perf_baseline_variance",
-                        "cargo_test",
-                    ),
                     ("criterion_extensions", "extensions", "criterion"),
                     ("criterion_pijs", "pijs_workload", "criterion"),
                     ("criterion_system", "system", "criterion"),
@@ -5726,6 +5904,30 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
                     })
                 })
                 .collect::<Vec<_>>();
+                let support_checks = [
+                    ("bench_schema", "bench_schema"),
+                    ("perf_regression", "perf_regression"),
+                    ("perf_comparison", "perf_comparison"),
+                    ("perf_baseline_variance", "perf_baseline_variance"),
+                ]
+                .into_iter()
+                .map(|(suite, target)| {
+                    json!({
+                        "suite": suite,
+                        "target": target,
+                        "kind": "cargo_test",
+                        "remote_execution_verified": true,
+                        "remote_marker": "[RCH] remote fixture-worker (1.00s)",
+                        "remote_worker": "fixture-worker",
+                        "clean_overlay_receipt": format!(
+                            "[RCH] clean-overlay receipt: base={} overlay-fingerprint={}",
+                            "1234567890abcdef1234567890abcdef12345678",
+                            "a".repeat(64),
+                        ),
+                        "overlay_fingerprint": "a".repeat(64),
+                    })
+                })
+                .collect::<Vec<_>>();
                 let payload = json!({
                     "schema": "pi.perf.post_generation_producer_admission.v1",
                     "generated_at": "2026-08-26T00:00:00Z",
@@ -5740,6 +5942,7 @@ fn write_complete_post_generation_input_fixture(evidence_root: &Path) -> Vec<Val
                     "failure_count": 0,
                     "failures": [],
                     "producers": producers,
+                    "support_checks": support_checks,
                 });
                 std::fs::write(
                     &path,
@@ -6061,6 +6264,48 @@ fn post_generation_inventory_rejects_fabricated_producer_remote_receipt() {
     assert!(
         validate_post_generation_evidence_inventory(&policy)
             .expect_err("a local fallback marker must not satisfy producer admission")
+            .contains("invalid remote proof metadata")
+    );
+}
+
+#[test]
+fn post_generation_inventory_rejects_fabricated_support_check_remote_receipt() {
+    let project = tempfile::tempdir().expect("create fake project root");
+    let evidence_root = project.path().join("a".repeat(64));
+    std::fs::create_dir(&evidence_root).expect("create evidence root");
+    let source_commit = "1234567890abcdef1234567890abcdef12345678";
+    let policy = PostGenerationEvidencePolicy {
+        root: std::fs::canonicalize(&evidence_root).expect("canonical evidence root"),
+        expected_source_commit: source_commit.to_string(),
+        correlation_id: "current-run".to_string(),
+    };
+    let mut entries = write_complete_post_generation_input_fixture(&evidence_root);
+    let admission_path = evidence_root.join("post_generation_producer_admission.json");
+    let mut admission: Value = serde_json::from_slice(
+        &std::fs::read(&admission_path).expect("read producer admission fixture"),
+    )
+    .expect("parse producer admission fixture");
+    admission["support_checks"][0]["remote_marker"] =
+        json!("[RCH] local (fixture fallback)");
+    std::fs::write(
+        &admission_path,
+        serde_json::to_vec_pretty(&admission).expect("serialize mutated support-check admission"),
+    )
+    .expect("write mutated support-check admission");
+    let admission_entry = entries
+        .iter_mut()
+        .find(|entry| entry["path"].as_str() == Some("post_generation_producer_admission.json"))
+        .expect("producer admission inventory entry");
+    *admission_entry = post_generation_inventory_entry(
+        &evidence_root,
+        "post_generation_producer_admission.json",
+        "file:post_generation_producer_admission.json",
+    );
+    write_post_generation_inventory_fixture(&evidence_root, source_commit, "current-run", entries);
+
+    assert!(
+        validate_post_generation_evidence_inventory(&policy)
+            .expect_err("a local support-check fallback marker must not satisfy admission")
             .contains("invalid remote proof metadata")
     );
 }
@@ -6545,7 +6790,12 @@ fn write_stratification_artifact(path: &Path, invalidity_reasons: &[&str], inclu
         json!({
             "layer_id": "full_e2e_long_session",
             "absolute_metrics": {"value": 120.0},
-            "relative_metrics": {"rust_vs_node_ratio": 1.8, "rust_vs_bun_ratio": 1.5}
+            "relative_metrics": {
+                "rust_vs_node_ratio": 1.8,
+                "rust_vs_node_ratio_basis": "matched_legacy_pi_mono_extension_loader",
+                "rust_vs_bun_ratio": 1.5,
+                "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
+            }
         })
     });
     write_stratification_artifact_with_full_e2e_layer(path, invalidity_reasons, full_e2e_layer);
@@ -6587,20 +6837,62 @@ fn write_stratification_artifact_with_claim_guard(
     global_claim_valid: Option<bool>,
     full_e2e_layer_coverage: Option<bool>,
 ) {
+    let mut full_e2e_layers = full_e2e_layers.to_vec();
+    for layer in &mut full_e2e_layers {
+        if let Some(layer_object) = layer.as_object_mut() {
+            layer_object
+                .entry("evidence_state".to_string())
+                .or_insert_with(|| Value::String("measured".to_string()));
+            layer_object
+                .entry("confidence".to_string())
+                .or_insert_with(|| Value::String("high".to_string()));
+        }
+        let Some(relative_metrics) = layer
+            .get_mut("relative_metrics")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        for (ratio_field, basis_field) in [
+            ("rust_vs_node_ratio", "rust_vs_node_ratio_basis"),
+            ("rust_vs_bun_ratio", "rust_vs_bun_ratio_basis"),
+        ] {
+            if relative_metrics.contains_key(basis_field) {
+                continue;
+            }
+            let basis = if relative_metrics.get(ratio_field) == Some(&Value::Null) {
+                "missing"
+            } else {
+                "matched_legacy_pi_mono_extension_loader"
+            };
+            relative_metrics.insert(basis_field.to_string(), Value::String(basis.to_string()));
+        }
+    }
+    let full_e2e_contract_matched = !full_e2e_layers.is_empty();
     let mut layers = vec![
         json!({
             "layer_id": "cold_load_init",
             "absolute_metrics": {"value": 10.0},
-            "relative_metrics": {"rust_vs_node_ratio": 2.1, "rust_vs_bun_ratio": 1.7}
+            "relative_metrics": {
+                "rust_vs_node_ratio": 2.1,
+                "rust_vs_node_ratio_basis": "matched_legacy_pi_mono_extension_loader",
+                "rust_vs_bun_ratio": 1.7,
+                "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
+            }
         }),
         json!({
             "layer_id": "per_call_dispatch_micro",
             "absolute_metrics": {"value": 40.0},
-            "relative_metrics": {"rust_vs_node_ratio": 2.0, "rust_vs_bun_ratio": 1.6}
+            "relative_metrics": {
+                "rust_vs_node_ratio": 2.0,
+                "rust_vs_node_ratio_basis": "matched_legacy_pi_mono_extension_loader",
+                "rust_vs_bun_ratio": 1.6,
+                "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
+            }
         }),
     ];
     if !full_e2e_layers.is_empty() {
-        layers.extend(full_e2e_layers.iter().cloned());
+        layers.extend(full_e2e_layers);
     }
 
     let mut cherry_pick_guard = serde_json::Map::new();
@@ -6618,6 +6910,8 @@ fn write_stratification_artifact_with_claim_guard(
     }
     if let Some(covered) = full_e2e_layer_coverage {
         let mut layer_coverage = serde_json::Map::new();
+        layer_coverage.insert("cold_load_init".to_string(), Value::Bool(true));
+        layer_coverage.insert("per_call_dispatch_micro".to_string(), Value::Bool(true));
         layer_coverage.insert("full_e2e_long_session".to_string(), Value::Bool(covered));
         cherry_pick_guard.insert("layer_coverage".to_string(), Value::Object(layer_coverage));
     }
@@ -6627,6 +6921,18 @@ fn write_stratification_artifact_with_claim_guard(
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "layers": layers,
         "claim_integrity": {
+            "cross_runtime_comparison": {
+                "contract_schema": "pi.perf.cross_runtime_comparison.v1",
+                "legacy_pi_mono_executed_required": true,
+                "exact_workload_and_host_contract_required": true,
+                "portable_shim_record_count": 0,
+                "true_legacy_pi_mono_record_count": 10,
+                "matched_layer_contracts": {
+                    "cold_load_init": true,
+                    "per_call_dispatch_micro": true,
+                    "full_e2e_long_session": full_e2e_contract_matched
+                }
+            },
             "cherry_pick_guard": Value::Object(cherry_pick_guard)
         }
     });
@@ -6710,6 +7016,14 @@ fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attr
                     "save_ms": 22.0,
                     "index_ms": 11.0,
                     "total_stage_ms": 117.0
+                },
+                "lineage": {
+                    "evidence_class": "measured",
+                    "confidence": "high",
+                    "eligible_for_regression_gate": true,
+                    "measurement_method": "wall_clock_observation",
+                    "measurement_boundary": "production_session_stage_instrumentation",
+                    "measurement_contract_version": "production_session_stage_instrumentation.v1"
                 }
             },
             {
@@ -6723,9 +7037,36 @@ fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attr
                     "save_ms": 19.0,
                     "index_ms": 10.0,
                     "total_stage_ms": 105.0
+                },
+                "lineage": {
+                    "evidence_class": "measured",
+                    "confidence": "high",
+                    "eligible_for_regression_gate": true,
+                    "measurement_method": "wall_clock_observation",
+                    "measurement_boundary": "production_session_stage_instrumentation",
+                    "measurement_contract_version": "production_session_stage_instrumentation.v1"
                 }
             }
         ],
+        "regression_guards": {
+            "memory": "pass",
+            "correctness": "pass",
+            "security": "pass",
+            "failure_or_gap_reasons": []
+        },
+        "stage_summary": {
+            "required_evidence_contract": {
+                "evidence_class": "measured",
+                "confidence": "high",
+                "eligible_for_regression_gate": true,
+                "measurement_method": "wall_clock_observation",
+                "measurement_boundary": "production_session_stage_instrumentation",
+                "measurement_contract_version": "production_session_stage_instrumentation.v1"
+            }
+        },
+        "consumption_contract": {
+            "artifact_ready_for_phase5": true
+        },
         "weighted_bottleneck_attribution": weighted_bottleneck_attribution
     });
     std::fs::write(
@@ -6814,6 +7155,63 @@ fn required_e2e_ratio_contract_fails_when_full_e2e_values_non_numeric() {
 }
 
 #[test]
+fn required_e2e_ratio_contract_rejects_unmatched_comparator_basis() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf");
+    std::fs::create_dir_all(&perf_dir).expect("create perf dir");
+    let artifact = perf_dir.join("extension_benchmark_stratification.json");
+    let invalid_full_e2e = json!({
+        "layer_id": "full_e2e_long_session",
+        "absolute_metrics": {"value": 120.0},
+        "relative_metrics": {
+            "rust_vs_node_ratio": 1.8,
+            "rust_vs_node_ratio_basis": "node_legacy_extension_workloads",
+            "rust_vs_bun_ratio": 1.5,
+            "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
+        }
+    });
+    write_stratification_artifact_with_full_e2e_layer(&artifact, &[], Some(invalid_full_e2e));
+
+    let failures = evaluate_required_e2e_ratio_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_cross_runtime_comparison_contract"
+        }),
+        "expected invalid cross-runtime comparison failure, got: {failures:?}",
+    );
+}
+
+#[test]
+fn required_e2e_ratio_contract_rejects_inferred_release_evidence() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf");
+    std::fs::create_dir_all(&perf_dir).expect("create perf dir");
+    let artifact = perf_dir.join("extension_benchmark_stratification.json");
+    let inferred_full_e2e = json!({
+        "layer_id": "full_e2e_long_session",
+        "evidence_state": "inferred",
+        "confidence": "high",
+        "absolute_metrics": {"value": 120.0},
+        "relative_metrics": {
+            "rust_vs_node_ratio": 1.8,
+            "rust_vs_node_ratio_basis": "matched_legacy_pi_mono_extension_loader",
+            "rust_vs_bun_ratio": 1.5,
+            "rust_vs_bun_ratio_basis": "matched_legacy_pi_mono_extension_loader"
+        }
+    });
+    write_stratification_artifact_with_full_e2e_layer(&artifact, &[], Some(inferred_full_e2e));
+
+    let failures = evaluate_required_e2e_ratio_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "invalid_cross_runtime_comparison_contract"
+                && failure.detail.contains("evidence_state=Some(\"inferred\")")
+        }),
+        "expected inferred release evidence failure, got: {failures:?}",
+    );
+}
+
+#[test]
 fn required_e2e_ratio_contract_fails_when_duplicate_full_e2e_layers_present() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let perf_dir = tmp.path().join("target/perf");
@@ -6897,9 +7295,7 @@ fn required_e2e_ratio_contract_fails_when_layer_coverage_missing() {
     assert!(
         failures.iter().any(|failure| {
             failure.contract_id == "invalid_claim_integrity_guard"
-                && failure
-                    .detail
-                    .contains("full_e2e_layer_coverage=missing_or_non_boolean")
+                && failure.detail.contains("full_e2e_long_session\", None")
         }),
         "expected invalid_claim_integrity_guard failure for missing layer coverage, got: {failures:?}",
     );
@@ -6964,6 +7360,69 @@ fn phase1_weighted_contract_accepts_valid_artifact() {
     assert!(
         failures.is_empty(),
         "did not expect weighted-attribution contract failures, got: {failures:?}",
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_rejects_ready_artifact_with_unverified_guard() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    write_phase1_matrix_validation_artifact(
+        &artifact,
+        &valid_weighted_bottleneck_attribution_fixture(),
+    );
+    let mut payload: Value = serde_json::from_slice(
+        &std::fs::read(&artifact).expect("read phase1 fixture"),
+    )
+    .expect("parse phase1 fixture");
+    payload["regression_guards"]["memory"] = json!("missing");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&payload).expect("serialize mutated phase1 fixture"),
+    )
+    .expect("write mutated phase1 fixture");
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "phase1_matrix_not_ready_for_phase5"
+                && failure.detail.contains("memory")
+                && failure.detail.contains("missing")
+        }),
+        "ready=true must not override an unverified memory guard: {failures:?}"
+    );
+}
+
+#[test]
+fn phase1_weighted_contract_rejects_inferred_passing_cell_lineage() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let perf_dir = tmp.path().join("target/perf/results");
+    std::fs::create_dir_all(&perf_dir).expect("create perf results dir");
+    let artifact = perf_dir.join("phase1_matrix_validation.json");
+    write_phase1_matrix_validation_artifact(
+        &artifact,
+        &valid_weighted_bottleneck_attribution_fixture(),
+    );
+    let mut payload: Value = serde_json::from_slice(
+        &std::fs::read(&artifact).expect("read phase1 fixture"),
+    )
+    .expect("parse phase1 fixture");
+    payload["matrix_cells"][0]["lineage"]["evidence_class"] = json!("inferred");
+    std::fs::write(
+        &artifact,
+        serde_json::to_vec_pretty(&payload).expect("serialize mutated phase1 fixture"),
+    )
+    .expect("write mutated phase1 fixture");
+
+    let failures = evaluate_phase1_weighted_attribution_contract(tmp.path(), 24.0);
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contract_id == "phase1_matrix_unmeasured_stage_evidence"
+                && failure.detail.contains("invalid_pass_cell_indexes=[0]")
+        }),
+        "inferred pass-cell lineage must not satisfy the Phase-5 consumer: {failures:?}"
     );
 }
 

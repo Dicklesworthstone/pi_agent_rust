@@ -1034,6 +1034,7 @@ if [[ "$SKIP_ENV_CHECK" -eq 0 ]]; then
   fingerprint_summary="$(
     python3 - "$OUTPUT_DIR/env_fingerprint.json" <<'PY'
 import json
+import math
 import sys
 
 payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
@@ -1396,16 +1397,23 @@ if observed_coverage != expected_coverage:
 PY
 }
 
-validate_retrieved_ext_bench_harness_report() {
-  local artifact_path="$1"
-  local expected_mode="$2"
-  python3 - "$artifact_path" "$expected_mode" <<'PY'
+validate_retrieved_ext_bench_harness_pair() {
+  local jsonl_path="$1"
+  local report_path="$2"
+  local expected_mode="$3"
+  local manifest_path="$4"
+  python3 - "$jsonl_path" "$report_path" "$expected_mode" "$manifest_path" <<'PY'
+import hashlib
 import json
+import math
 import sys
+from datetime import datetime
 from pathlib import Path
 
-artifact_path = Path(sys.argv[1])
-expected_mode = sys.argv[2]
+jsonl_path = Path(sys.argv[1])
+report_path = Path(sys.argv[2])
+expected_mode = sys.argv[3]
+manifest_path = Path(sys.argv[4])
 expected_config = {
     "pr": {
         "max_extensions": 10,
@@ -1420,9 +1428,93 @@ expected_config = {
 }[expected_mode]
 
 try:
-    report = json.loads(artifact_path.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    report = json.loads(report_path.read_text(encoding="utf-8"))
 except (OSError, json.JSONDecodeError) as error:
-    raise SystemExit(f"invalid extension benchmark harness report: {error}") from error
+    raise SystemExit(f"invalid extension benchmark harness input: {error}") from error
+
+if not isinstance(manifest, dict) or manifest.get("schema") != "pi.ext.validated-manifest.v1":
+    raise SystemExit("extension benchmark manifest schema mismatch")
+manifest_entries = manifest.get("extensions")
+if not isinstance(manifest_entries, list) or not manifest_entries:
+    raise SystemExit("extension benchmark manifest contains no extensions")
+safe_entries = []
+all_ids = set()
+for index, entry in enumerate(manifest_entries):
+    if not isinstance(entry, dict):
+        raise SystemExit(f"extension benchmark manifest entry {index} must be an object")
+    extension_id = entry.get("id")
+    if not isinstance(extension_id, str) or not extension_id.strip():
+        raise SystemExit(f"extension benchmark manifest entry {index} has no id")
+    if extension_id in all_ids:
+        raise SystemExit(f"extension benchmark manifest has duplicate id {extension_id!r}")
+    all_ids.add(extension_id)
+    capabilities = entry.get("capabilities")
+    if not isinstance(capabilities, dict):
+        raise SystemExit(f"extension benchmark manifest entry {extension_id!r} has no capabilities")
+    for field in (
+        "is_multi_file",
+        "uses_exec",
+        "registers_tools",
+        "registers_commands",
+        "registers_flags",
+        "registers_providers",
+    ):
+        if type(capabilities.get(field)) is not bool:
+            raise SystemExit(
+                f"extension benchmark manifest entry {extension_id!r} capabilities.{field} must be boolean"
+            )
+    subscribed_events = capabilities.get("subscribes_events")
+    if not isinstance(subscribed_events, list) or any(
+        not isinstance(event, str) for event in subscribed_events
+    ):
+        raise SystemExit(
+            f"extension benchmark manifest entry {extension_id!r} capabilities.subscribes_events must be an array of strings"
+        )
+    source_tier = entry.get("source_tier")
+    conformance_tier = entry.get("conformance_tier")
+    if not isinstance(source_tier, str) or not source_tier:
+        raise SystemExit(
+            f"extension benchmark manifest entry {extension_id!r} source_tier must be a non-empty string"
+        )
+    if type(conformance_tier) is not int or conformance_tier < 0:
+        raise SystemExit(
+            f"extension benchmark manifest entry {extension_id!r} conformance_tier must be a non-negative integer"
+        )
+    if not capabilities["is_multi_file"] and not capabilities["uses_exec"]:
+        safe_entries.append(
+            {
+                "id": extension_id,
+                "source_tier": source_tier,
+                "conformance_tier": conformance_tier,
+                "registers_tools": capabilities["registers_tools"],
+                "registers_commands": capabilities["registers_commands"],
+                "registers_flags": capabilities["registers_flags"],
+                "subscribes_events": subscribed_events,
+            }
+        )
+
+if not safe_entries:
+    raise SystemExit("extension benchmark manifest contains no safe extensions")
+
+records = []
+try:
+    lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+except OSError as error:
+    raise SystemExit(f"cannot read extension benchmark JSONL: {error}") from error
+for line_number, line in enumerate(lines, start=1):
+    if not line.strip():
+        continue
+    try:
+        record = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"extension benchmark JSONL line {line_number}: {error}") from error
+    if not isinstance(record, dict):
+        raise SystemExit(f"extension benchmark JSONL line {line_number} must be an object")
+    records.append(record)
+
+if not records:
+    raise SystemExit("extension benchmark JSONL contains no records")
 
 if not isinstance(report, dict):
     raise SystemExit("extension benchmark harness report must be an object")
@@ -1443,6 +1535,216 @@ for field, expected in expected_config.items():
             f"extension benchmark harness config.{field} mismatch: "
             f"expected={expected!r} observed={observed!r}"
         )
+if config.get("debug_build") is not False:
+    raise SystemExit("extension benchmark harness config.debug_build must equal false")
+
+if expected_mode == "pr":
+    selected_entries = []
+    selected_ids = set()
+
+    def pick(predicate):
+        if len(selected_entries) >= expected_config["max_extensions"]:
+            return
+        selected = next(
+            (
+                entry
+                for entry in safe_entries
+                if entry["id"] not in selected_ids and predicate(entry)
+            ),
+            None,
+        )
+        if selected is not None:
+            selected_entries.append(selected)
+            selected_ids.add(selected["id"])
+
+    pick(lambda entry: entry["source_tier"] == "official-pi-mono" and entry["registers_tools"])
+    pick(
+        lambda entry: entry["source_tier"] == "official-pi-mono"
+        and "agent_start" in entry["subscribes_events"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "community"
+        and entry["registers_commands"]
+        and "agent_start" in entry["subscribes_events"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "community"
+        and entry["registers_tools"]
+        and entry["registers_flags"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "npm-registry"
+        and entry["registers_commands"]
+    )
+    pick(
+        lambda entry: entry["source_tier"] == "npm-registry"
+        and "agent_start" in entry["subscribes_events"]
+    )
+    for entry in safe_entries:
+        if len(selected_entries) >= expected_config["max_extensions"]:
+            break
+        if entry["id"] not in selected_ids:
+            selected_entries.append(entry)
+            selected_ids.add(entry["id"])
+else:
+    selected_entries = safe_entries[: expected_config["max_extensions"]]
+
+expected_ids = [entry["id"] for entry in selected_entries]
+expected_entry_by_id = {entry["id"]: entry for entry in selected_entries}
+if not any("agent_start" in entry["subscribes_events"] for entry in selected_entries):
+    raise SystemExit(
+        "extension benchmark selection contains no agent_start subscriber"
+    )
+if expected_mode == "nightly" and len(safe_entries) > expected_config["max_extensions"]:
+    raise SystemExit(
+        "nightly extension benchmark max_extensions truncates the safe manifest corpus"
+    )
+
+expected_env_fields = {
+    "os",
+    "arch",
+    "cpu_model",
+    "cpu_cores",
+    "mem_total_mb",
+    "build_profile",
+    "git_commit",
+    "features",
+    "config_hash",
+}
+
+
+def validated_environment(value, location):
+    if not isinstance(value, dict) or set(value) != expected_env_fields:
+        raise SystemExit(f"{location} environment fields mismatch")
+    for field in ("os", "arch", "cpu_model", "build_profile", "git_commit"):
+        if not isinstance(value.get(field), str) or not value[field].strip():
+            raise SystemExit(f"{location} env.{field} must be a non-empty string")
+    if type(value.get("cpu_cores")) is not int or value["cpu_cores"] <= 0:
+        raise SystemExit(f"{location} env.cpu_cores must be a positive integer")
+    if type(value.get("mem_total_mb")) is not int or value["mem_total_mb"] <= 0:
+        raise SystemExit(f"{location} env.mem_total_mb must be a positive integer")
+    if value.get("features") != ["ext-conformance"]:
+        raise SystemExit(f"{location} env.features must equal ['ext-conformance']")
+    hash_input = "|".join(
+        str(value[field])
+        for field in (
+            "os",
+            "arch",
+            "cpu_model",
+            "cpu_cores",
+            "mem_total_mb",
+            "build_profile",
+            "git_commit",
+        )
+    )
+    expected_hash = hashlib.sha256(hash_input.encode()).hexdigest()
+    if value.get("config_hash") != expected_hash:
+        raise SystemExit(f"{location} env.config_hash mismatch")
+    return value
+
+
+generated_at = report.get("generated_at")
+if not isinstance(generated_at, str) or not generated_at.strip():
+    raise SystemExit("extension benchmark harness report generated_at is missing")
+try:
+    parsed_generated_at = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+except ValueError as error:
+    raise SystemExit("extension benchmark harness report generated_at is invalid") from error
+if parsed_generated_at.tzinfo is None:
+    raise SystemExit("extension benchmark harness report generated_at must be timezone-aware")
+report_env = validated_environment(report.get("env"), "extension benchmark report")
+
+observed = {}
+observed_env = None
+for index, record in enumerate(records):
+    if record.get("schema") != "pi.ext.rust_bench.v1":
+        raise SystemExit(f"extension benchmark record {index} schema mismatch")
+    if record.get("runtime") != "pi_agent_rust" or record.get("success") is not True:
+        raise SystemExit(f"extension benchmark record {index} is not a successful Pi Rust result")
+    record_env = validated_environment(
+        record.get("env"), f"extension benchmark record {index}"
+    )
+    if observed_env is None:
+        observed_env = record_env
+    elif record_env != observed_env:
+        raise SystemExit("extension benchmark records use mixed environments")
+    scenario = record.get("scenario")
+    extension_id = record.get("extension")
+    if not isinstance(scenario, str) or not isinstance(extension_id, str):
+        raise SystemExit(f"extension benchmark record {index} has invalid coverage identity")
+    key = (extension_id, scenario)
+    if key in observed:
+        raise SystemExit(f"duplicate extension benchmark coverage {key!r}")
+    stats = record.get("stats")
+    stat_fields = ("count", "min_us", "max_us", "mean_us", "p50_us", "p95_us", "p99_us")
+    if not isinstance(stats, dict) or any(
+        type(stats.get(field)) is not int or stats[field] < 0 for field in stat_fields
+    ):
+        raise SystemExit(
+            f"extension benchmark record {index} stats must contain non-negative integer fields"
+        )
+    expected_count = (
+        expected_config["event_dispatch_count"]
+        if scenario == "event_dispatch"
+        else expected_config["iterations"]
+    )
+    if stats["count"] != expected_count:
+        raise SystemExit(
+            f"extension benchmark record {key!r} stats.count mismatch: "
+            f"expected={expected_count} observed={stats['count']!r}"
+        )
+    if stats["count"] <= 0 or not (
+        stats["min_us"]
+        <= stats["p50_us"]
+        <= stats["p95_us"]
+        <= stats["p99_us"]
+        <= stats["max_us"]
+        and stats["min_us"] <= stats["mean_us"] <= stats["max_us"]
+    ):
+        raise SystemExit(f"extension benchmark record {index} stats are incoherent")
+    if scenario in {"cold_load", "warm_load"}:
+        entry = expected_entry_by_id.get(extension_id)
+        if entry is None:
+            raise SystemExit(
+                f"extension benchmark record {index} uses unselected extension {extension_id!r}"
+            )
+        expected_group = (
+            "official-simple"
+            if entry["source_tier"] == "official-pi-mono"
+            and entry["conformance_tier"] <= 3
+            else (
+                "official-complex"
+                if entry["source_tier"] == "official-pi-mono"
+                else "community"
+            )
+        )
+        if record.get("group") != expected_group or record.get("tier") != entry["conformance_tier"]:
+            raise SystemExit(
+                f"extension benchmark record {index} group/tier differs from manifest"
+            )
+    elif scenario == "event_dispatch":
+        if record.get("group") != "aggregate" or record.get("tier") != 0:
+            raise SystemExit(
+                f"extension benchmark record {index} aggregate group/tier mismatch"
+            )
+    observed[key] = record
+
+expected_coverage = {
+    (extension_id, scenario)
+    for extension_id in expected_ids
+    for scenario in ("cold_load", "warm_load")
+}
+expected_coverage.add((f"{len(expected_ids)}_extensions", "event_dispatch"))
+observed_coverage = set(observed)
+if observed_coverage != expected_coverage:
+    raise SystemExit(
+        "extension benchmark coverage mismatch: "
+        f"missing={sorted(expected_coverage - observed_coverage)!r}, "
+        f"unexpected={sorted(observed_coverage - expected_coverage)!r}"
+    )
+if observed_env != report_env:
+    raise SystemExit("extension benchmark report environment differs from JSONL")
+
 summary = report.get("summary")
 if not isinstance(summary, dict):
     raise SystemExit("extension benchmark harness report has no summary object")
@@ -1452,8 +1754,8 @@ for field in ("total_scenarios", "total_passed", "total_failed"):
         raise SystemExit(
             f"extension benchmark harness summary.{field} must be a non-negative integer"
         )
-if summary["total_scenarios"] <= 0:
-    raise SystemExit("extension benchmark harness report contains no scenarios")
+if summary["total_scenarios"] != len(records):
+    raise SystemExit("extension benchmark harness summary total does not match JSONL")
 if summary["total_passed"] + summary["total_failed"] != summary["total_scenarios"]:
     raise SystemExit("extension benchmark harness summary totals are inconsistent")
 if summary["total_failed"] != 0:
@@ -1464,10 +1766,208 @@ for field in ("budgets_passed", "budgets_failed", "budgets_no_data"):
         raise SystemExit(
             f"extension benchmark harness summary.{field} must be a non-negative integer"
         )
-if summary["budgets_passed"] <= 0:
-    raise SystemExit("extension benchmark harness report contains no passing budgets")
-if summary["budgets_failed"] != 0 or summary["budgets_no_data"] != 0:
+if summary["budgets_passed"] != 5 or summary["budgets_failed"] != 0 or summary["budgets_no_data"] != 0:
     raise SystemExit("extension benchmark harness report has failed or missing budget data")
+
+
+def percentile(values, percentile_value):
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    raw_index = (percentile_value / 100.0) * (len(sorted_values) - 1)
+    index = int(math.floor(raw_index + 0.5))
+    return sorted_values[min(index, len(sorted_values) - 1)]
+
+
+expected_scenario_counts = {
+    "cold_load": len(expected_ids),
+    "warm_load": len(expected_ids),
+    "event_dispatch": 1,
+}
+by_scenario = report.get("by_scenario")
+if not isinstance(by_scenario, dict) or set(by_scenario) != set(expected_scenario_counts):
+    raise SystemExit("extension benchmark harness by_scenario coverage mismatch")
+for scenario, expected_count in expected_scenario_counts.items():
+    row = by_scenario.get(scenario)
+    if not isinstance(row, dict):
+        raise SystemExit(f"extension benchmark harness by_scenario.{scenario} is invalid")
+    if (
+        row.get("scenario") != scenario
+        or row.get("extensions_tested") != expected_count
+        or row.get("passed") != expected_count
+        or row.get("failed") != 0
+    ):
+        raise SystemExit(f"extension benchmark harness by_scenario.{scenario} totals mismatch")
+    aggregate_stats = row.get("aggregate_stats")
+    representative_p50s = [
+        record["stats"]["p50_us"]
+        for record in records
+        if record.get("scenario") == scenario and record.get("success") is True
+    ]
+    expected_aggregate_stats = {
+        "count": len(representative_p50s),
+        "min_us": min(representative_p50s, default=0),
+        "max_us": max(representative_p50s, default=0),
+        "mean_us": (
+            sum(representative_p50s) // len(representative_p50s)
+            if representative_p50s
+            else 0
+        ),
+        "p50_us": percentile(representative_p50s, 50.0) or 0,
+        "p95_us": percentile(representative_p50s, 95.0) or 0,
+        "p99_us": percentile(representative_p50s, 99.0) or 0,
+    }
+    if (
+        not isinstance(aggregate_stats, dict)
+        or any(
+            type(aggregate_stats.get(field)) is not int
+            or aggregate_stats[field] < 0
+            for field in (
+                "count",
+                "min_us",
+                "max_us",
+                "mean_us",
+                "p50_us",
+                "p95_us",
+                "p99_us",
+            )
+        )
+        or aggregate_stats != expected_aggregate_stats
+    ):
+        raise SystemExit(
+            f"extension benchmark harness by_scenario.{scenario}.aggregate_stats is invalid"
+        )
+
+report_results = report.get("results")
+if not isinstance(report_results, list) or len(report_results) != len(records):
+    raise SystemExit("extension benchmark harness report results do not match JSONL count")
+report_by_key = {}
+for index, result in enumerate(report_results):
+    if not isinstance(result, dict):
+        raise SystemExit(f"extension benchmark harness report result {index} is invalid")
+    key = (result.get("extension"), result.get("scenario"))
+    if key in report_by_key:
+        raise SystemExit(f"duplicate extension benchmark report result {key!r}")
+    report_by_key[key] = result
+if set(report_by_key) != observed_coverage:
+    raise SystemExit("extension benchmark harness report result coverage differs from JSONL")
+for key, record in observed.items():
+    result = report_by_key[key]
+    comparable_fields = (
+        "schema",
+        "runtime",
+        "scenario",
+        "extension",
+        "group",
+        "tier",
+        "success",
+        "error",
+        "stats",
+        "env",
+    )
+    if any(result.get(field) != record.get(field) for field in comparable_fields):
+        raise SystemExit(f"extension benchmark harness report result {key!r} differs from JSONL")
+
+expected_budget_names = {
+    "ext_cold_load_simple_p95",
+    "ext_cold_load_per_ext_p99",
+    "ext_warm_load_per_ext_p99",
+    "event_dispatch_p99",
+    "ext_warm_load_p95",
+}
+budget_checks = report.get("budget_checks")
+if not isinstance(budget_checks, list) or len(budget_checks) != len(expected_budget_names):
+    raise SystemExit("extension benchmark harness report budget check count mismatch")
+budget_check_by_name = {}
+for check in budget_checks:
+    if not isinstance(check, dict):
+        raise SystemExit("extension benchmark harness report contains an invalid budget check")
+    budget_name = check.get("budget_name")
+    if budget_name in budget_check_by_name:
+        raise SystemExit("extension benchmark harness report has duplicate budget checks")
+    budget_check_by_name[budget_name] = check
+if set(budget_check_by_name) != expected_budget_names:
+    raise SystemExit("extension benchmark harness report budget check identities mismatch")
+
+def last_max_record(records_for_budget, stat_field):
+    worst = None
+    for record in records_for_budget:
+        candidate = (record["stats"][stat_field], record["extension"])
+        if worst is None or candidate[0] >= worst[0]:
+            worst = candidate
+    return worst
+
+
+cold_records = [
+    record for record in records if record.get("scenario") == "cold_load"
+]
+warm_records = [
+    record for record in records if record.get("scenario") == "warm_load"
+]
+event_records = [
+    record for record in records if record.get("scenario") == "event_dispatch"
+]
+cold_simple_p95 = percentile(
+    [
+        record["stats"]["p95_us"]
+        for record in cold_records
+        if record.get("group") == "official-simple"
+    ],
+    95.0,
+)
+worst_cold_p99 = last_max_record(cold_records, "p99_us")
+worst_warm_p99 = last_max_record(warm_records, "p99_us")
+event_p99 = event_records[0]["stats"]["p99_us"] if len(event_records) == 1 else None
+warm_aggregate_p95 = percentile(
+    [record["stats"]["p95_us"] for record in warm_records], 95.0
+)
+expected_budget_checks = {
+    "ext_cold_load_simple_p95": {
+        "threshold_us": 200_000,
+        "actual_us": cold_simple_p95,
+        "worst_extension": None,
+    },
+    "ext_cold_load_per_ext_p99": {
+        "threshold_us": 100_000,
+        "actual_us": worst_cold_p99[0] if worst_cold_p99 else None,
+        "worst_extension": worst_cold_p99[1] if worst_cold_p99 else None,
+    },
+    "ext_warm_load_per_ext_p99": {
+        "threshold_us": 100_000,
+        "actual_us": worst_warm_p99[0] if worst_warm_p99 else None,
+        "worst_extension": worst_warm_p99[1] if worst_warm_p99 else None,
+    },
+    "event_dispatch_p99": {
+        "threshold_us": 5_000,
+        "actual_us": event_p99,
+        "worst_extension": None,
+    },
+    "ext_warm_load_p95": {
+        "threshold_us": 100_000,
+        "actual_us": warm_aggregate_p95,
+        "worst_extension": None,
+    },
+}
+for budget_name, expected in expected_budget_checks.items():
+    expected_status = (
+        "NO_DATA"
+        if expected["actual_us"] is None
+        else (
+            "PASS"
+            if expected["actual_us"] <= expected["threshold_us"]
+            else "FAIL"
+        )
+    )
+    observed_check = budget_check_by_name[budget_name]
+    if (
+        observed_check.get("threshold_us") != expected["threshold_us"]
+        or observed_check.get("actual_us") != expected["actual_us"]
+        or observed_check.get("status") != expected_status
+        or observed_check.get("worst_extension") != expected["worst_extension"]
+    ):
+        raise SystemExit(
+            f"extension benchmark harness budget {budget_name!r} differs from recomputed JSONL evidence"
+        )
 PY
 }
 
@@ -1573,7 +2073,9 @@ required = {
     for runtime_kind in ("node", "bun")
     for scenario, extension in (
         ("ext_load_init/load_init_cold", "hello"),
+        ("ext_load_init/load_init_cold", "pirate"),
         ("ext_tool_call/hello", "hello"),
+        ("ext_event_hook/before_agent_start", "pirate"),
         ("full_e2e_long_session", "hello+pirate"),
     )
 }
@@ -1607,22 +2109,69 @@ for line_number, line in enumerate(
     extension = record.get("extension")
     if runtime_kind not in {"node", "bun"} or not isinstance(scenario, str):
         raise SystemExit(f"line {line_number}: runtime/scenario contract mismatch")
+    legacy_pi_mono_executed = record.get("legacy_pi_mono_executed") is True
+    if legacy_pi_mono_executed:
+        if (
+            record.get("runtime") != "legacy_pi_mono"
+            or record.get("runtime_family") != "legacy_pi_mono_extension_loader"
+        ):
+            raise SystemExit(
+                f"line {line_number}: true pi-mono evidence has invalid runtime identity"
+            )
+    elif (
+        record.get("runtime") != f"portable_{runtime_kind}_extension_api"
+        or record.get("runtime_family") != "portable_extension_api"
+    ):
+        raise SystemExit(
+            f"line {line_number}: portable shim evidence must identify its runtime honestly"
+        )
     key = (runtime_kind, scenario, extension)
     if key not in required:
-        continue
+        raise SystemExit(f"line {line_number}: unexpected legacy benchmark row {key!r}")
     if key in observed:
         raise SystemExit(f"line {line_number}: duplicate required legacy row {key!r}")
     if scenario == "ext_load_init/load_init_cold":
-        value = record.get("summary", {}).get("p50_ms")
-    elif scenario == "ext_tool_call/hello":
-        value = record.get("per_call_us")
+        summary = record.get("summary")
+        if (
+            not isinstance(summary, dict)
+            or record.get("runs") != 10
+            or summary.get("count") != 10
+        ):
+            raise SystemExit(f"line {line_number}: cold-load sampling contract mismatch")
+        values = (summary.get("p50_ms"), summary.get("p95_ms"))
+    elif scenario in {"ext_tool_call/hello", "ext_event_hook/before_agent_start"}:
+        if record.get("iterations") != 2000:
+            raise SystemExit(f"line {line_number}: dispatch iteration contract mismatch")
+        values = (record.get("per_call_us"),)
     else:
-        value = record.get("elapsed_ms")
-    if (
+        expected_shape_fields = {
+            "extension_loads_per_iteration": 2,
+            "tool_calls_per_iteration": 10,
+            "event_hooks_per_iteration": 1,
+        }
+        workload_shape = record.get("workload_shape")
+        if (
+            record.get("iterations") != 2000
+            or record.get("tool_calls_per_iteration") != 10
+            or record.get("tool_executions") != 20000
+            or record.get("event_executions") != 2000
+            or not isinstance(workload_shape, dict)
+            or set(workload_shape) != {*expected_shape_fields, "description"}
+            or any(
+                workload_shape.get(field) != expected
+                for field, expected in expected_shape_fields.items()
+            )
+            or not isinstance(workload_shape.get("description"), str)
+            or not workload_shape["description"].strip()
+        ):
+            raise SystemExit(f"line {line_number}: full-session workload shape mismatch")
+        values = (record.get("elapsed_ms"),)
+    if any(
         isinstance(value, bool)
         or not isinstance(value, (int, float))
         or not math.isfinite(value)
         or value <= 0
+        for value in values
     ):
         raise SystemExit(f"line {line_number}: required legacy metric is invalid")
     observed.add(key)
@@ -1851,12 +2400,16 @@ run_test_suite() {
       local artifact_name source_path accepted_path
       for artifact_name in "${returned_artifacts[@]}"; do
         source_path="$retrieved_result_dir/$artifact_name"
-        accepted_path="$OUTPUT_DIR/results/$artifact_name"
         if [[ ! -s "$source_path" || -L "$source_path" ]]; then
           log_fail "$suite_name did not return regular nonempty $artifact_name"
           exit_code=86
           break
         fi
+      done
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+      for artifact_name in "${returned_artifacts[@]}"; do
+        source_path="$retrieved_result_dir/$artifact_name"
         if [[ "$artifact_name" == "scenario_runner.jsonl" ]] \
           && ! validate_retrieved_rust_bench_jsonl \
             "$source_path" scenario "$GIT_COMMIT_FULL" "$CORRELATION_ID"; then
@@ -1865,8 +2418,13 @@ run_test_suite() {
           break
         fi
         if [[ "$artifact_name" == "ext_bench_harness.jsonl" ]] \
-          && ! validate_retrieved_rust_bench_jsonl \
-            "$source_path" extension "$GIT_COMMIT_FULL" "$CORRELATION_ID"; then
+          && { ! validate_retrieved_rust_bench_jsonl \
+                 "$source_path" extension "$GIT_COMMIT_FULL" "$CORRELATION_ID" \
+               || ! validate_retrieved_ext_bench_harness_pair \
+                 "$source_path" \
+                 "$retrieved_result_dir/ext_bench_harness_report.json" \
+                 "$producer_bench_mode" \
+                 "$ROOT_DIR/tests/ext_conformance/VALIDATED_MANIFEST.json"; }; then
           log_fail "$suite_name returned invalid extension benchmark evidence"
           exit_code=88
           break
@@ -1878,13 +2436,12 @@ run_test_suite() {
           exit_code=88
           break
         fi
-        if [[ "$artifact_name" == "ext_bench_harness_report.json" ]] \
-          && ! validate_retrieved_ext_bench_harness_report \
-            "$source_path" "$producer_bench_mode"; then
-          log_fail "$suite_name returned an invalid $producer_bench_mode harness report"
-          exit_code=88
-          break
-        fi
+      done
+    fi
+    if [[ "$exit_code" -eq 0 ]]; then
+      for artifact_name in "${returned_artifacts[@]}"; do
+        source_path="$retrieved_result_dir/$artifact_name"
+        accepted_path="$OUTPUT_DIR/results/$artifact_name"
         if [[ -e "$accepted_path" || -L "$accepted_path" ]]; then
           log_fail "Refusing preexisting accepted $artifact_name"
           exit_code=95
@@ -2736,6 +3293,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -3153,6 +3711,7 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   python3 - <<'PY'
 import hashlib
 import json
+import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -3474,74 +4033,188 @@ def legacy_runtime_kind(record: dict) -> str:
     return "node"
 
 
-legacy_cold_samples_ms_by_runtime: dict[str, list[float]] = {"node": [], "bun": []}
-legacy_tool_samples_us_by_runtime: dict[str, list[float]] = {"node": [], "bun": []}
-legacy_full_e2e_samples_ms_by_runtime: dict[str, list[float]] = {"node": [], "bun": []}
-for record in legacy_records:
-    runtime_kind = legacy_runtime_kind(record)
-    scenario = str(record.get("scenario", "")).strip()
-    if scenario == "ext_load_init/load_init_cold":
-        summary = record.get("summary", {})
-        if isinstance(summary, dict):
-            p50_ms = parse_float(summary.get("p50_ms"))
-            if p50_ms is not None:
-                legacy_cold_samples_ms_by_runtime.setdefault(runtime_kind, []).append(p50_ms)
-    if scenario == "ext_tool_call/hello":
-        per_call_us = parse_float(record.get("per_call_us"))
-        if per_call_us is not None:
-            legacy_tool_samples_us_by_runtime.setdefault(runtime_kind, []).append(per_call_us)
-    if scenario == "full_e2e_long_session":
-        elapsed_ms = parse_float(record.get("elapsed_ms"))
-        if elapsed_ms is not None:
-            legacy_full_e2e_samples_ms_by_runtime.setdefault(runtime_kind, []).append(elapsed_ms)
-
-legacy_cold_node_ms = mean(legacy_cold_samples_ms_by_runtime.get("node", []))
-legacy_cold_bun_ms = mean(legacy_cold_samples_ms_by_runtime.get("bun", []))
-legacy_tool_node_us = mean(legacy_tool_samples_us_by_runtime.get("node", []))
-legacy_tool_bun_us = mean(legacy_tool_samples_us_by_runtime.get("bun", []))
-legacy_full_e2e_node_ms = mean(legacy_full_e2e_samples_ms_by_runtime.get("node", []))
-legacy_full_e2e_bun_ms = mean(legacy_full_e2e_samples_ms_by_runtime.get("bun", []))
+comparison_boundaries = {
+    "cold_load_init": "matched_extension_cold_load",
+    "per_call_dispatch_micro": "matched_extension_tool_dispatch",
+    "full_e2e_long_session": "matched_full_session_workflow",
+}
+comparison_workload_shapes = {
+    "cold_load_init": {
+        "extension": "hello",
+        "operation": "cold_load_init",
+        "statistic": "p95",
+    },
+    "per_call_dispatch_micro": {
+        "extension": "hello",
+        "operation": "tool_call",
+        "statistic": "mean",
+    },
+    "full_e2e_long_session": {
+        "session_turns": 2000,
+        "extension_loads_per_iteration": 2,
+        "tool_calls_per_iteration": 10,
+        "event_hooks_per_iteration": 1,
+        "statistic": "elapsed",
+    },
+}
 
 
-def ratio_from_pair(rust_value, legacy_value):
-    if rust_value is not None and legacy_value is not None and legacy_value > 0:
-        return rust_value / legacy_value
-    return None
+def validated_comparison_contract(record: dict, claim_scope: str):
+    contract = record.get("comparison_contract")
+    required_fields = {
+        "schema",
+        "claim_scope",
+        "measurement_boundary",
+        "release_claim_eligible",
+        "host_fingerprint_sha256",
+        "workload_shape",
+    }
+    if not isinstance(contract, dict) or set(contract) != required_fields:
+        return None
+    if (
+        contract.get("schema") != "pi.perf.cross_runtime_comparison.v1"
+        or contract.get("claim_scope") != claim_scope
+        or contract.get("measurement_boundary") != comparison_boundaries[claim_scope]
+        or contract.get("release_claim_eligible") is not True
+    ):
+        return None
+    host_fingerprint = contract.get("host_fingerprint_sha256")
+    if (
+        not isinstance(host_fingerprint, str)
+        or len(host_fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in host_fingerprint)
+    ):
+        return None
+    workload_shape = contract.get("workload_shape")
+    if workload_shape != comparison_workload_shapes[claim_scope]:
+        return None
+    return contract
 
-cold_node_ratio = None
-cold_bun_ratio = None
-per_call_node_ratio = None
-per_call_bun_ratio = None
-full_e2e_node_ratio = None
-full_e2e_bun_ratio = None
-full_e2e_node_ratio_basis = "missing"
 
-cold_ratio_row = comparison_row("rust-to-ts ratio", "load time")
-if isinstance(cold_ratio_row, dict):
-    cold_node_ratio = parse_float(cold_ratio_row.get("rust_value"))
-if cold_node_ratio is None:
-    cold_node_ratio = ratio_from_pair(cold_abs_ms, legacy_cold_node_ms)
-cold_bun_ratio = ratio_from_pair(cold_abs_ms, legacy_cold_bun_ms)
+def positive_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and parsed > 0.0 else None
 
-per_call_row = comparison_row("hello per-call latency", "tool call")
-if isinstance(per_call_row, dict):
-    rust_value = parse_float(per_call_row.get("rust_value"))
-    legacy_value = parse_float(per_call_row.get("legacy_value"))
-    if rust_value is not None and legacy_value and legacy_value > 0:
-        per_call_node_ratio = rust_value / legacy_value
-if per_call_node_ratio is None:
-    per_call_node_ratio = ratio_from_pair(per_call_abs_us, legacy_tool_node_us)
-per_call_bun_ratio = ratio_from_pair(per_call_abs_us, legacy_tool_bun_us)
 
-full_e2e_node_ratio = ratio_from_pair(full_e2e_abs_ms, legacy_full_e2e_node_ms)
-if full_e2e_node_ratio is not None:
-    full_e2e_node_ratio_basis = "node_legacy_extension_workloads"
-if full_e2e_node_ratio is None:
-    full_e2e_row = comparison_row("200 iters x 1 tool", "e2e process")
-    full_e2e_node_ratio = extract_ratio_from_comparison_row(full_e2e_row)
-    if full_e2e_node_ratio is not None:
-        full_e2e_node_ratio_basis = "perf_comparison_full_e2e"
-full_e2e_bun_ratio = ratio_from_pair(full_e2e_abs_ms, legacy_full_e2e_bun_ms)
+def matched_cross_runtime_ratios(
+    rust_records: list[dict],
+    rust_value,
+    legacy_value,
+    claim_scope: str,
+):
+    rust_by_contract: dict[str, list[float]] = {}
+    for record in rust_records:
+        contract = validated_comparison_contract(record, claim_scope)
+        value = rust_value(record)
+        if contract is None or value is None:
+            continue
+        contract_key = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+        rust_by_contract.setdefault(contract_key, []).append(value)
+
+    legacy_by_runtime: dict[str, dict[str, list[float]]] = {"node": {}, "bun": {}}
+    for record in legacy_records:
+        if (
+            record.get("legacy_pi_mono_executed") is not True
+            or record.get("runtime_family") != "legacy_pi_mono_extension_loader"
+            or record.get("runtime") != "legacy_pi_mono"
+        ):
+            continue
+        contract = validated_comparison_contract(record, claim_scope)
+        value = legacy_value(record)
+        runtime_kind = legacy_runtime_kind(record)
+        if contract is None or value is None or runtime_kind not in legacy_by_runtime:
+            continue
+        contract_key = json.dumps(contract, sort_keys=True, separators=(",", ":"))
+        legacy_by_runtime[runtime_kind].setdefault(contract_key, []).append(value)
+
+    common_contracts = (
+        set(rust_by_contract)
+        & set(legacy_by_runtime["node"])
+        & set(legacy_by_runtime["bun"])
+    )
+    if len(common_contracts) != 1:
+        return None, None, None
+    contract_key = next(iter(common_contracts))
+    rust_metric = mean(rust_by_contract[contract_key])
+    node_metric = mean(legacy_by_runtime["node"][contract_key])
+    bun_metric = mean(legacy_by_runtime["bun"][contract_key])
+    if rust_metric is None or node_metric is None or bun_metric is None:
+        return None, None, None
+    return rust_metric, rust_metric / node_metric, rust_metric / bun_metric
+
+
+matched_cold_abs_ms, cold_node_ratio, cold_bun_ratio = matched_cross_runtime_ratios(
+    scenario_runner_records,
+    lambda record: (
+        positive_number(record.get("stats", {}).get("p95_ms"))
+        if record.get("scenario") == "cold_start"
+        and record.get("extension") == "hello"
+        and isinstance(record.get("stats"), dict)
+        else None
+    ),
+    lambda record: (
+        positive_number(record.get("summary", {}).get("p95_ms"))
+        if record.get("scenario") == "ext_load_init/load_init_cold"
+        and record.get("extension") == "hello"
+        and isinstance(record.get("summary"), dict)
+        else None
+    ),
+    "cold_load_init",
+)
+matched_per_call_abs_us, per_call_node_ratio, per_call_bun_ratio = (
+    matched_cross_runtime_ratios(
+        scenario_runner_records,
+        lambda record: (
+            positive_number(record.get("per_call_us"))
+            if record.get("scenario") == "tool_call"
+            and record.get("extension") == "hello"
+            else None
+        ),
+        lambda record: (
+            positive_number(record.get("per_call_us"))
+            if record.get("scenario") == "ext_tool_call/hello"
+            and record.get("extension") == "hello"
+            else None
+        ),
+        "per_call_dispatch_micro",
+    )
+)
+matched_full_e2e_abs_ms, full_e2e_node_ratio, full_e2e_bun_ratio = (
+    matched_cross_runtime_ratios(
+        workload_records,
+        lambda record: (
+            positive_number(record.get("elapsed_ms"))
+            if record.get("comparison_scenario") == "full_e2e_long_session"
+            and record.get("session_turns") == 2000
+            and record.get("extension_loads_per_iteration") == 2
+            and record.get("tool_calls_per_iteration") == 10
+            and record.get("event_hooks_per_iteration") == 1
+            and record.get("tool_executions") == 20000
+            and record.get("event_executions") == 2000
+            else None
+        ),
+        lambda record: (
+            positive_number(record.get("elapsed_ms"))
+            if record.get("scenario") == "full_e2e_long_session"
+            and record.get("extension") == "hello+pirate"
+            else None
+        ),
+        "full_e2e_long_session",
+    )
+)
+if matched_cold_abs_ms is not None:
+    cold_abs_ms = matched_cold_abs_ms
+if matched_per_call_abs_us is not None:
+    per_call_abs_us = matched_per_call_abs_us
+if matched_full_e2e_abs_ms is not None:
+    full_e2e_abs_ms = matched_full_e2e_abs_ms
+
+matched_comparison_basis = "matched_legacy_pi_mono_extension_loader"
+full_e2e_node_ratio_basis = (
+    matched_comparison_basis if full_e2e_node_ratio is not None else "missing"
+)
 
 
 def ratio_basis(value, measured_basis: str) -> str:
@@ -3568,12 +4241,11 @@ def build_layer(
     suite_statuses = {name: suite_status(name, suite_result_by_name) for name in expected_suites}
     absolute_present = absolute_value is not None
     relative_present = node_ratio is not None and bun_ratio is not None
-    suites_with_data = [name for name, status in suite_statuses.items() if status != "missing"]
-    all_ran_suites_passed = all(
-        status == "pass" for status in suite_statuses.values() if status != "missing"
+    all_required_suites_passed = all(
+        status == "pass" for status in suite_statuses.values()
     )
 
-    if absolute_present and relative_present and all_ran_suites_passed and suites_with_data:
+    if absolute_present and relative_present and all_required_suites_passed:
         confidence = "high"
         evidence_state = "measured"
     elif absolute_present and (node_ratio is not None or bun_ratio is not None):
@@ -3625,14 +4297,15 @@ layers = [
         cold_abs_ms,
         "ms",
         cold_node_ratio,
-        ratio_basis(cold_node_ratio, "node_legacy_extension_workloads"),
+        ratio_basis(cold_node_ratio, matched_comparison_basis),
         cold_bun_ratio,
-        ratio_basis(cold_bun_ratio, "bun_legacy_extension_workloads"),
+        ratio_basis(cold_bun_ratio, matched_comparison_basis),
         [
             ext_bench_path,
             ext_bench_report_path,
             scenario_runner_path,
             extension_bench_path,
+            legacy_path,
         ],
         "Cold-load wins are attribution-only and must not be promoted as global UX claims.",
     ),
@@ -3645,10 +4318,10 @@ layers = [
         per_call_abs_us,
         "us",
         per_call_node_ratio,
-        ratio_basis(per_call_node_ratio, "node_legacy_extension_workloads"),
+        ratio_basis(per_call_node_ratio, matched_comparison_basis),
         per_call_bun_ratio,
-        ratio_basis(per_call_bun_ratio, "bun_legacy_extension_workloads"),
-        [scenario_runner_path, extension_bench_path, workload_path],
+        ratio_basis(per_call_bun_ratio, matched_comparison_basis),
+        [scenario_runner_path, extension_bench_path, workload_path, legacy_path],
         "Per-call improvements are diagnostic and cannot substitute for full-session outcomes.",
     ),
     build_layer(
@@ -3662,8 +4335,8 @@ layers = [
         full_e2e_node_ratio,
         full_e2e_node_ratio_basis,
         full_e2e_bun_ratio,
-        ratio_basis(full_e2e_bun_ratio, "bun_legacy_extension_workloads"),
-        [workload_path, legacy_path, perf_comparison_path],
+        ratio_basis(full_e2e_bun_ratio, matched_comparison_basis),
+        [workload_path, legacy_path],
         "Full E2E evidence is the release-facing signal and must gate global speed claims.",
     ),
 ]
@@ -3695,9 +4368,22 @@ layer_coverage = {
         layer["absolute_metrics"]["value"] is not None
         and layer["relative_metrics"]["rust_vs_node_ratio"] is not None
         and layer["relative_metrics"]["rust_vs_bun_ratio"] is not None
+        and layer["evidence_state"] == "measured"
     )
     for layer in layers
 }
+portable_legacy_record_count = sum(
+    1
+    for record in legacy_records
+    if record.get("runtime_family") == "portable_extension_api"
+    and record.get("legacy_pi_mono_executed") is not True
+)
+true_legacy_record_count = sum(
+    1
+    for record in legacy_records
+    if record.get("runtime_family") == "legacy_pi_mono_extension_loader"
+    and record.get("legacy_pi_mono_executed") is True
+)
 
 invalidity_reasons = []
 for dataset in source_datasets:
@@ -3705,6 +4391,8 @@ for dataset in source_datasets:
         invalidity_reasons.append(f"missing_current_run_source:{dataset['path']}")
     if dataset["rejected_record_count"] > 0:
         invalidity_reasons.append(f"mixed_source_lineage:{dataset['path']}")
+if portable_legacy_record_count > 0:
+    invalidity_reasons.append("portable_extension_api_not_release_comparator")
 if not layer_coverage.get("full_e2e_long_session", False) and (
     layer_coverage.get("cold_load_init", False)
     or layer_coverage.get("per_call_dispatch_micro", False)
@@ -3747,6 +4435,22 @@ payload = {
             "cold_load_wins_do_not_imply_per_call_or_e2e": True,
             "per_call_wins_do_not_imply_full_e2e": True,
             "full_e2e_is_release_facing_primary_signal": True,
+        },
+        "cross_runtime_comparison": {
+            "contract_schema": "pi.perf.cross_runtime_comparison.v1",
+            "legacy_pi_mono_executed_required": True,
+            "exact_workload_and_host_contract_required": True,
+            "portable_shim_record_count": portable_legacy_record_count,
+            "true_legacy_pi_mono_record_count": true_legacy_record_count,
+            "matched_layer_contracts": {
+                "cold_load_init": cold_node_ratio is not None and cold_bun_ratio is not None,
+                "per_call_dispatch_micro": (
+                    per_call_node_ratio is not None and per_call_bun_ratio is not None
+                ),
+                "full_e2e_long_session": (
+                    full_e2e_node_ratio is not None and full_e2e_bun_ratio is not None
+                ),
+            },
         },
         "cherry_pick_guard": {
             "requires_all_layers_for_global_claim": True,
@@ -3883,6 +4587,7 @@ if OUTPUT_DIR="$OUTPUT_DIR" \
   python3 - <<'PY'
 import hashlib
 import json
+import math
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -4157,13 +4862,40 @@ def parse_partition(record, metadata, scenario_id):
     return partition
 
 
+required_stage_evidence = {
+    "evidence_class": "measured",
+    "confidence": "high",
+    "eligible_for_regression_gate": True,
+    "measurement_method": "wall_clock_observation",
+    "measurement_boundary": "production_session_stage_instrumentation",
+    "measurement_contract_version": "production_session_stage_instrumentation.v1",
+}
+stage_evidence_rejections = []
 stage_records = {}
+
+
+def parse_non_negative_finite_metric(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return None
+    return parsed
+
+
+def parse_positive_finite_metric(value):
+    parsed = parse_non_negative_finite_metric(value)
+    return parsed if parsed is not None and parsed > 0.0 else None
+
+
 for source_name, records in (
     ("scenario_runner", scenario_runner_records),
     ("pijs_workload", workload_records),
 ):
     for index, record in enumerate(records):
         if not isinstance(record, dict):
+            continue
+        if record.get("scenario") != "session_workload_matrix":
             continue
 
         metadata = record.get("scenario_metadata")
@@ -4191,29 +4923,44 @@ for source_name, records in (
         if partition not in required_partitions or session_messages not in required_sizes:
             continue
 
+        evidence_mismatches = {
+            field: {"expected": expected, "observed": record.get(field)}
+            for field, expected in required_stage_evidence.items()
+            if record.get(field) != expected
+        }
+        if evidence_mismatches:
+            stage_evidence_rejections.append(
+                {
+                    "source_name": source_name,
+                    "source_record_index": index,
+                    "partition": partition,
+                    "session_messages": session_messages,
+                    "mismatches": evidence_mismatches,
+                }
+            )
+            continue
+
         stage_attribution = record.get("stage_attribution")
         if not isinstance(stage_attribution, dict):
             stage_attribution = {}
 
-        open_ms = parse_float(record.get("open_ms"))
+        open_ms = parse_non_negative_finite_metric(record.get("open_ms"))
         if open_ms is None:
-            open_ms = parse_float(stage_attribution.get("open_ms"))
-        append_ms = parse_float(record.get("append_ms"))
+            open_ms = parse_non_negative_finite_metric(stage_attribution.get("open_ms"))
+        append_ms = parse_non_negative_finite_metric(record.get("append_ms"))
         if append_ms is None:
-            append_ms = parse_float(stage_attribution.get("append_ms"))
-        save_ms = parse_float(record.get("save_ms"))
+            append_ms = parse_non_negative_finite_metric(stage_attribution.get("append_ms"))
+        save_ms = parse_non_negative_finite_metric(record.get("save_ms"))
         if save_ms is None:
-            save_ms = parse_float(stage_attribution.get("save_ms"))
-        index_ms = parse_float(record.get("index_ms"))
+            save_ms = parse_non_negative_finite_metric(stage_attribution.get("save_ms"))
+        index_ms = parse_non_negative_finite_metric(record.get("index_ms"))
         if index_ms is None:
-            index_ms = parse_float(record.get("session_index_ms"))
+            index_ms = parse_non_negative_finite_metric(record.get("session_index_ms"))
         if index_ms is None:
-            index_ms = parse_float(stage_attribution.get("index_ms"))
-        wall_clock_ms = parse_float(record.get("total_ms"))
+            index_ms = parse_non_negative_finite_metric(stage_attribution.get("index_ms"))
+        wall_clock_ms = parse_positive_finite_metric(record.get("total_ms"))
         if wall_clock_ms is None:
-            wall_clock_ms = parse_float(record.get("elapsed_ms"))
-        if wall_clock_ms is None:
-            wall_clock_ms = parse_float(stage_attribution.get("total_stage_ms"))
+            wall_clock_ms = parse_positive_finite_metric(record.get("elapsed_ms"))
         source_swarm_metrics = record.get("swarm_metrics")
         if not isinstance(source_swarm_metrics, dict):
             source_swarm_metrics = None
@@ -4230,6 +4977,10 @@ for source_name, records in (
             "swarm_metrics": source_swarm_metrics,
             "source_record_index": index,
             "source_name": source_name,
+            **{
+                field: record.get(field)
+                for field in required_stage_evidence
+            },
         }
 
         key = (partition, session_messages)
@@ -4245,7 +4996,12 @@ for source_name, records in (
                 for metric in ("open_ms", "append_ms", "save_ms", "index_ms", "wall_clock_ms")
                 if candidate.get(metric) is not None
             )
-            if existing_score >= candidate_score:
+            existing_swarm_score = int(isinstance(existing.get("swarm_metrics"), dict))
+            candidate_swarm_score = int(isinstance(candidate.get("swarm_metrics"), dict))
+            if (existing_score, existing_swarm_score) >= (
+                candidate_score,
+                candidate_swarm_score,
+            ):
                 continue
 
         stage_records[key] = candidate
@@ -4317,8 +5073,8 @@ def normalize_metric_group(source: dict | None, keys: list[str]) -> tuple[dict, 
         return normalized, missing
 
     for key in keys:
-        value = parse_float(source.get(key))
-        if value is None or value < 0:
+        value = parse_non_negative_finite_metric(source.get(key))
+        if value is None:
             normalized[key] = None
             missing.append(key)
         else:
@@ -4364,14 +5120,18 @@ for partition in required_partitions:
         missing_stage_keys = [
             metric for metric in required_stage_keys if stage_attribution.get(metric) is None
         ]
-        if not missing_stage_keys:
-            cells_with_complete_stage_breakdown += 1
-
         total_stage_ms = sum(
             value for value in stage_attribution.values() if value is not None
         )
         if all(value is None for value in stage_attribution.values()):
             total_stage_ms = None
+        complete_stage_breakdown = (
+            not missing_stage_keys
+            and total_stage_ms is not None
+            and total_stage_ms > 0.0
+        )
+        if complete_stage_breakdown:
+            cells_with_complete_stage_breakdown += 1
 
         cell_wall_clock = source.get("wall_clock_ms")
         if cell_wall_clock is None:
@@ -4384,12 +5144,14 @@ for partition in required_partitions:
             missing_reasons.append(
                 "missing_stage_metrics:" + ",".join(sorted(missing_stage_keys))
             )
+        elif not complete_stage_breakdown:
+            missing_reasons.append("invalid_stage_total:non_positive")
         if cell_wall_clock is None:
             missing_reasons.append("missing_primary_wall_clock")
         if primary_rust_vs_node_ratio is None or primary_rust_vs_bun_ratio is None:
             missing_reasons.append("missing_primary_relative_ratios")
 
-        if source:
+        if source and complete_stage_breakdown:
             covered_cells += 1
 
         swarm_metrics, missing_swarm_keys = normalize_swarm_metrics(
@@ -4427,6 +5189,10 @@ for partition in required_partitions:
                 "lineage": {
                     "source_record_index": source.get("source_record_index"),
                     "source_record_stream": source.get("source_name"),
+                    **{
+                        field: source.get(field)
+                        for field in required_stage_evidence
+                    },
                     "source_artifacts": [
                         str(path)
                         for path in (
@@ -4449,7 +5215,8 @@ missing_cells = [
     }
     for cell in cells
     if any(
-        isinstance(reason, str) and reason.startswith("missing_stage_metrics:")
+        isinstance(reason, str)
+        and reason.startswith(("missing_stage_metrics:", "invalid_stage_total:"))
         for reason in cell.get("missing_reasons", [])
     )
 ]
@@ -5158,72 +5925,305 @@ for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
 
 fault_injection_candidates = []
 if fault_injection_root.exists():
-    fault_injection_candidates = sorted(
-        fault_injection_root.glob("*/integrity-summary.json")
-    )
+    fault_injection_candidates = sorted(fault_injection_root.glob("*/run-manifest.json"))
+fault_injection_manifest_path = None
 fault_injection_summary_path = None
 fault_injection_status = "missing"
 fault_injection_summary = {}
-matching_fault_injection_summaries = []
+fault_injection_manifest = {}
+matching_fault_injection_runs = []
 for candidate in fault_injection_candidates:
+    if candidate.is_symlink() or not candidate.is_file():
+        continue
     try:
-        candidate_summary = load_json(candidate)
-    except Exception:
+        candidate_manifest = load_json(candidate)
+    except (OSError, json.JSONDecodeError):
         continue
-    if not isinstance(candidate_summary, dict):
+    if not isinstance(candidate_manifest, dict):
         continue
-    if candidate_summary.get("schema") != "pi.e2e.persistence_fault_injection.summary.v1":
+    if (
+        candidate_manifest.get("schema")
+        != "pi.e2e.persistence_fault_injection.manifest.v1"
+        or candidate_manifest.get("terminal_state") != "complete"
+    ):
         continue
-    if candidate_summary.get("correlation_id") != correlation_id:
+    if candidate_manifest.get("correlation_id") != correlation_id:
         continue
-    if candidate_summary.get("run_id") != correlation_id:
+    if candidate_manifest.get("run_id") != correlation_id:
         continue
-    if candidate_summary.get("source_commit") != source_commit:
+    if candidate_manifest.get("source_commit") != source_commit:
         continue
-    if candidate_summary.get("source_dirty") is not source_dirty:
+    if candidate_manifest.get("source_dirty") is not source_dirty:
         continue
-    source_tree_digest = candidate_summary.get("source_tree_sha256")
+    source_tree_digest = candidate_manifest.get("source_tree_sha256")
     if not isinstance(source_tree_digest, str) or len(source_tree_digest) != 64:
         continue
     if any(character not in "0123456789abcdef" for character in source_tree_digest):
         continue
-    if candidate_summary.get("source_commit_final") != source_commit:
+    if candidate_manifest.get("source_commit_final") != source_commit:
         continue
-    if candidate_summary.get("source_dirty_final") is not source_dirty:
+    if candidate_manifest.get("source_dirty_final") is not source_dirty:
         continue
-    if candidate_summary.get("source_tree_sha256_final") != source_tree_digest:
+    if candidate_manifest.get("source_tree_sha256_final") != source_tree_digest:
         continue
-    if candidate_summary.get("source_tree_stable") is not True:
+    overall_passed = candidate_manifest.get("overall_passed")
+    if type(overall_passed) is not bool:
         continue
-    candidate_timestamp = parse_record_timestamp(candidate_summary)
+    exit_codes = candidate_manifest.get("exit_codes")
+    if not isinstance(exit_codes, dict):
+        continue
+    if any(
+        type(exit_codes.get(name)) is not int
+        for name in ("jsonl", "sqlite", "summary_validation", "overall")
+    ):
+        continue
+    required_exit_codes = {"jsonl", "sqlite", "summary_validation", "overall"}
+    if set(exit_codes) != required_exit_codes:
+        continue
+    if any(exit_codes[name] < 0 or exit_codes[name] > 255 for name in ("jsonl", "sqlite")):
+        continue
+    if any(exit_codes[name] not in (0, 1) for name in ("summary_validation", "overall")):
+        continue
+    attempt_id = candidate_manifest.get("attempt_id")
+    if not isinstance(attempt_id, str) or not attempt_id.strip():
+        continue
+    expected_overall_exit = (
+        0
+        if all(
+            exit_codes[name] == 0
+            for name in ("jsonl", "sqlite", "summary_validation")
+        )
+        else 1
+    )
+    if (
+        exit_codes["overall"] != expected_overall_exit
+        or overall_passed != (exit_codes["overall"] == 0)
+    ):
+        continue
+    candidate_timestamp = parse_record_timestamp(candidate_manifest)
     if candidate_timestamp is None:
         continue
     if candidate_timestamp < run_started_at - source_clock_skew:
         continue
     if candidate_timestamp > datetime.now(timezone.utc) + source_clock_skew:
         continue
-    matching_fault_injection_summaries.append(
-        (candidate_timestamp, str(candidate), candidate, candidate_summary)
+
+    summary_attestation = candidate_manifest.get("integrity_summary")
+    if not isinstance(summary_attestation, dict):
+        continue
+    expected_summary_path = candidate.parent / "integrity-summary.json"
+    if summary_attestation.get("path") != str(expected_summary_path):
+        continue
+    if expected_summary_path.is_symlink() or not expected_summary_path.is_file():
+        continue
+    try:
+        summary_metadata_before = expected_summary_path.stat()
+        summary_bytes = expected_summary_path.read_bytes()
+        summary_metadata_after = expected_summary_path.stat()
+    except OSError:
+        continue
+    if (
+        summary_metadata_before.st_dev,
+        summary_metadata_before.st_ino,
+        summary_metadata_before.st_size,
+        summary_metadata_before.st_mtime_ns,
+    ) != (
+        summary_metadata_after.st_dev,
+        summary_metadata_after.st_ino,
+        summary_metadata_after.st_size,
+        summary_metadata_after.st_mtime_ns,
+    ):
+        continue
+    if summary_attestation.get("size_bytes") != len(summary_bytes):
+        continue
+    if summary_attestation.get("sha256") != hashlib.sha256(summary_bytes).hexdigest():
+        continue
+    try:
+        candidate_summary = json.loads(summary_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        continue
+    if not isinstance(candidate_summary, dict):
+        continue
+    if (
+        candidate_summary.get("schema")
+        != "pi.e2e.persistence_fault_injection.summary.v1"
+        or candidate_summary.get("terminal_state") != "summary_validated"
+    ):
+        continue
+    if any(
+        candidate_summary.get(field) != candidate_manifest.get(field)
+        for field in (
+            "run_id",
+            "attempt_id",
+            "correlation_id",
+            "source_commit",
+            "source_dirty",
+            "source_tree_sha256",
+            "source_commit_final",
+            "source_dirty_final",
+            "source_tree_sha256_final",
+        )
+    ):
+        continue
+    if (
+        candidate_summary.get("source_dirty") is not source_dirty
+        or candidate_summary.get("source_dirty_final") is not source_dirty
+    ):
+        continue
+    if candidate_summary.get("source_tree_stable") is not True:
+        continue
+    validation_passed = candidate_summary.get("validation_passed")
+    if type(validation_passed) is not bool or validation_passed != overall_passed:
+        continue
+    summary_timestamp = parse_record_timestamp(candidate_summary)
+    if (
+        summary_timestamp is None
+        or summary_timestamp < run_started_at - source_clock_skew
+        or summary_timestamp > datetime.now(timezone.utc) + source_clock_skew
+    ):
+        continue
+    cases = candidate_summary.get("cases")
+    if not isinstance(cases, list) or len(cases) != 2:
+        continue
+    cases_by_id = {
+        case.get("case_id"): case
+        for case in cases
+        if isinstance(case, dict)
+        and case.get("case_id") in {"jsonl", "sqlite"}
+        and type(case.get("passed")) is bool
+    }
+    if set(cases_by_id) != {"jsonl", "sqlite"}:
+        continue
+    if validation_passed != (
+        all(case["passed"] for case in cases_by_id.values())
+        and candidate_summary.get("source_tree_stable") is True
+    ):
+        continue
+    if exit_codes["summary_validation"] != (0 if validation_passed else 1):
+        continue
+    matching_fault_injection_runs.append(
+        (
+            candidate_timestamp,
+            str(candidate),
+            candidate,
+            candidate_manifest,
+            expected_summary_path,
+            candidate_summary,
+        )
     )
 
-if matching_fault_injection_summaries:
+if matching_fault_injection_runs:
     (
         _,
         _,
+        fault_injection_manifest_path,
+        fault_injection_manifest,
         fault_injection_summary_path,
         fault_injection_summary,
-    ) = max(matching_fault_injection_summaries)
+    ) = max(matching_fault_injection_runs)
     fault_injection_status = (
-        "pass" if fault_injection_summary.get("overall_passed") is True else "fail"
+        "pass" if fault_injection_manifest.get("overall_passed") is True else "fail"
     )
 
-memory_status = suite_status("perf_budgets", suite_result_by_name)
-if memory_status == "pass":
-    memory_status = "pass"
-elif memory_status == "fail":
-    memory_status = "fail"
-else:
-    memory_status = "missing"
+def sha256_file(path: Path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def evaluate_idle_rss_control():
+    control_path = target_dir / "perf" / "release_evidence" / "idle_memory_rss.json"
+    evidence = {
+        "path": str(control_path),
+        "threshold_bytes": 50 * 1024 * 1024,
+        "status": "missing",
+        "failure_reasons": [],
+    }
+    if control_path.is_symlink() or not control_path.is_file():
+        evidence["failure_reasons"].append("missing_regular_control")
+        return "missing", evidence
+    try:
+        control = load_json(control_path)
+    except (OSError, json.JSONDecodeError) as error:
+        evidence["failure_reasons"].append(f"invalid_control_json:{error}")
+        return "missing", evidence
+    for field, expected in (
+        ("schema", "pi.perf.idle_rss_measurement.v1"),
+        ("run_id", correlation_id),
+        ("correlation_id", correlation_id),
+        ("source_commit", source_commit),
+        ("source_dirty", False),
+        ("process_name", "pi"),
+        ("idle_state", "startup_before_user_input"),
+        ("cargo_profile", "release"),
+        ("build_command", "cargo build --bin pi --release"),
+    ):
+        if control.get(field) != expected:
+            evidence["failure_reasons"].append(f"{field}_mismatch")
+    samples = control.get("samples")
+    sample_count = control.get("sample_count")
+    rss_bytes = control.get("rss_bytes")
+    if (
+        not isinstance(samples, list)
+        or type(sample_count) is not int
+        or sample_count < 5
+        or len(samples) != sample_count
+    ):
+        evidence["failure_reasons"].append("invalid_samples")
+    else:
+        sample_rss = [
+            sample.get("rss_bytes")
+            for sample in samples
+            if isinstance(sample, dict)
+            and type(sample.get("rss_bytes")) is int
+            and sample.get("rss_bytes") > 0
+            and sample.get("process_name") == "pi"
+        ]
+        sample_pids = [
+            sample.get("pid")
+            for sample in samples
+            if isinstance(sample, dict) and type(sample.get("pid")) is int
+        ]
+        if (
+            len(sample_rss) != sample_count
+            or len(sample_pids) != sample_count
+            or len(set(sample_pids)) != sample_count
+            or any(pid <= 0 for pid in sample_pids)
+            or rss_bytes != max(sample_rss)
+            or control.get("rss_spread_bytes") != max(sample_rss) - min(sample_rss)
+        ):
+            evidence["failure_reasons"].append("sample_aggregate_mismatch")
+    binary_path_raw = control.get("binary_path")
+    binary_sha256 = control.get("binary_sha256")
+    expected_binary_path = target_dir / "release" / "pi"
+    if not isinstance(binary_path_raw, str) or not binary_path_raw:
+        evidence["failure_reasons"].append("missing_binary_path")
+    else:
+        binary_path = Path(binary_path_raw)
+        try:
+            expected_binary = expected_binary_path.resolve(strict=True)
+            observed_binary = binary_path.resolve(strict=True)
+        except OSError:
+            evidence["failure_reasons"].append("missing_release_binary")
+        else:
+            if binary_path.is_symlink() or not binary_path.is_file() or observed_binary != expected_binary:
+                evidence["failure_reasons"].append("release_binary_path_mismatch")
+            elif not isinstance(binary_sha256, str) or sha256_file(binary_path) != binary_sha256:
+                evidence["failure_reasons"].append("release_binary_digest_mismatch")
+    evidence["rss_bytes"] = rss_bytes
+    evidence["control_sha256"] = sha256_file(control_path)
+    if evidence["failure_reasons"]:
+        return "missing", evidence
+    if type(rss_bytes) is not int or rss_bytes <= 0:
+        evidence["failure_reasons"].append("invalid_rss_bytes")
+        return "missing", evidence
+    evidence["status"] = "pass" if rss_bytes <= evidence["threshold_bytes"] else "fail"
+    return evidence["status"], evidence
+
+
+memory_status, memory_evidence = evaluate_idle_rss_control()
 
 correctness_status = suite_status("perf_regression", suite_result_by_name)
 if correctness_status == "pass":
@@ -5261,6 +6261,9 @@ phase5_ready = (
     source_lineage_valid
     and
     primary_status == "pass"
+    and memory_status == "pass"
+    and correctness_status == "pass"
+    and security_status == "pass"
     and cells_with_complete_stage_breakdown == required_cell_count
     and len(missing_cells) == 0
     and cells_with_complete_swarm_metrics == required_cell_count
@@ -5284,6 +6287,8 @@ payload = {
     "matrix_cells": cells,
     "stage_summary": {
         "required_stage_keys": required_stage_keys,
+        "required_evidence_contract": required_stage_evidence,
+        "evidence_rejections": stage_evidence_rejections,
         "operation_stage_coverage": operation_stage_coverage,
         "cells_with_complete_stage_breakdown": cells_with_complete_stage_breakdown,
         "cells_missing_stage_breakdown": required_cell_count
@@ -5320,7 +6325,13 @@ payload = {
     "evidence_links": {
         "phase1_unit_and_fault_injection": {
             "suite_logs": suite_logs,
+            "idle_memory_rss": memory_evidence,
             "fault_injection_script": str(fault_injection_script),
+            "fault_injection_manifest_path": (
+                str(fault_injection_manifest_path)
+                if fault_injection_manifest_path is not None
+                else None
+            ),
             "fault_injection_summary_path": (
                 str(fault_injection_summary_path)
                 if fault_injection_summary_path is not None
@@ -5367,9 +6378,13 @@ payload = {
             "missing_primary_wall_clock",
             "missing_primary_relative_ratios",
             "missing_swarm_metrics",
+            "non_measured_matrix_evidence",
             "memory_regression",
+            "memory_regression_unverified",
             "correctness_regression",
+            "correctness_regression_unverified",
             "security_regression",
+            "security_regression_unverified",
         ],
     },
     "lineage": {
@@ -5462,7 +6477,8 @@ fi
 POST_GENERATION_CONTRACT_PATH="$OUTPUT_DIR/results/post_generation_evidence_contract.json"
 post_generation_exit=0
 if [[ "$RUN_EXCLUSIVE_POST_GENERATION_GATE" == true ]]; then
-  if OUTPUT_DIR="$OUTPUT_DIR" \
+  if PROJECT_ROOT="$PROJECT_ROOT" \
+  OUTPUT_DIR="$OUTPUT_DIR" \
   CORRELATION_ID="$CORRELATION_ID" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   GIT_DIRTY="$GIT_DIRTY" \
@@ -5472,16 +6488,19 @@ import hashlib
 import json
 import math
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 output_dir = Path(os.environ["OUTPUT_DIR"])
+project_root = Path(os.environ["PROJECT_ROOT"])
 expected_correlation_id = os.environ["CORRELATION_ID"]
 expected_source_commit = os.environ["GIT_COMMIT_FULL"]
 expected_source_dirty = os.environ["GIT_DIRTY"] == "true"
 report_path = Path(os.environ["POST_GENERATION_CONTRACT_PATH"])
 phase1_path = output_dir / "results" / "phase1_matrix_validation.json"
 stratification_path = output_dir / "results" / "extension_benchmark_stratification.json"
+perf_sli_path = project_root / "docs" / "perf_sli_matrix.json"
 failures = []
 
 
@@ -5495,6 +6514,9 @@ def load_artifact(path: Path, expected_schema: str):
         failures.append(
             {"path": str(path), "reason": "invalid_json", "detail": str(error)}
         )
+        return {}
+    if not isinstance(payload, dict):
+        failures.append({"path": str(path), "reason": "non_object_artifact"})
         return {}
     if payload.get("schema") != expected_schema:
         failures.append(
@@ -5587,12 +6609,146 @@ def validate_source_datasets(path: Path, payload):
 
 phase1 = load_artifact(phase1_path, "pi.perf.phase1_matrix_validation.v1")
 validate_source_datasets(phase1_path, phase1)
-if phase1.get("consumption_contract", {}).get("artifact_ready_for_phase5") is not True:
+consumption_contract = phase1.get("consumption_contract")
+if not isinstance(consumption_contract, dict):
+    consumption_contract = {}
+if consumption_contract.get("artifact_ready_for_phase5") is not True:
     failures.append({"path": str(phase1_path), "reason": "phase1_not_ready"})
+regression_guards = phase1.get("regression_guards", {})
+for guard_name in ("memory", "correctness", "security"):
+    guard_status = (
+        regression_guards.get(guard_name)
+        if isinstance(regression_guards, dict)
+        else None
+    )
+    if guard_status != "pass":
+        failures.append(
+            {
+                "path": str(phase1_path),
+                "reason": f"{guard_name}_regression_unverified",
+                "observed": guard_status,
+            }
+        )
+stage_summary = phase1.get("stage_summary")
+if not isinstance(stage_summary, dict):
+    stage_summary = {}
+required_phase1_stage_evidence = {
+    "evidence_class": "measured",
+    "confidence": "high",
+    "eligible_for_regression_gate": True,
+    "measurement_method": "wall_clock_observation",
+    "measurement_boundary": "production_session_stage_instrumentation",
+    "measurement_contract_version": "production_session_stage_instrumentation.v1",
+}
+if stage_summary.get("required_evidence_contract") != required_phase1_stage_evidence:
+    failures.append(
+        {
+            "path": str(phase1_path),
+            "reason": "invalid_required_stage_evidence_contract",
+        }
+    )
 matrix_cells = phase1.get("matrix_cells", [])
-required_cell_count = phase1.get("matrix_requirements", {}).get("required_cell_count")
-if not isinstance(required_cell_count, int) or required_cell_count <= 0:
+matrix_requirements = phase1.get("matrix_requirements", {})
+if not isinstance(matrix_requirements, dict):
+    matrix_requirements = {}
+required_cell_count = matrix_requirements.get("required_cell_count")
+required_partitions = matrix_requirements.get("required_partition_tags")
+required_sizes = matrix_requirements.get("required_session_message_sizes")
+
+try:
+    perf_sli = json.loads(perf_sli_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    failures.append(
+        {
+            "path": str(perf_sli_path),
+            "reason": "invalid_perf_sli_contract",
+            "detail": str(error),
+        }
+    )
+    perf_sli = {}
+if not isinstance(perf_sli, dict):
+    failures.append({"path": str(perf_sli_path), "reason": "non_object_perf_sli_contract"})
+    perf_sli = {}
+
+reporting_contract = perf_sli.get("reporting_contract")
+if not isinstance(reporting_contract, dict):
+    reporting_contract = {}
+benchmark_partitions = perf_sli.get("benchmark_partitions")
+if not isinstance(benchmark_partitions, dict):
+    benchmark_partitions = {}
+expected_partitions = reporting_contract.get("required_partition_tags")
+realistic_ids = benchmark_partitions.get("realistic_long_session")
+
+
+def parse_contract_session_size(value):
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"(\d+)([km]?)$", value.strip().lower())
+    if match is None:
+        return None
+    multiplier = {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2)]
+    return int(match.group(1)) * multiplier
+
+
+expected_sizes = (
+    [parse_contract_session_size(value) for value in realistic_ids]
+    if isinstance(realistic_ids, list)
+    else None
+)
+canonical_dimensions_valid = (
+    isinstance(expected_partitions, list)
+    and bool(expected_partitions)
+    and all(isinstance(value, str) and value.strip() for value in expected_partitions)
+    and len(set(expected_partitions)) == len(expected_partitions)
+    and isinstance(expected_sizes, list)
+    and bool(expected_sizes)
+    and all(type(value) is int and value > 0 for value in expected_sizes)
+    and len(set(expected_sizes)) == len(expected_sizes)
+)
+if not canonical_dimensions_valid:
+    failures.append(
+        {"path": str(perf_sli_path), "reason": "invalid_canonical_matrix_dimensions"}
+    )
+    expected_partitions = []
+    expected_sizes = []
+declared_dimensions_valid = (
+    isinstance(required_partitions, list)
+    and bool(required_partitions)
+    and all(isinstance(partition, str) and partition.strip() for partition in required_partitions)
+    and len(set(required_partitions)) == len(required_partitions)
+    and isinstance(required_sizes, list)
+    and bool(required_sizes)
+    and all(type(size) is int and size > 0 for size in required_sizes)
+    and len(set(required_sizes)) == len(required_sizes)
+)
+expected_cell_count = (
+    len(required_partitions) * len(required_sizes)
+    if declared_dimensions_valid
+    else None
+)
+canonical_cell_count = len(expected_partitions) * len(expected_sizes)
+if required_partitions != expected_partitions or required_sizes != expected_sizes:
+    failures.append(
+        {
+            "path": str(phase1_path),
+            "reason": "matrix_dimensions_differ_from_perf_sli_contract",
+            "declared_partitions": required_partitions,
+            "expected_partitions": expected_partitions,
+            "declared_sizes": required_sizes,
+            "expected_sizes": expected_sizes,
+        }
+    )
+if type(required_cell_count) is not int or required_cell_count <= 0:
     failures.append({"path": str(phase1_path), "reason": "invalid_required_cell_count"})
+elif required_cell_count != expected_cell_count or required_cell_count != canonical_cell_count:
+    failures.append(
+        {
+            "path": str(phase1_path),
+            "reason": "incomplete_matrix_cartesian_product",
+            "expected": canonical_cell_count,
+            "observed": required_cell_count,
+        }
+    )
 elif not isinstance(matrix_cells, list) or len(matrix_cells) != required_cell_count:
     failures.append(
         {
@@ -5604,20 +6760,98 @@ elif not isinstance(matrix_cells, list) or len(matrix_cells) != required_cell_co
     )
 if isinstance(matrix_cells, list):
     required_stages = ("open_ms", "append_ms", "save_ms", "index_ms")
+    expected_matrix_keys = {
+        (partition, size)
+        for partition in expected_partitions
+        for size in expected_sizes
+    }
+    observed_matrix_keys = set()
     for index, cell in enumerate(matrix_cells):
-        attribution = cell.get("stage_attribution", {}) if isinstance(cell, dict) else {}
+        if not isinstance(cell, dict):
+            failures.append(
+                {
+                    "path": str(phase1_path),
+                    "reason": "non_object_matrix_cell",
+                    "cell_index": index,
+                }
+            )
+            continue
+        cell_partition = cell.get("workload_partition")
+        cell_size = cell.get("session_messages")
+        cell_identity_valid = (
+            isinstance(cell_partition, str)
+            and bool(cell_partition)
+            and type(cell_size) is int
+            and cell_size > 0
+        )
+        if not cell_identity_valid:
+            failures.append(
+                {
+                    "path": str(phase1_path),
+                    "reason": "invalid_matrix_cell_identity",
+                    "cell_index": index,
+                    "workload_partition": cell_partition,
+                    "session_messages": cell_size,
+                }
+            )
+        else:
+            cell_key = (cell_partition, cell_size)
+            if cell_key in observed_matrix_keys:
+                failures.append(
+                    {
+                        "path": str(phase1_path),
+                        "reason": "duplicate_matrix_cell",
+                        "cell_index": index,
+                        "workload_partition": cell_partition,
+                        "session_messages": cell_size,
+                    }
+                )
+            observed_matrix_keys.add(cell_key)
+        attribution = cell.get("stage_attribution")
+        if not isinstance(attribution, dict):
+            attribution = {}
+        lineage = cell.get("lineage")
+        if not isinstance(lineage, dict):
+            lineage = {}
         invalid_stages = [
             key
             for key in required_stages
-            if not isinstance(attribution.get(key), (int, float))
+            if isinstance(attribution.get(key), bool)
+            or not isinstance(attribution.get(key), (int, float))
             or not math.isfinite(float(attribution[key]))
             or float(attribution[key]) < 0.0
         ]
+        reported_stage_total = attribution.get("total_stage_ms")
+        observed_stage_total = (
+            sum(float(attribution[key]) for key in required_stages)
+            if not invalid_stages
+            else None
+        )
+        stage_total_valid = (
+            not isinstance(reported_stage_total, bool)
+            and isinstance(reported_stage_total, (int, float))
+            and math.isfinite(float(reported_stage_total))
+            and float(reported_stage_total) > 0.0
+            and observed_stage_total is not None
+            and math.isclose(
+                float(reported_stage_total),
+                observed_stage_total,
+                rel_tol=1e-9,
+                abs_tol=1e-9,
+            )
+        )
+        invalid_evidence = [
+            field
+            for field, expected in required_phase1_stage_evidence.items()
+            if not isinstance(lineage, dict) or lineage.get(field) != expected
+        ]
         if (
-            not isinstance(cell, dict)
+            not cell_identity_valid
             or cell.get("status") != "pass"
-            or cell.get("missing_reasons") not in ([], None)
+            or cell.get("missing_reasons") != []
             or invalid_stages
+            or not stage_total_valid
+            or invalid_evidence
         ):
             failures.append(
                 {
@@ -5625,31 +6859,243 @@ if isinstance(matrix_cells, list):
                     "reason": "invalid_matrix_cell",
                     "cell_index": index,
                     "invalid_stages": invalid_stages,
+                    "reported_stage_total_ms": reported_stage_total,
+                    "observed_stage_total_ms": observed_stage_total,
+                    "stage_total_valid": stage_total_valid,
+                    "invalid_evidence": invalid_evidence,
                 }
             )
+    if observed_matrix_keys != expected_matrix_keys:
+        failures.append(
+            {
+                "path": str(phase1_path),
+                "reason": "matrix_cell_identity_set_mismatch",
+                "missing": [
+                    {"workload_partition": partition, "session_messages": size}
+                    for partition, size in sorted(expected_matrix_keys - observed_matrix_keys)
+                ],
+                "unexpected": [
+                    {"workload_partition": partition, "session_messages": size}
+                    for partition, size in sorted(observed_matrix_keys - expected_matrix_keys)
+                ],
+            }
+        )
 
 stratification = load_artifact(
     stratification_path, "pi.perf.extension_benchmark_stratification.v1"
 )
 validate_source_datasets(stratification_path, stratification)
-required_layers = {"cold_load_init", "per_call_dispatch_micro", "full_e2e_long_session"}
+required_layer_ids = (
+    "cold_load_init",
+    "per_call_dispatch_micro",
+    "full_e2e_long_session",
+)
+required_layers = set(required_layer_ids)
 layers = stratification.get("layers", [])
-observed_layers = {
-    layer.get("layer_id")
-    for layer in layers
-    if isinstance(layer, dict) and layer.get("evidence_state") == "measured"
-}
-if observed_layers != required_layers:
+seen_layers = set()
+measured_layers = set()
+observed_layer_coverage = {layer_id: False for layer_id in required_layer_ids}
+observed_matched_contracts = {layer_id: False for layer_id in required_layer_ids}
+matched_comparison_basis = "matched_legacy_pi_mono_extension_loader"
+
+
+def positive_finite_number(value):
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) > 0.0
+    )
+
+
+if not isinstance(layers, list) or len(layers) != len(required_layer_ids):
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "invalid_layer_count",
+            "expected": len(required_layer_ids),
+            "observed": len(layers) if isinstance(layers, list) else None,
+        }
+    )
+    layers = layers if isinstance(layers, list) else []
+
+for index, layer in enumerate(layers):
+    if not isinstance(layer, dict):
+        failures.append(
+            {
+                "path": str(stratification_path),
+                "reason": "invalid_layer_record",
+                "layer_index": index,
+            }
+        )
+        continue
+    layer_id = layer.get("layer_id")
+    if layer_id not in required_layers or layer_id in seen_layers:
+        failures.append(
+            {
+                "path": str(stratification_path),
+                "reason": "unexpected_or_duplicate_layer",
+                "layer_index": index,
+                "layer_id": layer_id,
+            }
+        )
+        continue
+    seen_layers.add(layer_id)
+    absolute = layer.get("absolute_metrics", {})
+    relative = layer.get("relative_metrics", {})
+    absolute_valid = isinstance(absolute, dict) and positive_finite_number(
+        absolute.get("value")
+    )
+    node_ratio_valid = isinstance(relative, dict) and positive_finite_number(
+        relative.get("rust_vs_node_ratio")
+    )
+    bun_ratio_valid = isinstance(relative, dict) and positive_finite_number(
+        relative.get("rust_vs_bun_ratio")
+    )
+    ratio_pair_valid = node_ratio_valid and bun_ratio_valid
+    ratio_bases_valid = (
+        isinstance(relative, dict)
+        and relative.get("rust_vs_node_ratio_basis") == matched_comparison_basis
+        and relative.get("rust_vs_bun_ratio_basis") == matched_comparison_basis
+    )
+    matched_contract = ratio_pair_valid and ratio_bases_valid
+    observed_matched_contracts[layer_id] = matched_contract
+    evidence_measured = (
+        layer.get("evidence_state") == "measured"
+        and layer.get("confidence") == "high"
+    )
+    observed_layer_coverage[layer_id] = (
+        absolute_valid and matched_contract and evidence_measured
+    )
+    if evidence_measured:
+        measured_layers.add(layer_id)
+    if not absolute_valid or not matched_contract:
+        failures.append(
+            {
+                "path": str(stratification_path),
+                "reason": "invalid_layer_comparison_contract",
+                "layer_id": layer_id,
+                "absolute_metric_valid": absolute_valid,
+                "node_ratio_valid": node_ratio_valid,
+                "bun_ratio_valid": bun_ratio_valid,
+                "ratio_bases_valid": ratio_bases_valid,
+            }
+        )
+
+if measured_layers != required_layers:
     failures.append(
         {
             "path": str(stratification_path),
             "reason": "required_layers_not_measured",
             "expected": sorted(required_layers),
-            "observed": sorted(layer for layer in observed_layers if isinstance(layer, str)),
+            "observed": sorted(layer for layer in measured_layers if isinstance(layer, str)),
         }
     )
-claim_guard = stratification.get("claim_integrity", {}).get("cherry_pick_guard", {})
-if claim_guard.get("global_claim_valid") is not True:
+
+claim_integrity = stratification.get("claim_integrity", {})
+if not isinstance(claim_integrity, dict):
+    claim_integrity = {}
+cross_runtime = claim_integrity.get("cross_runtime_comparison", {})
+if not isinstance(cross_runtime, dict):
+    cross_runtime = {}
+portable_record_count = cross_runtime.get("portable_shim_record_count")
+true_legacy_record_count = cross_runtime.get("true_legacy_pi_mono_record_count")
+matched_layer_contracts = cross_runtime.get("matched_layer_contracts")
+cross_runtime_contract_valid = (
+    cross_runtime.get("contract_schema") == "pi.perf.cross_runtime_comparison.v1"
+    and cross_runtime.get("legacy_pi_mono_executed_required") is True
+    and cross_runtime.get("exact_workload_and_host_contract_required") is True
+    and type(portable_record_count) is int
+    and portable_record_count == 0
+    and type(true_legacy_record_count) is int
+    and true_legacy_record_count == 10
+    and isinstance(matched_layer_contracts, dict)
+    and set(matched_layer_contracts) == required_layers
+    and all(type(matched_layer_contracts.get(layer_id)) is bool for layer_id in required_layer_ids)
+    and matched_layer_contracts == observed_matched_contracts
+)
+if not cross_runtime_contract_valid:
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "invalid_cross_runtime_comparison_contract",
+            "portable_shim_record_count": portable_record_count,
+            "true_legacy_pi_mono_record_count": true_legacy_record_count,
+            "declared_matched_layer_contracts": matched_layer_contracts,
+            "observed_matched_layer_contracts": observed_matched_contracts,
+        }
+    )
+
+claim_guard = claim_integrity.get("cherry_pick_guard", {})
+if not isinstance(claim_guard, dict):
+    claim_guard = {}
+declared_layer_coverage = claim_guard.get("layer_coverage")
+if (
+    claim_guard.get("requires_all_layers_for_global_claim") is not True
+    or not isinstance(declared_layer_coverage, dict)
+    or set(declared_layer_coverage) != required_layers
+    or any(type(declared_layer_coverage.get(layer_id)) is not bool for layer_id in required_layer_ids)
+    or declared_layer_coverage != observed_layer_coverage
+):
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "invalid_layer_coverage_claim",
+            "declared": declared_layer_coverage,
+            "observed": observed_layer_coverage,
+        }
+    )
+
+invalidity_reasons = claim_guard.get("invalidity_reasons")
+invalidity_reasons_valid = isinstance(invalidity_reasons, list) and all(
+    isinstance(reason, str) for reason in invalidity_reasons
+)
+required_partition_tags = claim_integrity.get("required_partition_tags")
+required_partition_tags_valid = (
+    isinstance(required_partition_tags, list)
+    and bool(required_partition_tags)
+    and all(isinstance(tag, str) and tag.strip() for tag in required_partition_tags)
+    and len(set(required_partition_tags)) == len(required_partition_tags)
+)
+partition_coverage = claim_integrity.get("partition_coverage")
+partition_coverage_valid = (
+    required_partition_tags_valid
+    and isinstance(partition_coverage, dict)
+    and set(partition_coverage) == set(required_partition_tags)
+    and all(type(partition_coverage.get(tag)) is bool for tag in required_partition_tags)
+)
+all_partitions_covered = partition_coverage_valid and all(
+    partition_coverage[tag] is True for tag in required_partition_tags
+)
+expected_global_claim_valid = (
+    measured_layers == required_layers
+    and all(observed_layer_coverage.values())
+    and all(observed_matched_contracts.values())
+    and cross_runtime_contract_valid
+    and all_partitions_covered
+    and invalidity_reasons_valid
+    and not invalidity_reasons
+)
+if not invalidity_reasons_valid or not partition_coverage_valid:
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "invalid_global_claim_inputs",
+            "invalidity_reasons": invalidity_reasons,
+            "required_partition_tags": required_partition_tags,
+            "partition_coverage": partition_coverage,
+        }
+    )
+if claim_guard.get("global_claim_valid") is not expected_global_claim_valid:
+    failures.append(
+        {
+            "path": str(stratification_path),
+            "reason": "global_claim_validity_mismatch",
+            "declared": claim_guard.get("global_claim_valid"),
+            "expected": expected_global_claim_valid,
+        }
+    )
+if expected_global_claim_valid is not True:
     failures.append(
         {"path": str(stratification_path), "reason": "global_claim_not_valid"}
     )
