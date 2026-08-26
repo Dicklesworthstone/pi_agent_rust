@@ -341,6 +341,134 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+fn normalized_criterion_output_subdir(raw: &str) -> Result<PathBuf> {
+    let relative = PathBuf::from(raw);
+    let components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value
+                .to_str()
+                .ok_or_else(|| Error::extension("PI_CRITERION_OUTPUT_SUBDIR must be UTF-8")),
+            _ => Err(Error::extension(
+                "PI_CRITERION_OUTPUT_SUBDIR must contain only normal relative components",
+            )),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.len() != 3
+        || components[0] != "pi-perf-runs"
+        || components[2] != "criterion_pijs"
+        || components[1].len() != 64
+        || !components[1]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::extension(
+            "PI_CRITERION_OUTPUT_SUBDIR must equal pi-perf-runs/<lowercase-sha256>/criterion_pijs",
+        ));
+    }
+    Ok(relative)
+}
+
+fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
+    if records.len() != REGRESSION_GATE_TOOL_CALLS.len() {
+        return Err(Error::extension(
+            "regression-gate output must contain exactly two records",
+        ));
+    }
+    let target_dir = nonempty_env("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::extension("CARGO_TARGET_DIR is required for RCH artifact return"))?;
+    if !target_dir.is_absolute()
+        || target_dir.components().any(|component| {
+            matches!(component, Component::CurDir | Component::ParentDir)
+        })
+    {
+        return Err(Error::extension(
+            "CARGO_TARGET_DIR must be an absolute normalized path for RCH artifact return",
+        ));
+    }
+    let output_relative = nonempty_env("PI_CRITERION_OUTPUT_SUBDIR")
+        .ok_or_else(|| Error::extension("PI_CRITERION_OUTPUT_SUBDIR is required"))?;
+    let output_relative = normalized_criterion_output_subdir(&output_relative)?;
+    let output_dir = target_dir.join("criterion").join(output_relative);
+    let output_parent = output_dir
+        .parent()
+        .ok_or_else(|| Error::extension("PiJS Criterion output directory has no parent"))?;
+    fs::create_dir_all(output_parent).map_err(|error| {
+        Error::extension(format!(
+            "failed to create PiJS Criterion output parent: {error}"
+        ))
+    })?;
+    fs::create_dir(&output_dir).map_err(|error| {
+        Error::extension(format!(
+            "refusing unavailable or preexisting PiJS Criterion output {}: {error}",
+            output_dir.display()
+        ))
+    })?;
+
+    let current_exe = canonical_executable_path(
+        &std::env::current_exe().map_err(|error| {
+            Error::extension(format!("failed to resolve current workload executable: {error}"))
+        })?,
+    )?;
+    let returned_binary = output_dir.join("pijs_workload");
+    let mut source = File::open(&current_exe).map_err(|error| {
+        Error::extension(format!(
+            "failed to open workload executable {}: {error}",
+            current_exe.display()
+        ))
+    })?;
+    let source_permissions = source
+        .metadata()
+        .map_err(|error| {
+            Error::extension(format!("failed to inspect workload executable: {error}"))
+        })?
+        .permissions();
+    let mut destination = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&returned_binary)
+        .map_err(|error| {
+            Error::extension(format!(
+                "failed to create returned workload executable {}: {error}",
+                returned_binary.display()
+            ))
+        })?;
+    io::copy(&mut source, &mut destination).map_err(|error| {
+        Error::extension(format!("failed to copy returned workload executable: {error}"))
+    })?;
+    destination
+        .sync_all()
+        .map_err(|error| Error::extension(format!("failed to sync workload executable: {error}")))?;
+    fs::set_permissions(&returned_binary, source_permissions).map_err(|error| {
+        Error::extension(format!("failed to preserve workload executable mode: {error}"))
+    })?;
+
+    let evidence_path = output_dir.join("pijs_workload.jsonl");
+    let mut evidence = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&evidence_path)
+        .map_err(|error| {
+            Error::extension(format!(
+                "failed to create PiJS evidence {}: {error}",
+                evidence_path.display()
+            ))
+        })?;
+    for record in records {
+        serde_json::to_writer(&mut evidence, record).map_err(|error| {
+            Error::extension(format!("failed to serialize PiJS evidence: {error}"))
+        })?;
+        evidence
+            .write_all(b"\n")
+            .map_err(|error| Error::extension(format!("failed to write PiJS evidence: {error}")))?;
+    }
+    evidence
+        .sync_all()
+        .map_err(|error| Error::extension(format!("failed to sync PiJS evidence: {error}")))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn run_measurement(args: &Args, tool_calls: NonZeroUsize) -> Result<serde_json::Value> {
     let build_profile = perf_build::detect_build_profile();
