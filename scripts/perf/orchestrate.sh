@@ -3310,6 +3310,7 @@ import json
 import math
 import os
 import re
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -5940,21 +5941,143 @@ for suite_name in ["perf_baseline_variance", "perf_regression", "perf_budgets"]:
         "present": suite_dir.exists(),
     }
 
+def stable_file_identity(metadata):
+    return (
+        metadata.st_mode,
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def open_anchored_directory(parent_fd, child_name):
+    try:
+        path_metadata = os.stat(child_name, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(path_metadata.st_mode):
+            return None
+        descriptor = os.open(
+            child_name,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        descriptor_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(descriptor_metadata.st_mode)
+            or descriptor_metadata.st_dev != path_metadata.st_dev
+            or descriptor_metadata.st_ino != path_metadata.st_ino
+        ):
+            os.close(descriptor)
+            return None
+        return descriptor, (path_metadata.st_dev, path_metadata.st_ino)
+    except OSError:
+        return None
+
+
+def read_stable_regular_at(parent_fd, file_name):
+    path_metadata_before = os.stat(
+        file_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    descriptor = os.open(
+        file_name,
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        dir_fd=parent_fd,
+    )
+    try:
+        descriptor_metadata_before = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_metadata_before.st_mode):
+            raise ValueError(f"{file_name}: expected a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        descriptor_metadata_after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    path_metadata_after = os.stat(
+        file_name, dir_fd=parent_fd, follow_symlinks=False
+    )
+    contents = b"".join(chunks)
+    expected_identity = stable_file_identity(path_metadata_before)
+    if (
+        not stat.S_ISREG(path_metadata_after.st_mode)
+        or stable_file_identity(descriptor_metadata_before) != expected_identity
+        or stable_file_identity(descriptor_metadata_after) != expected_identity
+        or stable_file_identity(path_metadata_after) != expected_identity
+        or len(contents) != path_metadata_before.st_size
+    ):
+        raise ValueError(f"{file_name}: file changed while read")
+    return contents
+
+
+fault_injection_root_resolved = None
+fault_injection_root_fd = None
 fault_injection_candidates = []
-if fault_injection_root.exists():
-    fault_injection_candidates = sorted(fault_injection_root.glob("*/run-manifest.json"))
+fault_injection_child_descriptors = []
+try:
+    fault_injection_root_resolved = fault_injection_root.resolve(strict=True)
+    fault_injection_root_fd = os.open(
+        fault_injection_root_resolved,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+    )
+    for child_name in sorted(os.listdir(fault_injection_root_fd)):
+        if not child_name or child_name in {".", ".."}:
+            continue
+        opened_child = open_anchored_directory(fault_injection_root_fd, child_name)
+        if opened_child is None:
+            continue
+        child_fd, child_identity = opened_child
+        try:
+            manifest_bytes = read_stable_regular_at(child_fd, "run-manifest.json")
+        except (OSError, ValueError):
+            os.close(child_fd)
+            continue
+        fault_injection_child_descriptors.append(child_fd)
+        fault_injection_candidates.append(
+            (
+                child_name,
+                child_fd,
+                child_identity,
+                fault_injection_root_resolved / child_name / "run-manifest.json",
+                manifest_bytes,
+            )
+        )
+except (OSError, ValueError):
+    fault_injection_root_resolved = None
+    if fault_injection_root_fd is not None:
+        os.close(fault_injection_root_fd)
+        fault_injection_root_fd = None
 fault_injection_manifest_path = None
 fault_injection_summary_path = None
+fault_injection_manifest_sha256 = None
+fault_injection_manifest_size_bytes = None
+fault_injection_summary_sha256 = None
+fault_injection_summary_size_bytes = None
 fault_injection_status = "missing"
 fault_injection_summary = {}
 fault_injection_manifest = {}
 matching_fault_injection_runs = []
-for candidate in fault_injection_candidates:
-    if candidate.is_symlink() or not candidate.is_file():
-        continue
+for (
+    child_name,
+    child_fd,
+    child_identity,
+    candidate,
+    candidate_manifest_bytes,
+) in fault_injection_candidates:
     try:
-        candidate_manifest = load_json(candidate)
-    except (OSError, json.JSONDecodeError):
+        candidate_manifest = json.loads(candidate_manifest_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
         continue
     if not isinstance(candidate_manifest, dict):
         continue
