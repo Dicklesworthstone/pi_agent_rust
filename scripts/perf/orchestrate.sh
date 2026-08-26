@@ -1584,6 +1584,7 @@ run_criterion_bench() {
   local result_dir="$OUTPUT_DIR/results/$suite_name"
   local criterion_run_subdir="pi-perf-runs/$RUN_INSTANCE_ID/$suite_name"
   local criterion_dir="$TARGET_DIR/criterion/$criterion_run_subdir"
+  local remote_execution_verified=false
   mkdir -p "$result_dir"
 
   exit_code=0
@@ -1595,9 +1596,36 @@ run_criterion_bench() {
     CI_CORRELATION_ID="$CORRELATION_ID" \
     VERGEN_GIT_SHA="$GIT_COMMIT_FULL" \
     VERGEN_GIT_DIRTY="$GIT_DIRTY" \
+    RCH_REQUIRE_REMOTE=1 \
+    RCH_QUIET=0 \
+    RCH_VISIBILITY=summary \
       "${CARGO_RUNNER_ARGS[@]}" bench --bench "$bench_name" --profile "$CARGO_PROFILE" \
       >"$result_dir/stdout.log" 2>"$result_dir/stderr.log" \
       || exit_code=$?
+  fi
+
+  if [[ "$exit_code" -eq 0 && "$CARGO_RUNNER_MODE" == "rch" ]]; then
+    if ! grep -Eqs '^\[RCH\] remote [^[:space:]]+ \([^)]+\)$' \
+      "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+      log_fail "$suite_name has no remote-success marker"
+      exit_code=89
+    elif grep -Eqs '^\[RCH\] local( |$)' \
+      "$result_dir/stdout.log" "$result_dir/stderr.log"; then
+      log_fail "$suite_name reported local execution"
+      exit_code=90
+    else
+      remote_execution_verified=true
+    fi
+  fi
+  if [[ "$exit_code" -eq 0 && "$CARGO_RUNNER_MODE" == "rch" ]] \
+    && ! verify_current_clean_source_identity "RCH $suite_name postcondition"; then
+    remote_execution_verified=false
+    exit_code=91
+  fi
+  if [[ "$exit_code" -eq 0 \
+    && { ! -d "$criterion_dir" || -L "$criterion_dir"; } ]]; then
+    log_fail "$suite_name did not produce its isolated Criterion directory"
+    exit_code=92
   fi
 
   suite_end=$(epoch_ms)
@@ -1614,11 +1642,6 @@ run_criterion_bench() {
     log_fail "$suite_name failed (exit=$exit_code, ${suite_elapsed}ms)"
   fi
 
-  # Copy criterion output if it exists
-  if [[ "$exit_code" -eq 0 && -d "$criterion_dir" && ! -L "$criterion_dir" ]]; then
-    cp -r "$criterion_dir" "$result_dir/criterion/" 2>/dev/null || true
-  fi
-
   if [[ "$suite_name" == "criterion_extensions" ]]; then
     write_cold_load_measurement_control "$result_dir" "$exit_code"
   fi
@@ -1633,6 +1656,12 @@ run_criterion_bench() {
   "exit_code": $exit_code,
   "elapsed_ms": $suite_elapsed,
   "correlation_id": "$CORRELATION_ID",
+  "run_instance_id": "$RUN_INSTANCE_ID",
+  "source_commit": "$GIT_COMMIT_FULL",
+  "source_dirty": $GIT_DIRTY,
+  "output_relative": "criterion/$criterion_run_subdir",
+  "runner_mode": "$CARGO_RUNNER_MODE",
+  "remote_execution_verified": $remote_execution_verified,
   "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "profile": "$CARGO_PROFILE"
 }
@@ -4785,6 +4814,7 @@ if ! PROJECT_ROOT="$PROJECT_ROOT" \
   GIT_COMMIT_FULL="$GIT_COMMIT_FULL" \
   CORRELATION_ID="$CORRELATION_ID" \
   RUN_INSTANCE_ID="$RUN_INSTANCE_ID" \
+  CARGO_RUNNER_MODE="$CARGO_RUNNER_MODE" \
   SELECTED_SUITES="${SELECTED_SUITES[*]}" \
   python3 - <<'PY'
 import hashlib
@@ -4911,6 +4941,11 @@ criterion_required_inputs = {
         "semantic_context/planning/large_workspace/new/sample.json",
         "semantic_context/bundle_serialization/large_workspace/new/sample.json",
     ],
+}
+criterion_expected_targets = {
+    "criterion_extensions": "extensions",
+    "criterion_system": "system",
+    "criterion_semantic_context": "semantic_context",
 }
 for suite, relative_paths in criterion_required_inputs.items():
     if suite not in selected_suites:
@@ -5159,10 +5194,22 @@ for suite in sorted(selected_suites.intersection(criterion_required_inputs)):
             f"Criterion producer {suite} has no parseable current suite result: {error}"
         ) from error
     if (
-        suite_result.get("suite_name") != suite
+        suite_result.get("schema") != "pi.perf.suite_result.v1"
+        or suite_result.get("suite_name") != suite
+        or suite_result.get("target") != criterion_expected_targets[suite]
+        or suite_result.get("kind") != "criterion"
         or suite_result.get("status") != "pass"
+        or type(suite_result.get("exit_code")) is not int
         or suite_result.get("exit_code") != 0
         or suite_result.get("correlation_id") != os.environ["CORRELATION_ID"]
+        or suite_result.get("run_instance_id") != os.environ["RUN_INSTANCE_ID"]
+        or suite_result.get("source_commit") != os.environ["GIT_COMMIT_FULL"]
+        or suite_result.get("source_dirty") is not False
+        or suite_result.get("output_relative")
+        != f"criterion/pi-perf-runs/{os.environ['RUN_INSTANCE_ID']}/{suite}"
+        or suite_result.get("runner_mode") != os.environ["CARGO_RUNNER_MODE"]
+        or suite_result.get("remote_execution_verified")
+        is not (os.environ["CARGO_RUNNER_MODE"] == "rch")
     ):
         raise SystemExit(
             f"Criterion producer {suite} did not pass in the current correlation"
