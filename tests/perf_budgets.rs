@@ -364,6 +364,35 @@ const IDLE_RSS_CONTROL_FILE: &str = "idle_memory_rss.json";
 const POST_GENERATION_MODE_ENV: &str = "PI_PERF_POST_GENERATION";
 const POST_GENERATION_EXPECTED_COMMIT_ENV: &str = "PI_PERF_EXPECTED_SOURCE_COMMIT";
 const POST_GENERATION_INVENTORY_FILE: &str = "post_generation_evidence_inventory.json";
+const POST_GENERATION_REQUIRED_INPUT_PATHS: &[&str] = &[
+    "context_intelligence/perf_budget.json",
+    "criterion/ext_load_init/load_init_cold/hello/new/estimates.json",
+    "criterion/ext_load_init/load_init_cold/pirate/new/estimates.json",
+    "criterion/ext_policy/evaluate/permissive_allow/new/estimates.json",
+    "criterion/ext_policy/evaluate/prompt_allow/new/estimates.json",
+    "criterion/ext_policy/evaluate/prompt_deny/new/estimates.json",
+    "criterion/ext_policy/evaluate/prompt_prompt/new/estimates.json",
+    "criterion/ext_policy/evaluate/strict_allow/new/estimates.json",
+    "criterion/ext_policy/evaluate/strict_deny/new/estimates.json",
+    "criterion/ext_protocol/parse_and_validate/host_call_small/new/estimates.json",
+    "criterion/ext_protocol/parse_and_validate/log_big/new/estimates.json",
+    "criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json",
+    "criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json",
+    "criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json",
+    "criterion/semantic_context/incremental_update/large_workspace/new/estimates.json",
+    "criterion/semantic_context/planning/large_workspace/new/estimates.json",
+    "criterion/startup/help/warm/new/estimates.json",
+    "criterion/startup/list_models/warm/new/estimates.json",
+    "criterion/startup/version/warm/new/estimates.json",
+    "extension_benchmark_stratification.json",
+    "perf/examples/pijs_workload",
+    "phase1_matrix_validation.json",
+    "pijs_workload.jsonl",
+    "release/pi",
+    "release_evidence/binary_size_measurement.json",
+    "release_evidence/cold_load_measurement.json",
+    "release_evidence/idle_memory_rss.json",
+];
 const POST_GENERATION_ARTIFACT_OVERRIDE_ENVS: &[&str] = &[
     "PERF_RELEASE_BINARY_PATH",
     "PERF_BINARY_SIZE_CONTROL_PATH",
@@ -386,7 +415,9 @@ struct PostGenerationEvidencePolicy {
 struct PostGenerationEvidenceInventory {
     schema: String,
     source_commit: String,
+    source_dirty: bool,
     correlation_id: String,
+    run_instance_id: String,
     entries: Vec<PostGenerationEvidenceInventoryEntry>,
 }
 
@@ -641,8 +672,22 @@ fn validate_post_generation_evidence_inventory(
     if inventory.source_commit != policy.expected_source_commit {
         return Err("post-generation evidence inventory source_commit mismatch".to_string());
     }
+    if inventory.source_dirty {
+        return Err("post-generation evidence inventory source_dirty must equal false".to_string());
+    }
     if inventory.correlation_id != policy.correlation_id {
         return Err("post-generation evidence inventory correlation_id mismatch".to_string());
+    }
+    if inventory.run_instance_id.len() != 64
+        || !inventory
+            .run_instance_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(
+            "post-generation evidence inventory run_instance_id must be 64 lowercase hex characters"
+                .to_string(),
+        );
     }
     if inventory.entries.is_empty() {
         return Err("post-generation evidence inventory contains no inputs".to_string());
@@ -687,6 +732,22 @@ fn validate_post_generation_evidence_inventory(
 
     let mut observed_files = BTreeMap::new();
     collect_post_generation_evidence_files(&policy.root, &policy.root, &mut observed_files)?;
+    let required_files = POST_GENERATION_REQUIRED_INPUT_PATHS
+        .iter()
+        .map(|path| (*path).to_string())
+        .collect::<BTreeSet<_>>();
+    let inventoried_files = expected_files.keys().cloned().collect::<BTreeSet<_>>();
+    if inventoried_files != required_files {
+        return Err(format!(
+            "post-generation evidence input contract mismatch: missing={:?}, unexpected={:?}",
+            required_files
+                .difference(&inventoried_files)
+                .collect::<Vec<_>>(),
+            inventoried_files
+                .difference(&required_files)
+                .collect::<Vec<_>>()
+        ));
+    }
     if observed_files != expected_files {
         let expected = expected_files.keys().cloned().collect::<BTreeSet<_>>();
         let observed = observed_files.keys().cloned().collect::<BTreeSet<_>>();
@@ -5324,7 +5385,9 @@ fn write_post_generation_inventory_fixture(
     let inventory = json!({
         "schema": "pi.perf.post_generation_evidence_inventory.v1",
         "source_commit": source_commit,
+        "source_dirty": false,
         "correlation_id": correlation_id,
+        "run_instance_id": "a".repeat(64),
         "entries": entries,
     });
     std::fs::write(

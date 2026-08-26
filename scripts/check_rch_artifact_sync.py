@@ -13,6 +13,7 @@ import argparse
 import fnmatch
 import hashlib
 import json
+import os
 import stat as stat_mode
 import sys
 import tomllib
@@ -238,6 +239,17 @@ def rule_matches(rule: IgnoreRule, rel_path: str) -> bool:
     if rule.anchored:
         return core_rule_matches(rule.pattern, rel_path)
 
+    body = rule.pattern.strip("/")
+    if "/" not in body:
+        # An rsync exclude without a slash matches a basename at any depth. If
+        # that basename is a directory, excluding it also excludes every path
+        # below it, so inspecting every component is the correct conservative
+        # answer for a required descendant.
+        return any(
+            fnmatch.fnmatchcase(component, body)
+            for component in rel_path.split("/")
+        )
+
     if core_rule_matches(rule.pattern, rel_path):
         return True
 
@@ -250,16 +262,33 @@ def rule_matches(rule: IgnoreRule, rel_path: str) -> bool:
 
 def resolve_required_path(repo_root: Path, raw_path: str) -> tuple[str, Path]:
     path = Path(raw_path)
+    repo_root = Path(os.path.abspath(os.path.normpath(str(repo_root))))
     if path.is_absolute():
-        full_path = path
+        # Keep identity lexical and stable across the before/after interval.
+        # Path.resolve() follows symlinks, so re-resolving a manifest path after
+        # a parent was replaced by a symlink can silently change its identity.
+        full_path = Path(os.path.abspath(os.path.normpath(str(path))))
         try:
-            rel_path = full_path.resolve().relative_to(repo_root.resolve()).as_posix()
+            rel_path = full_path.relative_to(repo_root).as_posix()
         except ValueError:
-            rel_path = full_path.absolute().as_posix()
+            rel_path = full_path.as_posix()
     else:
         rel_path = normalize_posix_path(raw_path)
-        full_path = repo_root / rel_path
+        full_path = Path(os.path.abspath(os.path.normpath(str(repo_root / rel_path))))
     return rel_path, full_path
+
+
+def relative_path_escapes_repo(raw_path: str) -> bool:
+    path = Path(raw_path)
+    if path.is_absolute():
+        return False
+    rel_path = normalize_posix_path(raw_path)
+    return (
+        not rel_path
+        or rel_path == ".."
+        or rel_path.startswith("../")
+        or "/../" in rel_path
+    )
 
 
 def matched_rule_payload(rule: IgnoreRule, matched: bool) -> dict[str, Any]:
@@ -306,7 +335,18 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
         "mtime_ns": None,
         "sha256": None,
     }
-    symlink_ancestor = first_symlink_ancestor(full_path)
+    if relative_path_escapes_repo(raw_path):
+        snapshot["kind"] = "invalid"
+        snapshot["error"] = (
+            "generated artifact must be repo-relative without parent traversal "
+            "or an absolute path"
+        )
+        return snapshot
+    try:
+        symlink_ancestor = first_symlink_ancestor(full_path)
+    except OSError as exc:
+        snapshot["error"] = f"failed to inspect generated artifact ancestors: {exc}"
+        return snapshot
     if symlink_ancestor is not None:
         snapshot["exists"] = True
         snapshot["kind"] = "symlink_ancestor"
@@ -339,7 +379,11 @@ def artifact_snapshot(repo_root: Path, raw_path: str) -> dict[str, Any]:
     return snapshot
 
 
-def build_postcondition_baseline(repo_root: Path, generated_artifacts: list[str]) -> dict[str, Any]:
+def build_postcondition_baseline(
+    repo_root: Path,
+    generated_artifacts: list[str],
+    invocation_identity: dict[str, str] | None = None,
+) -> dict[str, Any]:
     snapshots = []
     violations: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
@@ -398,6 +442,7 @@ def build_postcondition_baseline(repo_root: Path, generated_artifacts: list[str]
         "mode": "postcondition-baseline",
         "status": "fail" if violations else "pass",
         "repo_root": str(repo_root),
+        "invocation_identity": invocation_identity or {},
         "generated_artifacts": snapshots,
         "violations": violations,
         "summary": {
@@ -443,6 +488,83 @@ def build_before_manifest_error_report(
             "violation_count": 1,
         },
     }
+
+
+def append_before_manifest_write_error(
+    report: dict[str, Any], before_manifest: Path, error: OSError
+) -> None:
+    report["status"] = "fail"
+    report["violations"].append(
+        {
+            "path": str(before_manifest),
+            "source": "postcondition",
+            "line": None,
+            "pattern": None,
+            "reason": "before_manifest_write_error",
+            "message": f"failed to write before manifest {before_manifest}: {error}",
+            "recommended_action": POSTCONDITION_ACTION,
+        }
+    )
+    report["summary"]["violation_count"] = len(report["violations"])
+
+
+def validate_invocation_identity(
+    raw_identity: Any,
+    expected_identity: dict[str, str] | None,
+    before_manifest: Path,
+) -> list[dict[str, Any]]:
+    violations: list[dict[str, Any]] = []
+    valid_identity = isinstance(raw_identity, dict) and all(
+        key in {"source_commit", "correlation_id", "command_digest"}
+        and isinstance(value, str)
+        and bool(value)
+        for key, value in raw_identity.items()
+    )
+    if not valid_identity:
+        violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_identity_invalid",
+                "message": "before manifest invocation_identity is not a valid string map",
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
+        return violations
+
+    if expected_identity is not None and raw_identity != expected_identity:
+        violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_identity_mismatch",
+                "message": (
+                    "before manifest invocation identity does not match this postcondition; "
+                    f"manifest={raw_identity!r}, expected={expected_identity!r}"
+                ),
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
+    elif expected_identity is None and raw_identity:
+        violations.append(
+            {
+                "path": str(before_manifest),
+                "source": "postcondition",
+                "line": None,
+                "pattern": None,
+                "reason": "before_manifest_identity_not_asserted",
+                "message": (
+                    "before manifest is invocation-bound, but the postcondition did not "
+                    "provide the same identity fields"
+                ),
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        )
+    return violations
 
 
 def before_snapshots_by_path(
@@ -620,7 +742,10 @@ def build_missing_before_manifest_report(repo_root: Path, generated_artifacts: l
 
 
 def build_postcondition_report(
-    repo_root: Path, generated_artifacts: list[str], before_manifest: Path
+    repo_root: Path,
+    generated_artifacts: list[str],
+    before_manifest: Path,
+    invocation_identity: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     try:
         before_manifest_payload = load_json_file(before_manifest)
@@ -698,6 +823,13 @@ def build_postcondition_report(
                 "recommended_action": POSTCONDITION_ACTION,
             }
         )
+    manifest_violations.extend(
+        validate_invocation_identity(
+            before_manifest_payload.get("invocation_identity", {}),
+            invocation_identity,
+            before_manifest,
+        )
+    )
     before_by_path, artifact_set_violations = before_snapshots_by_path(
         repo_root, before_manifest_payload
     )
@@ -956,7 +1088,29 @@ def evaluate_required_paths(
             )
             continue
         exists = metadata is not None
-        symlink_ancestor = first_symlink_ancestor(full_path)
+        try:
+            symlink_ancestor = first_symlink_ancestor(full_path)
+        except OSError as exc:
+            violations.append(
+                {
+                    "path": rel_path,
+                    "source": "required_paths",
+                    "line": None,
+                    "pattern": None,
+                    "reason": "required_path_inspection_error",
+                    "message": f"failed to inspect required path ancestors {rel_path}: {exc}",
+                }
+            )
+            required_results.append(
+                {
+                    "path": rel_path,
+                    "exists": False,
+                    "kind": "inspection_error",
+                    "matched_rules": matched_rules,
+                    "included": False,
+                }
+            )
+            continue
         if symlink_ancestor is not None:
             exists = True
             kind = "symlink_ancestor"
@@ -1165,8 +1319,63 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         help="Pre-run snapshot manifest to compare against in --mode postcondition.",
     )
+    parser.add_argument(
+        "--source-commit",
+        help="Optional full source commit identity to bind into both postcondition phases.",
+    )
+    parser.add_argument(
+        "--correlation-id",
+        help="Optional run correlation identity to bind into both postcondition phases.",
+    )
+    parser.add_argument(
+        "--command-digest",
+        help="Optional command digest to bind into both postcondition phases.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
     return parser.parse_args(argv)
+
+
+def requested_invocation_identity(args: argparse.Namespace) -> dict[str, str] | None:
+    values = {
+        "source_commit": args.source_commit,
+        "correlation_id": args.correlation_id,
+        "command_digest": args.command_digest,
+    }
+    supplied = {key: value for key, value in values.items() if value}
+    if supplied and len(supplied) != len(values):
+        missing = sorted(set(values) - set(supplied))
+        raise ValueError(
+            "postcondition invocation identity requires all of --source-commit, "
+            f"--correlation-id, and --command-digest; missing={missing}"
+        )
+    return supplied or None
+
+
+def build_cli_error_report(repo_root: Path, message: str) -> dict[str, Any]:
+    return {
+        "schema": SCHEMA,
+        "mode": "postcondition",
+        "status": "fail",
+        "repo_root": str(repo_root),
+        "postconditions": [],
+        "violations": [
+            {
+                "path": None,
+                "source": "arguments",
+                "line": None,
+                "pattern": None,
+                "reason": "invalid_postcondition_arguments",
+                "message": message,
+                "recommended_action": POSTCONDITION_ACTION,
+            }
+        ],
+        "summary": {
+            "generated_artifact_count": 0,
+            "updated_count": 0,
+            "unchanged_count": 0,
+            "violation_count": 1,
+        },
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -1181,10 +1390,26 @@ def main(argv: list[str]) -> int:
     required_paths = args.required_paths or list(DEFAULT_REQUIRED_PATHS)
 
     if args.mode == "postcondition":
+        try:
+            invocation_identity = requested_invocation_identity(args)
+        except ValueError as exc:
+            report = build_cli_error_report(repo_root, str(exc))
+            invocation_identity = None
+        else:
+            report = None
         generated_artifacts = list(args.generated_artifacts)
-        if args.write_before_manifest is not None:
+        if report is not None:
+            pass
+        elif args.write_before_manifest is not None and args.before_manifest is not None:
+            report = build_cli_error_report(
+                repo_root,
+                "--write-before-manifest and --before-manifest are mutually exclusive",
+            )
+        elif args.write_before_manifest is not None:
             if generated_artifacts:
-                report = build_postcondition_baseline(repo_root, generated_artifacts)
+                report = build_postcondition_baseline(
+                    repo_root, generated_artifacts, invocation_identity
+                )
             else:
                 report = build_missing_before_manifest_report(repo_root, generated_artifacts)
                 report["violations"] = [
@@ -1199,18 +1424,22 @@ def main(argv: list[str]) -> int:
                     }
                 ]
                 report["summary"]["violation_count"] = 1
-            args.write_before_manifest.parent.mkdir(parents=True, exist_ok=True)
-            args.write_before_manifest.write_text(
-                json.dumps(report, indent=2, sort_keys=True) + "\n",
-                encoding="utf-8",
-            )
+            try:
+                args.write_before_manifest.parent.mkdir(parents=True, exist_ok=True)
+                args.write_before_manifest.write_text(
+                    json.dumps(report, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            except OSError as exc:
+                append_before_manifest_write_error(report, args.write_before_manifest, exc)
         elif args.before_manifest is None:
             report = build_missing_before_manifest_report(repo_root, generated_artifacts)
         else:
             report = build_postcondition_report(
                 repo_root,
                 generated_artifacts,
-                args.before_manifest.resolve(),
+                Path(os.path.abspath(os.path.normpath(str(args.before_manifest)))),
+                invocation_identity,
             )
     else:
         report = build_report(repo_root, ignore_file, config_file, required_paths)

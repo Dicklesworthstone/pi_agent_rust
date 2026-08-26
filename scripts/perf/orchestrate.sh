@@ -4840,18 +4840,47 @@ source_anchors = sorted(
     reverse=True,
 )
 
-sources = [
-    (output_dir / "results", PurePosixPath("."), True),
-    (target_dir / "perf" / "release_evidence", PurePosixPath("release_evidence"), False),
-]
 selected_suites = set(os.environ["SELECTED_SUITES"].split())
 criterion_run_root = (
     target_dir / "criterion" / "pi-perf-runs" / os.environ["RUN_INSTANCE_ID"]
 )
-optional_files = [
-    (target_dir / "release" / "pi", PurePosixPath("release/pi")),
+required_files = [
+    (
+        output_dir / "results" / "extension_benchmark_stratification.json",
+        PurePosixPath("extension_benchmark_stratification.json"),
+        "post-generation derivation",
+    ),
+    (
+        output_dir / "results" / "phase1_matrix_validation.json",
+        PurePosixPath("phase1_matrix_validation.json"),
+        "post-generation derivation",
+    ),
+    (
+        output_dir / "results" / "pijs_workload.jsonl",
+        PurePosixPath("pijs_workload.jsonl"),
+        "pijs_workload",
+    ),
+    (
+        target_dir / "release" / "pi",
+        PurePosixPath("release/pi"),
+        "release binary build",
+    ),
+    (
+        target_dir / "perf" / "release_evidence" / "binary_size_measurement.json",
+        PurePosixPath("release_evidence/binary_size_measurement.json"),
+        "release binary measurement",
+    ),
+    (
+        target_dir / "perf" / "release_evidence" / "cold_load_measurement.json",
+        PurePosixPath("release_evidence/cold_load_measurement.json"),
+        "Criterion extension measurement",
+    ),
+    (
+        target_dir / "perf" / "release_evidence" / "idle_memory_rss.json",
+        PurePosixPath("release_evidence/idle_memory_rss.json"),
+        "idle RSS measurement",
+    ),
 ]
-required_files = []
 criterion_required_inputs = {
     "criterion_extensions": [
         "ext_load_init/load_init_cold/hello/new/estimates.json",
@@ -5207,9 +5236,6 @@ for suite in sorted(selected_suites.intersection(criterion_required_inputs)):
             f"Criterion producer {suite} did not pass in the current correlation"
         )
 
-for source_root, destination_root, required in sources:
-    copy_tree(source_root, destination_root, required)
-
 pijs_artifact = output_dir / "results" / "pijs_workload.jsonl"
 if pijs_artifact.is_file():
     admitted_pijs_records = []
@@ -5270,9 +5296,6 @@ if pijs_artifact.is_file():
             PurePosixPath("perf/examples/pijs_workload"),
         )
 
-for source, destination in optional_files:
-    if source.exists() or source.is_symlink():
-        copy_regular_file(source, destination)
 for source, destination, producer_suite in required_files:
     try:
         copy_regular_file(source, destination)
@@ -5287,7 +5310,9 @@ entries.sort(key=lambda entry: entry["path"])
 inventory = {
     "schema": "pi.perf.post_generation_evidence_inventory.v1",
     "source_commit": os.environ["GIT_COMMIT_FULL"],
+    "source_dirty": False,
     "correlation_id": os.environ["CORRELATION_ID"],
+    "run_instance_id": os.environ["RUN_INSTANCE_ID"],
     "entries": entries,
 }
 inventory_bytes = (json.dumps(inventory, indent=2, sort_keys=True) + "\n").encode("utf-8")
