@@ -362,6 +362,7 @@ impl OpenAIProvider {
             stream_options,
             thinking,
             reasoning_effort,
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
 
@@ -1335,6 +1336,12 @@ pub struct OpenAIRequest<'a> {
     /// compat config) is sent verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    /// Cache-affinity key (OpenAI `prompt_cache_key`). Providers route a
+    /// request to a prompt-cache shard by prefix hash combined with this key;
+    /// without it, streamed requests can get no cache affinity at all. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1801,6 +1808,34 @@ mod tests {
         let provider = OpenAIProvider::new("gpt-4o");
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.api(), "openai-completions");
+    }
+
+    #[test]
+    fn test_build_request_serializes_prompt_cache_key() {
+        let provider = OpenAIProvider::new("gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let options = StreamOptions {
+            prompt_cache_key: Some("session-abc".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(value["prompt_cache_key"], "session-abc");
+
+        // Absent when unset, so backends that reject unknown params never see it.
+        let value =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert!(value.get("prompt_cache_key").is_none());
     }
 
     #[test]

@@ -214,6 +214,13 @@ pub struct StreamOptions {
     pub api_key: Option<String>,
     pub cache_retention: CacheRetention,
     pub session_id: Option<String>,
+    /// Cache-affinity key serialized as `prompt_cache_key` on OpenAI-shaped
+    /// requests (chat completions, Azure, Responses). OpenAI and Azure route a
+    /// request to a cache shard by prefix hash combined with this key; some
+    /// stacks (observed on Azure OpenAI behind a proxy) give streamed requests
+    /// no prompt-cache affinity at all without it. Session-scoped by default;
+    /// `PI_PROMPT_CACHE_KEY` overrides (see `app::prompt_cache_key_from_env`).
+    pub prompt_cache_key: Option<String>,
     pub headers: HashMap<String, String>,
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,

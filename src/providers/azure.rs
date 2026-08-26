@@ -187,6 +187,7 @@ impl AzureOpenAIProvider {
             stream_options: Some(AzureStreamOptions {
                 include_usage: true,
             }),
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
 
@@ -692,6 +693,12 @@ pub struct AzureRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<AzureStreamOptions>,
+    /// Cache-affinity key (`prompt_cache_key`). Azure routes a request to a
+    /// prompt-cache shard by prefix hash combined with this key; without it,
+    /// streamed requests can get no cache affinity at all. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1101,6 +1108,34 @@ mod tests {
         assert_eq!(request_json["messages"][2]["role"], json!("assistant"));
         assert_eq!(request_json["tools"][0]["type"], json!("function"));
         assert_eq!(request_json["tools"][0]["function"]["name"], json!("echo"));
+    }
+
+    #[test]
+    fn test_azure_build_request_serializes_prompt_cache_key() {
+        let provider = AzureOpenAIProvider::new("contoso", "gpt-4o");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Hello".to_string()),
+                timestamp: 0,
+            })]
+            .into(),
+            tools: Vec::new().into(),
+        };
+
+        let options = StreamOptions {
+            prompt_cache_key: Some("session-abc".to_string()),
+            ..Default::default()
+        };
+        let request_json = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(request_json["prompt_cache_key"], "session-abc");
+
+        // Absent when unset, so backends that reject unknown params never see it.
+        let request_json =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert!(request_json.get("prompt_cache_key").is_none());
     }
 
     #[test]

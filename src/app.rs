@@ -1248,6 +1248,24 @@ pub fn cache_retention_from_env(value: Option<&str>) -> CacheRetention {
     }
 }
 
+/// Resolve the cache-affinity key serialized as `prompt_cache_key` on
+/// OpenAI-shaped requests.
+///
+/// Defaults to the session id, so every request of a session targets the same
+/// provider cache shard (OpenAI and Azure route by prefix hash combined with
+/// this key; without it, streamed requests can get no prompt-cache affinity at
+/// all — observed as a 0% cache hit rate on Azure OpenAI behind a LiteLLM
+/// proxy while non-streamed requests cached fine). `PI_PROMPT_CACHE_KEY`
+/// overrides: `off`/`none` disables the field, any other non-empty value is
+/// sent verbatim (a shared key across sessions).
+pub fn prompt_cache_key_from_env(value: Option<&str>, session_id: Option<&str>) -> Option<String> {
+    match value.map(str::trim) {
+        Some(v) if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") => None,
+        Some(v) if !v.is_empty() => Some(v.to_string()),
+        _ => session_id.map(str::to_string),
+    }
+}
+
 pub fn build_stream_options(
     config: &Config,
     api_key: Option<String>,
@@ -1263,6 +1281,10 @@ pub fn build_stream_options(
         // and users pay full input-token price on every turn.
         cache_retention: cache_retention_from_env(
             std::env::var("PI_CACHE_RETENTION").ok().as_deref(),
+        ),
+        prompt_cache_key: prompt_cache_key_from_env(
+            std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+            Some(session.header.id.as_str()),
         ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so the value users configure in `models.json` actually takes effect.
@@ -2268,6 +2290,33 @@ mod tests {
                 .expect("active branch thinking level should restore");
 
         assert_eq!(selection.thinking_level, model::ThinkingLevel::High);
+    }
+
+    #[test]
+    fn prompt_cache_key_from_env_resolution() {
+        // Default: the session id, so a session's requests share a cache shard.
+        assert_eq!(
+            prompt_cache_key_from_env(None, Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        // Explicit value wins verbatim (shared key across sessions).
+        assert_eq!(
+            prompt_cache_key_from_env(Some("shared"), Some("sess-1")),
+            Some("shared".to_string())
+        );
+        // "off"/"none" disable the field entirely.
+        assert_eq!(prompt_cache_key_from_env(Some("off"), Some("sess-1")), None);
+        assert_eq!(
+            prompt_cache_key_from_env(Some("NONE"), Some("sess-1")),
+            None
+        );
+        // Blank env falls back to the session id.
+        assert_eq!(
+            prompt_cache_key_from_env(Some("  "), Some("sess-1")),
+            Some("sess-1".to_string())
+        );
+        // No env, no session id: nothing to send.
+        assert_eq!(prompt_cache_key_from_env(None, None), None);
     }
 
     #[test]

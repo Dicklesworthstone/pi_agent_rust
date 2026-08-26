@@ -1796,6 +1796,10 @@ fn build_stream_options_with_optional_key(
         cache_retention: app::cache_retention_from_env(
             std::env::var("PI_CACHE_RETENTION").ok().as_deref(),
         ),
+        prompt_cache_key: app::prompt_cache_key_from_env(
+            std::env::var("PI_PROMPT_CACHE_KEY").ok().as_deref(),
+            Some(session.header.id.as_str()),
+        ),
         // Seed the per-request output cap from the model registry's `maxTokens`
         // so embedders inherit the configured limit by default; they can still
         // override it via `set_max_tokens`.

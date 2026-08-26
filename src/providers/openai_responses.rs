@@ -205,6 +205,7 @@ impl OpenAIResponsesProvider {
             text,
             include,
             reasoning,
+            prompt_cache_key: options.prompt_cache_key.clone(),
         }
     }
 }
@@ -1662,6 +1663,11 @@ pub struct OpenAIResponsesRequest {
     include: Option<Vec<&'static str>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<OpenAIResponsesReasoning>,
+    /// Cache-affinity key (OpenAI `prompt_cache_key`). Parity with the TS
+    /// `openai-responses` provider, which already sends it. See
+    /// `StreamOptions::prompt_cache_key`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2286,6 +2292,33 @@ mod tests {
                 "rewrite must be rejected: {label}"
             );
         }
+    }
+
+    #[test]
+    fn test_build_request_serializes_prompt_cache_key() {
+        let provider = OpenAIResponsesProvider::new("gpt-4o");
+        let context = Context::owned(
+            None,
+            vec![Message::User(crate::model::UserMessage {
+                content: UserContent::Text("Ping".to_string()),
+                timestamp: 0,
+            })],
+            Vec::new(),
+        );
+
+        let options = StreamOptions {
+            prompt_cache_key: Some("session-abc".to_string()),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(provider.build_request(&context, &options))
+            .expect("serialize request");
+        assert_eq!(value["prompt_cache_key"], "session-abc");
+
+        // Absent when unset, so backends that reject unknown params never see it.
+        let value =
+            serde_json::to_value(provider.build_request(&context, &StreamOptions::default()))
+                .expect("serialize request");
+        assert!(value.get("prompt_cache_key").is_none());
     }
 
     #[test]
