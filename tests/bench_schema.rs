@@ -22,6 +22,7 @@ use pi::perf_build::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -1722,6 +1723,84 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
     fs::create_dir_all(release_pi.parent().expect("release path has parent"))
         .expect("create fake release parent");
     write_executable(&release_pi, "#!/usr/bin/env sh\nexit 0\n");
+    let binary_sha256 = sha256_file(&release_pi).expect("hash fake release pi");
+    let binary_size = fs::metadata(&release_pi)
+        .expect("inspect fake release pi")
+        .len();
+    let generated_at = chrono::Utc::now().to_rfc3339();
+    write_json(
+        &target_dir.join("perf/release_evidence/binary_size_measurement.json"),
+        &serde_json::to_string(&json!({
+            "schema": "pi.perf.binary_size_measurement.v1",
+            "generated_at": generated_at,
+            "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+            "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+            "source_commit": FAKE_ORCHESTRATE_SOURCE_COMMIT,
+            "source_dirty": false,
+            "binary_path": release_pi,
+            "binary_sha256": binary_sha256,
+            "size_bytes": binary_size,
+            "cargo_profile": "release",
+            "compiled_profile_family": "release",
+            "compiled_opt_level": "z",
+            "strip": true,
+            "profile_source": "Cargo.toml#profile.release",
+            "build_command": "cargo build --bin pi --release"
+        }))
+        .expect("serialize fake binary-size control"),
+    );
+
+    let bench_env = json!({
+        "os": "linux",
+        "arch": "x86_64",
+        "cpu_brand": "fixture",
+        "cpu_cores": 8,
+        "mem_total_mb": 1024,
+        "governor": "performance",
+        "turbo_boost": "disabled",
+        "aslr": "disabled",
+        "thp": "never",
+        "noise_score": 0,
+        "config_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    });
+    let bench_env_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&bench_env).expect("serialize fake bench environment"))
+    );
+    write_json(
+        &target_dir.join("perf/release_evidence/idle_memory_rss.json"),
+        &serde_json::to_string(&json!({
+            "schema": "pi.perf.idle_rss_measurement.v1",
+            "generated_at": generated_at,
+            "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+            "correlation_id": FAKE_ORCHESTRATE_CORRELATION_ID,
+            "source_commit": FAKE_ORCHESTRATE_SOURCE_COMMIT,
+            "source_dirty": false,
+            "pid": 1005,
+            "process_name": "pi",
+            "allocator": "system",
+            "binary_path": release_pi,
+            "binary_sha256": binary_sha256,
+            "rss_bytes": 1_572_864,
+            "idle_state": "startup_before_user_input",
+            "cargo_profile": "release",
+            "build_command": "cargo build --bin pi --release",
+            "sample_count": 5,
+            "samples": [
+                {"pid": 1001, "process_name": "pi", "rss_bytes": 1_048_576},
+                {"pid": 1002, "process_name": "pi", "rss_bytes": 1_179_648},
+                {"pid": 1003, "process_name": "pi", "rss_bytes": 1_310_720},
+                {"pid": 1004, "process_name": "pi", "rss_bytes": 1_441_792},
+                {"pid": 1005, "process_name": "pi", "rss_bytes": 1_572_864}
+            ],
+            "rss_spread_bytes": 524_288,
+            "settle_ms": 1_000,
+            "bench_env_source": "benches/bench_env.rs",
+            "bench_env": bench_env,
+            "bench_env_sha256": bench_env_sha256
+        }))
+        .expect("serialize fake idle-RSS control"),
+    );
 
     write_json(
         &target_dir.join("perf/extension_benchmark_stratification.json"),
