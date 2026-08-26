@@ -1116,6 +1116,18 @@ mod tests {
         .expect("relocated binary bytes satisfy the producer control");
         assert_eq!(relocated.binary_path, relocated_binary_path);
 
+        relocated_control["binary_path"] =
+            serde_json::json!("/unavailable/producer/target/debug/pi");
+        write_json(&relocated_control_path, &relocated_control);
+        let wrong_suffix = verify_binary_size_measurement_control_with_relocated_artifact(
+            &relocated_control_path,
+            Some(&relocated_binary_path),
+        )
+        .expect_err("digest-identical relocated bytes must not excuse a non-release producer path");
+        assert!(wrong_suffix.to_string().contains(
+            "binary_path must end with the required producer path release/pi"
+        ));
+
         std::fs::write(&binary_path, b"tampered release binary").expect("tamper release binary");
         assert!(matches!(
             verify_binary_size_measurement_control(&control_path),
@@ -1331,6 +1343,18 @@ mod tests {
         )
         .expect("relocated idle-RSS binary bytes satisfy the producer control");
         assert_eq!(relocated.binary_path, relocated_binary_path);
+
+        relocated_control["binary_path"] =
+            serde_json::json!("/unavailable/producer/target/debug/pi");
+        write_json(&relocated_control_path, &relocated_control);
+        let wrong_suffix = verify_idle_rss_measurement_control_with_relocated_artifact(
+            &relocated_control_path,
+            Some(&relocated_binary_path),
+        )
+        .expect_err("digest-identical relocated bytes must not excuse a non-release producer path");
+        assert!(wrong_suffix.to_string().contains(
+            "binary_path must end with the required producer path release/pi"
+        ));
 
         control["process_name"] = serde_json::json!("cargo-test");
         write_json(&control_path, &control);
