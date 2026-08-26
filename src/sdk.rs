@@ -298,6 +298,11 @@ pub struct SessionOptions {
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
+    /// Optional override for the package directory (`PI_PACKAGE_DIR`
+    /// equivalent) used for prompt documentation discovery. Relative values
+    /// are resolved against the session's working directory so advertised
+    /// paths stay readable through the same roots the tools use (bd-jtehj).
+    pub package_dir: Option<PathBuf>,
     pub extension_paths: Vec<PathBuf>,
     pub extension_policy: Option<String>,
     pub repair_policy: Option<String>,
@@ -388,6 +393,7 @@ impl Default for SessionOptions {
             append_system_prompt: None,
             enabled_tools: None,
             working_directory: None,
+            package_dir: None,
             no_session: true,
             session_path: None,
             session_dir: None,
@@ -1870,7 +1876,13 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     auth.refresh_expired_oauth_tokens().await?;
 
     let global_dir = Config::global_dir();
-    let package_dir = Config::package_dir();
+    let raw_package_dir = options
+        .package_dir
+        .clone()
+        .unwrap_or_else(crate::config::Config::package_dir);
+    // bd-jtehj: interpret relative package roots against the session cwd —
+    // never the ambient process cwd — before prompt discovery sees them.
+    let package_dir = crate::app::stable_package_dir(&raw_package_dir, Some(&cwd));
     let models_path = default_models_path(&global_dir);
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
 
@@ -2167,6 +2179,56 @@ mod tests {
         assert!(!provider.model_id().is_empty());
         assert_eq!(handle.model().0, provider.name());
         assert_eq!(handle.model().1, provider.model_id());
+    }
+
+    /// bd-jtehj: a RELATIVE `SessionOptions::package_dir` must resolve
+    /// against the SESSION's working directory rather than the ambient
+    /// process cwd, so prompt-advertised paths are the same absolute
+    /// locations the session tools read. Mutation-sensitive: before the fix,
+    /// prompt discovery ran from the process cwd — where `relpkgs` does not
+    /// exist — and the docs block was silently omitted.
+    #[test]
+    fn create_agent_session_resolves_relative_package_dir_against_working_directory() {
+        let _lock = current_dir_lock();
+        // Ambient process cwd differs from the session root on purpose.
+        let process_cwd = tempdir().expect("process cwd");
+        let sdk_cwd = tempdir().expect("sdk cwd");
+        let _guard = CurrentDirGuard::new(process_cwd.path());
+
+        let pkg_root = sdk_cwd.path().join("relpkgs");
+        std::fs::create_dir_all(pkg_root.join("docs")).expect("mkdir relpkgs/docs");
+        std::fs::write(pkg_root.join("README.md"), "# pi\n").expect("write readme");
+        std::fs::write(pkg_root.join("docs").join("extensions.md"), "#\n")
+            .expect("write extensions.md");
+
+        let handle = run_async(create_agent_session(SessionOptions {
+            provider: Some("openai".to_string()),
+            model: Some("gpt-4o".to_string()),
+            api_key: Some("dummy-key".to_string()),
+            working_directory: Some(sdk_cwd.path().to_path_buf()),
+            no_session: true,
+            // Deliberately relative: stabilization must anchor it to sdk_cwd.
+            package_dir: Some(PathBuf::from("relpkgs")),
+            ..SessionOptions::default()
+        }))
+        .expect("create session");
+        let system_prompt = handle
+            .session()
+            .agent
+            .system_prompt()
+            .expect("default system prompt present")
+            .to_string();
+        assert!(system_prompt.contains("Pi documentation"));
+        let advertised_readme = pkg_root.join("README.md");
+        assert!(
+            system_prompt.contains(&advertised_readme.display().to_string()),
+            "prompt must advertise the session-root-resolved README: {system_prompt}"
+        );
+        // The prompt's marker paths must be real files reachable through the
+        // same root the tools read from.
+        assert!(advertised_readme.is_file());
+        assert!(pkg_root.join("docs").join("extensions.md").is_file());
+        assert!(system_prompt.contains("extensions (docs/extensions.md)"));
     }
 
     #[test]

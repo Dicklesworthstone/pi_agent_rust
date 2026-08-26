@@ -361,15 +361,33 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let mut prompt = format!(
         "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}"
     );
-    if let Some(docs) = pi_docs_prompt_section(package_dir) {
+    if let Some(docs) = pi_docs_prompt_section(&stable_package_dir(package_dir, None)) {
         prompt.push_str("\n\n");
         prompt.push_str(&docs);
     }
     prompt
 }
 
+/// Resolve a configured package dir into ONE stable absolute location so
+/// prompt discovery and downstream tool reads cannot reinterpret a relative
+/// value from different working directories (bd-jtehj). Absolute inputs pass
+/// through untouched; textual identity is preserved (no symlink collapse) so
+/// advertised paths stay deterministic across main and SDK.
+pub(crate) fn stable_package_dir(
+    package_dir: &Path,
+    interpretation_cwd: Option<&Path>,
+) -> std::path::PathBuf {
+    if package_dir.is_absolute() {
+        return package_dir.to_path_buf();
+    }
+    interpretation_cwd.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        |cwd| cwd.join(package_dir),
+    )
+}
+
 /// The "Pi documentation" block of the default system prompt, listing only
-/// the documentation that is actually present under `package_dir`.
+/// documentation that is actually present under the resolved package root.
 ///
 /// Upstream pi ships `README.md`, `docs/`, and `examples/` inside its npm
 /// package, so its prompt can point at them unconditionally. A standalone
@@ -377,6 +395,9 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
 /// files that do not exist just wastes a tool call and confuses the model
 /// (gh #183). Returns `None` when nothing is available.
 fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
+    // Callers hand us an already-stable absolute root (bd-jtehj); every
+    // advertised path below is verified to exist right here so empty or
+    // partial installs never point the model at fiction.
     let readme = package_dir.join("README.md");
     let docs = package_dir.join("docs");
     let examples = package_dir.join("examples");
@@ -386,6 +407,8 @@ fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
     if !has_readme && !has_docs && !has_examples {
         return None;
     }
+
+    let exists_file = |relative: &str| -> bool { docs.join(relative).is_file() };
 
     let mut lines = vec![String::from(
         "Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):",
@@ -397,27 +420,74 @@ fn pi_docs_prompt_section(package_dir: &Path) -> Option<String> {
         lines.push(format!("- Additional docs: {}", docs.display()));
     }
     if has_examples {
-        lines.push(format!(
-            "- Examples: {} (extensions, custom tools, SDK)",
-            examples.display()
+        let examples_extensions = examples.join("extensions").is_dir();
+        if examples_extensions {
+            lines.push(format!(
+                "- Examples: {} (extensions, custom tools, SDK)",
+                examples.display()
+            ));
+        } else {
+            lines.push(format!("- Examples: {}", examples.display()));
+        }
+    }
+
+    const SINGLE_FILE_TOPICS: [(&str, &str); 9] = [
+        ("themes", "docs/themes.md"),
+        ("skills", "docs/skills.md"),
+        ("prompt templates", "docs/prompt-templates.md"),
+        ("TUI components", "docs/tui.md"),
+        ("keybindings", "docs/keybindings.md"),
+        ("SDK integrations", "docs/sdk.md"),
+        ("custom providers", "docs/custom-provider.md"),
+        ("adding models", "docs/models.md"),
+        ("pi packages", "docs/packages.md"),
+    ];
+
+    // Topic index: one entry per label whose documented file(s) actually
+    // exist. The old behavior advertised all ten unconditionally.
+    let mut surfaces: Vec<String> = Vec::new();
+    {
+        let ext_doc = has_docs && exists_file("extensions.md");
+        let ext_examples = has_examples && examples.join("extensions").is_dir();
+        match (ext_doc, ext_examples) {
+            (true, true) => {
+                surfaces.push("extensions (docs/extensions.md, examples/extensions/)".to_string());
+            }
+            (true, false) => surfaces.push("extensions (docs/extensions.md)".to_string()),
+            (false, true) => surfaces.push("extensions (examples/extensions/)".to_string()),
+            (false, false) => {}
+        }
+    }
+    for (label, file) in SINGLE_FILE_TOPICS {
+        let Some(file_name) = file.strip_prefix("docs/") else {
+            continue;
+        };
+        if exists_file(file_name) {
+            surfaces.push(format!("{label} ({file})"));
+        }
+    }
+    if !surfaces.is_empty() {
+        lines.push(format!("- When asked about: {}", surfaces.join(", ")));
+    }
+
+    lines.push(String::from(match (has_docs, has_examples) {
+        (true, true) => "- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing",
+        (true, false) | (false, true) => {
+            "- When working on pi topics, read the installed documentation surface, and follow .md cross-references before implementing"
+        }
+        (false, false) => {
+            "- When working on pi topics, read the documentation and follow .md cross-references before implementing"
+        }
+    }));
+    if exists_file("tui.md") {
+        lines.push(String::from(
+            "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
+        ));
+    } else {
+        lines.push(String::from(
+            "- Always read pi .md files completely and follow links to related docs",
         ));
     }
-    if has_docs {
-        let mut topics = String::from("- When asked about: extensions (docs/extensions.md");
-        if has_examples {
-            topics.push_str(", examples/extensions/");
-        }
-        topics.push_str("), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)");
-        lines.push(topics);
-    }
-    lines.push(String::from(if has_docs || has_examples {
-        "- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing"
-    } else {
-        "- When working on pi topics, read the documentation and follow .md cross-references before implementing"
-    }));
-    lines.push(String::from(
-        "- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)",
-    ));
     Some(lines.join("\n"))
 }
 
@@ -2888,8 +2958,8 @@ mod tests {
             assert!(models_equal(&left, &right));
         }
     }
-    /// gh #183: the default prompt must not instruct the model to read
-    /// documentation that the standalone install does not provision.
+    /// gh #183 + bd-jtehj: the default prompt must list each documentation
+    /// surface and topic file only when it actually exists.
     #[test]
     fn default_system_prompt_omits_docs_block_when_package_dir_has_no_docs() {
         let dir = tempdir().expect("tempdir");
@@ -2906,36 +2976,17 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         let prompt = default_system_prompt(&["read"], &missing);
         assert!(!prompt.contains("Pi documentation"));
-    }
 
-    #[test]
-    fn default_system_prompt_lists_only_present_docs() {
-        let dir = tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("README.md"), "# pi\n").expect("write readme");
-        let prompt = default_system_prompt(&["read"], dir.path());
-        assert!(prompt.contains("Pi documentation"));
-        assert!(prompt.contains(&format!(
-            "- Main documentation: {}",
-            dir.path().join("README.md").display()
-        )));
-        assert!(!prompt.contains("- Additional docs:"));
-        assert!(!prompt.contains("- Examples:"));
-        assert!(!prompt.contains("docs/extensions.md"));
-        assert!(prompt.contains("read the documentation and follow .md cross-references"));
-
+        // Empty directory placeholders must NOT resurrect the block either.
         std::fs::create_dir(dir.path().join("docs")).expect("mkdir docs");
         std::fs::create_dir(dir.path().join("examples")).expect("mkdir examples");
         let prompt = default_system_prompt(&["read"], dir.path());
-        assert!(prompt.contains(&format!(
-            "- Additional docs: {}",
-            dir.path().join("docs").display()
-        )));
-        assert!(prompt.contains(&format!(
-            "- Examples: {} (extensions, custom tools, SDK)",
-            dir.path().join("examples").display()
-        )));
-        assert!(prompt.contains("extensions (docs/extensions.md, examples/extensions/)"));
-        assert!(prompt.contains("read the docs and examples, and follow .md cross-references"));
+        assert!(prompt.contains("Pi documentation"));
+        assert!(
+            !prompt.contains("When asked about:"),
+            "empty dirs must not advertise any topic files: {prompt}"
+        );
+        assert!(!prompt.contains("docs/extensions.md"));
 
         // A README that is a directory (or docs that is a file) does not count.
         let odd = tempdir().expect("tempdir");
@@ -2943,5 +2994,106 @@ mod tests {
         std::fs::write(odd.path().join("docs"), "").expect("write docs file");
         let prompt = default_system_prompt(&["read"], odd.path());
         assert!(!prompt.contains("Pi documentation"));
+    }
+
+    /// Partial installs advertise exactly the files that exist — nothing more.
+    #[test]
+    fn default_system_prompt_partial_install_lists_only_existing_topic_files() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# pi\n").expect("write readme");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir(&docs).expect("mkdir docs");
+        for present in ["extensions.md", "tui.md"] {
+            std::fs::write(docs.join(present), "#\n").expect("write topic");
+        }
+
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains("extensions (docs/extensions.md)"));
+        assert!(
+            !prompt.contains(", examples/extensions/"),
+            "no examples surface exists"
+        );
+        assert!(prompt.contains("TUI components (docs/tui.md)"));
+        // Every absent topic stays out of the roster.
+        assert!(!prompt.contains("docs/themes.md"));
+        assert!(!prompt.contains("docs/skills.md"));
+        assert!(!prompt.contains("docs/packages.md"));
+        assert!(prompt.contains("(e.g., tui.md for TUI API details)"));
+        // No examples surface exists, so guidance names the installed one only.
+        assert!(prompt.contains("read the installed documentation surface"));
+        assert!(!prompt.contains("read the docs and examples"));
+    }
+
+    /// Docs-only and examples-only installs speak about what is installed.
+    #[test]
+    fn default_system_prompt_names_only_installed_surfaces() {
+        let docs_only = tempdir().expect("tempdir");
+        std::fs::create_dir(docs_only.path().join("docs")).expect("mkdir docs");
+        let prompt = default_system_prompt(&["read"], docs_only.path());
+        assert!(prompt.contains("Pi documentation"));
+        assert!(prompt.contains("- Additional docs:"));
+        assert!(!prompt.contains("- Main documentation:"));
+        assert!(!prompt.contains("- Examples:"));
+        assert!(prompt.contains("read the installed documentation surface"));
+
+        let examples_only = tempdir().expect("tempdir");
+        let examples = examples_only.path().join("examples");
+        std::fs::create_dir_all(examples.join("extensions")).expect("mkdir examples/ext");
+        let prompt = default_system_prompt(&["read"], examples_only.path());
+        assert!(prompt.contains(&format!(
+            "- Examples: {} (extensions, custom tools, SDK)",
+            examples.display()
+        )));
+        assert!(prompt.contains("extensions (examples/extensions/)"));
+        assert!(!prompt.contains("- Additional docs:"));
+        assert!(!prompt.contains("docs/extensions.md"));
+    }
+
+    /// A fully provisioned package advertises every topic and the composite
+    /// extensions entry, with the stable absolute root shown on each path.
+    #[test]
+    fn default_system_prompt_full_package_advertises_every_surface() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("README.md"), "# pi\n").expect("write readme");
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).expect("mkdir docs");
+        let files = [
+            "extensions.md",
+            "themes.md",
+            "skills.md",
+            "prompt-templates.md",
+            "tui.md",
+            "keybindings.md",
+            "sdk.md",
+            "custom-provider.md",
+            "models.md",
+            "packages.md",
+        ];
+        for file in files {
+            std::fs::write(docs.join(file), "#\n").expect("write doc file");
+        }
+        std::fs::create_dir_all(dir.path().join("examples").join("extensions"))
+            .expect("mkdir examples/ext");
+
+        let prompt = default_system_prompt(&["read"], dir.path());
+        assert!(prompt.contains(&format!(
+            "- Main documentation: {}",
+            dir.path().join("README.md").display()
+        )));
+        assert!(prompt.contains("extensions (docs/extensions.md, examples/extensions/)"));
+        for label in [
+            "themes (docs/themes.md)",
+            "skills (docs/skills.md)",
+            "prompt templates (docs/prompt-templates.md)",
+            "TUI components (docs/tui.md)",
+            "keybindings (docs/keybindings.md)",
+            "SDK integrations (docs/sdk.md)",
+            "custom providers (docs/custom-provider.md)",
+            "adding models (docs/models.md)",
+            "pi packages (docs/packages.md)",
+        ] {
+            assert!(prompt.contains(label), "missing topic entry {label}");
+        }
+        assert!(prompt.contains("read the docs and examples, and follow .md cross-references"));
     }
 }
