@@ -3664,8 +3664,8 @@ main() {
     local download_rc=0
     if run_with_spinner "Downloading release binary" download_release_binary > "$TMP/source_bin_path"; then
       source_bin=$(cat "$TMP/source_bin_path")
-      release_binary_needs_newer_libc "$source_bin"
-      local libc_probe_rc=$?
+      local libc_probe_rc=0
+      release_binary_needs_newer_libc "$source_bin" || libc_probe_rc=$?
       if [ "$libc_probe_rc" -eq 2 ]; then
         # Inconclusive probe (hard deadline elapsed): treat the artifact as
         # untrustworthy and never touch an existing executable with it.
