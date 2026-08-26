@@ -1,0 +1,89 @@
+name: Model Catalog Drift
+
+# Runs the model-catalog generator (scripts/gen-model-catalog.mjs, gh #117) and
+# checks the vendored catalog against what the pinned @earendil-works/pi-ai
+# upstream + scripts/models.local.json overlay would produce.
+#
+# ADVISORY by default: the vendored catalog is intentionally NOT yet sourced from
+# @earendil-works/pi-ai (the only published line is ~23-30 minor versions ahead of
+# the vendored 0.51-era catalog; see scripts/models.local.json "_README"). This
+# job only reports the delta and proves the generator runs clean.
+#
+# To make it GATING after the catalog is adopted from upstream, set the repo
+# variable PI_CATALOG_ADOPT_UPSTREAM=true: the job then regenerates the vendored
+# file and fails on any drift (i.e. "updates are a version bump + regen", not a
+# manual edit).
+
+on:
+  push:
+    paths:
+      - scripts/gen-model-catalog.mjs
+      - scripts/models.local.json
+      - scripts/package.json
+      - scripts/package-lock.json
+      - .github/workflows/model-catalog-drift.yml
+      - legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts
+  pull_request:
+    paths:
+      - scripts/gen-model-catalog.mjs
+      - scripts/models.local.json
+      - scripts/package.json
+      - scripts/package-lock.json
+      - .github/workflows/model-catalog-drift.yml
+      - legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts
+  schedule:
+    # Weekly: catches an @earendil-works/pi-ai bump landed by Dependabot.
+    - cron: '17 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-catalog-drift-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      VENDORED: legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned generator deps
+        run: npm --prefix scripts ci
+      - name: Regenerate catalog candidate
+        run: node scripts/gen-model-catalog.mjs --out scripts/models.generated.candidate.ts
+      - name: Drift check
+        env:
+          ADOPT: ${{ vars.PI_CATALOG_ADOPT_UPSTREAM }}
+        run: |
+          set -euo pipefail
+          if [ "${ADOPT:-}" = "true" ]; then
+            echo "Adoption mode: vendored catalog must equal the generated output."
+            node scripts/gen-model-catalog.mjs --out "$VENDORED"
+            if ! git diff --exit-code -- "$VENDORED"; then
+              echo "::error::Vendored model catalog is out of sync with @earendil-works/pi-ai + local overlay. Run 'npm --prefix scripts run generate:vendored' and commit."
+              exit 1
+            fi
+            echo "Vendored catalog is in sync."
+          else
+            echo "::notice::Advisory mode. Set repo variable PI_CATALOG_ADOPT_UPSTREAM=true to gate."
+            echo "Generator runs clean. The vendored catalog is intentionally NOT yet sourced from @earendil-works/pi-ai (see scripts/models.local.json _README)."
+            diff -u "$VENDORED" scripts/models.generated.candidate.ts > catalog-drift.diff || true
+            echo "Generated-vs-vendored delta: $(wc -l < catalog-drift.diff) diff lines"
+          fi
+      - name: Upload candidate + drift artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-catalog-candidate
+          path: |
+            scripts/models.generated.candidate.ts
+            catalog-drift.diff
+          if-no-files-found: ignore
+          retention-days: 14

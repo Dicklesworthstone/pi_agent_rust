@@ -1,0 +1,2516 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CI: "true"
+      VCR_MODE: "playback"
+      VCR_CASSETTE_DIR: "tests/fixtures/vcr"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      CI_GATE_PROMOTION_MODE: ${{ vars.CI_GATE_PROMOTION_MODE || 'strict' }}
+      CI_GATE_THRESHOLD_VERSION: ${{ vars.CI_GATE_THRESHOLD_VERSION || '2026-02-08.v1' }}
+      CI_GATE_MIN_PASS_RATE_PCT: ${{ vars.CI_GATE_MIN_PASS_RATE_PCT || '80.0' }}
+      CI_GATE_MAX_FAIL_COUNT: ${{ vars.CI_GATE_MAX_FAIL_COUNT || '36' }}
+      CI_GATE_MAX_NA_COUNT: ${{ vars.CI_GATE_MAX_NA_COUNT || '170' }}
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Free disk space [linux]
+        if: runner.os == 'Linux'
+        working-directory: /
+        run: |
+          set -euxo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+            /opt/hostedtoolcache/Python /opt/hostedtoolcache/Ruby \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk \
+            /usr/local/share/powershell /usr/share/swift \
+            /usr/local/graalvm /usr/local/.ghcup /usr/local/julia*
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: PR Definition-of-Done evidence guard [linux]
+        if: runner.os == 'Linux' && github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+          import sys
+
+          base_sha = os.environ.get("BASE_SHA", "").strip()
+          head_sha = os.environ.get("HEAD_SHA", "").strip()
+          pr_body = os.environ.get("PR_BODY", "").replace("\r\n", "\n")
+
+          if not base_sha or not head_sha:
+              print("missing pull_request base/head SHA", file=sys.stderr)
+              sys.exit(1)
+
+          diff_proc = subprocess.run(
+              ["git", "diff", "--name-only", f"{base_sha}...{head_sha}"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          changed_files = [line.strip() for line in diff_proc.stdout.splitlines() if line.strip()]
+          if not changed_files:
+              print("No changed files in PR diff; skipping DoD evidence guard.")
+              sys.exit(0)
+
+          feature_path_pattern = re.compile(
+              r"^(src/|Cargo\.toml$|Cargo\.lock$|scripts/e2e/|scripts/release_gate\.sh$|scripts/check_conformance_regression\.py$|scripts/check_traceability_matrix\.py$)"
+          )
+          feature_files = [path for path in changed_files if feature_path_pattern.search(path)]
+          if not feature_files:
+              print("No feature-surface changes detected; skipping DoD evidence guard.")
+              sys.exit(0)
+
+          required_patterns = {
+              "Definition-of-Done header": r"(?mi)^##\s+Definition of Done Evidence\s*$",
+              "Unit evidence checkbox": r"(?mi)^\s*-\s*\[[xX]\]\s+Unit evidence linked\s*$",
+              "E2E evidence checkbox": r"(?mi)^\s*-\s*\[[xX]\]\s+E2E evidence linked\s*$",
+              "Extension evidence checkbox": r"(?mi)^\s*-\s*\[[xX]\]\s+Extension evidence linked\s*$",
+              "Failing-path diagnostics checkbox": r"(?mi)^\s*-\s*\[[xX]\]\s+Failing paths include artifact links and repro commands\s*$",
+              "Reproduction Commands header": r"(?mi)^##\s+Reproduction Commands\s*$",
+          }
+          missing = [label for label, pattern in required_patterns.items() if not re.search(pattern, pr_body)]
+
+          evidence_links = re.findall(r"\[[^\]]+\]\((https?://[^)]+)\)", pr_body)
+          if len(evidence_links) < 3:
+              missing.append("At least three HTTP(S) evidence links")
+
+          command_patterns = {
+              "Unit reproduction command": r"(?mi)`?cargo test --all-targets`?",
+              "E2E reproduction command": r"(?mi)`?\./scripts/e2e/run_all\.sh --profile ci`?",
+              "Extension reproduction command": r"(?mi)`?cargo test (?:--all-targets )?--features ext-conformance`?",
+          }
+          for label, pattern in command_patterns.items():
+              if not re.search(pattern, pr_body):
+                  missing.append(label)
+
+          forbidden_placeholders = (
+              "<link>",
+              "<artifact link>",
+              "<paste command>",
+              "<command>",
+          )
+          if any(token in pr_body for token in forbidden_placeholders):
+              missing.append("Template placeholders removed")
+
+          if missing:
+              print("Definition-of-Done evidence guard failed for feature-surface changes.", file=sys.stderr)
+              print("Changed feature files:", file=sys.stderr)
+              for path in feature_files:
+                  print(f"  - {path}", file=sys.stderr)
+              print("Missing PR body requirements:", file=sys.stderr)
+              for item in missing:
+                  print(f"  - {item}", file=sys.stderr)
+              print(
+                  "Complete .github/pull_request_template.md with evidence links and repro commands before merging.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print("Definition-of-Done evidence guard passed.")
+          PY
+
+      - name: Install system deps (fd, rg, xcb) [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install system deps (fd, rg) [macos]
+        if: runner.os == 'macOS'
+        run: |
+          set -euxo pipefail
+          brew install fd ripgrep
+
+      - name: Install system deps (fd, rg) [windows]
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install -y fd ripgrep
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: No-mock dependency guard
+        run: |
+          set -euxo pipefail
+          if rg -n --fixed-strings -e mockall -e mockito -e wiremock Cargo.toml Cargo.lock; then
+            echo "Mocking crates are forbidden in dependencies."
+            exit 1
+          fi
+
+      - name: Cargo bin manifest parity
+        run: |
+          set -euxo pipefail
+          bash scripts/check_cargo_bin_parity.sh
+
+      - name: Docs purpose/header lint
+        run: |
+          set -euxo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/check_docs_purpose_headers.py
+          elif command -v python >/dev/null 2>&1; then
+            python scripts/check_docs_purpose_headers.py
+          else
+            echo "python interpreter not found"
+            exit 1
+          fi
+
+      - name: Completion audit closeout gate self-test
+        run: |
+          set -euxo pipefail
+          python3 scripts/check_completion_audit_gate.py --self-test --generated-at 2026-01-02T03:04:05+00:00
+
+      - name: No-mock code guard
+        run: |
+          set -euo pipefail
+
+          # The allowlist is .no-mock-allowlist at repo root. Each non-blank,
+          # non-# line is "<path>:<identifier>"; path "*" matches anywhere.
+          # Anything not covered is treated as a NEW policy violation and
+          # fails CI. See the allowlist file's header for rationale.
+          allowlist=".no-mock-allowlist"
+          if [ ! -f "$allowlist" ]; then
+            echo "::error::missing $allowlist (required by no-mock policy gate)"
+            exit 1
+          fi
+
+          matches="$(rg -n --column --no-heading --color never --glob '!tests/ext_conformance/artifacts/**' -o '\b(Mock|Fake|Stub)[A-Za-z0-9_]+\b' tests || true)"
+          if [ -z "$matches" ]; then
+            exit 0
+          fi
+
+          # Split allowlist into global (*:Ident) and per-file (path:Ident) sets.
+          global_allow="$(grep -E '^\*:' "$allowlist" | sed 's/^\*://' | sort -u)"
+          file_allow="$(grep -Ev '^\s*(#|$|\*:)' "$allowlist" | sort -u)"
+
+          # rg output: file:line:col:identifier (4 colon-separated fields).
+          violations="$(printf '%s\n' "$matches" | awk -F: \
+            -v global_allow="$global_allow" \
+            -v file_allow="$file_allow" \
+            '
+            BEGIN {
+              n = split(global_allow, ga, "\n")
+              for (i = 1; i <= n; i++) if (ga[i] != "") g[ga[i]] = 1
+              n = split(file_allow, fa, "\n")
+              for (i = 1; i <= n; i++) if (fa[i] != "") f[fa[i]] = 1
+            }
+            {
+              ident = $4
+              file = $1
+              if (ident in g) next
+              key = file ":" ident
+              if (key in f) next
+              print
+            }')"
+
+          if [ -n "$violations" ]; then
+            printf '%s\n' "$violations"
+            echo
+            echo "NEW no-mock policy violations detected."
+            echo "Mock*/Fake*/Stub* identifiers are forbidden in tests."
+            echo "Use VCR fixtures or real deps instead. See docs/TEST_COVERAGE_MATRIX.md."
+            echo "If the identifier is unavoidable, add it to .no-mock-allowlist with"
+            echo "rationale and a follow-up issue link."
+            exit 1
+          fi
+
+      - name: Traceability matrix guard
+        run: |
+          set -euxo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/check_traceability_matrix.py
+          elif command -v python >/dev/null 2>&1; then
+            python scripts/check_traceability_matrix.py
+          else
+            echo "python interpreter not found"
+            exit 1
+          fi
+
+      - name: Evidence freshness claim integrity
+        run: |
+          set -euxo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/check_readme_evidence_freshness.py
+          elif command -v python >/dev/null 2>&1; then
+            python scripts/check_readme_evidence_freshness.py
+          else
+            echo "python interpreter not found"
+            exit 1
+          fi
+
+      - name: Closeout and runpack freshness integrity
+        run: |
+          set -euo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          elif command -v python >/dev/null 2>&1; then
+            PYTHON=python
+          else
+            echo "python interpreter not found"
+            exit 1
+          fi
+
+          closeout_report="$(mktemp)"
+          if ! "$PYTHON" scripts/check_closeout_gate_freshness.py --compact > "$closeout_report"; then
+            echo "Closeout freshness audit failed:"
+            "$PYTHON" -m json.tool "$closeout_report" || cat "$closeout_report"
+            exit 1
+          fi
+          "$PYTHON" -m json.tool "$closeout_report" >/dev/null
+
+          # Keep --run-runpack-smoke out of PR CI: it exercises the broader
+          # runpack builder. The self-test is the bounded freshness-guard
+          # contract proof; live closeout artifacts are audited above.
+          "$PYTHON" scripts/check_swarm_runpack_freshness.py --self-test
+
+      - name: Built-in tool count claim guard
+        run: |
+          set -euo pipefail
+          files="$(git ls-files README.md AGENTS.md 'docs/*.md' 'tests/*.rs')"
+          stale_claims="$(printf '%s\n' "$files" | xargs rg -n --color never \
+            -e '7 built-in' \
+            -e '7 Built-in' \
+            -e 'seven built-in' \
+            -e 'Seven built-ins' \
+            -e 'all 7 built-in' \
+            -e 'all 7 tools' \
+            -e 'exercise all 7 tools' || true)"
+          if [ -n "$stale_claims" ]; then
+            echo "$stale_claims"
+            echo "Built-in tool count drift: Pi exposes 8 built-ins including hashline_edit."
+            exit 1
+          fi
+          rg -n --fixed-strings '### 8 Built-in Tools' README.md >/dev/null
+          rg -n --fixed-strings '`hashline_edit`' README.md AGENTS.md >/dev/null
+
+      - name: Provider count claim guard
+        run: |
+          set -euo pipefail
+          files="$(git ls-files README.md AGENTS.md 'docs/*.md' 'tests/*.rs')"
+          native_claims="$(printf '%s\n' "$files" | xargs rg -n --color never \
+            -e '\b[0-9]+[[:space:]]+native providers?\b' \
+            -e '\b[0-9]+[[:space:]]+native provider implementation modules?\b' || true)"
+          stale_claims="$(printf '%s\n' "$native_claims" | rg -v \
+            -e '\b10[[:space:]]+native providers?\b' \
+            -e '\b10[[:space:]]+native provider implementation modules?\b' \
+            -e 'Expected 10 native providers' || true)"
+          if [ -n "$stale_claims" ]; then
+            echo "$stale_claims"
+            echo "Native provider count drift: use 10 native provider implementation modules, counted as src/providers/*.rs excluding mod.rs."
+            exit 1
+          fi
+          rg -n --fixed-strings '10 native provider implementation modules' README.md AGENTS.md docs/providers.md >/dev/null
+
+      - name: SQLite sessions feature claim guard
+        run: |
+          set -euo pipefail
+          files="$(git ls-files README.md AGENTS.md 'docs/*.md' 'tests/*.rs')"
+          stale_claims="$(printf '%s\n' "$files" | xargs rg -n --color never -i \
+            -e 'optional[[:space:]]+sqlite[[:space:]]+session' \
+            -e 'sqlite-sessions.*optional' \
+            -e 'optional.*sqlite-sessions' \
+            -e 'sqlite-sessions.*behind[[:space:]]+(a[[:space:]]+)?feature[[:space:]]+flag' \
+            -e 'behind[[:space:]]+(a[[:space:]]+)?feature[[:space:]]+flag.*sqlite-sessions' || true)"
+          if [ -n "$stale_claims" ]; then
+            echo "$stale_claims"
+            echo "sqlite-sessions claim drift: Cargo.toml enables sqlite-sessions by default; document opt-out with --no-default-features instead."
+            exit 1
+          fi
+          rg -n --fixed-strings 'default = ["image-resize", "jemalloc", "clipboard", "wasm-host", "sqlite-sessions"]' Cargo.toml >/dev/null
+          rg -n --fixed-strings 'Default builds enable `image-resize`, `jemalloc`, `clipboard`, `wasm-host`, and `sqlite-sessions`.' README.md >/dev/null
+
+      - name: Suite classification guard
+        run: |
+          set -euo pipefail
+          # Every tests/*.rs file must appear in tests/suite_classification.toml.
+          # Subdirectories (common/, provider_streaming/, conformance/, ext_conformance/) are excluded.
+          classification="tests/suite_classification.toml"
+          if [ ! -f "$classification" ]; then
+            echo "Missing $classification — see docs/testing-policy.md"
+            exit 1
+          fi
+
+          missing=0
+          for f in tests/*.rs; do
+            stem="$(basename "$f" .rs)"
+            if ! rg -q --fixed-strings "\"$stem\"" "$classification"; then
+              echo "UNCLASSIFIED: $f is not listed in $classification"
+              missing=$((missing + 1))
+            fi
+          done
+
+          if [ "$missing" -gt 0 ]; then
+            echo
+            echo "Suite classification violation: $missing test file(s) missing from $classification."
+            echo "Add each file to [suite.unit], [suite.vcr], or [suite.e2e]. See docs/testing-policy.md."
+            exit 1
+          fi
+          echo "All test files classified."
+
+      - name: VCR leak guard (unit suite)
+        run: |
+          set -euo pipefail
+          classification="tests/suite_classification.toml"
+
+          # Extract unit suite file names.
+          unit_files="$(sed -n '/\[suite\.unit\]/,/\[suite\./{ /^files/,/\]/p }' "$classification" \
+            | rg -o '"([^"]+)"' -r '$1' || true)"
+
+          if [ -z "$unit_files" ]; then
+            echo "No unit suite files found; skipping VCR leak check."
+            exit 0
+          fi
+
+          violations=0
+          for stem in $unit_files; do
+            f="tests/${stem}.rs"
+            [ -f "$f" ] || continue
+            if rg -q 'VcrRecorder|VcrMode|cassette_root|cassette_dir|fixtures/vcr' "$f"; then
+              echo "VCR LEAK: $f is in suite.unit but references VCR infrastructure."
+              violations=$((violations + 1))
+            fi
+          done
+
+          if [ "$violations" -gt 0 ]; then
+            echo
+            echo "VCR leak violation: $violations unit-suite file(s) reference VCR."
+            echo "Move to [suite.vcr] or remove VCR usage. See docs/testing-policy.md."
+            exit 1
+          fi
+          echo "No VCR leaks in unit suite."
+
+      - name: Quarantine expiry guard
+        run: |
+          set -euo pipefail
+          classification="tests/suite_classification.toml"
+          python3 - "$classification" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+          from datetime import date, datetime, timezone
+
+          toml_path = sys.argv[1]
+          with open(toml_path, encoding="utf-8") as fh:
+              content = fh.read()
+
+          # Simple TOML parser: find [quarantine.<name>] sections and extract key=value pairs.
+          section_re = re.compile(r"^\[quarantine\.(\w+)\]\s*$", re.MULTILINE)
+          kv_re = re.compile(r'^(\w+)\s*=\s*"([^"]*)"', re.MULTILINE)
+
+          entries = {}
+          for match in section_re.finditer(content):
+              name = match.group(1)
+              start = match.end()
+              # Find next section or end of file.
+              next_section = re.search(r"^\[", content[start:], re.MULTILINE)
+              end = start + next_section.start() if next_section else len(content)
+              block = content[start:end]
+              fields = {m.group(1): m.group(2) for m in kv_re.finditer(block)}
+              entries[name] = fields
+
+          allowed_categories = {
+              "FLAKE-TIMING",
+              "FLAKE-ENV",
+              "FLAKE-NET",
+              "FLAKE-RES",
+              "FLAKE-EXT",
+              "FLAKE-LOGIC",
+          }
+          max_quarantine_days = 14
+          retry_policy = {
+              "max_auto_retries": 1,
+              "retry_delay_seconds": 5,
+              "retry_scope": "failed-target-only",
+              "second_failure_policy": "deterministic-failure",
+          }
+
+          today = date.today()
+          report = {
+              "schema": "pi.test.quarantine_report.v2",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "policy_version": "2026-02-10",
+              "today": today.isoformat(),
+              "max_quarantine_days": max_quarantine_days,
+              "retry_policy": retry_policy,
+              "active_count": 0,
+              "expiring_soon_count": 0,
+              "expired_count": 0,
+              "category_counts": {},
+              "entries": [],
+              "escalations": [],
+          }
+
+          required_fields = {
+              "category",
+              "owner",
+              "quarantined",
+              "expires",
+              "bead",
+              "evidence",
+              "repro",
+              "reason",
+              "remove_when",
+          }
+          errors = []
+
+          for name, fields in sorted(entries.items()):
+              missing = required_fields - set(fields.keys())
+              if missing:
+                  errors.append(f"quarantine.{name}: missing required fields: {sorted(missing)}")
+                  continue
+
+              category = fields.get("category", "").strip()
+              if category not in allowed_categories:
+                  errors.append(
+                      f"quarantine.{name}: invalid category {category!r}; expected one of {sorted(allowed_categories)}"
+                  )
+                  continue
+
+              try:
+                  quarantined_date = date.fromisoformat(fields["quarantined"])
+              except ValueError:
+                  errors.append(
+                      f"quarantine.{name}: invalid quarantined date: {fields['quarantined']}"
+                  )
+                  continue
+
+              try:
+                  expires_date = date.fromisoformat(fields["expires"])
+              except ValueError:
+                  errors.append(f"quarantine.{name}: invalid expires date: {fields['expires']}")
+                  continue
+
+              quarantine_span_days = (expires_date - quarantined_date).days
+              if quarantine_span_days < 0:
+                  errors.append(
+                      f"quarantine.{name}: expires precedes quarantined ({fields['quarantined']} -> {fields['expires']})"
+                  )
+                  continue
+              if quarantine_span_days > max_quarantine_days:
+                  errors.append(
+                      f"quarantine.{name}: quarantine window {quarantine_span_days}d exceeds max {max_quarantine_days}d"
+                  )
+                  continue
+
+              if not fields.get("evidence", "").strip():
+                  errors.append(f"quarantine.{name}: evidence must reference CI run URL or artifact path")
+                  continue
+              if not fields.get("repro", "").strip():
+                  errors.append(f"quarantine.{name}: repro must include exact reproduction command")
+                  continue
+              if not fields.get("remove_when", "").strip():
+                  errors.append(f"quarantine.{name}: remove_when must define exit criteria")
+                  continue
+
+              days_remaining = (expires_date - today).days
+              if days_remaining < 0:
+                  status = "expired"
+                  report["expired_count"] += 1
+                  report["escalations"].append(
+                      {
+                          "name": name,
+                          "severity": "critical",
+                          "action": "Fix now or remove quarantine entry before merge",
+                          "owner": fields.get("owner", ""),
+                          "bead": fields.get("bead", ""),
+                      }
+                  )
+              elif days_remaining <= 2:
+                  status = "expiring-soon"
+                  report["expiring_soon_count"] += 1
+                  report["active_count"] += 1
+                  report["escalations"].append(
+                      {
+                          "name": name,
+                          "severity": "warning",
+                          "action": "Prepare fix/extension with updated evidence before expiry",
+                          "owner": fields.get("owner", ""),
+                          "bead": fields.get("bead", ""),
+                      }
+                  )
+              else:
+                  status = "active"
+                  report["active_count"] += 1
+
+              report["category_counts"][category] = report["category_counts"].get(category, 0) + 1
+              report["entries"].append({
+                  "name": name,
+                  "category": category,
+                  "owner": fields.get("owner", ""),
+                  "quarantined": fields.get("quarantined", ""),
+                  "expires": fields.get("expires", ""),
+                  "bead": fields.get("bead", ""),
+                  "evidence": fields.get("evidence", ""),
+                  "repro": fields.get("repro", ""),
+                  "reason": fields.get("reason", ""),
+                  "remove_when": fields.get("remove_when", ""),
+                  "status": status,
+                  "quarantine_span_days": quarantine_span_days,
+                  "days_remaining": days_remaining,
+              })
+
+          report_path = pathlib.Path("tests/quarantine_report.json")
+          report_path.write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          )
+
+          audit_path = pathlib.Path("tests/quarantine_audit.jsonl")
+          audit_lines = []
+          for entry in report["entries"]:
+              audit_lines.append(
+                  json.dumps(
+                      {
+                          "schema": "pi.test.quarantine_audit_entry.v1",
+                          "generated_at": report["generated_at"],
+                          "name": entry["name"],
+                          "category": entry["category"],
+                          "owner": entry["owner"],
+                          "bead": entry["bead"],
+                          "status": entry["status"],
+                          "expires": entry["expires"],
+                          "days_remaining": entry["days_remaining"],
+                          "evidence": entry["evidence"],
+                          "repro": entry["repro"],
+                          "remove_when": entry["remove_when"],
+                      },
+                      sort_keys=True,
+                  )
+              )
+          audit_path.write_text(("\n".join(audit_lines) + "\n") if audit_lines else "", encoding="utf-8")
+
+          print(
+              "Quarantine report:"
+              f" {report['active_count']} active,"
+              f" {report['expiring_soon_count']} expiring-soon,"
+              f" {report['expired_count']} expired."
+          )
+          print(f"  report: {report_path}")
+          print(f"  audit:  {audit_path}")
+
+          if errors:
+              for err in errors:
+                  print(f"ERROR: {err}", file=sys.stderr)
+              sys.exit(1)
+
+          if report["expired_count"] > 0:
+              print("Expired quarantine entries (must fix or extend):", file=sys.stderr)
+              for entry in report["entries"]:
+                  if entry["status"] == "expired":
+                      print(f"  - {entry['name']} (expired {-entry['days_remaining']} days ago, owner: {entry['owner']}, bead: {entry['bead']})", file=sys.stderr)
+              sys.exit(1)
+
+          if report["expiring_soon_count"] > 0:
+              print("Expiring-soon quarantine entries (review and refresh evidence/remove_when):")
+              for entry in report["entries"]:
+                  if entry["status"] == "expiring-soon":
+                      print(
+                          f"  - {entry['name']} (expires in {entry['days_remaining']} day(s), owner: {entry['owner']}, bead: {entry['bead']})"
+                      )
+
+          print("All quarantine entries are within policy bounds.")
+          PY
+
+      - name: Parity suite gate
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          # Validate that all parity test suites are classified and will run in CI.
+          classification = Path("tests/suite_classification.toml")
+          content = classification.read_text(encoding="utf-8")
+
+          parity_suites = [
+              "json_mode_parity",
+              "cross_surface_parity",
+              "config_precedence",
+              "vcr_parity_validation",
+              "e2e_cross_provider_parity",
+          ]
+
+          missing = []
+          for suite in parity_suites:
+              if f'"{suite}"' not in content:
+                  missing.append(suite)
+
+          if missing:
+              print(f"PARITY GATE FAIL: {len(missing)} parity suite(s) not classified:", file=sys.stderr)
+              for name in missing:
+                  print(f"  - {name}", file=sys.stderr)
+              sys.exit(1)
+
+          # Validate parity evidence artifacts exist (if available from prior runs).
+          evidence_path = Path("tests/ext_conformance/reports/conformance_summary.json")
+          if evidence_path.exists():
+              summary = json.loads(evidence_path.read_text(encoding="utf-8"))
+              evidence = summary.get("evidence", {})
+              required = {"parity_logs", "smoke_logs"}
+              present = set(evidence.keys()) if isinstance(evidence, dict) else set()
+              missing_keys = required - present
+              if missing_keys:
+                  print(f"WARNING: conformance_summary.json missing evidence keys: {sorted(missing_keys)}")
+              else:
+                  print(f"Parity evidence keys present: {sorted(present & required)}")
+
+          print(f"Parity suite gate: all {len(parity_suites)} suites classified.")
+          PY
+
+      - name: Beads ledger reconciliation check [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # Verify that active critical/high parity gaps have exact active bead coverage,
+          # and that active gap-tracking beads do not outlive active ledger entries.
+          if ! ./scripts/reconcile_beads_ledger.sh; then
+            echo "RECONCILIATION FAILED: Found orphan ledger gaps or stale gap-tracking beads" >&2
+            echo "Run './scripts/reconcile_beads_ledger.sh' locally to see details" >&2
+            exit 1
+          fi
+          echo "Beads ↔ ledger reconciliation passed: no orphan gaps or stale active gap beads found"
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings
+
+      - name: cargo clippy (wasm-host) [linux]
+        if: runner.os == 'Linux'
+        run: cargo clippy --locked --all-targets --features wasm-host,internal-legacy-capture -- -D warnings
+
+      - name: cargo doc
+        run: cargo doc --locked --no-deps
+
+      - name: Reclaim disk space before tests [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          df -h /
+          # Full clean: clippy/doc artefacts are not reusable by cargo test and
+          # can consume 20+ GB.  Tests will recompile from scratch.
+          cargo clean 2>/dev/null || true
+          df -h /
+
+      - name: cargo test
+        run: cargo test --locked --all-targets --features internal-legacy-capture
+
+      - name: Upload inclusion manifest artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: inclusion-manifest-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            pi_agent_rust/docs/extension-inclusion-list.json
+            pi_agent_rust/tests/ext_conformance/reports/inclusion_manifest/**
+          if-no-files-found: warn
+
+      - name: Reclaim disk space before wasm-host tests [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          df -h /
+          # Full clean again: default-feature test binaries are not reusable by
+          # wasm-host feature tests and consume 20+ GB.
+          cargo clean 2>/dev/null || true
+          df -h /
+
+      - name: cargo test (wasm-host) [linux]
+        if: runner.os == 'Linux'
+        run: cargo test --locked --all-targets --features wasm-host,internal-legacy-capture
+
+      - name: Prepare claim-integrity perf paths [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          PERF_CLAIM_CORRELATION_ID="ci-claim-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PERF_EVIDENCE_DIR="tests/e2e_results/perf-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "PERF_CLAIM_CORRELATION_ID=${PERF_CLAIM_CORRELATION_ID}"
+            echo "PERF_EVIDENCE_DIR=${PERF_EVIDENCE_DIR}"
+            echo "PERF_BASELINE_CONFIDENCE_JSON=${PERF_EVIDENCE_DIR}/results/baseline_variance_confidence.json"
+            echo "PERF_EXTENSION_STRATIFICATION_JSON=${PERF_EVIDENCE_DIR}/results/extension_benchmark_stratification.json"
+            echo "PERF_SCENARIO_CELL_STATUS_JSON=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.json"
+            echo "PERF_SCENARIO_CELL_STATUS_MD=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.md"
+          } >> "$GITHUB_ENV"
+
+      - name: Generate perf claim-integrity evidence bundle [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          CI_CORRELATION_ID="$PERF_CLAIM_CORRELATION_ID" \
+          PERF_OUTPUT_DIR="$PERF_EVIDENCE_DIR" \
+          ./scripts/perf/orchestrate.sh \
+            --profile ci \
+            --skip-build \
+            --skip-env-check
+
+      - name: Unified verification runner (ci profile) [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          CI_CORRELATION_ID="$PERF_CLAIM_CORRELATION_ID" \
+          CLAIM_INTEGRITY_REQUIRED=1 \
+          PERF_EVIDENCE_DIR="$PERF_EVIDENCE_DIR" \
+          PERF_BASELINE_CONFIDENCE_JSON="$PERF_BASELINE_CONFIDENCE_JSON" \
+          PERF_EXTENSION_STRATIFICATION_JSON="$PERF_EXTENSION_STRATIFICATION_JSON" \
+          ./scripts/e2e/run_all.sh --profile ci
+
+      - name: Publish scenario-cell gate status [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          json_path = Path(os.environ["PERF_SCENARIO_CELL_STATUS_JSON"])
+          md_path = Path(os.environ["PERF_SCENARIO_CELL_STATUS_MD"])
+          if not json_path.is_file():
+              print(f"missing scenario-cell status JSON: {json_path}", file=sys.stderr)
+              sys.exit(1)
+
+          payload = json.loads(json_path.read_text(encoding="utf-8"))
+          summary = payload.get("summary", {})
+          total = int(summary.get("total_cells", 0))
+          passing = int(summary.get("passing_cells", 0))
+          failing = int(summary.get("failing_cells", 0))
+
+          print(
+              "Scenario-cell claim-integrity status: "
+              f"total={total}, passing={passing}, failing={failing}"
+          )
+          if failing > 0:
+              print(
+                  "Scenario-cell failures detected; run_all gate should already fail in strict mode.",
+                  file=sys.stderr,
+              )
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as handle:
+                  handle.write("\n## Scenario Cell Gate Status\n\n")
+                  handle.write(
+                      f"- Total cells: `{total}`\n- Passing: `{passing}`\n- Failing: `{failing}`\n\n"
+                  )
+                  if md_path.is_file():
+                      markdown = md_path.read_text(encoding="utf-8")
+                      handle.write(markdown)
+                      if not markdown.endswith("\n"):
+                          handle.write("\n")
+                  else:
+                      handle.write(
+                          f"_Detailed markdown artifact not found at `{md_path}`._\n"
+                      )
+          PY
+
+      - name: Upload scenario-cell gate artifacts [linux]
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-cell-gate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            pi_agent_rust/${{ env.PERF_SCENARIO_CELL_STATUS_JSON }}
+            pi_agent_rust/${{ env.PERF_SCENARIO_CELL_STATUS_MD }}
+          if-no-files-found: warn
+
+      - name: CI gate promotion (strict/rollback) [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+
+          def parse_float(name: str) -> float:
+              raw = os.environ.get(name, "").strip()
+              try:
+                  return float(raw)
+              except ValueError:
+                  print(f"invalid {name}: {raw!r}", file=sys.stderr)
+                  sys.exit(1)
+
+
+          def parse_int(name: str) -> int:
+              raw = os.environ.get(name, "").strip()
+              try:
+                  return int(raw)
+              except ValueError:
+                  print(f"invalid {name}: {raw!r}", file=sys.stderr)
+                  sys.exit(1)
+
+
+          def load_json(path: Path, label: str) -> dict:
+              if not path.is_file():
+                  raise RuntimeError(f"missing required {label}: {path}")
+              with path.open(encoding="utf-8") as handle:
+                  payload = json.load(handle)
+              if not isinstance(payload, dict):
+                  raise RuntimeError(f"invalid {label}: expected JSON object at {path}")
+              return payload
+
+
+          mode = os.environ.get("CI_GATE_PROMOTION_MODE", "strict").strip().lower()
+          if mode not in {"strict", "rollback"}:
+              print(
+                  f"invalid CI_GATE_PROMOTION_MODE={mode!r}; expected 'strict' or 'rollback'",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          threshold_version = os.environ.get("CI_GATE_THRESHOLD_VERSION", "2026-02-08.v1").strip()
+          thresholds = {
+              "min_pass_rate_pct": parse_float("CI_GATE_MIN_PASS_RATE_PCT"),
+              "max_fail_count": parse_int("CI_GATE_MAX_FAIL_COUNT"),
+              "max_na_count": parse_int("CI_GATE_MAX_NA_COUNT"),
+          }
+
+          # Rollback semantics are intentionally simple and asserted each run.
+          def gate_allows(mode_name: str, has_failures: bool) -> bool:
+              return not (has_failures and mode_name == "strict")
+
+
+          assert gate_allows("strict", False)
+          assert not gate_allows("strict", True)
+          assert gate_allows("rollback", True)
+
+          summary_candidates = sorted(
+              Path("tests/e2e_results").rglob("summary.json"),
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          )
+          if not summary_candidates:
+              print("no summary.json found under tests/e2e_results", file=sys.stderr)
+              sys.exit(1)
+
+          summary_path = summary_candidates[0]
+          artifact_dir = summary_path.parent
+          evidence_path = artifact_dir / "evidence_contract.json"
+          conformance_summary_path = Path("tests/ext_conformance/reports/conformance_summary.json")
+
+          try:
+              summary = load_json(summary_path, "summary")
+              evidence = load_json(evidence_path, "evidence_contract")
+              conformance_summary = load_json(conformance_summary_path, "conformance_summary")
+          except RuntimeError as exc:
+              print(str(exc), file=sys.stderr)
+              sys.exit(1)
+
+          checks = []
+          failures = []
+
+          def add_check(check_id: str, actual, threshold, ok: bool) -> None:
+              checks.append(
+                  {
+                      "id": check_id,
+                      "actual": actual,
+                      "threshold": threshold,
+                      "ok": ok,
+                  }
+              )
+              if not ok:
+                  failures.append(check_id)
+
+
+          evidence_schema = evidence.get("schema")
+          evidence_status = evidence.get("status")
+          evidence_errors = evidence.get("errors")
+          if not isinstance(evidence_errors, list):
+              evidence_errors = []
+          evidence_warnings = evidence.get("warnings")
+          if not isinstance(evidence_warnings, list):
+              evidence_warnings = []
+
+          add_check(
+              "evidence_contract.schema",
+              evidence_schema,
+              "pi.evidence.contract.v1",
+              evidence_schema == "pi.evidence.contract.v1",
+          )
+          add_check(
+              "evidence_contract.status",
+              evidence_status,
+              "pass",
+              evidence_status == "pass",
+          )
+          add_check(
+              "evidence_contract.errors",
+              len(evidence_errors),
+              0,
+              len(evidence_errors) == 0,
+          )
+
+          conformance_schema = conformance_summary.get("schema")
+          counts = conformance_summary.get("counts")
+          if not isinstance(counts, dict):
+              counts = {}
+          pass_rate_pct = conformance_summary.get("pass_rate_pct")
+          fail_count = counts.get("fail")
+          na_count = counts.get("na")
+          total_count = counts.get("total")
+
+          try:
+              pass_rate_pct = float(pass_rate_pct)
+          except (TypeError, ValueError):
+              pass_rate_pct = None
+          try:
+              fail_count = int(fail_count)
+          except (TypeError, ValueError):
+              fail_count = None
+          try:
+              na_count = int(na_count)
+          except (TypeError, ValueError):
+              na_count = None
+          try:
+              total_count = int(total_count)
+          except (TypeError, ValueError):
+              total_count = None
+
+          evidence_payload = conformance_summary.get("evidence")
+          required_evidence_keys = {"golden_fixtures", "load_time_benchmarks", "parity_logs", "smoke_logs"}
+          if isinstance(evidence_payload, dict):
+              evidence_keys = set(evidence_payload.keys())
+          else:
+              evidence_keys = set()
+
+          add_check(
+              "conformance_summary.schema",
+              conformance_schema,
+              "pi.ext.conformance_summary.v2",
+              conformance_schema == "pi.ext.conformance_summary.v2",
+          )
+          add_check(
+              "conformance_summary.total",
+              total_count,
+              "> 0",
+              total_count is not None and total_count > 0,
+          )
+          add_check(
+              "conformance_summary.pass_rate_pct",
+              pass_rate_pct,
+              f">= {thresholds['min_pass_rate_pct']}",
+              pass_rate_pct is not None and pass_rate_pct >= thresholds["min_pass_rate_pct"],
+          )
+          add_check(
+              "conformance_summary.fail_count",
+              fail_count,
+              f"<= {thresholds['max_fail_count']}",
+              fail_count is not None and fail_count <= thresholds["max_fail_count"],
+          )
+          add_check(
+              "conformance_summary.na_count",
+              na_count,
+              f"<= {thresholds['max_na_count']}",
+              na_count is not None and na_count <= thresholds["max_na_count"],
+          )
+          add_check(
+              "conformance_summary.evidence_keys",
+              sorted(evidence_keys),
+              sorted(required_evidence_keys),
+              required_evidence_keys.issubset(evidence_keys),
+          )
+
+          observed = {
+              "summary_profile": summary.get("profile"),
+              "summary_artifact_dir": summary.get("artifact_dir"),
+              "pass_rate_pct": pass_rate_pct,
+              "fail_count": fail_count,
+              "na_count": na_count,
+              "total_count": total_count,
+              "evidence_contract_status": evidence_status,
+              "evidence_contract_error_count": len(evidence_errors),
+              "evidence_contract_warning_count": len(evidence_warnings),
+          }
+
+          status = "pass" if not failures else ("rollback_warning" if mode == "rollback" else "fail")
+          verdict = {
+              "schema": "pi.ci.gate_promotion.v1",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "threshold_version": threshold_version,
+              "mode": mode,
+              "status": status,
+              "paths": {
+                  "summary_json": str(summary_path),
+                  "evidence_contract_json": str(evidence_path),
+                  "conformance_summary_json": str(conformance_summary_path),
+              },
+              "thresholds": thresholds,
+              "observed": observed,
+              "checks": checks,
+              "failures": failures,
+          }
+
+          verdict_path = artifact_dir / "ci_gate_promotion_v1.json"
+          verdict_path.write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+          print(f"CI gate verdict written: {verdict_path}")
+
+          if failures:
+              print("CI gate promotion failures:", file=sys.stderr)
+              for check_id in failures:
+                  print(f"  - {check_id}", file=sys.stderr)
+          if not gate_allows(mode, bool(failures)):
+              sys.exit(1)
+          PY
+
+      - name: Conformance regression gate [linux]
+        if: runner.os == 'Linux'
+        env:
+          CI_REGRESSION_MODE: ${{ vars.CI_REGRESSION_MODE || 'strict' }}
+        run: |
+          set -euxo pipefail
+          python3 scripts/check_conformance_regression.py
+
+      - name: Must-pass extension gate (208 extensions) [linux]
+        if: runner.os == 'Linux'
+        env:
+          PI_EXT_GATE_MUST_PASS_RATE: ${{ vars.PI_EXT_GATE_MUST_PASS_RATE || '100.0' }}
+          PI_EXT_GATE_MAX_FAILURES: ${{ vars.PI_EXT_GATE_MAX_FAILURES || '0' }}
+          PI_EXT_GATE_MODE: ${{ vars.PI_EXT_GATE_MODE || 'strict' }}
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test ext_conformance_generated --features ext-conformance \
+            -- conformance_must_pass_gate --nocapture --exact
+        continue-on-error: false
+
+      - name: Upload must-pass gate artifacts [linux]
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: must-pass-gate-${{ github.sha }}
+          path: |
+            tests/ext_conformance/reports/gate/must_pass_gate_verdict.json
+            tests/ext_conformance/reports/gate/must_pass_events.jsonl
+            tests/ext_conformance/reports/gate/must_pass_gate_report.md
+          if-no-files-found: warn
+
+      - name: Cross-platform matrix validation
+        if: always()
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test ci_cross_platform_matrix \
+            -- cross_platform_matrix --nocapture --exact
+        continue-on-error: true
+
+      - name: Upload cross-platform report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cross-platform-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            tests/cross_platform_reports/**/platform_report.json
+            tests/cross_platform_reports/**/platform_events.jsonl
+            tests/cross_platform_reports/**/platform_report.md
+          if-no-files-found: warn
+
+      - name: Build unified evidence bundle [linux]
+        if: always() && runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test ci_evidence_bundle \
+            -- build_evidence_bundle --nocapture --exact
+        continue-on-error: true
+
+      - name: Security compatibility gate [linux] (bd-1a2cu)
+        if: always() && runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test security_conformance_benign -- --nocapture
+        continue-on-error: true
+
+      - name: Full-suite gate [linux]
+        if: always() && runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test ci_full_suite_gate \
+            -- full_suite_gate --nocapture --exact
+        continue-on-error: true
+
+      - name: Build drop-in certification verdict artifact [linux]
+        if: always() && runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path, PurePosixPath
+
+          source_path = Path("tests/full_suite_gate/certification_verdict.json")
+          contract_path = Path("docs/contracts/dropin-certification-contract.json")
+          target_path = Path("docs/evidence/dropin-certification-verdict.json")
+          repo_root = Path.cwd().resolve(strict=True)
+          generated_at = (
+              datetime.now(timezone.utc)
+              .replace(microsecond=0)
+              .isoformat()
+              .replace("+00:00", "Z")
+          )
+          gate_id_pattern = re.compile(r"G(0[1-9]|1[0-2])-[a-z0-9]+(?:-[a-z0-9]+)*")
+          commit_pattern = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+
+          def write_payload(payload):
+              if target_path.is_symlink():
+                  raise RuntimeError(f"refusing to replace symlinked verdict target: {target_path}")
+              target_path.parent.mkdir(parents=True, exist_ok=True)
+              target_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+              print(
+                  f"Wrote {target_path} with overall_verdict={payload.get('overall_verdict')}"
+              )
+
+          def load_object(path, label, errors):
+              if path.is_symlink() or not path.is_file():
+                  errors.append(
+                      f"missing or non-regular {label}: {path.as_posix()}"
+                  )
+                  return {}
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:  # noqa: BLE001
+                  errors.append(f"invalid {label}: {exc}")
+                  return {}
+              if not isinstance(payload, dict):
+                  errors.append(f"invalid {label}: root must be an object")
+                  return {}
+              return payload
+
+          def canonical_repo_path(value):
+              if (
+                  not isinstance(value, str)
+                  or not value
+                  or "\\" in value
+                  or re.match(r"^[A-Za-z]:", value) is not None
+              ):
+                  return None
+              pure = PurePosixPath(value)
+              if (
+                  pure.is_absolute()
+                  or pure.as_posix() != value
+                  or any(part in ("", ".", "..") for part in pure.parts)
+              ):
+                  return None
+              return pure.as_posix()
+
+          def run_git(*args, text=True):
+              env = os.environ.copy()
+              env["GIT_LITERAL_PATHSPECS"] = "1"
+              return subprocess.run(
+                  ["git", *args],
+                  check=False,
+                  capture_output=True,
+                  text=text,
+                  env=env,
+              )
+
+          def committed_regular_blob_error(value):
+              relative = canonical_repo_path(value)
+              if relative is None:
+                  return "path is not canonical and repository-relative"
+              candidate = Path(relative)
+              if candidate.is_symlink() or not candidate.is_file():
+                  return "path is not a regular non-symlink file"
+              try:
+                  candidate.resolve(strict=True).relative_to(repo_root)
+              except (OSError, RuntimeError, ValueError):
+                  return "path resolves outside the repository"
+
+              tree = run_git("ls-tree", "-z", "HEAD", "--", relative, text=False)
+              if tree.returncode != 0:
+                  return "unable to inspect release HEAD"
+              records = [record for record in tree.stdout.split(b"\0") if record]
+              if len(records) != 1:
+                  return "path is not tracked as one exact release-HEAD entry"
+              try:
+                  metadata, recorded_path = records[0].split(b"\t", 1)
+                  mode, object_type, object_id = metadata.split(b" ", 2)
+              except ValueError:
+                  return "release-HEAD entry is malformed"
+              if (
+                  mode not in (b"100644", b"100755")
+                  or object_type != b"blob"
+                  or os.fsdecode(recorded_path) != relative
+              ):
+                  return "release-HEAD entry is not a canonical regular-file blob"
+
+              committed = run_git("cat-file", "blob", os.fsdecode(object_id), text=False)
+              if committed.returncode != 0:
+                  return "unable to read release-HEAD blob"
+              try:
+                  worktree_bytes = candidate.read_bytes()
+              except OSError as exc:
+                  return f"unable to read worktree artifact: {exc}"
+              if committed.stdout != worktree_bytes:
+                  return "worktree bytes differ from the release-HEAD blob"
+              return None
+
+          def resolve_git_commit():
+              candidate = os.environ.get("GITHUB_SHA", "").strip()
+              if commit_pattern.fullmatch(candidate):
+                  return candidate
+              result = subprocess.run(
+                  ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              fallback = result.stdout.strip()
+              return fallback if result.returncode == 0 else candidate
+
+          producer_errors = []
+          contract = load_object(contract_path, "drop-in certification contract", producer_errors)
+          source = load_object(source_path, "certification lane artifact", producer_errors)
+          contract_provenance_error = committed_regular_blob_error(contract_path.as_posix())
+          if contract_provenance_error is not None:
+              producer_errors.append(
+                  "drop-in certification contract provenance: " + contract_provenance_error
+              )
+
+          if contract.get("schema") != "pi.dropin.certification_contract.v1":
+              producer_errors.append("unsupported drop-in certification contract schema")
+          enforcement = contract.get("release_process_enforcement")
+          verdict_spec = enforcement.get("verdict_artifact_contract") if isinstance(enforcement, dict) else None
+          required_verdict_fields = {
+              "git_commit",
+              "generated_at_utc",
+              "overall_verdict",
+              "hard_gate_results",
+              "blocking_reasons",
+              "evidence_index",
+          }
+          if not isinstance(verdict_spec, dict):
+              producer_errors.append("contract verdict_artifact_contract must be an object")
+          else:
+              if verdict_spec.get("path") != target_path.as_posix():
+                  producer_errors.append("contract verdict path does not name the canonical target")
+              if verdict_spec.get("schema") != "pi.dropin.certification_verdict.v1":
+                  producer_errors.append("contract names an unsupported verdict schema")
+              required_fields = verdict_spec.get("required_fields")
+              if (
+                  not isinstance(required_fields, list)
+                  or len(required_fields) != len(set(required_fields))
+                  or set(required_fields) != required_verdict_fields
+              ):
+                  producer_errors.append("contract verdict required_fields do not match the v1 schema")
+          if source.get("schema") != "pi.ci.certification_lane.v1":
+              producer_errors.append("unsupported certification lane schema")
+
+          contract_gates = contract.get("hard_gates")
+          gate_specs = []
+          if not isinstance(contract_gates, list):
+              producer_errors.append("contract hard_gates must be an array")
+          else:
+              seen_gate_ids = set()
+              for index, gate in enumerate(contract_gates, start=1):
+                  if not isinstance(gate, dict):
+                      producer_errors.append(f"contract hard_gates[{index - 1}] must be an object")
+                      continue
+                  gate_id = gate.get("gate_id")
+                  match = gate_id_pattern.fullmatch(gate_id) if isinstance(gate_id, str) else None
+                  if match is None or int(match.group(1)) != index:
+                      producer_errors.append(
+                          f"contract hard_gates[{index - 1}] must be canonical gate G{index:02d}"
+                      )
+                      continue
+                  if gate_id in seen_gate_ids:
+                      producer_errors.append(f"duplicate contract hard gate: {gate_id}")
+                      continue
+                  seen_gate_ids.add(gate_id)
+                  blocking = gate.get("blocking")
+                  if not isinstance(blocking, bool):
+                      producer_errors.append(f"contract hard gate {gate_id} blocking must be boolean")
+                      continue
+                  bead = gate.get("owner_issue_primary")
+                  if not isinstance(bead, str) or not bead:
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} owner_issue_primary must be non-empty"
+                      )
+                      continue
+                  required_artifacts = gate.get("required_artifacts")
+                  if not isinstance(required_artifacts, list) or not required_artifacts:
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} required_artifacts must be non-empty"
+                      )
+                      continue
+                  canonical_artifacts = [canonical_repo_path(path) for path in required_artifacts]
+                  if any(path is None for path in canonical_artifacts):
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} has a non-canonical required artifact"
+                      )
+                      continue
+                  if len(canonical_artifacts) != len(set(canonical_artifacts)):
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} repeats a required artifact"
+                      )
+                      continue
+                  gate_specs.append(
+                      {
+                          "gate_id": gate_id,
+                          "blocking": blocking,
+                          "required_artifacts": canonical_artifacts,
+                          "bead": bead,
+                      }
+                  )
+              if len(contract_gates) != 12 or len(gate_specs) != 12:
+                  producer_errors.append(
+                      f"contract must define exactly the ordered G01-G12 gate set; found {len(gate_specs)} valid gates"
+                  )
+
+          source_gates = source.get("gates")
+          source_gate_by_id = {}
+          if not isinstance(source_gates, list):
+              producer_errors.append("certification lane gates must be an array")
+          else:
+              for index, gate in enumerate(source_gates):
+                  if (
+                      not isinstance(gate, dict)
+                      or not isinstance(gate.get("id"), str)
+                      or not gate["id"]
+                  ):
+                      producer_errors.append(f"certification lane gate[{index}] is malformed")
+                      continue
+                  gate_id = gate["id"]
+                  if gate_id in source_gate_by_id:
+                      producer_errors.append(f"duplicate certification lane gate: {gate_id}")
+                      continue
+                  source_gate_by_id[gate_id] = gate
+
+          hard_gate_results = []
+          blocking_reasons = list(producer_errors)
+          evidence_by_path = {}
+          artifact_errors = {}
+          for spec in gate_specs:
+              gate_id = spec["gate_id"]
+              required_artifacts = spec["required_artifacts"]
+              for artifact_path in required_artifacts:
+                  if artifact_path not in artifact_errors:
+                      artifact_errors[artifact_path] = committed_regular_blob_error(
+                          artifact_path
+                      )
+                  evidence_by_path.setdefault(
+                      artifact_path,
+                      {"path": artifact_path, "exists": artifact_errors[artifact_path] is None},
+                  )
+
+              source_gate = source_gate_by_id.get(gate_id)
+              failures = []
+              status = "fail"
+              detail = None
+              if source_gate is None:
+                  failures.append("canonical gate is absent from certification lane output")
+              else:
+                  source_status = source_gate.get("status")
+                  normalized_status = source_status.lower() if isinstance(source_status, str) else ""
+                  if normalized_status not in ("pass", "fail", "blocked", "waived"):
+                      failures.append(f"invalid certification lane status: {source_status!r}")
+                  elif normalized_status != "pass":
+                      failures.append(f"certification lane status={normalized_status}")
+
+                  source_blocking = source_gate.get("blocking")
+                  if source_blocking is not spec["blocking"]:
+                      failures.append(
+                          f"certification lane blocking={source_blocking!r}, expected {spec['blocking']}"
+                      )
+
+                  source_artifacts = source_gate.get("artifact_paths")
+                  if source_artifacts is None and isinstance(source_gate.get("artifact_path"), str):
+                      source_artifacts = [source_gate["artifact_path"]]
+                  if source_artifacts != required_artifacts:
+                      failures.append(
+                          "certification lane artifact paths do not match the contract"
+                      )
+                  source_detail = source_gate.get("detail")
+                  if source_detail is not None and not isinstance(source_detail, str):
+                      failures.append("certification lane detail must be a string or null")
+                  elif source_detail:
+                      detail = source_detail
+
+              invalid_artifacts = [
+                  f"{path} ({artifact_errors[path]})"
+                  for path in required_artifacts
+                  if artifact_errors[path] is not None
+              ]
+              if invalid_artifacts:
+                  failures.append(
+                      "invalid required artifacts: " + ", ".join(invalid_artifacts)
+                  )
+
+              if not failures:
+                  status = "pass"
+              else:
+                  failure_detail = "; ".join(failures)
+                  detail = f"{detail}; {failure_detail}" if detail else failure_detail
+                  blocking_reasons.append(f"{gate_id}:fail ({failure_detail})")
+              hard_gate_results.append(
+                  {
+                      "gate_id": gate_id,
+                      "status": status,
+                      "blocking": spec["blocking"],
+                      "detail": detail,
+                      "artifact_paths": required_artifacts,
+                      "bead": spec["bead"],
+                  }
+              )
+
+          lane_verdict = source.get("verdict", "missing")
+          if lane_verdict != "pass":
+              blocking_reasons.append(f"certification lane verdict={lane_verdict!r} (expected 'pass')")
+
+          overall_verdict = (
+              "CERTIFIED"
+              if len(hard_gate_results) == 12
+              and all(gate["status"] == "pass" for gate in hard_gate_results)
+              and not blocking_reasons
+              else "NOT_CERTIFIED"
+          )
+          write_payload(
+              {
+                  "schema": "pi.dropin.certification_verdict.v1",
+                  "git_commit": resolve_git_commit(),
+                  "generated_at_utc": generated_at,
+                  "overall_verdict": overall_verdict,
+                  "hard_gate_results": hard_gate_results,
+                  "blocking_reasons": blocking_reasons,
+                  "evidence_index": list(evidence_by_path.values()),
+                  "source": {
+                      "certification_lane_artifact": source_path.as_posix(),
+                      "lane_schema": source.get("schema"),
+                      "lane_verdict": lane_verdict,
+                      "lane_generated_at": source.get("generated_at"),
+                  },
+              }
+          )
+          PY
+
+      - name: Release gate (evidence bundle) [linux]
+        if: always() && runner.os == 'Linux'
+        env:
+          RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED: ${{ vars.RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED || '0' }}
+          # rch (remote cargo) is a developer-laptop tool and is not installed
+          # on GitHub-hosted runners; force the local runner so the script does
+          # not abort with "RELEASE_GATE_CARGO_RUNNER=rch ... not available".
+          RELEASE_GATE_CARGO_RUNNER: local
+        run: |
+          set -euxo pipefail
+          report_path="${RUNNER_TEMP}/pi-release-gate-report.json"
+          gate_checkout="${RUNNER_TEMP}/pi-release-gate-checkout"
+          # Earlier evidence producers intentionally write ignored and tracked
+          # artifacts in the primary checkout. The release gate verifies only
+          # committed evidence and a clean source tree, so run it against a
+          # detached worktree populated from the exact CI commit.
+          git worktree add --detach "$gate_checkout" HEAD
+          cd "$gate_checkout"
+          gate_exit=0
+          ./scripts/release_gate.sh --report --no-rch | tee "$report_path" || gate_exit=$?
+          VERDICT=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('verdict','unknown'))" "$report_path")
+          echo "Release gate verdict: $VERDICT"
+          if [ "$gate_exit" -ne 0 ] || [ "$VERDICT" != "pass" ]; then
+            echo "::error::Release gate failed (exit=$gate_exit, verdict=$VERDICT)"
+            exit 1
+          fi
+
+      - name: Upload release gate report [linux]
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-${{ github.sha }}
+          path: ${{ runner.temp }}/pi-release-gate-report.json
+          if-no-files-found: error
+
+      - name: Upload unified evidence bundle [linux]
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-bundle-${{ github.sha }}
+          path: |
+            tests/evidence_bundle/index.json
+            tests/evidence_bundle/bundle_report.md
+            tests/evidence_bundle/events.jsonl
+          if-no-files-found: warn
+
+      - name: Upload full-suite gate artifacts [linux]
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-suite-gate-${{ github.sha }}
+          path: |
+            tests/full_suite_gate/full_suite_verdict.json
+            tests/full_suite_gate/full_suite_events.jsonl
+            tests/full_suite_gate/full_suite_report.md
+            tests/security_compat/security_compat_dashboard.json
+            tests/security_compat/security_compat_events.jsonl
+            docs/evidence/dropin-certification-verdict.json
+          if-no-files-found: warn
+
+      - name: Reclaim disk space before coverage [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          df -h /
+          cargo clean 2>/dev/null || true
+          df -h /
+
+      - name: Coverage summary (llvm-cov)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          start=$(date +%s)
+          echo "env: CI=$CI VCR_MODE=$VCR_MODE VCR_CASSETTE_DIR=$VCR_CASSETTE_DIR"
+          cargo llvm-cov --locked --all-targets --workspace --summary-only | tee llvm-cov-summary.txt
+          end=$(date +%s)
+          echo "coverage_summary_duration_s=$((end-start))"
+
+      - name: Coverage gate (lcov)
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          start=$(date +%s)
+          # Coverage gate: 50% (actual: ~66% as of 2026-02-05)
+          cargo llvm-cov --locked --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 50
+          ls -lah lcov.info
+          end=$(date +%s)
+          echo "coverage_lcov_duration_s=$((end-start))"
+
+      - name: Coverage report (html)
+        if: runner.os == 'Linux'
+        run: cargo llvm-cov --locked --all-targets --workspace --html
+
+      - name: Upload coverage artifacts
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            pi_agent_rust/llvm-cov-summary.txt
+            pi_agent_rust/lcov.info
+            pi_agent_rust/target/llvm-cov/html
+
+      - name: Upload conformance reports
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-reports
+          path: |
+            pi_agent_rust/tests/ext_conformance/reports/**/*.json
+            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
+            pi_agent_rust/tests/e2e_results/**/*.json
+            pi_agent_rust/tests/e2e_results/**/*.jsonl
+            pi_agent_rust/tests/e2e_results/**/*.log
+            pi_agent_rust/tests/quarantine_report.json
+            pi_agent_rust/tests/quarantine_audit.jsonl
+            pi_agent_rust/release_gate_report.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload provider test artifacts
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: provider-test-artifacts-${{ github.sha }}
+          path: |
+            pi_agent_rust/tests/full_suite_gate/**/*.json
+            pi_agent_rust/tests/full_suite_gate/**/*.jsonl
+            pi_agent_rust/tests/full_suite_gate/**/*.md
+            pi_agent_rust/tests/cross_platform_reports/**/*.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  release_evidence_gate:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pi_agent_rust -> target
+          prefix-key: release-evidence-gate
+
+      - name: Release evidence gate
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test release_evidence_gate -- --nocapture
+
+  qa_shards_linux:
+    name: qa-shard (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - name: unit
+            lane: unit
+            shard_index: 0
+            shard_total: 1
+          - name: integration-0
+            lane: integration
+            shard_index: 0
+            shard_total: 2
+          - name: integration-1
+            lane: integration
+            shard_index: 1
+            shard_total: 2
+          - name: e2e-0
+            lane: e2e
+            shard_index: 0
+            shard_total: 2
+          - name: e2e-1
+            lane: e2e
+            shard_index: 1
+            shard_total: 2
+          - name: extension-0
+            lane: extension
+            shard_index: 0
+            shard_total: 4
+          - name: extension-1
+            lane: extension
+            shard_index: 1
+            shard_total: 4
+          - name: extension-2
+            lane: extension
+            shard_index: 2
+            shard_total: 4
+          - name: extension-3
+            lane: extension
+            shard_index: 3
+            shard_total: 4
+          - name: parity
+            lane: parity
+            shard_index: 0
+            shard_total: 1
+          - name: security
+            lane: security
+            shard_index: 0
+            shard_total: 1
+          - name: perf
+            lane: perf
+            shard_index: 0
+            shard_total: 1
+    env:
+      CI: "true"
+      VCR_MODE: "playback"
+      VCR_CASSETTE_DIR: "tests/fixtures/vcr"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+      SHARD_ARTIFACT_DIR: ${{ github.workspace }}/pi_agent_rust/tests/e2e_results/ci-shards/${{ matrix.shard.name }}
+      SHARD_CORRELATION_ID: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard.name }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/pi_agent_rust/target/ci-shards/${{ matrix.shard.name }}
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: Install system deps (fd, rg)
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
+          components: rustfmt, clippy, llvm-tools-preview
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pi_agent_rust -> target
+          prefix-key: qa-shards-${{ matrix.shard.name }}
+
+      - name: Execute shard lane
+        run: |
+          set -euxo pipefail
+          mkdir -p "$SHARD_ARTIFACT_DIR"
+          case "${{ matrix.shard.lane }}" in
+            unit)
+              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
+              ./scripts/e2e/run_all.sh \
+                --profile quick \
+                --skip-lint \
+                --shard-name "${{ matrix.shard.name }}"
+              ;;
+            integration)
+              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
+              ./scripts/e2e/run_all.sh \
+                --profile ci \
+                --skip-lint \
+                --skip-e2e \
+                --shard-kind unit \
+                --shard-index "${{ matrix.shard.shard_index }}" \
+                --shard-total "${{ matrix.shard.shard_total }}" \
+                --shard-name "${{ matrix.shard.name }}"
+              ;;
+            e2e)
+              E2E_ARTIFACT_DIR="$SHARD_ARTIFACT_DIR" \
+              CI_CORRELATION_ID="$SHARD_CORRELATION_ID" \
+              ./scripts/e2e/run_all.sh \
+                --profile full \
+                --skip-lint \
+                --skip-unit \
+                --shard-kind suite \
+                --shard-index "${{ matrix.shard.shard_index }}" \
+                --shard-total "${{ matrix.shard.shard_total }}" \
+                --shard-name "${{ matrix.shard.name }}"
+              ;;
+            extension)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              PI_SHARD_INDEX="${{ matrix.shard.shard_index }}" \
+              PI_SHARD_TOTAL="${{ matrix.shard.shard_total }}" \
+              PI_SHARD_PARALLELISM="${{ vars.PI_EXT_SHARD_PARALLELISM || '4' }}" \
+              RUST_LOG=info \
+              cargo test --locked --test ext_conformance_generated --features ext-conformance \
+                -- conformance_sharded_matrix --nocapture --exact \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              mkdir -p "$SHARD_ARTIFACT_DIR/sharded"
+              cp -f tests/ext_conformance/reports/sharded/shard_*_report.json "$SHARD_ARTIFACT_DIR/sharded/" || true
+              cp -f tests/ext_conformance/reports/sharded/shard_*_events.jsonl "$SHARD_ARTIFACT_DIR/sharded/" || true
+              cp -f tests/ext_conformance/reports/sharded/shard_*_report.md "$SHARD_ARTIFACT_DIR/sharded/" || true
+              ;;
+            parity)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test \
+                --locked \
+                --test json_mode_parity \
+                --test cross_surface_parity \
+                --test config_precedence \
+                --test vcr_parity_validation \
+                --test e2e_cross_provider_parity \
+                -- --test-threads=2 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              python3 scripts/ci/generate_parity_evidence.py \
+                --output "$SHARD_ARTIFACT_DIR/parity_evidence.json" \
+                --log "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
+            security)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test \
+                --locked \
+                --test security_budgets \
+                --test security_fs_escape \
+                --test security_http_policy \
+                -- --test-threads=1 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
+            perf)
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo build --locked --bin pi
+              TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
+              TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
+              RUST_LOG=info \
+              cargo test \
+                --locked \
+                --test perf_budgets \
+                --test perf_regression \
+                --test perf_comparison \
+                --test performance_comparison \
+                -- --test-threads=1 \
+                2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
+              ;;
+            *)
+              echo "Unknown shard lane: ${{ matrix.shard.lane }}" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Build shard artifact index
+        if: always()
+        env:
+          SHARD_NAME: ${{ matrix.shard.name }}
+          SHARD_LANE: ${{ matrix.shard.lane }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$SHARD_ARTIFACT_DIR"
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          root = Path(os.environ["SHARD_ARTIFACT_DIR"])
+          index_path = root / "ci-shard-index.json"
+          entries = []
+          for path in sorted(root.rglob("*")):
+              if path.is_file():
+                  entries.append(
+                      {
+                          "path": str(path.relative_to(root)),
+                          "size_bytes": path.stat().st_size,
+                      }
+                  )
+
+          payload = {
+              "schema": "pi.ci.shard_index.v1",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "shard_name": os.environ["SHARD_NAME"],
+              "lane": os.environ["SHARD_LANE"],
+              "correlation_id": os.environ["SHARD_CORRELATION_ID"],
+              "job_status": os.environ.get("JOB_STATUS", "unknown"),
+              "file_count": len(entries),
+              "entries": entries,
+          }
+          index_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+          print(f"wrote shard index: {index_path}")
+          PY
+
+      - name: Upload shard artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-shard-${{ matrix.shard.name }}-${{ github.sha }}
+          path: |
+            pi_agent_rust/tests/e2e_results/ci-shards/${{ matrix.shard.name }}/
+          if-no-files-found: warn
+          retention-days: 30
+
+  qa_shard_summary:
+    name: qa-shard-summary
+    runs-on: ubuntu-latest
+    needs: qa_shards_linux
+    if: always()
+    steps:
+      - name: Download shard artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ci-shard-*
+          path: shard-artifacts
+          merge-multiple: false
+
+      - name: Build merged shard index
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import math
+          import os
+          from collections import Counter
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          def now_iso():
+              return datetime.now(timezone.utc).isoformat()
+
+          def load_json(path):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:  # pragma: no cover
+                  return {"error": str(exc)}
+
+          def clean_signature(value):
+              text = " ".join(str(value).strip().split())
+              if not text:
+                  return "unknown failure"
+              if len(text) > 240:
+                  return text[:237] + "..."
+              return text
+
+          def extract_failure_signature(log_path):
+              if not log_path.is_file():
+                  return "missing log file"
+              try:
+                  lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+              except Exception as exc:  # pragma: no cover
+                  return clean_signature(f"log read error: {exc}")
+              signal_tokens = (
+                  "error:",
+                  "panicked at",
+                  "assertion failed",
+                  "thread '",
+                  "failed",
+                  "timeout",
+                  "timed out",
+                  "connection reset",
+                  "rate limit",
+              )
+              for line in reversed(lines[-400:]):
+                  lowered = line.lower()
+                  if any(token in lowered for token in signal_tokens):
+                      return clean_signature(line)
+              if lines:
+                  return clean_signature(lines[-1])
+              return "empty log"
+
+          def summarize_balance(samples):
+              if not samples:
+                  return {
+                      "count": 0,
+                      "min": None,
+                      "max": None,
+                      "spread": None,
+                      "ratio_max_to_min": None,
+                  }
+              sample_min = min(samples)
+              sample_max = max(samples)
+              ratio = None
+              if sample_min > 0:
+                  ratio = sample_max / sample_min
+              return {
+                  "count": len(samples),
+                  "min": sample_min,
+                  "max": sample_max,
+                  "spread": sample_max - sample_min,
+                  "ratio_max_to_min": ratio,
+              }
+
+          def percentile(values, pct):
+              if not values:
+                  return None
+              ordered = sorted(float(v) for v in values)
+              if len(ordered) == 1:
+                  return ordered[0]
+              rank = (pct / 100.0) * (len(ordered) - 1)
+              lower = int(math.floor(rank))
+              upper = int(math.ceil(rank))
+              if lower == upper:
+                  return ordered[lower]
+              weight = rank - lower
+              return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+          root = Path("shard-artifacts")
+          index_files = sorted(root.rglob("ci-shard-index.json"))
+          shards = []
+          for index_file in index_files:
+              try:
+                  payload = json.loads(index_file.read_text(encoding="utf-8"))
+              except Exception as exc:  # pragma: no cover
+                  payload = {
+                      "schema": "pi.ci.shard_index.v1",
+                      "shard_name": index_file.parent.name,
+                      "lane": "unknown",
+                      "correlation_id": "unknown",
+                      "job_status": "invalid",
+                      "file_count": 0,
+                      "entries": [],
+                      "error": str(exc),
+                  }
+              shard_dir = index_file.parent
+              payload["artifact_source"] = str(shard_dir)
+
+              shard_failure_records = []
+              summary_file = shard_dir / "summary.json"
+              duration_seconds = None
+              if summary_file.is_file():
+                  summary_payload = load_json(summary_file)
+                  if "error" in summary_payload:
+                      payload["summary_error"] = summary_payload["error"]
+                  else:
+                      raw_duration = summary_payload.get("duration_seconds")
+                      if isinstance(raw_duration, (int, float)):
+                          duration_seconds = float(raw_duration)
+                      payload["summary_excerpt"] = {
+                          "profile": summary_payload.get("profile"),
+                          "duration_seconds": duration_seconds,
+                          "total_units": summary_payload.get("total_units"),
+                          "failed_units": summary_payload.get("failed_units"),
+                          "total_suites": summary_payload.get("total_suites"),
+                          "failed_suites": summary_payload.get("failed_suites"),
+                      }
+                      for item in summary_payload.get("unit_targets", []):
+                          if not isinstance(item, dict):
+                              continue
+                          if int(item.get("exit_code", 1)) == 0:
+                              continue
+                          target = str(item.get("target", "unknown"))
+                          rel_log = Path("unit") / target / "output.log"
+                          signature = extract_failure_signature(shard_dir / rel_log)
+                          shard_failure_records.append(
+                              {
+                                  "shard_name": payload.get("shard_name", shard_dir.name),
+                                  "lane": payload.get("lane", "unknown"),
+                                  "scope": "unit_target",
+                                  "name": target,
+                                  "signature": signature,
+                                  "log_path": str(rel_log),
+                                  "artifact_source": str(shard_dir),
+                                  "issue_id": "bd-1f42.6.2",
+                                  "thread_id": "bd-1f42.6.2",
+                              }
+                          )
+                      for item in summary_payload.get("suites", []):
+                          if not isinstance(item, dict):
+                              continue
+                          if int(item.get("exit_code", 1)) == 0:
+                              continue
+                          suite = str(item.get("suite", "unknown"))
+                          rel_log = Path(suite) / "output.log"
+                          signature = extract_failure_signature(shard_dir / rel_log)
+                          shard_failure_records.append(
+                              {
+                                  "shard_name": payload.get("shard_name", shard_dir.name),
+                                  "lane": payload.get("lane", "unknown"),
+                                  "scope": "suite",
+                                  "name": suite,
+                                  "signature": signature,
+                                  "log_path": str(rel_log),
+                                  "artifact_source": str(shard_dir),
+                                  "issue_id": "bd-1f42.6.2",
+                                  "thread_id": "bd-1f42.6.2",
+                              }
+                          )
+              manifest_file = shard_dir / "ci_shard_manifest.json"
+              unit_targets = []
+              e2e_suites = []
+              extension_count = 0
+              if manifest_file.is_file():
+                  manifest_payload = load_json(manifest_file)
+                  if "error" in manifest_payload:
+                      payload["manifest_error"] = manifest_payload["error"]
+                  else:
+                      selection = manifest_payload.get("selection", {})
+                      maybe_units = selection.get("unit_targets", [])
+                      maybe_suites = selection.get("e2e_suites", [])
+                      if isinstance(maybe_units, list):
+                          unit_targets = [item for item in maybe_units if isinstance(item, str) and item]
+                      if isinstance(maybe_suites, list):
+                          e2e_suites = [item for item in maybe_suites if isinstance(item, str) and item]
+                      payload["manifest_excerpt"] = {
+                          "profile": manifest_payload.get("profile"),
+                          "correlation_id": manifest_payload.get("correlation_id"),
+                          "shard": manifest_payload.get("shard"),
+                          "selection_counts": {
+                              "unit_targets": len(unit_targets),
+                              "e2e_suites": len(e2e_suites),
+                          },
+                      }
+              extension_reports = sorted((shard_dir / "sharded").glob("shard_*_report.json"))
+              if extension_reports:
+                  extension_excerpts = []
+                  extension_durations_ms = []
+                  for report_file in extension_reports:
+                      report_payload = load_json(report_file)
+                      if "error" in report_payload:
+                          payload.setdefault("extension_report_errors", []).append(
+                              {
+                                  "path": str(report_file.relative_to(shard_dir)),
+                                  "error": report_payload["error"],
+                              }
+                          )
+                          continue
+                      shard_size = report_payload.get("shard_count")
+                      if isinstance(shard_size, int):
+                          extension_count += shard_size
+                      duration_ms = report_payload.get("total_duration_ms")
+                      if isinstance(duration_ms, (int, float)):
+                          extension_durations_ms.append(float(duration_ms))
+                      extension_excerpts.append(
+                          {
+                              "path": str(report_file.relative_to(shard_dir)),
+                              "shard_index": report_payload.get("shard_index"),
+                              "shard_total": report_payload.get("shard_total"),
+                              "shard_count": report_payload.get("shard_count"),
+                              "tested": report_payload.get("tested"),
+                              "passed": report_payload.get("passed"),
+                              "failed": report_payload.get("failed"),
+                              "skipped": report_payload.get("skipped"),
+                              "pass_rate_pct": report_payload.get("pass_rate_pct"),
+                              "by_failure_category": report_payload.get("by_failure_category"),
+                          }
+                      )
+                      for failure in report_payload.get("failures", []):
+                          if not isinstance(failure, dict):
+                              continue
+                          extension_id = str(failure.get("id", "unknown"))
+                          reason = str(failure.get("reason", "unknown"))
+                          category = str(failure.get("category", "unknown"))
+                          shard_failure_records.append(
+                              {
+                                  "shard_name": payload.get("shard_name", shard_dir.name),
+                                  "lane": payload.get("lane", "unknown"),
+                                  "scope": "extension",
+                                  "name": extension_id,
+                                  "signature": clean_signature(f"[{category}] {reason}"),
+                                  "failure_category": category,
+                                  "reason": reason,
+                                  "log_path": str(report_file.relative_to(shard_dir)),
+                                  "artifact_source": str(shard_dir),
+                                  "issue_id": "bd-1f42.6.2",
+                                  "thread_id": "bd-1f42.6.2",
+                              }
+                          )
+                  payload["extension_shard_reports"] = extension_excerpts
+                  if duration_seconds is None and extension_durations_ms:
+                      duration_seconds = max(extension_durations_ms) / 1000.0
+
+              payload["selection_counts"] = {
+                  "unit_targets": len(unit_targets),
+                  "e2e_suites": len(e2e_suites),
+                  "extensions": extension_count,
+              }
+              payload["duration_seconds"] = duration_seconds
+
+              if not shard_failure_records and payload.get("job_status") not in {
+                  "success",
+                  "unknown",
+              }:
+                  fallback_log = shard_dir / "output.log"
+                  shard_failure_records.append(
+                      {
+                          "shard_name": payload.get("shard_name", shard_dir.name),
+                          "lane": payload.get("lane", "unknown"),
+                          "scope": "shard",
+                          "name": payload.get("shard_name", shard_dir.name),
+                          "signature": extract_failure_signature(fallback_log),
+                          "log_path": str(fallback_log.relative_to(shard_dir))
+                          if fallback_log.exists()
+                          else "output.log",
+                          "artifact_source": str(shard_dir),
+                          "issue_id": "bd-1f42.6.2",
+                          "thread_id": "bd-1f42.6.2",
+                      }
+                  )
+              payload["failure_records"] = shard_failure_records
+              shards.append(payload)
+
+          lane_counts = {}
+          lane_runtime_samples = {}
+          lane_duration_seconds = {}
+          lane_unit_samples = {}
+          lane_suite_samples = {}
+          lane_extension_samples = {}
+          correlation_ids = set()
+          duration_rows = []
+          failure_records = []
+          failed = 0
+          for shard in shards:
+              lane = shard.get("lane", "unknown")
+              lane_counts[lane] = lane_counts.get(lane, 0) + 1
+              lane_duration_seconds.setdefault(lane, 0.0)
+              lane_runtime_samples.setdefault(lane, [])
+              lane_unit_samples.setdefault(lane, [])
+              lane_suite_samples.setdefault(lane, [])
+              lane_extension_samples.setdefault(lane, [])
+              if shard.get("job_status") not in {"success", "unknown"}:
+                  failed += 1
+              duration = shard.get("duration_seconds")
+              if isinstance(duration, (int, float)):
+                  lane_duration_seconds[lane] += float(duration)
+                  lane_runtime_samples[lane].append(float(duration))
+                  duration_rows.append(
+                      {
+                          "shard_name": shard.get("shard_name", "unknown"),
+                          "lane": lane,
+                          "duration_seconds": float(duration),
+                      }
+                  )
+              selection_counts = shard.get("selection_counts", {})
+              unit_count = selection_counts.get("unit_targets")
+              suite_count = selection_counts.get("e2e_suites")
+              extension_count = selection_counts.get("extensions")
+              if isinstance(unit_count, int):
+                  lane_unit_samples[lane].append(unit_count)
+              if isinstance(suite_count, int):
+                  lane_suite_samples[lane].append(suite_count)
+              if isinstance(extension_count, int):
+                  lane_extension_samples[lane].append(extension_count)
+              correlation = shard.get("correlation_id")
+              if isinstance(correlation, str) and correlation:
+                  correlation_ids.add(correlation)
+              for failure in shard.get("failure_records", []):
+                  if isinstance(failure, dict):
+                      failure_records.append(failure)
+
+          slowest = max(duration_rows, key=lambda row: row["duration_seconds"], default=None)
+          fastest = min(duration_rows, key=lambda row: row["duration_seconds"], default=None)
+          runtime_samples = [row["duration_seconds"] for row in duration_rows]
+          p95_runtime_seconds = percentile(runtime_samples, 95)
+
+          signature_counter = Counter(
+              failure.get("signature", "unknown failure") for failure in failure_records
+          )
+          top_failure_signatures = []
+          for signature, count in signature_counter.most_common(10):
+              samples = [
+                  failure
+                  for failure in failure_records
+                  if failure.get("signature", "unknown failure") == signature
+              ][:3]
+              top_failure_signatures.append(
+                  {
+                      "signature": signature,
+                      "count": count,
+                      "samples": samples,
+                  }
+              )
+
+          transient_tokens = (
+              "timeout",
+              "timed out",
+              "connection reset",
+              "rate limit",
+              "temporarily unavailable",
+              "broken pipe",
+              "econnreset",
+              "429",
+              "503",
+          )
+          flaky_candidates = [
+              failure
+              for failure in failure_records
+              if any(token in failure.get("signature", "").lower() for token in transient_tokens)
+          ]
+          flake_rate_estimate = (
+              (len(flaky_candidates) / len(failure_records)) if failure_records else 0.0
+          )
+
+          pass_rate = (
+              ((len(shards) - failed) / len(shards))
+              if shards
+              else 0.0
+          )
+
+          lane_balance = {}
+          for lane in sorted(lane_counts):
+              lane_balance[lane] = {
+                  "runtime_seconds": summarize_balance(lane_runtime_samples.get(lane, [])),
+                  "selection_unit_targets": summarize_balance(
+                      lane_unit_samples.get(lane, [])
+                  ),
+                  "selection_e2e_suites": summarize_balance(
+                      lane_suite_samples.get(lane, [])
+                  ),
+                  "selection_extensions": summarize_balance(
+                      lane_extension_samples.get(lane, [])
+                  ),
+              }
+
+          dashboard = {
+              "schema": "pi.ci.test_health_dashboard.v1",
+              "generated_at": now_iso(),
+              "owner_issue_id": "bd-1f42.6.2",
+              "owner_thread_id": "bd-1f42.6.2",
+              "run": {
+                  "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+                  "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                  "github_sha": os.environ.get("GITHUB_SHA"),
+              },
+              "metrics": {
+                  "total_shards": len(shards),
+                  "failed_shards": failed,
+                  "pass_rate": pass_rate,
+                  "p95_runtime_seconds": p95_runtime_seconds,
+                  "flake_rate_estimate": flake_rate_estimate,
+                  "failure_signature_count": len(failure_records),
+              },
+              "top_failure_signatures": top_failure_signatures,
+              "artifact_links": {
+                  "merged_summary": "ci-shard-summary.json",
+                  "shards": [
+                      {
+                          "shard_name": shard.get("shard_name"),
+                          "lane": shard.get("lane"),
+                          "artifact_source": shard.get("artifact_source"),
+                          "index_file": "ci-shard-index.json",
+                      }
+                      for shard in shards
+                  ],
+              },
+              "methodology": {
+                  "pass_rate": "successful_shards / total_shards",
+                  "p95_runtime_seconds": "p95 across shard duration_seconds",
+                  "flake_rate_estimate": "transient-keyword signature count / total failure signatures",
+                  "top_failure_signatures": "frequency-ranked failure signature extraction from shard logs",
+              },
+          }
+
+          summary = {
+              "schema": "pi.ci.shard_summary.v1",
+              "generated_at": now_iso(),
+              "total_shards": len(shards),
+              "failed_shards": failed,
+              "lane_counts": lane_counts,
+              "runtime": {
+                  "documented_shards": len(duration_rows),
+                  "total_duration_seconds": sum(
+                      row["duration_seconds"] for row in duration_rows
+                  ),
+                  "lane_duration_seconds": lane_duration_seconds,
+                  "slowest_shard": slowest,
+                  "fastest_shard": fastest,
+              },
+              "balance": {"lane_balance": lane_balance},
+              "correlation_ids": sorted(correlation_ids),
+              "dashboard": dashboard["metrics"],
+              "top_failure_signatures": top_failure_signatures,
+              "flake_candidates": flaky_candidates,
+              "shards": shards,
+          }
+
+          summary_out = Path("ci-shard-summary.json")
+          summary_out.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+          print(f"wrote {summary_out}")
+
+          dashboard_out = Path("ci-test-health-dashboard.json")
+          dashboard_out.write_text(
+              json.dumps(dashboard, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"wrote {dashboard_out}")
+
+          trend_row = {
+              "schema": "pi.ci.test_health_trend_row.v1",
+              "generated_at": now_iso(),
+              "owner_issue_id": "bd-1f42.6.2",
+              "owner_thread_id": "bd-1f42.6.2",
+              "github_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "github_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "github_sha": os.environ.get("GITHUB_SHA"),
+              "pass_rate": pass_rate,
+              "p95_runtime_seconds": p95_runtime_seconds,
+              "flake_rate_estimate": flake_rate_estimate,
+              "failed_shards": failed,
+              "total_shards": len(shards),
+              "top_failure_signatures": [
+                  entry["signature"] for entry in top_failure_signatures[:5]
+              ],
+              "summary_artifact": "ci-shard-summary.json",
+              "dashboard_artifact": "ci-test-health-dashboard.json",
+          }
+          trend_out = Path("ci-test-health-trend.jsonl")
+          trend_out.write_text(json.dumps(trend_row) + "\n", encoding="utf-8")
+          print(f"wrote {trend_out}")
+          PY
+
+      - name: Upload merged shard summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-shard-summary-${{ github.sha }}
+          path: |
+            ci-shard-summary.json
+            ci-test-health-dashboard.json
+            ci-test-health-trend.jsonl
+          if-no-files-found: error
+
+  # SDK / library consumers (e.g. the pi-code-gui VSCode extension) embed the
+  # `pi` library without the interactive terminal front-end. The `tui` feature
+  # is in the default set, so `cargo build` is unchanged for CLI users, but the
+  # library must keep compiling without crossterm + the charmed_rust stack.
+  # This job locks that contract in so it can never silently regress.
+  library_no_default_features:
+    name: lib (--no-default-features, no TUI)
+    runs-on: ubuntu-latest
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pi_agent_rust -> target
+          prefix-key: library-no-default-features
+
+      - name: cargo check (lib, no default features, no TUI)
+        run: |
+          set -euxo pipefail
+          # Library-only build: SDK consumers must compile without the
+          # crossterm / charmed_rust terminal stack pulled in by `tui`.
+          # `--lib` (not `--all-targets`) is deliberate: the `pi` binary and the
+          # integration tests/benches require the `tui` feature, so they are
+          # expected to be skipped here — only the library contract is locked in.
+          cargo check --locked --no-default-features --lib
