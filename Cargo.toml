@@ -208,7 +208,7 @@ clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 clap_complete = "4.5.66"
 
 # Async runtime
-asupersync = { version = "0.4.4", default-features = false, features = ["tls-webpki-roots", "test-internals"] }
+asupersync = { version = "0.4.4", default-features = false, features = ["tls-webpki-roots", "tls-native-roots", "test-internals"] }
 futures = "0.3"
 async-trait = "0.1"
 

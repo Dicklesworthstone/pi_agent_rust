@@ -16,6 +16,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ### Added
 
+- **System/custom CA certificate support** (gh
+  [#186](https://github.com/Dicklesworthstone/pi_agent_rust/issues/186)):
+  `PI_HTTP_USE_SYSTEM_CERTS=1` switches the HTTP client from the bundled
+  webpki roots to the OS trust store. Setting `SSL_CERT_FILE`, `SSL_CERT_DIR`,
+  `REQUESTS_CA_BUNDLE`, or `CURL_CA_BUNDLE` does the same and also merges that
+  bundle in — needed behind a TLS-terminating corporate proxy. Webpki roots
+  stay the default (see #101: the OS trust store is expensive to load on
+  macOS).
+
 - **Host-mediated native-Responses compaction bridge** (gh
   [#167](https://github.com/Dicklesworthstone/pi_agent_rust/issues/167)):
   `ctx.compact(preparation, { strategy: "openai-responses-native", request })`

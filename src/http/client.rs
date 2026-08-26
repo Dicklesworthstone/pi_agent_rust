@@ -231,18 +231,49 @@ pub struct Client {
 static TLS_CONNECTOR: std::sync::OnceLock<std::result::Result<TlsConnector, String>> =
     std::sync::OnceLock::new();
 
-/// Build (or fetch the cached) TLS connector backed by the bundled webpki
-/// root certificates.
+/// Explicit opt-in for the OS/system trust store instead of the bundled
+/// webpki roots. See [`use_system_certs`].
+pub const USE_SYSTEM_CERTS_ENV: &str = "PI_HTTP_USE_SYSTEM_CERTS";
+
+/// True when the operator wants the OS trust store (plus any custom CA it
+/// points at) instead of the bundled webpki roots - needed behind a
+/// TLS-terminating corporate proxy. Triggered explicitly by
+/// `PI_HTTP_USE_SYSTEM_CERTS`, or implicitly by setting any of the
+/// OpenSSL-style custom-CA vars (`SSL_CERT_FILE`, `SSL_CERT_DIR`,
+/// `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`) - setting one of those *is* the
+/// opt-in signal for asupersync's `enable_env_cert_loading()`. See
+/// pi_agent_rust#186.
+fn use_system_certs() -> bool {
+    std::env::var_os(USE_SYSTEM_CERTS_ENV).is_some()
+        || std::env::var_os("SSL_CERT_FILE").is_some()
+        || std::env::var_os("SSL_CERT_DIR").is_some()
+        || std::env::var_os("REQUESTS_CA_BUNDLE").is_some()
+        || std::env::var_os("CURL_CA_BUNDLE").is_some()
+}
+
+/// Build (or fetch the cached) TLS connector.
 ///
-/// Using webpki roots avoids hitting the OS trust store, which on macOS calls
-/// into Security.framework (`SecTrustSettingsCopyTrustSettings`) and can spend
+/// Defaults to the bundled webpki root certificates: using webpki roots
+/// avoids hitting the OS trust store, which on macOS calls into
+/// Security.framework (`SecTrustSettingsCopyTrustSettings`) and can spend
 /// many seconds at high CPU parsing the system cert trust plist on startup.
 /// See pi_agent_rust#101.
+///
+/// [`use_system_certs`] switches to the OS trust store plus any custom CA
+/// bundle it's pointed at instead - see pi_agent_rust#186.
 fn shared_tls_connector() -> std::result::Result<TlsConnector, String> {
     TLS_CONNECTOR
         .get_or_init(|| {
-            TlsConnectorBuilder::new()
-                .with_webpki_roots()
+            let builder = TlsConnectorBuilder::new();
+            let builder = if use_system_certs() {
+                builder
+                    .enable_env_cert_loading()
+                    .with_native_roots()
+                    .map_err(|e| e.to_string())?
+            } else {
+                builder.with_webpki_roots()
+            };
+            builder
                 .alpn_protocols(vec![b"http/1.1".to_vec()])
                 .build()
                 .map_err(|e| e.to_string())
