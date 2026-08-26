@@ -965,8 +965,7 @@ impl QueuedAgentMessage {
             .persistence_identity
             .get_or_init(|| QueuedPersistenceIdentity {
                 entry_id: uuid::Uuid::new_v4().to_string(),
-                timestamp: chrono::Utc::now()
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 parent_id,
             });
         (
@@ -10630,9 +10629,9 @@ fn finish_turn_persistence<T>(result: Result<T>, persist_result: Result<()>) -> 
         Err(persist_err) => {
             let message = match result {
                 Ok(_) => persist_err.to_string(),
-                Err(primary_err) => format!(
-                    "{persist_err}; primary provider/tool turn also failed: {primary_err}"
-                ),
+                Err(primary_err) => {
+                    format!("{persist_err}; primary provider/tool turn also failed: {primary_err}")
+                }
             };
             Err(Error::session_persistence(message))
         }

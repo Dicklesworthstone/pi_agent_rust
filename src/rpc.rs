@@ -244,18 +244,13 @@ fn command_payload_can_advance_rpc_session(
             parse_optional_u32_field(parsed, "reserveTokens").is_ok()
                 && parse_optional_u32_field(parsed, "keepRecentTokens").is_ok()
         }
-        "switch_session" => parsed
-            .get("sessionPath")
-            .and_then(Value::as_str)
-            .is_some(),
+        "switch_session" => parsed.get("sessionPath").and_then(Value::as_str).is_some(),
         "fork" => parsed.get("entryId").and_then(Value::as_str).is_some(),
         _ => true,
     }
 }
 
-async fn take_last_rpc_user_turn_for_retry(
-    session: &mut AgentSession,
-) -> Result<Option<String>> {
+async fn take_last_rpc_user_turn_for_retry(session: &mut AgentSession) -> Result<Option<String>> {
     // Session is the durable authority. Truncating only Agent history is undone
     // by `run_agent_with_text`, which rehydrates Agent from this path before it
     // appends the retried prompt. Read the same retryable turn shape as
@@ -1129,12 +1124,10 @@ pub async fn run(
                 else {
                     return Vec::new();
                 };
-                steering_state
-                    .lock(&steering_cx)
-                    .await
-                    .map_or_else(|_| Vec::new(), |mut state| {
-                        state.lease_steering(session_entry_baseline)
-                    })
+                steering_state.lock(&steering_cx).await.map_or_else(
+                    |_| Vec::new(),
+                    |mut state| state.lease_steering(session_entry_baseline),
+                )
             })
         };
         let follow_fetcher = move || -> BoxFuture<'static, Vec<QueuedAgentMessage>> {
@@ -1150,12 +1143,10 @@ pub async fn run(
                 else {
                     return Vec::new();
                 };
-                follow_state
-                    .lock(&follow_cx)
-                    .await
-                    .map_or_else(|_| Vec::new(), |mut state| {
-                        state.lease_follow_up_for_fetch(session_entry_baseline)
-                    })
+                follow_state.lock(&follow_cx).await.map_or_else(
+                    |_| Vec::new(),
+                    |mut state| state.lease_follow_up_for_fetch(session_entry_baseline),
+                )
             })
         };
         guard
@@ -1301,9 +1292,7 @@ pub async fn run(
                 let _ = out_tx.send(response_error(
                     id.clone(),
                     command_type,
-                    format!(
-                        "Agent is currently compacting; wait before running {command_type}"
-                    ),
+                    format!("Agent is currently compacting; wait before running {command_type}"),
                 ));
                 continue;
             }
@@ -1355,12 +1344,8 @@ pub async fn run(
                     RpcTerminalRecoveryPlan::None => None,
                     RpcTerminalRecoveryPlan::RecordedToolTranscript { recovery_count } => Some((
                         recovery_count,
-                        preserve_recorded_tool_transcript(
-                            &session,
-                            &shared_state,
-                            &recovery_cx,
-                        )
-                        .await,
+                        preserve_recorded_tool_transcript(&session, &shared_state, &recovery_cx)
+                            .await,
                     )),
                     RpcTerminalRecoveryPlan::All { recovery_count } => Some((
                         recovery_count,
@@ -3586,9 +3571,7 @@ fn rpc_recovery_message_fingerprint(
     timestamp_is_synthetic: bool,
 ) -> Result<Value> {
     let mut value = serde_json::to_value(message)?;
-    if timestamp_is_synthetic
-        && let Some(object) = value.as_object_mut()
-    {
+    if timestamp_is_synthetic && let Some(object) = value.as_object_mut() {
         // Legacy rows and summary projections can synthesize a fresh timestamp
         // on every rebuild. Authored timestamps remain part of causal identity.
         object.remove("timestamp");
@@ -3819,9 +3802,7 @@ async fn preserve_terminal_rpc_state(
     }
 
     if save_enabled
-        && let Err(persist_err) = candidate
-            .flush_autosave(AutosaveFlushTrigger::Manual)
-            .await
+        && let Err(persist_err) = candidate.flush_autosave(AutosaveFlushTrigger::Manual).await
     {
         return Err(persist_err);
     }
@@ -3866,12 +3847,10 @@ async fn terminal_rpc_recovery_plan(
         .await
         .map_err(|err| Error::session(format!("state lock failed: {err}")))?;
     let pending_count = state.pending_count();
-    let completed_tool_effect_count = completed_live_tool_effect_suffix(
-        &inner,
-        guard.agent.messages(),
-    )?
-    .len()
-    .max(state.completed_tool_transcript_entries().len());
+    let completed_tool_effect_count =
+        completed_live_tool_effect_suffix(&inner, guard.agent.messages())?
+            .len()
+            .max(state.completed_tool_transcript_entries().len());
 
     // A max-time boundary can return leased steering to Agent's private queue.
     // Keep that delivery executable when the next command starts a provider
@@ -3913,11 +3892,7 @@ fn find_represented_rpc_deliveries(
         .filter_map(|entry| entry.base_id().map(String::as_str))
         .collect();
     let mut candidates = Vec::new();
-    for (index, entry) in session
-        .entries
-        .iter()
-        .enumerate()
-    {
+    for (index, entry) in session.entries.iter().enumerate() {
         if !entry
             .base_id()
             .is_some_and(|id| current_path_ids.contains(id.as_str()))
@@ -3933,9 +3908,8 @@ fn find_represented_rpc_deliveries(
     let mut matched_entries = HashSet::new();
     let mut represented = Vec::with_capacity(deliveries.len());
     for in_flight in deliveries {
-        let expected = serde_json::to_vec(&SessionMessage::from(
-            in_flight.delivery.message().clone(),
-        ))?;
+        let expected =
+            serde_json::to_vec(&SessionMessage::from(in_flight.delivery.message().clone()))?;
         let matched = candidates.iter().find_map(|(index, encoded)| {
             (*index >= in_flight.session_entry_baseline
                 && !matched_entries.contains(index)
@@ -9384,7 +9358,13 @@ export default function init(pi) {
 
     #[test]
     fn session_advancing_commands_require_stranded_input_recovery() {
-        for command in ["prompt", "set_plan_mode", "bash", "checkpoint", "new_session"] {
+        for command in [
+            "prompt",
+            "set_plan_mode",
+            "bash",
+            "checkpoint",
+            "new_session",
+        ] {
             assert!(
                 command_can_advance_rpc_session(command),
                 "{command} can advance the session"
@@ -9421,11 +9401,7 @@ export default function init(pi) {
             None
         ));
         assert!(!command_resumes_rpc_agent("prompt", &json!({}), None));
-        assert!(!command_resumes_rpc_agent(
-            "set_model",
-            &json!({}),
-            None
-        ));
+        assert!(!command_resumes_rpc_agent("set_model", &json!({}), None));
         assert!(command_payload_can_advance_rpc_session(
             "prompt",
             &json!({"message": "resume"}),
@@ -9468,13 +9444,12 @@ export default function init(pi) {
             let prompt = build_user_message("[REWIND REPORT: literal user prompt", &[]);
             let mut inner = Session::in_memory();
             let original_user_id = inner.append_model_message(prompt.clone());
-            let original_assistant_id = inner.append_model_message(Message::Assistant(Arc::new(
-                AssistantMessage {
+            let original_assistant_id =
+                inner.append_model_message(Message::Assistant(Arc::new(AssistantMessage {
                     content: vec![ContentBlock::Text(TextContent::new("original response"))],
                     stop_reason: StopReason::Stop,
                     ..AssistantMessage::default()
-                },
-            )));
+                })));
             let original_entry_count = inner.entries.len();
             let mut agent_session = build_test_agent_session(inner);
             agent_session.agent.replace_messages(vec![
@@ -10751,10 +10726,7 @@ export default function init(pi) {
         assert_eq!(leased.len(), 1);
         assert!(shared.steering.is_empty());
         assert_eq!(shared.steering_in_flight.len(), 1);
-        assert_eq!(
-            shared.steering_in_flight[0].session_entry_baseline,
-            7
-        );
+        assert_eq!(shared.steering_in_flight[0].session_entry_baseline, 7);
         assert_eq!(
             shared.pending_count(),
             1,
@@ -11881,9 +11853,9 @@ export default function init(pi) {
 
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
-            let inner_session = Arc::new(asupersync::sync::Mutex::new(
-                Session::create_with_dir(Some(temp.path().join("sessions"))),
-            ));
+            let inner_session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+                Some(temp.path().join("sessions")),
+            )));
             let provider: Arc<dyn Provider> = Arc::new(NoopProvider);
             let agent = Agent::new(
                 provider,
@@ -11919,10 +11891,9 @@ export default function init(pi) {
                 .expect("inner session lock")
                 .append_model_message(delivered.message().clone());
 
-            let acknowledged =
-                acknowledge_durable_rpc_in_flight(&session, &shared_state, &cx)
-                    .await
-                    .expect("durably acknowledge represented input");
+            let acknowledged = acknowledge_durable_rpc_in_flight(&session, &shared_state, &cx)
+                .await
+                .expect("durably acknowledge represented input");
             assert_eq!(acknowledged, 1);
             assert_eq!(
                 shared_state
@@ -11969,10 +11940,8 @@ export default function init(pi) {
 
         runtime.block_on(async {
             let temp = tempfile::tempdir().expect("tempdir");
-            let mut live = Session::create_with_dir_and_store(
-                Some(temp.path().join("sessions")),
-                store_kind,
-            );
+            let mut live =
+                Session::create_with_dir_and_store(Some(temp.path().join("sessions")), store_kind);
             live.append_model_message(build_user_message("durable base", &[]));
             live.save().await.expect("persist replay base entry");
             let session_path = live.path.clone().expect("pinned session path");
@@ -12007,8 +11976,7 @@ export default function init(pi) {
                 };
 
             let mut cancelled_candidate = live.clone();
-            append_queued(&mut cancelled_candidate, &queued)
-                .expect("prepare first candidate");
+            append_queued(&mut cancelled_candidate, &queued).expect("prepare first candidate");
             cancelled_candidate
                 .flush_autosave(AutosaveFlushTrigger::Periodic)
                 .await

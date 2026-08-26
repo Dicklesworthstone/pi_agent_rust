@@ -2063,7 +2063,10 @@ fn is_positive_finite_metric(value: Option<f64>) -> bool {
     value.is_some_and(|v| v.is_finite() && v > 0.0)
 }
 
-fn phase1_artifact_attestation_is_valid(value: Option<&Value>, expected_path: Option<&str>) -> bool {
+fn phase1_artifact_attestation_is_valid(
+    value: Option<&Value>,
+    expected_path: Option<&str>,
+) -> bool {
     let Some(attestation) = value.and_then(Value::as_object) else {
         return false;
     };
@@ -2229,9 +2232,7 @@ fn cross_runtime_comparison_contract_failure(
         .pointer("/claim_integrity/cross_runtime_comparison/contract_schema")
         .and_then(Value::as_str);
     let legacy_required = payload
-        .pointer(
-            "/claim_integrity/cross_runtime_comparison/legacy_pi_mono_executed_required",
-        )
+        .pointer("/claim_integrity/cross_runtime_comparison/legacy_pi_mono_executed_required")
         .and_then(Value::as_bool);
     let exact_contract_required = payload
         .pointer(
@@ -2443,9 +2444,7 @@ fn evaluate_phase1_weighted_attribution_contract(
     let phase5_ready = payload
         .pointer("/consumption_contract/artifact_ready_for_phase5")
         .and_then(Value::as_bool);
-    let regression_guards = payload
-        .get("regression_guards")
-        .and_then(Value::as_object);
+    let regression_guards = payload.get("regression_guards").and_then(Value::as_object);
     let guard_statuses = ["memory", "correctness", "security"].map(|guard| {
         (
             guard,
@@ -2517,13 +2516,7 @@ fn evaluate_phase1_weighted_attribution_contract(
         "measurement_contract_version": "production_session_stage_instrumentation.v1"
     });
     const REQUIRED_PARTITIONS: [&str; 2] = ["matched-state", "realistic"];
-    const REQUIRED_SESSION_SIZES: [u64; 5] = [
-        100_000,
-        200_000,
-        500_000,
-        1_000_000,
-        5_000_000,
-    ];
+    const REQUIRED_SESSION_SIZES: [u64; 5] = [100_000, 200_000, 500_000, 1_000_000, 5_000_000];
     const REQUIRED_STAGES: [&str; 4] = ["open_ms", "append_ms", "save_ms", "index_ms"];
     const REQUIRED_SWARM_GROUPS: [(&str, &[&str]); 6] = [
         ("latency_quantiles_ms", &["p50", "p95", "p99", "p999"]),
@@ -2595,9 +2588,7 @@ fn evaluate_phase1_weighted_attribution_contract(
             let partition = cell_object
                 .get("workload_partition")
                 .and_then(Value::as_str);
-            let session_messages = cell_object
-                .get("session_messages")
-                .and_then(Value::as_u64);
+            let session_messages = cell_object.get("session_messages").and_then(Value::as_u64);
             let Some((partition, session_messages)) = partition.zip(session_messages) else {
                 matrix_contract_errors.push(format!("matrix cell {index} identity is invalid"));
                 continue;
@@ -2621,8 +2612,8 @@ fn evaluate_phase1_weighted_attribution_contract(
             let stages_valid = stage_values
                 .iter()
                 .all(|value| value.is_some_and(|metric| metric.is_finite() && metric >= 0.0));
-            let observed_stage_total = stages_valid
-                .then(|| stage_values.iter().flatten().sum::<f64>());
+            let observed_stage_total =
+                stages_valid.then(|| stage_values.iter().flatten().sum::<f64>());
             let reported_stage_total = stage
                 .and_then(|values| values.get("total_stage_ms"))
                 .and_then(Value::as_f64);
@@ -2640,9 +2631,10 @@ fn evaluate_phase1_weighted_attribution_contract(
                     ["wall_clock_ms", "rust_vs_node_ratio", "rust_vs_bun_ratio"]
                         .iter()
                         .all(|field| {
-                            primary.get(*field).and_then(Value::as_f64).is_some_and(
-                                |metric| metric.is_finite() && metric > 0.0,
-                            )
+                            primary
+                                .get(*field)
+                                .and_then(Value::as_f64)
+                                .is_some_and(|metric| metric.is_finite() && metric > 0.0)
                         })
                 });
             let swarm_valid = cell_object
@@ -2708,8 +2700,7 @@ fn evaluate_phase1_weighted_attribution_contract(
             let lineage = cell.get("lineage").and_then(Value::as_object);
             if expected_evidence.iter().any(|(field, expected)| {
                 lineage.and_then(|value| value.get(field)) != Some(expected)
-            })
-            {
+            }) {
                 invalid_pass_cell_lineage.push(index);
             }
         }
@@ -6562,8 +6553,7 @@ fn post_generation_inventory_rejects_fabricated_support_check_remote_receipt() {
         &std::fs::read(&admission_path).expect("read producer admission fixture"),
     )
     .expect("parse producer admission fixture");
-    admission["support_checks"][0]["remote_marker"] =
-        json!("[RCH] local (fixture fallback)");
+    admission["support_checks"][0]["remote_marker"] = json!("[RCH] local (fixture fallback)");
     std::fs::write(
         &admission_path,
         serde_json::to_vec_pretty(&admission).expect("serialize mutated support-check admission"),
@@ -7332,9 +7322,12 @@ fn write_phase1_matrix_validation_artifact(path: &Path, weighted_bottleneck_attr
     let matrix_cells = ["matched-state", "realistic"]
         .into_iter()
         .flat_map(|partition| {
-            required_sizes.into_iter().enumerate().map(move |(index, size)| {
-                phase1_matrix_cell_fixture(partition, size, 10.0 + index as f64)
-            })
+            required_sizes
+                .into_iter()
+                .enumerate()
+                .map(move |(index, size)| {
+                    phase1_matrix_cell_fixture(partition, size, 10.0 + index as f64)
+                })
         })
         .collect::<Vec<_>>();
     let payload = json!({
@@ -7510,9 +7503,9 @@ fn required_e2e_ratio_contract_rejects_unmatched_comparator_basis() {
 
     let failures = evaluate_required_e2e_ratio_contract(tmp.path(), 24.0);
     assert!(
-        failures.iter().any(|failure| {
-            failure.contract_id == "invalid_cross_runtime_comparison_contract"
-        }),
+        failures
+            .iter()
+            .any(|failure| { failure.contract_id == "invalid_cross_runtime_comparison_contract" }),
         "expected invalid cross-runtime comparison failure, got: {failures:?}",
     );
 }
@@ -7539,9 +7532,9 @@ fn required_e2e_ratio_contract_rejects_inferred_release_evidence() {
 
     let failures = evaluate_required_e2e_ratio_contract(tmp.path(), 24.0);
     assert!(
-        failures.iter().any(|failure| {
-            failure.contract_id == "invalid_cross_runtime_comparison_contract"
-        }),
+        failures
+            .iter()
+            .any(|failure| { failure.contract_id == "invalid_cross_runtime_comparison_contract" }),
         "expected inferred release evidence failure, got: {failures:?}",
     );
 }
@@ -7708,10 +7701,9 @@ fn phase1_weighted_contract_rejects_ready_artifact_with_unverified_guard() {
         &artifact,
         &valid_weighted_bottleneck_attribution_fixture(),
     );
-    let mut payload: Value = serde_json::from_slice(
-        &std::fs::read(&artifact).expect("read phase1 fixture"),
-    )
-    .expect("parse phase1 fixture");
+    let mut payload: Value =
+        serde_json::from_slice(&std::fs::read(&artifact).expect("read phase1 fixture"))
+            .expect("parse phase1 fixture");
     payload["regression_guards"]["memory"] = json!("missing");
     std::fs::write(
         &artifact,
@@ -7740,12 +7732,11 @@ fn phase1_weighted_contract_rejects_unbound_persistence_evidence() {
         &artifact,
         &valid_weighted_bottleneck_attribution_fixture(),
     );
-    let mut payload: Value = serde_json::from_slice(
-        &std::fs::read(&artifact).expect("read phase1 fixture"),
-    )
-    .expect("parse phase1 fixture");
-    payload["evidence_links"]["phase1_unit_and_fault_injection"]
-        ["fault_injection_summary"]["sha256"] = json!("not-a-digest");
+    let mut payload: Value =
+        serde_json::from_slice(&std::fs::read(&artifact).expect("read phase1 fixture"))
+            .expect("parse phase1 fixture");
+    payload["evidence_links"]["phase1_unit_and_fault_injection"]["fault_injection_summary"]["sha256"] =
+        json!("not-a-digest");
     std::fs::write(
         &artifact,
         serde_json::to_vec_pretty(&payload).expect("serialize mutated phase1 fixture"),
@@ -7772,10 +7763,9 @@ fn phase1_weighted_contract_rejects_inferred_passing_cell_lineage() {
         &artifact,
         &valid_weighted_bottleneck_attribution_fixture(),
     );
-    let mut payload: Value = serde_json::from_slice(
-        &std::fs::read(&artifact).expect("read phase1 fixture"),
-    )
-    .expect("parse phase1 fixture");
+    let mut payload: Value =
+        serde_json::from_slice(&std::fs::read(&artifact).expect("read phase1 fixture"))
+            .expect("parse phase1 fixture");
     payload["matrix_cells"][0]["lineage"]["evidence_class"] = json!("inferred");
     std::fs::write(
         &artifact,
@@ -7803,10 +7793,9 @@ fn phase1_weighted_contract_rejects_ready_artifact_with_failed_matrix_cell() {
         &artifact,
         &valid_weighted_bottleneck_attribution_fixture(),
     );
-    let mut payload: Value = serde_json::from_slice(
-        &std::fs::read(&artifact).expect("read phase1 fixture"),
-    )
-    .expect("parse phase1 fixture");
+    let mut payload: Value =
+        serde_json::from_slice(&std::fs::read(&artifact).expect("read phase1 fixture"))
+            .expect("parse phase1 fixture");
     payload["matrix_cells"][0]["status"] = json!("fail");
     std::fs::write(
         &artifact,
@@ -7818,7 +7807,9 @@ fn phase1_weighted_contract_rejects_ready_artifact_with_failed_matrix_cell() {
     assert!(
         failures.iter().any(|failure| {
             failure.contract_id == "invalid_phase1_matrix_validation_contract"
-                && failure.detail.contains("not complete measured pass evidence")
+                && failure
+                    .detail
+                    .contains("not complete measured pass evidence")
         }),
         "artifact_ready_for_phase5=true must not override a failed matrix cell: {failures:?}"
     );

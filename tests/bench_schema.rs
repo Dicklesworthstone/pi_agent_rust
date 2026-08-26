@@ -771,8 +771,7 @@ fn assert_persistence_completion_contract(
 ) -> (Value, Value) {
     let summary_path = artifact_root.join("integrity-summary.json");
     let summary_bytes = fs::read(&summary_path).expect("read integrity summary");
-    let summary: Value =
-        serde_json::from_slice(&summary_bytes).expect("parse integrity summary");
+    let summary: Value = serde_json::from_slice(&summary_bytes).expect("parse integrity summary");
     assert_eq!(
         summary["schema"],
         "pi.e2e.persistence_fault_injection.summary.v1"
@@ -783,10 +782,9 @@ fn assert_persistence_completion_contract(
     assert_eq!(summary["correlation_id"], correlation_id);
 
     let manifest_path = artifact_root.join("run-manifest.json");
-    let manifest: Value = serde_json::from_slice(
-        &fs::read(&manifest_path).expect("read run manifest"),
-    )
-    .expect("parse run manifest");
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("read run manifest"))
+            .expect("parse run manifest");
     assert_eq!(
         manifest["schema"],
         "pi.e2e.persistence_fault_injection.manifest.v1"
@@ -4222,10 +4220,8 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
                 None => unreachable!("relative ratio field presence checked above"),
             }
         };
-        let node_ratio_present =
-            validate_ratio("rust_vs_node_ratio", "rust_vs_node_ratio_basis")?;
-        let bun_ratio_present =
-            validate_ratio("rust_vs_bun_ratio", "rust_vs_bun_ratio_basis")?;
+        let node_ratio_present = validate_ratio("rust_vs_node_ratio", "rust_vs_node_ratio_basis")?;
+        let bun_ratio_present = validate_ratio("rust_vs_bun_ratio", "rust_vs_bun_ratio_basis")?;
         if node_ratio_present != bun_ratio_present {
             return Err(format!(
                 "layer {layer_id} must provide matched Node and Bun ratios together"
@@ -4400,7 +4396,9 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
     let declared_layer_coverage = cherry_pick_guard
         .get("layer_coverage")
         .and_then(Value::as_object)
-        .ok_or_else(|| "claim_integrity.cherry_pick_guard.layer_coverage must be object".to_string())?;
+        .ok_or_else(|| {
+            "claim_integrity.cherry_pick_guard.layer_coverage must be object".to_string()
+        })?;
     if declared_layer_coverage.len() != REQUIRED_LAYER_IDS.len() {
         return Err(
             "claim_integrity.cherry_pick_guard.layer_coverage must contain exactly the required layers"
@@ -4425,7 +4423,10 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
         .ok_or_else(|| {
             "claim_integrity.cherry_pick_guard.invalidity_reasons must be array".to_string()
         })?;
-    if invalidity_reasons.iter().any(|reason| reason.as_str().is_none()) {
+    if invalidity_reasons
+        .iter()
+        .any(|reason| reason.as_str().is_none())
+    {
         return Err(
             "claim_integrity.cherry_pick_guard.invalidity_reasons entries must be strings"
                 .to_string(),
@@ -4468,12 +4469,12 @@ fn validate_extension_stratification_record(record: &Value) -> Result<(), String
             .map(|covered| all && covered)
             .ok_or_else(|| format!("partition_coverage.{tag} must be boolean"))
     })?;
-    let all_layers_covered = REQUIRED_LAYER_IDS.iter().all(|layer_id| {
-        observed_layer_coverage.get(*layer_id).copied() == Some(true)
-    });
-    let all_comparison_contracts_matched = REQUIRED_LAYER_IDS.iter().all(|layer_id| {
-        observed_matched_contracts.get(*layer_id).copied() == Some(true)
-    });
+    let all_layers_covered = REQUIRED_LAYER_IDS
+        .iter()
+        .all(|layer_id| observed_layer_coverage.get(*layer_id).copied() == Some(true));
+    let all_comparison_contracts_matched = REQUIRED_LAYER_IDS
+        .iter()
+        .all(|layer_id| observed_matched_contracts.get(*layer_id).copied() == Some(true));
     let expected_global_claim_valid = all_layers_covered
         && all_comparison_contracts_matched
         && all_partitions_covered
@@ -4811,8 +4812,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             }
             None => unreachable!("total_stage_ms presence checked above"),
         }
-        let complete_stage_breakdown =
-            missing_stage_metrics == 0 && observed_stage_total_ms > 0.0;
+        let complete_stage_breakdown = missing_stage_metrics == 0 && observed_stage_total_ms > 0.0;
         if complete_stage_breakdown {
             observed_complete_stage_breakdown_cells += 1;
         } else {
@@ -5041,8 +5041,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             .get("session_messages")
             .and_then(Value::as_u64)
             .ok_or_else(|| {
-                "stage_summary.evidence_rejections session_messages must be an integer"
-                    .to_string()
+                "stage_summary.evidence_rejections session_messages must be an integer".to_string()
             })?;
         if !required_sizes.contains(&session_messages) {
             return Err(format!(
@@ -5064,9 +5063,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 )
             })?;
             let mismatch = mismatch.as_object().ok_or_else(|| {
-                format!(
-                    "stage_summary.evidence_rejections mismatches.{field} must be an object"
-                )
+                format!("stage_summary.evidence_rejections mismatches.{field} must be an object")
             })?;
             if mismatch.get("expected") != Some(expected) {
                 return Err(format!(
@@ -5074,9 +5071,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                 ));
             }
             let observed = mismatch.get("observed").ok_or_else(|| {
-                format!(
-                    "stage_summary.evidence_rejections mismatches.{field} missing observed"
-                )
+                format!("stage_summary.evidence_rejections mismatches.{field} missing observed")
             })?;
             if observed == expected {
                 return Err(format!(
@@ -5210,8 +5205,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
         if !reason_set.iter().any(|reason| {
             reason.starts_with("missing_stage_metrics:")
                 || reason.starts_with("invalid_stage_total:")
-        })
-        {
+        }) {
             return Err(format!(
                 "stage_summary.missing_cells entry ({workload_partition}, {session_messages}) reasons must include a missing_stage_metrics:* or invalid_stage_total:* token"
             ));
@@ -6081,13 +6075,17 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
             phase1_fault_evidence,
             "evidence_links.phase1_unit_and_fault_injection",
             "fault_injection_manifest",
-            fault_manifest_path.and_then(Value::as_str).unwrap_or_default(),
+            fault_manifest_path
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
         )?;
         require_artifact_attestation(
             phase1_fault_evidence,
             "evidence_links.phase1_unit_and_fault_injection",
             "fault_injection_summary",
-            fault_summary_path.and_then(Value::as_str).unwrap_or_default(),
+            fault_summary_path
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
         )?;
     }
     let required_artifacts = evidence_links
@@ -6183,9 +6181,7 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
     let fail_closed_conditions = collect_string_set(
         consumption_contract
             .get("fail_closed_conditions")
-            .ok_or_else(|| {
-                "consumption_contract.fail_closed_conditions is required".to_string()
-            })?,
+            .ok_or_else(|| "consumption_contract.fail_closed_conditions is required".to_string())?,
         "consumption_contract.fail_closed_conditions",
     )?;
     if fail_closed_conditions != expected_fail_closed_conditions {
@@ -8150,8 +8146,8 @@ fn extension_stratification_validator_rejects_unmatched_ratio_basis() {
 #[test]
 fn extension_stratification_validator_rejects_inferred_layer_claimed_as_covered() {
     let mut malformed = extension_stratification_golden_fixture();
-    malformed["claim_integrity"]["cherry_pick_guard"]["layer_coverage"]
-        ["cold_load_init"] = json!(true);
+    malformed["claim_integrity"]["cherry_pick_guard"]["layer_coverage"]["cold_load_init"] =
+        json!(true);
 
     let err = validate_extension_stratification_record(&malformed).expect_err("fixture must fail");
     assert!(
@@ -8869,8 +8865,7 @@ fn phase1_matrix_validator_rejects_required_cell_count_mismatching_partition_siz
 #[test]
 fn phase1_matrix_validator_rejects_required_cell_count_below_partition_size_space() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
-    malformed["matrix_requirements"]["required_session_message_sizes"] =
-        json!([100_000, 200_000]);
+    malformed["matrix_requirements"]["required_session_message_sizes"] = json!([100_000, 200_000]);
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
@@ -9004,8 +8999,8 @@ fn phase1_matrix_validator_rejects_reason_for_passing_regression_guard() {
 #[test]
 fn phase1_matrix_validator_rejects_persistence_attestation_path_mismatch() {
     let mut malformed = phase1_matrix_validation_golden_fixture();
-    malformed["evidence_links"]["phase1_unit_and_fault_injection"]
-        ["fault_injection_summary"]["path"] = json!("foreign/integrity-summary.json");
+    malformed["evidence_links"]["phase1_unit_and_fault_injection"]["fault_injection_summary"]["path"] =
+        json!("foreign/integrity-summary.json");
 
     let err = validate_phase1_matrix_validation_record(&malformed).expect_err("fixture must fail");
     assert!(
@@ -9612,13 +9607,13 @@ fn run_orchestrate_with_fake_toolchain_with_env(
             .expect("fault-injection summary parent"),
     )
     .expect("create fake fault-injection evidence directory");
-    let fault_injection_summary_only_failure = extra_env.iter().any(|(key, value)| {
-        *key == "PI_FAKE_PERSISTENCE_SUMMARY_ONLY_FAILURE" && *value == "1"
-    });
+    let fault_injection_summary_only_failure = extra_env
+        .iter()
+        .any(|(key, value)| *key == "PI_FAKE_PERSISTENCE_SUMMARY_ONLY_FAILURE" && *value == "1");
     let fault_injection_passed = !fault_injection_summary_only_failure
         && !extra_env
-        .iter()
-        .any(|(key, value)| *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1");
+            .iter()
+            .any(|(key, value)| *key == "PI_FAKE_FAILED_PERSISTENCE_SUMMARY" && *value == "1");
     let fault_injection_case_exit_69 = extra_env
         .iter()
         .any(|(key, value)| *key == "PI_FAKE_PERSISTENCE_CASE_EXIT_69" && *value == "1");
@@ -9734,17 +9729,12 @@ fn run_orchestrate_with_fake_toolchain_with_env(
         ],
         "validation_passed": fault_injection_passed,
     });
-    let fault_injection_summary_bytes =
-        serde_json::to_vec(&fault_injection_summary_payload)
-            .expect("encode fake fault-injection summary");
-    fs::write(
-        &fault_injection_summary,
-        &fault_injection_summary_bytes,
-    )
-    .expect("write fake fault-injection evidence");
-    let fault_injection_summary_sha256 = pi::package_manager::hex_encode(&Sha256::digest(
-        &fault_injection_summary_bytes,
-    ));
+    let fault_injection_summary_bytes = serde_json::to_vec(&fault_injection_summary_payload)
+        .expect("encode fake fault-injection summary");
+    fs::write(&fault_injection_summary, &fault_injection_summary_bytes)
+        .expect("write fake fault-injection evidence");
+    let fault_injection_summary_sha256 =
+        pi::package_manager::hex_encode(&Sha256::digest(&fault_injection_summary_bytes));
     let fault_injection_manifest_payload = json!({
         "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
         "run_id": FAKE_ORCHESTRATE_CORRELATION_ID,
@@ -9961,10 +9951,8 @@ fn orchestrate_rejects_persistence_summary_without_completion_manifest() {
         "summary-only persistence evidence must not satisfy strict Phase-5 admission"
     );
     let matrix: Value = serde_json::from_str(
-        &fs::read_to_string(
-            temp_root.join("run/results/phase1_matrix_validation.json"),
-        )
-        .expect("read matrix artifact"),
+        &fs::read_to_string(temp_root.join("run/results/phase1_matrix_validation.json"))
+            .expect("read matrix artifact"),
     )
     .expect("parse matrix artifact");
     assert_eq!(
@@ -9997,10 +9985,8 @@ fn orchestrate_rejects_persistence_summary_that_breaks_manifest_binding() {
         "a summary whose bytes no longer match the final manifest must fail admission"
     );
     let matrix: Value = serde_json::from_str(
-        &fs::read_to_string(
-            temp_root.join("run/results/phase1_matrix_validation.json"),
-        )
-        .expect("read matrix artifact"),
+        &fs::read_to_string(temp_root.join("run/results/phase1_matrix_validation.json"))
+            .expect("read matrix artifact"),
     )
     .expect("parse matrix artifact");
     assert_eq!(
@@ -10024,19 +10010,15 @@ fn orchestrate_rejects_persistence_summary_that_breaks_manifest_binding() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_refuses_portable_extension_shim_as_legacy_release_comparator() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_PORTABLE_LEGACY_SHIM",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_PORTABLE_LEGACY_SHIM", "1")]);
     assert!(
         !output.status.success(),
         "portable callback-shim timings must not satisfy strict cross-runtime claims"
     );
     let stratification: Value = serde_json::from_str(
-        &fs::read_to_string(
-            temp_root.join("run/results/extension_benchmark_stratification.json"),
-        )
-        .expect("read stratification artifact"),
+        &fs::read_to_string(temp_root.join("run/results/extension_benchmark_stratification.json"))
+            .expect("read stratification artifact"),
     )
     .expect("parse stratification artifact");
     let full_e2e = stratification["layers"]
@@ -10053,8 +10035,7 @@ fn orchestrate_refuses_portable_extension_shim_as_legacy_release_comparator() {
         "portable shim metrics must remain diagnostic and never become release ratios"
     );
     assert_eq!(
-        stratification["claim_integrity"]["cherry_pick_guard"]["global_claim_valid"]
-            .as_bool(),
+        stratification["claim_integrity"]["cherry_pick_guard"]["global_claim_valid"].as_bool(),
         Some(false)
     );
     assert!(
@@ -10100,21 +10081,16 @@ fn orchestrate_rejects_incomplete_legacy_runtime_workload_coverage() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rejects_current_run_idle_rss_over_budget_for_phase5() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_IDLE_RSS_OVER_BUDGET",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_IDLE_RSS_OVER_BUDGET", "1")]);
     assert!(
         !output.status.success(),
         "strict orchestration must fail when current-run idle RSS exceeds 50 MiB"
     );
 
     let matrix: Value = serde_json::from_str(
-        &fs::read_to_string(
-            temp_root
-                .join("run/results/phase1_matrix_validation.json"),
-        )
-        .expect("read matrix artifact"),
+        &fs::read_to_string(temp_root.join("run/results/phase1_matrix_validation.json"))
+            .expect("read matrix artifact"),
     )
     .expect("parse matrix artifact");
     assert_eq!(matrix["regression_guards"]["memory"].as_str(), Some("fail"));
@@ -10127,8 +10103,7 @@ fn orchestrate_rejects_current_run_idle_rss_over_budget_for_phase5() {
         "over-budget current-run RSS must name the memory regression"
     );
     assert_eq!(
-        matrix["evidence_links"]["phase1_unit_and_fault_injection"]
-            ["idle_memory_rss"]["rss_bytes"]
+        matrix["evidence_links"]["phase1_unit_and_fault_injection"]["idle_memory_rss"]["rss_bytes"]
             .as_u64(),
         Some(64 * 1024 * 1024),
         "memory guard must expose the measured current-run RSS"
@@ -10825,10 +10800,8 @@ fn orchestrate_rejects_incomplete_nightly_extension_harness_manifest_coverage() 
 #[cfg(unix)]
 #[test]
 fn orchestrate_rejects_extension_budget_report_not_derived_from_jsonl() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_CORRUPT_EXT_BENCH_BUDGET",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_CORRUPT_EXT_BENCH_BUDGET", "1")]);
     assert!(
         !output.status.success(),
         "an extension budget report that disagrees with its JSONL must fail admission"
@@ -11838,21 +11811,16 @@ fn orchestrate_rejects_malformed_source_row_before_finalization() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_phase1_matrix_rejects_synthetic_seed_rows_as_release_evidence() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_SYNTHETIC_MATRIX_EVIDENCE",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_SYNTHETIC_MATRIX_EVIDENCE", "1")]);
     assert!(
         !output.status.success(),
         "synthetic inferred matrix seeds must not satisfy strict Phase-5 admission"
     );
 
     let matrix: Value = serde_json::from_str(
-        &fs::read_to_string(
-            temp_root
-                .join("run/results/phase1_matrix_validation.json"),
-        )
-        .expect("read matrix artifact"),
+        &fs::read_to_string(temp_root.join("run/results/phase1_matrix_validation.json"))
+            .expect("read matrix artifact"),
     )
     .expect("parse matrix artifact");
     assert_eq!(
@@ -11871,10 +11839,8 @@ fn orchestrate_phase1_matrix_rejects_synthetic_seed_rows_as_release_evidence() {
         matrix["stage_summary"]["evidence_rejections"]
             .as_array()
             .is_some_and(|rejections| rejections.iter().all(|rejection| {
-                rejection["mismatches"]["evidence_class"]["observed"].as_str()
-                    == Some("inferred")
-                    && rejection["mismatches"]["eligible_for_regression_gate"]["observed"]
-                        .as_bool()
+                rejection["mismatches"]["evidence_class"]["observed"].as_str() == Some("inferred")
+                    && rejection["mismatches"]["eligible_for_regression_gate"]["observed"].as_bool()
                         == Some(false)
             })),
         "synthetic evidence rejection must name classification and eligibility mismatches"

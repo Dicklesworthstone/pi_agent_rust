@@ -241,7 +241,9 @@ impl ManifestEntry {
     }
 
     fn subscribes_to(&self, event: &str) -> bool {
-        self.subscribes_events.iter().any(|candidate| candidate == event)
+        self.subscribes_events
+            .iter()
+            .any(|candidate| candidate == event)
     }
 }
 
@@ -297,9 +299,7 @@ impl Manifest {
         });
         // Community: commands + events
         pick(&|e: &&ManifestEntry| {
-            e.source_tier == "community"
-                && e.registers_commands
-                && e.subscribes_to("agent_start")
+            e.source_tier == "community" && e.registers_commands && e.subscribes_to("agent_start")
         });
         // Community: tools + commands + flags (complex registration)
         pick(&|e: &&ManifestEntry| {
@@ -899,10 +899,9 @@ fn bench_event_dispatch(
 #[test]
 fn failed_event_dispatch_is_not_recorded_as_a_latency_sample() {
     let mut samples = Vec::new();
-    let error = measure_successful_dispatch(&mut samples, || {
-        Err::<(), _>("synthetic dispatch failure")
-    })
-    .expect_err("dispatch failure must be propagated");
+    let error =
+        measure_successful_dispatch(&mut samples, || Err::<(), _>("synthetic dispatch failure"))
+            .expect_err("dispatch failure must be propagated");
     assert!(error.contains("synthetic dispatch failure"));
     assert!(
         samples.is_empty(),
