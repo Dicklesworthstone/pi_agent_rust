@@ -1569,12 +1569,12 @@ artifact_path = Path(sys.argv[1])
 expected_commit = sys.argv[2]
 expected_correlation_id = sys.argv[3]
 required = {
-    (runtime_kind, scenario)
+    (runtime_kind, scenario, extension)
     for runtime_kind in ("node", "bun")
-    for scenario in (
-        "ext_load_init/load_init_cold",
-        "ext_tool_call/hello",
-        "full_e2e_long_session",
+    for scenario, extension in (
+        ("ext_load_init/load_init_cold", "hello"),
+        ("ext_tool_call/hello", "hello"),
+        ("full_e2e_long_session", "hello+pirate"),
     )
 }
 observed = set()
@@ -1604,9 +1604,10 @@ for line_number, line in enumerate(
         raise SystemExit(f"line {line_number}: timestamp is missing")
     runtime_kind = record.get("runtime_kind")
     scenario = record.get("scenario")
+    extension = record.get("extension")
     if runtime_kind not in {"node", "bun"} or not isinstance(scenario, str):
         raise SystemExit(f"line {line_number}: runtime/scenario contract mismatch")
-    key = (runtime_kind, scenario)
+    key = (runtime_kind, scenario, extension)
     if key not in required:
         continue
     if key in observed:
@@ -3424,6 +3425,8 @@ if not per_call_samples_us:
 
 full_e2e_samples_ms: list[float] = []
 for record in workload_records:
+    if record.get("iterations") != 2000 or record.get("tool_calls_per_iteration") != 10:
+        continue
     elapsed_ms = parse_float(record.get("elapsed_ms"))
     if elapsed_ms is not None:
         full_e2e_samples_ms.append(elapsed_ms)

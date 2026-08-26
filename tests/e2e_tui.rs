@@ -1393,6 +1393,7 @@ fn e2e_tui_reload_resources_and_autocomplete_refresh() {
     };
 
     let args = [
+        "--classic",
         "--provider",
         "openai",
         "--model",
@@ -3329,6 +3330,7 @@ fn e2e_scenario_session_restore_explicit_path() {
     let session_path_str = session_file.display().to_string();
     let sessions_dir_str = sessions_dir.display().to_string();
     let scenario = CliScenario::new("session_restore_explicit_path")
+        .arg("--classic")
         .arg("--provider")
         .arg("openai")
         .arg("--model")

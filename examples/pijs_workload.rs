@@ -379,9 +379,9 @@ fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
         .map(PathBuf::from)
         .ok_or_else(|| Error::extension("CARGO_TARGET_DIR is required for RCH artifact return"))?;
     if !target_dir.is_absolute()
-        || target_dir.components().any(|component| {
-            matches!(component, Component::CurDir | Component::ParentDir)
-        })
+        || target_dir
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err(Error::extension(
             "CARGO_TARGET_DIR must be an absolute normalized path for RCH artifact return",
@@ -416,11 +416,11 @@ fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
         ))
     })?;
 
-    let current_exe = canonical_executable_path(
-        &std::env::current_exe().map_err(|error| {
-            Error::extension(format!("failed to resolve current workload executable: {error}"))
-        })?,
-    )?;
+    let current_exe = canonical_executable_path(&std::env::current_exe().map_err(|error| {
+        Error::extension(format!(
+            "failed to resolve current workload executable: {error}"
+        ))
+    })?)?;
     let returned_binary = output_dir.join("pijs_workload");
     let mut source = File::open(&current_exe).map_err(|error| {
         Error::extension(format!(
@@ -445,14 +445,18 @@ fn write_regression_gate_pair(records: &[serde_json::Value]) -> Result<()> {
             ))
         })?;
     io::copy(&mut source, &mut destination).map_err(|error| {
-        Error::extension(format!("failed to copy returned workload executable: {error}"))
+        Error::extension(format!(
+            "failed to copy returned workload executable: {error}"
+        ))
     })?;
     fs::set_permissions(&returned_binary, source_permissions).map_err(|error| {
-        Error::extension(format!("failed to preserve workload executable mode: {error}"))
+        Error::extension(format!(
+            "failed to preserve workload executable mode: {error}"
+        ))
     })?;
-    destination
-        .sync_all()
-        .map_err(|error| Error::extension(format!("failed to sync workload executable: {error}")))?;
+    destination.sync_all().map_err(|error| {
+        Error::extension(format!("failed to sync workload executable: {error}"))
+    })?;
 
     let evidence_path = output_dir.join("pijs_workload.jsonl");
     let mut evidence = OpenOptions::new()
@@ -669,60 +673,60 @@ fn run_measurement(args: &Args, tool_calls: NonZeroUsize) -> Result<serde_json::
     }
 
     Ok(json!({
-            "schema": "pi.perf.workload.v1",
-            "timestamp": timestamp,
-            "run_id": run_id,
-            "correlation_id": correlation_id,
-            "source_commit": source_commit,
-            "source_dirty": source_dirty,
-            "tool": "pijs_workload",
-            "scenario": "tool_call_roundtrip",
-            "iterations": args.iterations.get(),
-            "tool_calls_per_iteration": tool_calls.get(),
-            "total_calls": total_calls,
-            "elapsed_ms": elapsed_millis,
-            "elapsed_us": elapsed_micros,
-            "elapsed_us_f64": elapsed_micros_f64,
-            "per_call_us": per_call_us,
-            "per_call_us_f64": per_call_micros_f64,
-            "per_call_ns_f64": per_call_nanos_f64,
-            "calls_per_sec": calls_per_sec,
-            "build_profile": build_profile,
-            "build_profile_verified": build_profile_verified,
-            "build_fingerprint_contract": perf_build::BUILD_FINGERPRINT_CONTRACT,
-            "build_fingerprint_verified": build_fingerprint_verified,
-            "compiled_profile_family": perf_build::COMPILED_PROFILE_FAMILY,
-            "compiled_opt_level": perf_build::COMPILED_OPT_LEVEL,
-            "compiled_debug": perf_build::COMPILED_DEBUG,
-            "compiled_features": compiled_features,
-            "executable_build_profile": executable_build_profile,
-            "executable_profile_verified": binary_profile_verified,
-            "debug_assertions": cfg!(debug_assertions),
-            "config_hash": config_hash,
-            "runtime_engine": args.runtime_engine.as_str(),
-            "evidence_class": "measured",
-            "confidence": if eligible_for_regression_gate {
-                "high"
-            } else {
-                "medium"
-            },
-            "eligible_for_regression_gate": eligible_for_regression_gate,
-            "measurement_method": "wall_clock_observation",
-            "measurement_boundary": args.runtime_engine.measurement_boundary(),
-            "measurement_contract_version": args.runtime_engine.measurement_contract_version(),
-            "disk_cache_policy": if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
-                "disabled"
-            } else {
-                "not_applicable"
-            },
-            "host_page_cache_policy": "not_applicable_measured_region",
-            "allocator_requested": allocator.requested,
-            "allocator_request_source": allocator.requested_source,
-            "allocator_effective": allocator.effective.as_str(),
-            "allocator_fallback_reason": allocator.fallback_reason,
-            "binary_path": binary_path,
-            "binary_sha256": binary_sha256,
-        }))
+        "schema": "pi.perf.workload.v1",
+        "timestamp": timestamp,
+        "run_id": run_id,
+        "correlation_id": correlation_id,
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
+        "tool": "pijs_workload",
+        "scenario": "tool_call_roundtrip",
+        "iterations": args.iterations.get(),
+        "tool_calls_per_iteration": tool_calls.get(),
+        "total_calls": total_calls,
+        "elapsed_ms": elapsed_millis,
+        "elapsed_us": elapsed_micros,
+        "elapsed_us_f64": elapsed_micros_f64,
+        "per_call_us": per_call_us,
+        "per_call_us_f64": per_call_micros_f64,
+        "per_call_ns_f64": per_call_nanos_f64,
+        "calls_per_sec": calls_per_sec,
+        "build_profile": build_profile,
+        "build_profile_verified": build_profile_verified,
+        "build_fingerprint_contract": perf_build::BUILD_FINGERPRINT_CONTRACT,
+        "build_fingerprint_verified": build_fingerprint_verified,
+        "compiled_profile_family": perf_build::COMPILED_PROFILE_FAMILY,
+        "compiled_opt_level": perf_build::COMPILED_OPT_LEVEL,
+        "compiled_debug": perf_build::COMPILED_DEBUG,
+        "compiled_features": compiled_features,
+        "executable_build_profile": executable_build_profile,
+        "executable_profile_verified": binary_profile_verified,
+        "debug_assertions": cfg!(debug_assertions),
+        "config_hash": config_hash,
+        "runtime_engine": args.runtime_engine.as_str(),
+        "evidence_class": "measured",
+        "confidence": if eligible_for_regression_gate {
+            "high"
+        } else {
+            "medium"
+        },
+        "eligible_for_regression_gate": eligible_for_regression_gate,
+        "measurement_method": "wall_clock_observation",
+        "measurement_boundary": args.runtime_engine.measurement_boundary(),
+        "measurement_contract_version": args.runtime_engine.measurement_contract_version(),
+        "disk_cache_policy": if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
+            "disabled"
+        } else {
+            "not_applicable"
+        },
+        "host_page_cache_policy": "not_applicable_measured_region",
+        "allocator_requested": allocator.requested,
+        "allocator_request_source": allocator.requested_source,
+        "allocator_effective": allocator.effective.as_str(),
+        "allocator_fallback_reason": allocator.fallback_reason,
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+    }))
 }
 
 fn setup_quickjs_runtime() -> Result<QuickJsBenchRuntime> {
@@ -850,12 +854,8 @@ mod tests {
 
     #[test]
     fn workload_args_accept_cargo_bench_regression_pair() {
-        let args = Args::try_parse_from([
-            "pijs_workload",
-            "--bench",
-            "--regression-gate-pair",
-        ])
-        .expect("Cargo's harness-free benchmark arguments must parse");
+        let args = Args::try_parse_from(["pijs_workload", "--bench", "--regression-gate-pair"])
+            .expect("Cargo's harness-free benchmark arguments must parse");
         assert!(args.cargo_bench);
         assert!(args.regression_gate_pair);
     }

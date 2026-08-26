@@ -1388,14 +1388,16 @@ for line in rows:
 path.write_text("\n".join(rewritten) + ("\n" if rewritten else ""), encoding="utf-8")
 PY
     fi
-    cat >"$artifact_output_dir/legacy_extension_workloads.jsonl" <<'JSON'
+    if [[ "${PI_BENCH_LEGACY_RUNTIMES:-0}" == "1" ]]; then
+      cat >"$artifact_output_dir/legacy_extension_workloads.jsonl" <<'JSON'
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"node","summary":{"p50_ms":10.0}}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_load_init/load_init_cold","extension":"hello","runtime_kind":"bun","summary":{"p50_ms":8.0}}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"node","per_call_us":20.0}
 {"schema":"pi.ext.legacy_bench.v1","scenario":"ext_tool_call/hello","extension":"hello","runtime_kind":"bun","per_call_us":15.0}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"node","elapsed_ms":2400.0}
-{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","runtime_kind":"bun","elapsed_ms":1800.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","extension":"hello+pirate","runtime_kind":"node","elapsed_ms":2400.0}
+{"schema":"pi.ext.legacy_bench.v1","scenario":"full_e2e_long_session","extension":"hello+pirate","runtime_kind":"bun","elapsed_ms":1800.0}
 JSON
+    fi
     python3 - "$artifact_output_dir/scenario_runner.jsonl" <<'PY'
 import json
 import sys
@@ -1479,9 +1481,11 @@ PY
     fi
     cat >"$artifact_output_dir/ext_bench_harness.jsonl" <<'JSON'
 {"schema":"pi.ext.rust_bench.v1","scenario":"cold_load","extension":"hello","success":true,"stats":{"p95_us":18000}}
+{"schema":"pi.ext.rust_bench.v1","scenario":"warm_load","extension":"hello","success":true,"stats":{"p95_us":9000}}
+{"schema":"pi.ext.rust_bench.v1","scenario":"event_dispatch","extension":"1_extensions","success":true,"stats":{"p95_us":120}}
 JSON
     cat >"$artifact_output_dir/ext_bench_harness_report.json" <<JSON
-{"schema":"pi.bench.harness_report.v1","mode":"${PI_BENCH_MODE:-pr}","config":{"max_extensions":$ext_bench_max,"iterations":$ext_bench_iterations,"event_dispatch_count":$ext_bench_events},"summary":{"total_scenarios":1,"total_passed":1,"total_failed":0,"budgets_passed":1,"budgets_failed":0,"budgets_no_data":0}}
+{"schema":"pi.bench.harness_report.v1","mode":"${PI_BENCH_MODE:-pr}","config":{"max_extensions":$ext_bench_max,"iterations":$ext_bench_iterations,"event_dispatch_count":$ext_bench_events},"summary":{"total_scenarios":3,"total_passed":3,"total_failed":0,"budgets_passed":1,"budgets_failed":0,"budgets_no_data":0}}
 JSON
     ;;
   perf_bench_harness)
@@ -8566,10 +8570,8 @@ fn orchestrate_rch_perf_harness_retrieves_nextest_artifact() {
 #[cfg(unix)]
 #[test]
 fn orchestrate_rejects_missing_rch_pijs_pair_before_producer_admission() {
-    let (output, temp_root) = run_orchestrate_with_fake_toolchain_with_env(&[(
-        "PI_FAKE_DROP_RCH_PIJS_ARTIFACT",
-        "1",
-    )]);
+    let (output, temp_root) =
+        run_orchestrate_with_fake_toolchain_with_env(&[("PI_FAKE_DROP_RCH_PIJS_ARTIFACT", "1")]);
     assert!(
         !output.status.success(),
         "strict full orchestration must reject a successful remote command with no PiJS JSONL"
@@ -8584,9 +8586,7 @@ fn orchestrate_rejects_missing_rch_pijs_pair_before_producer_admission() {
         "failure must name the rejected PiJS return contract: {combined}"
     );
     assert!(
-        !temp_root
-            .join("run/results/pijs_workload.jsonl")
-            .exists(),
+        !temp_root.join("run/results/pijs_workload.jsonl").exists(),
         "missing worker evidence must not create an accepted PiJS artifact"
     );
     let admission: Value = serde_json::from_slice(

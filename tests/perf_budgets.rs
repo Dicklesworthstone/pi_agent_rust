@@ -770,10 +770,7 @@ fn validate_post_generation_producer_admission(
         ("cargo_profile", "perf"),
         ("status", "ready"),
         ("proof_scope", "producer_execution_receipts"),
-        (
-            "artifact_binding",
-            "post_generation_evidence_inventory",
-        ),
+        ("artifact_binding", "post_generation_evidence_inventory"),
     ] {
         if payload.get(field).and_then(Value::as_str) != Some(expected) {
             return Err(format!(
@@ -2999,7 +2996,11 @@ fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
                 && disambiguator
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                && path.parent().and_then(Path::file_name).and_then(OsStr::to_str) == Some("deps")
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(OsStr::to_str)
+                    == Some("deps")
         });
     if binary_name != Some("pijs_workload") && !cargo_bench_name {
         return Err(format!(
