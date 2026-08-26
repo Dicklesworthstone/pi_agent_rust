@@ -489,25 +489,45 @@ set +e
 SOURCE_COMMIT_FINAL="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 SOURCE_DIRTY_FINAL="$(source_dirty_state)"
 SOURCE_TREE_DIGEST_FINAL="$(source_tree_digest)"
-python3 - "$ARTIFACT_DIR" "$CORRELATION_ID" "$STAMP" "$SOURCE_COMMIT" "$SOURCE_DIRTY" "$SOURCE_TREE_DIGEST" "$SOURCE_COMMIT_FINAL" "$SOURCE_DIRTY_FINAL" "$SOURCE_TREE_DIGEST_FINAL" <<'PY'
+RUN_FINISHED_AT="$(utc_timestamp)"
+python3 - \
+    "$ARTIFACT_DIR" \
+    "$CORRELATION_ID" \
+    "$RUN_ID" \
+    "$RUN_STARTED_AT" \
+    "$RUN_FINISHED_AT" \
+    "$SOURCE_COMMIT" \
+    "$SOURCE_DIRTY" \
+    "$SOURCE_TREE_DIGEST" \
+    "$SOURCE_COMMIT_FINAL" \
+    "$SOURCE_DIRTY_FINAL" \
+    "$SOURCE_TREE_DIGEST_FINAL" \
+    "$CARGO_RUNNER_MODE" \
+    "$PERSISTENCE_RCH_FORCE_REMOTE" \
+    "$PERSISTENCE_RCH_REQUIRE_REMOTE" <<'PY'
 import base64
 import binascii
 import hashlib
 import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 artifact_dir = Path(sys.argv[1])
 correlation_id = sys.argv[2]
-timestamp = sys.argv[3]
-source_commit = sys.argv[4]
-source_dirty = sys.argv[5] == "true"
-source_tree_digest = sys.argv[6]
-source_commit_final = sys.argv[7]
-source_dirty_final = sys.argv[8] == "true"
-source_tree_digest_final = sys.argv[9]
+attempt_id = sys.argv[3]
+run_started_at_raw = sys.argv[4]
+run_finished_at_raw = sys.argv[5]
+source_commit = sys.argv[6]
+source_dirty = sys.argv[7] == "true"
+source_tree_digest = sys.argv[8]
+source_commit_final = sys.argv[9]
+source_dirty_final = sys.argv[10] == "true"
+source_tree_digest_final = sys.argv[11]
+runner_mode = sys.argv[12]
+rch_force_remote = sys.argv[13] == "true"
+rch_require_remote = sys.argv[14] == "true"
 
 
 def load_json(path: Path) -> dict:
@@ -535,17 +555,33 @@ def load_jsonl(path: Path) -> list[dict]:
     return records
 
 
-def timestamp_is_valid(value: object) -> bool:
+def parse_timestamp(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
-        return False
+        return None
     normalized = value.strip()
     if normalized.endswith("Z"):
         normalized = f"{normalized[:-1]}+00:00"
     try:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
-        return False
-    return parsed.tzinfo is not None
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+run_started_at = parse_timestamp(run_started_at_raw)
+run_finished_at = parse_timestamp(run_finished_at_raw)
+if run_started_at is None or run_finished_at is None or run_finished_at < run_started_at:
+    raise ValueError("runner timestamps are invalid or reversed")
+timestamp_skew = timedelta(seconds=120)
+
+
+def timestamp_is_current(value: object) -> bool:
+    parsed = parse_timestamp(value)
+    return (
+        parsed is not None
+        and parsed >= run_started_at - timestamp_skew
+        and parsed <= run_finished_at + timestamp_skew
+    )
 
 
 def log_record_is_valid(record: dict, expected_test_name: str) -> bool:
@@ -581,7 +617,7 @@ def log_record_is_valid(record: dict, expected_test_name: str) -> bool:
         return False
     if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
         return False
-    if not timestamp_is_valid(record.get("ts")):
+    if not timestamp_is_current(record.get("ts")):
         return False
     if record.get("level") not in {"debug", "info", "warn", "error"}:
         return False
@@ -605,7 +641,7 @@ def artifact_envelope_is_valid(record: dict, expected_test_name: str) -> bool:
         return False
     if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
         return False
-    if not timestamp_is_valid(record.get("ts")):
+    if not timestamp_is_current(record.get("ts")):
         return False
     return all(
         isinstance(record.get(field), str) and bool(record[field].strip())
@@ -814,11 +850,52 @@ def case_checks(
     artifact_index_schema_valid = bool(artifacts) and all(
         artifact_envelope_is_valid(record, expected_test_name) for record in artifacts
     )
+    result_exit_code = result.get("exit_code")
+    result_duration_ms = result.get("duration_ms")
+    result_schema_valid = (
+        result.get("schema") == "pi.e2e.persistence_fault_case.v1"
+        and isinstance(result.get("run_id"), str)
+        and isinstance(result.get("attempt_id"), str)
+        and bool(result["attempt_id"].strip())
+        and isinstance(result.get("correlation_id"), str)
+        and isinstance(result.get("source_commit"), str)
+        and isinstance(result.get("source_dirty"), bool)
+        and isinstance(result.get("source_tree_sha256"), str)
+        and isinstance(result.get("case_id"), str)
+        and isinstance(result.get("suite"), str)
+        and isinstance(result.get("test_name"), str)
+        and isinstance(result.get("feature"), str)
+        and not isinstance(result_exit_code, bool)
+        and isinstance(result_exit_code, int)
+        and not isinstance(result_duration_ms, bool)
+        and isinstance(result_duration_ms, int)
+        and result_duration_ms >= 0
+        and result.get("log_file") == str(case_dir / "output.log")
+        and result.get("test_log_jsonl") == str(case_dir / "test-log.jsonl")
+        and result.get("artifact_index_jsonl") == str(case_dir / "artifact-index.jsonl")
+        and timestamp_is_current(result.get("timestamp"))
+    )
+    diagnostic_sequence_valid = (
+        bool(diagnostic_records)
+        and [record.get("seq") for record in diagnostic_records]
+        == list(range(1, len(diagnostic_records) + 1))
+        and all(
+            current.get("t_ms", -1) <= following.get("t_ms", -1)
+            for current, following in zip(diagnostic_records, diagnostic_records[1:])
+        )
+    )
+    diagnostic_trace_bound = (
+        bool(logs)
+        and len({record.get("trace_id") for record in logs}) == 1
+        and all(record.get("ci_correlation_id") == correlation_id for record in logs)
+    )
 
     checks = {
-        "test_command_passed": result.get("exit_code") == 0,
+        "test_command_passed": result_schema_valid and result_exit_code == 0,
+        "result_schema_valid": result_schema_valid,
         "result_identity_current": (
             result.get("run_id") == correlation_id
+            and result.get("attempt_id") == attempt_id
             and result.get("correlation_id") == correlation_id
             and result.get("source_commit") == source_commit
             and result.get("source_dirty") == source_dirty
@@ -835,6 +912,8 @@ def case_checks(
         "summary_artifact_path_confined": has_confined_summary_artifact,
         "diagnostic_log_schema_valid": diagnostic_log_schema_valid,
         "artifact_index_schema_valid": artifact_index_schema_valid,
+        "diagnostic_sequence_valid": diagnostic_sequence_valid,
+        "diagnostic_trace_bound": diagnostic_trace_bound,
         "correlation_id_current": has_current_correlation,
         "test_identity_current": has_expected_test_identity,
     }
@@ -873,6 +952,7 @@ overall_passed = jsonl_case["passed"] and sqlite_case["passed"] and source_tree_
 summary = {
     "schema": "pi.e2e.persistence_fault_injection.summary.v1",
     "run_id": correlation_id,
+    "attempt_id": attempt_id,
     "correlation_id": correlation_id,
     "source_commit": source_commit,
     "source_dirty": source_dirty,
@@ -881,7 +961,12 @@ summary = {
     "source_dirty_final": source_dirty_final,
     "source_tree_sha256_final": source_tree_digest_final,
     "source_tree_stable": source_tree_stable,
-    "timestamp": timestamp,
+    "run_started_at": run_started_at_raw,
+    "timestamp": run_finished_at_raw,
+    "runner_mode": runner_mode,
+    "rch_force_remote": rch_force_remote,
+    "rch_require_remote": rch_require_remote,
+    "terminal_state": "complete",
     "assertions": {
         "crash_windows": ["pre_flush", "mid_flush", "post_flush"],
         "integrity_invariants": [
@@ -894,9 +979,8 @@ summary = {
     "overall_passed": overall_passed,
 }
 
-summary_path = artifact_dir / "integrity-summary.json"
+summary_path = artifact_dir / ".integrity-summary.pending.json"
 summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-print(f"[fault-injection] Integrity summary: {summary_path}")
 
 sys.exit(0 if overall_passed else 1)
 PY
@@ -908,36 +992,95 @@ if [[ "$jsonl_exit" -ne 0 || "$sqlite_exit" -ne 0 || "$summary_exit" -ne 0 ]]; t
     overall_exit=1
 fi
 
-cat >"$ARTIFACT_DIR/run-manifest.json" <<EOF
-{
-  "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
-  "run_id": "$CORRELATION_ID",
-  "correlation_id": "$CORRELATION_ID",
-  "source_commit": "$SOURCE_COMMIT",
-  "source_dirty": $SOURCE_DIRTY,
-  "source_tree_sha256": "$SOURCE_TREE_DIGEST",
-  "source_commit_final": "$SOURCE_COMMIT_FINAL",
-  "source_dirty_final": $SOURCE_DIRTY_FINAL,
-  "source_tree_sha256_final": "$SOURCE_TREE_DIGEST_FINAL",
-  "timestamp": "$STAMP",
-  "artifact_dir": "$ARTIFACT_DIR",
-  "runner_mode": "$CARGO_RUNNER_MODE",
-  "rch_require_remote": $PERSISTENCE_RCH_REQUIRE_REMOTE,
-  "result_files": [
-    "$ARTIFACT_DIR/jsonl/result.json",
-    "$ARTIFACT_DIR/sqlite/result.json",
-    "$ARTIFACT_DIR/integrity-summary.json"
-  ],
-  "exit_codes": {
-    "jsonl": $jsonl_exit,
-    "sqlite": $sqlite_exit,
-    "summary_validation": $summary_exit,
-    "overall": $overall_exit
-  }
+MANIFEST_COMPLETED_AT="$(utc_timestamp)"
+python3 - \
+    "$ARTIFACT_DIR/run-manifest.json" \
+    "$ARTIFACT_DIR/.integrity-summary.pending.json" \
+    "$ARTIFACT_DIR/integrity-summary.json" \
+    "$CORRELATION_ID" \
+    "$RUN_ID" \
+    "$SOURCE_COMMIT" \
+    "$SOURCE_DIRTY" \
+    "$SOURCE_TREE_DIGEST" \
+    "$SOURCE_COMMIT_FINAL" \
+    "$SOURCE_DIRTY_FINAL" \
+    "$SOURCE_TREE_DIGEST_FINAL" \
+    "$MANIFEST_COMPLETED_AT" \
+    "$ARTIFACT_DIR" \
+    "$CARGO_RUNNER_MODE" \
+    "$PERSISTENCE_RCH_FORCE_REMOTE" \
+    "$PERSISTENCE_RCH_REQUIRE_REMOTE" \
+    "$jsonl_exit" \
+    "$sqlite_exit" \
+    "$summary_exit" \
+    "$overall_exit" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+pending_summary_path = Path(sys.argv[2])
+final_summary_path = Path(sys.argv[3])
+summary_bytes = pending_summary_path.read_bytes()
+payload = {
+    "schema": "pi.e2e.persistence_fault_injection.manifest.v1",
+    "run_id": sys.argv[4],
+    "attempt_id": sys.argv[5],
+    "correlation_id": sys.argv[4],
+    "source_commit": sys.argv[6],
+    "source_dirty": sys.argv[7] == "true",
+    "source_tree_sha256": sys.argv[8],
+    "source_commit_final": sys.argv[9],
+    "source_dirty_final": sys.argv[10] == "true",
+    "source_tree_sha256_final": sys.argv[11],
+    "timestamp": sys.argv[12],
+    "artifact_dir": sys.argv[13],
+    "runner_mode": sys.argv[14],
+    "rch_force_remote": sys.argv[15] == "true",
+    "rch_require_remote": sys.argv[16] == "true",
+    "terminal_state": "complete",
+    "result_files": [
+        str(Path(sys.argv[13]) / "jsonl/result.json"),
+        str(Path(sys.argv[13]) / "sqlite/result.json"),
+        str(final_summary_path),
+    ],
+    "integrity_summary": {
+        "path": str(final_summary_path),
+        "size_bytes": len(summary_bytes),
+        "sha256": hashlib.sha256(summary_bytes).hexdigest(),
+    },
+    "exit_codes": {
+        "jsonl": int(sys.argv[17]),
+        "sqlite": int(sys.argv[18]),
+        "summary_validation": int(sys.argv[19]),
+        "overall": int(sys.argv[20]),
+    },
 }
-EOF
+with manifest_path.open("x", encoding="utf-8") as manifest:
+    json.dump(payload, manifest, indent=2)
+    manifest.write("\n")
+PY
+
+python3 - \
+    "$ARTIFACT_DIR/.integrity-summary.pending.json" \
+    "$ARTIFACT_DIR/integrity-summary.json" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+pending = Path(sys.argv[1])
+published = Path(sys.argv[2])
+metadata = pending.lstat()
+if not stat.S_ISREG(metadata.st_mode) or published.exists() or published.is_symlink():
+    raise SystemExit("integrity summary publication target is unsafe")
+os.link(pending, published, follow_symlinks=False)
+pending.unlink()
+PY
 
 echo "[fault-injection] Completed with exit code $overall_exit"
 echo "[fault-injection] Artifacts: $ARTIFACT_DIR"
+echo "[fault-injection] Integrity summary: $ARTIFACT_DIR/integrity-summary.json"
 
 exit "$overall_exit"
