@@ -5150,79 +5150,6 @@ def read_stable_regular_file(path: Path):
         os.close(parent_fd)
 
 
-def copy_tree(source_root: Path, destination_root: PurePosixPath, required: bool):
-    source_parent_fd = None
-    try:
-        source_parent_fd, source_name = open_source_parent(source_root)
-        root_metadata = os.stat(source_name, dir_fd=source_parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        if source_parent_fd is not None:
-            os.close(source_parent_fd)
-        if required:
-            raise SystemExit(f"required post-generation evidence root is missing: {source_root}")
-        return
-    try:
-        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
-            raise SystemExit(f"post-generation evidence root is unsafe: {source_root}")
-        root_fd = os.open(source_name, directory_flags, dir_fd=source_parent_fd)
-        opened_root = os.fstat(root_fd)
-        if (root_metadata.st_dev, root_metadata.st_ino) != (
-            opened_root.st_dev,
-            opened_root.st_ino,
-        ):
-            os.close(root_fd)
-            raise SystemExit(f"post-generation evidence root changed: {source_root}")
-    finally:
-        os.close(source_parent_fd)
-    pending = [(root_fd, PurePosixPath("."), source_root)]
-    while pending:
-        directory_fd, relative_directory, directory_label = pending.pop()
-        try:
-            with os.scandir(directory_fd) as iterator:
-                child_names = sorted(entry.name for entry in iterator)
-            for child_name in child_names:
-                child_relative = relative_directory / child_name
-                child_label = directory_label / child_name
-                child_metadata = os.stat(
-                    child_name, dir_fd=directory_fd, follow_symlinks=False
-                )
-                if stat.S_ISLNK(child_metadata.st_mode):
-                    raise SystemExit(
-                        f"post-generation evidence contains symlink: {child_label}"
-                    )
-                if stat.S_ISDIR(child_metadata.st_mode):
-                    child_fd = os.open(child_name, directory_flags, dir_fd=directory_fd)
-                    opened_child = os.fstat(child_fd)
-                    if (child_metadata.st_dev, child_metadata.st_ino) != (
-                        opened_child.st_dev,
-                        opened_child.st_ino,
-                    ):
-                        os.close(child_fd)
-                        raise SystemExit(
-                            f"post-generation evidence directory changed: {child_label}"
-                        )
-                    pending.append((child_fd, child_relative, child_label))
-                elif stat.S_ISREG(child_metadata.st_mode):
-                    relative = (
-                        child_relative
-                        if destination_root == PurePosixPath(".")
-                        else destination_root / child_relative
-                    )
-                    copy_regular_from_parent(
-                        directory_fd,
-                        child_name,
-                        child_label,
-                        relative,
-                        child_metadata,
-                    )
-                else:
-                    raise SystemExit(
-                        f"post-generation evidence contains non-regular entry: {child_label}"
-                    )
-        finally:
-            os.close(directory_fd)
-
-
 for suite in sorted(selected_suites.intersection(criterion_required_inputs)):
     suite_result_path = output_dir / "results" / suite / "result.json"
     try:
@@ -5412,7 +5339,7 @@ if stat.S_ISLNK(inventory_metadata.st_mode) or not stat.S_ISREG(
     raise SystemExit("retained post-generation evidence inventory is not a regular file")
 
 
-def stable_regular_digest(path: Path):
+def stable_regular_digest(path: Path, collect_bytes: bool = False):
     before = path.lstat()
     if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
         raise SystemExit(f"retained post-generation evidence is not a regular file: {path}")
@@ -5431,23 +5358,27 @@ def stable_regular_digest(path: Path):
         if identity(before) != identity(opened):
             raise SystemExit(f"retained post-generation evidence changed before read: {path}")
         digest = hashlib.sha256()
-        chunks = []
+        chunks = [] if collect_bytes else None
         while True:
             chunk = os.read(descriptor, 1024 * 1024)
             if not chunk:
                 break
             digest.update(chunk)
-            chunks.append(chunk)
+            if chunks is not None:
+                chunks.append(chunk)
         after = os.fstat(descriptor)
         after_path = path.lstat()
         if identity(before) != identity(after) or identity(before) != identity(after_path):
             raise SystemExit(f"retained post-generation evidence changed while read: {path}")
-        return digest.hexdigest(), before.st_size, b"".join(chunks)
+        content = b"".join(chunks) if chunks is not None else None
+        return digest.hexdigest(), before.st_size, content
     finally:
         os.close(descriptor)
 
 
-inventory_sha256, _, inventory_bytes = stable_regular_digest(inventory_path)
+inventory_sha256, _, inventory_bytes = stable_regular_digest(
+    inventory_path, collect_bytes=True
+)
 try:
     inventory = json.loads(inventory_bytes)
 except (UnicodeDecodeError, json.JSONDecodeError) as error:
