@@ -1468,11 +1468,20 @@ PY
     fi
     ;;
   ext_bench_harness)
+    if [[ "${PI_BENCH_MODE:-pr}" == "nightly" ]]; then
+      ext_bench_max=200
+      ext_bench_iterations=100
+      ext_bench_events=200
+    else
+      ext_bench_max=10
+      ext_bench_iterations=10
+      ext_bench_events=50
+    fi
     cat >"$artifact_output_dir/ext_bench_harness.jsonl" <<'JSON'
 {"schema":"pi.ext.rust_bench.v1","scenario":"cold_load","extension":"hello","success":true,"stats":{"p95_us":18000}}
 JSON
-    cat >"$artifact_output_dir/ext_bench_harness_report.json" <<'JSON'
-{"schema":"pi.bench.harness_report.v1","summary":{"total_scenarios":1}}
+    cat >"$artifact_output_dir/ext_bench_harness_report.json" <<JSON
+{"schema":"pi.bench.harness_report.v1","mode":"${PI_BENCH_MODE:-pr}","config":{"max_extensions":$ext_bench_max,"iterations":$ext_bench_iterations,"event_dispatch_count":$ext_bench_events},"summary":{"total_scenarios":1,"total_passed":1,"total_failed":0}}
 JSON
     ;;
   perf_bench_harness)
@@ -1771,14 +1780,14 @@ PY
 esac
 
 if [[ -n "${CI_CORRELATION_ID:-}" ]]; then
-  python3 - "$target_dir" "$CI_CORRELATION_ID" "$(git rev-parse HEAD)" <<'PY'
+  python3 - "$artifact_output_dir" "$CI_CORRELATION_ID" "$(git rev-parse HEAD)" <<'PY'
 import json
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-target_dir = Path(sys.argv[1])
+artifact_output_dir = Path(sys.argv[1])
 correlation_id = sys.argv[2]
 source_commit = sys.argv[3]
 generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -1789,7 +1798,7 @@ artifacts = (
     ("legacy_extension_workloads.jsonl", "correlation_id"),
 )
 for relative_path, correlation_field in artifacts:
-    path = target_dir / "perf" / relative_path
+    path = artifact_output_dir / relative_path
     if not path.is_file():
         continue
     records = [
@@ -1857,6 +1866,7 @@ case "${1:-}" in
       PI_BENCH_RUN_ID \
       PI_BENCH_CORRELATION_ID \
       PI_BENCH_ALLOCATOR \
+      PI_BENCH_MODE \
       CARGO_BUILD_JOBS \
       PI_CRITERION_OUTPUT_SUBDIR; do
       case ",${RCH_ENV_ALLOWLIST:-}," in

@@ -583,7 +583,15 @@ impl RpcSharedState {
 /// Tracks a running bash command so it can be aborted.
 struct RunningBash {
     id: String,
-    abort_tx: oneshot::Sender<()>,
+    abort_tx: Option<oneshot::Sender<()>>,
+}
+
+impl RunningBash {
+    fn request_abort(&mut self, cx: &asupersync::Cx) {
+        if let Some(abort_tx) = self.abort_tx.take() {
+            let _ = abort_tx.send(cx, ());
+        }
+    }
 }
 
 async fn rpc_session_transition_blocker(
@@ -1933,7 +1941,7 @@ pub async fn run(
                 };
                 *running = Some(RunningBash {
                     id: run_id.clone(),
-                    abort_tx,
+                    abort_tx: Some(abort_tx),
                 });
 
                 let out_tx = out_tx.clone();
@@ -2142,8 +2150,8 @@ pub async fn run(
                 let mut running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
                     .await
                     .map_err(|err| Error::session(format!("bash state lock failed: {err}")))?;
-                if let Some(running_bash) = running.take() {
-                    let _ = running_bash.abort_tx.send(&cx, ());
+                if let Some(running_bash) = running.as_mut() {
+                    running_bash.request_abort(&cx);
                 }
                 let _ = out_tx.send(response_ok(id, "abort_bash", None));
             }
@@ -9934,6 +9942,41 @@ export default function init(pi) {
                 Some("An accepted follow-up is still pending; resume it before changing sessions")
             );
         });
+    }
+
+    #[test]
+    fn bash_abort_keeps_running_state_until_worker_finalization() {
+        let cx = asupersync::Cx::for_testing();
+        let (abort_tx, mut abort_rx) = oneshot::channel();
+        let mut running = Some(RunningBash {
+            id: "bash-abort-transition-guard".to_string(),
+            abort_tx: Some(abort_tx),
+        });
+
+        running
+            .as_mut()
+            .expect("running bash state")
+            .request_abort(&cx);
+
+        assert!(
+            running.is_some(),
+            "abort acknowledgement must not reopen session transitions before the worker finalizes"
+        );
+        assert!(
+            running
+                .as_ref()
+                .expect("running bash state after abort")
+                .abort_tx
+                .is_none(),
+            "the abort sender must be consumed exactly once"
+        );
+        assert_eq!(abort_rx.try_recv(), Ok(()));
+
+        running
+            .as_mut()
+            .expect("running bash state after repeated abort")
+            .request_abort(&cx);
+        assert!(running.is_some(), "repeated abort must retain the blocker");
     }
 
     #[test]
