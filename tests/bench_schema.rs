@@ -1592,38 +1592,44 @@ PY
     fi
     ;;
   ext_bench_harness)
-    if [[ "${PI_BENCH_MODE:-pr}" == "nightly" ]]; then
-      ext_bench_max=200
-      ext_bench_iterations=100
-      ext_bench_events=200
-    else
-      ext_bench_max=10
-      ext_bench_iterations=10
-      ext_bench_events=50
-    fi
     python3 - \
       "$artifact_output_dir/ext_bench_harness.jsonl" \
       "$artifact_output_dir/ext_bench_harness_report.json" \
-      "${PI_BENCH_MODE:-pr}" \
-      "$ext_bench_max" \
-      "$ext_bench_iterations" \
-      "$ext_bench_events" \
       "${PI_FAKE_DROP_EXT_BENCH_HARNESS_COVERAGE:-0}" \
       "${PI_FAKE_CORRUPT_EXT_BENCH_BUDGET:-0}" <<'PY'
 import hashlib
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 jsonl_path = Path(sys.argv[1])
 report_path = Path(sys.argv[2])
-mode = sys.argv[3]
-max_extensions = int(sys.argv[4])
-iterations = int(sys.argv[5])
-event_count = int(sys.argv[6])
-drop_coverage = sys.argv[7] == "1"
-corrupt_budget = sys.argv[8] == "1"
+drop_coverage = sys.argv[3] == "1"
+corrupt_budget = sys.argv[4] == "1"
+raw_mode = os.environ.get("PI_BENCH_MODE", "pr").strip().lower()
+mode = "nightly" if raw_mode in {"nightly", "full"} else (
+    "custom" if raw_mode == "custom" else "pr"
+)
+mode_defaults = {
+    "pr": (10, 10, 50),
+    "nightly": (200, 100, 200),
+    "custom": (20, 20, 100),
+}
+
+
+def unsigned_override(name, fallback):
+    raw_value = os.environ.get(name)
+    if raw_value is None or not raw_value.isascii() or not raw_value.isdigit():
+        return fallback
+    return int(raw_value)
+
+
+default_max, default_iterations, default_event_count = mode_defaults[mode]
+max_extensions = unsigned_override("PI_BENCH_MAX", default_max)
+iterations = unsigned_override("PI_BENCH_ITERATIONS", default_iterations)
+event_count = unsigned_override("PI_BENCH_EVENT_COUNT", default_event_count)
 manifest = json.loads(
     Path("tests/ext_conformance/VALIDATED_MANIFEST.json").read_text(encoding="utf-8")
 )
@@ -1701,9 +1707,15 @@ fake_env = {
     "cpu_model": "fake-rch-worker",
     "cpu_cores": 8,
     "mem_total_mb": 65536,
-    "build_profile": "release",
-    "git_commit": "abcdef0",
-    "features": ["ext-conformance"],
+    "build_profile": os.environ["PI_BENCH_BUILD_PROFILE"],
+    "git_commit": os.environ["VERGEN_GIT_SHA"],
+    "features": [
+        "bpe-tokens",
+        "ext-conformance",
+        "ftui",
+        "sqlite-sessions",
+        "tui",
+    ],
 }
 fake_env_hash_input = "|".join(
     str(fake_env[field])
@@ -1716,7 +1728,7 @@ fake_env_hash_input = "|".join(
         "build_profile",
         "git_commit",
     )
-)
+) + "|" + ",".join(fake_env["features"])
 fake_env["config_hash"] = hashlib.sha256(fake_env_hash_input.encode()).hexdigest()
 
 

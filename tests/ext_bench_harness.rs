@@ -156,25 +156,33 @@ fn collect_env_fingerprint() -> EnvFingerprint {
     );
     let mem_total_mb = sys.total_memory() / (1024 * 1024);
 
-    let build_profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
-    .to_string();
+    let build_profile = perf_build::detect_build_profile();
 
-    let git_commit = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
+    let git_commit = std::env::var("VERGEN_GIT_SHA")
         .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::process::Command::new("git")
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
 
-    let features = vec!["ext-conformance".to_string()];
+    let features = perf_build::compiled_feature_set()
+        .into_iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
 
     // Build config hash from env fields
-    let hash_input =
-        format!("{os}|{arch}|{cpu_model}|{cpu_cores}|{mem_total_mb}|{build_profile}|{git_commit}");
+    let hash_input = format!(
+        "{os}|{arch}|{cpu_model}|{cpu_cores}|{mem_total_mb}|{build_profile}|{git_commit}|{}",
+        features.join(",")
+    );
     let config_hash = format!("{:x}", Sha256::digest(hash_input.as_bytes()));
 
     EnvFingerprint {

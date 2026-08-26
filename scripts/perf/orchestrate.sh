@@ -1402,7 +1402,8 @@ validate_retrieved_ext_bench_harness_pair() {
   local report_path="$2"
   local expected_mode="$3"
   local manifest_path="$4"
-  python3 - "$jsonl_path" "$report_path" "$expected_mode" "$manifest_path" <<'PY'
+  local expected_commit="$5"
+  python3 - "$jsonl_path" "$report_path" "$expected_mode" "$manifest_path" "$expected_commit" <<'PY'
 import hashlib
 import json
 import math
@@ -1414,6 +1415,7 @@ jsonl_path = Path(sys.argv[1])
 report_path = Path(sys.argv[2])
 expected_mode = sys.argv[3]
 manifest_path = Path(sys.argv[4])
+expected_commit = sys.argv[5]
 expected_config = {
     "pr": {
         "max_extensions": 10,
@@ -1611,6 +1613,13 @@ expected_env_fields = {
     "features",
     "config_hash",
 }
+expected_features = [
+    "bpe-tokens",
+    "ext-conformance",
+    "ftui",
+    "sqlite-sessions",
+    "tui",
+]
 
 
 def validated_environment(value, location):
@@ -1623,8 +1632,14 @@ def validated_environment(value, location):
         raise SystemExit(f"{location} env.cpu_cores must be a positive integer")
     if type(value.get("mem_total_mb")) is not int or value["mem_total_mb"] <= 0:
         raise SystemExit(f"{location} env.mem_total_mb must be a positive integer")
-    if value.get("features") != ["ext-conformance"]:
-        raise SystemExit(f"{location} env.features must equal ['ext-conformance']")
+    if value.get("build_profile") != "perf":
+        raise SystemExit(f"{location} env.build_profile must equal 'perf'")
+    if value.get("git_commit") != expected_commit:
+        raise SystemExit(f"{location} env.git_commit must equal the source commit")
+    if value.get("features") != expected_features:
+        raise SystemExit(
+            f"{location} env.features must equal {expected_features!r}"
+        )
     hash_input = "|".join(
         str(value[field])
         for field in (
@@ -1636,7 +1651,7 @@ def validated_environment(value, location):
             "build_profile",
             "git_commit",
         )
-    )
+    ) + "|" + ",".join(value["features"])
     expected_hash = hashlib.sha256(hash_input.encode()).hexdigest()
     if value.get("config_hash") != expected_hash:
         raise SystemExit(f"{location} env.config_hash mismatch")
@@ -2424,7 +2439,8 @@ run_test_suite() {
                  "$source_path" \
                  "$retrieved_result_dir/ext_bench_harness_report.json" \
                  "$producer_bench_mode" \
-                 "$ROOT_DIR/tests/ext_conformance/VALIDATED_MANIFEST.json"; }; then
+                 "$ROOT_DIR/tests/ext_conformance/VALIDATED_MANIFEST.json" \
+                 "$GIT_COMMIT_FULL"; }; then
           log_fail "$suite_name returned invalid extension benchmark evidence"
           exit_code=88
           break
@@ -2932,7 +2948,7 @@ def load_current_result(suite):
             raise OSError("result is not a regular file")
         encoded = path.read_bytes()
         return path, json.loads(encoded)
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         failures.append(
             {"suite": suite, "reason": "missing_or_invalid_result", "detail": str(error)}
         )
@@ -4814,6 +4830,7 @@ def admit_dataset(path, records, correlation_field):
     return accepted, {
         "path": str(path),
         "sha256": digest,
+        "required": True,
         "correlation_field": correlation_field,
         "expected_correlation_id": correlation_id,
         "expected_source_commit": source_commit,
@@ -6510,7 +6527,7 @@ def load_artifact(path: Path, expected_schema: str):
         return {}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
         failures.append(
             {"path": str(path), "reason": "invalid_json", "detail": str(error)}
         )
@@ -6544,27 +6561,56 @@ def load_artifact(path: Path, expected_schema: str):
     return payload
 
 
-def validate_source_datasets(path: Path, payload):
+def validate_source_datasets(path: Path, payload, expected_basenames):
     datasets = payload.get("source_datasets", [])
     if not isinstance(datasets, list) or not datasets:
         failures.append({"path": str(path), "reason": "missing_source_datasets"})
         return
+    observed_basenames = [
+        Path(dataset.get("path")).name
+        for dataset in datasets
+        if isinstance(dataset, dict)
+        and isinstance(dataset.get("path"), str)
+        and dataset.get("path")
+    ]
+    if len(observed_basenames) != len(datasets) or set(observed_basenames) != set(
+        expected_basenames
+    ) or len(observed_basenames) != len(expected_basenames):
+        failures.append(
+            {
+                "path": str(path),
+                "reason": "source_dataset_identity_mismatch",
+                "expected_basenames": sorted(expected_basenames),
+                "observed_basenames": sorted(observed_basenames),
+            }
+        )
     for dataset in datasets:
         if not isinstance(dataset, dict):
             failures.append({"path": str(path), "reason": "invalid_source_dataset"})
             continue
         accepted = dataset.get("accepted_record_count")
         rejected = dataset.get("rejected_record_count")
-        required = dataset.get("required", True)
+        required = dataset.get("required")
         source_path = dataset.get("path")
         expected_sha256 = dataset.get("sha256")
+        accepted_valid = type(accepted) is int and accepted >= 0
+        rejected_valid = type(rejected) is int and rejected >= 0
+        required_valid = type(required) is bool
+        if not accepted_valid or not rejected_valid or not required_valid:
+            failures.append(
+                {
+                    "path": str(path),
+                    "reason": "invalid_source_dataset_metadata",
+                    "source_path": source_path,
+                }
+            )
         verify_source_bytes = (
-            required
-            or (isinstance(accepted, int) and accepted > 0)
-            or (isinstance(rejected, int) and rejected > 0)
+            required is True
+            or (accepted_valid and accepted > 0)
+            or (rejected_valid and rejected > 0)
             or expected_sha256 is not None
         )
-        if required and (not isinstance(accepted, int) or accepted <= 0):
+        if required is True and (not accepted_valid or accepted <= 0):
             failures.append(
                 {
                     "path": str(path),
@@ -6585,7 +6631,18 @@ def validate_source_datasets(path: Path, payload):
                 }
             )
         elif verify_source_bytes:
-            observed_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+            try:
+                observed_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+            except OSError as error:
+                failures.append(
+                    {
+                        "path": str(path),
+                        "reason": "source_dataset_read_error",
+                        "source_path": source_path,
+                        "detail": str(error),
+                    }
+                )
+                continue
             if not isinstance(expected_sha256, str) or observed_sha256 != expected_sha256:
                 failures.append(
                     {
@@ -6596,7 +6653,7 @@ def validate_source_datasets(path: Path, payload):
                         "observed_sha256": observed_sha256,
                     }
                 )
-        if not isinstance(rejected, int) or rejected != 0:
+        if not rejected_valid or rejected != 0:
             failures.append(
                 {
                     "path": str(path),
@@ -6608,7 +6665,11 @@ def validate_source_datasets(path: Path, payload):
 
 
 phase1 = load_artifact(phase1_path, "pi.perf.phase1_matrix_validation.v1")
-validate_source_datasets(phase1_path, phase1)
+validate_source_datasets(
+    phase1_path,
+    phase1,
+    {"scenario_runner.jsonl", "pijs_workload.jsonl"},
+)
 consumption_contract = phase1.get("consumption_contract")
 if not isinstance(consumption_contract, dict):
     consumption_contract = {}
@@ -6657,7 +6718,7 @@ required_sizes = matrix_requirements.get("required_session_message_sizes")
 
 try:
     perf_sli = json.loads(perf_sli_path.read_text(encoding="utf-8"))
-except (OSError, json.JSONDecodeError) as error:
+except (OSError, UnicodeError, json.JSONDecodeError) as error:
     failures.append(
         {
             "path": str(perf_sli_path),
@@ -6678,26 +6739,61 @@ if not isinstance(benchmark_partitions, dict):
     benchmark_partitions = {}
 expected_partitions = reporting_contract.get("required_partition_tags")
 realistic_ids = benchmark_partitions.get("realistic_long_session")
+matched_state_ids = benchmark_partitions.get("matched_state")
+declared_partition_tags = benchmark_partitions.get("partition_tags")
 
 
-def parse_contract_session_size(value):
-    if not isinstance(value, str):
+def parse_contract_session_sizes(values, prefix):
+    if not isinstance(values, list):
         return None
-    match = re.search(r"(\d+)([km]?)$", value.strip().lower())
-    if match is None:
+    parsed_sizes = []
+    pattern = re.compile(rf"{re.escape(prefix)}_(\d+)([km]?)")
+    for value in values:
+        if not isinstance(value, str):
+            return None
+        match = pattern.fullmatch(value.strip().lower())
+        if match is None:
+            return None
+        multiplier = {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2)]
+        parsed_sizes.append(int(match.group(1)) * multiplier)
+    return parsed_sizes
+
+
+def finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    multiplier = {"": 1, "k": 1_000, "m": 1_000_000}[match.group(2)]
-    return int(match.group(1)) * multiplier
+    try:
+        parsed = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
+def positive_finite_number(value):
+    parsed = finite_number(value)
+    return parsed is not None and parsed > 0.0
+
+
+def canonical_cell_identity(partition, size):
+    return (
+        isinstance(partition, str)
+        and bool(partition)
+        and type(size) is int
+        and size > 0
+    )
+
+
+realistic_sizes = parse_contract_session_sizes(realistic_ids, "realistic")
+matched_state_sizes = parse_contract_session_sizes(matched_state_ids, "matched_state")
 expected_sizes = (
-    [parse_contract_session_size(value) for value in realistic_ids]
-    if isinstance(realistic_ids, list)
+    realistic_sizes
+    if realistic_sizes is not None and realistic_sizes == matched_state_sizes
     else None
 )
 canonical_dimensions_valid = (
     isinstance(expected_partitions, list)
     and bool(expected_partitions)
+    and expected_partitions == declared_partition_tags
     and all(isinstance(value, str) and value.strip() for value in expected_partitions)
     and len(set(expected_partitions)) == len(expected_partitions)
     and isinstance(expected_sizes, list)
@@ -6760,6 +6856,14 @@ elif not isinstance(matrix_cells, list) or len(matrix_cells) != required_cell_co
     )
 if isinstance(matrix_cells, list):
     required_stages = ("open_ms", "append_ms", "save_ms", "index_ms")
+    required_swarm_groups = {
+        "latency_quantiles_ms": ("p50", "p95", "p99", "p999"),
+        "queue_depth": ("p50", "p95", "p99", "p999", "max"),
+        "resource_usage": ("rss_mb", "cpu_pct"),
+        "component_breakdown_ms": ("tool", "provider", "extension", "session"),
+        "stage_breakdown_ms": ("open", "append", "save", "index"),
+        "host_capacity": ("target_cpu_cores", "observed_cpu_cores", "mem_total_mb"),
+    }
     expected_matrix_keys = {
         (partition, size)
         for partition in expected_partitions
@@ -6778,12 +6882,7 @@ if isinstance(matrix_cells, list):
             continue
         cell_partition = cell.get("workload_partition")
         cell_size = cell.get("session_messages")
-        cell_identity_valid = (
-            isinstance(cell_partition, str)
-            and bool(cell_partition)
-            and type(cell_size) is int
-            and cell_size > 0
-        )
+        cell_identity_valid = canonical_cell_identity(cell_partition, cell_size)
         if not cell_identity_valid:
             failures.append(
                 {
@@ -6813,28 +6912,60 @@ if isinstance(matrix_cells, list):
         lineage = cell.get("lineage")
         if not isinstance(lineage, dict):
             lineage = {}
+        swarm_metrics = cell.get("swarm_metrics")
+        invalid_swarm_metrics = []
+        if not isinstance(swarm_metrics, dict) or set(swarm_metrics) != set(
+            required_swarm_groups
+        ):
+            invalid_swarm_metrics.append("group_set")
+            swarm_metrics = {}
+        for group_name, required_keys in required_swarm_groups.items():
+            group = swarm_metrics.get(group_name)
+            if not isinstance(group, dict) or set(group) != set(required_keys):
+                invalid_swarm_metrics.append(group_name)
+                continue
+            for metric_name in required_keys:
+                metric_value = finite_number(group.get(metric_name))
+                if metric_value is None or metric_value < 0.0:
+                    invalid_swarm_metrics.append(f"{group_name}.{metric_name}")
+        primary_e2e = cell.get("primary_e2e")
+        invalid_primary_metrics = []
+        if not isinstance(primary_e2e, dict) or set(primary_e2e) != {
+            "wall_clock_ms",
+            "rust_vs_node_ratio",
+            "rust_vs_bun_ratio",
+        }:
+            invalid_primary_metrics.append("field_set")
+            primary_e2e = {}
+        for metric_name in (
+            "wall_clock_ms",
+            "rust_vs_node_ratio",
+            "rust_vs_bun_ratio",
+        ):
+            metric_value = finite_number(primary_e2e.get(metric_name))
+            if metric_value is None or metric_value <= 0.0:
+                invalid_primary_metrics.append(metric_name)
+        parsed_stages = {
+            key: finite_number(attribution.get(key)) for key in required_stages
+        }
         invalid_stages = [
             key
-            for key in required_stages
-            if isinstance(attribution.get(key), bool)
-            or not isinstance(attribution.get(key), (int, float))
-            or not math.isfinite(float(attribution[key]))
-            or float(attribution[key]) < 0.0
+            for key, value in parsed_stages.items()
+            if value is None or value < 0.0
         ]
         reported_stage_total = attribution.get("total_stage_ms")
+        parsed_stage_total = finite_number(reported_stage_total)
         observed_stage_total = (
-            sum(float(attribution[key]) for key in required_stages)
+            sum(parsed_stages[key] for key in required_stages)
             if not invalid_stages
             else None
         )
         stage_total_valid = (
-            not isinstance(reported_stage_total, bool)
-            and isinstance(reported_stage_total, (int, float))
-            and math.isfinite(float(reported_stage_total))
-            and float(reported_stage_total) > 0.0
+            parsed_stage_total is not None
+            and parsed_stage_total > 0.0
             and observed_stage_total is not None
             and math.isclose(
-                float(reported_stage_total),
+                parsed_stage_total,
                 observed_stage_total,
                 rel_tol=1e-9,
                 abs_tol=1e-9,
@@ -6852,6 +6983,8 @@ if isinstance(matrix_cells, list):
             or invalid_stages
             or not stage_total_valid
             or invalid_evidence
+            or invalid_swarm_metrics
+            or invalid_primary_metrics
         ):
             failures.append(
                 {
@@ -6863,6 +6996,8 @@ if isinstance(matrix_cells, list):
                     "observed_stage_total_ms": observed_stage_total,
                     "stage_total_valid": stage_total_valid,
                     "invalid_evidence": invalid_evidence,
+                    "invalid_swarm_metrics": invalid_swarm_metrics,
+                    "invalid_primary_metrics": invalid_primary_metrics,
                 }
             )
     if observed_matrix_keys != expected_matrix_keys:
@@ -6880,11 +7015,74 @@ if isinstance(matrix_cells, list):
                 ],
             }
         )
+    stage_summary_valid = (
+        stage_summary.get("cells_with_complete_stage_breakdown")
+        == canonical_cell_count
+        and stage_summary.get("cells_missing_stage_breakdown") == 0
+        and stage_summary.get("covered_cells") == canonical_cell_count
+        and stage_summary.get("missing_cells") == []
+    )
+    if not stage_summary_valid:
+        failures.append(
+            {"path": str(phase1_path), "reason": "stage_summary_mismatch"}
+        )
+    swarm_summary = phase1.get("swarm_summary")
+    if not isinstance(swarm_summary, dict):
+        swarm_summary = {}
+    swarm_summary_valid = (
+        swarm_summary.get("required_latency_quantiles")
+        == list(required_swarm_groups["latency_quantiles_ms"])
+        and swarm_summary.get("required_queue_depth_quantiles")
+        == list(required_swarm_groups["queue_depth"])
+        and swarm_summary.get("required_resource_usage_keys")
+        == list(required_swarm_groups["resource_usage"])
+        and swarm_summary.get("required_component_breakdown_keys")
+        == list(required_swarm_groups["component_breakdown_ms"])
+        and swarm_summary.get("required_stage_breakdown_keys")
+        == list(required_swarm_groups["stage_breakdown_ms"])
+        and swarm_summary.get("cells_with_complete_swarm_metrics")
+        == canonical_cell_count
+        and swarm_summary.get("cells_missing_swarm_metrics") == 0
+        and swarm_summary.get("missing_cells") == []
+    )
+    if not swarm_summary_valid:
+        failures.append(
+            {"path": str(phase1_path), "reason": "swarm_summary_mismatch"}
+        )
+    primary_outcomes = phase1.get("primary_outcomes")
+    if not isinstance(primary_outcomes, dict):
+        primary_outcomes = {}
+    primary_outcomes_valid = (
+        primary_outcomes.get("status") == "pass"
+        and primary_outcomes.get("missing_reasons") == []
+        and all(
+            positive_finite_number(primary_outcomes.get(metric_name))
+            for metric_name in (
+                "wall_clock_ms",
+                "rust_vs_node_ratio",
+                "rust_vs_bun_ratio",
+            )
+        )
+    )
+    if not primary_outcomes_valid:
+        failures.append(
+            {"path": str(phase1_path), "reason": "primary_outcomes_mismatch"}
+        )
 
 stratification = load_artifact(
     stratification_path, "pi.perf.extension_benchmark_stratification.v1"
 )
-validate_source_datasets(stratification_path, stratification)
+validate_source_datasets(
+    stratification_path,
+    stratification,
+    {
+        "scenario_runner.jsonl",
+        "pijs_workload.jsonl",
+        "extension_bench.jsonl",
+        "ext_bench_harness.jsonl",
+        "legacy_extension_workloads.jsonl",
+    },
+)
 required_layer_ids = (
     "cold_load_init",
     "per_call_dispatch_micro",
@@ -6897,15 +7095,6 @@ measured_layers = set()
 observed_layer_coverage = {layer_id: False for layer_id in required_layer_ids}
 observed_matched_contracts = {layer_id: False for layer_id in required_layer_ids}
 matched_comparison_basis = "matched_legacy_pi_mono_extension_loader"
-
-
-def positive_finite_number(value):
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, (int, float))
-        and math.isfinite(float(value))
-        and float(value) > 0.0
-    )
 
 
 if not isinstance(layers, list) or len(layers) != len(required_layer_ids):
@@ -6930,7 +7119,11 @@ for index, layer in enumerate(layers):
         )
         continue
     layer_id = layer.get("layer_id")
-    if layer_id not in required_layers or layer_id in seen_layers:
+    if (
+        not isinstance(layer_id, str)
+        or layer_id not in required_layers
+        or layer_id in seen_layers
+    ):
         failures.append(
             {
                 "path": str(stratification_path),
@@ -7054,6 +7247,7 @@ required_partition_tags = claim_integrity.get("required_partition_tags")
 required_partition_tags_valid = (
     isinstance(required_partition_tags, list)
     and bool(required_partition_tags)
+    and required_partition_tags == expected_partitions
     and all(isinstance(tag, str) and tag.strip() for tag in required_partition_tags)
     and len(set(required_partition_tags)) == len(required_partition_tags)
 )
