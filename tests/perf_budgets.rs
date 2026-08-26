@@ -695,6 +695,19 @@ fn validate_post_generation_evidence_inventory(
                 .to_string(),
         );
     }
+    let staged_run_instance_id = policy
+        .root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            "post-generation evidence root has no UTF-8 run-instance component".to_string()
+        })?;
+    if inventory.run_instance_id != staged_run_instance_id {
+        return Err(format!(
+            "post-generation evidence inventory run_instance_id does not match its staged root (inventory={}, root={staged_run_instance_id})",
+            inventory.run_instance_id
+        ));
+    }
     if inventory.entries.is_empty() {
         return Err("post-generation evidence inventory contains no inputs".to_string());
     }
@@ -5544,7 +5557,7 @@ fn post_generation_policy_rejects_symlinked_evidence_root_component() {
 #[test]
 fn post_generation_inventory_is_exact_digest_bound_and_lineage_bound() {
     let project = tempfile::tempdir().expect("create fake project root");
-    let evidence_root = project.path().join("evidence");
+    let evidence_root = project.path().join("a".repeat(64));
     std::fs::create_dir(&evidence_root).expect("create evidence root");
     let source_commit = "1234567890abcdef1234567890abcdef12345678";
     let policy = PostGenerationEvidencePolicy {

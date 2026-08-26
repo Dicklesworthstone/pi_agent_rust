@@ -616,6 +616,49 @@ fn measurement_artifact_path(
     )
 }
 
+fn validate_isolated_cold_load_producer_path(
+    claimed_path: &str,
+    extension: &str,
+) -> Result<(), MeasurementControlError> {
+    let path = Path::new(claimed_path);
+    let components = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let suffix = [
+        "criterion_extensions",
+        "ext_load_init",
+        "load_init_cold",
+        extension,
+        "new",
+        "estimates.json",
+    ];
+    if components.len() < suffix.len() + 3 {
+        return Err(MeasurementControlError::Invalid(
+            "artifact_path must identify an isolated criterion_extensions producer"
+                .to_string(),
+        ));
+    }
+    let suffix_start = components.len() - suffix.len();
+    let run_instance_id = components[suffix_start - 1];
+    if components[suffix_start - 3] != "criterion"
+        || components[suffix_start - 2] != "pi-perf-runs"
+        || run_instance_id.len() != 64
+        || !run_instance_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        || components[suffix_start..] != suffix.as_slice()
+    {
+        return Err(MeasurementControlError::Invalid(format!(
+            "artifact_path must identify criterion/pi-perf-runs/<run-instance>/criterion_extensions/ext_load_init/load_init_cold/{extension}/new/estimates.json"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_sha256(value: &str, field: &str) -> Result<(), MeasurementControlError> {
     if value.len() == 64
         && value
@@ -767,8 +810,9 @@ pub fn verify_cold_load_measurement_control_with_relocated_artifact(
         ))
     })?;
     validate_sha256(&measurement.sha256, "artifact_sha256")?;
+    validate_isolated_cold_load_producer_path(&measurement.path, extension)?;
     let required_suffix = PathBuf::from(format!(
-        "criterion/ext_load_init/load_init_cold/{extension}/new/estimates.json"
+        "criterion_extensions/ext_load_init/load_init_cold/{extension}/new/estimates.json"
     ));
     let artifact_path = measurement_artifact_path(
         &measurement.path,
@@ -1138,7 +1182,16 @@ mod tests {
     #[test]
     fn cold_load_control_rejects_noisy_or_tampered_criterion_input() {
         let temp = tempfile::tempdir().expect("create test directory");
-        let artifact_path = temp.path().join("estimates.json");
+        let run_instance_id = "a".repeat(64);
+        let artifact_path = temp
+            .path()
+            .join("criterion/pi-perf-runs")
+            .join(&run_instance_id)
+            .join(
+                "criterion_extensions/ext_load_init/load_init_cold/hello/new/estimates.json",
+            );
+        std::fs::create_dir_all(artifact_path.parent().expect("Criterion estimate parent"))
+            .expect("create Criterion estimate directory");
         std::fs::write(&artifact_path, br#"{"mean":{"point_estimate":1000000}}"#)
             .expect("write Criterion estimate");
         let artifact_path = std::fs::canonicalize(artifact_path).expect("canonical Criterion path");
@@ -1199,9 +1252,9 @@ mod tests {
             .expect("canonicalize relocated Criterion estimate");
         let mut relocated_control = control.clone();
         relocated_control["measurements"]["hello"]["artifact_path"] =
-            serde_json::json!(
-                "/unavailable/producer/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json"
-            );
+            serde_json::json!(format!(
+                "/unavailable/producer/target/criterion/pi-perf-runs/{run_instance_id}/criterion_extensions/ext_load_init/load_init_cold/hello/new/estimates.json"
+            ));
         let relocated_control_path = temp.path().join("cold-load-relocated.json");
         write_json(&relocated_control_path, &relocated_control);
         assert!(
@@ -1215,9 +1268,10 @@ mod tests {
         .expect("relocated Criterion bytes satisfy the producer control");
         assert_eq!(relocated.artifact_path, relocated_artifact_path);
 
-        relocated_control["measurements"]["hello"]["artifact_path"] = serde_json::json!(
-            "/unavailable/producer/target/criterion/ext_load_init/load_init_cold/pirate/new/estimates.json"
-        );
+        relocated_control["measurements"]["hello"]["artifact_path"] =
+            serde_json::json!(format!(
+                "/unavailable/producer/target/criterion/pi-perf-runs/{run_instance_id}/criterion_extensions/ext_load_init/load_init_cold/pirate/new/estimates.json"
+            ));
         write_json(&relocated_control_path, &relocated_control);
         assert!(
             verify_cold_load_measurement_control_with_relocated_artifact(

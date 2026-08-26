@@ -1422,6 +1422,8 @@ if (
     or any(character not in "0123456789abcdef" for character in run_instance_id)
 ):
     raise SystemExit("post-generation evidence inventory run_instance_id mismatch")
+if evidence_dir.name != run_instance_id:
+    raise SystemExit("post-generation evidence inventory staged-root mismatch")
 if not inventory.get("entries"):
     raise SystemExit("post-generation evidence inventory is empty")
 for name in (
